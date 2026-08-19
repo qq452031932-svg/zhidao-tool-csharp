@@ -29,23 +29,22 @@ public sealed class TransferCoordinatorTests
     }
 
     [Fact]
-    public async Task ResultPendingRetainsBothGlobalAndAccountSlotWhileOtherAccountContinues()
+    public async Task ResultPendingKeepsAccountBusyButDoesNotConsumeGlobalNetworkWorker()
     {
         var batch = Guid.NewGuid();
         var accountA = Guid.NewGuid();
         var accountB = Guid.NewGuid();
-        var store = new RecordingAllocationStore(batch, [Candidate(accountA, 2, "Public"), Candidate(accountB, 3, "Public")])
-        {
-            ActiveSlotCount = 1,
-        };
+        var accountC = Guid.NewGuid();
+        var store = new RecordingAllocationStore(batch,
+            [Candidate(accountA, 2, "Public"), Candidate(accountB, 3, "Public"), Candidate(accountC, 4, "Public")]);
         store.BusyAccounts.Add(accountA);
         var executor = new ImmediateExecutor();
 
         var scheduled = await new TransferCoordinator(
             new AllocationTransactionService(store), executor, new NetworkExecutionGate(true)).RunCycleAsync();
 
-        Assert.Equal(1, scheduled);
-        Assert.Equal(accountB, Assert.Single(store.Reserved).AccountId);
+        Assert.Equal(2, scheduled);
+        Assert.Equal([accountB, accountC], store.Reserved.Select(item => item.AccountId));
     }
 
     [Fact]
@@ -60,6 +59,24 @@ public sealed class TransferCoordinatorTests
 
         Assert.Equal(0, scheduled);
         Assert.Equal(0, store.ReservationAttempts);
+        Assert.Equal(0, store.ExhaustionChecks);
+        Assert.Equal(1, store.RecoveryChecks);
+    }
+
+    [Fact]
+    public async Task FullNetworkWorkerCapacityDoesNotTriggerFalseExhaustion()
+    {
+        var store = new RecordingAllocationStore(Guid.NewGuid(), [] )
+        {
+            ActiveNetworkOperationCount = TransferCoordinator.MaximumGlobalConcurrency,
+        };
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(store), new ImmediateExecutor(), new NetworkExecutionGate(true)).RunCycleAsync();
+
+        Assert.Equal(0, scheduled);
+        Assert.Equal(0, store.ReservationAttempts);
+        Assert.Equal(0, store.ExhaustionChecks);
     }
 
     [Fact]
@@ -75,6 +92,18 @@ public sealed class TransferCoordinatorTests
         Assert.Equal("More than one active batch was detected; scheduling is blocked.", error.Message);
     }
 
+    [Fact]
+    public async Task EmptyOnlineCycleChecksPersistentExhaustionExactlyOnce()
+    {
+        var store = new RecordingAllocationStore(Guid.NewGuid(), []);
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(store), new ImmediateExecutor(), new NetworkExecutionGate(true)).RunCycleAsync();
+
+        Assert.Equal(0, scheduled);
+        Assert.Equal(1, store.ExhaustionChecks);
+    }
+
     private static ScheduledOperation Candidate(Guid account, long ordinal, string source) =>
         new(Guid.NewGuid(), Guid.NewGuid(), account, ordinal, source);
 
@@ -85,11 +114,13 @@ public sealed class TransferCoordinatorTests
         public List<Guid> ActiveBatchIds { get; } = [activeBatchId];
         public HashSet<Guid> BusyAccounts { get; } = [];
         public List<ScheduledOperation> Reserved { get; } = [];
-        public int ActiveSlotCount { get; set; }
+        public int ActiveNetworkOperationCount { get; set; }
         public int ReservationAttempts { get; private set; }
+        public int ExhaustionChecks { get; private set; }
+        public int RecoveryChecks { get; private set; }
 
         public Task<CoordinatorState> GetStateAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(new CoordinatorState(ActiveBatchIds.ToArray(), ActiveSlotCount, BusyAccounts.ToArray()));
+            Task.FromResult(new CoordinatorState(ActiveBatchIds.ToArray(), ActiveNetworkOperationCount, BusyAccounts.ToArray()));
 
         public Task<Guid?> TryActivateNextBatchAsync(DateTimeOffset now, CancellationToken cancellationToken = default) =>
             Task.FromResult<Guid?>(null);
@@ -105,11 +136,28 @@ public sealed class TransferCoordinatorTests
             {
                 if (BusyAccounts.Contains(candidate.AccountId)) continue;
                 BusyAccounts.Add(candidate.AccountId);
-                ActiveSlotCount++;
+                ActiveNetworkOperationCount++;
                 Reserved.Add(candidate);
                 return Task.FromResult<ScheduledOperation?>(candidate);
             }
             return Task.FromResult<ScheduledOperation?>(null);
+        }
+
+        public Task<BatchExhaustionOutcome> TryFinalizeExhaustedBatchAsync(
+            Guid batchId,
+            DateTimeOffset now,
+            CancellationToken cancellationToken = default)
+        {
+            ExhaustionChecks++;
+            return Task.FromResult(BatchExhaustionOutcome.NotExhausted);
+        }
+
+        public Task<LeaseRecoveryResult> RecoverExpiredLeasesAsync(
+            DateTimeOffset now,
+            CancellationToken cancellationToken = default)
+        {
+            RecoveryChecks++;
+            return Task.FromResult(new LeaseRecoveryResult(0, 0));
         }
     }
 

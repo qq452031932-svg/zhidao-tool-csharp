@@ -27,10 +27,10 @@ public sealed class TransferCoordinator
 
     public async Task<int> RunCycleAsync(CancellationToken cancellationToken = default)
     {
-        if (!networkGate.CanAcquireNewWork) return 0;
         await singleCycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            await allocation.RecoverExpiredLeasesAsync(cancellationToken).ConfigureAwait(false);
             if (!networkGate.CanAcquireNewWork) return 0;
             var state = await allocation.GetStateAsync(cancellationToken).ConfigureAwait(false);
             if (state.ActiveBatchIds.Count > 1)
@@ -41,7 +41,7 @@ public sealed class TransferCoordinator
                 : await allocation.TryActivateNextBatchAsync(cancellationToken).ConfigureAwait(false);
             if (batchId is null) return 0;
 
-            var capacity = Math.Max(0, MaximumGlobalConcurrency - state.ActiveSlotCount);
+            var capacity = Math.Max(0, MaximumGlobalConcurrency - state.ActiveNetworkOperationCount);
             if (capacity == 0) return 0;
             var channel = Channel.CreateBounded<ScheduledOperation>(new BoundedChannelOptions(MaximumGlobalConcurrency)
             {
@@ -66,6 +66,8 @@ public sealed class TransferCoordinator
             }
 
             await Task.WhenAll(ConsumeAsync(), ConsumeAsync()).ConfigureAwait(false);
+            if (scheduled == 0 && state.ActiveNetworkOperationCount == 0 && state.BusyAccountIds.Count == 0 && networkGate.CanAcquireNewWork)
+                await allocation.TryFinalizeExhaustedBatchAsync(batchId.Value, cancellationToken).ConfigureAwait(false);
             return scheduled;
         }
         finally

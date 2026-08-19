@@ -9,7 +9,14 @@ public sealed record ReassignmentAllocation(
     Guid AccountId,
     int TargetCount,
     int EffectiveTargetCount,
-    int MinimumRetainedTargetCount = 0);
+    int MinimumRetainedTargetCount,
+    string AccountStatus,
+    bool IsEnabled,
+    bool IsDeleted)
+{
+    public bool IsHealthy =>
+        string.Equals(AccountStatus, "Active", StringComparison.Ordinal) && IsEnabled && !IsDeleted;
+}
 
 public sealed record ReassignmentOperation(
     Guid OperationId,
@@ -17,7 +24,12 @@ public sealed record ReassignmentOperation(
     Guid AssignedAccountId,
     string Status,
     string SubmitState,
-    bool IsAccountExclusive);
+    bool IsAccountExclusive,
+    IReadOnlySet<Guid>? CompatibleTargetAccountIds = null)
+{
+    public bool CanMoveTo(Guid accountId) =>
+        CompatibleTargetAccountIds is null || CompatibleTargetAccountIds.Contains(accountId);
+}
 
 public sealed record ReassignmentCandidate(
     Guid ResourceItemId,
@@ -114,6 +126,8 @@ public sealed class ReassignRemainingWorkService
         if (request.NewTargetCounts.Count != current.Count ||
             current.Keys.Any(accountId => !request.NewTargetCounts.ContainsKey(accountId)))
             throw new ReassignmentValidationException("A target is required for every participating account.");
+        if (current[request.FailedAccountId].IsHealthy)
+            throw new ReassignmentValidationException("The reassignment source account is still healthy.");
 
         var oldTotal = current.Values.Sum(item => (long)item.TargetCount);
         var newTotal = request.NewTargetCounts.Values.Sum(value => (long)value);
@@ -138,6 +152,8 @@ public sealed class ReassignRemainingWorkService
         if (failedDelta >= 0 || deltas.Any(item => item.AccountId != request.FailedAccountId && item.Delta < 0) ||
             deltas.Where(item => item.AccountId != request.FailedAccountId && item.Delta > 0).Sum(item => item.Delta) != -failedDelta)
             throw new ReassignmentValidationException("Only the failed account target can be redistributed to healthy accounts.");
+        if (deltas.Any(item => item.Delta > 0 && !current[item.AccountId].IsHealthy))
+            throw new ReassignmentValidationException("Replacement targets must be active, enabled, and not deleted.");
 
         ReassignmentOperationMove[] operationMoves;
         ReassignmentCandidateMove[] candidateMoves = [];
@@ -149,9 +165,7 @@ public sealed class ReassignRemainingWorkService
         }
         else
         {
-            // Success-target candidates stay unreserved and public. Submitted, reserved,
-            // result-pending, fulfilled and account-exclusive work is never rewritten here.
-            operationMoves = [];
+            (operationMoves, candidateMoves) = BuildSuccessTargetMoves(state, request, deltas);
             affectedCount = checked(deltas.Where(item => item.Delta > 0).Sum(item => item.Delta));
         }
 
@@ -193,7 +207,16 @@ public sealed class ReassignRemainingWorkService
         if (!FixedTimeEquals(preview.ConfirmationToken, suppliedShapeToken))
             throw new ReassignmentConfirmationException("The reassignment preview was modified after confirmation.");
 
-        var canonical = await PreviewAsync(preview.Request, cancellationToken).ConfigureAwait(false);
+        ReassignmentPreview canonical;
+        try
+        {
+            canonical = await PreviewAsync(preview.Request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ReassignmentValidationException)
+        {
+            throw new ReassignmentStaleStateException(
+                "The batch changed; create and confirm a new reassignment preview.");
+        }
         if (!string.Equals(canonical.BatchVersion, preview.BatchVersion, StringComparison.Ordinal))
             throw new ReassignmentStaleStateException("The batch changed; create and confirm a new reassignment preview.");
         if (!FixedTimeEquals(canonical.ConfirmationToken, preview.ConfirmationToken))
@@ -215,11 +238,8 @@ public sealed class ReassignRemainingWorkService
     {
         var required = deltas.Where(item => item.AccountId == request.FailedAccountId && item.Delta < 0)
             .Select(item => -item.Delta).SingleOrDefault();
-        var destinations = new Queue<Guid>(deltas
-            .Where(item => item.AccountId != request.FailedAccountId && item.Delta > 0)
-            .OrderBy(item => item.AccountId)
-            .SelectMany(item => Enumerable.Repeat(item.AccountId, item.Delta)));
-        if (destinations.Count != required)
+        var destinationCapacity = DestinationCapacity(request, deltas);
+        if (destinationCapacity.Values.Sum() != required)
             throw new ReassignmentValidationException("Replacement targets do not match the failed account reduction.");
 
         var eligible = state.Operations
@@ -230,15 +250,101 @@ public sealed class ReassignRemainingWorkService
                 string.Equals(item.SubmitState, "NotPrepared", StringComparison.Ordinal))
             .OrderBy(item => item.SequenceNumber)
             .ThenBy(item => item.OperationId)
-            .Take(required)
             .ToArray();
-        if (eligible.Length != required)
-            throw new ReassignmentValidationException("Not enough never-submitted unlocked operations can be reassigned.");
+        return MatchOperations(eligible, destinationCapacity, required,
+            "Not enough never-submitted unlocked operations can be reassigned.");
+    }
 
-        return eligible.Select(item => new ReassignmentOperationMove(
-            item.OperationId,
-            item.AssignedAccountId,
-            destinations.Dequeue())).ToArray();
+    private static (ReassignmentOperationMove[] OperationMoves, ReassignmentCandidateMove[] CandidateMoves) BuildSuccessTargetMoves(
+        ReassignmentState state,
+        ReassignmentRequest request,
+        IReadOnlyList<ReassignmentAllocationDelta> deltas)
+    {
+        var destinationCapacity = DestinationCapacity(request, deltas);
+        var candidatesBySequence = state.Candidates.ToDictionary(item => item.CandidateSequence);
+        var movable = state.Operations
+            .Where(item =>
+                item.AssignedAccountId == request.FailedAccountId &&
+                !item.IsAccountExclusive &&
+                string.Equals(item.Status, "Waiting", StringComparison.Ordinal) &&
+                string.Equals(item.SubmitState, "NotPrepared", StringComparison.Ordinal))
+            .Select(item => (Operation: item, Candidate: candidatesBySequence.GetValueOrDefault(item.SequenceNumber)))
+            .Where(item =>
+                item.Candidate is not null &&
+                string.Equals(item.Candidate.CandidateStatus, "Reserved", StringComparison.Ordinal) &&
+                item.Candidate.ReservedAccountId == request.FailedAccountId &&
+                item.Candidate.ConstraintAccountId is null)
+            .OrderBy(item => item.Operation.SequenceNumber)
+            .ThenBy(item => item.Operation.OperationId)
+            .ToArray();
+        var requiredMoves = Math.Min(destinationCapacity.Values.Sum(), movable.Length);
+        var operationMoves = MatchOperations(movable.Select(item => item.Operation), destinationCapacity, requiredMoves,
+            "Paused reservations cannot be moved to the selected replacement accounts.");
+        var candidateByOperation = movable.ToDictionary(item => item.Operation.OperationId, item => item.Candidate!);
+        var candidateMoves = new List<ReassignmentCandidateMove>(operationMoves.Length);
+        foreach (var move in operationMoves)
+        {
+            var candidate = candidateByOperation[move.OperationId];
+            candidateMoves.Add(new ReassignmentCandidateMove(
+                candidate.ResourceItemId, request.FailedAccountId, move.NewAccountId));
+        }
+        return (operationMoves, candidateMoves.ToArray());
+    }
+
+    private static SortedDictionary<Guid, int> DestinationCapacity(
+        ReassignmentRequest request,
+        IReadOnlyList<ReassignmentAllocationDelta> deltas) =>
+        new(deltas
+            .Where(item => item.AccountId != request.FailedAccountId && item.Delta > 0)
+            .ToDictionary(item => item.AccountId, item => item.Delta));
+
+    private static ReassignmentOperationMove[] MatchOperations(
+        IEnumerable<ReassignmentOperation> candidates,
+        IReadOnlyDictionary<Guid, int> capacity,
+        int required,
+        string failureMessage)
+    {
+        if (required == 0) return [];
+        var ordered = candidates.OrderBy(item => item.SequenceNumber).ThenBy(item => item.OperationId).ToArray();
+        var assignedByAccount = capacity.Keys.ToDictionary(accountId => accountId, _ => new List<ReassignmentOperation>());
+        var accountByOperation = new Dictionary<Guid, Guid>();
+
+        bool TryAssign(ReassignmentOperation operation, HashSet<Guid> visitedAccounts)
+        {
+            foreach (var accountId in capacity.Keys.OrderBy(value => value))
+            {
+                if (!operation.CanMoveTo(accountId) || !visitedAccounts.Add(accountId)) continue;
+                var assigned = assignedByAccount[accountId];
+                if (assigned.Count < capacity[accountId])
+                {
+                    assigned.Add(operation);
+                    accountByOperation[operation.OperationId] = accountId;
+                    return true;
+                }
+                foreach (var displaced in assigned.ToArray())
+                {
+                    if (!TryAssign(displaced, visitedAccounts)) continue;
+                    assigned.Remove(displaced);
+                    assigned.Add(operation);
+                    accountByOperation[operation.OperationId] = accountId;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        foreach (var operation in ordered)
+        {
+            if (!TryAssign(operation, [])) continue;
+            if (accountByOperation.Count == required) break;
+        }
+        if (accountByOperation.Count != required)
+            throw new ReassignmentValidationException(failureMessage);
+        return ordered
+            .Where(item => accountByOperation.ContainsKey(item.OperationId))
+            .Select(item => new ReassignmentOperationMove(
+                item.OperationId, item.AssignedAccountId, accountByOperation[item.OperationId]))
+            .ToArray();
     }
 
     private static string CreateToken(

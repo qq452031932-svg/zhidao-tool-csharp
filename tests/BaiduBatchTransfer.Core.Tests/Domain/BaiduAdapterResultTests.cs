@@ -26,4 +26,19 @@ public sealed class BaiduAdapterResultTests
                 null,
                 TimeSpan.FromSeconds(-1)));
     }
+
+    [Fact]
+    public void FailureCarriesTypedSubmissionAcceptanceWithoutInferringFromErrorText()
+    {
+        var definite = BaiduAdapterResult<string>.Failure(
+            BaiduErrorKind.ExpiredLogin,
+            "untrusted response",
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+        var unknown = BaiduAdapterResult<string>.Failure(
+            BaiduErrorKind.ExpiredLogin,
+            "not accepted maybe");
+
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, definite.SubmissionAcceptance);
+        Assert.Equal(SubmissionAcceptance.Unknown, unknown.SubmissionAcceptance);
+    }
 }

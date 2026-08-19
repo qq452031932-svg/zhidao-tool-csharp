@@ -5,8 +5,9 @@ public static class BaiduAdapterResult
     public static BaiduAdapterResult<object> Failure(
         BaiduErrorKind errorKind,
         string? adapterDiagnostic,
-        TimeSpan? retryAfter = null) =>
-        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic, retryAfter);
+        TimeSpan? retryAfter = null,
+        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown) =>
+        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic, retryAfter, submissionAcceptance);
 
     internal static BaiduErrorScope GetScope(BaiduErrorKind errorKind) => errorKind switch
     {
@@ -46,7 +47,8 @@ public sealed class BaiduAdapterResult<T>
         BaiduErrorKind? errorKind,
         BaiduErrorScope? scope,
         string? safeMessage,
-        TimeSpan? retryAfter)
+        TimeSpan? retryAfter,
+        SubmissionAcceptance submissionAcceptance)
     {
         IsSuccess = isSuccess;
         Value = value;
@@ -54,6 +56,7 @@ public sealed class BaiduAdapterResult<T>
         Scope = scope;
         SafeMessage = safeMessage;
         RetryAfter = retryAfter;
+        SubmissionAcceptance = submissionAcceptance;
     }
 
     public bool IsSuccess { get; }
@@ -68,16 +71,19 @@ public sealed class BaiduAdapterResult<T>
 
     public TimeSpan? RetryAfter { get; }
 
+    public SubmissionAcceptance SubmissionAcceptance { get; }
+
     public static BaiduAdapterResult<T> Success(T value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        return new BaiduAdapterResult<T>(true, value, null, null, null, null);
+        return new BaiduAdapterResult<T>(true, value, null, null, null, null, SubmissionAcceptance.Unknown);
     }
 
     public static BaiduAdapterResult<T> Failure(
         BaiduErrorKind errorKind,
         string? adapterDiagnostic,
-        TimeSpan? retryAfter = null)
+        TimeSpan? retryAfter = null,
+        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown)
     {
         if (retryAfter < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(retryAfter), "The server retry delay cannot be negative.");
@@ -90,6 +96,7 @@ public sealed class BaiduAdapterResult<T>
             errorKind,
             scope,
             BaiduAdapterResult.GetSafeMessage(errorKind),
-            retryAfter);
+            retryAfter,
+            submissionAcceptance);
     }
 }

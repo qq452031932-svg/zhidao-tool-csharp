@@ -2,6 +2,7 @@ using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Application.Tests.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using Microsoft.Data.Sqlite;
 
@@ -26,6 +27,341 @@ public sealed class SqliteSchedulingStoreTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.ConfirmReadyForQueueAsync(batch, userConfirmed: false));
         await service.ConfirmReadyForQueueAsync(batch, userConfirmed: true);
         Assert.Equal(batch, await store.TryActivateNextBatchAsync(Now));
+    }
+
+    [Fact]
+    public async Task DynamicReservationUsesPersistedOrdinalCursorInsteadOfScanningHistory()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var historical = Resource(batch, 1, null, "Expanded");
+        var candidate = Resource(batch, 2, null);
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 2, 1),
+            resources: [historical, candidate],
+            operations: [Operation(historical, account, 999, "Succeeded", "ResultReceived", "Fulfilled", "{}")],
+            allocations: [Allocation(batch, account, 1, 2)]);
+        await ExecuteAsync(db,
+            "UPDATE BatchJobs SET NextAllocationOrdinal=101 WHERE Id=$id;",
+            ("$id", batch.ToString("D")));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var reserved = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+
+        Assert.Equal(101, reserved?.AllocationOrdinal);
+        Assert.Equal(102L, await ScalarLongAsync(db, "SELECT NextAllocationOrdinal FROM BatchJobs"));
+    }
+
+    [Fact]
+    public async Task DynamicReservationCursorOverflowRollsBackCandidateAndAllocation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [Resource(batch, 1, null)],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        await ExecuteAsync(db,
+            "UPDATE BatchJobs SET NextAllocationOrdinal=$ordinal WHERE Id=$id;",
+            ("$ordinal", long.MaxValue), ("$id", batch.ToString("D")));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await Assert.ThrowsAsync<OverflowException>(() =>
+            store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5)));
+
+        Assert.Equal(long.MaxValue, await ScalarLongAsync(db, "SELECT NextAllocationOrdinal FROM BatchJobs"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+        Assert.Equal("Unallocated", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+    }
+
+    [Fact]
+    public async Task AccountPriorityShortagePolicyFillsHealthyAccountsInExplicitPriorityOrder()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var firstPriority = Guid.NewGuid();
+        var secondPriority = Guid.NewGuid();
+        await db.SeedAsync([Account(firstPriority, 0), Account(secondPriority, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 2) with { ShortagePolicy = "AccountPriority" },
+            resources: [Resource(batch, 1, null), Resource(batch, 2, null)],
+            allocations:
+            [
+                Allocation(batch, firstPriority, 1, 2) with { FulfilledCount = 1 },
+                Allocation(batch, secondPriority, 2, 2),
+            ]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var reserved = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+
+        Assert.Equal(firstPriority, reserved?.AccountId);
+    }
+
+    [Fact]
+    public async Task AccountPriorityStillConsumesExclusiveCandidateBeforePublicCandidate()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var publicPriority = Guid.NewGuid();
+        var exclusivePriority = Guid.NewGuid();
+        var publicCandidate = Resource(batch, 1, null);
+        var exclusiveCandidate = Resource(batch, 2, exclusivePriority);
+        await db.SeedAsync([Account(publicPriority, 0), Account(exclusivePriority, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 2) with { ShortagePolicy = "AccountPriority" },
+            resources: [publicCandidate, exclusiveCandidate],
+            allocations:
+            [
+                Allocation(batch, publicPriority, 1, 1),
+                Allocation(batch, exclusivePriority, 2, 1),
+            ]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var reserved = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+
+        Assert.Equal(exclusivePriority, reserved?.AccountId);
+        Assert.Equal(exclusiveCandidate.Id,
+            await ScalarGuidAsync(db, "SELECT ResourceItemId FROM TransferOperations WHERE Id=$id", reserved!.OperationId));
+    }
+
+    [Fact]
+    public async Task TwoHundredThousandCandidatesUseStatusFirstIndexDuringContinuousReservations()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 200_000),
+            allocations: [Allocation(batch, account, 1, 200_000)]);
+        await ExecuteAsync(db,
+            """
+            WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+            numbers(n) AS (
+                SELECT h.n*100000 + a.n*10000 + b.n*1000 + c.n*100 + d.n*10 + e.n
+                FROM (SELECT 0 n UNION ALL SELECT 1) h
+                CROSS JOIN digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d CROSS JOIN digits e
+            )
+            INSERT INTO ResourceItems(
+                Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+                FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            SELECT printf('00000000-0000-0000-0000-%012d',n+1),$batch,n+1,
+                'https://pan.baidu.com/s/'||(n+1),'share-'||(n+1),'a1b2',
+                'OptionalOuter','Unknown','Unallocated',$now,$now
+            FROM numbers;
+            """,
+            ("$batch", batch.ToString("D")), ("$now", Now.ToString("O")));
+
+        await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
+        await using (var explain = connection.CreateCommand())
+        {
+            explain.CommandText =
+                "EXPLAIN QUERY PLAN SELECT Id,CandidateSequence FROM ResourceItems WHERE BatchJobId=$batch AND CandidateStatus=$status AND CandidateConstraintAccountId IS NULL AND GlobalValidityStatus<>'Invalid' ORDER BY CandidateSequence LIMIT 1;";
+            explain.Parameters.AddWithValue("$batch", batch.ToString("D"));
+            explain.Parameters.AddWithValue("$status", "Unallocated");
+            var details = new List<string>();
+            await using var reader = await explain.ExecuteReaderAsync();
+            while (await reader.ReadAsync()) details.Add(reader.GetString(3));
+            var plan = string.Join(Environment.NewLine, details);
+            Assert.Contains("IX_ResourceItems_Batch_Status_Constraint_Sequence", plan, StringComparison.Ordinal);
+            Assert.DoesNotContain("SCAN ResourceItems", plan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("USE TEMP B-TREE", plan, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var operationIds = new HashSet<Guid>();
+        for (var index = 0; index < 256; index++)
+        {
+            var reserved = await store.TryReserveNextAsync(batch, Now.AddSeconds(index), Now.AddMinutes(5).AddSeconds(index));
+            Assert.NotNull(reserved);
+            Assert.True(operationIds.Add(reserved.OperationId));
+            Assert.Equal(index + 1, reserved.AllocationOrdinal);
+            await store.MarkFailedAsync(reserved.OperationId, "InvalidLink", "The share link is invalid.", globallyInvalid: true, Now.AddSeconds(index + 1));
+        }
+
+        Assert.Equal(256L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+        Assert.Equal(257L, await ScalarLongAsync(db, "SELECT NextAllocationOrdinal FROM BatchJobs"));
+    }
+
+    [Fact]
+    public async Task TwoHundredThousandTaskOperationsUseWaitingAndGlobalStatusIndexes()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "TaskCount", "Active", 200_000, 200_000),
+            allocations: [Allocation(batch, account, 1, 200_000)]);
+        await ExecuteAsync(db,
+            """
+            WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+            numbers(n) AS (
+                SELECT h.n*100000 + a.n*10000 + b.n*1000 + c.n*100 + d.n*10 + e.n
+                FROM (SELECT 0 n UNION ALL SELECT 1) h
+                CROSS JOIN digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d CROSS JOIN digits e
+            )
+            INSERT INTO ResourceItems(
+                Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+                FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            SELECT printf('20000000-0000-0000-0000-%012d',n+1),$batch,n+1,
+                'https://pan.baidu.com/s/task-'||(n+1),'task-share-'||(n+1),'a1b2',
+                'OptionalOuter','Unknown','Expanded',$now,$now
+            FROM numbers;
+
+            WITH digits(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+            numbers(n) AS (
+                SELECT h.n*100000 + a.n*10000 + b.n*1000 + c.n*100 + d.n*10 + e.n
+                FROM (SELECT 0 n UNION ALL SELECT 1) h
+                CROSS JOIN digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d CROSS JOIN digits e
+            )
+            INSERT INTO TransferOperations(
+                Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+                OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+            SELECT printf('30000000-0000-0000-0000-%012d',n+1),
+                printf('20000000-0000-0000-0000-%012d',n+1),$batch,n+1,n+1,'/base','/base','',$account,'Weighted',
+                CASE WHEN n<199744 THEN 'Succeeded' ELSE 'Waiting' END,
+                CASE WHEN n<199744 THEN 'NewTransfer' ELSE NULL END,0,'task-fp-'||(n+1),
+                CASE WHEN n<199744 THEN '{}' ELSE NULL END,
+                CASE WHEN n<199744 THEN 'ResultReceived' ELSE 'NotPrepared' END,
+                CASE WHEN n<199744 THEN 'Fulfilled' ELSE 'Unoccupied' END,$now,$now
+            FROM numbers;
+            """,
+            ("$batch", batch.ToString("D")), ("$account", account.ToString("D")), ("$now", Now.ToString("O")));
+
+        await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
+        {
+            await using var waiting = connection.CreateCommand();
+            waiting.CommandText =
+                "EXPLAIN QUERY PLAN SELECT o.Id,o.AssignedAccountId,o.AllocationOrdinal,o.AllocationSource FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId JOIN AccountAllocations al ON al.BatchJobId=o.BatchJobId AND al.AccountId=o.AssignedAccountId JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch AND o.Status='Waiting' AND o.TargetSlotState IN ('Unoccupied','Released') AND r.CandidateStatus<>'GloballyInvalid' AND r.GlobalValidityStatus<>'Invalid' AND (b.QuotaBasis<>'SuccessTarget' OR al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0) AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=o.AssignedAccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending')) ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT 1;";
+            waiting.Parameters.AddWithValue("$batch", batch.ToString("D"));
+            waiting.Parameters.AddWithValue("$date", "2026-08-19");
+            var waitingPlan = await ExplainDetailsAsync(waiting);
+            Assert.Contains("IX_TransferOperations_Batch_Status_AllocationOrdinal", waitingPlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("USE TEMP B-TREE", waitingPlan, StringComparison.OrdinalIgnoreCase);
+
+            await using var active = connection.CreateCommand();
+            active.CommandText = "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM TransferOperations WHERE Status IN ('Reserved','Preparing','Submitting');";
+            var activePlan = await ExplainDetailsAsync(active);
+            Assert.Contains("IX_TransferOperations_Status_Lease", activePlan, StringComparison.Ordinal);
+            Assert.DoesNotContain("SCAN TransferOperations", activePlan, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        for (var index = 0; index < 256; index++)
+        {
+            var reserved = await store.TryReserveNextAsync(batch, Now.AddSeconds(index), Now.AddMinutes(5).AddSeconds(index));
+            Assert.NotNull(reserved);
+            Assert.Equal(199_745 + index, reserved.AllocationOrdinal);
+            await store.MarkFailedAsync(reserved.OperationId,
+                "InvalidLink", "The share link is invalid.", globallyInvalid: true, Now.AddSeconds(index + 1));
+        }
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations WHERE Status='Waiting'"));
+    }
+
+    [Fact]
+    public async Task WaitForCandidatesMovesTrulyExhaustedBatchToAwaitingCandidates()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 0) with { ShortagePolicy = "WaitForCandidates" },
+            allocations: [Allocation(batch, account, 1, 5)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var outcome = await store.TryFinalizeExhaustedBatchAsync(batch, Now);
+
+        Assert.Equal(BatchExhaustionOutcome.AwaitingCandidates, outcome);
+        Assert.Equal("AwaitingCandidates", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
+        Assert.Equal(5L, await ScalarLongAsync(db, "SELECT EffectiveTargetSuccessCount FROM AccountAllocations"));
+    }
+
+    [Theory]
+    [InlineData("ProportionalReduction")]
+    [InlineData("AccountPriority")]
+    public async Task FiniteShortagePoliciesSettleEffectiveTargetsWhenNoReachableWorkRemains(string shortagePolicy)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 0) with { ShortagePolicy = shortagePolicy },
+            allocations: [Allocation(batch, account, 1, 5) with { FulfilledCount = 2 }]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var outcome = await store.TryFinalizeExhaustedBatchAsync(batch, Now);
+
+        Assert.Equal(BatchExhaustionOutcome.CompletedWithShortfall, outcome);
+        Assert.Equal("CompletedWithShortfall", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
+        Assert.Equal(2L, await ScalarLongAsync(db, "SELECT EffectiveTargetSuccessCount FROM AccountAllocations"));
+    }
+
+    [Theory]
+    [InlineData("WaitForCandidates", false, BatchExhaustionOutcome.AwaitingCandidates)]
+    [InlineData("WaitForCandidates", true, BatchExhaustionOutcome.AwaitingCandidates)]
+    [InlineData("ProportionalReduction", false, BatchExhaustionOutcome.CompletedWithShortfall)]
+    [InlineData("AccountPriority", true, BatchExhaustionOutcome.CompletedWithShortfall)]
+    public async Task ExistingFailedOperationKeyDoesNotKeepExhaustedBatchActive(
+        string shortagePolicy,
+        bool exclusive,
+        BatchExhaustionOutcome expected)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, exclusive ? account : null, "Unused");
+        var failed = Operation(resource, account, 1, "Failed", "ResultReceived", "Released", "{}") with
+        {
+            AllocationSource = exclusive ? "Exclusive" : "Weighted",
+            OutcomeKind = "Failed",
+        };
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1, 1) with { ShortagePolicy = shortagePolicy },
+            resources: [resource], operations: [failed],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.Null(await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5)));
+        Assert.Equal(expected, await store.TryFinalizeExhaustedBatchAsync(batch, Now));
+        Assert.Equal(expected == BatchExhaustionOutcome.AwaitingCandidates ? "AwaitingCandidates" : "CompletedWithShortfall",
+            await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
+    }
+
+    [Fact]
+    public async Task ExhaustionDoesNotSettleWhileAValidCandidateIsBlockedByUnavailableAccount()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 0) with { Status = "Invalid" }],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [Resource(batch, 1, account)],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var outcome = await store.TryFinalizeExhaustedBatchAsync(batch, Now);
+
+        Assert.Equal(BatchExhaustionOutcome.TemporarilyBlocked, outcome);
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
+    }
+
+    [Fact]
+    public async Task ExhaustionDoesNotSettleWhileCandidateIsBlockedByCurrentDailyLimit()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync([Account(account, 1) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [Resource(batch, 1, null)],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var outcome = await store.TryFinalizeExhaustedBatchAsync(batch, Now);
+
+        Assert.Equal(BatchExhaustionOutcome.TemporarilyBlocked, outcome);
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
     }
 
     [Fact]
@@ -141,9 +477,87 @@ public sealed class SqliteSchedulingStoreTests
         var state = await store.GetStateAsync();
         var reserved = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
 
-        Assert.Equal(1, state.ActiveSlotCount);
+        Assert.Equal(0, state.ActiveNetworkOperationCount);
         Assert.Contains(a, state.BusyAccountIds);
         Assert.Equal(b, reserved?.AccountId);
+    }
+
+    [Fact]
+    public async Task ExpiredPreSubmissionLeaseReturnsSameOperationToWaitingWithoutLosingCandidate()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with
+        {
+            ReservedAccountId = account,
+            ReservationExpiresAt = Now.AddMinutes(-1),
+        };
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved") with
+        {
+            LeaseExpiresAt = Now.AddMinutes(-1),
+        };
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var recovered = await store.RecoverExpiredLeasesAsync(Now);
+
+        Assert.Equal(1, recovered.RetryableOperationCount);
+        Assert.Equal(0, recovered.ResultPendingOperationCount);
+        Assert.Equal("Waiting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Unoccupied", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(account, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems", null));
+        var reacquired = await store.TryReserveNextAsync(batch, Now.AddSeconds(1), Now.AddMinutes(5));
+        Assert.Equal(operation.Id, reacquired?.OperationId);
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+    }
+
+    [Fact]
+    public async Task ExpiredSubmittingLeasesBecomeResultPendingBeforeAndAfterResponseIdentifiers()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var firstAccount = Guid.NewGuid();
+        var secondAccount = Guid.NewGuid();
+        var firstResource = Resource(batch, 1, null, "Expanded");
+        var secondResource = Resource(batch, 2, null, "Expanded");
+        var first = Operation(firstResource, firstAccount, 1, "Submitting", "Submitting", "Reserved", "{}") with
+        {
+            DailyCountedAt = Now.AddMinutes(-2),
+            SubmitStartedAt = Now.AddMinutes(-2),
+            LeaseExpiresAt = Now.AddMinutes(-1),
+        };
+        var second = Operation(secondResource, secondAccount, 2, "Submitting", "Submitting", "Reserved", "{}") with
+        {
+            AdapterRequestId = "request-returned-before-crash",
+            DailyCountedAt = Now.AddMinutes(-2),
+            SubmitStartedAt = Now.AddMinutes(-2),
+            LeaseExpiresAt = Now.AddMinutes(-1),
+        };
+        await db.SeedAsync([Account(firstAccount, 0), Account(secondAccount, 0)],
+            job: Job(batch, "TaskCount", "Active", 2, 2),
+            resources: [firstResource, secondResource], operations: [first, second],
+            allocations:
+            [
+                Allocation(batch, firstAccount, 1, 1, reserved: 1),
+                Allocation(batch, secondAccount, 2, 1, reserved: 1),
+            ]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var recovered = await store.RecoverExpiredLeasesAsync(Now);
+        var state = await store.GetStateAsync();
+
+        Assert.Equal(0, recovered.RetryableOperationCount);
+        Assert.Equal(2, recovered.ResultPendingOperationCount);
+        Assert.Equal(2L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations WHERE Status='ResultPending' AND SubmitState='PendingConfirmation'"));
+        Assert.Equal(2L, await ScalarLongAsync(db, "SELECT SUM(ReservedSlotCount) FROM AccountAllocations"));
+        Assert.Equal(0, state.ActiveNetworkOperationCount);
+        Assert.Equal(2, state.BusyAccountIds.Count);
     }
 
     [Theory]
@@ -153,7 +567,7 @@ public sealed class SqliteSchedulingStoreTests
     [InlineData("InvalidTargetPath", "The target path is invalid.")]
     [InlineData("InvalidLink", "The share link is invalid.")]
     [InlineData("InvalidExtractionCode", "The extraction code is invalid.")]
-    public async Task ResultPendingStoreRejectsDefiniteErrorsWithoutChangingDatabase(string code, string message)
+    public async Task ResultPendingStoreRejectsDefinitelyNotAcceptedWithoutChangingDatabase(string code, string message)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var batch = Guid.NewGuid();
@@ -172,7 +586,12 @@ public sealed class SqliteSchedulingStoreTests
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
-            store.MarkResultPendingAsync(operation.Id, code, message, Now.AddSeconds(1)));
+            store.MarkResultPendingAsync(
+                operation.Id,
+                code,
+                message,
+                SubmissionAcceptance.DefinitelyNotAccepted,
+                Now.AddSeconds(1)));
 
         Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
         Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
@@ -185,7 +604,8 @@ public sealed class SqliteSchedulingStoreTests
     [Theory]
     [InlineData("TransientService", "The service is temporarily unavailable.")]
     [InlineData("UnknownResponse", "The service returned an unrecognized response.")]
-    public async Task ResultPendingStoreAcceptsOnlyUncertainExecutionResults(string code, string message)
+    [InlineData("ExpiredLogin", "The account session has expired.")]
+    public async Task ResultPendingStoreAcceptsUnknownSubmissionAcceptance(string code, string message)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var batch = Guid.NewGuid();
@@ -203,7 +623,12 @@ public sealed class SqliteSchedulingStoreTests
             allocations: [Allocation(batch, account, 1, 1, 1)]);
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
 
-        await store.MarkResultPendingAsync(operation.Id, code, message, Now.AddSeconds(1));
+        await store.MarkResultPendingAsync(
+            operation.Id,
+            code,
+            message,
+            SubmissionAcceptance.Unknown,
+            Now.AddSeconds(1));
 
         Assert.Equal("ResultPending", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
         Assert.Equal("PendingConfirmation", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
@@ -251,11 +676,16 @@ public sealed class SqliteSchedulingStoreTests
         var replacement = Guid.NewGuid();
         var resource = Resource(batch, 1, null, "Expanded");
         var operation = Operation(resource, failed, 1);
+        var replacementAllocation = Allocation(batch, replacement, 2, 0) with
+        {
+            DefaultTargetPath = "/replacement",
+            NormalizedDefaultTargetPath = "/replacement",
+        };
         await db.SeedAsync(
             [Account(failed, 0), Account(replacement, 0)],
             job: Job(batch, "TaskCount", "Paused", 1, 1),
             resources: [resource], operations: [operation],
-            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 0)]);
+            allocations: [Allocation(batch, failed, 1, 1), replacementAllocation]);
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var state = await store.LoadAsync(batch);
         Assert.NotNull(state);
@@ -266,8 +696,99 @@ public sealed class SqliteSchedulingStoreTests
         Assert.True(await store.ApplyAsync(mutation, state.BatchVersion));
         Assert.False(await store.ApplyAsync(mutation, state.BatchVersion));
         Assert.Equal(replacement, await ScalarGuidAsync(db, "SELECT AssignedAccountId FROM TransferOperations", null));
+        Assert.Equal("/replacement", await ScalarStringAsync(db, "SELECT TargetPath FROM TransferOperations"));
+        Assert.Equal("/replacement", await ScalarStringAsync(db, "SELECT NormalizedTargetPath FROM TransferOperations"));
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT AssignedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT AssignedItemCount FROM AccountAllocations WHERE AccountId='" + replacement.ToString("D") + "'"));
+    }
+
+    [Fact]
+    public async Task ReassignmentPreservesResourceTargetOverrideInsteadOfReplacementDefault()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded") with
+        {
+            TargetPathOverride = "/override",
+            NormalizedTargetPathOverride = "/override",
+        };
+        var operation = Operation(resource, failed, 1);
+        var replacementAllocation = Allocation(batch, replacement, 2, 0) with
+        {
+            DefaultTargetPath = "/replacement",
+            NormalizedDefaultTargetPath = "/replacement",
+        };
+        await db.SeedAsync([Account(failed, 0), Account(replacement, 0)],
+            job: Job(batch, "TaskCount", "Paused", 1, 1), resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, failed, 1, 1), replacementAllocation]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var state = await store.LoadAsync(batch);
+
+        Assert.True(await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(operation.Id, failed, replacement)], [],
+            [new ReassignmentAllocationDelta(failed, 1, 0, -1), new ReassignmentAllocationDelta(replacement, 0, 1, 1)]),
+            state!.BatchVersion));
+
+        Assert.Equal("/override", await ScalarStringAsync(db, "SELECT TargetPath FROM TransferOperations"));
+        Assert.Equal("/override", await ScalarStringAsync(db, "SELECT NormalizedTargetPath FROM TransferOperations"));
+    }
+
+    [Fact]
+    public async Task TaskCountPreviewRejectsReplacementWithExistingReplicationOperationKey()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var sourceOperation = Operation(resource, failed, 1);
+        var existingReplacement = Operation(resource, replacement, 2, "Succeeded", "ResultReceived", "Fulfilled", "{}") with
+        {
+            OutcomeKind = "NewTransfer",
+        };
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "TaskCount", "Paused", 1, 2), resources: [resource],
+            operations: [sourceOperation, existingReplacement],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new ReassignRemainingWorkService(store);
+
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() => service.PreviewAsync(
+            new ReassignmentRequest(batch, failed,
+                new Dictionary<Guid, int> { [failed] = 0, [replacement] = 2 })));
+        var state = await store.LoadAsync(batch);
+        Assert.False(await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(sourceOperation.Id, failed, replacement)], [],
+            [new ReassignmentAllocationDelta(failed, 1, 0, -1), new ReassignmentAllocationDelta(replacement, 1, 2, 1)]),
+            state!.BatchVersion));
+        Assert.Equal(failed, await ScalarGuidAsync(db,
+            "SELECT AssignedAccountId FROM TransferOperations WHERE Id=$id", sourceOperation.Id));
+    }
+
+    [Fact]
+    public async Task SuccessTargetPreviewRejectsReplacementWithExistingFailedOperationKey()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = failed };
+        var sourceOperation = Operation(resource, failed, 1);
+        var existingReplacement = Operation(resource, replacement, 2, "Failed", "ResultReceived", "Released", "{}") with
+        {
+            OutcomeKind = "Failed",
+        };
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "SuccessTarget", "Paused", 1, 2), resources: [resource],
+            operations: [sourceOperation, existingReplacement],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 0)]);
+        var service = new ReassignRemainingWorkService(new SqliteTransferSchedulingStore(db.ConnectionFactory));
+
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() => service.PreviewAsync(
+            new ReassignmentRequest(batch, failed,
+                new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 })));
     }
 
     [Fact]
@@ -299,7 +820,7 @@ public sealed class SqliteSchedulingStoreTests
     }
 
     [Fact]
-    public async Task GlobalSlotCountIncludesPendingWorkOutsideCurrentActiveBatch()
+    public async Task GlobalNetworkCountExcludesResultPendingButIncludesSubmittingAcrossBatches()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var activeBatch = Guid.NewGuid();
@@ -324,8 +845,8 @@ public sealed class SqliteSchedulingStoreTests
         var state = await store.GetStateAsync();
         var result = await store.TryReserveNextAsync(activeBatch, Now, Now.AddMinutes(5));
 
-        Assert.Equal(2, state.ActiveSlotCount);
-        Assert.Null(result);
+        Assert.Equal(1, state.ActiveNetworkOperationCount);
+        Assert.Equal(c, result?.AccountId);
     }
 
     [Fact]
@@ -388,12 +909,119 @@ public sealed class SqliteSchedulingStoreTests
         Assert.False(applied);
     }
 
+    [Fact]
+    public async Task AccountHealthChangeInvalidatesReassignmentPreviewVersion()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, failed, 1);
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "TaskCount", "Paused", 1, 1), resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 0)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var previewState = await store.LoadAsync(batch);
+        await ExecuteAsync(db, "UPDATE Accounts SET IsEnabled=0 WHERE Id=$id;", ("$id", replacement.ToString("D")));
+
+        var applied = await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(operation.Id, failed, replacement)], [],
+            [new ReassignmentAllocationDelta(failed, 1, 0, -1), new ReassignmentAllocationDelta(replacement, 0, 1, 1)]),
+            previewState!.BatchVersion);
+
+        Assert.False(applied);
+        Assert.Equal(failed, await ScalarGuidAsync(db, "SELECT AssignedAccountId FROM TransferOperations", null));
+    }
+
+    [Fact]
+    public async Task OperationBecomingLockedInvalidatesReassignmentPreviewAndCannotMove()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, failed, 1);
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "TaskCount", "Paused", 1, 1), resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 0)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var previewState = await store.LoadAsync(batch);
+        await ExecuteAsync(db, "UPDATE TransferOperations SET AllocationSource='Locked' WHERE Id=$id;",
+            ("$id", operation.Id.ToString("D")));
+
+        var applied = await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(operation.Id, failed, replacement)], [],
+            [new ReassignmentAllocationDelta(failed, 1, 0, -1), new ReassignmentAllocationDelta(replacement, 0, 1, 1)]),
+            previewState!.BatchVersion);
+
+        Assert.False(applied);
+        Assert.Equal(failed, await ScalarGuidAsync(db, "SELECT AssignedAccountId FROM TransferOperations", null));
+    }
+
+    [Fact]
+    public async Task SuccessTargetReassignmentMovesPausedPublicReservationAtomicallyAndReusesOperation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = failed };
+        var operation = Operation(resource, failed, 1);
+        var replacementAllocation = Allocation(batch, replacement, 2, 0) with
+        {
+            DefaultTargetPath = "/replacement",
+            NormalizedDefaultTargetPath = "/replacement",
+        };
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "SuccessTarget", "Paused", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, failed, 1, 1), replacementAllocation]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new ReassignRemainingWorkService(store);
+        var preview = await service.PreviewAsync(new ReassignmentRequest(batch, failed,
+            new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 }));
+
+        await service.ApplyAsync(preview, preview.ConfirmationToken);
+
+        Assert.Equal(replacement, await ScalarGuidAsync(db, "SELECT AssignedAccountId FROM TransferOperations", null));
+        Assert.Equal(replacement, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems", null));
+        Assert.Equal("/replacement", await ScalarStringAsync(db, "SELECT TargetPath FROM TransferOperations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT AssignedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT AssignedItemCount FROM AccountAllocations WHERE AccountId='" + replacement.ToString("D") + "'"));
+        await ExecuteAsync(db, "UPDATE BatchJobs SET Status='Active' WHERE Id=$id;", ("$id", batch.ToString("D")));
+        var resumed = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+        Assert.Equal(operation.Id, resumed?.OperationId);
+        Assert.Equal(replacement, resumed?.AccountId);
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+    }
+
+    [Fact]
+    public async Task SuccessTargetReassignmentCannotDropPausedExclusiveReservationBelowRetainedTarget()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resource = Resource(batch, 1, failed, "Reserved") with { ReservedAccountId = failed };
+        var operation = Operation(resource, failed, 1) with { AllocationSource = "Exclusive" };
+        await db.SeedAsync([Account(failed, 0) with { Status = "Invalid" }, Account(replacement, 0)],
+            job: Job(batch, "SuccessTarget", "Paused", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, replacement, 2, 0)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new ReassignRemainingWorkService(store);
+
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() => service.PreviewAsync(
+            new ReassignmentRequest(batch, failed,
+                new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 })));
+    }
+
     [Theory]
-    [InlineData("ExpiredLogin", "The account session has expired.")]
-    [InlineData("VerificationRequired", "Account verification is required.")]
     [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
     [InlineData("InvalidTargetPath", "The target path is invalid.")]
-    public async Task AccountFailurePausesOnlyThatAccountAndAllowsAnotherAccountToContinue(string code, string message)
+    public async Task DefinitePreSubmissionAccountFailureStopsOnlyThatAccountAndAllowsAnotherToContinue(string code, string message)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var batch = Guid.NewGuid();
@@ -421,6 +1049,43 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts WHERE Id='" + failed.ToString("D") + "'"));
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM AccountAllocations WHERE ReservedSlotCount<0"));
         Assert.Equal(healthy, next?.AccountId);
+    }
+
+    [Theory]
+    [InlineData("ExpiredLogin", "The account session has expired.")]
+    [InlineData("VerificationRequired", "Account verification is required.")]
+    public async Task PreSubmissionSessionPauseResumesSameOperationWithoutDuplicate(string code, string message)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null);
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [resource],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var first = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+        Assert.NotNull(first);
+        await store.MarkPreparingAsync(first.OperationId, Now.AddSeconds(1));
+
+        await store.PauseAccountBeforeSubmissionAsync(first.OperationId, code, message, Now.AddSeconds(2));
+
+        Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal("Waiting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Unoccupied", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(account, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+
+        await ExecuteAsync(db, "UPDATE Accounts SET Status='Active' WHERE Id=$id;", ("$id", account.ToString("D")));
+        var resumed = await store.TryReserveNextAsync(batch, Now.AddMinutes(1), Now.AddMinutes(6));
+
+        Assert.Equal(first.OperationId, resumed?.OperationId);
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
     }
 
     [Theory]
@@ -498,6 +1163,55 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + healthy.ToString("D") + "'"));
+    }
+
+    [Fact]
+    public async Task DynamicAllocationSkipsExistingFailedKeyForRestoredAccountAndUsesAnotherAccount()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var restored = Guid.NewGuid();
+        var healthy = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Unused");
+        var failed = Operation(resource, restored, 1, "Failed", "ResultReceived", "Released", "{}") with
+        {
+            OutcomeKind = "Failed",
+        };
+        await db.SeedAsync([Account(restored, 0), Account(healthy, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1, 1) with { ShortagePolicy = "AccountPriority" },
+            resources: [resource], operations: [failed],
+            allocations: [Allocation(batch, restored, 1, 1), Allocation(batch, healthy, 2, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        var reserved = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+
+        Assert.Equal(healthy, reserved?.AccountId);
+        Assert.Equal(2L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
+    }
+
+    [Fact]
+    public async Task DefiniteNonGlobalOperationFailureDoesNotLeaveSuccessCandidateReservedForever()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null);
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [resource],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var operation = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+        Assert.NotNull(operation);
+
+        await store.MarkFailedAsync(operation.OperationId,
+            "TransientService", "The service is temporarily unavailable.", globallyInvalid: false, Now.AddSeconds(1));
+
+        Assert.Equal("Expanded", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM ResourceItems WHERE ReservedAccountId IS NOT NULL"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(BatchExhaustionOutcome.CompletedWithShortfall,
+            await store.TryFinalizeExhaustedBatchAsync(batch, Now.AddSeconds(2)));
     }
 
     [Fact]
@@ -604,5 +1318,13 @@ public sealed class SqliteSchedulingStoreTests
         await using var command = connection.CreateCommand(); command.CommandText = sql;
         foreach (var value in values) command.Parameters.AddWithValue(value.Name, value.Value ?? DBNull.Value);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string> ExplainDetailsAsync(SqliteCommand command)
+    {
+        var details = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) details.Add(reader.GetString(3));
+        return string.Join(Environment.NewLine, details);
     }
 }

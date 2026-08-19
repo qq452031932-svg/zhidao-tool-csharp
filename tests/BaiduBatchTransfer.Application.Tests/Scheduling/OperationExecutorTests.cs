@@ -146,7 +146,8 @@ public sealed class OperationExecutorTests
         {
             SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(
                 BaiduErrorKind.InsufficientCapacity,
-                "private response"),
+                "private response",
+                submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted),
         };
 
         await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
@@ -157,6 +158,63 @@ public sealed class OperationExecutorTests
         Assert.False(store.ResultPending);
         Assert.Equal(1, adapter.SaveCalls);
         Assert.Null(store.FailureCode);
+    }
+
+    [Fact]
+    public async Task AccountFailureWithoutDefiniteRejectionAfterSubmitRemainsResultPending()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(
+                BaiduErrorKind.ExpiredLogin,
+                "private ambiguous response"),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.ResultPending);
+        Assert.False(store.AccountPaused);
+        Assert.Equal("ExpiredLogin", store.FailureCode);
+        Assert.Equal(SubmissionAcceptance.Unknown, store.PendingAcceptance);
+        Assert.Equal(1, adapter.SaveCalls);
+    }
+
+    [Fact]
+    public async Task SaveTimeoutAfterSubmissionBoundaryBecomesResultPendingWithoutCrashingWorker()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            SaveException = new TimeoutException("private endpoint timeout"),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.ResultPending);
+        Assert.Equal("UnknownResponse", store.FailureCode);
+        Assert.Equal("The service returned an unrecognized response.", store.FailureMessage);
+        Assert.Equal(SubmissionAcceptance.Unknown, store.PendingAcceptance);
+    }
+
+    [Fact]
+    public async Task CancellationDuringSavePersistsUnknownResultBeforePropagatingCancellation()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            SaveException = new OperationCanceledException("private cancellation"),
+        };
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            Executor(store, adapter).ExecuteAsync(snapshot.OperationId));
+
+        Assert.True(store.ResultPending);
+        Assert.Equal("UnknownResponse", store.FailureCode);
+        Assert.Equal(SubmissionAcceptance.Unknown, store.PendingAcceptance);
     }
 
     [Fact]
@@ -233,8 +291,8 @@ public sealed class OperationExecutorTests
 
     [Theory]
     [InlineData(BaiduErrorKind.ExpiredLogin)]
-    [InlineData(BaiduErrorKind.InsufficientCapacity)]
-    public async Task AccountScopedFailurePausesAccountWithoutConsumingRemainingWork(BaiduErrorKind errorKind)
+    [InlineData(BaiduErrorKind.VerificationRequired)]
+    public async Task PreSubmissionSessionFailurePausesAccountAndKeepsOperationRetryable(BaiduErrorKind errorKind)
     {
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot);
@@ -247,9 +305,31 @@ public sealed class OperationExecutorTests
         await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
 
         Assert.True(store.AccountPaused);
+        Assert.True(store.PreSubmissionPaused);
+        Assert.False(store.DefiniteAccountFailure);
         Assert.Equal(errorKind.ToString(), store.AccountPauseCode);
         Assert.Equal(1, adapter.EnsureCalls);
         Assert.Null(store.FailureCode);
+        Assert.Equal(0, adapter.SaveCalls);
+    }
+
+    [Fact]
+    public async Task PreSubmissionCapacityFailureIsDefinitiveAndNotRetried()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            EnsureResults = new Queue<BaiduAdapterResult<RemoteDirectory>>(
+                [BaiduAdapterResult<RemoteDirectory>.Failure(BaiduErrorKind.InsufficientCapacity, "private")]),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.AccountPaused);
+        Assert.True(store.DefiniteAccountFailure);
+        Assert.False(store.PreSubmissionPaused);
+        Assert.Equal(1, adapter.EnsureCalls);
         Assert.Equal(0, adapter.SaveCalls);
     }
 
@@ -319,6 +399,9 @@ public sealed class OperationExecutorTests
         public bool Succeeded { get; private set; }
         public bool ResultPending { get; private set; }
         public bool AccountPaused { get; private set; }
+        public bool PreSubmissionPaused { get; private set; }
+        public bool DefiniteAccountFailure { get; private set; }
+        public SubmissionAcceptance? PendingAcceptance { get; private set; }
         public string? AccountPauseCode { get; private set; }
         public string? AccountPauseMessage { get; private set; }
 
@@ -369,18 +452,30 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, SubmissionAcceptance submissionAcceptance, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
             ResultPending = true;
+            PendingAcceptance = submissionAcceptance;
             FailureCode = code;
             FailureMessage = safeMessage;
             Events.Add((++order, "ResultPending"));
             return Task.CompletedTask;
         }
 
+        public Task PauseAccountBeforeSubmissionAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+        {
+            AccountPaused = true;
+            PreSubmissionPaused = true;
+            AccountPauseCode = code;
+            AccountPauseMessage = safeMessage;
+            Events.Add((++order, "AccountPausedBeforeSubmission"));
+            return Task.CompletedTask;
+        }
+
         public Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
             AccountPaused = true;
+            DefiniteAccountFailure = true;
             AccountPauseCode = code;
             AccountPauseMessage = safeMessage;
             Events.Add((++order, "AccountPaused"));
@@ -392,6 +487,7 @@ public sealed class OperationExecutorTests
     {
         public Queue<BaiduAdapterResult<RemoteDirectory>> EnsureResults { get; init; } = [];
         public Exception? EnsureException { get; init; }
+        public Exception? SaveException { get; init; }
         public BaiduAdapterResult<TransferReceipt> SaveResult { get; init; } = BaiduAdapterResult<TransferReceipt>.Success(
             new TransferReceipt(Now, "request-1", ["remote-1"]));
         public RemotePath? EnsuredPath { get; private set; }
@@ -415,6 +511,7 @@ public sealed class OperationExecutorTests
             SavedDestination = destination;
             Events.Add((3, "Save"));
             timeline?.Add("Save");
+            if (SaveException is not null) throw SaveException;
             return Task.FromResult(SaveResult);
         }
 

@@ -1,11 +1,10 @@
-using System.Reflection;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class DatabaseMigrator
 {
-    private const int LatestVersion = 1;
+    internal const int LatestVersion = 2;
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseBackupService backupService;
     private readonly DatabaseIntegrityService integrityService;
@@ -53,13 +52,7 @@ public sealed class DatabaseMigrator
 
     private async Task ApplyMigrationAsync(int version, CancellationToken cancellationToken)
     {
-        var prefix = $"Database.Migrations.{version:000}_";
-        var assembly = typeof(DatabaseMigrator).Assembly;
-        var resource = assembly.GetManifestResourceNames().SingleOrDefault(x =>
-            x.Contains(prefix, StringComparison.Ordinal) && x.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException($"Missing migration resource with prefix {prefix}.");
-        await using var stream = assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException($"Cannot read {resource}.");
-        using var reader = new StreamReader(stream); var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+        var sql = ReadMigrationSql(version);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -75,5 +68,17 @@ public sealed class DatabaseMigrator
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
+    }
+
+    internal static string ReadMigrationSql(int version)
+    {
+        var prefix = $"Database.Migrations.{version:000}_";
+        var assembly = typeof(DatabaseMigrator).Assembly;
+        var resource = assembly.GetManifestResourceNames().SingleOrDefault(x =>
+            x.Contains(prefix, StringComparison.Ordinal) && x.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"Missing migration resource with prefix {prefix}.");
+        using var stream = assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException($"Cannot read {resource}.");
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
     }
 }

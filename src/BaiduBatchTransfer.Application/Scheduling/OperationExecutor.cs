@@ -41,6 +41,13 @@ public interface IOperationExecutionStore
         Guid operationId,
         string code,
         string safeMessage,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default);
+    Task PauseAccountBeforeSubmissionAsync(
+        Guid operationId,
+        string code,
+        string safeMessage,
         DateTimeOffset now,
         CancellationToken cancellationToken = default);
     Task MarkDefiniteAccountFailureAsync(
@@ -116,7 +123,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             .ConfigureAwait(false);
         if (session is null)
         {
-            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.ExpiredLogin, cancellationToken)
+            await PauseAccountBeforeSubmissionAsync(snapshot.OperationId, BaiduErrorKind.ExpiredLogin, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -148,7 +155,9 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         if (!directoryResult.IsSuccess)
         {
             var error = directoryResult.ErrorKind!.Value;
-            if (IsAccountPausingFailure(error))
+            if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+                await PauseAccountBeforeSubmissionAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
+            else if (IsAccountPausingFailure(error))
                 await FailAndPauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
             else
                 await FailAsync(snapshot.OperationId, error, false, cancellationToken).ConfigureAwait(false);
@@ -173,28 +182,43 @@ public sealed class OperationExecutor : ITransferOperationExecutor
 
         // There is deliberately no blind retry beyond this point. A transport error may hide
         // a completed remote transfer and therefore must be reconciled instead of resubmitted.
-        var saveResult = await adapter.SaveWholeShareAsync(
-            session,
-            snapshot.Share,
-            directoryResult.Value!,
-            snapshot.DuplicatePolicy,
-            cancellationToken).ConfigureAwait(false);
+        BaiduAdapterResult<TransferReceipt> saveResult;
+        try
+        {
+            saveResult = await adapter.SaveWholeShareAsync(
+                session,
+                snapshot.Share,
+                directoryResult.Value!,
+                snapshot.DuplicatePolicy,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await MarkUnknownSubmissionResultAsync(snapshot.OperationId).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception)
+        {
+            await MarkUnknownSubmissionResultAsync(snapshot.OperationId).ConfigureAwait(false);
+            return;
+        }
         now = timeProvider.GetUtcNow();
         if (!saveResult.IsSuccess)
         {
             var errorKind = saveResult.ErrorKind!.Value;
-            if (IsAccountPausingFailure(errorKind))
-            {
-                await FailAndPauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
-            }
-            else if (errorKind is BaiduErrorKind.TransientService or BaiduErrorKind.UnknownResponse)
+            if (saveResult.SubmissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
             {
                 await store.MarkResultPendingAsync(
                     snapshot.OperationId,
                     errorKind.ToString(),
                     saveResult.SafeMessage!,
+                    saveResult.SubmissionAcceptance,
                     now,
                     cancellationToken).ConfigureAwait(false);
+            }
+            else if (IsAccountPausingFailure(errorKind))
+            {
+                await FailAndPauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -262,6 +286,32 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             safe.SafeMessage!,
             timeProvider.GetUtcNow(),
             cancellationToken);
+    }
+
+    private Task PauseAccountBeforeSubmissionAsync(
+        Guid operationId,
+        BaiduErrorKind errorKind,
+        CancellationToken cancellationToken)
+    {
+        var safe = BaiduAdapterResult.Failure(errorKind, null);
+        return store.PauseAccountBeforeSubmissionAsync(
+            operationId,
+            errorKind.ToString(),
+            safe.SafeMessage!,
+            timeProvider.GetUtcNow(),
+            cancellationToken);
+    }
+
+    private Task MarkUnknownSubmissionResultAsync(Guid operationId)
+    {
+        var failure = BaiduAdapterResult.Failure(BaiduErrorKind.UnknownResponse, null);
+        return store.MarkResultPendingAsync(
+            operationId,
+            BaiduErrorKind.UnknownResponse.ToString(),
+            failure.SafeMessage!,
+            SubmissionAcceptance.Unknown,
+            timeProvider.GetUtcNow(),
+            CancellationToken.None);
     }
 
     private static bool IsAccountPausingFailure(BaiduErrorKind errorKind) =>

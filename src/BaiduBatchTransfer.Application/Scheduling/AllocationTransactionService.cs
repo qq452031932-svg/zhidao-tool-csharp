@@ -2,7 +2,7 @@ namespace BaiduBatchTransfer.Application.Scheduling;
 
 public sealed record CoordinatorState(
     IReadOnlyList<Guid> ActiveBatchIds,
-    int ActiveSlotCount,
+    int ActiveNetworkOperationCount,
     IReadOnlyCollection<Guid> BusyAccountIds);
 
 public sealed record ScheduledOperation(
@@ -12,6 +12,19 @@ public sealed record ScheduledOperation(
     long AllocationOrdinal,
     string AllocationSource);
 
+public enum BatchExhaustionOutcome
+{
+    NotExhausted,
+    TemporarilyBlocked,
+    AwaitingCandidates,
+    Completed,
+    CompletedWithShortfall,
+}
+
+public sealed record LeaseRecoveryResult(
+    int RetryableOperationCount,
+    int ResultPendingOperationCount);
+
 public interface IAllocationTransactionStore
 {
     Task<CoordinatorState> GetStateAsync(CancellationToken cancellationToken = default);
@@ -20,6 +33,13 @@ public interface IAllocationTransactionStore
         Guid batchId,
         DateTimeOffset reservedAt,
         DateTimeOffset leaseExpiresAt,
+        CancellationToken cancellationToken = default);
+    Task<BatchExhaustionOutcome> TryFinalizeExhaustedBatchAsync(
+        Guid batchId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default);
+    Task<LeaseRecoveryResult> RecoverExpiredLeasesAsync(
+        DateTimeOffset now,
         CancellationToken cancellationToken = default);
 }
 
@@ -53,6 +73,38 @@ public sealed class AllocationTransactionService
             var now = timeProvider.GetUtcNow();
             return await store.TryReserveNextAsync(
                 batchId, now, now.Add(DefaultLease), cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            serialAllocation.Release();
+        }
+    }
+
+    public async Task<BatchExhaustionOutcome> TryFinalizeExhaustedBatchAsync(
+        Guid batchId,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchId == Guid.Empty) throw new ArgumentException("A batch ID is required.", nameof(batchId));
+        await serialAllocation.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await store.TryFinalizeExhaustedBatchAsync(
+                batchId, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            serialAllocation.Release();
+        }
+    }
+
+    public async Task<LeaseRecoveryResult> RecoverExpiredLeasesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await serialAllocation.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await store.RecoverExpiredLeasesAsync(
+                timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
         }
         finally
         {

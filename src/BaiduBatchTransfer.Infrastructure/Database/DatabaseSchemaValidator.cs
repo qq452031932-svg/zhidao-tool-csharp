@@ -50,31 +50,41 @@ public sealed partial class DatabaseSchemaValidator
             catch (SqliteException) { errors.Add("SchemaVersions has an invalid shape."); }
         }
         if (expectedVersion == 0) return new(errors.Count == 0, errors);
-        if (expectedVersion != 1) return new(false, [.. errors, "Unsupported schema version."]);
+        if (expectedVersion is < 1 or > DatabaseMigrator.LatestVersion)
+            return new(false, [.. errors, "Unsupported schema version."]);
 
-        var expected = LoadExpectedV1();
+        var expected = await LoadExpectedSchemaAsync(expectedVersion, cancellationToken).ConfigureAwait(false);
         foreach (var (name, sql) in expected)
         {
             if (!actual.TryGetValue(name, out var actualSql)) errors.Add($"Required schema object {name} is missing.");
-            else if (!string.Equals(sql, actualSql, StringComparison.Ordinal)) errors.Add($"Schema object {name} does not match the v1 fingerprint.");
+            else if (!string.Equals(sql, actualSql, StringComparison.Ordinal)) errors.Add($"Schema object {name} does not match the v{expectedVersion} fingerprint.");
         }
         foreach (var name in actual.Keys.Except(expected.Keys, StringComparer.OrdinalIgnoreCase))
             errors.Add($"Unexpected schema object {name} is present.");
         return new(errors.Count == 0, errors);
     }
 
-    private static IReadOnlyDictionary<string, string> LoadExpectedV1()
+    private static async Task<IReadOnlyDictionary<string, string>> LoadExpectedSchemaAsync(
+        int expectedVersion,
+        CancellationToken cancellationToken)
     {
-        var assembly = typeof(DatabaseSchemaValidator).Assembly;
-        var resource = assembly.GetManifestResourceNames().Single(x =>
-            x.Contains("Database.Migrations.001_", StringComparison.Ordinal) && x.EndsWith(".sql", StringComparison.OrdinalIgnoreCase));
-        using var stream = assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException("Missing v1 migration.");
-        using var reader = new StreamReader(stream); var text = reader.ReadToEnd();
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var statement in text.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        await using var expectedConnection = new SqliteConnection("Data Source=:memory:");
+        await expectedConnection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        for (var version = 1; version <= expectedVersion; version++)
         {
-            var match = CreateObject().Match(statement);
-            if (match.Success) result[match.Groups[1].Value] = Normalize(statement);
+            await using var migration = expectedConnection.CreateCommand();
+            migration.CommandText = DatabaseMigrator.ReadMigrationSql(version);
+            await migration.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        await using var command = expectedConnection.CreateCommand();
+        command.CommandText = "SELECT name,sql FROM sqlite_master WHERE type IN ('table','index','view','trigger') AND sql IS NOT NULL;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var name = reader.GetString(0);
+            if (!name.StartsWith("sqlite_", StringComparison.OrdinalIgnoreCase))
+                result[name] = Normalize(reader.GetString(1));
         }
         return result;
     }
@@ -125,8 +135,6 @@ public sealed partial class DatabaseSchemaValidator
         return output.ToString();
     }
 
-    [GeneratedRegex("(?i)^CREATE\\s+(?:UNIQUE\\s+)?(?:TABLE|INDEX)\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?([A-Za-z0-9_]+)")]
-    private static partial Regex CreateObject();
     [GeneratedRegex("(?i)^(CREATE\\s+(?:UNIQUE\\s+)?(?:TABLE|INDEX)\\s+)IF\\s+NOT\\s+EXISTS\\s+")]
     private static partial Regex IfNotExists();
     [GeneratedRegex("\\s+")]
