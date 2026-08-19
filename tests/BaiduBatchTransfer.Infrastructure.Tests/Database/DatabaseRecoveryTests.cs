@@ -191,6 +191,52 @@ public sealed class DatabaseRecoveryTests : IDisposable
         static string Read(ZipArchiveEntry entry) { using var reader = new StreamReader(entry.Open()); return reader.ReadToEnd(); }
     }
 
+    [Fact]
+    public async Task DiagnosticZipOmitsEveryFreeFormLogMessageAndExportsOnlyStructuralFields()
+    {
+        Directory.CreateDirectory(root);
+        var messages = new[]
+        {
+            "plain-unknown-secret-marker",
+            "prefix mysteryCredential=opaque-future-value suffix",
+            "{\"unknownFutureKey\":{\"nested\":[\"nested-secret-one\",\"nested-secret-two\"]}}",
+            "truncated-json:{\"arbitrary\":\"truncated-secret",
+            "pwd_without_known_delimiter arbitrary-password",
+            "code-prefixed-but-novel::future-code-value"
+        };
+        var logs = messages.Select((message, index) =>
+            new DiagnosticLogEntry("Transfer", "Warning", $"E{index + 1}", message)).ToArray();
+        var service = new DiagnosticExportService(Path.Combine(root, "diagnostics"));
+
+        var path = await service.CreateAsync(new DiagnosticExportRequest(
+            "1.0", 1, ["ok", "integrity-secret-marker"], logs,
+            new Dictionary<string, string> { ["os"] = "Windows", ["unknownMetadata"] = "metadata-secret-marker" }));
+
+        using var zip = ZipFile.OpenRead(path);
+        var contents = string.Join('\n', zip.Entries.Select(Read));
+        foreach (var message in messages)
+            Assert.DoesNotContain(message, contents, StringComparison.Ordinal);
+        Assert.DoesNotContain("metadata-secret-marker", contents, StringComparison.Ordinal);
+        Assert.DoesNotContain("integrity-secret-marker", contents, StringComparison.Ordinal);
+
+        using var logsJson = JsonDocument.Parse(Read(zip.GetEntry("logs.json")!));
+        var exportedLogs = logsJson.RootElement.EnumerateArray().ToArray();
+        Assert.Equal(messages.Length, exportedLogs.Length);
+        for (var index = 0; index < exportedLogs.Length; index++)
+        {
+            var fields = exportedLogs[index].EnumerateObject().Select(x => x.Name).Order().ToArray();
+            Assert.Equal(new[] { "EventCode", "Level", "MessageOmitted", "Sequence", "Stage" }, fields);
+            Assert.Equal(index + 1, exportedLogs[index].GetProperty("Sequence").GetInt32());
+            Assert.True(exportedLogs[index].GetProperty("MessageOmitted").GetBoolean());
+        }
+
+        using var metadataJson = JsonDocument.Parse(Read(zip.GetEntry("metadata.json")!));
+        var metadataFields = metadataJson.RootElement.EnumerateObject().Select(x => x.Name).ToArray();
+        Assert.Equal(new[] { "os" }, metadataFields);
+
+        static string Read(ZipArchiveEntry entry) { using var reader = new StreamReader(entry.Open()); return reader.ReadToEnd(); }
+    }
+
     private async Task<(SqliteConnectionFactory Factory, DatabaseBackupService Backup, DatabaseMigrator Migrator)> CreateDatabaseAsync()
     {
         Directory.CreateDirectory(root);
