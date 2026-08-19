@@ -56,6 +56,34 @@ public sealed class RepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task NormalizedIdentityQueriesNeverReturnExcludedRows()
+    {
+        var factory = await CreateFactoryAsync();
+        var session = ImportSessionRecord.Create(Guid.NewGuid(), "Text", "paste");
+        var rows = new[]
+        {
+            StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 1, "url-1", "Excluded") with { NormalizedShareId = "shared", Note = "keep-first" },
+            StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 2, "url-2", "Ready") with { NormalizedShareId = "shared" },
+            StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 3, "url-3", "Excluded") with { NormalizedShareId = "shared", Note = "keep-later" },
+            StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 4, "url-4", "Duplicate") with { NormalizedShareId = "shared" },
+            StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 5, "url-5", "Excluded") with { NormalizedShareId = "excluded-only" },
+        };
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Imports.AddSessionAsync(session);
+            await unit.Imports.AddRowsAsync(rows);
+            await unit.CommitAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(factory);
+        Assert.Equal(rows[1].Id, (await read.Imports.GetFirstByNormalizedShareIdAsync(session.Id, "shared"))!.Id);
+        Assert.Equal(
+            new[] { rows[3].Id },
+            (await read.Imports.GetRowsByNormalizedShareIdAfterSourceRowAsync(session.Id, "shared", 2, 10)).Select(row => row.Id));
+        Assert.Null(await read.Imports.GetFirstByNormalizedShareIdAsync(session.Id, "excluded-only"));
+    }
+
+    [Fact]
     public async Task RepositoryOperationsHonorPreCancelledToken()
     {
         var factory = await CreateFactoryAsync();

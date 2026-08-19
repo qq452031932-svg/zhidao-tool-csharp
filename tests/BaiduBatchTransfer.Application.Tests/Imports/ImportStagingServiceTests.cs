@@ -189,6 +189,87 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task RetryPreservesExcludedEarliestRowAndChoosesNextNonExcludedPrimary()
+    {
+        var unavailable = BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+        var resolved = BaiduAdapterResult<ResolvedShareLink>.Success(
+            new ResolvedShareLink("https://pan.baidu.com/s/shared", "shared"));
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver(unavailable, resolved), chunkSize: 1);
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/s/shared", "a1b2", "/keep", "outer", "account", accountId, "keep-note"),
+                new ImportSourceRow(2, "https://pan.baidu.com/scl/fi/later", TargetPath: "/later")));
+        var excluded = ExcludeRow(store, 0, "user excluded earliest");
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+
+        Assert.Equal(excluded, store.Rows[0]);
+        Assert.Equal("Ready", store.Rows[1].Disposition);
+        Assert.Equal(1, store.Session!.ReadyRows);
+        Assert.Equal(1, store.Session.ExcludedRows);
+    }
+
+    [Fact]
+    public async Task RetryPreservesExcludedLaterRowAndItsUserFields()
+    {
+        var unavailable = BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+        var resolved = BaiduAdapterResult<ResolvedShareLink>.Success(
+            new ResolvedShareLink("https://pan.baidu.com/s/shared", "shared"));
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver(unavailable, resolved), chunkSize: 1);
+        var sessionId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/s/shared", TargetPath: "/same"),
+                new ImportSourceRow(2, "https://pan.baidu.com/s/shared", "c0de", "/same", "keep-folder", "keep-account", Note: "keep-later-note"),
+                new ImportSourceRow(3, "https://pan.baidu.com/scl/fi/trigger", TargetPath: "/same")));
+        var excluded = ExcludeRow(store, 1, "user excluded later");
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+
+        Assert.Equal(excluded, store.Rows[1]);
+        Assert.Equal("Duplicate", store.Rows[2].Disposition);
+        Assert.Equal(1, store.Session!.ReadyRows);
+        Assert.Equal(1, store.Session.DuplicateRows);
+        Assert.Equal(1, store.Session.ExcludedRows);
+    }
+
+    [Fact]
+    public async Task RetryNeverReactivatesAnExistingGroupWhoseEveryRowIsExcluded()
+    {
+        var unavailable = BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+        var resolved = BaiduAdapterResult<ResolvedShareLink>.Success(
+            new ResolvedShareLink("https://pan.baidu.com/s/shared", "shared"));
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver(unavailable, resolved), chunkSize: 1);
+        var sessionId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/s/shared", Note: "excluded-one"),
+                new ImportSourceRow(2, "https://pan.baidu.com/s/shared", Note: "excluded-two"),
+                new ImportSourceRow(3, "https://pan.baidu.com/scl/fi/trigger")));
+        var first = ExcludeRow(store, 0, "user excluded one");
+        var second = ExcludeRow(store, 1, "user excluded two");
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+
+        Assert.Equal(first, store.Rows[0]);
+        Assert.Equal(second, store.Rows[1]);
+        Assert.Equal("Ready", store.Rows[2].Disposition);
+        Assert.Equal(1, store.Session!.ReadyRows);
+        Assert.Equal(2, store.Session.ExcludedRows);
+    }
+
+    [Fact]
     public async Task RetryReleasesReadUnitOfWorkBeforeWaitingForResolverNetwork()
     {
         var store = new ImportStore();
@@ -346,6 +427,26 @@ public sealed class ImportStagingServiceTests
         }
     }
 
+    private static StagedImportRowRecord ExcludeRow(ImportStore store, int index, string reason)
+    {
+        var excluded = store.Rows[index] with
+        {
+            Disposition = "Excluded",
+            DuplicateOfStagedRowId = null,
+            ValidationMessage = reason,
+            UpdatedAt = store.Rows[index].UpdatedAt.AddTicks(1),
+        };
+        store.Rows[index] = excluded;
+        store.Session = store.Session! with
+        {
+            ReadyRows = store.Rows.Count(row => row.Disposition == "Ready"),
+            InvalidRows = store.Rows.Count(row => row.Disposition is "Invalid" or "Conflict"),
+            DuplicateRows = store.Rows.Count(row => row.Disposition == "Duplicate"),
+            ExcludedRows = store.Rows.Count(row => row.Disposition == "Excluded"),
+        };
+        return excluded;
+    }
+
     private sealed class SequenceResolver(params BaiduAdapterResult<ResolvedShareLink>[] results) : IShareLinkResolver
     {
         private readonly Queue<BaiduAdapterResult<ResolvedShareLink>> results = new(results);
@@ -463,7 +564,7 @@ public sealed class ImportStagingServiceTests
 
             public Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(Guid sessionId, string normalizedShareId, CancellationToken cancellationToken = default) =>
                 Task.FromResult(store.Rows.FirstOrDefault(row =>
-                    row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId));
+                    row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId && row.Disposition != "Excluded"));
 
             public Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default) =>
                 Task.FromResult(store.Rows.FirstOrDefault(row => row.Id == rowId));
@@ -494,7 +595,7 @@ public sealed class ImportStagingServiceTests
                 int pageSize,
                 CancellationToken cancellationToken = default) =>
                 Task.FromResult<IReadOnlyList<StagedImportRowRecord>>(store.Rows
-                    .Where(row => row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId && row.SourceRowNumber > afterSourceRowNumber)
+                    .Where(row => row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId && row.Disposition != "Excluded" && row.SourceRowNumber > afterSourceRowNumber)
                     .OrderBy(row => row.SourceRowNumber)
                     .Take(pageSize)
                     .ToArray());

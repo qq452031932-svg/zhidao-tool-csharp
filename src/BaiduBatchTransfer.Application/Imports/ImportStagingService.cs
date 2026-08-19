@@ -192,8 +192,8 @@ public sealed class ImportStagingService
         var primary = await repository.GetFirstByNormalizedShareIdAsync(
             sessionId,
             normalizedShareId,
-            cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException("A normalized staging group has no primary row.");
+            cancellationToken).ConfigureAwait(false);
+        if (primary is null || primary.Disposition == "Excluded") return;
         var readyPrimary = primary with
         {
             Disposition = "Ready",
@@ -221,6 +221,7 @@ public sealed class ImportStagingService
             afterSourceRowNumber = page[^1].SourceRowNumber;
             foreach (var later in page)
             {
+                if (later.Disposition == "Excluded") continue;
                 var classification = conflicts.Classify(transferMode, primary, later);
                 var desired = classification.Kind switch
                 {
