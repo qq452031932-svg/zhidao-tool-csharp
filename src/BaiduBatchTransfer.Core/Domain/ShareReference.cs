@@ -23,4 +23,7 @@ public sealed record ShareReference
     public string OriginalUrl { get; }
 
     public string? ExtractionCode { get; }
+
+    public override string ToString() =>
+        "ShareReference { StableShareId = [REDACTED], OriginalUrl = [REDACTED], ExtractionCode = [REDACTED] }";
 }

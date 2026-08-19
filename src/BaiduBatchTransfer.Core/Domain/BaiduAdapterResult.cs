@@ -2,26 +2,8 @@ namespace BaiduBatchTransfer.Core.Domain;
 
 public static class BaiduAdapterResult
 {
-    public const string SensitiveDetailsRemovedMessage = "Sensitive details were removed.";
-    public const string UnavailableSafeMessage = "The operation could not be completed.";
-
-    private static readonly string[] UnsafeMessageMarkers =
-    [
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "bduss",
-        "stoken",
-        "ptoken",
-        "token",
-        "bearer",
-        "sessionid",
-        "secret"
-    ];
-
-    public static BaiduAdapterResult<object> Failure(BaiduErrorKind errorKind, string? safeMessage) =>
-        BaiduAdapterResult<object>.Failure(errorKind, safeMessage);
+    public static BaiduAdapterResult<object> Failure(BaiduErrorKind errorKind, string? adapterDiagnostic) =>
+        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic);
 
     internal static BaiduErrorScope GetScope(BaiduErrorKind errorKind) => errorKind switch
     {
@@ -39,24 +21,18 @@ public static class BaiduAdapterResult
         _ => throw new ArgumentOutOfRangeException(nameof(errorKind), errorKind, "Unknown adapter error kind.")
     };
 
-    internal static string SanitizeMessage(string? safeMessage)
+    internal static string GetSafeMessage(BaiduErrorKind errorKind) => errorKind switch
     {
-        if (string.IsNullOrWhiteSpace(safeMessage))
-        {
-            return UnavailableSafeMessage;
-        }
-
-        var trimmedMessage = safeMessage.Trim();
-        foreach (var marker in UnsafeMessageMarkers)
-        {
-            if (trimmedMessage.Contains(marker, StringComparison.OrdinalIgnoreCase))
-            {
-                return SensitiveDetailsRemovedMessage;
-            }
-        }
-
-        return trimmedMessage;
-    }
+        BaiduErrorKind.InvalidLink => "The share link is invalid.",
+        BaiduErrorKind.InvalidExtractionCode => "The extraction code is invalid.",
+        BaiduErrorKind.ExpiredLogin => "The account session has expired.",
+        BaiduErrorKind.VerificationRequired => "Account verification is required.",
+        BaiduErrorKind.InsufficientCapacity => "The account has insufficient capacity.",
+        BaiduErrorKind.InvalidTargetPath => "The target path is invalid.",
+        BaiduErrorKind.TransientService => "The service is temporarily unavailable.",
+        BaiduErrorKind.UnknownResponse => "The service returned an unrecognized response.",
+        _ => throw new ArgumentOutOfRangeException(nameof(errorKind), errorKind, "Unknown adapter error kind.")
+    };
 }
 
 public sealed class BaiduAdapterResult<T>
@@ -91,14 +67,16 @@ public sealed class BaiduAdapterResult<T>
         return new BaiduAdapterResult<T>(true, value, null, null, null);
     }
 
-    public static BaiduAdapterResult<T> Failure(BaiduErrorKind errorKind, string? safeMessage)
+    public static BaiduAdapterResult<T> Failure(BaiduErrorKind errorKind, string? adapterDiagnostic)
     {
+        // Diagnostics may contain credentials and are deliberately excluded from the public result.
+        _ = adapterDiagnostic;
         var scope = BaiduAdapterResult.GetScope(errorKind);
         return new BaiduAdapterResult<T>(
             false,
             default,
             errorKind,
             scope,
-            BaiduAdapterResult.SanitizeMessage(safeMessage));
+            BaiduAdapterResult.GetSafeMessage(errorKind));
     }
 }

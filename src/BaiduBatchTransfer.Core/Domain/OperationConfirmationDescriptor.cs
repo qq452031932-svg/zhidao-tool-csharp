@@ -1,6 +1,6 @@
 namespace BaiduBatchTransfer.Core.Domain;
 
-public sealed class OperationConfirmationDescriptor
+public sealed class OperationConfirmationDescriptor : IEquatable<OperationConfirmationDescriptor>
 {
     public OperationConfirmationDescriptor(
         string sourceShareId,
@@ -47,6 +47,21 @@ public sealed class OperationConfirmationDescriptor
     public string? AdapterRequestId { get; }
 
     public IReadOnlyList<string> RemoteItemIds { get; }
+
+    public bool Equals(OperationConfirmationDescriptor? other) =>
+        other is not null && ToQuery().Equals(other.ToQuery());
+
+    public override bool Equals(object? obj) => Equals(obj as OperationConfirmationDescriptor);
+
+    public override int GetHashCode() => ToQuery().GetHashCode();
+
+    public static bool operator ==(
+        OperationConfirmationDescriptor? left,
+        OperationConfirmationDescriptor? right) => object.Equals(left, right);
+
+    public static bool operator !=(
+        OperationConfirmationDescriptor? left,
+        OperationConfirmationDescriptor? right) => !object.Equals(left, right);
 
     public OperationConfirmationDescriptor WithResponseIdentifiers(
         string? adapterRequestId,

@@ -31,4 +31,7 @@ public sealed record ShareMetadata
     public long TotalBytes { get; }
 
     public string OuterNameFingerprint { get; }
+
+    public override string ToString() =>
+        $"ShareMetadata {{ Share = [REDACTED], OuterName = [REDACTED], ItemCount = {ItemCount}, TotalBytes = {TotalBytes}, OuterNameFingerprint = [REDACTED] }}";
 }

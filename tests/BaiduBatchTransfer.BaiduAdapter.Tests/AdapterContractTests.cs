@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using System.Collections.Immutable;
 
 namespace BaiduBatchTransfer.BaiduAdapter.Tests;
 
@@ -23,11 +24,38 @@ public sealed class AdapterContractTests
             BaiduErrorKind.UnknownResponse,
             "Cookie: BDUSS=secret; Authorization: Bearer private-token");
 
-        Assert.Equal(BaiduAdapterResult.SensitiveDetailsRemovedMessage, result.SafeMessage);
+        Assert.Equal("The service returned an unrecognized response.", result.SafeMessage);
         Assert.DoesNotContain("Cookie", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("BDUSS", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Authorization", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("X-Baidu-Signature: opaque-signature-value")]
+    [InlineData("sign=opaque-sign-value")]
+    [InlineData("csrf=opaque-csrf-value")]
+    [InlineData("opaque-sensitive-value")]
+    public void Failure_NeverPublishesRawAdapterDiagnostics(string rawDiagnostic)
+    {
+        var result = BaiduAdapterResult<object>.Failure(
+            BaiduErrorKind.UnknownResponse,
+            rawDiagnostic);
+
+        Assert.Equal("The service returned an unrecognized response.", result.SafeMessage);
+        Assert.DoesNotContain(rawDiagnostic, result.SafeMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Failure_UsesCanonicalPublicMessagesForEveryErrorKind()
+    {
+        foreach (var errorKind in Enum.GetValues<BaiduErrorKind>())
+        {
+            var result = BaiduAdapterResult<object>.Failure(errorKind, "raw adapter diagnostic");
+
+            Assert.False(string.IsNullOrWhiteSpace(result.SafeMessage));
+            Assert.DoesNotContain("raw adapter diagnostic", result.SafeMessage, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -58,7 +86,7 @@ public sealed class AdapterContractTests
         Assert.Null(result.Value);
         Assert.Equal(BaiduErrorKind.ExpiredLogin, result.ErrorKind);
         Assert.Equal(BaiduErrorScope.Account, result.Scope);
-        Assert.Equal("Please sign in again.", result.SafeMessage);
+        Assert.Equal("The account session has expired.", result.SafeMessage);
     }
 
     [Fact]
@@ -90,6 +118,107 @@ public sealed class AdapterContractTests
         Assert.Equal(rebuilt, enriched.ToQuery());
         Assert.Equal(rebuilt.GetHashCode(), enriched.ToQuery().GetHashCode());
         Assert.Equal("/batch/2026", rebuilt.TargetPath.Value);
+    }
+
+    [Fact]
+    public void SensitiveDomainValues_HaveExplicitlyRedactedStringRepresentations()
+    {
+        const string shareId = "fake-share-id-secret";
+        const string extractionCode = "fake-extraction-code-secret";
+        const string fullUrl = "https://pan.baidu.com/s/fake-url-secret";
+        const string userId = "fake-full-user-id-secret";
+        const string displayName = "fake-display-name-secret";
+        const string outerName = "fake-outer-name-secret";
+        const string fingerprint = "fake-fingerprint-secret";
+        var share = new ShareReference(shareId, fullUrl, extractionCode);
+        var identity = new BaiduAccountIdentity(userId, displayName);
+        var resolved = new ResolvedShareLink(fullUrl, shareId);
+        var metadata = new ShareMetadata(share, outerName, 1, 25, fingerprint);
+
+        AssertRedacted(share.ToString(), shareId, extractionCode, fullUrl);
+        AssertRedacted(identity.ToString(), userId, displayName);
+        AssertRedacted(resolved.ToString(), shareId, fullUrl);
+        AssertRedacted(metadata.ToString(), shareId, extractionCode, fullUrl, outerName, fingerprint);
+    }
+
+    [Fact]
+    public void DirectoryListing_UsesAnImmutableSnapshot()
+    {
+        var source = new List<RemoteDirectory>
+        {
+            new("directory-1", new RemotePath("/batch/2026"))
+        };
+        BaiduAdapterResult<ImmutableArray<RemoteDirectory>> result =
+            BaiduAdapterResult<ImmutableArray<RemoteDirectory>>.Success(source.ToImmutableArray());
+
+        source.Clear();
+
+        Assert.True(result.IsSuccess);
+        Assert.Single(result.Value);
+        Assert.IsType<ImmutableArray<RemoteDirectory>>(result.Value);
+    }
+
+    [Fact]
+    public void TransferReceipt_ReconstructsWithStructuralValueEquality()
+    {
+        var submittedAt = new DateTimeOffset(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
+        var first = new TransferReceipt(submittedAt, "request-42", ["remote-2", "remote-1"]);
+        var rebuilt = new TransferReceipt(submittedAt, "request-42", ["remote-1", "remote-2"]);
+
+        Assert.Equal(first, rebuilt);
+        Assert.Equal(first.GetHashCode(), rebuilt.GetHashCode());
+    }
+
+    [Fact]
+    public void ConfirmationDescriptor_ReconstructsWithStructuralValueEquality()
+    {
+        var start = new DateTimeOffset(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
+        var first = new OperationConfirmationDescriptor(
+            "share-identity",
+            new RemotePath("/batch/2026"),
+            "outer-name-fingerprint",
+            "operation-fingerprint",
+            start,
+            start.AddMinutes(2),
+            "request-42",
+            ["remote-2", "remote-1"]);
+        var rebuilt = new OperationConfirmationDescriptor(
+            "share-identity",
+            new RemotePath("//batch//2026/"),
+            "outer-name-fingerprint",
+            "operation-fingerprint",
+            start,
+            start.AddMinutes(2),
+            "request-42",
+            ["remote-1", "remote-2"]);
+
+        Assert.Equal(first, rebuilt);
+        Assert.Equal(first.GetHashCode(), rebuilt.GetHashCode());
+    }
+
+    [Fact]
+    public void ConfirmationDescriptor_RejectsImpossibleWindowsAndIdentifierReplacement()
+    {
+        var start = new DateTimeOffset(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
+        Assert.Throws<ArgumentException>(() => new OperationConfirmationDescriptor(
+            "share-identity",
+            new RemotePath("/batch/2026"),
+            "outer-name-fingerprint",
+            "operation-fingerprint",
+            start,
+            start.AddSeconds(-1)));
+
+        var descriptor = new OperationConfirmationDescriptor(
+            "share-identity",
+            new RemotePath("/batch/2026"),
+            "outer-name-fingerprint",
+            "operation-fingerprint",
+            start,
+            start.AddMinutes(2),
+            "request-42");
+
+        Assert.Throws<InvalidOperationException>(() =>
+            descriptor.WithResponseIdentifiers("different-request", []));
     }
 
     [Fact]
@@ -136,6 +265,15 @@ public sealed class AdapterContractTests
         new Dictionary<string, string> { ["BDUSS"] = "secret" },
         new DateTimeOffset(2026, 8, 19, 9, 0, 0, TimeSpan.Zero));
 
+    private static void AssertRedacted(string rendered, params string[] secrets)
+    {
+        Assert.Contains("[REDACTED]", rendered, StringComparison.Ordinal);
+        foreach (var secret in secrets)
+        {
+            Assert.DoesNotContain(secret, rendered, StringComparison.Ordinal);
+        }
+    }
+
     private sealed class ContractAdapter : IBaiduNetdiskAdapter
     {
         public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(
@@ -150,11 +288,11 @@ public sealed class AdapterContractTests
             Task.FromResult(BaiduAdapterResult<AccountCapacity>.Success(
                 new AccountCapacity(100, 25)));
 
-        public Task<BaiduAdapterResult<IReadOnlyList<RemoteDirectory>>> ListDirectoriesAsync(
+        public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(
             AccountSession session,
             RemotePath path,
             CancellationToken cancellationToken) =>
-            Task.FromResult(BaiduAdapterResult<IReadOnlyList<RemoteDirectory>>.Success([]));
+            Task.FromResult(BaiduAdapterResult<ImmutableArray<RemoteDirectory>>.Success([]));
 
         public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(
             AccountSession session,

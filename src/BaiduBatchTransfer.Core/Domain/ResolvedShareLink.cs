@@ -20,4 +20,7 @@ public sealed record ResolvedShareLink
     public string FinalUrl { get; }
 
     public string StableShareId { get; }
+
+    public override string ToString() =>
+        "ResolvedShareLink { FinalUrl = [REDACTED], StableShareId = [REDACTED] }";
 }

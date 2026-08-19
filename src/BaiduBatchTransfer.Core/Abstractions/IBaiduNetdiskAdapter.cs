@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Domain;
+using System.Collections.Immutable;
 
 namespace BaiduBatchTransfer.Core.Abstractions;
 
@@ -12,7 +13,7 @@ public interface IBaiduNetdiskAdapter
         AccountSession session,
         CancellationToken cancellationToken);
 
-    Task<BaiduAdapterResult<IReadOnlyList<RemoteDirectory>>> ListDirectoriesAsync(
+    Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(
         AccountSession session,
         RemotePath path,
         CancellationToken cancellationToken);

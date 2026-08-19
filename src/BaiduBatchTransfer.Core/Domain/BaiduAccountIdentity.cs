@@ -12,6 +12,9 @@ public sealed record BaiduAccountIdentity
 
     public string DisplayName { get; }
 
+    public override string ToString() =>
+        "BaiduAccountIdentity { UserId = [REDACTED], DisplayName = [REDACTED] }";
+
     private static string RequireText(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
