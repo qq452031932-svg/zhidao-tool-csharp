@@ -16,4 +16,8 @@
     <ProjectReference Include="..\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Database\Migrations\*.sql" />
+  </ItemGroup>
+
 </Project>
