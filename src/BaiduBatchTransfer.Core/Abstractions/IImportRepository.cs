@@ -29,12 +29,18 @@ public interface IImportRepository
     Task<KeysetPage<StagedImportRowRecord>> GetRowsKeysetPageAsync(
         StagedImportKeysetQuery query,
         CancellationToken cancellationToken = default);
-    Task<IReadOnlyList<string>> GetNormalizedShareIdsPageAsync(
+    Task<IReadOnlyList<string>> GetDuplicateNormalizedShareIdsPageAsync(
         Guid sessionId,
         string? afterNormalizedShareId,
         int pageSize,
         CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("Normalized identity paging is not supported by this repository.");
+        throw new NotSupportedException("Duplicate identity paging is not supported by this repository.");
+    Task<KeysetPage<StagedImportRowRecord>> GetNonDuplicateClassifiableRowsKeysetPageAsync(
+        Guid sessionId,
+        long afterSourceRowNumber,
+        int pageSize,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Non-duplicate staging row paging is not supported by this repository.");
     Task<Page<RequestedAccountNameGroupRecord>> GetRequestedAccountNameGroupsPageAsync(
         Guid sessionId,
         PageQuery query,
@@ -44,8 +50,4 @@ public interface IImportRepository
         Guid sessionId,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Disposition aggregation is not supported by this repository.");
-    Task<bool> HasDuplicateNormalizedShareIdsAsync(
-        Guid sessionId,
-        CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException("Duplicate identity probing is not supported by this repository.");
 }

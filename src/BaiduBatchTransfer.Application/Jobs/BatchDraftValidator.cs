@@ -108,7 +108,7 @@ public sealed class BatchDraftValidator
             confirmations,
             operationCount,
             immediateOperationCount,
-            BatchConfirmationTokens.ForCreate(draft, session, rows, operationCount, confirmations));
+            BatchConfirmationTokens.ForCreate(draft, session, rows, operationCount, confirmations, rules));
     }
 
     internal static async Task ValidateSessionCountersAsync(
@@ -295,7 +295,8 @@ internal static class BatchConfirmationTokens
         ImportSessionRecord session,
         IReadOnlyList<ValidatedStagedRow> rows,
         long operationCount,
-        IEnumerable<BatchAccountConfirmation> accounts) =>
+        IEnumerable<BatchAccountConfirmation> accounts,
+        IEnumerable<AccountRule> rules) =>
         Hash(string.Join('|', new[]
         {
             "create-v1", draft.BatchJobId.ToString("N"), session.Id.ToString("N"), session.UpdatedAt.ToString("O"),
@@ -308,6 +309,7 @@ internal static class BatchConfirmationTokens
             operationCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
             HashRows(rows),
             string.Join(';', accounts.Select(account => $"{account.AccountId:N}:{account.PriorityOrder}:{account.TargetItemCount}:{account.TargetSuccessCount}:{Hash(account.NormalizedDefaultTargetPath)}")),
+            HashRules(rules),
         }));
 
     public static string ForAppend(
@@ -350,6 +352,20 @@ internal static class BatchConfirmationTokens
             Append(hash, item.Row.Note);
             Append(hash, item.Row.PrecheckStatus);
             Append(hash, item.Row.PrecheckErrorCode);
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static string HashRules(IEnumerable<AccountRule> rules)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var rule in rules.OrderBy(rule => rule.AccountId).ThenBy(rule => rule.Id))
+        {
+            Append(hash, rule.Id.ToString("N"));
+            Append(hash, rule.AccountId.ToString("N"));
+            Append(hash, rule.DirectoryPrefix);
+            Append(hash, rule.Priority.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, rule.IsEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
         return Convert.ToHexString(hash.GetHashAndReset());
     }

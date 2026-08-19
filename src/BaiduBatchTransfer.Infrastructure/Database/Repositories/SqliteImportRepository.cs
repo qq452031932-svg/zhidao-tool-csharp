@@ -167,7 +167,7 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         return new(items, total, hasMore ? items[^1].SourceRowNumber : null);
     }
 
-    public async Task<IReadOnlyList<string>> GetNormalizedShareIdsPageAsync(
+    public async Task<IReadOnlyList<string>> GetDuplicateNormalizedShareIdsPageAsync(
         Guid sessionId,
         string? afterNormalizedShareId,
         int pageSize,
@@ -179,9 +179,10 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             SELECT NormalizedShareId
             FROM StagedImportRows
             WHERE ImportSessionId=$session AND NormalizedShareId IS NOT NULL
-              AND Disposition<>'Excluded'
+              AND Disposition IN ('Ready','Duplicate','Conflict')
               AND ($after IS NULL OR NormalizedShareId>$after)
             GROUP BY NormalizedShareId
+            HAVING COUNT(*)>1
             ORDER BY NormalizedShareId
             LIMIT $limit;
             """);
@@ -192,6 +193,44 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add(reader.GetString(0));
         return values;
+    }
+
+    public async Task<KeysetPage<StagedImportRowRecord>> GetNonDuplicateClassifiableRowsKeysetPageAsync(
+        Guid sessionId,
+        long afterSourceRowNumber,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        if (sessionId == Guid.Empty) throw new ArgumentException("An import session is required.", nameof(sessionId));
+        if (afterSourceRowNumber < 0) throw new ArgumentOutOfRangeException(nameof(afterSourceRowNumber));
+        if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var command = Command("""
+            SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,
+              CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,
+              ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt
+            FROM StagedImportRows AS row
+            WHERE row.ImportSessionId=$session
+              AND row.SourceRowNumber>$after
+              AND row.NormalizedShareId IS NOT NULL
+              AND row.Disposition IN ('Ready','Duplicate','Conflict')
+              AND NOT EXISTS (
+                SELECT 1 FROM StagedImportRows AS other
+                WHERE other.ImportSessionId=row.ImportSessionId
+                  AND other.NormalizedShareId=row.NormalizedShareId
+                  AND other.Disposition IN ('Ready','Duplicate','Conflict')
+                  AND other.Id<>row.Id
+              )
+            ORDER BY row.SourceRowNumber,row.Id
+            LIMIT $limit;
+            """);
+        Add(command, "$session", Id(sessionId)); Add(command, "$after", afterSourceRowNumber);
+        Add(command, "$limit", checked(pageSize + 1));
+        var items = new List<StagedImportRowRecord>(pageSize + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(ReadRow(reader));
+        var hasMore = items.Count > pageSize;
+        if (hasMore) items.RemoveAt(items.Count - 1);
+        return new(items, null, hasMore ? items[^1].SourceRowNumber : null);
     }
 
     public async Task<Page<RequestedAccountNameGroupRecord>> GetRequestedAccountNameGroupsPageAsync(
@@ -244,22 +283,6 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         static int Value(SqliteDataReader reader, int index) => reader.IsDBNull(index) ? 0 : reader.GetInt32(index);
         return new(Value(reader, 0), Value(reader, 1), Value(reader, 2), Value(reader, 3),
             Value(reader, 4), Value(reader, 5), Value(reader, 6));
-    }
-
-    public async Task<bool> HasDuplicateNormalizedShareIdsAsync(
-        Guid sessionId,
-        CancellationToken cancellationToken = default)
-    {
-        await using var command = Command("""
-            SELECT EXISTS(
-              SELECT 1 FROM StagedImportRows
-              WHERE ImportSessionId=$session AND NormalizedShareId IS NOT NULL
-                AND Disposition IN ('Ready','Duplicate','Conflict')
-              GROUP BY NormalizedShareId HAVING COUNT(*)>1 LIMIT 1
-            );
-            """);
-        Add(command, "$session", Id(sessionId));
-        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 0;
     }
 
     private static StagedImportRowRecord ReadRow(SqliteDataReader r) => new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),r.GetInt32(2),r.GetString(3),r.IsDBNull(4)?null:r.GetString(4),r.IsDBNull(5)?null:r.GetString(5),r.IsDBNull(6)?null:r.GetString(6),r.IsDBNull(7)?null:r.GetString(7),r.IsDBNull(8)?null:r.GetString(8),ReadNullableId(r,9),r.IsDBNull(10)?null:r.GetString(10),r.GetString(11),ReadNullableId(r,12),r.IsDBNull(13)?null:r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),ReadNullableTime(r,16),ReadTime(r,17));

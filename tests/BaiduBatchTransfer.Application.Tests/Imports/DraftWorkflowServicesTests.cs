@@ -153,6 +153,27 @@ public sealed class DraftWorkflowServicesTests
     }
 
     [Fact]
+    public async Task ChangingRequestedAccountNameCannotRetainAStaleMappedAccount()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var oldAccount = Guid.NewGuid();
+        var row = Row(sessionId, 1, "one", requested: "甲", mapped: oldAccount);
+        await database.SeedAsync([Jobs.BatchTestData.Account(oldAccount, "a")], Session(sessionId, 1, ready: 1), [row]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+
+        await service.EditAsync(new DraftRowEditRequest(sessionId, row.Id, requestedAccountName: "乙"), TransferMode.Distribution);
+        await using (var read = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            Assert.Null((await read.Imports.GetRowByIdAsync(row.Id))!.MappedAccountId);
+        }
+
+        await service.ApplyBulkOverridesAsync(sessionId, new DraftBulkOverride(RequestedAccountName: "丙"), TransferMode.Distribution);
+        await using var verify = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null((await verify.Imports.GetRowByIdAsync(row.Id))!.MappedAccountId);
+    }
+
+    [Fact]
     public async Task DraftEditsInvalidatePrecheckMaintainCountersAndResolveConflictPrimary()
     {
         await using var database = await Jobs.BatchTestDatabase.CreateAsync();
@@ -238,6 +259,31 @@ public sealed class DraftWorkflowServicesTests
     }
 
     [Fact]
+    public async Task RestoringAPrecheckFailedExclusionClearsTheFailureForImmediateValidation()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var row = Row(sessionId, 1, "one") with
+        {
+            PrecheckStatus = "Failed",
+            PrecheckErrorCode = "INVALID",
+            PrecheckedAt = Jobs.BatchTestData.Now,
+        };
+        await database.SeedAsync([], Session(sessionId, 1, ready: 1), [row]);
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+        await service.ExcludeFailedPrechecksAsync(sessionId, TransferMode.Distribution);
+
+        await service.RestoreAsync(sessionId, row.Id, TransferMode.Distribution);
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var restored = await read.Imports.GetRowByIdAsync(row.Id);
+        Assert.Equal("Ready", restored!.Disposition);
+        Assert.Null(restored.PrecheckStatus);
+        Assert.Null(restored.PrecheckErrorCode);
+        Assert.Null(restored.PrecheckedAt);
+    }
+
+    [Fact]
     public async Task PreviewResolvesExplicitThenDirectoryThenPublicAndBindsResolutionIntoToken()
     {
         await using var database = await Jobs.BatchTestDatabase.CreateAsync();
@@ -258,9 +304,10 @@ public sealed class DraftWorkflowServicesTests
             Row(sessionId, 3, "3") with { TargetPath = "/other" },
         };
         await database.SeedAsync(accounts, Session(sessionId, 3, ready: 3), rows);
+        var teamRuleId = Guid.NewGuid();
         await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
         {
-            await seed.Accounts.UpsertRuleAsync(new AccountRuleRecord(Guid.NewGuid(), directoryAccount, "DirectoryPrefix", "/team", 0, true));
+            await seed.Accounts.UpsertRuleAsync(new AccountRuleRecord(teamRuleId, directoryAccount, "DirectoryPrefix", "/team", 0, true));
             await seed.CommitAsync();
         }
         var service = CreateService(database);
@@ -276,9 +323,10 @@ public sealed class DraftWorkflowServicesTests
         Assert.Equal(1, preview.Accounts.Single(x => x.AccountId == directoryAccount).LockedItemCount);
         Assert.Equal(0, preview.Accounts.Single(x => x.AccountId == publicAccount).LockedItemCount);
         await using var mutate = await database.UnitOfWorkFactory.BeginAsync();
-        await mutate.Accounts.UpsertRuleAsync(new AccountRuleRecord(Guid.NewGuid(), publicAccount, "DirectoryPrefix", "/other", 0, true));
+        await mutate.Accounts.UpsertRuleAsync(new AccountRuleRecord(teamRuleId, directoryAccount, "DirectoryPrefix", "/team/", 99, true));
         await mutate.CommitAsync();
         var changed = await service.PreviewAsync(draft);
+        Assert.Equal(preview.Accounts.Select(x => x.LockedItemCount), changed.Accounts.Select(x => x.LockedItemCount));
         Assert.NotEqual(preview.ConfirmationToken, changed.ConfirmationToken);
         await Assert.ThrowsAsync<BatchConfirmationException>(() =>
             service.ConfirmAsync(draft, preview.ConfirmationToken));
@@ -338,6 +386,45 @@ public sealed class DraftWorkflowServicesTests
         Assert.Equal(200_000, groups.Items.Sum(x => x.RowCount));
         Assert.Equal(200_000, result.ReadyRows);
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(30), $"Large draft operations took {watch.Elapsed}.");
+    }
+
+    [Fact]
+    [Trait("Category", "Performance")]
+    public async Task TwoHundredThousandUniqueRowsPlusOneDuplicateDoNotDegenerateIntoPerIdentityQueries()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        await database.SeedAsync([], Session(sessionId, 200_001, ready: 200_001));
+        await using (var connection = await database.ConnectionFactory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                WITH RECURSIVE seq(n) AS (
+                  VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<200000
+                )
+                INSERT INTO StagedImportRows(
+                  Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,Disposition,UpdatedAt)
+                SELECT printf('%08x-0000-0000-0000-%012x',n,n),$session,n,
+                  'https://pan.baidu.com/s/'||n,'share-'||n,'a1b2','Ready','2026-08-19T01:02:03.0000000+00:00'
+                FROM seq;
+                INSERT INTO StagedImportRows(
+                  Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,Disposition,UpdatedAt)
+                VALUES('ffffffff-0000-0000-0000-000000000001',$session,200001,
+                  'https://pan.baidu.com/s/duplicate','share-1','a1b2','Ready','2026-08-19T01:02:03.0000000+00:00');
+                """;
+            command.Parameters.AddWithValue("$session", sessionId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var watch = Stopwatch.StartNew();
+
+        var result = await new TransferModeReclassificationService(database.UnitOfWorkFactory)
+            .SwitchAsync(sessionId, TransferMode.Distribution, timeout.Token);
+
+        watch.Stop();
+        Assert.Equal(200_000, result.ReadyRows);
+        Assert.Equal(1, result.DuplicateRows);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(15), $"Duplicate-aware reclassification took {watch.Elapsed}.");
     }
 
     private static CreateBatchService CreateService(Jobs.BatchTestDatabase database) =>

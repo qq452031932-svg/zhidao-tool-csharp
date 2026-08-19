@@ -115,7 +115,13 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
                 catch (ArgumentException) { throw new DraftWorkflowException("DRAFT_INVALID_TARGET_PATH", "目标目录格式无效。"); }
             }
             var requested = request.ClearRequestedAccount ? null : request.RequestedAccountName ?? row.RequestedAccountName;
-            var mapped = request.ClearRequestedAccount ? null : request.MappedAccountId ?? row.MappedAccountId;
+            if (request.MappedAccountId is { } requestedMapping)
+                await RequireActiveAccountAsync(unit.Accounts, requestedMapping, cancellationToken).ConfigureAwait(false);
+            var mapped = request.ClearRequestedAccount
+                ? null
+                : request.RequestedAccountName is not null
+                    ? request.MappedAccountId
+                    : request.MappedAccountId ?? row.MappedAccountId;
             var extractionCode = request.ClearExtractionCode ? null : request.ExtractionCode ?? row.ExtractionCode;
             var invalidatesPrecheck = !string.Equals(shareUrl, row.ShareUrl, StringComparison.Ordinal) ||
                 !string.Equals(extractionCode, row.ExtractionCode, StringComparison.Ordinal);
@@ -170,6 +176,9 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
             {
                 Disposition = row.NormalizedShareId is null ? "Invalid" : "Ready",
                 ValidationMessage = row.NormalizedShareId is null ? "DRAFT_INVALID_LINK" : null,
+                PrecheckStatus = null,
+                PrecheckErrorCode = null,
+                PrecheckedAt = null,
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
         }, cancellationToken);
@@ -243,6 +252,8 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
         }
         return MutateAsync(sessionId, transferMode, async (unit, session) =>
         {
+            if (overrides.MappedAccountId is { } requestedMapping)
+                await RequireActiveAccountAsync(unit.Accounts, requestedMapping, cancellationToken).ConfigureAwait(false);
             long cursor = 0;
             while (true)
             {
@@ -253,7 +264,11 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
                     TargetPath = overrides.ClearTargetPath ? null : overrides.TargetPath ?? row.TargetPath,
                     CreateFolderName = overrides.ClearCreateFolderName ? null : overrides.CreateFolderName ?? row.CreateFolderName,
                     RequestedAccountName = overrides.ClearRequestedAccount ? null : overrides.RequestedAccountName ?? row.RequestedAccountName,
-                    MappedAccountId = overrides.ClearRequestedAccount ? null : overrides.MappedAccountId ?? row.MappedAccountId,
+                    MappedAccountId = overrides.ClearRequestedAccount
+                        ? null
+                        : overrides.RequestedAccountName is not null
+                            ? overrides.MappedAccountId
+                            : overrides.MappedAccountId ?? row.MappedAccountId,
                     Note = overrides.ClearNote ? null : overrides.Note ?? row.Note,
                     UpdatedAt = DateTimeOffset.UtcNow,
                 }).ToArray();
@@ -345,5 +360,17 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
         }, cancellationToken).ConfigureAwait(false);
         return new(counts.TotalRows, counts.ReadyRows, counts.InvalidRows, counts.DuplicateRows,
             counts.ConflictRows, counts.NeedsResolutionRows, counts.ExcludedRows);
+    }
+
+    private static async Task RequireActiveAccountAsync(
+        IAccountRepository repository,
+        Guid accountId,
+        CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty)
+            throw new DraftWorkflowException("DRAFT_ACCOUNT_TARGET_UNAVAILABLE", "指定账号不可用。");
+        var account = await repository.GetByIdAsync(accountId, cancellationToken).ConfigureAwait(false);
+        if (account is null || !account.IsEnabled || account.IsDeleted || account.Status != "Active")
+            throw new DraftWorkflowException("DRAFT_ACCOUNT_TARGET_UNAVAILABLE", "指定账号不可用。");
     }
 }
