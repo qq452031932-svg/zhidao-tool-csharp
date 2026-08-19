@@ -71,6 +71,74 @@ public sealed class OpenXmlStreamingTests : IDisposable
     }
 
     [Fact]
+    public void DefaultRowPolicyUsesExcelFormatBoundaryInsteadOfBusinessSizedCap() =>
+        Assert.Equal(1_048_575, new OpenXmlImportLimits().MaxRows);
+
+    [Fact]
+    public async Task ReaderRejectsSourceRowIndexBeyondExcelFormatBoundary()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "row-boundary.xlsx");
+        WriteRowIndexWorkbook(path, 1_048_577);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.RowLimitExceeded, error.Code);
+    }
+
+    [Fact]
+    public async Task ReaderRejectsArchiveWithTooManyEntries()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "many-entries.xlsx");
+        WritePlainZip(path, 3, 16);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader(
+                new OpenXmlImportLimits(MaxArchiveEntries: 2)).ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
+    }
+
+    [Fact]
+    public async Task ReaderRejectsCumulativeUncompressedSizeWhileStreamingEntries()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "cumulative-size.xlsx");
+        WritePlainZip(path, 3, 512);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(
+                MaxPartBytes: 1_024,
+                MaxArchiveEntries: 10,
+                MaxTotalUncompressedBytes: 1_000)).ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
+    }
+
+    [Fact]
+    public async Task StreamedEntryValidationRejectsActualContentBeyondDeclaredSize()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "forged-size.xlsx");
+        WritePlainZip(path, 1, 512);
+        ForgeDeclaredUncompressedSizes(path, 10);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(
+                MaxPartBytes: 1_024,
+                MaxArchiveEntries: 10,
+                MaxTotalUncompressedBytes: 1_024)).ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
+    }
+
+    [Fact]
     public async Task ReaderStreamsTwoHundredThousandRowsWithBoundedWorkingSet()
     {
         Directory.CreateDirectory(root);
@@ -112,10 +180,14 @@ public sealed class OpenXmlStreamingTests : IDisposable
         Assert.Equal(
             new[] { "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注" },
             ReadHeader(templatePath));
+        Assert.Equal(
+            new[] { "源行号", "分享链接", "状态", "账号", "目标目录", "备注", "错误" },
+            ReadHeader(resultPath));
         using var document = SpreadsheetDocument.Open(resultPath, false);
         var worksheet = document.WorkbookPart!.WorksheetParts.Single();
         using var reader = OpenXmlReader.Create(worksheet);
         Cell? dangerousCell = null;
+        Cell? noteCell = null;
         Cell? numericCell = null;
         while (reader.Read())
         {
@@ -124,6 +196,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
             if (row.RowIndex?.Value == 2)
             {
                 dangerousCell = row.Elements<Cell>().ElementAt(1);
+                noteCell = row.Elements<Cell>().ElementAt(5);
                 numericCell = row.Elements<Cell>().First();
                 break;
             }
@@ -132,6 +205,8 @@ public sealed class OpenXmlStreamingTests : IDisposable
         Assert.NotNull(dangerousCell);
         Assert.Equal(CellValues.InlineString, dangerousCell!.DataType!.Value);
         Assert.StartsWith("'", dangerousCell.InlineString!.Text!.Text, StringComparison.Ordinal);
+        Assert.Equal(CellValues.InlineString, noteCell!.DataType!.Value);
+        Assert.StartsWith("'", noteCell.InlineString!.Text!.Text, StringComparison.Ordinal);
         Assert.Equal(CellValues.Number, numericCell!.DataType!.Value);
     }
 
@@ -157,7 +232,14 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
     private static async IAsyncEnumerable<ExcelResultRow> ResultRows()
     {
-        yield return new ExcelResultRow(2, "=HYPERLINK(\"https://evil.test\")", "ready", "@account", "+path", "-error");
+        yield return new ExcelResultRow(
+            SourceRowNumber: 2,
+            ShareUrl: "=HYPERLINK(\"https://evil.test\")",
+            Disposition: "ready",
+            Account: "@account",
+            TargetPath: "+path",
+            Note: " =private-note",
+            ErrorMessage: "-error");
         await Task.Yield();
     }
 
@@ -205,6 +287,59 @@ public sealed class OpenXmlStreamingTests : IDisposable
             WriteInlineRow(sheetWriter, (uint)(index + 1), $"https://pan.baidu.com/s/id-{index}", $"note-{index}");
         sheetWriter.WriteEndElement();
         sheetWriter.WriteEndElement();
+    }
+
+    private static void WriteRowIndexWorkbook(string path, uint dataRowIndex)
+    {
+        using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var workbookPart = document.AddWorkbookPart();
+        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+        workbookPart.Workbook = new Workbook(new Sheets(new Sheet
+        {
+            Id = workbookPart.GetIdOfPart(worksheetPart),
+            SheetId = 1,
+            Name = "导入",
+        }));
+        using var writer = OpenXmlWriter.Create(worksheetPart);
+        writer.WriteStartElement(new Worksheet());
+        writer.WriteStartElement(new SheetData());
+        WriteInlineRow(writer, 1, "分享链接");
+        WriteInlineRow(writer, dataRowIndex, "https://pan.baidu.com/s/id");
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static void WritePlainZip(string path, int entryCount, int bytesPerEntry)
+    {
+        using var stream = File.Create(path);
+        using var archive = new System.IO.Compression.ZipArchive(
+            stream,
+            System.IO.Compression.ZipArchiveMode.Create);
+        for (var index = 0; index < entryCount; index++)
+        {
+            var entry = archive.CreateEntry($"part-{index}.bin", System.IO.Compression.CompressionLevel.NoCompression);
+            using var content = entry.Open();
+            content.Write(new byte[bytesPerEntry]);
+        }
+    }
+
+    private static void ForgeDeclaredUncompressedSizes(string path, uint declaredSize)
+    {
+        var bytes = File.ReadAllBytes(path);
+        var span = bytes.AsSpan();
+        for (var index = 0; index <= span.Length - sizeof(uint); index++)
+        {
+            var signature = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(span[index..]);
+            var sizeOffset = signature switch
+            {
+                0x04034b50 => index + 22,
+                0x02014b50 => index + 24,
+                _ => -1,
+            };
+            if (sizeOffset >= 0 && sizeOffset <= span.Length - sizeof(uint))
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(span[sizeOffset..], declaredSize);
+        }
+        File.WriteAllBytes(path, bytes);
     }
 
     private static void WriteInlineWorkbook(string path, string[] headers, string[][] rows)

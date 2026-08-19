@@ -39,7 +39,8 @@ public sealed class TextImportParserTests
         var rows = await ReadAllAsync(new TextImportParser().ParseAsync(new StringReader(text)));
 
         Assert.Equal(2, rows.Count);
-        Assert.All(rows, row => Assert.Equal("No supported Baidu share link was found.", row.ValidationError));
+        Assert.Equal("No supported Baidu share link was found.", rows[0].ValidationError);
+        Assert.Equal("The Baidu link is malformed or unsupported.", rows[1].ValidationError);
         Assert.All(rows, row => Assert.DoesNotContain("do-not-echo", row.ToString(), StringComparison.Ordinal));
     }
 
@@ -53,7 +54,24 @@ public sealed class TextImportParserTests
             await ReadAllAsync(
                 new TextImportParser().ParseAsync(
                     new StringReader("https://pan.baidu.com/s/id"),
-                    cancellation.Token)));
+                cancellation.Token)));
+    }
+
+    [Fact]
+    public async Task MixedValidAndMalformedBaiduLinksProduceSeparateRowsWithoutReportingOtherHosts()
+    {
+        const string text = "有效 https://pan.baidu.com/s/ok，畸形 https://pan.baidu.com/%ZZ，旧协议 http://yun.baidu.com/s/legacy，参考 https://example.com/page";
+
+        var rows = await ReadAllAsync(new TextImportParser().ParseAsync(new StringReader(text)));
+
+        Assert.Equal(3, rows.Count);
+        Assert.Equal("https://pan.baidu.com/s/ok", rows[0].ShareUrl);
+        Assert.Null(rows[0].ValidationError);
+        Assert.Equal("https://pan.baidu.com/%ZZ", rows[1].ShareUrl);
+        Assert.Equal("The Baidu link is malformed or unsupported.", rows[1].ValidationError);
+        Assert.Equal("http://yun.baidu.com/s/legacy", rows[2].ShareUrl);
+        Assert.Equal("The Baidu link is malformed or unsupported.", rows[2].ValidationError);
+        Assert.DoesNotContain(rows, row => row.ShareUrl.Contains("example.com", StringComparison.Ordinal));
     }
 
     private static async Task<List<ImportSourceRow>> ReadAllAsync(IAsyncEnumerable<ImportSourceRow> source)

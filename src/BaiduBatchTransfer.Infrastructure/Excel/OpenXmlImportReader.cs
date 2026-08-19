@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Compression;
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.Core.Abstractions;
@@ -10,11 +11,17 @@ namespace BaiduBatchTransfer.Infrastructure.Excel;
 public sealed record OpenXmlImportLimits(
     long MaxWorkbookBytes = 256L * 1024 * 1024,
     long MaxPartBytes = 128L * 1024 * 1024,
-    int MaxRows = 250_000,
+    int MaxRows = 1_048_575,
     int MaxCellsPerRow = 64,
     int MaxSharedStrings = 250_000,
     long MaxSharedStringCharacters = 64L * 1024 * 1024,
-    double MaxCompressionRatio = 1_000);
+    double MaxCompressionRatio = 1_000,
+    int MaxArchiveEntries = 2_048,
+    long MaxTotalUncompressedBytes = 512L * 1024 * 1024)
+{
+    public const int ExcelMaximumRows = 1_048_576;
+    public const int ExcelMaximumDataRows = ExcelMaximumRows - 1;
+}
 
 public enum ExcelImportErrorCode
 {
@@ -47,9 +54,11 @@ public sealed class OpenXmlImportReader
     {
         this.limits = limits ?? new OpenXmlImportLimits();
         if (this.limits.MaxWorkbookBytes <= 0 || this.limits.MaxPartBytes <= 0 ||
-            this.limits.MaxRows <= 0 || this.limits.MaxCellsPerRow <= 0 ||
+            this.limits.MaxRows <= 0 || this.limits.MaxRows > OpenXmlImportLimits.ExcelMaximumDataRows ||
+            this.limits.MaxCellsPerRow <= 0 ||
             this.limits.MaxSharedStrings <= 0 || this.limits.MaxSharedStringCharacters <= 0 ||
-            this.limits.MaxCompressionRatio <= 0)
+            this.limits.MaxCompressionRatio <= 0 || this.limits.MaxArchiveEntries <= 0 ||
+            this.limits.MaxTotalUncompressedBytes <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(limits));
         }
@@ -65,7 +74,7 @@ public sealed class OpenXmlImportReader
             throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "The workbook stream must be readable and seekable.");
         }
 
-        ValidatePackage(stream);
+        await ValidatePackageAsync(stream, cancellationToken).ConfigureAwait(false);
         stream.Position = 0;
         SpreadsheetDocument document;
         try
@@ -101,6 +110,7 @@ public sealed class OpenXmlImportReader
             using var reader = OpenXmlReader.Create(worksheetPart);
             HeaderMap? headers = null;
             var physicalRowCount = 0;
+            var dataRowCount = 0;
             var fallbackRowNumber = 0;
             while (reader.Read())
             {
@@ -114,7 +124,12 @@ public sealed class OpenXmlImportReader
                     ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet row could not be read.");
                 physicalRowCount++;
                 fallbackRowNumber++;
-                var sourceRowNumber = checked((int)(row.RowIndex?.Value ?? (uint)fallbackRowNumber));
+                var rawRowNumber = row.RowIndex?.Value ?? (uint)fallbackRowNumber;
+                if (rawRowNumber is 0 or > OpenXmlImportLimits.ExcelMaximumRows)
+                {
+                    throw new ExcelImportException(ExcelImportErrorCode.RowLimitExceeded, "A worksheet row index exceeds the Excel format boundary.");
+                }
+                var sourceRowNumber = (int)rawRowNumber;
                 var values = ReadCells(row, sharedStrings);
                 if (headers is null)
                 {
@@ -123,7 +138,8 @@ public sealed class OpenXmlImportReader
                     continue;
                 }
 
-                if (physicalRowCount - 1 > limits.MaxRows)
+                dataRowCount++;
+                if (dataRowCount > limits.MaxRows)
                 {
                     throw new ExcelImportException(ExcelImportErrorCode.RowLimitExceeded, "The workbook contains more data rows than allowed.");
                 }
@@ -149,8 +165,9 @@ public sealed class OpenXmlImportReader
         }
     }
 
-    private void ValidatePackage(Stream stream)
+    private async Task ValidatePackageAsync(Stream stream, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (stream.Length > limits.MaxWorkbookBytes)
         {
             throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook package exceeds the allowed size.");
@@ -159,15 +176,60 @@ public sealed class OpenXmlImportReader
         try
         {
             using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: true);
-            foreach (var entry in archive.Entries)
+            if (archive.Entries.Count > limits.MaxArchiveEntries)
             {
-                if (entry.Length > limits.MaxPartBytes ||
-                    (entry.Length > 1_048_576 && entry.CompressedLength == 0) ||
-                    (entry.CompressedLength > 0 && entry.Length / (double)entry.CompressedLength > limits.MaxCompressionRatio))
+                throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook package contains more entries than allowed.");
+            }
+
+            long declaredTotal = 0;
+            long streamedTotal = 0;
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                foreach (var entry in archive.Entries)
                 {
-                    throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook contains an oversized or suspiciously compressed part.");
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (entry.Length > limits.MaxPartBytes ||
+                        (entry.Length > 1_048_576 && entry.CompressedLength == 0) ||
+                        (entry.CompressedLength > 0 && entry.Length / (double)entry.CompressedLength > limits.MaxCompressionRatio))
+                    {
+                        throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook contains an oversized or suspiciously compressed part.");
+                    }
+
+                    declaredTotal = checked(declaredTotal + entry.Length);
+                    if (declaredTotal > limits.MaxTotalUncompressedBytes)
+                    {
+                        throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook package exceeds the allowed cumulative uncompressed size.");
+                    }
+
+                    await using var entryStream = entry.Open();
+                    long streamedPart = 0;
+                    int read;
+                    while ((read = await entryStream.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false)) != 0)
+                    {
+                        streamedPart = checked(streamedPart + read);
+                        streamedTotal = checked(streamedTotal + read);
+                        if (streamedPart > limits.MaxPartBytes || streamedPart > entry.Length ||
+                            streamedTotal > limits.MaxTotalUncompressedBytes)
+                        {
+                            throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook exceeded an uncompressed-size limit while its parts were read.");
+                        }
+                    }
+
+                    if (streamedPart != entry.Length)
+                    {
+                        throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "A workbook part did not match its declared uncompressed size.");
+                    }
                 }
             }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer, clearArray: true);
+            }
+        }
+        catch (OverflowException error)
+        {
+            throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "The workbook package size metadata overflowed safe limits.", error);
         }
         catch (ExcelImportException)
         {

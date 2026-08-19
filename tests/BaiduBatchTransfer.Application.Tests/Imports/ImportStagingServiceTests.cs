@@ -8,6 +8,18 @@ namespace BaiduBatchTransfer.Application.Tests.Imports;
 public sealed class ImportStagingServiceTests
 {
     [Fact]
+    public void ImportRequestToStringRedactsSourceNameAndPath()
+    {
+        var request = new ImportRequest(Guid.NewGuid(), "Excel", @"C:\private\customer-list.xlsx");
+
+        var text = request.ToString();
+
+        Assert.DoesNotContain("private", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("customer-list", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("SourceName = [REDACTED]", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CanonicalRowsAreNormalizedAndNotesDoNotChangeDuplicateIdentity()
     {
         var store = new ImportStore();
@@ -113,6 +125,32 @@ public sealed class ImportStagingServiceTests
         Assert.Equal("NeedsResolution", store.Rows[0].Disposition);
         Assert.Equal("NeedsResolution", store.Rows[1].Disposition);
         Assert.Equal("Ready", store.Rows[2].Disposition);
+    }
+
+    [Fact]
+    public async Task RetryClassifiesSamePageResolvedIdentityAsDuplicateOrConflict()
+    {
+        var unavailable = BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+        var resolved = BaiduAdapterResult<ResolvedShareLink>.Success(
+            new ResolvedShareLink("https://pan.baidu.com/s/shared", "shared"));
+        var resolver = new SequenceResolver(unavailable, unavailable, unavailable, resolved, resolved, resolved);
+        var store = new ImportStore();
+        var service = CreateService(store, resolver, chunkSize: 3);
+        var sessionId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/scl/fi/one", TargetPath: "/same"),
+                new ImportSourceRow(2, "https://pan.baidu.com/scl/fi/two", TargetPath: "/same"),
+                new ImportSourceRow(3, "https://pan.baidu.com/scl/fi/three", TargetPath: "/different")));
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+
+        Assert.Equal("Ready", store.Rows[0].Disposition);
+        Assert.Equal("Duplicate", store.Rows[1].Disposition);
+        Assert.Equal(store.Rows[0].Id, store.Rows[1].DuplicateOfStagedRowId);
+        Assert.Equal("Conflict", store.Rows[2].Disposition);
     }
 
     [Fact]

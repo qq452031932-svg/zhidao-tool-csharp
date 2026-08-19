@@ -11,6 +11,7 @@ public sealed record ExcelResultRow(
     string Disposition,
     string? Account,
     string? TargetPath,
+    string? Note,
     string? ErrorMessage)
 {
     public override string ToString() =>
@@ -19,7 +20,7 @@ public sealed record ExcelResultRow(
 
 public sealed class OpenXmlResultWriter
 {
-    private static readonly string[] Headers = ["源行号", "分享链接", "状态", "账号", "目标目录", "错误"];
+    private static readonly string[] Headers = ["源行号", "分享链接", "状态", "账号", "目标目录", "备注", "错误"];
 
     public async Task WriteAsync(
         Stream stream,
@@ -53,6 +54,7 @@ public sealed class OpenXmlResultWriter
             WriteTextCell(writer, row.Disposition);
             WriteTextCell(writer, row.Account);
             WriteTextCell(writer, row.TargetPath);
+            WriteTextCell(writer, row.Note);
             WriteTextCell(writer, row.ErrorMessage);
             writer.WriteEndElement();
         }

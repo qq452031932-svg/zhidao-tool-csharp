@@ -11,7 +11,11 @@ public sealed record ImportRequest(
     string SourceType,
     string SourceName,
     TransferMode TransferMode = TransferMode.Distribution,
-    Guid? AppendToBatchJobId = null);
+    Guid? AppendToBatchJobId = null)
+{
+    public override string ToString() =>
+        $"ImportRequest {{ SessionId = {SessionId}, SourceType = {SourceType}, SourceName = [REDACTED], TransferMode = {TransferMode}, AppendToBatchJobId = {AppendToBatchJobId} }}";
+}
 
 public sealed class ImportStagingService
 {
@@ -128,9 +132,16 @@ public sealed class ImportStagingService
             var resolved = await Task.WhenAll(page.Select(row => ReresolveAsync(row, sessionId, cancellationToken)))
                 .ConfigureAwait(false);
             var updated = new List<StagedImportRowRecord>(resolved.Length);
+            var localFirst = new Dictionary<string, StagedImportRowRecord>(StringComparer.Ordinal);
             foreach (var candidate in resolved)
             {
-                updated.Add(await ClassifyAsync(unit.Imports, candidate, sessionId, transferMode, cancellationToken)
+                updated.Add(await ClassifyAsync(
+                    unit.Imports,
+                    candidate,
+                    sessionId,
+                    transferMode,
+                    cancellationToken,
+                    localFirst)
                     .ConfigureAwait(false));
             }
 
