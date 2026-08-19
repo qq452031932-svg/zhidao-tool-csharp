@@ -2,6 +2,7 @@ using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using System.Globalization;
+using BaiduBatchTransfer.Application.Jobs;
 
 namespace BaiduBatchTransfer.Infrastructure.Excel;
 
@@ -18,7 +19,7 @@ public sealed record ExcelResultRow(
         $"ExcelResultRow {{ SourceRowNumber = {SourceRowNumber}, UserContent = [REDACTED] }}";
 }
 
-public sealed class OpenXmlResultWriter
+public sealed class OpenXmlResultWriter : IBatchResultWriter
 {
     public const int ExcelMaximumRowsPerSheet = 1_048_576;
 
@@ -81,6 +82,32 @@ public sealed class OpenXmlResultWriter
         finally
         {
             writer?.Dispose();
+        }
+    }
+
+    public Task WriteAsync(
+        Stream stream,
+        IAsyncEnumerable<BatchResultExportRow> rows,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        return WriteAsync(stream, ConvertRowsAsync(rows, cancellationToken), cancellationToken);
+    }
+
+    private static async IAsyncEnumerable<ExcelResultRow> ConvertRowsAsync(
+        IAsyncEnumerable<BatchResultExportRow> rows,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var row in rows.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            yield return new(
+                row.SourceRowNumber,
+                row.ShareUrl,
+                row.Disposition,
+                row.Account,
+                row.TargetPath,
+                row.Note,
+                row.ErrorMessage);
         }
     }
 

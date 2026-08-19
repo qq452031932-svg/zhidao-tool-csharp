@@ -219,6 +219,137 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             : null;
     }
 
+    public async Task<KeysetPage<ResourceItemRecord>> GetResourceResultsKeysetPageAsync(
+        ResourceResultKeysetQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var statusFilter = query.CandidateStatus is null ? string.Empty : " AND CandidateStatus=$candidateStatus";
+        var validityFilter = query.GlobalValidityStatus is null ? string.Empty : " AND GlobalValidityStatus=$validity";
+        var filter = statusFilter + validityFilter;
+        await using var count = Command("SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=$job" + filter + ";");
+        Add(count, "$job", Id(query.BatchJobId));
+        if (query.CandidateStatus is not null) Add(count, "$candidateStatus", query.CandidateStatus);
+        if (query.GlobalValidityStatus is not null) Add(count, "$validity", query.GlobalValidityStatus);
+        var total = Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+
+        await using var command = Command(
+            "SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt " +
+            "FROM ResourceItems WHERE BatchJobId=$job" + filter +
+            " AND CandidateSequence>$after ORDER BY CandidateSequence,Id LIMIT $limit;");
+        Add(command, "$job", Id(query.BatchJobId));
+        if (query.CandidateStatus is not null) Add(command, "$candidateStatus", query.CandidateStatus);
+        if (query.GlobalValidityStatus is not null) Add(command, "$validity", query.GlobalValidityStatus);
+        Add(command, "$after", query.AfterCandidateSequence);
+        Add(command, "$limit", checked(query.PageSize + 1));
+        var items = new List<ResourceItemRecord>(query.PageSize + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            items.Add(new(
+                Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), ReadNullableId(reader, 2),
+                reader.GetInt64(3), reader.GetString(4), reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6), reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8), reader.IsDBNull(9) ? null : reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetString(10), reader.GetString(11), reader.GetString(12),
+                ReadNullableId(reader, 13), reader.GetString(14), ReadNullableId(reader, 15),
+                ReadNullableTime(reader, 16), ReadTime(reader, 17), ReadTime(reader, 18)));
+        }
+        var hasMore = items.Count > query.PageSize;
+        if (hasMore) items.RemoveAt(items.Count - 1);
+        return new(items, total, hasMore ? items[^1].CandidateSequence : null);
+    }
+
+    public async Task<KeysetPage<OperationResultRecord>> GetOperationResultsKeysetPageAsync(
+        OperationResultKeysetQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var accountFilter = query.AccountId is null ? string.Empty : " AND o.AssignedAccountId=$account";
+        var statusFilter = query.Status is null ? string.Empty : " AND o.Status=$status";
+        var fromFilter = query.UpdatedFrom is null ? string.Empty : " AND julianday(o.UpdatedAt)>=julianday($from)";
+        var toFilter = query.UpdatedTo is null ? string.Empty : " AND julianday(o.UpdatedAt)<=julianday($to)";
+        var filter = accountFilter + statusFilter + fromFilter + toFilter;
+        var pageIndex = query.AccountId is not null
+            ? "IX_TransferOperations_Result_Account_Keyset"
+            : query.Status is not null
+                ? "IX_TransferOperations_Batch_Status_AllocationOrdinal"
+                : "IX_TransferOperations_Batch_AllocationOrdinal";
+        long? total = null;
+        if (query.IncludeTotalCount)
+        {
+            await using var count = Command("SELECT COUNT(*) FROM TransferOperations o WHERE o.BatchJobId=$job" + filter + ";");
+            BindOperationFilters(count, query);
+            total = Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        }
+
+        await using var command = Command(
+            "SELECT o.Id,o.ResourceItemId,o.BatchJobId,r.CandidateSequence,o.AllocationOrdinal,r.ShareUrl,r.Note," +
+            "o.AssignedAccountId,a.DisplayName,o.TargetPath,o.Status,o.OutcomeKind,o.LastErrorCode,o.LastErrorMessage,o.UpdatedAt " +
+            $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN Accounts a ON a.Id=o.AssignedAccountId " +
+            "WHERE o.BatchJobId=$job" + filter +
+            " AND o.AllocationOrdinal>$after ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT $limit;");
+        BindOperationFilters(command, query);
+        Add(command, "$after", query.AfterAllocationOrdinal);
+        Add(command, "$limit", checked(query.PageSize + 1));
+        var items = new List<OperationResultRecord>(query.PageSize + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            items.Add(new(
+                Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), Guid.Parse(reader.GetString(2)),
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6), Guid.Parse(reader.GetString(7)),
+                reader.GetString(8), reader.GetString(9), reader.GetString(10),
+                reader.IsDBNull(11) ? null : reader.GetString(11),
+                reader.IsDBNull(12) ? null : reader.GetString(12),
+                reader.IsDBNull(13) ? null : reader.GetString(13), ReadTime(reader, 14)));
+        }
+        var hasMore = items.Count > query.PageSize;
+        if (hasMore) items.RemoveAt(items.Count - 1);
+        return new(items, total, hasMore ? items[^1].AllocationOrdinal : null);
+    }
+
+    public async Task<BatchStatisticsRecord> GetBatchStatisticsAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        var resourceCount = await CountAsync("ResourceItems", batchJobId, cancellationToken).ConfigureAwait(false);
+        var operationCount = await CountAsync("TransferOperations", batchJobId, cancellationToken).ConfigureAwait(false);
+        await using var command = Command(
+            "SELECT al.AccountId,a.DisplayName,al.PriorityOrder," +
+            "COALESCE(SUM(CASE WHEN o.Status='Succeeded' AND o.OutcomeKind='NewTransfer' THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status='Succeeded' AND o.OutcomeKind='AlreadySatisfied' THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status IN ('Failed','Cancelled') OR o.OutcomeKind IN ('Failed','GloballyInvalid','Cancelled') THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending') THEN 1 ELSE 0 END),0) " +
+            "FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId " +
+            "LEFT JOIN TransferOperations o ON o.BatchJobId=al.BatchJobId AND o.AssignedAccountId=al.AccountId " +
+            "WHERE al.BatchJobId=$job GROUP BY al.AccountId,a.DisplayName,al.PriorityOrder " +
+            "ORDER BY al.PriorityOrder,al.AccountId;");
+        Add(command, "$job", Id(batchJobId));
+        var accounts = new List<AccountBatchStatisticsRecord>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            accounts.Add(new(
+                Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt32(2),
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6)));
+        }
+        return new(batchJobId, resourceCount, operationCount, accounts);
+    }
+
+    private static void BindOperationFilters(SqliteCommand command, OperationResultKeysetQuery query)
+    {
+        Add(command, "$job", Id(query.BatchJobId));
+        if (query.AccountId is { } accountId) Add(command, "$account", Id(accountId));
+        if (query.Status is not null) Add(command, "$status", query.Status);
+        if (query.UpdatedFrom is { } from) Add(command, "$from", Time(from.ToUniversalTime()));
+        if (query.UpdatedTo is { } to) Add(command, "$to", Time(to.ToUniversalTime()));
+    }
+
     private async Task<long> CountAsync(string table, Guid batchJobId, CancellationToken cancellationToken)
     {
         var sql = table switch { "ResourceItems" => "SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=$job;", "TransferOperations" => "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$job;", "AccountAllocations" => "SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=$job;", _ => throw new ArgumentOutOfRangeException(nameof(table)) };

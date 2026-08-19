@@ -26,4 +26,7 @@ public interface IImportRepository
         int pageSize,
         CancellationToken cancellationToken = default);
     Task<Page<StagedImportRowRecord>> GetRowsPageAsync(StagedImportRowQuery query, CancellationToken cancellationToken = default);
+    Task<KeysetPage<StagedImportRowRecord>> GetRowsKeysetPageAsync(
+        StagedImportKeysetQuery query,
+        CancellationToken cancellationToken = default);
 }

@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
+    <InternalsVisibleTo Include="BaiduBatchTransfer.Application.Tests" />
   </ItemGroup>
 
   <PropertyGroup>

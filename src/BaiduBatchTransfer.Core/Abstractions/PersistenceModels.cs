@@ -13,6 +13,99 @@ public record PageQuery(int PageNumber, int PageSize)
 
 public sealed record Page<T>(IReadOnlyList<T> Items, long TotalCount, int PageNumber, int PageSize);
 
+public sealed record KeysetPage<T>(IReadOnlyList<T> Items, long? TotalCount, long? NextCursor);
+
+public sealed record StagedImportKeysetQuery(
+    Guid ImportSessionId,
+    string? Disposition,
+    string? PrecheckStatus,
+    int PageSize,
+    long AfterSourceRowNumber = 0,
+    bool IncludeTotalCount = true)
+{
+    public void Validate()
+    {
+        if (ImportSessionId == Guid.Empty) throw new ArgumentException("An import session is required.", nameof(ImportSessionId));
+        if (PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(PageSize));
+        if (AfterSourceRowNumber < 0) throw new ArgumentOutOfRangeException(nameof(AfterSourceRowNumber));
+    }
+}
+
+public sealed record ResourceResultKeysetQuery(
+    Guid BatchJobId,
+    string? CandidateStatus,
+    string? GlobalValidityStatus,
+    int PageSize,
+    long AfterCandidateSequence = 0)
+{
+    public void Validate()
+    {
+        if (BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(BatchJobId));
+        if (PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(PageSize));
+        if (AfterCandidateSequence < 0) throw new ArgumentOutOfRangeException(nameof(AfterCandidateSequence));
+    }
+}
+
+public sealed record OperationResultKeysetQuery(
+    Guid BatchJobId,
+    Guid? AccountId,
+    string? Status,
+    DateTimeOffset? UpdatedFrom,
+    DateTimeOffset? UpdatedTo,
+    int PageSize,
+    long AfterAllocationOrdinal = 0,
+    bool IncludeTotalCount = true)
+{
+    public void Validate()
+    {
+        if (BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(BatchJobId));
+        if (AccountId == Guid.Empty) throw new ArgumentException("An account filter cannot be empty.", nameof(AccountId));
+        if (PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(PageSize));
+        if (AfterAllocationOrdinal < 0) throw new ArgumentOutOfRangeException(nameof(AfterAllocationOrdinal));
+        if (UpdatedFrom > UpdatedTo) throw new ArgumentException("The result time range is invalid.");
+    }
+}
+
+public sealed record OperationResultRecord(
+    Guid OperationId,
+    Guid ResourceItemId,
+    Guid BatchJobId,
+    long CandidateSequence,
+    long AllocationOrdinal,
+    string ShareUrl,
+    string? Note,
+    Guid AccountId,
+    string AccountDisplayName,
+    string TargetPath,
+    string Status,
+    string? OutcomeKind,
+    string? LastErrorCode,
+    string? LastErrorMessage,
+    DateTimeOffset UpdatedAt)
+{
+    public override string ToString() =>
+        $"OperationResultRecord {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, UserContent = [REDACTED] }}";
+}
+
+public sealed record AccountBatchStatisticsRecord(
+    Guid AccountId,
+    string AccountDisplayName,
+    int PriorityOrder,
+    long NewCount,
+    long ExistingCount,
+    long FailedCount,
+    long PendingCount)
+{
+    public override string ToString() =>
+        $"AccountBatchStatisticsRecord {{ AccountId = {AccountId}, PriorityOrder = {PriorityOrder}, NewCount = {NewCount}, ExistingCount = {ExistingCount}, FailedCount = {FailedCount}, PendingCount = {PendingCount}, DisplayName = [REDACTED] }}";
+}
+
+public sealed record BatchStatisticsRecord(
+    Guid BatchJobId,
+    long ResourceCount,
+    long OperationCount,
+    IReadOnlyList<AccountBatchStatisticsRecord> Accounts);
+
 public sealed record StagedImportRowQuery(Guid ImportSessionId, string? Disposition, int PageNumber, int PageSize)
     : PageQuery(PageNumber, PageSize);
 
@@ -69,7 +162,11 @@ public sealed record ResourceItemRecord(
     string NormalizedShareId, string? ExtractionCode, string? Note, string? TargetPathOverride,
     string? NormalizedTargetPathOverride, string? CreateFolderName, string FolderCreationModeOverride,
     string GlobalValidityStatus, Guid? CandidateConstraintAccountId, string CandidateStatus,
-    Guid? ReservedAccountId, DateTimeOffset? ReservationExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+    Guid? ReservedAccountId, DateTimeOffset? ReservationExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt)
+{
+    public override string ToString() =>
+        $"ResourceItemRecord {{ Id = {Id}, BatchJobId = {BatchJobId}, CandidateSequence = {CandidateSequence}, CandidateStatus = {CandidateStatus}, UserContent = [REDACTED] }}";
+}
 
 public sealed record TransferOperationRecord(
     Guid Id, Guid ResourceItemId, Guid BatchJobId, long SequenceNumber, long AllocationOrdinal,
@@ -78,7 +175,11 @@ public sealed record TransferOperationRecord(
     string? ConfirmationDescriptorJson, string? AdapterRequestId, string? RemoteItemIdsJson, string SubmitState,
     string TargetSlotState, DateTimeOffset? TargetSlotReservedAt, DateTimeOffset? DailyCountedAt,
     DateTimeOffset? SubmitStartedAt, string? LastErrorCode, string? LastErrorMessage,
-    DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+    DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt)
+{
+    public override string ToString() =>
+        $"TransferOperationRecord {{ Id = {Id}, BatchJobId = {BatchJobId}, SequenceNumber = {SequenceNumber}, AllocationOrdinal = {AllocationOrdinal}, Status = {Status}, OutcomeKind = {OutcomeKind}, UserContent = [REDACTED] }}";
+}
 
 public sealed record OperationSubmissionPreparation(
     Guid OperationId, string ConfirmationDescriptorJson, DateTimeOffset LeaseExpiresAt, DateTimeOffset UpdatedAt);

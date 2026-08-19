@@ -282,6 +282,29 @@ public sealed class OpenXmlStreamingTests : IDisposable
         Assert.InRange(count, 100, 101);
     }
 
+    [Fact]
+    public async Task CancelledResultExportLeavesAReadablePartialWorkbookThatCanBeRestarted()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var partial = new MemoryStream();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new OpenXmlResultWriter().WriteAsync(partial, CancellingResultRows(cancellation), cancellation.Token));
+
+        partial.Position = 0;
+        using (var document = SpreadsheetDocument.Open(partial, false))
+        {
+            var worksheet = document.WorkbookPart!.WorksheetParts.Single();
+            Assert.Equal(3, CountRowsAndAssertHeader(worksheet));
+        }
+
+        await using var restarted = new MemoryStream();
+        await new OpenXmlResultWriter().WriteAsync(restarted, ResultRows(3));
+        restarted.Position = 0;
+        using var complete = SpreadsheetDocument.Open(restarted, false);
+        Assert.Equal(4, CountRowsAndAssertHeader(complete.WorkbookPart!.WorksheetParts.Single()));
+    }
+
     private static async IAsyncEnumerable<ExcelResultRow> ResultRows()
     {
         yield return new ExcelResultRow(
@@ -302,6 +325,15 @@ public sealed class OpenXmlStreamingTests : IDisposable
             yield return new ExcelResultRow(index + 2, $"https://pan.baidu.com/s/{index}", "ready", null, null, null, null);
             await Task.Yield();
         }
+    }
+
+    private static async IAsyncEnumerable<ExcelResultRow> CancellingResultRows(CancellationTokenSource cancellation)
+    {
+        yield return new(2, "https://pan.baidu.com/s/1", "ready", null, null, null, null);
+        yield return new(3, "https://pan.baidu.com/s/2", "ready", null, null, null, null);
+        cancellation.Cancel();
+        await Task.Yield();
+        yield return new(4, "https://pan.baidu.com/s/3", "ready", null, null, null, null);
     }
 
     private static async Task<List<ImportSourceRow>> ReadAllAsync(IAsyncEnumerable<ImportSourceRow> source)

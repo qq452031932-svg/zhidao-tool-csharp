@@ -610,6 +610,30 @@ public sealed class ImportStagingServiceTests
                 var page = filtered.Skip(query.Offset).Take(query.PageSize).ToArray();
                 return Task.FromResult(new Page<StagedImportRowRecord>(page, filtered.Length, query.PageNumber, query.PageSize));
             }
+
+            public Task<KeysetPage<StagedImportRowRecord>> GetRowsKeysetPageAsync(
+                StagedImportKeysetQuery query,
+                CancellationToken cancellationToken = default)
+            {
+                var filtered = store.Rows
+                    .Where(row => row.ImportSessionId == query.ImportSessionId &&
+                        (query.Disposition is null || row.Disposition == query.Disposition) &&
+                        (query.PrecheckStatus is null ||
+                         (query.PrecheckStatus == "Pending" && row.PrecheckStatus is null) ||
+                         row.PrecheckStatus == query.PrecheckStatus))
+                    .OrderBy(row => row.SourceRowNumber)
+                    .ToArray();
+                var candidates = filtered
+                    .Where(row => row.SourceRowNumber > query.AfterSourceRowNumber)
+                    .Take(query.PageSize + 1)
+                    .ToList();
+                var hasMore = candidates.Count > query.PageSize;
+                if (hasMore) candidates.RemoveAt(candidates.Count - 1);
+                return Task.FromResult(new KeysetPage<StagedImportRowRecord>(
+                    candidates,
+                    filtered.LongLength,
+                    hasMore ? candidates[^1].SourceRowNumber : null));
+            }
         }
     }
 }

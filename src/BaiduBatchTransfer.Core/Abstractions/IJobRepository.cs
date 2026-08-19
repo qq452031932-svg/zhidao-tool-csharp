@@ -16,4 +16,13 @@ public interface IJobRepository
     Task<Page<AccountAllocationRecord>> GetAllocationsPageAsync(Guid batchJobId, PageQuery query, CancellationToken cancellationToken = default);
     Task WriteAuditAsync(AuditEventRecord audit, CancellationToken cancellationToken = default);
     Task<ExecutionLogRecord?> GetExecutionLogAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<KeysetPage<ResourceItemRecord>> GetResourceResultsKeysetPageAsync(
+        ResourceResultKeysetQuery query,
+        CancellationToken cancellationToken = default);
+    Task<KeysetPage<OperationResultRecord>> GetOperationResultsKeysetPageAsync(
+        OperationResultKeysetQuery query,
+        CancellationToken cancellationToken = default);
+    Task<BatchStatisticsRecord> GetBatchStatisticsAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default);
 }

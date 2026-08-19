@@ -21,7 +21,7 @@ public abstract class SqliteRepositoryBase
     protected static void Add(SqliteCommand command, string name, object? value) => command.Parameters.AddWithValue(name, value ?? DBNull.Value);
     protected static string Id(Guid value) => value.ToString("D");
     protected static object NullableId(Guid? value) => value is null ? DBNull.Value : Id(value.Value);
-    protected static string Time(DateTimeOffset value) => value.ToString("O");
+    protected static string Time(DateTimeOffset value) => value.ToUniversalTime().ToString("O");
     protected static object NullableTime(DateTimeOffset? value) => value is null ? DBNull.Value : Time(value.Value);
     protected static DateTimeOffset ReadTime(SqliteDataReader reader, int ordinal) => DateTimeOffset.Parse(reader.GetString(ordinal), System.Globalization.CultureInfo.InvariantCulture);
     protected static DateTimeOffset? ReadNullableTime(SqliteDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : ReadTime(reader, ordinal);
