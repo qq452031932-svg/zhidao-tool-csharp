@@ -29,4 +29,23 @@ public interface IImportRepository
     Task<KeysetPage<StagedImportRowRecord>> GetRowsKeysetPageAsync(
         StagedImportKeysetQuery query,
         CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<string>> GetNormalizedShareIdsPageAsync(
+        Guid sessionId,
+        string? afterNormalizedShareId,
+        int pageSize,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Normalized identity paging is not supported by this repository.");
+    Task<Page<RequestedAccountNameGroupRecord>> GetRequestedAccountNameGroupsPageAsync(
+        Guid sessionId,
+        PageQuery query,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Requested-account aggregation is not supported by this repository.");
+    Task<ImportDispositionCounts> GetDispositionCountsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Disposition aggregation is not supported by this repository.");
+    Task<bool> HasDuplicateNormalizedShareIdsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Duplicate identity probing is not supported by this repository.");
 }
