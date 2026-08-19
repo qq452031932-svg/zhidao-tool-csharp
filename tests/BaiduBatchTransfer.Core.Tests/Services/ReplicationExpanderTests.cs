@@ -32,5 +32,40 @@ public sealed class ReplicationExpanderTests
         Assert.Throws<OverflowException>(() => ReplicationExpander.EstimateIntentCount(long.MaxValue, 2));
     }
 
+    [Fact]
+    public void CallTimeSnapshot_IsUnaffectedByLaterCallerMutation()
+    {
+        var originalResource = new ReplicationResource(Id(10), 1);
+        var originalAccount = Id(1);
+        var resources = new List<ReplicationResource> { originalResource };
+        var accounts = new List<Guid> { originalAccount };
+
+        var expansion = new ReplicationExpander().Expand(resources, accounts);
+        resources.Clear();
+        resources.Add(new ReplicationResource(Id(20), 2));
+        accounts[0] = Id(2);
+
+        var intent = Assert.Single(expansion);
+        Assert.Equal(originalResource.ResourceId, intent.ResourceId);
+        Assert.Equal(originalAccount, intent.AccountId);
+    }
+
+    [Fact]
+    public void InvalidAccounts_AreRejectedBeforeResourceEnumeration()
+    {
+        var exception = Assert.Throws<ArgumentException>(() =>
+            new ReplicationExpander().Expand(ThrowingResources(), Array.Empty<Guid>()));
+
+        Assert.Equal("selectedAccountIds", exception.ParamName);
+    }
+
+    private static IEnumerable<ReplicationResource> ThrowingResources()
+    {
+        throw new InvalidOperationException("Resources must not be enumerated.");
+#pragma warning disable CS0162
+        yield break;
+#pragma warning restore CS0162
+    }
+
     private static Guid Id(int value) => Guid.Parse($"00000000-0000-0000-0000-{value:D12}");
 }

@@ -96,6 +96,111 @@ public sealed class ShortageSimulatorTests
         Assert.Equal(ShortageSimulationStatus.AwaitingCandidates, result.Status);
     }
 
+    [Fact]
+    public void TwoHundredThousandCandidates_ArePreprocessedAndConsumedOnce()
+    {
+        const int candidateCount = 200_000;
+        var accounts = new[] { State(1, 100_000, 0), State(2, 100_000, 1) };
+        var candidates = Enumerable.Range(1, candidateCount)
+            .Select(sequence => Candidate(sequence, null))
+            .ToArray();
+
+        var result = new ShortageSimulator().Simulate(
+            ShortagePolicy.ProportionalReduction,
+            accounts,
+            candidates);
+
+        Assert.Equal(candidateCount, result.Decisions.Count());
+        Assert.Equal(candidateCount, result.CandidateInspectionCount);
+        Assert.InRange(result.CandidateOperationCount, candidateCount, 4L * candidateCount + 2);
+    }
+
+    [Fact]
+    public void ResultCollections_AreImmutableSnapshots()
+    {
+        var result = new ShortageSimulator().Simulate(
+            ShortagePolicy.ProportionalReduction,
+            new[] { State(1, 1, 0) },
+            new[] { Candidate(1, null) });
+
+        Assert.Equal(
+            typeof(IReadOnlyDictionary<Guid, int>),
+            typeof(ShortageSimulationResult).GetProperty(nameof(result.EffectiveTargets))!.PropertyType);
+        Assert.Equal(
+            typeof(IReadOnlyList<AllocationDecision>),
+            typeof(ShortageSimulationResult).GetProperty(nameof(result.Decisions))!.PropertyType);
+
+        var mutableTargets = Assert.IsAssignableFrom<IDictionary<Guid, int>>(result.EffectiveTargets);
+        Assert.Throws<NotSupportedException>(() => mutableTargets.Add(Id(2), 1));
+        var mutableDecisions = Assert.IsAssignableFrom<IList<AllocationDecision>>(result.Decisions);
+        Assert.Throws<NotSupportedException>(() => mutableDecisions.Add(result.Decisions[0]));
+
+        var legacyConstructor = typeof(ShortageSimulationResult).GetConstructor(
+            new[]
+            {
+                typeof(IReadOnlyDictionary<Guid, int>),
+                typeof(IReadOnlyList<AllocationDecision>),
+                typeof(int),
+                typeof(ShortageSimulationStatus),
+            });
+        Assert.NotNull(legacyConstructor);
+        var legacyDeconstruct = typeof(ShortageSimulationResult).GetMethod(
+            "Deconstruct",
+            new[]
+            {
+                typeof(IReadOnlyDictionary<Guid, int>).MakeByRefType(),
+                typeof(IReadOnlyList<AllocationDecision>).MakeByRefType(),
+                typeof(int).MakeByRefType(),
+                typeof(ShortageSimulationStatus).MakeByRefType(),
+            });
+        Assert.NotNull(legacyDeconstruct);
+    }
+
+    [Fact]
+    public void ResultRecord_PreservesInitAndWithSemanticsWhileSnapshottingCollections()
+    {
+        var original = new ShortageSimulator().Simulate(
+            ShortagePolicy.ProportionalReduction,
+            new[] { State(1, 1, 0) },
+            new[] { Candidate(1, null) });
+        var replacementTargets = new Dictionary<Guid, int> { [Id(2)] = 2 };
+        var replacementDecisions = new List<AllocationDecision>
+        {
+            new(Id(200), 100, Id(2), null),
+        };
+
+        var changed = original with
+        {
+            EffectiveTargets = replacementTargets,
+            Decisions = replacementDecisions,
+            Status = ShortageSimulationStatus.AwaitingCandidates,
+        };
+        replacementTargets.Clear();
+        replacementDecisions.Clear();
+
+        Assert.Equal(2, changed.EffectiveTargets[Id(2)]);
+        Assert.Single(changed.Decisions);
+        Assert.Equal(ShortageSimulationStatus.AwaitingCandidates, changed.Status);
+    }
+
+    [Fact]
+    public void AggregateTargetsAndShortfall_UseCheckedLongArithmetic()
+    {
+        var accounts = new[]
+        {
+            new SuccessTargetAccount(Id(1), int.MaxValue, int.MaxValue, 0, 0, 0),
+            new SuccessTargetAccount(Id(2), int.MaxValue, int.MaxValue, 0, 0, 1),
+        };
+
+        var result = new ShortageSimulator().Simulate(
+            ShortagePolicy.WaitForCandidates,
+            accounts,
+            Array.Empty<AllocationCandidate>());
+
+        Assert.Equal(4_294_967_294L, result.TotalEffectiveTarget);
+        Assert.Equal(4_294_967_294L, result.TotalShortfall);
+    }
+
     private static SuccessTargetAccount State(int id, int target, int priority) =>
         new(Id(id), target, target, 0, 0, priority);
 

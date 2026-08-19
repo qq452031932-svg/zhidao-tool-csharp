@@ -9,17 +9,19 @@ public sealed class ReplicationExpander
         ArgumentNullException.ThrowIfNull(resources);
         ArgumentNullException.ThrowIfNull(selectedAccountIds);
 
-        if (selectedAccountIds.Count == 0)
+        var accountSnapshot = selectedAccountIds.ToArray();
+        if (accountSnapshot.Length == 0)
         {
             throw new ArgumentException("At least one account must be selected.", nameof(selectedAccountIds));
         }
 
-        if (selectedAccountIds.Count != selectedAccountIds.Distinct().Count())
+        if (accountSnapshot.Length != accountSnapshot.Distinct().Count())
         {
             throw new ArgumentException("Selected accounts must be unique.", nameof(selectedAccountIds));
         }
 
-        return ExpandIterator(resources, selectedAccountIds);
+        var resourceSnapshot = resources.ToArray();
+        return ExpandIterator(resourceSnapshot, accountSnapshot);
     }
 
     public static long EstimateIntentCount(long resourceCount, long accountCount)

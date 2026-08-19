@@ -9,29 +9,84 @@ public sealed class CandidateSelector
         IEnumerable<AllocationCandidate> candidates)
     {
         ArgumentNullException.ThrowIfNull(candidates);
+        return Prepare(candidates).Take(accountId);
+    }
 
-        AllocationCandidate? exclusive = null;
-        AllocationCandidate? publicCandidate = null;
+    public CandidatePool Prepare(IEnumerable<AllocationCandidate> candidates) => new(candidates);
+}
+
+public sealed class CandidatePool
+{
+    private readonly Dictionary<Guid, Queue<AllocationCandidate>> _exclusive = new();
+    private readonly Queue<AllocationCandidate> _public = new();
+
+    internal CandidatePool(IEnumerable<AllocationCandidate> candidates)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        var available = new List<AllocationCandidate>();
         foreach (var candidate in candidates)
         {
-            if (candidate.Status is not (CandidateStatus.Unallocated or CandidateStatus.Unused))
+            CandidateInspectionCount = checked(CandidateInspectionCount + 1);
+            CandidateOperationCount = checked(CandidateOperationCount + 1);
+            if (candidate.Status is CandidateStatus.Unallocated or CandidateStatus.Unused)
             {
-                continue;
-            }
-
-            if (candidate.CandidateConstraintAccountId == accountId &&
-                (exclusive is null || candidate.CandidateSequence < exclusive.CandidateSequence))
-            {
-                exclusive = candidate;
-            }
-            else if (candidate.CandidateConstraintAccountId is null &&
-                     (publicCandidate is null || candidate.CandidateSequence < publicCandidate.CandidateSequence))
-            {
-                publicCandidate = candidate;
+                available.Add(candidate);
             }
         }
 
-        return exclusive ?? publicCandidate;
+        foreach (var candidate in available.OrderBy(candidate => candidate.CandidateSequence))
+        {
+            if (candidate.CandidateConstraintAccountId is not { } accountId)
+            {
+                _public.Enqueue(candidate);
+                continue;
+            }
+
+            if (!_exclusive.TryGetValue(accountId, out var queue))
+            {
+                queue = new Queue<AllocationCandidate>();
+                _exclusive.Add(accountId, queue);
+            }
+
+            queue.Enqueue(candidate);
+        }
+
+        AvailableCount = available.Count;
+    }
+
+    public int CandidateInspectionCount { get; }
+
+    public long CandidateOperationCount { get; private set; }
+
+    public int AvailableCount { get; private set; }
+
+    public bool HasCandidate(Guid accountId)
+    {
+        CandidateOperationCount = checked(CandidateOperationCount + 1);
+        return (_exclusive.TryGetValue(accountId, out var queue) && queue.Count > 0) ||
+            _public.Count > 0;
+    }
+
+    public AllocationCandidate? Take(Guid accountId)
+    {
+        CandidateOperationCount = checked(CandidateOperationCount + 1);
+        AllocationCandidate? candidate = null;
+        if (_exclusive.TryGetValue(accountId, out var queue) && queue.Count > 0)
+        {
+            candidate = queue.Dequeue();
+        }
+        else if (_public.Count > 0)
+        {
+            candidate = _public.Dequeue();
+        }
+
+        if (candidate is not null)
+        {
+            AvailableCount--;
+        }
+
+        return candidate;
     }
 }
 

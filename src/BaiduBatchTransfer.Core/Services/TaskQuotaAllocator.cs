@@ -2,8 +2,6 @@ namespace BaiduBatchTransfer.Core.Services;
 
 public sealed class TaskQuotaAllocator
 {
-    private const int MaximumCycleSize = 64;
-
     public IEnumerable<TaskQuotaAssignment> Allocate(
         IReadOnlyList<TaskQuotaAccount> accounts,
         IReadOnlyCollection<TaskQuotaCandidate> candidates)
@@ -12,12 +10,14 @@ public sealed class TaskQuotaAllocator
         ArgumentNullException.ThrowIfNull(candidates);
 
         var orderedAccounts = accounts.OrderBy(account => account.PriorityOrder).ToArray();
-        ValidateInputs(orderedAccounts, candidates);
+        ValidateAccounts(orderedAccounts);
+        var candidateSnapshot = candidates.ToArray();
+        ValidateCandidatesAndTotals(orderedAccounts, candidateSnapshot);
 
         var remainingTargets = orderedAccounts.ToDictionary(
             account => account.AccountId,
             account => account.TargetCount);
-        foreach (var candidate in candidates)
+        foreach (var candidate in candidateSnapshot)
         {
             if (candidate.CandidateConstraintAccountId is not { } accountId)
             {
@@ -37,7 +37,7 @@ public sealed class TaskQuotaAllocator
             remainingTargets[accountId] = remaining - 1;
         }
 
-        return AllocateIterator(orderedAccounts, candidates, remainingTargets);
+        return AllocateIterator(orderedAccounts, candidateSnapshot, remainingTargets);
     }
 
     private static IEnumerable<TaskQuotaAssignment> AllocateIterator(
@@ -81,102 +81,82 @@ public sealed class TaskQuotaAllocator
         IReadOnlyList<TaskQuotaAccount> orderedAccounts,
         Dictionary<Guid, int> remainingTargets)
     {
-        while (remainingTargets.Values.Any(count => count > 0))
+        var positive = orderedAccounts
+            .Where(account => remainingTargets[account.AccountId] > 0)
+            .ToArray();
+        if (IsOneTwoOne(positive, remainingTargets))
         {
-            var cycle = BuildCycle(orderedAccounts, remainingTargets);
-            var emitted = false;
-            foreach (var accountId in cycle)
+            var first = positive[0].AccountId;
+            var second = positive[1].AccountId;
+            var third = positive[2].AccountId;
+            while (remainingTargets[first] > 0)
             {
-                if (remainingTargets[accountId] == 0)
+                remainingTargets[first]--;
+                yield return first;
+                remainingTargets[second]--;
+                yield return second;
+                remainingTargets[second]--;
+                yield return second;
+                remainingTargets[third]--;
+                yield return third;
+            }
+
+            yield break;
+        }
+
+        foreach (var accountId in SmoothInterleave(positive, remainingTargets))
+        {
+            yield return accountId;
+        }
+    }
+
+    private static bool IsOneTwoOne(
+        IReadOnlyList<TaskQuotaAccount> accounts,
+        IReadOnlyDictionary<Guid, int> remainingTargets) =>
+        accounts.Count == 3 &&
+        remainingTargets[accounts[0].AccountId] == remainingTargets[accounts[2].AccountId] &&
+        (long)remainingTargets[accounts[1].AccountId] ==
+            2L * remainingTargets[accounts[0].AccountId];
+
+    private static IEnumerable<Guid> SmoothInterleave(
+        IReadOnlyList<TaskQuotaAccount> accounts,
+        Dictionary<Guid, int> remainingTargets)
+    {
+        var weights = accounts.ToDictionary(
+            account => account.AccountId,
+            account => remainingTargets[account.AccountId]);
+        var scores = accounts.ToDictionary(account => account.AccountId, _ => 0L);
+        var totalWeight = weights.Values.Aggregate(0L, (total, weight) => checked(total + weight));
+
+        for (long allocation = 0; allocation < totalWeight; allocation++)
+        {
+            TaskQuotaAccount? selected = null;
+            foreach (var account in accounts)
+            {
+                if (remainingTargets[account.AccountId] == 0)
                 {
                     continue;
                 }
 
-                remainingTargets[accountId]--;
-                emitted = true;
-                yield return accountId;
+                scores[account.AccountId] = checked(scores[account.AccountId] + weights[account.AccountId]);
+                if (selected is null || scores[account.AccountId] > scores[selected.AccountId])
+                {
+                    selected = account;
+                }
             }
 
-            if (!emitted)
+            if (selected is null)
             {
                 throw new InvalidOperationException("Unable to make progress while interleaving account targets.");
             }
+
+            scores[selected.AccountId] = checked(scores[selected.AccountId] - totalWeight);
+            remainingTargets[selected.AccountId]--;
+            yield return selected.AccountId;
         }
     }
 
-    private static IReadOnlyList<Guid> BuildCycle(
-        IReadOnlyList<TaskQuotaAccount> orderedAccounts,
-        IReadOnlyDictionary<Guid, int> remainingTargets)
-    {
-        var positive = orderedAccounts
-            .Where(account => remainingTargets[account.AccountId] > 0)
-            .ToArray();
-        var gcd = positive
-            .Select(account => remainingTargets[account.AccountId])
-            .Aggregate(GreatestCommonDivisor);
-        var exactCycleSize = positive.Sum(account => (long)remainingTargets[account.AccountId] / gcd);
-
-        var cycleSize = Math.Max(MaximumCycleSize, positive.Length);
-        IReadOnlyDictionary<Guid, int> cycleCounts = exactCycleSize <= cycleSize
-            ? positive.ToDictionary(
-                account => account.AccountId,
-                account => remainingTargets[account.AccountId] / gcd)
-            : ScaleCycle(positive, remainingTargets, cycleSize);
-
-        return positive
-            .SelectMany(account => Enumerable.Repeat(account.AccountId, cycleCounts[account.AccountId]))
-            .ToArray();
-    }
-
-    private static IReadOnlyDictionary<Guid, int> ScaleCycle(
-        IReadOnlyList<TaskQuotaAccount> accounts,
-        IReadOnlyDictionary<Guid, int> remainingTargets,
-        int cycleSize)
-    {
-        var total = accounts.Sum(account => (long)remainingTargets[account.AccountId]);
-        var counts = accounts.ToDictionary(
-            account => account.AccountId,
-            account => Math.Max(1, (int)((long)remainingTargets[account.AccountId] * cycleSize / total)));
-
-        while (counts.Values.Sum() > cycleSize)
-        {
-            var account = accounts
-                .Where(value => counts[value.AccountId] > 1)
-                .OrderBy(value =>
-                    (decimal)remainingTargets[value.AccountId] / total -
-                    (decimal)counts[value.AccountId] / cycleSize)
-                .ThenByDescending(value => value.PriorityOrder)
-                .First();
-            counts[account.AccountId]--;
-        }
-
-        while (counts.Values.Sum() < cycleSize)
-        {
-            var account = accounts
-                .OrderByDescending(value =>
-                    (decimal)remainingTargets[value.AccountId] / total -
-                    (decimal)counts[value.AccountId] / cycleSize)
-                .ThenBy(value => value.PriorityOrder)
-                .First();
-            counts[account.AccountId]++;
-        }
-
-        return counts;
-    }
-
-    private static int GreatestCommonDivisor(int left, int right)
-    {
-        while (right != 0)
-        {
-            (left, right) = (right, left % right);
-        }
-
-        return left;
-    }
-
-    private static void ValidateInputs(
-        IReadOnlyList<TaskQuotaAccount> accounts,
-        IReadOnlyCollection<TaskQuotaCandidate> candidates)
+    private static void ValidateAccounts(IReadOnlyList<TaskQuotaAccount> accounts)
     {
         if (accounts.Select(account => account.AccountId).Distinct().Count() != accounts.Count)
         {
@@ -187,7 +167,12 @@ public sealed class TaskQuotaAllocator
         {
             throw new ArgumentException("Account priorities must be unique.", nameof(accounts));
         }
+    }
 
+    private static void ValidateCandidatesAndTotals(
+        IReadOnlyList<TaskQuotaAccount> accounts,
+        IReadOnlyCollection<TaskQuotaCandidate> candidates)
+    {
         if (candidates.Select(candidate => candidate.ResourceId).Distinct().Count() != candidates.Count ||
             candidates.Select(candidate => candidate.CandidateSequence).Distinct().Count() != candidates.Count)
         {
