@@ -193,6 +193,33 @@ public sealed class DatabaseRecoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task SidecarSwapFailureIsIndependentAndPreservesEveryTrackedCopy()
+    {
+        var (factory, backup, migrator) = await CreateDatabaseAsync();
+        var candidate = await backup.CreateBackupAsync(1);
+        var originalMain = await File.ReadAllBytesAsync(factory.DatabasePath);
+        var originalWal = new byte[] { 1, 2, 3 }; var originalShm = new byte[] { 4, 5, 6 };
+        await File.WriteAllBytesAsync(factory.DatabasePath + "-wal", originalWal);
+        await File.WriteAllBytesAsync(factory.DatabasePath + "-shm", originalShm);
+        var files = new FaultInjectingFileOperations
+        {
+            CorruptInstalledDatabase = true,
+            CreateInstalledSidecars = true,
+            FailSidecarReplaceSuffix = "-wal"
+        };
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"), fileOperations: files);
+
+        await Assert.ThrowsAsync<AggregateException>(() => recovery.RestoreAsync(candidate.Path));
+
+        Assert.Equal(originalMain, await File.ReadAllBytesAsync(factory.DatabasePath));
+        Assert.NotNull(files.QuarantinePath); Assert.NotNull(files.FailedRestorePath);
+        Assert.True(File.Exists(factory.DatabasePath + "-wal"));
+        Assert.Equal(originalWal, await File.ReadAllBytesAsync(files.QuarantinePath + "-wal"));
+        Assert.Equal(originalShm, await File.ReadAllBytesAsync(factory.DatabasePath + "-shm"));
+        Assert.True(File.Exists(files.FailedRestorePath + "-shm"));
+    }
+
+    [Fact]
     public async Task RestoreRejectsTraversalAndRequiresClosedConnections()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
@@ -381,6 +408,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         public bool CorruptInstalledDatabase { get; init; }
         public bool CreateInstalledSidecars { get; init; }
         public bool FailFailedRestoreCopy { get; init; }
+        public string? FailSidecarReplaceSuffix { get; init; }
         public string? QuarantinePath { get; private set; }
         public string? FailedRestorePath { get; private set; }
 
@@ -404,6 +432,8 @@ public sealed class DatabaseRecoveryTests : IDisposable
         public void Replace(string source, string destination, string? backupPath)
         {
             var call = ++replaceCalls;
+            if (FailSidecarReplaceSuffix is not null && destination.EndsWith(FailSidecarReplaceSuffix, StringComparison.Ordinal))
+                throw new IOException($"Injected sidecar replace failure for {FailSidecarReplaceSuffix}.");
             if (FailReplaceCall == call) throw new IOException($"Injected replace failure {call}.");
             File.Replace(source, destination, backupPath, ignoreMetadataErrors: true);
             if (call == 1)

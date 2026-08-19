@@ -31,7 +31,9 @@ public sealed class SqliteConnectionFactory
             DataSource = DatabasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
             Cache = SqliteCacheMode.Private,
-            Pooling = false
+            Pooling = false,
+            ForeignKeys = true,
+            DefaultTimeout = (int)Math.Ceiling(BusyTimeoutMilliseconds / 1000d)
         };
         Interlocked.Increment(ref activeConnectionCount);
         if (Volatile.Read(ref exclusiveMaintenance) != 0 && !maintenanceOwner.Value)
@@ -51,6 +53,9 @@ public sealed class SqliteConnectionFactory
                     connection.Close();
                     throw new InvalidOperationException("Database recovery is in progress.");
                 }
+                using var lifecycleConfiguration = connection.CreateCommand();
+                lifecycleConfiguration.CommandText = $"PRAGMA foreign_keys=ON; PRAGMA busy_timeout={BusyTimeoutMilliseconds};";
+                lifecycleConfiguration.ExecuteNonQuery();
             }
             else if (args.CurrentState == ConnectionState.Closed && Interlocked.Exchange(ref counted, 0) != 0)
                 Interlocked.Decrement(ref activeConnectionCount);

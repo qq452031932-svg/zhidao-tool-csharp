@@ -159,13 +159,25 @@ public sealed class RepositoryTests : IDisposable
     [Fact]
     public async Task FactoryTracksRawCloseAndReopenLifecycle()
     {
-        var factory = await CreateFactoryAsync();
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"), busyTimeoutMilliseconds: 4321);
+        await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "1.0").MigrateAsync();
         await using var connection = await factory.OpenConnectionAsync();
         Assert.Equal(1, factory.ActiveConnectionCount);
         connection.Close();
         Assert.Equal(0, factory.ActiveConnectionCount);
         connection.Open();
         Assert.Equal(1, factory.ActiveConnectionCount);
+        await using (var foreignKeys = connection.CreateCommand())
+        {
+            foreignKeys.CommandText = "PRAGMA foreign_keys;";
+            Assert.Equal(1L, await foreignKeys.ExecuteScalarAsync());
+        }
+        await using (var timeout = connection.CreateCommand())
+        {
+            timeout.CommandText = "PRAGMA busy_timeout;";
+            Assert.Equal(4321L, await timeout.ExecuteScalarAsync());
+        }
         await connection.DisposeAsync();
         Assert.Equal(0, factory.ActiveConnectionCount);
     }

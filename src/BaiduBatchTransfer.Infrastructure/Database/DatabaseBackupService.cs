@@ -10,11 +10,13 @@ public sealed partial class DatabaseBackupService
 {
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseSchemaValidator schemaValidator = new();
+    private readonly TimeProvider timeProvider;
 
-    public DatabaseBackupService(SqliteConnectionFactory factory, string backupRoot)
+    public DatabaseBackupService(SqliteConnectionFactory factory, string backupRoot, TimeProvider? timeProvider = null)
     {
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
         BackupRoot = Path.GetFullPath(backupRoot ?? throw new ArgumentNullException(nameof(backupRoot)));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public string BackupRoot { get; }
@@ -22,27 +24,32 @@ public sealed partial class DatabaseBackupService
     public async Task<DatabaseBackupDescriptor> CreateBackupAsync(int schemaVersion, CancellationToken cancellationToken = default)
     {
         Directory.CreateDirectory(BackupRoot);
-        var createdAt = DateTimeOffset.UtcNow;
-        var path = Path.Combine(BackupRoot, $"database-v{schemaVersion}-{createdAt:yyyyMMddTHHmmssfffZ}.db.bak");
-        path = EnsureDirectChild(path, BackupRoot);
+        var createdAt = timeProvider.GetUtcNow();
+        var identity = Guid.NewGuid().ToString("N");
+        var path = EnsureDirectChild(Path.Combine(BackupRoot, $"database-v{schemaVersion}-{createdAt:yyyyMMddTHHmmssfffZ}-{identity}.db.bak"), BackupRoot);
+        var temporary = EnsureDirectChild(Path.Combine(BackupRoot, $"database-backup-{identity}.tmp"), BackupRoot);
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var source = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            var destinationString = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString();
-            await using var destination = new SqliteConnection(destinationString);
-            await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using (var source = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var destinationString = new SqliteConnectionStringBuilder { DataSource = temporary, Pooling = false }.ToString();
+                await using var destination = new SqliteConnection(destinationString);
+                await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                source.BackupDatabase(destination);
+                cancellationToken.ThrowIfCancellationRequested();
+                var integrity = await QuickCheckAsync(destination, cancellationToken).ConfigureAwait(false);
+                if (!integrity || !(await schemaValidator.ValidateAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false)).IsValid)
+                    throw new InvalidDataException("The SQLite online backup is not a valid application database.");
+            }
             cancellationToken.ThrowIfCancellationRequested();
-            source.BackupDatabase(destination);
-            cancellationToken.ThrowIfCancellationRequested();
-            var integrity = await QuickCheckAsync(destination, cancellationToken).ConfigureAwait(false);
-            if (!integrity || !(await schemaValidator.ValidateAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false)).IsValid)
-                throw new InvalidDataException("The SQLite online backup is not a valid application database.");
+            File.Move(temporary, path);
             return new(path, schemaVersion, createdAt, true);
         }
         catch
         {
-            if (File.Exists(path)) File.Delete(path);
+            if (File.Exists(temporary)) File.Delete(temporary);
             throw;
         }
     }
@@ -138,6 +145,6 @@ public sealed partial class DatabaseBackupService
         return any;
     }
 
-    [GeneratedRegex("^database-v(\\d+)-(\\d{8}T\\d{9}Z)\\.db\\.bak$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex("^database-v(\\d+)-(\\d{8}T\\d{9}Z)(?:-[0-9a-f]{32})?\\.db\\.bak$", RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
     private static partial Regex BackupName();
 }

@@ -15,12 +15,17 @@ public sealed partial class DatabaseSchemaValidator
         "PRIMARY", "KEY", "INTEGER", "TEXT", "FOREIGN", "REFERENCES", "DELETE", "CASCADE", "OR", "AND", "IS"
     };
 
-    public async Task<DatabaseSchemaValidationResult> ValidateAsync(SqliteConnection connection, int expectedVersion, CancellationToken cancellationToken = default)
+    public async Task<DatabaseSchemaValidationResult> ValidateAsync(
+        SqliteConnection connection,
+        int expectedVersion,
+        CancellationToken cancellationToken = default,
+        SqliteTransaction? transaction = null)
     {
         var errors = new List<string>();
         var actual = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         await using (var command = connection.CreateCommand())
         {
+            command.Transaction = transaction;
             command.CommandText = "SELECT name, sql FROM sqlite_master WHERE type IN ('table','index','view','trigger') AND sql IS NOT NULL;";
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -32,6 +37,7 @@ public sealed partial class DatabaseSchemaValidator
         if (!actual.ContainsKey("SchemaVersions")) return new(false, ["SchemaVersions is missing."]);
         await using (var version = connection.CreateCommand())
         {
+            version.Transaction = transaction;
             version.CommandText = "SELECT COALESCE(MAX(Version),-1) FROM SchemaVersions;";
             try
             {

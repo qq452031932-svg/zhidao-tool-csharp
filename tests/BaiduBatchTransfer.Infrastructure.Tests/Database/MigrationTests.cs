@@ -182,6 +182,11 @@ public sealed class MigrationTests : IDisposable
 
         await Assert.ThrowsAsync<InvalidDataException>(() => new DatabaseMigrator(factory, backup, "1.0").MigrateAsync());
 
+        await using (var live = await factory.OpenConnectionAsync())
+        {
+            Assert.Equal(0L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+            Assert.Equal(0L, await ScalarAsync<long>(live, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ImportSessions';"));
+        }
         var preserved = Assert.Single(await backup.ListValidatedBackupsAsync());
         Assert.Equal(0, preserved.SchemaVersion);
     }
@@ -205,6 +210,22 @@ public sealed class MigrationTests : IDisposable
         using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => backup.CreateBackupAsync(1, cancellation.Token));
         Assert.Empty(Directory.EnumerateFiles(backupRoot));
+    }
+
+    [Fact]
+    public async Task ConcurrentBackupsPromoteToDistinctValidatedCanonicalFiles()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"));
+        var backup = new DatabaseBackupService(factory, Path.Combine(root, "backups"), new FixedTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)));
+        await new DatabaseMigrator(factory, backup, "1.0").MigrateAsync();
+
+        var created = await Task.WhenAll(Enumerable.Range(0, 6).Select(_ => backup.CreateBackupAsync(1)));
+
+        Assert.Equal(6, created.Select(x => x.Path).Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        Assert.All(created, item => Assert.True(File.Exists(item.Path)));
+        Assert.Equal(6, (await backup.ListValidatedBackupsAsync()).Count);
+        Assert.DoesNotContain(Directory.EnumerateFiles(backup.BackupRoot), path => path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase));
     }
 
     public void Dispose()
@@ -245,5 +266,10 @@ public sealed class MigrationTests : IDisposable
     {
         await using var command = connection.CreateCommand(); command.CommandText = $"PRAGMA table_info({table});";
         var names = new List<string>(); await using var reader = await command.ExecuteReaderAsync(); while (await reader.ReadAsync()) names.Add(reader.GetString(1)); return names;
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => value;
     }
 }

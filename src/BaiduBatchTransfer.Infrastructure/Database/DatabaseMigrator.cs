@@ -70,6 +70,8 @@ public sealed class DatabaseMigrator
             versionCommand.CommandText = "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,$applied,$app);";
             versionCommand.Parameters.AddWithValue("$version", version); versionCommand.Parameters.AddWithValue("$applied", DateTimeOffset.UtcNow.ToString("O")); versionCommand.Parameters.AddWithValue("$app", appVersion);
             await versionCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var schema = await schemaValidator.ValidateAsync(connection, version, cancellationToken, (SqliteTransaction)transaction).ConfigureAwait(false);
+            if (!schema.IsValid) throw new InvalidDataException($"Database schema validation failed before commit: {string.Join("; ", schema.Errors)}");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }

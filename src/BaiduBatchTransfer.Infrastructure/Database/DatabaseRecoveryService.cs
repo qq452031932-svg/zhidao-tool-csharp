@@ -110,13 +110,22 @@ public sealed class DatabaseRecoveryService
             {
                 foreach (var suffix in new[] { "-wal", "-shm" })
                 {
+                    var sidecarStaging = rollbackStaging + suffix;
                     TryCleanup(() =>
                     {
                         var live = factory.DatabasePath + suffix;
                         var quarantined = quarantine + suffix;
-                        if (files.Exists(live)) files.Move(live, failedRestore + suffix);
-                        if (files.Exists(quarantined)) files.Move(quarantined, live);
+                        var hasLive = files.Exists(live);
+                        var hasQuarantined = files.Exists(quarantined);
+                        if (hasLive && hasQuarantined)
+                        {
+                            files.Copy(quarantined, sidecarStaging, overwrite: false);
+                            files.Replace(sidecarStaging, live, failedRestore + suffix);
+                        }
+                        else if (hasLive) files.Move(live, failedRestore + suffix);
+                        else if (hasQuarantined) files.Move(quarantined, live);
                     }, cleanupErrors);
+                    TryCleanup(() => { if (files.Exists(sidecarStaging)) files.Delete(sidecarStaging); }, cleanupErrors);
                 }
             }
             else if (!installed)
