@@ -1,0 +1,69 @@
+<UserControl x:Class="BaiduBatchTransfer.App.Features.Imports.ImportView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Border Style="{StaticResource Card}">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="130" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel>
+                    <TextBlock Text="导入百度分享链接" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="可粘贴整段文案，系统会流式解析链接与常见四位提取码。也可以导入软件模板格式的 Excel。"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,5,0,12" />
+                </StackPanel>
+                <TextBox Grid.Row="1" Text="{Binding TextContent, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True"
+                         VerticalScrollBarVisibility="Auto" TextWrapping="Wrap"
+                         ToolTip="在此粘贴包含百度分享链接的文本" />
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,0">
+                    <Button Content="导入粘贴内容" Command="{Binding ImportTextCommand}" Style="{StaticResource PrimaryButton}" />
+                    <Button Content="选择 Excel 文件" Command="{Binding SelectAndImportExcelCommand}" />
+                    <Button Content="继续上次导入" Command="{Binding ResumeImportCommand}" />
+                    <Button Content="取消导入" Command="{Binding CancelCommand}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+        <Border Grid.Row="1" Style="{StaticResource Card}">
+            <StackPanel>
+                <TextBlock Text="{Binding StatisticsText}" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding StatusMessage}" Margin="0,6,0,0" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
+                <TextBlock Text="{Binding AdapterStatusMessage}" Margin="0,4,0,0" Foreground="#B54708" TextWrapping="Wrap" />
+            </StackPanel>
+        </Border>
+        <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <TextBlock Text="草稿记录（仅加载当前页）" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10" />
+                <DataGrid Grid.Row="1" ItemsSource="{Binding Rows}" AutoGenerateColumns="False" IsReadOnly="True"
+                          EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                          VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                          ScrollViewer.CanContentScroll="True">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="行号" Binding="{Binding SourceRowNumber}" Width="75" />
+                        <DataGridTextColumn Header="分享链接" Binding="{Binding ShareUrl}" Width="*" />
+                        <DataGridTextColumn Header="提取码" Binding="{Binding ExtractionCode}" Width="90" />
+                        <DataGridTextColumn Header="表格账号" Binding="{Binding RequestedAccountName}" Width="130" />
+                        <DataGridTextColumn Header="草稿状态" Binding="{Binding DispositionText}" Width="120" />
+                        <DataGridTextColumn Header="预检结果" Binding="{Binding PrecheckText}" Width="110" />
+                    </DataGrid.Columns>
+                </DataGrid>
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
+                    <Button Content="刷新第一页" Command="{Binding LoadFirstPageCommand}" />
+                    <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
+                    <TextBlock Text="{Binding TotalRows, StringFormat=共 {0:N0} 条}" VerticalAlignment="Center" Foreground="{StaticResource MutedBrush}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>
