@@ -43,7 +43,7 @@ public sealed record StagedImportRowRecord(
 }
 
 public sealed record AccountRecord(
-    Guid Id, string BaiduUserId, string DisplayName, string? EncryptedSession, string? WebView2ProfileDirectory,
+    Guid Id, string BaiduUserId, string DisplayName, byte[]? EncryptedSession, string? WebView2ProfileDirectory,
     string LoginMethod, string Status, long? CapacityTotal, long? CapacityUsed, int DailyLimit,
     int DailyExecutedCount, int SortOrder, bool IsEnabled, DateTimeOffset? LastValidatedAt,
     string DailyCountDateKey, bool IsDeleted, DateTimeOffset? DeletedAt)
@@ -51,6 +51,9 @@ public sealed record AccountRecord(
     public static AccountRecord Create(Guid id, string baiduUserId, string displayName) =>
         new(id, baiduUserId, displayName, null, null, "WebView2", "Active", null, null, 0, 0, 0, true, null,
             DateTimeOffset.Now.ToString("yyyy-MM-dd"), false, null);
+
+    public override string ToString() =>
+        $"AccountRecord {{ Id = {Id}, Identity = [REDACTED], DisplayName = [REDACTED], EncryptedSession = [REDACTED], Status = {Status} }}";
 }
 
 public sealed record AccountRuleRecord(Guid Id, Guid AccountId, string RuleType, string RuleValue, int Priority, bool IsEnabled);

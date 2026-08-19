@@ -23,6 +23,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.Application\BaiduBatchTransfer.Application.csproj" />
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
+    <ProjectReference Include="..\..\src\BaiduBatchTransfer.Infrastructure\BaiduBatchTransfer.Infrastructure.csproj" />
   </ItemGroup>
 
 </Project>

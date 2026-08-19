@@ -25,6 +25,23 @@ public sealed class SqliteAccountRepository : SqliteRepositoryBase, IAccountRepo
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? Read(reader) : null;
     }
 
+    public async Task<AccountRecord?> GetByBaiduUserIdAsync(string baiduUserId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(baiduUserId);
+        await using var command = Command($"SELECT {Columns} FROM Accounts WHERE BaiduUserId=$user LIMIT 1;");
+        Add(command, "$user", baiduUserId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? Read(reader) : null;
+    }
+
+    public async Task SetEncryptedSessionAsync(Guid id, byte[]? encryptedSession, CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("UPDATE Accounts SET EncryptedSession=$session WHERE Id=$id;");
+        Add(command, "$session", encryptedSession is null ? null : (byte[])encryptedSession.Clone());
+        Add(command, "$id", Id(id));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<Page<AccountRecord>> GetPageAsync(PageQuery query, CancellationToken cancellationToken = default)
     {
         query.Validate(); cancellationToken.ThrowIfCancellationRequested();
@@ -68,8 +85,11 @@ public sealed class SqliteAccountRepository : SqliteRepositoryBase, IAccountRepo
     }
 
     private static AccountRecord Read(SqliteDataReader r) => new(
-        Guid.Parse(r.GetString(0)), r.GetString(1), r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3),
+        Guid.Parse(r.GetString(0)), r.GetString(1), r.GetString(2), ReadEncryptedSession(r, 3),
         r.IsDBNull(4) ? null : r.GetString(4), r.GetString(5), r.GetString(6), r.IsDBNull(7) ? null : r.GetInt64(7),
         r.IsDBNull(8) ? null : r.GetInt64(8), r.GetInt32(9), r.GetInt32(10), r.GetInt32(11), r.GetInt32(12) != 0,
         ReadNullableTime(r,13), r.GetString(14), r.GetInt32(15) != 0, ReadNullableTime(r,16));
+
+    private static byte[]? ReadEncryptedSession(SqliteDataReader reader, int ordinal) =>
+        reader.IsDBNull(ordinal) || reader.GetValue(ordinal) is not byte[] bytes ? null : (byte[])bytes.Clone();
 }
