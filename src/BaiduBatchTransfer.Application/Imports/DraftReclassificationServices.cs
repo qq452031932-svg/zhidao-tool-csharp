@@ -72,16 +72,11 @@ internal static class DraftReclassificationEngine
         CancellationToken cancellationToken)
     {
         if (!Enum.IsDefined(transferMode)) throw new ArgumentOutOfRangeException(nameof(transferMode));
-        if (!await repository.HasDuplicateNormalizedShareIdsAsync(session.Id, cancellationToken).ConfigureAwait(false))
-        {
-            await ReclassifyUniqueRowsAsync(repository, session.Id, transferMode, cancellationToken).ConfigureAwait(false);
-            return await RefreshSessionAsync(repository, session, cancellationToken).ConfigureAwait(false);
-        }
         string? identityCursor = null;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var identities = await repository.GetNormalizedShareIdsPageAsync(
+            var identities = await repository.GetDuplicateNormalizedShareIdsPageAsync(
                 session.Id, identityCursor, PageSize, cancellationToken).ConfigureAwait(false);
             if (identities.Count == 0) break;
             foreach (var identity in identities)
@@ -92,6 +87,8 @@ internal static class DraftReclassificationEngine
             }
             identityCursor = identities[^1];
         }
+
+        await ReclassifyUniqueRowsAsync(repository, session.Id, transferMode, cancellationToken).ConfigureAwait(false);
 
         return await RefreshSessionAsync(repository, session, cancellationToken).ConfigureAwait(false);
     }
@@ -105,9 +102,8 @@ internal static class DraftReclassificationEngine
         long cursor = 0;
         while (true)
         {
-            var page = await repository.GetRowsKeysetPageAsync(
-                new StagedImportKeysetQuery(sessionId, null, null, PageSize, cursor, false), cancellationToken)
-                .ConfigureAwait(false);
+            var page = await repository.GetNonDuplicateClassifiableRowsKeysetPageAsync(
+                sessionId, cursor, PageSize, cancellationToken).ConfigureAwait(false);
             var changed = new List<StagedImportRowRecord>(page.Items.Count);
             foreach (var row in page.Items)
             {
