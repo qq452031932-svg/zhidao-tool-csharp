@@ -43,7 +43,7 @@ public interface IOperationExecutionStore
         string safeMessage,
         DateTimeOffset now,
         CancellationToken cancellationToken = default);
-    Task MarkAccountUnavailableAsync(
+    Task MarkDefiniteAccountFailureAsync(
         Guid operationId,
         string code,
         string safeMessage,
@@ -107,7 +107,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (ArgumentException)
         {
-            await PauseAccountAsync(operationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(operationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -116,7 +116,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             .ConfigureAwait(false);
         if (session is null)
         {
-            await PauseAccountAsync(snapshot.OperationId, BaiduErrorKind.ExpiredLogin, cancellationToken)
+            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.ExpiredLogin, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -130,7 +130,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
-            await PauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -141,7 +141,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
-            await PauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -149,7 +149,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             var error = directoryResult.ErrorKind!.Value;
             if (IsAccountPausingFailure(error))
-                await PauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
+                await FailAndPauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
             else
                 await FailAsync(snapshot.OperationId, error, false, cancellationToken).ConfigureAwait(false);
             return;
@@ -185,7 +185,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             var errorKind = saveResult.ErrorKind!.Value;
             if (IsAccountPausingFailure(errorKind))
             {
-                await PauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
+                await FailAndPauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
             }
             else if (errorKind is BaiduErrorKind.TransientService or BaiduErrorKind.UnknownResponse)
             {
@@ -250,13 +250,13 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             cancellationToken);
     }
 
-    private Task PauseAccountAsync(
+    private Task FailAndPauseAccountAsync(
         Guid operationId,
         BaiduErrorKind errorKind,
         CancellationToken cancellationToken)
     {
         var safe = BaiduAdapterResult.Failure(errorKind, null);
-        return store.MarkAccountUnavailableAsync(
+        return store.MarkDefiniteAccountFailureAsync(
             operationId,
             errorKind.ToString(),
             safe.SafeMessage!,

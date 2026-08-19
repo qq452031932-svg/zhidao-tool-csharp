@@ -303,10 +303,15 @@ public sealed class SqliteTransferSchedulingStore :
     public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid, DateTimeOffset now, CancellationToken cancellationToken = default) =>
         CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid, resultPending: false, now, cancellationToken);
 
-    public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default) =>
-        CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid: false, resultPending: true, now, cancellationToken);
+    public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        ValidateSafeError(code, safeMessage);
+        if (code is not ("TransientService" or "UnknownResponse"))
+            throw new ArgumentException("Only an uncertain remote execution result can remain pending.", nameof(code));
+        return CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid: false, resultPending: true, now, cancellationToken);
+    }
 
-    public async Task MarkAccountUnavailableAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public async Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         ValidateSafeError(code, safeMessage);
         if (code is not ("ExpiredLogin" or "VerificationRequired" or "InsufficientCapacity" or "InvalidTargetPath"))
@@ -314,47 +319,27 @@ public sealed class SqliteTransferSchedulingStore :
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
-        string status;
-        bool submitted;
-        await using (var read = Command(connection, transaction,
-            "SELECT Status,CASE WHEN DailyCountedAt IS NOT NULL OR SubmitState IN ('Submitting','ResultReceived','PendingConfirmation') THEN 1 ELSE 0 END FROM TransferOperations WHERE Id=$id;"))
-        {
-            Add(read, "$id", Id(operationId));
-            await using var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) throw new InvalidOperationException("The operation no longer exists.");
-            status = reader.GetString(0); submitted = reader.GetInt64(1) != 0;
-        }
         await using (var account = Command(connection, transaction,
             "UPDATE Accounts SET Status='Invalid',LastValidatedAt=$now WHERE Id=$account AND IsDeleted=0;"))
         {
             Add(account, "$now", Time(now)); Add(account, "$account", Id(ids.AccountId));
             RequireOne(await account.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The unavailable account no longer exists.");
         }
-        if (submitted || status == "Submitting")
+        await using (var failed = Command(connection, transaction,
+            "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState=CASE WHEN SubmitState IN ('Submitting','PendingConfirmation') OR DailyCountedAt IS NOT NULL THEN 'ResultReceived' ELSE SubmitState END,TargetSlotState='Released',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting','ResultPending') AND TargetSlotState='Reserved';"))
         {
-            await using var pending = Command(connection, transaction,
-                "UPDATE TransferOperations SET Status='ResultPending',SubmitState='PendingConfirmation',LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved';");
-            Add(pending, "$code", code); Add(pending, "$message", safeMessage); Add(pending, "$now", Time(now)); Add(pending, "$id", Id(operationId));
-            RequireOne(await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Submitted operation cannot be paused before reconciliation.");
+            Add(failed, "$code", code); Add(failed, "$message", safeMessage); Add(failed, "$now", Time(now)); Add(failed, "$id", Id(operationId));
+            RequireOne(await failed.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The account failure operation cannot be finalized.");
         }
-        else
+        await using (var allocation = Command(connection, transaction,
+            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1,FailedItemCount=FailedItemCount+1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
         {
-            await using (var waiting = Command(connection, transaction,
-                "UPDATE TransferOperations SET Status='Waiting',SubmitState='NotPrepared',TargetSlotState='Unoccupied',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing') AND DailyCountedAt IS NULL;"))
-            {
-                Add(waiting, "$code", code); Add(waiting, "$message", safeMessage); Add(waiting, "$now", Time(now)); Add(waiting, "$id", Id(operationId));
-                RequireOne(await waiting.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Unsubmitted operation cannot be paused for its account.");
-            }
-            await using (var allocation = Command(connection, transaction,
-                "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
-            {
-                Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
-                RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing.");
-            }
-            await using (var resource = Command(connection, transaction,
-                "UPDATE ResourceItems SET ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved';"))
-            { Add(resource, "$now", Time(now)); Add(resource, "$resource", Id(ids.ResourceId)); await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false); }
+            Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
+            RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing.");
         }
+        await using (var resource = Command(connection, transaction,
+            "UPDATE ResourceItems SET CandidateStatus='Unused',ReservedAccountId=NULL,ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved';"))
+        { Add(resource, "$now", Time(now)); Add(resource, "$resource", Id(ids.ResourceId)); await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false); }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 

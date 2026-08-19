@@ -117,25 +117,28 @@ public sealed class OperationExecutorTests
         Assert.Equal(["remote-1"], store.RemoteItemIds);
     }
 
-    [Fact]
-    public async Task UncertainSaveFailureBecomesResultPendingAndRetainsSlot()
+    [Theory]
+    [InlineData(BaiduErrorKind.TransientService)]
+    [InlineData(BaiduErrorKind.UnknownResponse)]
+    public async Task OnlyUncertainSaveFailureBecomesResultPendingAndRetainsSlot(BaiduErrorKind errorKind)
     {
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot);
         var adapter = new RecordingAdapter
         {
-            SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(BaiduErrorKind.TransientService, "response body secret"),
+            SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(errorKind, "response body secret"),
         };
 
         await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
 
         Assert.True(store.ResultPending);
         Assert.False(store.Succeeded);
-        Assert.Equal("TransientService", store.FailureCode);
+        Assert.Equal(1, adapter.SaveCalls);
+        Assert.Equal(errorKind.ToString(), store.FailureCode);
     }
 
     [Fact]
-    public async Task AccountFailureReturnedAfterSubmitPausesAccountForReconciliation()
+    public async Task DefiniteAccountFailureReturnedAfterSubmitDoesNotBecomeResultPending()
     {
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot);
@@ -151,6 +154,8 @@ public sealed class OperationExecutorTests
         Assert.Contains(store.Events, item => item.Name == "Boundary");
         Assert.True(store.AccountPaused);
         Assert.Equal("InsufficientCapacity", store.AccountPauseCode);
+        Assert.False(store.ResultPending);
+        Assert.Equal(1, adapter.SaveCalls);
         Assert.Null(store.FailureCode);
     }
 
@@ -243,6 +248,7 @@ public sealed class OperationExecutorTests
 
         Assert.True(store.AccountPaused);
         Assert.Equal(errorKind.ToString(), store.AccountPauseCode);
+        Assert.Equal(1, adapter.EnsureCalls);
         Assert.Null(store.FailureCode);
         Assert.Equal(0, adapter.SaveCalls);
     }
@@ -372,7 +378,7 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task MarkAccountUnavailableAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
             AccountPaused = true;
             AccountPauseCode = code;

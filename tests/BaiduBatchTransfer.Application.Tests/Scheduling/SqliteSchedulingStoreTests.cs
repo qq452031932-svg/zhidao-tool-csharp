@@ -41,7 +41,7 @@ public sealed class SqliteSchedulingStoreTests
         var first = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
         Assert.NotNull(first);
         await store.MarkPreparingAsync(first.OperationId, Now.AddSeconds(1));
-        await store.MarkAccountUnavailableAsync(first.OperationId, "ExpiredLogin", "The account session has expired.", Now.AddSeconds(2));
+        await store.ReturnToWaitingForDailyLimitAsync(first.OperationId, Now.AddSeconds(2));
         await ExecuteAsync(db,
             "UPDATE Accounts SET Status='Active' WHERE Id=$account; UPDATE AccountAllocations SET EffectiveTargetSuccessCount=0,TargetSuccessCount=0 WHERE BatchJobId=$batch AND AccountId=$account;",
             ("$account", account.ToString("D")), ("$batch", batch.ToString("D")));
@@ -144,6 +144,71 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(1, state.ActiveSlotCount);
         Assert.Contains(a, state.BusyAccountIds);
         Assert.Equal(b, reserved?.AccountId);
+    }
+
+    [Theory]
+    [InlineData("ExpiredLogin", "The account session has expired.")]
+    [InlineData("VerificationRequired", "Account verification is required.")]
+    [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
+    [InlineData("InvalidTargetPath", "The target path is invalid.")]
+    [InlineData("InvalidLink", "The share link is invalid.")]
+    [InlineData("InvalidExtractionCode", "The extraction code is invalid.")]
+    public async Task ResultPendingStoreRejectsDefiniteErrorsWithoutChangingDatabase(string code, string message)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, account, 1, "Submitting", "Submitting", "Reserved", "{}") with
+        {
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.MarkResultPendingAsync(operation.Id, code, message, Now.AddSeconds(1)));
+
+        Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+    }
+
+    [Theory]
+    [InlineData("TransientService", "The service is temporarily unavailable.")]
+    [InlineData("UnknownResponse", "The service returned an unrecognized response.")]
+    public async Task ResultPendingStoreAcceptsOnlyUncertainExecutionResults(string code, string message)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, account, 1, "Submitting", "Submitting", "Reserved", "{}") with
+        {
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.MarkResultPendingAsync(operation.Id, code, message, Now.AddSeconds(1));
+
+        Assert.Equal("ResultPending", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("PendingConfirmation", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
+        Assert.Equal(code, await ScalarStringAsync(db, "SELECT LastErrorCode FROM TransferOperations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
     }
 
     [Fact]
@@ -325,6 +390,7 @@ public sealed class SqliteSchedulingStoreTests
 
     [Theory]
     [InlineData("ExpiredLogin", "The account session has expired.")]
+    [InlineData("VerificationRequired", "Account verification is required.")]
     [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
     [InlineData("InvalidTargetPath", "The target path is invalid.")]
     public async Task AccountFailurePausesOnlyThatAccountAndAllowsAnotherAccountToContinue(string code, string message)
@@ -343,17 +409,26 @@ public sealed class SqliteSchedulingStoreTests
             allocations: [Allocation(batch, failed, 1, 1, 1), Allocation(batch, healthy, 2, 1)]);
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
 
-        await store.MarkAccountUnavailableAsync(failedOperation.Id, code, message, Now);
+        await store.MarkDefiniteAccountFailureAsync(failedOperation.Id, code, message, Now);
         var next = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
 
         Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts WHERE Id='" + failed.ToString("D") + "'"));
-        Assert.Equal("Waiting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id='" + failedOperation.Id.ToString("D") + "'"));
-        Assert.Equal("Unoccupied", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id='" + failedOperation.Id.ToString("D") + "'"));
+        Assert.Equal("Failed", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id='" + failedOperation.Id.ToString("D") + "'"));
+        Assert.Equal("Released", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id='" + failedOperation.Id.ToString("D") + "'"));
+        Assert.Equal(code, await ScalarStringAsync(db, "SELECT LastErrorCode FROM TransferOperations WHERE Id='" + failedOperation.Id.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts WHERE Id='" + failed.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM AccountAllocations WHERE ReservedSlotCount<0"));
         Assert.Equal(healthy, next?.AccountId);
     }
 
-    [Fact]
-    public async Task AccountFailureAfterSubmitKeepsOperationPendingAndRetainsItsSlot()
+    [Theory]
+    [InlineData("ExpiredLogin", "The account session has expired.")]
+    [InlineData("VerificationRequired", "Account verification is required.")]
+    [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
+    [InlineData("InvalidTargetPath", "The target path is invalid.")]
+    public async Task DefiniteAccountFailureAfterSubmitIsFinalAndReleasesItsSlot(string code, string message)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var batch = Guid.NewGuid();
@@ -367,26 +442,90 @@ public sealed class SqliteSchedulingStoreTests
             DailyCountedAt = Now,
             SubmitStartedAt = Now,
         };
-        await db.SeedAsync([Account(failed, 0), Account(healthy, 0)],
+        await db.SeedAsync([Account(failed, 0) with { DailyExecutedCount = 1 }, Account(healthy, 0)],
             job: Job(batch, "TaskCount", "Active", 2, 2),
             resources: [submittedResource, healthyResource],
             operations: [submitted, Operation(healthyResource, healthy, 2)],
             allocations: [Allocation(batch, failed, 1, 1, 1), Allocation(batch, healthy, 2, 1)]);
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
 
-        await store.MarkAccountUnavailableAsync(
+        await store.MarkDefiniteAccountFailureAsync(
             submitted.Id,
-            "InsufficientCapacity",
-            "The account has insufficient capacity.",
+            code,
+            message,
             Now.AddSeconds(1));
         var next = await store.TryReserveNextAsync(batch, Now.AddMinutes(1), Now.AddMinutes(6));
 
         Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts WHERE Id='" + failed.ToString("D") + "'"));
-        Assert.Equal("ResultPending", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
-        Assert.Equal("PendingConfirmation", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
-        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
-        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal("Failed", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
+        Assert.Equal("ResultReceived", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
+        Assert.Equal("Released", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
+        Assert.Equal(code, await ScalarStringAsync(db, "SELECT LastErrorCode FROM TransferOperations WHERE Id='" + submitted.Id.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts WHERE Id='" + failed.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM AccountAllocations WHERE ReservedSlotCount<0"));
         Assert.Equal(healthy, next?.AccountId);
+    }
+
+    [Fact]
+    public async Task DefiniteAccountFailureReleasesSuccessCandidateForAnotherAccount()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var healthy = Guid.NewGuid();
+        var resource = Resource(batch, 1, null);
+        await db.SeedAsync([Account(failed, 0), Account(healthy, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [resource],
+            allocations: [Allocation(batch, failed, 1, 1), Allocation(batch, healthy, 2, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var first = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+        Assert.Equal(failed, first?.AccountId);
+        await store.MarkPreparingAsync(first!.OperationId, Now.AddSeconds(1));
+
+        await store.MarkDefiniteAccountFailureAsync(
+            first.OperationId,
+            "InsufficientCapacity",
+            "The account has insufficient capacity.",
+            Now.AddSeconds(2));
+        var replacement = await store.TryReserveNextAsync(batch, Now.AddMinutes(1), Now.AddMinutes(6));
+
+        Assert.Equal(healthy, replacement?.AccountId);
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems WHERE Id='" + resource.Id.ToString("D") + "'"));
+        Assert.Equal(healthy, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations WHERE AccountId='" + failed.ToString("D") + "'"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations WHERE AccountId='" + healthy.ToString("D") + "'"));
+    }
+
+    [Fact]
+    public async Task DefiniteAccountFailureRollsBackInsteadOfMakingReservedCountNegative()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved");
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, reserved: 0)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.MarkDefiniteAccountFailureAsync(
+            operation.Id,
+            "ExpiredLogin",
+            "The account session has expired.",
+            Now));
+
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts WHERE Id='" + account.ToString("D") + "'"));
+        Assert.Equal("Preparing", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations WHERE Id='" + operation.Id.ToString("D") + "'"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations WHERE Id='" + operation.Id.ToString("D") + "'"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
     }
 
     [Fact]
