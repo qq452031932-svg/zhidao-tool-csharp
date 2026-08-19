@@ -5,10 +5,19 @@ namespace BaiduBatchTransfer.Infrastructure.Security;
 public sealed class FileSystemAccountProfilePathPolicy : IAccountProfilePathPolicy
 {
     private readonly string canonicalRoot;
+    private readonly IProfilePathFileSystem fileSystem;
 
-    public FileSystemAccountProfilePathPolicy(string configuredRoot)
+    public FileSystemAccountProfilePathPolicy(string configuredRoot) :
+        this(configuredRoot, PhysicalProfilePathFileSystem.Instance)
+    {
+    }
+
+    internal FileSystemAccountProfilePathPolicy(
+        string configuredRoot,
+        IProfilePathFileSystem fileSystem)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(configuredRoot);
+        this.fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
         canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configuredRoot));
         if (string.Equals(Path.GetPathRoot(canonicalRoot), canonicalRoot, StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("The profile root cannot be a filesystem root.", nameof(configuredRoot));
@@ -44,21 +53,21 @@ public sealed class FileSystemAccountProfilePathPolicy : IAccountProfilePathPoli
         EnsureExistingComponentsAreDirectoriesWithoutReparsePoints(canonicalCandidate);
     }
 
-    private static void EnsureExistingComponentsAreDirectoriesWithoutReparsePoints(string fullPath)
+    private void EnsureExistingComponentsAreDirectoriesWithoutReparsePoints(string fullPath)
     {
         string? current = Path.TrimEndingDirectorySeparator(Path.GetFullPath(fullPath));
         while (!string.IsNullOrEmpty(current))
         {
-            var isDirectory = Directory.Exists(current);
-            var isFile = File.Exists(current);
-            if (isDirectory || isFile)
+            try
             {
-                var attributes = File.GetAttributes(current);
+                var attributes = fileSystem.GetAttributes(current);
                 if ((attributes & FileAttributes.ReparsePoint) != 0)
                     throw new IOException("Profile paths cannot contain reparse points or junctions.");
-                if (isFile)
+                if ((attributes & FileAttributes.Directory) == 0)
                     throw new IOException("Every existing profile path component must be a directory.");
             }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
 
             var parent = Path.GetDirectoryName(current);
             if (string.IsNullOrEmpty(parent) || string.Equals(parent, current, StringComparison.OrdinalIgnoreCase))
@@ -66,4 +75,18 @@ public sealed class FileSystemAccountProfilePathPolicy : IAccountProfilePathPoli
             current = Path.TrimEndingDirectorySeparator(parent);
         }
     }
+}
+
+internal interface IProfilePathFileSystem
+{
+    FileAttributes GetAttributes(string path);
+}
+
+internal sealed class PhysicalProfilePathFileSystem : IProfilePathFileSystem
+{
+    public static PhysicalProfilePathFileSystem Instance { get; } = new();
+
+    private PhysicalProfilePathFileSystem() { }
+
+    public FileAttributes GetAttributes(string path) => File.GetAttributes(path);
 }

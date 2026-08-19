@@ -22,6 +22,34 @@ public sealed class ProfilePathSecurityTests : IDisposable
     }
 
     [Fact]
+    public void DanglingAncestorJunctionIsRejectedInsteadOfBeingTreatedAsAbsent()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var target = Path.Combine(testRoot, "dangling-target");
+        var link = Path.Combine(testRoot, "dangling-link");
+        Directory.CreateDirectory(target);
+        CreateDirectoryLink(link, target);
+        Directory.Delete(target, recursive: true);
+
+        Assert.Throws<IOException>(() =>
+            new FileSystemAccountProfilePathPolicy(Path.Combine(link, "profiles")));
+
+        Directory.Delete(link, recursive: false);
+    }
+
+    [Fact]
+    public void AttributeInspectionRejectsDanglingReparseEvenWhenExistenceProbesWouldBeFalse()
+    {
+        var dangling = Path.Combine(testRoot, "simulated-dangling-link");
+        var fileSystem = new DanglingReparseFileSystem(dangling);
+
+        Assert.Throws<IOException>(() =>
+            new FileSystemAccountProfilePathPolicy(Path.Combine(dangling, "profiles"), fileSystem));
+
+        Assert.Contains(dangling, fileSystem.InspectedPaths, StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task DeleteRevalidatesAncestorsAfterEarlierValidationAndRefusesReplacementJunction()
     {
         var anchor = Path.Combine(testRoot, "anchor");
@@ -83,6 +111,19 @@ public sealed class ProfilePathSecurityTests : IDisposable
         {
             callback();
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DanglingReparseFileSystem(string danglingPath) : IProfilePathFileSystem
+    {
+        public List<string> InspectedPaths { get; } = [];
+
+        public FileAttributes GetAttributes(string path)
+        {
+            InspectedPaths.Add(path);
+            if (string.Equals(path, danglingPath, StringComparison.OrdinalIgnoreCase))
+                return FileAttributes.Directory | FileAttributes.ReparsePoint;
+            throw new DirectoryNotFoundException();
         }
     }
 }
