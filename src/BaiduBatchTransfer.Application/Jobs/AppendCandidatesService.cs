@@ -7,8 +7,8 @@ namespace BaiduBatchTransfer.Application.Jobs;
 
 public sealed class AppendCandidatesService
 {
+    private const string AppendEventCode = "CANDIDATES_APPENDED";
     private const int PageSize = 1_000;
-    private const int WriteBatchSize = 500;
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly ReplicationPreflightEstimator preflightEstimator;
     private readonly BaiduPathNormalizer pathNormalizer = new();
@@ -39,12 +39,33 @@ public sealed class AppendCandidatesService
             validated.ConfirmationToken);
     }
 
-    public async Task ConfirmAsync(
+    public async Task<AppendCandidatesResult?> GetResultAsync(
         AppendCandidatesDraft draft,
         string confirmationToken,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(confirmationToken);
+        var auditId = BatchCommandIdempotency.AuditId(
+            "append-candidates", confirmationToken, draft.BatchJobId, draft.ImportSessionId);
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var audit = await unit.Jobs.GetExecutionLogAsync(auditId, cancellationToken).ConfigureAwait(false);
+        if (audit is null) return null;
+        if (audit.BatchJobId != draft.BatchJobId || audit.EventCode != AppendEventCode)
+            throw new BatchConfirmationException("The confirmation token is already bound to a different command.");
+        return new AppendCandidatesResult(draft.BatchJobId, draft.ImportSessionId, audit.CreatedAt, audit.EventCode);
+    }
+
+    public async Task<AppendCandidatesResult> ConfirmAsync(
+        AppendCandidatesDraft draft,
+        string confirmationToken,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(confirmationToken);
+        var auditId = BatchCommandIdempotency.AuditId(
+            "append-candidates", confirmationToken, draft.BatchJobId, draft.ImportSessionId);
+        await using var gate = await BatchCommandIdempotency.AcquireAsync(auditId, cancellationToken).ConfigureAwait(false);
+        var completed = await GetResultAsync(draft, confirmationToken, cancellationToken).ConfigureAwait(false);
+        if (completed is not null) return completed;
         var preview = await PreviewAsync(draft, cancellationToken).ConfigureAwait(false);
         if (!CreateBatchService.FixedTimeEquals(preview.ConfirmationToken, confirmationToken))
             throw new BatchConfirmationException("The append preview changed and must be confirmed again.");
@@ -60,6 +81,9 @@ public sealed class AppendCandidatesService
             if (!CreateBatchService.FixedTimeEquals(validated.ConfirmationToken, confirmationToken))
                 throw new BatchConfirmationException("The append preview changed and must be confirmed again.");
             var now = DateTimeOffset.UtcNow;
+            await unit.Jobs.WriteAuditAsync(
+                new AuditEventRecord(auditId, draft.BatchJobId, null, null, null,
+                    AuditEventKind.CandidatesAppended, now), cancellationToken).ConfigureAwait(false);
             var sequence = validated.MaximumCandidateSequence;
             var resources = validated.Rows.Select(row => new ResourceItemRecord(
                 Guid.NewGuid(),
@@ -82,8 +106,7 @@ public sealed class AppendCandidatesService
                 now,
                 now)).ToArray();
 
-            foreach (var chunk in resources.Chunk(WriteBatchSize))
-                await unit.Jobs.AddResourcesAsync(chunk, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.AddResourcesAsync(resources, cancellationToken).ConfigureAwait(false);
             var updatedAllocations = validated.Allocations.Select(allocation => allocation with
             {
                 ExclusiveCandidateCount = checked(allocation.ExclusiveCandidateCount +
@@ -102,15 +125,15 @@ public sealed class AppendCandidatesService
                 CreatedBatchJobId = draft.BatchJobId,
                 UpdatedAt = now,
             }, cancellationToken).ConfigureAwait(false);
-            await unit.Jobs.AddExecutionLogsAsync(
-                [new ExecutionLogRecord(Guid.NewGuid(), draft.BatchJobId, null, null, null,
-                    "Finalization", "Information", "CANDIDATES_APPENDED", "Candidate append was confirmed.", now)],
-                cancellationToken).ConfigureAwait(false);
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new AppendCandidatesResult(
+                draft.BatchJobId, draft.ImportSessionId, now, AppendEventCode);
         }
         catch
         {
             await CreateBatchService.TryRollbackAsync(unit).ConfigureAwait(false);
+            var recovered = await GetResultAsync(draft, confirmationToken, cancellationToken).ConfigureAwait(false);
+            if (recovered is not null) return recovered;
             throw;
         }
     }

@@ -8,7 +8,6 @@ namespace BaiduBatchTransfer.Application.Jobs;
 
 public sealed class CreateBatchService
 {
-    private const int WriteBatchSize = 500;
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly BatchDraftValidator validator;
     private readonly ReplicationPreflightEstimator preflightEstimator;
@@ -85,15 +84,12 @@ public sealed class CreateBatchService
                 draft.QueueOrder);
 
             await unit.Jobs.AddAsync(job, cancellationToken).ConfigureAwait(false);
-            foreach (var chunk in resources.Chunk(WriteBatchSize))
-                await unit.Jobs.AddResourcesAsync(chunk, cancellationToken).ConfigureAwait(false);
-            foreach (var chunk in operations.Chunk(WriteBatchSize))
-                await unit.Jobs.AddOperationsAsync(chunk, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.AddResourcesAsync(resources, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.AddOperationsAsync(operations, cancellationToken).ConfigureAwait(false);
             await unit.Jobs.AddAllocationsAsync(allocations, cancellationToken).ConfigureAwait(false);
-            await unit.Jobs.AddExecutionLogsAsync(
-                [new ExecutionLogRecord(Guid.NewGuid(), draft.BatchJobId, null, null, null,
-                    "Finalization", "Information", "BATCH_CREATED", "Batch creation was confirmed.", now)],
-                cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.WriteAuditAsync(
+                new AuditEventRecord(Guid.NewGuid(), draft.BatchJobId, null, null, null,
+                    AuditEventKind.BatchCreated, now), cancellationToken).ConfigureAwait(false);
             await unit.Imports.UpdateSessionAsync(validated.Session with
             {
                 Status = "BatchCreated",

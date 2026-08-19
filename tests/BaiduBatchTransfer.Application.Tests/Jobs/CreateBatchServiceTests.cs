@@ -212,12 +212,20 @@ public sealed class CreateBatchServiceTests
             TransferMode.Replication,
             QuotaBasis.TaskCount,
             accountIds.Select((id, index) => new BatchAccountDraft(
-                id, index, $"/account-{index}", 1_000, 1_000)).ToArray());
+                id, index, $"/account-{index}", index == 0 ? 0 : index * 17,
+                index == 0 ? 0 : index * 123)).ToArray());
         var service = Service(database, long.MaxValue);
 
         var preview = await service.PreviewAsync(draft);
         Assert.Equal(1_000, preview.ResourceCount);
         Assert.Equal(3_000, preview.OperationCount);
+        Assert.All(preview.Accounts, account =>
+        {
+            Assert.Equal(1_000, account.TargetItemCount);
+            Assert.Equal(1_000, account.TargetSuccessCount);
+            Assert.Equal(1_000, account.EffectiveTargetSuccessCount);
+            Assert.Equal(1_000, account.ReachableTargetSuccessCount);
+        });
 
         await service.ConfirmAsync(draft, preview.ConfirmationToken);
 
@@ -233,6 +241,12 @@ public sealed class CreateBatchServiceTests
         Assert.Equal(3_000, operations.Select(operation => operation.OperationFingerprint).Distinct().Count());
         Assert.Equal(accountIds, allocations.Select(allocation => allocation.AccountId));
         Assert.Equal(new[] { "/account-0", "/account-1", "/account-2" }, allocations.Select(allocation => allocation.DefaultTargetPath));
+        Assert.All(allocations, allocation =>
+        {
+            Assert.Equal(1_000, allocation.TargetItemCount);
+            Assert.Equal(1_000, allocation.TargetSuccessCount);
+            Assert.Equal(1_000, allocation.EffectiveTargetSuccessCount);
+        });
         var overridden = resources.Single(resource => resource.CandidateSequence == 1);
         Assert.Equal("private note", overridden.Note);
         Assert.Equal("/row override", overridden.TargetPathOverride);

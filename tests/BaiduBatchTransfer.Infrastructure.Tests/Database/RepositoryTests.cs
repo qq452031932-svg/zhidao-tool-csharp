@@ -1,10 +1,12 @@
+using System.Diagnostics;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Database.Repositories;
+using Xunit.Abstractions;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
 
-public sealed class RepositoryTests : IDisposable
+public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-repository-{Guid.NewGuid():N}");
 
@@ -153,10 +155,8 @@ public sealed class RepositoryTests : IDisposable
         {
             await unit.Jobs.UpdateAsync(job with { ResourceCount = 2, Status = "PausedReady" });
             await unit.Jobs.UpdateAllocationsAsync([allocation with { ExclusiveCandidateCount = 2 }]);
-            await unit.Jobs.AddExecutionLogsAsync([
-                new ExecutionLogRecord(Guid.NewGuid(), job.Id, null, null, null, "Finalization",
-                    "Information", "CANDIDATES_APPENDED", "Candidate append was confirmed.", now)
-            ]);
+            await unit.Jobs.WriteAuditAsync(new AuditEventRecord(
+                Guid.NewGuid(), job.Id, null, null, null, AuditEventKind.CandidatesAppended, now));
             await unit.CommitAsync();
         }
 
@@ -173,6 +173,94 @@ public sealed class RepositoryTests : IDisposable
         Assert.True(await reader.ReadAsync());
         Assert.Equal("CANDIDATES_APPENDED", reader.GetString(0));
         Assert.Equal("Candidate append was confirmed.", reader.GetString(1));
+    }
+
+    [Fact]
+    public async Task AuditBoundaryRejectsUnknownEventsAndNeverAcceptsUserMessageContent()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var job = new BatchJobRecord(Guid.NewGuid(), "https://private/?pwd=code", "Text", "Distribution",
+            "SuccessTarget", "WaitForCandidates", 0, 0, "/private/cookie/profile", "None", "Skip",
+            "Immediate", "AwaitingCandidates", now, null, null, null, 1);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Jobs.AddAsync(job);
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => unit.Jobs.WriteAuditAsync(
+                new AuditEventRecord(Guid.NewGuid(), job.Id, null, null, null, (AuditEventKind)999, now)));
+            await unit.Jobs.WriteAuditAsync(new AuditEventRecord(
+                Guid.NewGuid(), job.Id, null, null, null, AuditEventKind.CandidatesAppended, now));
+            await unit.CommitAsync();
+        }
+
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT EventCode,SanitizedMessage FROM ExecutionLogs WHERE BatchJobId=$id;";
+        command.Parameters.AddWithValue("$id", job.Id.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        var persisted = $"{reader.GetString(0)} {reader.GetString(1)}";
+        Assert.Equal("CANDIDATES_APPENDED Candidate append was confirmed.", persisted);
+        Assert.DoesNotContain("https://", persisted, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("pwd=", persisted, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("cookie", persisted, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("profile", persisted, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/private", persisted, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task PreparedStreamingWritesHandleTwoHundredThousandResourcesAndThreeReplicasWithinBoundedMemory()
+    {
+        const int resourceCount = 200_000;
+        const int accountCount = 3;
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var accounts = Enumerable.Range(0, accountCount)
+            .Select(index => AccountRecord.Create(StableGuid(index + 1), $"scale-{index}", $"Scale {index}"))
+            .ToArray();
+        var job = new BatchJobRecord(StableGuid(900_001), "Scale", "Text", "Replication", "TaskCount",
+            "ProportionalReduction", resourceCount, resourceCount * accountCount, "/", "None", "Skip",
+            "Immediate", "Queued", now, null, null, null, 1);
+        var beforeBytes = GC.GetTotalMemory(forceFullCollection: true);
+        var peakBytes = beforeBytes;
+        using var sampling = new CancellationTokenSource();
+        var sampler = Task.Run(async () =>
+        {
+            while (!sampling.IsCancellationRequested)
+            {
+                var current = GC.GetTotalMemory(forceFullCollection: false);
+                UpdateMaximum(ref peakBytes, current);
+                await Task.Delay(10);
+            }
+        });
+        var timer = Stopwatch.StartNew();
+        try
+        {
+            await using var unit = await SqliteUnitOfWork.BeginAsync(factory);
+            foreach (var account in accounts) await unit.Accounts.UpsertAsync(account);
+            await unit.Jobs.AddAsync(job);
+            await unit.Jobs.AddResourcesAsync(ScaleResources(job.Id, resourceCount, now));
+            await unit.Jobs.AddOperationsAsync(ScaleOperations(job.Id, accounts, resourceCount, now));
+            await unit.CommitAsync();
+        }
+        finally
+        {
+            timer.Stop();
+            sampling.Cancel();
+            await sampler;
+        }
+
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT (SELECT COUNT(*) FROM ResourceItems), (SELECT COUNT(*) FROM TransferOperations);";
+        await using var reader = await count.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(resourceCount, reader.GetInt32(0));
+        Assert.Equal(resourceCount * accountCount, reader.GetInt32(1));
+        var peakGrowth = Math.Max(0, Volatile.Read(ref peakBytes) - beforeBytes);
+        output.WriteLine($"scale resources={resourceCount}, operations={resourceCount * accountCount}, elapsed={timer.Elapsed}, peak-managed-growth={peakGrowth:N0} bytes");
+        Assert.True(peakGrowth < 384L * 1024 * 1024, $"Peak managed growth was {peakGrowth:N0} bytes.");
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(18), $"Bulk insert took {timer.Elapsed}.");
     }
 
     [Fact]
@@ -261,6 +349,55 @@ public sealed class RepositoryTests : IDisposable
         var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"));
         await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         return factory;
+    }
+
+    private static IEnumerable<ResourceItemRecord> ScaleResources(
+        Guid batchJobId,
+        int count,
+        DateTimeOffset now)
+    {
+        for (var index = 1; index <= count; index++)
+        {
+            yield return new ResourceItemRecord(
+                StableGuid(1_000_000 + index), batchJobId, null, index,
+                $"https://pan.baidu.com/s/scale-{index}", $"scale-{index}", null, null, null, null,
+                null, "None", "Unknown", null, "Expanded", null, null, now, now);
+        }
+    }
+
+    private static IEnumerable<TransferOperationRecord> ScaleOperations(
+        Guid batchJobId,
+        IReadOnlyList<AccountRecord> accounts,
+        int resourceCount,
+        DateTimeOffset now)
+    {
+        var ordinal = 0;
+        for (var resourceIndex = 1; resourceIndex <= resourceCount; resourceIndex++)
+        {
+            var resourceId = StableGuid(1_000_000 + resourceIndex);
+            foreach (var account in accounts)
+            {
+                ordinal++;
+                yield return new TransferOperationRecord(
+                    StableGuid(2_000_000 + ordinal), resourceId, batchJobId, resourceIndex, ordinal,
+                    "/", "/", string.Empty, account.Id, "Replication", "Waiting", null, 0,
+                    $"scale-{resourceIndex}-{account.Id:N}", null, null, null, "NotPrepared", "Unoccupied",
+                    null, null, null, null, null, null, now, now);
+            }
+        }
+    }
+
+    private static Guid StableGuid(int value) => new(value, 0, 0, new byte[8]);
+
+    private static void UpdateMaximum(ref long target, long value)
+    {
+        var current = Volatile.Read(ref target);
+        while (value > current)
+        {
+            var observed = Interlocked.CompareExchange(ref target, value, current);
+            if (observed == current) return;
+            current = observed;
+        }
     }
 
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }

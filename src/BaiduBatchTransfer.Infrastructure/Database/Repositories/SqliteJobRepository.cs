@@ -32,11 +32,39 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddResourcesAsync(IEnumerable<ResourceItemRecord> resources, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(resources);
+        await using var c = Command("INSERT INTO ResourceItems(Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$job,$staged,$sequence,$url,$share,$code,$note,$target,$normalizedTarget,$folder,$folderMode,$validity,$constraint,$status,$reserved,$expires,$created,$updated);");
+        var id = c.Parameters.Add("$id", SqliteType.Text);
+        var job = c.Parameters.Add("$job", SqliteType.Text);
+        var staged = c.Parameters.Add("$staged", SqliteType.Text);
+        var sequence = c.Parameters.Add("$sequence", SqliteType.Integer);
+        var url = c.Parameters.Add("$url", SqliteType.Text);
+        var share = c.Parameters.Add("$share", SqliteType.Text);
+        var code = c.Parameters.Add("$code", SqliteType.Text);
+        var note = c.Parameters.Add("$note", SqliteType.Text);
+        var target = c.Parameters.Add("$target", SqliteType.Text);
+        var normalizedTarget = c.Parameters.Add("$normalizedTarget", SqliteType.Text);
+        var folder = c.Parameters.Add("$folder", SqliteType.Text);
+        var folderMode = c.Parameters.Add("$folderMode", SqliteType.Text);
+        var validity = c.Parameters.Add("$validity", SqliteType.Text);
+        var constraint = c.Parameters.Add("$constraint", SqliteType.Text);
+        var status = c.Parameters.Add("$status", SqliteType.Text);
+        var reserved = c.Parameters.Add("$reserved", SqliteType.Text);
+        var expires = c.Parameters.Add("$expires", SqliteType.Text);
+        var created = c.Parameters.Add("$created", SqliteType.Text);
+        var updated = c.Parameters.Add("$updated", SqliteType.Text);
+        c.Prepare();
         foreach (var x in resources)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var c = Command("INSERT INTO ResourceItems(Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$job,$staged,$sequence,$url,$share,$code,$note,$target,$normalizedTarget,$folder,$folderMode,$validity,$constraint,$status,$reserved,$expires,$created,$updated);");
-            Add(c,"$id",Id(x.Id)); Add(c,"$job",Id(x.BatchJobId)); Add(c,"$staged",NullableId(x.StagedImportRowId)); Add(c,"$sequence",x.CandidateSequence); Add(c,"$url",x.ShareUrl); Add(c,"$share",x.NormalizedShareId); Add(c,"$code",x.ExtractionCode); Add(c,"$note",x.Note); Add(c,"$target",x.TargetPathOverride); Add(c,"$normalizedTarget",x.NormalizedTargetPathOverride); Add(c,"$folder",x.CreateFolderName); Add(c,"$folderMode",x.FolderCreationModeOverride); Add(c,"$validity",x.GlobalValidityStatus); Add(c,"$constraint",NullableId(x.CandidateConstraintAccountId)); Add(c,"$status",x.CandidateStatus); Add(c,"$reserved",NullableId(x.ReservedAccountId)); Add(c,"$expires",NullableTime(x.ReservationExpiresAt)); Add(c,"$created",Time(x.CreatedAt)); Add(c,"$updated",Time(x.UpdatedAt));
+            id.Value = Id(x.Id); job.Value = Id(x.BatchJobId); staged.Value = NullableId(x.StagedImportRowId);
+            sequence.Value = x.CandidateSequence; url.Value = x.ShareUrl; share.Value = x.NormalizedShareId;
+            code.Value = x.ExtractionCode ?? (object)DBNull.Value; note.Value = x.Note ?? (object)DBNull.Value;
+            target.Value = x.TargetPathOverride ?? (object)DBNull.Value;
+            normalizedTarget.Value = x.NormalizedTargetPathOverride ?? (object)DBNull.Value;
+            folder.Value = x.CreateFolderName ?? (object)DBNull.Value; folderMode.Value = x.FolderCreationModeOverride;
+            validity.Value = x.GlobalValidityStatus; constraint.Value = NullableId(x.CandidateConstraintAccountId);
+            status.Value = x.CandidateStatus; reserved.Value = NullableId(x.ReservedAccountId);
+            expires.Value = NullableTime(x.ReservationExpiresAt); created.Value = Time(x.CreatedAt); updated.Value = Time(x.UpdatedAt);
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -54,11 +82,49 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddOperationsAsync(IEnumerable<TransferOperationRecord> operations, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(operations);
+        await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated);");
+        var id = c.Parameters.Add("$id", SqliteType.Text);
+        var resource = c.Parameters.Add("$resource", SqliteType.Text);
+        var job = c.Parameters.Add("$job", SqliteType.Text);
+        var sequence = c.Parameters.Add("$sequence", SqliteType.Integer);
+        var ordinal = c.Parameters.Add("$ordinal", SqliteType.Integer);
+        var target = c.Parameters.Add("$target", SqliteType.Text);
+        var normalized = c.Parameters.Add("$normalized", SqliteType.Text);
+        var folder = c.Parameters.Add("$folder", SqliteType.Text);
+        var account = c.Parameters.Add("$account", SqliteType.Text);
+        var source = c.Parameters.Add("$source", SqliteType.Text);
+        var status = c.Parameters.Add("$status", SqliteType.Text);
+        var outcome = c.Parameters.Add("$outcome", SqliteType.Text);
+        var attempt = c.Parameters.Add("$attempt", SqliteType.Integer);
+        var fingerprint = c.Parameters.Add("$fingerprint", SqliteType.Text);
+        var confirmation = c.Parameters.Add("$confirmation", SqliteType.Text);
+        var request = c.Parameters.Add("$request", SqliteType.Text);
+        var remote = c.Parameters.Add("$remote", SqliteType.Text);
+        var submit = c.Parameters.Add("$submit", SqliteType.Text);
+        var slot = c.Parameters.Add("$slot", SqliteType.Text);
+        var reserved = c.Parameters.Add("$reserved", SqliteType.Text);
+        var counted = c.Parameters.Add("$counted", SqliteType.Text);
+        var started = c.Parameters.Add("$started", SqliteType.Text);
+        var errorCode = c.Parameters.Add("$errorCode", SqliteType.Text);
+        var errorMessage = c.Parameters.Add("$errorMessage", SqliteType.Text);
+        var lease = c.Parameters.Add("$lease", SqliteType.Text);
+        var created = c.Parameters.Add("$created", SqliteType.Text);
+        var updated = c.Parameters.Add("$updated", SqliteType.Text);
+        c.Prepare();
         foreach (var x in operations)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated);");
-            Add(c,"$id",Id(x.Id)); Add(c,"$resource",Id(x.ResourceItemId)); Add(c,"$job",Id(x.BatchJobId)); Add(c,"$sequence",x.SequenceNumber); Add(c,"$ordinal",x.AllocationOrdinal); Add(c,"$target",x.TargetPath); Add(c,"$normalized",x.NormalizedTargetPath); Add(c,"$folder",x.CreateFolderName); Add(c,"$account",Id(x.AssignedAccountId)); Add(c,"$source",x.AllocationSource); Add(c,"$status",x.Status); Add(c,"$outcome",x.OutcomeKind); Add(c,"$attempt",x.AttemptCount); Add(c,"$fingerprint",x.OperationFingerprint); Add(c,"$confirmation",x.ConfirmationDescriptorJson); Add(c,"$request",x.AdapterRequestId); Add(c,"$remote",x.RemoteItemIdsJson); Add(c,"$submit",x.SubmitState); Add(c,"$slot",x.TargetSlotState); Add(c,"$reserved",NullableTime(x.TargetSlotReservedAt)); Add(c,"$counted",NullableTime(x.DailyCountedAt)); Add(c,"$started",NullableTime(x.SubmitStartedAt)); Add(c,"$errorCode",x.LastErrorCode); Add(c,"$errorMessage",x.LastErrorMessage); Add(c,"$lease",NullableTime(x.LeaseExpiresAt)); Add(c,"$created",Time(x.CreatedAt)); Add(c,"$updated",Time(x.UpdatedAt));
+            id.Value = Id(x.Id); resource.Value = Id(x.ResourceItemId); job.Value = Id(x.BatchJobId);
+            sequence.Value = x.SequenceNumber; ordinal.Value = x.AllocationOrdinal; target.Value = x.TargetPath;
+            normalized.Value = x.NormalizedTargetPath; folder.Value = x.CreateFolderName; account.Value = Id(x.AssignedAccountId);
+            source.Value = x.AllocationSource; status.Value = x.Status; outcome.Value = x.OutcomeKind ?? (object)DBNull.Value;
+            attempt.Value = x.AttemptCount; fingerprint.Value = x.OperationFingerprint;
+            confirmation.Value = x.ConfirmationDescriptorJson ?? (object)DBNull.Value;
+            request.Value = x.AdapterRequestId ?? (object)DBNull.Value; remote.Value = x.RemoteItemIdsJson ?? (object)DBNull.Value;
+            submit.Value = x.SubmitState; slot.Value = x.TargetSlotState; reserved.Value = NullableTime(x.TargetSlotReservedAt);
+            counted.Value = NullableTime(x.DailyCountedAt); started.Value = NullableTime(x.SubmitStartedAt);
+            errorCode.Value = x.LastErrorCode ?? (object)DBNull.Value; errorMessage.Value = x.LastErrorMessage ?? (object)DBNull.Value;
+            lease.Value = NullableTime(x.LeaseExpiresAt); created.Value = Time(x.CreatedAt); updated.Value = Time(x.UpdatedAt);
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -126,16 +192,31 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         return new(items,total,query.PageNumber,query.PageSize);
     }
 
-    public async Task AddExecutionLogsAsync(IEnumerable<ExecutionLogRecord> logs, CancellationToken cancellationToken = default)
+    public async Task WriteAuditAsync(AuditEventRecord audit, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(logs);
-        foreach (var x in logs)
+        ArgumentNullException.ThrowIfNull(audit);
+        var (eventCode, message) = audit.EventKind switch
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            await using var c = Command("INSERT INTO ExecutionLogs(Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,Stage,Level,EventCode,SanitizedMessage,CreatedAt) VALUES($id,$job,$resource,$operation,$account,$stage,$level,$code,$message,$created);");
-            Add(c,"$id",Id(x.Id)); Add(c,"$job",NullableId(x.BatchJobId)); Add(c,"$resource",NullableId(x.ResourceItemId)); Add(c,"$operation",NullableId(x.TransferOperationId)); Add(c,"$account",NullableId(x.AccountId)); Add(c,"$stage",x.Stage); Add(c,"$level",x.Level); Add(c,"$code",x.EventCode); Add(c,"$message",x.SanitizedMessage); Add(c,"$created",Time(x.CreatedAt));
-            await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+            AuditEventKind.BatchCreated => ("BATCH_CREATED", "Batch creation was confirmed."),
+            AuditEventKind.CandidatesAppended => ("CANDIDATES_APPENDED", "Candidate append was confirmed."),
+            AuditEventKind.ShortfallReopened => ("SHORTFALL_REOPENED", "Shortfall batch reopen was confirmed."),
+            _ => throw new ArgumentOutOfRangeException(nameof(audit), "The audit event is not allowlisted."),
+        };
+        await using var c = Command("INSERT INTO ExecutionLogs(Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,Stage,Level,EventCode,SanitizedMessage,CreatedAt) VALUES($id,$job,$resource,$operation,$account,'Finalization','Information',$code,$message,$created);");
+        Add(c,"$id",Id(audit.Id)); Add(c,"$job",NullableId(audit.BatchJobId)); Add(c,"$resource",NullableId(audit.ResourceItemId)); Add(c,"$operation",NullableId(audit.TransferOperationId)); Add(c,"$account",NullableId(audit.AccountId)); Add(c,"$code",eventCode); Add(c,"$message",message); Add(c,"$created",Time(audit.CreatedAt));
+        await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<ExecutionLogRecord?> GetExecutionLogAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        await using var c = Command("SELECT Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,Stage,Level,EventCode,SanitizedMessage,CreatedAt FROM ExecutionLogs WHERE Id=$id;");
+        Add(c,"$id",Id(id));
+        await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new ExecutionLogRecord(
+                Guid.Parse(r.GetString(0)), ReadNullableId(r,1), ReadNullableId(r,2), ReadNullableId(r,3),
+                ReadNullableId(r,4), r.GetString(5), r.GetString(6), r.GetString(7), r.GetString(8), ReadTime(r,9))
+            : null;
     }
 
     private async Task<long> CountAsync(string table, Guid batchJobId, CancellationToken cancellationToken)

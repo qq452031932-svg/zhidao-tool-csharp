@@ -91,6 +91,76 @@ public sealed class AppendCandidatesServiceTests
     }
 
     [Fact]
+    public async Task AppendConfirmationIsDurablyIdempotentForConcurrentAndSequentialReplay()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var importId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(batchId, oldImportId, "AwaitingCandidates", null, 0), null, null,
+            [Allocation(batchId, account, 1, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(importId, 1, 1, appendToBatchJobId: batchId),
+            [BatchTestData.ReadyRow(importId, 1)]);
+        var service = Service(database, long.MaxValue);
+        var request = new AppendCandidatesDraft(batchId, importId);
+        var preview = await service.PreviewAsync(request);
+
+        var concurrent = await Task.WhenAll(Enumerable.Range(0, 4)
+            .Select(_ => Service(database, long.MaxValue).ConfirmAsync(request, preview.ConfirmationToken)));
+        var replay = await service.ConfirmAsync(request, preview.ConfirmationToken);
+        var queried = await service.GetResultAsync(request, preview.ConfirmationToken);
+
+        Assert.All(concurrent, result => Assert.Equal(concurrent[0], result));
+        Assert.Equal(concurrent[0], replay);
+        Assert.Equal(concurrent[0], queried);
+        Assert.Equal(batchId, replay.BatchJobId);
+        Assert.Equal(importId, replay.ImportSessionId);
+        Assert.Equal("CANDIDATES_APPENDED", replay.EventCode);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Single(await CreateBatchServiceTests.AllResourcesAsync(read.Jobs, batchId));
+        Assert.Equal(1, (await read.Jobs.GetAsync(batchId))!.ResourceCount);
+        Assert.Equal(1L, await CountAuditAsync(database, batchId, "CANDIDATES_APPENDED"));
+    }
+
+    [Fact]
+    public async Task CompletedAppendTokenCannotBeReusedForDifferentRequest()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var firstBatch = Guid.NewGuid();
+        var secondBatch = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        var firstImport = Guid.NewGuid();
+        var secondImport = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(firstBatch, oldImportId, "AwaitingCandidates", null, 0), null, null,
+            [Allocation(firstBatch, account, 1, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(firstImport, 1, 1, appendToBatchJobId: firstBatch),
+            [BatchTestData.ReadyRow(firstImport, 1)]);
+        var secondOldImport = Guid.NewGuid();
+        await database.SeedAsync([], BatchTestData.ReadySession(secondOldImport, 0, 0), null,
+            Job(secondBatch, secondOldImport, "AwaitingCandidates", null, 0), null, null,
+            [Allocation(secondBatch, account, 1, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(secondImport, 1, 1, appendToBatchJobId: secondBatch),
+            [BatchTestData.ReadyRow(secondImport, 1)]);
+        var service = Service(database, long.MaxValue);
+        var first = new AppendCandidatesDraft(firstBatch, firstImport);
+        var preview = await service.PreviewAsync(first);
+        await service.ConfirmAsync(first, preview.ConfirmationToken);
+
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ConfirmAsync(new AppendCandidatesDraft(secondBatch, secondImport), preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Empty(await CreateBatchServiceTests.AllResourcesAsync(read.Jobs, secondBatch));
+        Assert.Equal("ReadyToConfirm", (await read.Imports.GetSessionAsync(secondImport))!.Status);
+    }
+
+    [Fact]
     public async Task AppendConfirmationBecomesStaleWhenInheritedAllocationSnapshotChanges()
     {
         await using var database = await BatchTestDatabase.CreateAsync();
@@ -297,6 +367,42 @@ public sealed class AppendCandidatesServiceTests
         Assert.Equal(1, savedAllocation.ReservedSlotCount);
     }
 
+    [Fact]
+    public async Task ReopenShortfallApplyIsDurablyIdempotentForConcurrentAndSequentialReplay()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        var completedAt = BatchTestData.Now.AddHours(1);
+        var allocation = Allocation(batchId, account, 10, 7, 1, 1) with { EffectiveTargetSuccessCount = 7 };
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(batchId, oldImportId, "CompletedWithShortfall", completedAt, 0), null, null, [allocation]);
+        var service = new ReopenShortfallBatchService(database.UnitOfWorkFactory);
+        var preview = await service.PreviewAsync(batchId);
+        var reopenedAt = BatchTestData.Now.AddHours(2);
+
+        var concurrent = await Task.WhenAll(Enumerable.Range(0, 4)
+            .Select(_ => new ReopenShortfallBatchService(database.UnitOfWorkFactory)
+                .ApplyAsync(batchId, preview.ConfirmationToken, reopenedAt)));
+        var replay = await service.ApplyAsync(batchId, preview.ConfirmationToken, reopenedAt);
+        var queried = await service.GetResultAsync(batchId, preview.ConfirmationToken);
+
+        Assert.All(concurrent, result => Assert.Equal(concurrent[0], result));
+        Assert.Equal(concurrent[0], replay);
+        Assert.Equal(concurrent[0], queried);
+        Assert.Equal(batchId, replay.BatchJobId);
+        Assert.Equal("SHORTFALL_REOPENED", replay.EventCode);
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ApplyAsync(batchId, preview.ConfirmationToken, reopenedAt.AddSeconds(1)));
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("PausedReady", (await read.Jobs.GetAsync(batchId))!.Status);
+        Assert.Equal(10, Assert.Single((await read.Jobs.GetAllocationsPageAsync(
+            batchId, new PageQuery(1, 10))).Items).EffectiveTargetSuccessCount);
+        Assert.Equal(1L, await CountAuditAsync(database, batchId, "SHORTFALL_REOPENED"));
+    }
+
     private static BatchJobRecord Job(
         Guid id,
         Guid importId,
@@ -312,6 +418,19 @@ public sealed class AppendCandidatesServiceTests
         new(database.UnitOfWorkFactory,
             new ReplicationPreflightEstimator(
                 new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(availableBytes), database.DatabasePath));
+
+    private static async Task<long> CountAuditAsync(
+        BatchTestDatabase database,
+        Guid batchJobId,
+        string eventCode)
+    {
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM ExecutionLogs WHERE BatchJobId=$batch AND EventCode=$event;";
+        command.Parameters.AddWithValue("$batch", batchJobId.ToString("D"));
+        command.Parameters.AddWithValue("$event", eventCode);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
 
     private static ResourceItemRecord Resource(
         Guid batchId,

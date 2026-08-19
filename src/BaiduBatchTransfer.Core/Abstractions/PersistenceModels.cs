@@ -100,3 +100,23 @@ public sealed record ExecutionLogRecord(
     public override string ToString() =>
         $"ExecutionLogRecord {{ Id = {Id}, Stage = {Stage}, Level = {Level}, EventCode = {EventCode}, SanitizedMessage = [REDACTED] }}";
 }
+
+public enum AuditEventKind
+{
+    BatchCreated,
+    CandidatesAppended,
+    ShortfallReopened,
+}
+
+public sealed record AuditEventRecord(
+    Guid Id,
+    Guid? BatchJobId,
+    Guid? ResourceItemId,
+    Guid? TransferOperationId,
+    Guid? AccountId,
+    AuditEventKind EventKind,
+    DateTimeOffset CreatedAt)
+{
+    public override string ToString() =>
+        $"AuditEventRecord {{ Id = {Id}, EventKind = {EventKind}, EntityIds = [REDACTED] }}";
+}

@@ -79,17 +79,20 @@ public sealed class BatchDraftValidator
         var confirmations = accounts.Select(account =>
         {
             var constraintCount = rows.Count(row => row.ConstraintAccountId == account.Draft.AccountId);
+            var replicationTarget = draft.TransferMode == TransferMode.Replication ? rows.Length : (int?)null;
             return new BatchAccountConfirmation(
                 account.Draft.AccountId,
                 account.Draft.PriorityOrder,
                 account.Draft.DefaultTargetPath,
                 account.NormalizedDefaultTargetPath,
-                draft.TransferMode == TransferMode.Replication ? rows.Length : account.Draft.TargetItemCount,
-                draft.TransferMode == TransferMode.Replication ? rows.Length : account.Draft.TargetSuccessCount,
+                replicationTarget ?? account.Draft.TargetItemCount,
+                replicationTarget ?? account.Draft.TargetSuccessCount,
                 draft.QuotaBasis == QuotaBasis.TaskCount ? constraintCount : 0,
                 draft.QuotaBasis == QuotaBasis.SuccessTarget ? constraintCount : 0,
-                effectiveTargetSuccessCount: effectiveTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount,
-                reachableTargetSuccessCount: reachableTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount);
+                effectiveTargetSuccessCount: replicationTarget ??
+                    effectiveTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount,
+                reachableTargetSuccessCount: replicationTarget ??
+                    reachableTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount);
         }).ToImmutableArray();
 
         var operationCount = draft.TransferMode == TransferMode.Replication

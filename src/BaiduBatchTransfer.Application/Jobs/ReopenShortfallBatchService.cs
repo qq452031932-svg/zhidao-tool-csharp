@@ -9,6 +9,7 @@ namespace BaiduBatchTransfer.Application.Jobs;
 public sealed class ReopenShortfallBatchService(IUnitOfWorkFactory unitOfWorkFactory)
 {
     private const int PageSize = 1_000;
+    private const string ReopenEventCode = "SHORTFALL_REOPENED";
     private readonly IUnitOfWorkFactory unitOfWorkFactory =
         unitOfWorkFactory ?? throw new ArgumentNullException(nameof(unitOfWorkFactory));
 
@@ -21,13 +22,37 @@ public sealed class ReopenShortfallBatchService(IUnitOfWorkFactory unitOfWorkFac
         return await BuildPreviewAsync(batchJobId, unit, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task ApplyAsync(
+    public async Task<ReopenShortfallResult?> GetResultAsync(
+        Guid batchJobId,
+        string confirmationToken,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(confirmationToken);
+        var auditId = BatchCommandIdempotency.AuditId("reopen-shortfall", confirmationToken, batchJobId);
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var audit = await unit.Jobs.GetExecutionLogAsync(auditId, cancellationToken).ConfigureAwait(false);
+        if (audit is null) return null;
+        if (audit.BatchJobId != batchJobId || audit.EventCode != ReopenEventCode)
+            throw new BatchConfirmationException("The confirmation token is already bound to a different command.");
+        return new ReopenShortfallResult(batchJobId, audit.CreatedAt, audit.EventCode);
+    }
+
+    public async Task<ReopenShortfallResult> ApplyAsync(
         Guid batchJobId,
         string confirmationToken,
         DateTimeOffset reopenedAt,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(confirmationToken);
+        var auditId = BatchCommandIdempotency.AuditId("reopen-shortfall", confirmationToken, batchJobId);
+        await using var gate = await BatchCommandIdempotency.AcquireAsync(auditId, cancellationToken).ConfigureAwait(false);
+        var completed = await GetResultAsync(batchJobId, confirmationToken, cancellationToken).ConfigureAwait(false);
+        if (completed is not null)
+        {
+            if (completed.AppliedAt != reopenedAt)
+                throw new BatchConfirmationException("The confirmation token is already bound to a different reopen request.");
+            return completed;
+        }
         var preview = await PreviewAsync(batchJobId, cancellationToken).ConfigureAwait(false);
         if (!CreateBatchService.FixedTimeEquals(preview.ConfirmationToken, confirmationToken))
             throw new BatchConfirmationException("The shortfall snapshot changed and must be confirmed again.");
@@ -41,6 +66,9 @@ public sealed class ReopenShortfallBatchService(IUnitOfWorkFactory unitOfWorkFac
             if (reopenedAt < current.CompletedAt)
                 throw new ArgumentOutOfRangeException(nameof(reopenedAt), "The reopen time cannot precede completion.");
 
+            await unit.Jobs.WriteAuditAsync(
+                new AuditEventRecord(auditId, batchJobId, null, null, null,
+                    AuditEventKind.ShortfallReopened, reopenedAt), cancellationToken).ConfigureAwait(false);
             var allocations = await ReadAllocationsAsync(unit.Jobs, batchJobId, cancellationToken).ConfigureAwait(false);
             await unit.Jobs.UpdateAllocationsAsync(allocations.Select(allocation => allocation with
             {
@@ -50,15 +78,19 @@ public sealed class ReopenShortfallBatchService(IUnitOfWorkFactory unitOfWorkFac
                 ?? throw new BatchDraftValidationException("The shortfall batch does not exist.");
             await unit.Jobs.UpdateAsync(batch with { Status = "PausedReady", CompletedAt = null }, cancellationToken)
                 .ConfigureAwait(false);
-            await unit.Jobs.AddExecutionLogsAsync(
-                [new ExecutionLogRecord(Guid.NewGuid(), batchJobId, null, null, null,
-                    "Finalization", "Information", "SHORTFALL_REOPENED", "Shortfall batch reopen was confirmed.", reopenedAt)],
-                cancellationToken).ConfigureAwait(false);
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new ReopenShortfallResult(batchJobId, reopenedAt, ReopenEventCode);
         }
         catch
         {
             await CreateBatchService.TryRollbackAsync(unit).ConfigureAwait(false);
+            var recovered = await GetResultAsync(batchJobId, confirmationToken, cancellationToken).ConfigureAwait(false);
+            if (recovered is not null)
+            {
+                if (recovered.AppliedAt != reopenedAt)
+                    throw new BatchConfirmationException("The confirmation token is already bound to a different reopen request.");
+                return recovered;
+            }
             throw;
         }
     }

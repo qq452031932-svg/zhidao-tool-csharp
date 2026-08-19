@@ -14,5 +14,6 @@ public interface IJobRepository
     Task AddAllocationsAsync(IEnumerable<AccountAllocationRecord> allocations, CancellationToken cancellationToken = default);
     Task UpdateAllocationsAsync(IEnumerable<AccountAllocationRecord> allocations, CancellationToken cancellationToken = default);
     Task<Page<AccountAllocationRecord>> GetAllocationsPageAsync(Guid batchJobId, PageQuery query, CancellationToken cancellationToken = default);
-    Task AddExecutionLogsAsync(IEnumerable<ExecutionLogRecord> logs, CancellationToken cancellationToken = default);
+    Task WriteAuditAsync(AuditEventRecord audit, CancellationToken cancellationToken = default);
+    Task<ExecutionLogRecord?> GetExecutionLogAsync(Guid id, CancellationToken cancellationToken = default);
 }
