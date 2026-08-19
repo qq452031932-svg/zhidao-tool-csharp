@@ -14,6 +14,14 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task UpdateAsync(BatchJobRecord j, CancellationToken cancellationToken = default)
+    {
+        await using var c = Command("UPDATE BatchJobs SET Name=$name,SourceType=$source,TransferMode=$mode,QuotaBasis=$quota,ShortagePolicy=$shortage,ResourceCount=$resources,OperationCount=$operations,DefaultTargetPath=$target,FolderCreationMode=$folder,DuplicatePolicy=$duplicate,ValidationMode=$validation,Status=$status,StartedAt=$started,CompletedAt=$completed,ImportSessionId=$import,QueueOrder=$queue WHERE Id=$id;");
+        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder);
+        if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidOperationException("The batch no longer exists.");
+    }
+
     public async Task<BatchJobRecord?> GetAsync(Guid id, CancellationToken cancellationToken = default)
     {
         await using var c = Command("SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder FROM BatchJobs WHERE Id=$id;"); Add(c,"$id",Id(id));
@@ -95,6 +103,19 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         }
     }
 
+    public async Task UpdateAllocationsAsync(IEnumerable<AccountAllocationRecord> allocations, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(allocations);
+        foreach (var x in allocations)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var c = Command("UPDATE AccountAllocations SET PriorityOrder=$priority,DefaultTargetPath=$target,NormalizedDefaultTargetPath=$normalized,TargetItemCount=$targetItems,TargetSuccessCount=$targetSuccess,EffectiveTargetSuccessCount=$effective,AssignedItemCount=$assigned,AttemptedItemCount=$attempted,NewSuccessItemCount=$newSuccess,AlreadySatisfiedItemCount=$satisfied,SuccessItemCount=$success,FailedItemCount=$failed,LockedItemCount=$locked,ExclusiveCandidateCount=$exclusive,UnusedCandidateCount=$unused,ReservedSlotCount=$reserved,FulfilledCount=$fulfilled WHERE Id=$id AND BatchJobId=$job AND AccountId=$account;");
+            Add(c,"$id",Id(x.Id)); Add(c,"$job",Id(x.BatchJobId)); Add(c,"$account",Id(x.AccountId)); Add(c,"$priority",x.PriorityOrder); Add(c,"$target",x.DefaultTargetPath); Add(c,"$normalized",x.NormalizedDefaultTargetPath); Add(c,"$targetItems",x.TargetItemCount); Add(c,"$targetSuccess",x.TargetSuccessCount); Add(c,"$effective",x.EffectiveTargetSuccessCount); Add(c,"$assigned",x.AssignedItemCount); Add(c,"$attempted",x.AttemptedItemCount); Add(c,"$newSuccess",x.NewSuccessItemCount); Add(c,"$satisfied",x.AlreadySatisfiedItemCount); Add(c,"$success",x.SuccessItemCount); Add(c,"$failed",x.FailedItemCount); Add(c,"$locked",x.LockedItemCount); Add(c,"$exclusive",x.ExclusiveCandidateCount); Add(c,"$unused",x.UnusedCandidateCount); Add(c,"$reserved",x.ReservedSlotCount); Add(c,"$fulfilled",x.FulfilledCount);
+            if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException("The account allocation no longer exists.");
+        }
+    }
+
     public async Task<Page<AccountAllocationRecord>> GetAllocationsPageAsync(Guid batchJobId, PageQuery query, CancellationToken cancellationToken = default)
     {
         query.Validate(); cancellationToken.ThrowIfCancellationRequested();
@@ -103,6 +124,18 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var items = new List<AccountAllocationRecord>(); await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),Guid.Parse(r.GetString(2)),r.GetInt32(3),r.GetString(4),r.GetString(5),r.GetInt32(6),r.GetInt32(7),r.GetInt32(8),r.GetInt32(9),r.GetInt32(10),r.GetInt32(11),r.GetInt32(12),r.GetInt32(13),r.GetInt32(14),r.GetInt32(15),r.GetInt32(16),r.GetInt32(17),r.GetInt32(18),r.GetInt32(19)));
         return new(items,total,query.PageNumber,query.PageSize);
+    }
+
+    public async Task AddExecutionLogsAsync(IEnumerable<ExecutionLogRecord> logs, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(logs);
+        foreach (var x in logs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var c = Command("INSERT INTO ExecutionLogs(Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,Stage,Level,EventCode,SanitizedMessage,CreatedAt) VALUES($id,$job,$resource,$operation,$account,$stage,$level,$code,$message,$created);");
+            Add(c,"$id",Id(x.Id)); Add(c,"$job",NullableId(x.BatchJobId)); Add(c,"$resource",NullableId(x.ResourceItemId)); Add(c,"$operation",NullableId(x.TransferOperationId)); Add(c,"$account",NullableId(x.AccountId)); Add(c,"$stage",x.Stage); Add(c,"$level",x.Level); Add(c,"$code",x.EventCode); Add(c,"$message",x.SanitizedMessage); Add(c,"$created",Time(x.CreatedAt));
+            await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private async Task<long> CountAsync(string table, Guid batchJobId, CancellationToken cancellationToken)

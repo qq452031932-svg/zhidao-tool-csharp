@@ -92,3 +92,11 @@ public sealed record AccountAllocationRecord(
     int EffectiveTargetSuccessCount, int AssignedItemCount, int AttemptedItemCount, int NewSuccessItemCount,
     int AlreadySatisfiedItemCount, int SuccessItemCount, int FailedItemCount, int LockedItemCount,
     int ExclusiveCandidateCount, int UnusedCandidateCount, int ReservedSlotCount, int FulfilledCount);
+
+public sealed record ExecutionLogRecord(
+    Guid Id, Guid? BatchJobId, Guid? ResourceItemId, Guid? TransferOperationId, Guid? AccountId,
+    string Stage, string Level, string EventCode, string SanitizedMessage, DateTimeOffset CreatedAt)
+{
+    public override string ToString() =>
+        $"ExecutionLogRecord {{ Id = {Id}, Stage = {Stage}, Level = {Level}, EventCode = {EventCode}, SanitizedMessage = [REDACTED] }}";
+}

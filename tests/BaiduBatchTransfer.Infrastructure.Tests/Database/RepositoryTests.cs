@@ -131,6 +131,51 @@ public sealed class RepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task JobUpdatesAllocationUpdatesAndSanitizedAuditShareOneTransaction()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var account = AccountRecord.Create(Guid.NewGuid(), "update-user", "Update");
+        var job = new BatchJobRecord(Guid.NewGuid(), "Job", "Text", "Distribution", "SuccessTarget",
+            "WaitForCandidates", 1, 0, "/", "None", "Skip", "Immediate", "AwaitingCandidates",
+            now, null, null, null, 1);
+        var allocation = new AccountAllocationRecord(Guid.NewGuid(), job.Id, account.Id, 1, "/", "/",
+            0, 10, 10, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(account);
+            await unit.Jobs.AddAsync(job);
+            await unit.Jobs.AddAllocationsAsync([allocation]);
+            await unit.CommitAsync();
+        }
+
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Jobs.UpdateAsync(job with { ResourceCount = 2, Status = "PausedReady" });
+            await unit.Jobs.UpdateAllocationsAsync([allocation with { ExclusiveCandidateCount = 2 }]);
+            await unit.Jobs.AddExecutionLogsAsync([
+                new ExecutionLogRecord(Guid.NewGuid(), job.Id, null, null, null, "Finalization",
+                    "Information", "CANDIDATES_APPENDED", "Candidate append was confirmed.", now)
+            ]);
+            await unit.CommitAsync();
+        }
+
+        await using (var read = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            Assert.Equal("PausedReady", (await read.Jobs.GetAsync(job.Id))!.Status);
+            Assert.Equal(2, Assert.Single((await read.Jobs.GetAllocationsPageAsync(job.Id, new PageQuery(1, 10))).Items).ExclusiveCandidateCount);
+        }
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT EventCode,SanitizedMessage FROM ExecutionLogs WHERE BatchJobId=$id;";
+        command.Parameters.AddWithValue("$id", job.Id.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("CANDIDATES_APPENDED", reader.GetString(0));
+        Assert.Equal("Candidate append was confirmed.", reader.GetString(1));
+    }
+
+    [Fact]
     public async Task OperationSubmitLifecyclePersistsDescriptorBeforeResponseIdentifiers()
     {
         var factory = await CreateFactoryAsync(); var now = DateTimeOffset.UtcNow;
