@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
@@ -17,6 +18,11 @@ public sealed partial class DiagnosticExportService
     private static readonly HashSet<string> AllowedMetadata = new(StringComparer.OrdinalIgnoreCase)
     {
         "os", "architecture", "runtime", "appMode"
+    };
+    private static readonly HashSet<string> SensitiveJsonKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "userId", "accountId", "extractionCode", "accessToken", "token", "Cookie", "Authorization", "BDUSS", "STOKEN",
+        "responseBody", "response_body", "body"
     };
     private readonly string diagnosticRoot;
 
@@ -53,7 +59,8 @@ public sealed partial class DiagnosticExportService
 
     private static string Sanitize(string value)
     {
-        var result = ResponseBody().Replace(value ?? string.Empty, "[REDACTED]");
+        var result = SanitizeJson(value ?? string.Empty);
+        result = ResponseBody().Replace(result, "[REDACTED]");
         result = AnyUrl().Replace(result, "[REDACTED_URL]");
         result = WindowsPath().Replace(result, "[REDACTED_PATH]");
         result = SensitiveJsonField().Replace(result, "$1[REDACTED]");
@@ -64,6 +71,34 @@ public sealed partial class DiagnosticExportService
         result = ExtractionCode().Replace(result, "$1[REDACTED]");
         result = GuidIdentifier().Replace(result, "[REDACTED_ID]");
         return result;
+    }
+
+    private static string SanitizeJson(string value)
+    {
+        try
+        {
+            var node = JsonNode.Parse(value);
+            if (node is null) return value;
+            RedactNode(node);
+            return node.ToJsonString();
+        }
+        catch (JsonException) { return value; }
+    }
+
+    private static void RedactNode(JsonNode node)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var key in obj.Select(x => x.Key).ToArray())
+            {
+                if (SensitiveJsonKeys.Contains(key)) obj[key] = "[REDACTED]";
+                else if (obj[key] is { } child) RedactNode(child);
+            }
+        }
+        else if (node is JsonArray array)
+        {
+            foreach (var child in array.OfType<JsonNode>()) RedactNode(child);
+        }
     }
 
     private static string SafeMetadata(string value) => value is not null && SafeMetadataPattern().IsMatch(value) ? value : "[REDACTED]";

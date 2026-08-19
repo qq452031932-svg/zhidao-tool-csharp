@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Globalization;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
@@ -23,7 +24,10 @@ public sealed partial class DatabaseSchemaValidator
             version.CommandText = "SELECT COALESCE(MAX(Version),-1) FROM SchemaVersions;";
             try
             {
-                if (Convert.ToInt32(await version.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != expectedVersion)
+                var rawVersion = await version.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                var textVersion = Convert.ToString(rawVersion, CultureInfo.InvariantCulture);
+                if (!long.TryParse(textVersion, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedVersion) ||
+                    parsedVersion is < 0 or > int.MaxValue || parsedVersion != expectedVersion)
                     errors.Add("Schema version does not match the backup identity.");
             }
             catch (SqliteException) { errors.Add("SchemaVersions has an invalid shape."); }

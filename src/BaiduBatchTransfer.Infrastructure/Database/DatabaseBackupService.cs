@@ -57,8 +57,8 @@ public sealed partial class DatabaseBackupService
                     !(await schemaValidator.ValidateAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)).IsValid) continue;
                 result.Add(new(path, expectedVersion, created, true));
             }
-            catch (SqliteException) { }
-            catch (InvalidDataException) { }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception) { }
         }
         return result;
     }
@@ -79,7 +79,8 @@ public sealed partial class DatabaseBackupService
             return await QuickCheckAsync(connection, cancellationToken).ConfigureAwait(false) &&
                 (await schemaValidator.ValidateAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)).IsValid;
         }
-        catch (SqliteException) { return false; }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception) { return false; }
     }
 
     internal static string EnsureDirectChild(string path, string root)
