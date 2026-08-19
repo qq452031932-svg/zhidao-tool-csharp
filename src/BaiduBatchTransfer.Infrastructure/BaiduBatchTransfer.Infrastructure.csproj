@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Database\Migrations\*.sql" />
+    <InternalsVisibleTo Include="BaiduBatchTransfer.Infrastructure.Tests" />
   </ItemGroup>
 
 </Project>

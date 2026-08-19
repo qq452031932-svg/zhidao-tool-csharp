@@ -25,15 +25,26 @@ public sealed partial class DatabaseBackupService
         var createdAt = DateTimeOffset.UtcNow;
         var path = Path.Combine(BackupRoot, $"database-v{schemaVersion}-{createdAt:yyyyMMddTHHmmssfffZ}.db.bak");
         path = EnsureDirectChild(path, BackupRoot);
-        await using var source = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        var destinationString = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString();
-        await using var destination = new SqliteConnection(destinationString);
-        await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
-        source.BackupDatabase(destination);
-        var integrity = await QuickCheckAsync(destination, cancellationToken).ConfigureAwait(false);
-        if (!integrity || !(await schemaValidator.ValidateAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false)).IsValid)
-            throw new InvalidDataException("The SQLite online backup is not a valid application database.");
-        return new(path, schemaVersion, createdAt, true);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var source = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var destinationString = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString();
+            await using var destination = new SqliteConnection(destinationString);
+            await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            source.BackupDatabase(destination);
+            cancellationToken.ThrowIfCancellationRequested();
+            var integrity = await QuickCheckAsync(destination, cancellationToken).ConfigureAwait(false);
+            if (!integrity || !(await schemaValidator.ValidateAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false)).IsValid)
+                throw new InvalidDataException("The SQLite online backup is not a valid application database.");
+            return new(path, schemaVersion, createdAt, true);
+        }
+        catch
+        {
+            if (File.Exists(path)) File.Delete(path);
+            throw;
+        }
     }
 
     public async Task<IReadOnlyList<DatabaseBackupDescriptor>> ListValidatedBackupsAsync(CancellationToken cancellationToken = default)
@@ -81,6 +92,27 @@ public sealed partial class DatabaseBackupService
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception) { return false; }
+    }
+
+    internal async Task<bool> ValidateDatabaseFileAsync(string path, int expectedVersion, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder { DataSource = Path.GetFullPath(path), Mode = SqliteOpenMode.ReadOnly, Pooling = false };
+            await using var connection = new SqliteConnection(builder.ToString());
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            return await QuickCheckAsync(connection, cancellationToken).ConfigureAwait(false) &&
+                (await schemaValidator.ValidateAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)).IsValid;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception) { return false; }
+    }
+
+    internal static bool TryGetBackupVersion(string path, out int version)
+    {
+        version = 0;
+        var match = BackupName().Match(Path.GetFileName(path));
+        return match.Success && int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out version);
     }
 
     internal static string EnsureDirectChild(string path, string root)

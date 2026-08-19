@@ -78,16 +78,17 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task RestoreQuarantinesCurrentDatabaseAndReopensValidatedBackup()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "CREATE TABLE Marker(Value TEXT); INSERT INTO Marker VALUES('backup');");
+        var accountId = Guid.NewGuid().ToString("D");
+        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'marker','backup','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
         var candidate = await backup.CreateBackupAsync(1);
-        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "UPDATE Marker SET Value='damaged-newer';");
+        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "UPDATE Accounts SET DisplayName='damaged-newer' WHERE Id=$id;", ("$id", accountId));
         var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"));
 
         var result = await recovery.RestoreAsync(candidate.Path);
 
         Assert.True(File.Exists(result.QuarantinePath));
         await using var verify = await factory.OpenConnectionAsync();
-        await using var command = verify.CreateCommand(); command.CommandText = "SELECT Value FROM Marker;";
+        await using var command = verify.CreateCommand(); command.CommandText = "SELECT DisplayName FROM Accounts WHERE Id=$id;"; command.Parameters.AddWithValue("$id", accountId);
         Assert.Equal("backup", await command.ExecuteScalarAsync());
     }
 
@@ -95,7 +96,8 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task FailedRestorePreservesOriginalDatabase()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "CREATE TABLE Marker(Value TEXT); INSERT INTO Marker VALUES('original');");
+        var accountId = Guid.NewGuid().ToString("D");
+        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'marker','original','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
         var valid = await backup.CreateBackupAsync(1);
         var tooNew = Path.Combine(root, "backups", "database-v99-20260101T000000000Z.db.bak");
         File.Copy(valid.Path, tooNew);
@@ -109,22 +111,85 @@ public sealed class DatabaseRecoveryTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => recovery.RestoreAsync(tooNew));
 
         await using var verify = await factory.OpenConnectionAsync();
-        await using var command = verify.CreateCommand(); command.CommandText = "SELECT Value FROM Marker;";
+        await using var command = verify.CreateCommand(); command.CommandText = "SELECT DisplayName FROM Accounts WHERE Id=$id;"; command.Parameters.AddWithValue("$id", accountId);
         Assert.Equal("original", await command.ExecuteScalarAsync());
     }
 
     [Fact]
-    public async Task QuarantineCollisionNeverDeletesOrChangesLiveDatabase()
+    public async Task AtomicReplaceFailureNeverDeletesOrChangesLiveDatabase()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "CREATE TABLE Marker(Value TEXT); INSERT INTO Marker VALUES('original');");
         var candidate = await backup.CreateBackupAsync(1); var before = await File.ReadAllBytesAsync(factory.DatabasePath);
         var quarantineRoot = Path.Combine(root, "quarantine"); Directory.CreateDirectory(quarantineRoot);
         var fixedNow = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
-        await File.WriteAllTextAsync(Path.Combine(quarantineRoot, "database-damaged-20260101T000000000Z.db"), "collision");
-        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), quarantineRoot, new FixedTimeProvider(fixedNow));
+        var files = new FaultInjectingFileOperations { FailReplaceCall = 1 };
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), quarantineRoot, new FixedTimeProvider(fixedNow), files);
         await Assert.ThrowsAnyAsync<IOException>(() => recovery.RestoreAsync(candidate.Path));
         Assert.True(File.Exists(factory.DatabasePath)); Assert.Equal(before, await File.ReadAllBytesAsync(factory.DatabasePath));
+    }
+
+    [Fact]
+    public async Task PostInstallValidationFailureRestoresOriginalAndPreservesFailedRestore()
+    {
+        var (factory, backup, migrator) = await CreateDatabaseAsync();
+        var accountId = Guid.NewGuid().ToString("D");
+        await using (var connection = await factory.OpenConnectionAsync())
+            await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'u','backup','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
+        var candidate = await backup.CreateBackupAsync(1);
+        await using (var connection = await factory.OpenConnectionAsync())
+            await MigrationTests.ExecuteAsync(connection, "UPDATE Accounts SET DisplayName='original-live' WHERE Id=$id;", ("$id", accountId));
+        var files = new FaultInjectingFileOperations { CorruptInstalledDatabase = true, CreateInstalledSidecars = true };
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"), fileOperations: files);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => recovery.RestoreAsync(candidate.Path));
+
+        Assert.False(File.Exists(factory.DatabasePath + "-wal"));
+        Assert.False(File.Exists(factory.DatabasePath + "-shm"));
+        Assert.NotNull(files.FailedRestorePath);
+        Assert.True(File.Exists(files.FailedRestorePath + "-wal"));
+        Assert.True(File.Exists(files.FailedRestorePath + "-shm"));
+        await using var verify = await factory.OpenConnectionAsync();
+        await using var command = verify.CreateCommand(); command.CommandText = "SELECT DisplayName FROM Accounts WHERE Id=$id;"; command.Parameters.AddWithValue("$id", accountId);
+        Assert.Equal("original-live", await command.ExecuteScalarAsync());
+        Assert.NotNull(files.FailedRestorePath); Assert.True(File.Exists(files.FailedRestorePath));
+        Assert.NotNull(files.QuarantinePath); Assert.True(File.Exists(files.QuarantinePath));
+    }
+
+    [Fact]
+    public async Task RollbackFailurePreservesOriginalQuarantineAndFailedRestoreAndAggregatesErrors()
+    {
+        var (factory, backup, migrator) = await CreateDatabaseAsync();
+        var candidate = await backup.CreateBackupAsync(1);
+        var files = new FaultInjectingFileOperations { CorruptInstalledDatabase = true, FailReplaceCall = 2 };
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"), fileOperations: files);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() => recovery.RestoreAsync(candidate.Path));
+
+        Assert.True(error.InnerExceptions.Count >= 2);
+        Assert.NotNull(files.QuarantinePath); Assert.True(File.Exists(files.QuarantinePath));
+        Assert.NotNull(files.FailedRestorePath); Assert.True(File.Exists(files.FailedRestorePath));
+    }
+
+    [Fact]
+    public async Task SuccessfulMainRollbackRestoresOriginalSidecarsDespiteFailedDiagnosticCopy()
+    {
+        var (factory, backup, migrator) = await CreateDatabaseAsync();
+        var candidate = await backup.CreateBackupAsync(1);
+        var originalWal = new byte[] { 1, 2, 3 }; var originalShm = new byte[] { 4, 5, 6 };
+        await File.WriteAllBytesAsync(factory.DatabasePath + "-wal", originalWal);
+        await File.WriteAllBytesAsync(factory.DatabasePath + "-shm", originalShm);
+        var files = new FaultInjectingFileOperations
+        {
+            CorruptInstalledDatabase = true,
+            CreateInstalledSidecars = true,
+            FailFailedRestoreCopy = true
+        };
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"), fileOperations: files);
+
+        await Assert.ThrowsAsync<AggregateException>(() => recovery.RestoreAsync(candidate.Path));
+
+        Assert.Equal(originalWal, await File.ReadAllBytesAsync(factory.DatabasePath + "-wal"));
+        Assert.Equal(originalShm, await File.ReadAllBytesAsync(factory.DatabasePath + "-shm"));
     }
 
     [Fact]
@@ -142,11 +207,17 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task ExclusiveMaintenanceBlocksNewConnectionsUntilReleased()
     {
         var (factory, _, _) = await CreateDatabaseAsync();
+        await using var rawLifecycle = await factory.OpenConnectionAsync();
+        rawLifecycle.Close();
         Task<Microsoft.Data.Sqlite.SqliteConnection> blocked;
         using (factory.EnterExclusiveMaintenance())
         {
             using (ExecutionContext.SuppressFlow()) blocked = Task.Run(() => factory.OpenConnectionAsync());
             await Assert.ThrowsAsync<InvalidOperationException>(() => blocked);
+            Task rawBlocked;
+            using (ExecutionContext.SuppressFlow()) rawBlocked = Task.Run(rawLifecycle.Open);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => rawBlocked);
+            Assert.Equal(0, factory.ActiveConnectionCount);
         }
         await using var reopened = await factory.OpenConnectionAsync();
         Assert.Equal(System.Data.ConnectionState.Open, reopened.State);
@@ -225,7 +296,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         for (var index = 0; index < exportedLogs.Length; index++)
         {
             var fields = exportedLogs[index].EnumerateObject().Select(x => x.Name).Order().ToArray();
-            Assert.Equal(new[] { "EventCode", "Level", "MessageOmitted", "Sequence", "Stage" }, fields);
+            Assert.Equal(new[] { "EventCodeOmitted", "Level", "MessageOmitted", "Sequence", "Stage" }, fields);
             Assert.Equal(index + 1, exportedLogs[index].GetProperty("Sequence").GetInt32());
             Assert.True(exportedLogs[index].GetProperty("MessageOmitted").GetBoolean());
         }
@@ -233,6 +304,55 @@ public sealed class DatabaseRecoveryTests : IDisposable
         using var metadataJson = JsonDocument.Parse(Read(zip.GetEntry("metadata.json")!));
         var metadataFields = metadataJson.RootElement.EnumerateObject().Select(x => x.Name).ToArray();
         Assert.Equal(new[] { "os" }, metadataFields);
+
+        static string Read(ZipArchiveEntry entry) { using var reader = new StreamReader(entry.Open()); return reader.ReadToEnd(); }
+    }
+
+    [Fact]
+    public async Task DiagnosticZipMapsTokenShapedStructuralValuesToSemanticConstants()
+    {
+        Directory.CreateDirectory(root);
+        var service = new DiagnosticExportService(Path.Combine(root, "diagnostics"));
+        var path = await service.CreateAsync(new DiagnosticExportRequest(
+            "AppTokenSecret123", 1, ["ok"],
+            [new DiagnosticLogEntry("StageTokenSecret123", "LevelTokenSecret123", "EventTokenSecret123", "message")],
+            new Dictionary<string, string>
+            {
+                ["os"] = "OsTokenSecret123", ["architecture"] = "ArchitectureTokenSecret123",
+                ["runtime"] = "RuntimeTokenSecret123", ["appMode"] = "ModeTokenSecret123"
+            }));
+
+        using var zip = ZipFile.OpenRead(path);
+        var contents = string.Join('\n', zip.Entries.Select(Read));
+        foreach (var secret in new[] { "AppTokenSecret123", "StageTokenSecret123", "LevelTokenSecret123", "EventTokenSecret123", "OsTokenSecret123", "ArchitectureTokenSecret123", "RuntimeTokenSecret123", "ModeTokenSecret123" })
+            Assert.DoesNotContain(secret, contents, StringComparison.Ordinal);
+
+        using var manifest = JsonDocument.Parse(Read(zip.GetEntry("manifest.json")!));
+        Assert.Equal("unknown", manifest.RootElement.GetProperty("AppVersion").GetString());
+        using var logs = JsonDocument.Parse(Read(zip.GetEntry("logs.json")!));
+        var log = logs.RootElement[0];
+        Assert.Equal("Other", log.GetProperty("Stage").GetString());
+        Assert.Equal("Other", log.GetProperty("Level").GetString());
+        Assert.False(log.TryGetProperty("EventCode", out _));
+        Assert.True(log.GetProperty("EventCodeOmitted").GetBoolean());
+        using var metadata = JsonDocument.Parse(Read(zip.GetEntry("metadata.json")!));
+        Assert.All(metadata.RootElement.EnumerateObject(), property => Assert.Equal("Other", property.Value.GetString()));
+
+        static string Read(ZipArchiveEntry entry) { using var reader = new StreamReader(entry.Open()); return reader.ReadToEnd(); }
+    }
+
+    [Fact]
+    public async Task DiagnosticMetadataDoesNotPermitPrimitiveBypassOfPerKeySemantics()
+    {
+        Directory.CreateDirectory(root);
+        var service = new DiagnosticExportService(Path.Combine(root, "diagnostics"));
+        var path = await service.CreateAsync(new DiagnosticExportRequest(
+            "1.0", 1, ["ok"], [],
+            new Dictionary<string, string> { ["os"] = "123456789", ["architecture"] = "true", ["runtime"] = "987654321", ["appMode"] = "false" }));
+
+        using var zip = ZipFile.OpenRead(path);
+        using var metadata = JsonDocument.Parse(Read(zip.GetEntry("metadata.json")!));
+        Assert.All(metadata.RootElement.EnumerateObject(), property => Assert.Equal("Other", property.Value.GetString()));
 
         static string Read(ZipArchiveEntry entry) { using var reader = new StreamReader(entry.Open()); return reader.ReadToEnd(); }
     }
@@ -251,5 +371,52 @@ public sealed class DatabaseRecoveryTests : IDisposable
     private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => value;
+    }
+
+    private sealed class FaultInjectingFileOperations : IDatabaseFileOperations
+    {
+        private int replaceCalls;
+        private string? installedDatabasePath;
+        public int? FailReplaceCall { get; init; }
+        public bool CorruptInstalledDatabase { get; init; }
+        public bool CreateInstalledSidecars { get; init; }
+        public bool FailFailedRestoreCopy { get; init; }
+        public string? QuarantinePath { get; private set; }
+        public string? FailedRestorePath { get; private set; }
+
+        public void CreateDirectory(string path) => Directory.CreateDirectory(path);
+        public bool Exists(string path)
+        {
+            if (CreateInstalledSidecars && replaceCalls >= 1 && installedDatabasePath is not null &&
+                (path == installedDatabasePath + "-wal" || path == installedDatabasePath + "-shm") && !File.Exists(path))
+                File.WriteAllBytes(path, [7, 7, 7]);
+            return File.Exists(path);
+        }
+        public void Copy(string source, string destination, bool overwrite)
+        {
+            if (FailFailedRestoreCopy && destination.Contains("failed-restore", StringComparison.Ordinal) && !source.EndsWith("-wal", StringComparison.Ordinal) && !source.EndsWith("-shm", StringComparison.Ordinal))
+                throw new IOException("Injected failed-restore copy failure.");
+            File.Copy(source, destination, overwrite);
+            if (destination.Contains("failed-restore", StringComparison.Ordinal)) FailedRestorePath = destination;
+        }
+        public void Move(string source, string destination) => File.Move(source, destination);
+        public void Delete(string path) => File.Delete(path);
+        public void Replace(string source, string destination, string? backupPath)
+        {
+            var call = ++replaceCalls;
+            if (FailReplaceCall == call) throw new IOException($"Injected replace failure {call}.");
+            File.Replace(source, destination, backupPath, ignoreMetadataErrors: true);
+            if (call == 1)
+            {
+                installedDatabasePath = destination;
+                QuarantinePath = backupPath;
+                if (CorruptInstalledDatabase) File.WriteAllBytes(destination, [1, 2, 3, 4, 5]);
+                if (CreateInstalledSidecars)
+                {
+                    File.WriteAllBytes(destination + "-wal", [9, 9, 9]);
+                    File.WriteAllBytes(destination + "-shm", [8, 8, 8]);
+                }
+            }
+        }
     }
 }

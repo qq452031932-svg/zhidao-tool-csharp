@@ -43,8 +43,16 @@ public sealed class SqliteConnectionFactory
         var counted = 1;
         connection.StateChange += (_, args) =>
         {
-            if (args.OriginalState == ConnectionState.Open && args.CurrentState == ConnectionState.Closed &&
-                Interlocked.Exchange(ref counted, 0) != 0)
+            if (args.CurrentState == ConnectionState.Open)
+            {
+                if (Interlocked.Exchange(ref counted, 1) == 0) Interlocked.Increment(ref activeConnectionCount);
+                if (Volatile.Read(ref exclusiveMaintenance) != 0 && !maintenanceOwner.Value)
+                {
+                    connection.Close();
+                    throw new InvalidOperationException("Database recovery is in progress.");
+                }
+            }
+            else if (args.CurrentState == ConnectionState.Closed && Interlocked.Exchange(ref counted, 0) != 0)
                 Interlocked.Decrement(ref activeConnectionCount);
         };
         try

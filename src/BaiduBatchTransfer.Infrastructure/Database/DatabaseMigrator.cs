@@ -9,6 +9,7 @@ public sealed class DatabaseMigrator
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseBackupService backupService;
     private readonly DatabaseIntegrityService integrityService;
+    private readonly DatabaseSchemaValidator schemaValidator = new();
     private readonly string appVersion;
 
     public DatabaseMigrator(SqliteConnectionFactory factory, DatabaseBackupService backupService, string appVersion)
@@ -32,6 +33,11 @@ public sealed class DatabaseMigrator
             await ApplyMigrationAsync(next, cancellationToken).ConfigureAwait(false);
         }
         await integrityService.EnsureHealthyAsync(cancellationToken).ConfigureAwait(false);
+        await using (var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var schema = await schemaValidator.ValidateAsync(connection, LatestVersion, cancellationToken).ConfigureAwait(false);
+            if (!schema.IsValid) throw new InvalidDataException($"Database schema validation failed: {string.Join("; ", schema.Errors)}");
+        }
         return LatestVersion;
     }
 
@@ -47,10 +53,11 @@ public sealed class DatabaseMigrator
 
     private async Task ApplyMigrationAsync(int version, CancellationToken cancellationToken)
     {
-        var suffix = $"Database.Migrations.{version:000}_InitialSchema.sql";
+        var prefix = $"Database.Migrations.{version:000}_";
         var assembly = typeof(DatabaseMigrator).Assembly;
-        var resource = assembly.GetManifestResourceNames().SingleOrDefault(x => x.EndsWith(suffix, StringComparison.Ordinal))
-            ?? throw new InvalidOperationException($"Missing migration resource {suffix}.");
+        var resource = assembly.GetManifestResourceNames().SingleOrDefault(x =>
+            x.Contains(prefix, StringComparison.Ordinal) && x.EndsWith(".sql", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"Missing migration resource with prefix {prefix}.");
         await using var stream = assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException($"Cannot read {resource}.");
         using var reader = new StreamReader(stream); var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);

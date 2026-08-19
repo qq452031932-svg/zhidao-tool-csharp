@@ -1,3 +1,5 @@
+using System.Runtime.ExceptionServices;
+
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed record DatabaseRecoveryResult(string RestoredBackupPath, string QuarantinePath);
@@ -10,6 +12,7 @@ public sealed class DatabaseRecoveryService
     private readonly DatabaseIntegrityService integrityService;
     private readonly string quarantineRoot;
     private readonly TimeProvider timeProvider;
+    private readonly IDatabaseFileOperations files;
 
     public DatabaseRecoveryService(
         SqliteConnectionFactory factory,
@@ -17,7 +20,8 @@ public sealed class DatabaseRecoveryService
         DatabaseMigrator migrator,
         DatabaseIntegrityService integrityService,
         string quarantineRoot,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IDatabaseFileOperations? fileOperations = null)
     {
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
         this.backupService = backupService ?? throw new ArgumentNullException(nameof(backupService));
@@ -25,6 +29,7 @@ public sealed class DatabaseRecoveryService
         this.integrityService = integrityService ?? throw new ArgumentNullException(nameof(integrityService));
         this.quarantineRoot = Path.GetFullPath(quarantineRoot ?? throw new ArgumentNullException(nameof(quarantineRoot)));
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        files = fileOperations ?? new DatabaseFileOperations();
     }
 
     public Task<IReadOnlyList<DatabaseBackupDescriptor>> ListValidatedBackupsAsync(CancellationToken cancellationToken = default) =>
@@ -34,51 +39,110 @@ public sealed class DatabaseRecoveryService
     {
         var backup = DatabaseBackupService.EnsureDirectChild(selectedBackupPath, backupService.BackupRoot);
         using var maintenance = factory.EnterExclusiveMaintenance();
-        if (!await backupService.ValidateBackupAsync(backup, cancellationToken).ConfigureAwait(false))
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!DatabaseBackupService.TryGetBackupVersion(backup, out var backupVersion) ||
+            !await backupService.ValidateBackupAsync(backup, cancellationToken).ConfigureAwait(false))
             throw new InvalidDataException("The selected backup is not a validated SQLite backup.");
 
-        Directory.CreateDirectory(quarantineRoot);
-        var stamp = timeProvider.GetUtcNow().ToString("yyyyMMddTHHmmssfffZ");
-        var quarantine = DatabaseBackupService.EnsureDirectChild(Path.Combine(quarantineRoot, $"database-damaged-{stamp}.db"), quarantineRoot);
-        var staging = DatabaseBackupService.EnsureDirectChild(Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, $"database-restore-{Guid.NewGuid():N}.tmp"), Path.GetDirectoryName(factory.DatabasePath)!);
-        var moved = new List<(string Original, string Quarantine)>();
-        var installedRestore = false;
+        var liveRoot = Path.GetDirectoryName(factory.DatabasePath) ?? throw new InvalidOperationException("Database path has no directory.");
+        files.CreateDirectory(liveRoot);
+        files.CreateDirectory(quarantineRoot);
+        var identity = $"{timeProvider.GetUtcNow():yyyyMMddTHHmmssfffZ}-{Guid.NewGuid():N}";
+        var quarantine = DatabaseBackupService.EnsureDirectChild(Path.Combine(quarantineRoot, $"database-damaged-{identity}.db"), quarantineRoot);
+        var failedRestore = DatabaseBackupService.EnsureDirectChild(Path.Combine(quarantineRoot, $"database-failed-restore-{identity}.db"), quarantineRoot);
+        var staging = DatabaseBackupService.EnsureDirectChild(Path.Combine(liveRoot, $"database-restore-{Guid.NewGuid():N}.tmp"), liveRoot);
+        var rollbackStaging = DatabaseBackupService.EnsureDirectChild(Path.Combine(liveRoot, $"database-rollback-{Guid.NewGuid():N}.tmp"), liveRoot);
+        var movedSidecars = new List<(string Live, string Quarantined)>();
+        var installed = false;
+        var originalExisted = files.Exists(factory.DatabasePath);
+
         try
         {
-            MoveToQuarantineIfPresent(factory.DatabasePath, quarantine, moved);
-            MoveToQuarantineIfPresent(factory.DatabasePath + "-wal", quarantine + "-wal", moved);
-            MoveToQuarantineIfPresent(factory.DatabasePath + "-shm", quarantine + "-shm", moved);
-            File.Copy(backup, staging, overwrite: false);
-            File.Move(staging, factory.DatabasePath);
-            installedRestore = true;
+            cancellationToken.ThrowIfCancellationRequested();
+            files.Copy(backup, staging, overwrite: false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!await backupService.ValidateDatabaseFileAsync(staging, backupVersion, cancellationToken).ConfigureAwait(false))
+                throw new InvalidDataException("The staged restore is not a validated application database.");
+
+            MoveSidecarIfPresent(factory.DatabasePath + "-wal", quarantine + "-wal", movedSidecars);
+            MoveSidecarIfPresent(factory.DatabasePath + "-shm", quarantine + "-shm", movedSidecars);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (originalExisted) files.Replace(staging, factory.DatabasePath, quarantine);
+            else files.Move(staging, factory.DatabasePath);
+            installed = true;
+
             await migrator.MigrateAsync(cancellationToken).ConfigureAwait(false);
             await integrityService.EnsureHealthyAsync(cancellationToken).ConfigureAwait(false);
             return new(backup, quarantine);
         }
-        catch
+        catch (Exception original)
         {
-            DeleteExactIfPresent(staging);
-            if (installedRestore)
+            var cleanupErrors = new List<Exception>();
+            var mainRollbackSucceeded = !installed;
+            if (installed)
             {
-                DeleteExactIfPresent(factory.DatabasePath);
-                DeleteExactIfPresent(factory.DatabasePath + "-wal");
-                DeleteExactIfPresent(factory.DatabasePath + "-shm");
+                TryCleanup(() =>
+                {
+                    if (files.Exists(factory.DatabasePath)) files.Copy(factory.DatabasePath, failedRestore, overwrite: false);
+                }, cleanupErrors);
+
+                if (originalExisted)
+                {
+                    TryCleanup(() =>
+                    {
+                        if (!files.Exists(quarantine)) throw new IOException("The original database quarantine is missing.");
+                        files.Copy(quarantine, rollbackStaging, overwrite: false);
+                        files.Replace(rollbackStaging, factory.DatabasePath, backupPath: null);
+                        mainRollbackSucceeded = true;
+                    }, cleanupErrors);
+                }
+                else
+                {
+                    TryCleanup(() =>
+                    {
+                        if (files.Exists(factory.DatabasePath)) files.Delete(factory.DatabasePath);
+                        mainRollbackSucceeded = true;
+                    }, cleanupErrors);
+                }
             }
-            foreach (var (original, quarantined) in moved.AsEnumerable().Reverse())
-                if (File.Exists(quarantined)) File.Move(quarantined, original);
+
+            if (installed && mainRollbackSucceeded)
+            {
+                foreach (var suffix in new[] { "-wal", "-shm" })
+                {
+                    TryCleanup(() =>
+                    {
+                        var live = factory.DatabasePath + suffix;
+                        var quarantined = quarantine + suffix;
+                        if (files.Exists(live)) files.Move(live, failedRestore + suffix);
+                        if (files.Exists(quarantined)) files.Move(quarantined, live);
+                    }, cleanupErrors);
+                }
+            }
+            else if (!installed)
+            {
+                foreach (var (live, quarantined) in movedSidecars.AsEnumerable().Reverse())
+                    TryCleanup(() => { if (files.Exists(quarantined)) files.Move(quarantined, live); }, cleanupErrors);
+            }
+            TryCleanup(() => { if (files.Exists(staging)) files.Delete(staging); }, cleanupErrors);
+            TryCleanup(() => { if (files.Exists(rollbackStaging)) files.Delete(rollbackStaging); }, cleanupErrors);
+
+            if (cleanupErrors.Count != 0) throw new AggregateException("Database restore and recovery cleanup failed.", [original, .. cleanupErrors]);
+            ExceptionDispatchInfo.Capture(original).Throw();
             throw;
         }
     }
 
-    private static void MoveToQuarantineIfPresent(string original, string quarantine, ICollection<(string, string)> moved)
+    private void MoveSidecarIfPresent(string live, string quarantined, ICollection<(string, string)> moved)
     {
-        if (!File.Exists(original)) return;
-        File.Move(original, quarantine);
-        moved.Add((original, quarantine));
+        if (!files.Exists(live)) return;
+        files.Move(live, quarantined);
+        moved.Add((live, quarantined));
     }
 
-    private static void DeleteExactIfPresent(string path)
+    private static void TryCleanup(Action action, ICollection<Exception> errors)
     {
-        if (File.Exists(path)) File.Delete(path);
+        try { action(); }
+        catch (Exception error) { errors.Add(error); }
     }
 }

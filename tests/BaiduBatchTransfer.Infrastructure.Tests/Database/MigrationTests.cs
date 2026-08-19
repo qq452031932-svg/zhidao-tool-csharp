@@ -95,7 +95,7 @@ public sealed class MigrationTests : IDisposable
         await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
-            await ExecuteAsync(connection, "CREATE TABLE Legacy(Value TEXT); INSERT INTO Legacy VALUES ('kept'); CREATE TABLE SchemaVersions(Version INTEGER PRIMARY KEY, AppliedAt TEXT NOT NULL, AppVersion TEXT NOT NULL); INSERT INTO SchemaVersions VALUES(0,'2026-01-01','old');");
+            await ExecuteAsync(connection, "CREATE TABLE SchemaVersions(Version INTEGER PRIMARY KEY, AppliedAt TEXT NOT NULL, AppVersion TEXT NOT NULL); INSERT INTO SchemaVersions VALUES(0,'2026-01-01','old');");
         }
         var factory = new SqliteConnectionFactory(path);
         var backup = new DatabaseBackupService(factory, Path.Combine(root, "backups"));
@@ -131,6 +131,80 @@ public sealed class MigrationTests : IDisposable
         await migrator.MigrateAsync();
         await File.WriteAllBytesAsync(path, [1, 2, 3, 4, 5]);
         await Assert.ThrowsAsync<DatabaseIntegrityException>(() => migrator.MigrateAsync());
+    }
+
+    [Fact]
+    public async Task SchemaFingerprintPreservesCheckLiteralCaseAndRejectsUnexpectedUserObjects()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "app.db");
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "1.0").MigrateAsync();
+
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, "PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=replace(sql, '''Cancelled''', '''cancelled''') WHERE name='UX_TransferOperations_ActiveKey'; PRAGMA writable_schema=OFF;");
+        }
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            var changedLiteral = await new DatabaseSchemaValidator().ValidateAsync(connection, 1);
+            Assert.False(changedLiteral.IsValid);
+        }
+
+        File.Delete(path);
+        await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups-2")), "1.0").MigrateAsync();
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, "CREATE TRIGGER malicious_trigger AFTER INSERT ON Accounts BEGIN DELETE FROM Accounts; END;");
+            var extraTrigger = await new DatabaseSchemaValidator().ValidateAsync(connection, 1);
+            Assert.False(extraTrigger.IsValid);
+            await ExecuteAsync(connection, "DROP TRIGGER malicious_trigger; CREATE VIEW malicious_view AS SELECT * FROM Accounts;");
+            var extraView = await new DatabaseSchemaValidator().ValidateAsync(connection, 1);
+            Assert.False(extraView.IsValid);
+            await ExecuteAsync(connection, "DROP VIEW malicious_view; CREATE TABLE malicious_table(Value TEXT);");
+            var extraTable = await new DatabaseSchemaValidator().ValidateAsync(connection, 1);
+            Assert.False(extraTable.IsValid);
+        }
+    }
+
+    [Fact]
+    public async Task MigratorRejectsMalformedPreexistingSchemaAfterMigrationAndPreservesUpgradeBackup()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "app.db");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            await ExecuteAsync(connection, "CREATE TABLE Accounts(Id TEXT PRIMARY KEY, BaiduUserId TEXT, DisplayName TEXT, Status TEXT, IsEnabled INTEGER, IsDeleted INTEGER, SortOrder INTEGER); CREATE TABLE SchemaVersions(Version INTEGER PRIMARY KEY, AppliedAt TEXT NOT NULL, AppVersion TEXT NOT NULL); INSERT INTO SchemaVersions VALUES(0,'2026-01-01','old');");
+        }
+        var factory = new SqliteConnectionFactory(path);
+        var backup = new DatabaseBackupService(factory, Path.Combine(root, "backups"));
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => new DatabaseMigrator(factory, backup, "1.0").MigrateAsync());
+
+        var preserved = Assert.Single(await backup.ListValidatedBackupsAsync());
+        Assert.Equal(0, preserved.SchemaVersion);
+    }
+
+    [Fact]
+    public async Task BackupCancellationOrValidationFailureLeavesNoPartialBackup()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "app.db");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            await ExecuteAsync(connection, "CREATE TABLE SchemaVersions(Version INTEGER PRIMARY KEY, AppliedAt TEXT NOT NULL, AppVersion TEXT NOT NULL); INSERT INTO SchemaVersions VALUES(1,'2026-01-01','bad');");
+        }
+        var factory = new SqliteConnectionFactory(path);
+        var backupRoot = Path.Combine(root, "backups");
+        var backup = new DatabaseBackupService(factory, backupRoot);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => backup.CreateBackupAsync(1));
+        Assert.Empty(Directory.EnumerateFiles(backupRoot));
+        using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => backup.CreateBackupAsync(1, cancellation.Token));
+        Assert.Empty(Directory.EnumerateFiles(backupRoot));
     }
 
     public void Dispose()

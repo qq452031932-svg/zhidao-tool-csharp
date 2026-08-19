@@ -135,6 +135,41 @@ public sealed class RepositoryTests : IDisposable
         Assert.Equal(0, page.TotalCount);
     }
 
+    [Fact]
+    public async Task UnitOfWorkCleanupAttemptsEveryStepAndAggregatesFailures()
+    {
+        var calls = new List<string>();
+        static ValueTask Fail(List<string> calls, string step)
+        {
+            calls.Add(step);
+            return ValueTask.FromException(new IOException(step));
+        }
+
+        var error = await Assert.ThrowsAsync<AggregateException>(async () =>
+            await UnitOfWorkCleanup.DisposeAsync(
+                rollbackRequired: true,
+                () => Fail(calls, "rollback"),
+                () => Fail(calls, "transaction"),
+                () => Fail(calls, "connection")));
+
+        Assert.Equal(new[] { "rollback", "transaction", "connection" }, calls);
+        Assert.Equal(3, error.InnerExceptions.Count);
+    }
+
+    [Fact]
+    public async Task FactoryTracksRawCloseAndReopenLifecycle()
+    {
+        var factory = await CreateFactoryAsync();
+        await using var connection = await factory.OpenConnectionAsync();
+        Assert.Equal(1, factory.ActiveConnectionCount);
+        connection.Close();
+        Assert.Equal(0, factory.ActiveConnectionCount);
+        connection.Open();
+        Assert.Equal(1, factory.ActiveConnectionCount);
+        await connection.DisposeAsync();
+        Assert.Equal(0, factory.ActiveConnectionCount);
+    }
+
     private async Task<SqliteConnectionFactory> CreateFactoryAsync()
     {
         Directory.CreateDirectory(root);

@@ -46,14 +46,13 @@ public sealed class SqliteUnitOfWork : IUnitOfWork
 
     public async ValueTask DisposeAsync()
     {
-        if (!completed)
-        {
-            try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
-            catch (InvalidOperationException) { }
-            completed = true;
-        }
-        await transaction.DisposeAsync().ConfigureAwait(false);
-        await connection.DisposeAsync().ConfigureAwait(false);
+        var rollbackRequired = !completed;
+        completed = true;
+        await UnitOfWorkCleanup.DisposeAsync(
+            rollbackRequired,
+            () => new ValueTask(transaction.RollbackAsync(CancellationToken.None)),
+            transaction.DisposeAsync,
+            connection.DisposeAsync).ConfigureAwait(false);
     }
 
     private void EnsureActive()
