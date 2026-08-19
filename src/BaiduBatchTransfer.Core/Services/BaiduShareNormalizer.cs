@@ -10,7 +10,7 @@ public sealed class BaiduShareNormalizer
         throwOnInvalidBytes: true);
 
     private const string TrailingSentencePunctuation =
-        ".,;!?)\"]}>\u3002\uFF0C\uFF1B\uFF01\uFF1F\uFF09\u3011\u300B\u300D\u300F\u3015\u3017\u3019\u301B";
+        ".,;!?:')\"]}>\u2019\u201D\u3002\uFF0C\uFF1A\uFF1B\uFF01\uFF1F\uFF09\u3011\u300B\u300D\u300F\u3015\u3017\u3019\u301B";
 
     public BaiduShareNormalizationResult Normalize(string input)
     {

@@ -67,6 +67,37 @@ public sealed class BaiduShareNormalizerTests
     }
 
     [Theory]
+    [InlineData("'")]
+    [InlineData("\u2019")]
+    [InlineData("\u201D")]
+    [InlineData(":")]
+    [InlineData("\uFF1A")]
+    [InlineData("\"")]
+    public void RawTrailingProseMarks_AreRemoved(string proseMark)
+    {
+        var result = _normalizer.Normalize($"https://pan.baidu.com/s/abc{proseMark}");
+
+        Assert.Equal("abc", result.ShareId);
+        Assert.Equal("https://pan.baidu.com/s/abc", result.CanonicalUrl);
+    }
+
+    [Theory]
+    [InlineData("%27", "abc'")]
+    [InlineData("%E2%80%99", "abc\u2019")]
+    [InlineData("%E2%80%9D", "abc\u201D")]
+    [InlineData("%3A", "abc:")]
+    [InlineData("%EF%BC%9A", "abc\uFF1A")]
+    [InlineData("%22", "abc\"")]
+    public void PercentEncodedTrailingMarks_RemainShareIdData(
+        string encodedMark,
+        string expectedShareId)
+    {
+        var result = _normalizer.Normalize($"https://pan.baidu.com/s/abc{encodedMark}");
+
+        Assert.Equal(expectedShareId, result.ShareId);
+    }
+
+    [Theory]
     [InlineData("not a url")]
     [InlineData("http://pan.baidu.com/s/abc")]
     [InlineData("https://example.com/s/abc")]
