@@ -915,7 +915,7 @@ public sealed class SqliteTransferSchedulingStore :
             }
             var fingerprint = Fingerprint(shareId, move.NewAccountId, normalizedPath, folder);
             await using var command = Command(connection, transaction,
-                "UPDATE TransferOperations SET AssignedAccountId=$new,TargetPath=$target,NormalizedTargetPath=$normalized,CreateFolderName=$folder,OperationFingerprint=$fingerprint,UpdatedAt=$now WHERE Id=$id AND BatchJobId=$batch AND AssignedAccountId=$old AND Status='Waiting' AND SubmitState='NotPrepared' AND AllocationSource NOT IN ('Locked','Exclusive') AND NOT EXISTS(SELECT 1 FROM ResourceItems r WHERE r.Id=TransferOperations.ResourceItemId AND r.CandidateConstraintAccountId IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM TransferOperations existing WHERE existing.Id<>TransferOperations.Id AND existing.ResourceItemId=TransferOperations.ResourceItemId AND existing.AssignedAccountId=$new AND existing.NormalizedTargetPath=$normalized AND existing.CreateFolderName=$folder AND existing.Status<>'Cancelled');" );
+                "UPDATE TransferOperations SET AssignedAccountId=$new,TargetPath=$target,NormalizedTargetPath=$normalized,CreateFolderName=$folder,OperationFingerprint=$fingerprint,UpdatedAt=$now WHERE Id=$id AND BatchJobId=$batch AND AssignedAccountId=$old AND Status='Waiting' AND SubmitState='NotPrepared' AND DailyCountedAt IS NULL AND AllocationSource NOT IN ('Locked','Exclusive') AND NOT EXISTS(SELECT 1 FROM ResourceItems r WHERE r.Id=TransferOperations.ResourceItemId AND r.CandidateConstraintAccountId IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM TransferOperations existing WHERE existing.Id<>TransferOperations.Id AND existing.ResourceItemId=TransferOperations.ResourceItemId AND existing.AssignedAccountId=$new AND existing.NormalizedTargetPath=$normalized AND existing.CreateFolderName=$folder AND existing.Status<>'Cancelled');" );
             Add(command, "$new", Id(move.NewAccountId)); Add(command, "$old", Id(move.OldAccountId)); Add(command, "$id", Id(move.OperationId));
             Add(command, "$target", targetPath); Add(command, "$normalized", normalizedPath); Add(command, "$folder", folder);
             Add(command, "$fingerprint", fingerprint); Add(command, "$batch", Id(mutation.BatchJobId)); Add(command, "$now", Time(mutationNow));
@@ -1044,7 +1044,7 @@ public sealed class SqliteTransferSchedulingStore :
         }
         var operations = new List<ReassignmentOperation>();
         await using (var command = Command(connection, transaction,
-            "SELECT o.Id,o.SequenceNumber,o.AssignedAccountId,o.Status,o.SubmitState,CASE WHEN o.AllocationSource IN ('Locked','Exclusive') OR r.CandidateConstraintAccountId IS NOT NULL THEN 1 ELSE 0 END,(SELECT GROUP_CONCAT(al.AccountId,'|') FROM AccountAllocations al WHERE al.BatchJobId=o.BatchJobId AND NOT EXISTS(SELECT 1 FROM TransferOperations existing WHERE existing.Id<>o.Id AND existing.ResourceItemId=o.ResourceItemId AND existing.AssignedAccountId=al.AccountId AND existing.NormalizedTargetPath=COALESCE(r.NormalizedTargetPathOverride,al.NormalizedDefaultTargetPath) AND existing.CreateFolderName=COALESCE(r.CreateFolderName,o.CreateFolderName) AND existing.Status<>'Cancelled')) FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch ORDER BY o.SequenceNumber,o.Id;"))
+            "SELECT o.Id,o.SequenceNumber,o.AssignedAccountId,o.Status,o.SubmitState,CASE WHEN o.AllocationSource IN ('Locked','Exclusive') OR r.CandidateConstraintAccountId IS NOT NULL THEN 1 ELSE 0 END,(SELECT GROUP_CONCAT(al.AccountId,'|') FROM AccountAllocations al WHERE al.BatchJobId=o.BatchJobId AND NOT EXISTS(SELECT 1 FROM TransferOperations existing WHERE existing.Id<>o.Id AND existing.ResourceItemId=o.ResourceItemId AND existing.AssignedAccountId=al.AccountId AND existing.NormalizedTargetPath=COALESCE(r.NormalizedTargetPathOverride,al.NormalizedDefaultTargetPath) AND existing.CreateFolderName=COALESCE(r.CreateFolderName,o.CreateFolderName) AND existing.Status<>'Cancelled')),CASE WHEN o.DailyCountedAt IS NOT NULL THEN 1 ELSE 0 END FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch ORDER BY o.SequenceNumber,o.Id;"))
         {
             Add(command, "$batch", Id(batchId)); await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -1053,7 +1053,7 @@ public sealed class SqliteTransferSchedulingStore :
                     ? new HashSet<Guid>()
                     : reader.GetString(6).Split('|', StringSplitOptions.RemoveEmptyEntries)
                         .Select(Guid.Parse).ToHashSet();
-                operations.Add(new(Guid.Parse(reader.GetString(0)),reader.GetInt64(1),Guid.Parse(reader.GetString(2)),reader.GetString(3),reader.GetString(4),reader.GetInt64(5)!=0,compatible));
+                operations.Add(new(Guid.Parse(reader.GetString(0)),reader.GetInt64(1),Guid.Parse(reader.GetString(2)),reader.GetString(3),reader.GetString(4),reader.GetInt64(5)!=0,compatible,reader.GetInt64(7)!=0));
             }
         }
         var candidates = new List<ReassignmentCandidate>();
@@ -1073,7 +1073,7 @@ public sealed class SqliteTransferSchedulingStore :
         foreach (var item in allocations) builder.Append("|A:").Append(item.AccountId.ToString("N")).Append(':').Append(item.TargetCount).Append(':').Append(item.EffectiveTargetCount).Append(':').Append(item.MinimumRetainedTargetCount).Append(':').Append(item.AccountStatus).Append(':').Append(item.IsEnabled).Append(':').Append(item.IsDeleted);
         foreach (var item in operations)
         {
-            builder.Append("|O:").Append(item.OperationId.ToString("N")).Append(':').Append(item.AssignedAccountId.ToString("N")).Append(':').Append(item.Status).Append(':').Append(item.SubmitState).Append(':').Append(item.IsAccountExclusive);
+            builder.Append("|O:").Append(item.OperationId.ToString("N")).Append(':').Append(item.AssignedAccountId.ToString("N")).Append(':').Append(item.Status).Append(':').Append(item.SubmitState).Append(':').Append(item.IsAccountExclusive).Append(':').Append(item.HasCrossedSubmissionBoundary);
             if (item.CompatibleTargetAccountIds is not null)
                 foreach (var accountId in item.CompatibleTargetAccountIds.OrderBy(value => value)) builder.Append(':').Append(accountId.ToString("N"));
         }

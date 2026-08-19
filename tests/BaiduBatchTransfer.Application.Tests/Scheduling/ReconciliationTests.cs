@@ -176,6 +176,49 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
+    public async Task ManualRetryCannotMoveToAnotherAccountAfterOriginalAccountBecomesInvalid()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedTaskQuotaPendingWithReplacementAsync(db);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var reconciliation = new OperationReconciliationService(
+            new ConfirmationAdapter(),
+            new SessionStore(data.FailedAccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        await reconciliation.RetryAsync(data.OperationId, duplicateRiskAccepted: true);
+        await ExecuteAsync(db,
+            "UPDATE Accounts SET Status='Invalid' WHERE Id=$id;",
+            ("$id", data.FailedAccountId.ToString("D")));
+
+        var service = new ReassignRemainingWorkService(store);
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() => service.PreviewAsync(
+            new ReassignmentRequest(data.BatchId, data.FailedAccountId,
+                new Dictionary<Guid, int>
+                {
+                    [data.FailedAccountId] = 0,
+                    [data.ReplacementAccountId] = 1,
+                })));
+
+        var state = await store.LoadAsync(data.BatchId);
+        Assert.NotNull(state);
+        Assert.False(await store.ApplyAsync(new ReassignmentMutation(
+            data.BatchId,
+            [new ReassignmentOperationMove(
+                data.OperationId, data.FailedAccountId, data.ReplacementAccountId)],
+            [],
+            [
+                new ReassignmentAllocationDelta(data.FailedAccountId, 1, 0, -1),
+                new ReassignmentAllocationDelta(data.ReplacementAccountId, 0, 1, 1),
+            ]), state!.BatchVersion));
+        Assert.Equal(data.FailedAccountId.ToString("D"),
+            await ScalarAsync(db, "TransferOperations", "AssignedAccountId"));
+        Assert.NotNull(await ScalarNullableAsync(db, "TransferOperations", "DailyCountedAt"));
+        Assert.Equal(1, await ScalarIntForIdAsync(db, "Accounts", "DailyExecutedCount", data.FailedAccountId));
+    }
+
+    [Fact]
     public async Task CancelReleasesReservedSlotBeforeAtomicallyCancellingPreSubmissionOperation()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -349,6 +392,46 @@ public sealed class ReconciliationTests
         return (batchId, accountId, operationId);
     }
 
+    private static async Task<(Guid BatchId, Guid FailedAccountId, Guid ReplacementAccountId, Guid OperationId)>
+        SeedTaskQuotaPendingWithReplacementAsync(BatchTestDatabase db)
+    {
+        var batchId = Guid.NewGuid();
+        var failedAccountId = Guid.NewGuid();
+        var replacementAccountId = Guid.NewGuid();
+        var resourceId = Guid.NewGuid();
+        var operationId = Guid.NewGuid();
+        var failedAccount = AccountRecord.Create(failedAccountId, $"baidu-{failedAccountId:N}", "Failed") with
+        {
+            DailyExecutedCount = 1,
+            DailyCountDateKey = "2026-08-20",
+        };
+        var replacementAccount = AccountRecord.Create(
+            replacementAccountId, $"baidu-{replacementAccountId:N}", "Replacement");
+        var job = new BatchJobRecord(batchId, "Batch", "Text", "Distribution", "TaskCount",
+            "ProportionalReduction", 1, 1, "/base", "OptionalOuter", "Skip", "Immediate", "Active",
+            Now.AddHours(-1), Now.AddHours(-1), null, null, 1);
+        var resource = new ResourceItemRecord(resourceId, batchId, null, 1,
+            "https://pan.baidu.com/s/reassign-retry", "share", "a1b2", null, null, null, null,
+            "OptionalOuter", "Unknown", null, "Reserved", failedAccountId, Now.AddMinutes(5),
+            Now.AddHours(-1), Now);
+        var operation = new TransferOperationRecord(operationId, resourceId, batchId, 1, 1,
+            "/base", "/base", "", failedAccountId, "Weighted", "ResultPending", null, 1, "operation",
+            DescriptorJson("operation"), null, null, "PendingConfirmation", "Reserved",
+            Now.AddMinutes(-10), Now.AddMinutes(-9), Now.AddMinutes(-9), null, null, Now.AddMinutes(5),
+            Now.AddHours(-1), Now);
+        var failedAllocation = new AccountAllocationRecord(Guid.NewGuid(), batchId, failedAccountId, 1,
+            "/base", "/base", 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0);
+        var replacementAllocation = new AccountAllocationRecord(Guid.NewGuid(), batchId, replacementAccountId, 2,
+            "/base", "/base", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        await db.SeedAsync(
+            [failedAccount, replacementAccount],
+            job: job,
+            resources: [resource],
+            operations: [operation],
+            allocations: [failedAllocation, replacementAllocation]);
+        return (batchId, failedAccountId, replacementAccountId, operationId);
+    }
+
     private static string DescriptorJson(string operationFingerprint) =>
         $$"""{"SourceShareId":"share","TargetPath":"/base","ExpectedOuterNameFingerprint":"outer","OperationFingerprint":"{{operationFingerprint}}","SubmitWindowStartUtc":"2026-08-20T01:50:00+00:00","SubmitWindowEndUtc":"2026-08-20T02:10:00+00:00"}""";
 
@@ -362,6 +445,19 @@ public sealed class ReconciliationTests
 
     private static async Task<int> ScalarIntAsync(BatchTestDatabase db, string table, string column) =>
         Convert.ToInt32(await ScalarAsync(db, table, column));
+
+    private static async Task<int> ScalarIntForIdAsync(
+        BatchTestDatabase db,
+        string table,
+        string column,
+        Guid id)
+    {
+        await using var connection = await db.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT {column} FROM {table} WHERE Id=$id;";
+        command.Parameters.AddWithValue("$id", id.ToString("D"));
+        return Convert.ToInt32(await command.ExecuteScalarAsync());
+    }
 
     private static async Task<string?> ScalarNullableAsync(BatchTestDatabase db, string table, string column)
     {

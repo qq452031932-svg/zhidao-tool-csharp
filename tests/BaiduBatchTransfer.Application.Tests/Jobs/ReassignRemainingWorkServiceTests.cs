@@ -42,6 +42,37 @@ public sealed class ReassignRemainingWorkServiceTests
     }
 
     [Fact]
+    public async Task TaskQuotaPreviewExcludesManualRetryAfterSubmissionBoundaryWhenAccountBecomesInvalid()
+    {
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var resultPending = Operation(failed, 1, "ResultPending", "PendingConfirmation", false) with
+        {
+            HasCrossedSubmissionBoundary = true,
+        };
+        var retriedOnSameAccount = resultPending with
+        {
+            Status = "Waiting",
+            SubmitState = "NotPrepared",
+        };
+        var stateAfterAccountInvalidation = new ReassignmentState(
+            batch,
+            "version-after-retry",
+            QuotaBasis.TaskCount,
+            [UnavailableAllocation(failed, 1), Allocation(replacement, 0)],
+            [retriedOnSameAccount],
+            []);
+        var store = new RecordingReassignmentStore(stateAfterAccountInvalidation);
+
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() =>
+            new ReassignRemainingWorkService(store).PreviewAsync(new ReassignmentRequest(
+                batch, failed, new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 })));
+
+        Assert.Equal(0, store.ApplyCalls);
+    }
+
+    [Fact]
     public async Task SuccessTargetPreviewChangesTargetsButNeverReservedOrExclusiveCandidates()
     {
         var batch = Guid.NewGuid();

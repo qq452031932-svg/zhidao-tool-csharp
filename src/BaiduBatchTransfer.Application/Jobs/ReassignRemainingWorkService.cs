@@ -25,7 +25,8 @@ public sealed record ReassignmentOperation(
     string Status,
     string SubmitState,
     bool IsAccountExclusive,
-    IReadOnlySet<Guid>? CompatibleTargetAccountIds = null)
+    IReadOnlySet<Guid>? CompatibleTargetAccountIds = null,
+    bool HasCrossedSubmissionBoundary = false)
 {
     public bool CanMoveTo(Guid accountId) =>
         CompatibleTargetAccountIds is null || CompatibleTargetAccountIds.Contains(accountId);
@@ -246,6 +247,7 @@ public sealed class ReassignRemainingWorkService
             .Where(item =>
                 item.AssignedAccountId == request.FailedAccountId &&
                 !item.IsAccountExclusive &&
+                !item.HasCrossedSubmissionBoundary &&
                 string.Equals(item.Status, "Waiting", StringComparison.Ordinal) &&
                 string.Equals(item.SubmitState, "NotPrepared", StringComparison.Ordinal))
             .OrderBy(item => item.SequenceNumber)
