@@ -17,6 +17,13 @@ public sealed class BaiduShareNormalizer
         ArgumentException.ThrowIfNullOrWhiteSpace(input);
 
         var candidate = TrimTrailingSentencePunctuation(input.Trim());
+        if (!candidate.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ||
+            candidate.Contains('\\', StringComparison.Ordinal))
+        {
+            throw InvalidShareUrl();
+        }
+
+        ValidateWellFormedUnicode(candidate);
         ValidateRawPercentEncoding(candidate);
         if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri) ||
             !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
@@ -119,7 +126,7 @@ public sealed class BaiduShareNormalizer
         string key)
     {
         var matches = query
-            .Where(pair => string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase))
+            .Where(pair => string.Equals(pair.Key, key, StringComparison.Ordinal))
             .Select(pair => pair.Value)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
@@ -142,7 +149,7 @@ public sealed class BaiduShareNormalizer
 
     private static string ValidateShareId(string value)
     {
-        var shareId = value.Normalize(NormalizationForm.FormC);
+        var shareId = value;
         if (string.IsNullOrWhiteSpace(shareId) ||
             shareId is "." or ".." ||
             shareId.Any(character =>
@@ -158,22 +165,33 @@ public sealed class BaiduShareNormalizer
 
     private static string? NormalizeExtractionCode(string? extractionCode)
     {
-        if (string.IsNullOrWhiteSpace(extractionCode))
+        if (string.IsNullOrEmpty(extractionCode))
         {
             return null;
         }
 
-        var normalized = extractionCode.Trim().Normalize(NormalizationForm.FormC);
-        if (normalized.Any(char.IsControl))
+        if (extractionCode.Any(char.IsControl))
         {
             throw InvalidShareUrl();
         }
 
-        return normalized;
+        return extractionCode;
     }
 
     private static void ValidateRawPercentEncoding(string value) =>
         _ = DecodePercentEncoded(value, plusAsSpace: false);
+
+    private static void ValidateWellFormedUnicode(string value)
+    {
+        try
+        {
+            _ = StrictUtf8.GetByteCount(value);
+        }
+        catch (EncoderFallbackException)
+        {
+            throw InvalidShareUrl();
+        }
+    }
 
     private static string DecodePercentEncoded(string value, bool plusAsSpace)
     {

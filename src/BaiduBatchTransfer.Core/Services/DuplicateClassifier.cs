@@ -73,7 +73,7 @@ public sealed class DuplicateCandidate
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedShareId);
 
         NormalizedShareId = normalizedShareId.Trim();
-        ExtractionCode = NormalizeOptional(extractionCode);
+        ExtractionCode = PreserveOpaqueOptional(extractionCode);
         NormalizedTargetPath = NormalizeOptional(normalizedTargetPath);
         OuterFolderName = NormalizeOptional(outerFolderName);
         RequestedAccountName = NormalizeOptional(requestedAccountName);
@@ -102,6 +102,9 @@ public sealed class DuplicateCandidate
 
     private static string? NormalizeOptional(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static string? PreserveOpaqueOptional(string? value) =>
+        string.IsNullOrEmpty(value) ? null : value;
 }
 
 public sealed class DuplicateClassification

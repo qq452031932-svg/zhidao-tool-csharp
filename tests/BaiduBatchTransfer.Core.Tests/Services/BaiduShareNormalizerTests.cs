@@ -46,6 +46,29 @@ public sealed class BaiduShareNormalizerTests
     }
 
     [Fact]
+    public void CanonicallyDifferentUnicodeShareIds_RemainDistinctOpaqueValues()
+    {
+        var nfc = _normalizer.Normalize("https://pan.baidu.com/s/%C3%A9");
+        var nfd = _normalizer.Normalize("https://pan.baidu.com/s/e%CC%81");
+
+        Assert.Equal("\u00E9", nfc.ShareId);
+        Assert.Equal("e\u0301", nfd.ShareId);
+        Assert.NotEqual(nfc.ShareId, nfd.ShareId);
+        Assert.NotEqual(nfc.CanonicalUrl, nfd.CanonicalUrl);
+    }
+
+    [Fact]
+    public void CanonicallyDifferentUnicodeExtractionCodes_RemainDistinctOpaqueValues()
+    {
+        var nfc = _normalizer.Normalize("https://pan.baidu.com/s/abc?pwd=%C3%A9");
+        var nfd = _normalizer.Normalize("https://pan.baidu.com/s/abc?pwd=e%CC%81");
+
+        Assert.Equal("\u00E9", nfc.ExtractionCode);
+        Assert.Equal("e\u0301", nfd.ExtractionCode);
+        Assert.NotEqual(nfc.ExtractionCode, nfd.ExtractionCode);
+    }
+
+    [Fact]
     public void PathAndQueryForms_DecodeEscapedDataExactlyOnce()
     {
         var pathForm = _normalizer.Normalize("https://pan.baidu.com/s/abc%252E");
@@ -109,9 +132,34 @@ public sealed class BaiduShareNormalizerTests
     [InlineData("https://pan.baidu.com/s/abc%C0%AF")]
     [InlineData("https://pan.baidu.com/s/abc?pwd=%ZZ")]
     [InlineData("https://pan.baidu.com/s/abc?pwd=%C0%AF")]
+    [InlineData(@"https:\\pan.baidu.com/s/abc")]
+    [InlineData(@"https:/\pan.baidu.com/s/abc")]
+    [InlineData(@"https://pan.baidu.com\s\abc")]
+    [InlineData(@"https://pan.baidu.com/s\abc")]
     public void MalformedOrUntrustedLinks_AreRejected(string input)
     {
         Assert.Throws<ArgumentException>(() => _normalizer.Normalize(input));
+    }
+
+    [Fact]
+    public void ProviderQueryKeys_AreCaseSensitive()
+    {
+        var direct = _normalizer.Normalize(
+            "https://pan.baidu.com/s/abc?PWD=upper&Pwd=mixed");
+
+        Assert.Null(direct.ExtractionCode);
+        Assert.Throws<ArgumentException>(() =>
+            _normalizer.Normalize("https://pan.baidu.com/share/init?SURL=abc"));
+    }
+
+    [Fact]
+    public void ExactLowercaseProviderKeys_WinWithoutUsingUppercaseAliases()
+    {
+        var result = _normalizer.Normalize(
+            "https://pan.baidu.com/share/init?SURL=wrong&surl=abc&PWD=wrong&pwd=right");
+
+        Assert.Equal("abc", result.ShareId);
+        Assert.Equal("right", result.ExtractionCode);
     }
 
     [Theory]
@@ -144,6 +192,22 @@ public sealed class BaiduShareNormalizerTests
 
         Assert.DoesNotContain("first", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("second", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RawUnpairedSurrogates_AreRejectedWithASafeValidationError()
+    {
+        var invalidScalar = new string((char)0xD800, 1);
+
+        var pathException = Assert.Throws<ArgumentException>(() =>
+            _normalizer.Normalize($"https://pan.baidu.com/s/abc{invalidScalar}"));
+        var passwordException = Assert.Throws<ArgumentException>(() =>
+            _normalizer.Normalize($"https://pan.baidu.com/s/abc?pwd={invalidScalar}"));
+
+        Assert.Equal(
+            "The value is not a supported resolved Baidu HTTPS share URL.",
+            pathException.Message);
+        Assert.Equal(pathException.Message, passwordException.Message);
     }
 
     [Fact]

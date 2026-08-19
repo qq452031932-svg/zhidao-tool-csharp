@@ -60,6 +60,35 @@ public sealed class DuplicateClassifierTests
     }
 
     [Fact]
+    public void CanonicallyDifferentUnicodeExtractionCodes_ConflictAsOpaqueValues()
+    {
+        var result = _classifier.Classify(
+            TransferMode.Distribution,
+            Candidate(extractionCode: "\u00E9"),
+            Candidate(extractionCode: "e\u0301"));
+
+        Assert.Equal(DuplicateKind.Conflict, result.Kind);
+        Assert.Equal(DuplicateConflictReason.SourceSettingsDiffer, result.ConflictReason);
+    }
+
+    [Theory]
+    [InlineData(" code", "code")]
+    [InlineData("code ", "code")]
+    [InlineData(" ", null)]
+    public void ExtractionCodeWhitespace_IsOpaqueAndParticipatesInConflicts(
+        string firstCode,
+        string? secondCode)
+    {
+        var result = _classifier.Classify(
+            TransferMode.Distribution,
+            Candidate(extractionCode: firstCode),
+            Candidate(extractionCode: secondCode));
+
+        Assert.Equal(DuplicateKind.Conflict, result.Kind);
+        Assert.Equal(DuplicateConflictReason.SourceSettingsDiffer, result.ConflictReason);
+    }
+
+    [Fact]
     public void NoteDoesNotParticipateInDuplicateIdentity()
     {
         var result = _classifier.Classify(
