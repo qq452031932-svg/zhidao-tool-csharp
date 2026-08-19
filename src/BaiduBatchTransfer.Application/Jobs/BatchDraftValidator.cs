@@ -25,7 +25,7 @@ public sealed class BatchDraftValidator
             (session.Status == "Draft" && draft.ValidationMode != "BatchPrecheck");
         if (!confirmableStatus || session.CreatedBatchJobId is not null || session.AppendToBatchJobId is not null)
             throw new BatchDraftValidationException("The import draft is not ready for final confirmation.");
-        ValidateSessionCounters(session);
+        await ValidateSessionCountersAsync(session, unit.Imports, cancellationToken).ConfigureAwait(false);
 
         var accountDrafts = SelectAccounts(draft);
         var accounts = await ValidateAccountsAsync(accountDrafts, unit.Accounts, cancellationToken).ConfigureAwait(false);
@@ -94,9 +94,7 @@ public sealed class BatchDraftValidator
 
         var operationCount = draft.TransferMode == TransferMode.Replication
             ? ReplicationExpander.EstimateIntentCount(rows.Length, accounts.Length)
-            : draft.QuotaBasis == QuotaBasis.TaskCount
-                ? rows.Length
-                : confirmations.Sum(account => (long)account.TargetSuccessCount);
+            : rows.Length;
         var immediateOperationCount = draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.TaskCount
             ? operationCount
             : 0;
@@ -109,13 +107,31 @@ public sealed class BatchDraftValidator
             BatchConfirmationTokens.ForCreate(draft, session, rows, operationCount, confirmations));
     }
 
-    private static void ValidateSessionCounters(ImportSessionRecord session)
+    internal static async Task ValidateSessionCountersAsync(
+        ImportSessionRecord session,
+        IImportRepository repository,
+        CancellationToken cancellationToken)
     {
-        var classified = checked((long)session.ReadyRows + session.InvalidRows + session.DuplicateRows + session.ExcludedRows);
-        if (session.InvalidRows != 0)
-            throw new BatchDraftValidationException("The import contains invalid or conflicting rows that require user action.");
-        if (classified != session.TotalRows)
+        ArgumentNullException.ThrowIfNull(repository);
+        if (await HasDispositionAsync(repository, session.Id, "Conflict", cancellationToken).ConfigureAwait(false))
+            throw new BatchDraftValidationException("The import contains conflicting rows that require user action.");
+        if (await HasDispositionAsync(repository, session.Id, "NeedsResolution", cancellationToken).ConfigureAwait(false))
             throw new BatchDraftValidationException("The import contains unresolved rows that require user action.");
+
+        var classified = checked((long)session.ReadyRows + session.InvalidRows + session.DuplicateRows + session.ExcludedRows);
+        if (classified != session.TotalRows)
+            throw new BatchDraftValidationException("The import counters no longer match the staged rows.");
+    }
+
+    private static async Task<bool> HasDispositionAsync(
+        IImportRepository repository,
+        Guid sessionId,
+        string disposition,
+        CancellationToken cancellationToken)
+    {
+        var rows = await repository.GetRowsAfterSourceRowAsync(
+            sessionId, disposition, 0, 1, cancellationToken).ConfigureAwait(false);
+        return rows.Count != 0;
     }
 
     private static ImmutableArray<BatchAccountDraft> SelectAccounts(BatchDraft draft)

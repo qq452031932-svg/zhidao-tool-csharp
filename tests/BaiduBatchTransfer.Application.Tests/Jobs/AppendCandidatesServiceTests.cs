@@ -33,6 +33,8 @@ public sealed class AppendCandidatesServiceTests
 
         var preview = await service.PreviewAsync(request);
         Assert.Equal(1, preview.ResourceCount);
+        Assert.Equal(1, preview.OperationCount);
+        Assert.Equal(1, preview.StorageEstimate.OperationCount);
         var accountPreview = Assert.Single(preview.Accounts);
         Assert.Equal(2, accountPreview.FulfilledCount);
         Assert.Equal(0, accountPreview.ReservedSlotCount);
@@ -123,7 +125,95 @@ public sealed class AppendCandidatesServiceTests
     }
 
     [Fact]
-    public async Task ReopenShortfallRequiresExplicitConfirmationAndPreservesTargetsAndResults()
+    public async Task AppendDiskShortageUsesFutureOperationsAndWritesNothing()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var importId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(batchId, oldImportId, "AwaitingCandidates", null, 0), null, null,
+            [Allocation(batchId, account, 1, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(importId, 1, 1, appendToBatchJobId: batchId),
+            [BatchTestData.ReadyRow(importId, 1)]);
+        var service = Service(database, availableBytes: 0);
+        var request = new AppendCandidatesDraft(batchId, importId);
+
+        var preview = await service.PreviewAsync(request);
+        var error = await Assert.ThrowsAsync<StorageCapacityException>(() =>
+            service.ConfirmAsync(request, preview.ConfirmationToken));
+
+        Assert.Equal(1, preview.ResourceCount);
+        Assert.Equal(1, preview.OperationCount);
+        Assert.Equal(1, preview.StorageEstimate.OperationCount);
+        Assert.True(preview.StorageEstimate.DatabaseBytes > 0);
+        Assert.True(preview.StorageEstimate.IndexBytes > 0);
+        Assert.True(preview.StorageEstimate.WalBytes > 0);
+        Assert.True(preview.StorageEstimate.SafetyReserveBytes > 0);
+        Assert.True(error.RequiredBytes > error.AvailableBytes);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("AwaitingCandidates", (await read.Jobs.GetAsync(batchId))!.Status);
+        Assert.Equal("ReadyToConfirm", (await read.Imports.GetSessionAsync(importId))!.Status);
+        Assert.Empty(await CreateBatchServiceTests.AllResourcesAsync(read.Jobs, batchId));
+    }
+
+    [Fact]
+    public async Task BatchPrecheckAppendIncludesOnlySucceededCandidates()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var importId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        var succeeded = BatchTestData.ReadyRow(importId, 1) with { PrecheckStatus = "Succeeded" };
+        var failed = BatchTestData.ReadyRow(importId, 2) with { PrecheckStatus = "Failed", PrecheckErrorCode = "INVALID" };
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(batchId, oldImportId, "AwaitingCandidates", null, 0, validationMode: "BatchPrecheck"),
+            null, null, [Allocation(batchId, account, 2, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(importId, 2, 2, appendToBatchJobId: batchId),
+            [succeeded, failed]);
+        var service = Service(database, long.MaxValue);
+        var request = new AppendCandidatesDraft(batchId, importId);
+
+        var preview = await service.PreviewAsync(request);
+        await service.ConfirmAsync(request, preview.ConfirmationToken);
+
+        Assert.Equal(1, preview.ResourceCount);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var saved = Assert.Single(await CreateBatchServiceTests.AllResourcesAsync(read.Jobs, batchId));
+        Assert.Equal(succeeded.Id, saved.StagedImportRowId);
+    }
+
+    [Fact]
+    public async Task BatchPrecheckAppendRejectsUnprecheckedReadyCandidateWithoutWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var importId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(oldImportId, 0, 0), null,
+            Job(batchId, oldImportId, "AwaitingCandidates", null, 0, validationMode: "BatchPrecheck"),
+            null, null, [Allocation(batchId, account, 1, 0, 0, 0)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(importId, 1, 1, appendToBatchJobId: batchId),
+            [BatchTestData.ReadyRow(importId, 1)]);
+        var service = Service(database, long.MaxValue);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() =>
+            service.PreviewAsync(new AppendCandidatesDraft(batchId, importId)));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("AwaitingCandidates", (await read.Jobs.GetAsync(batchId))!.Status);
+        Assert.Equal("ReadyToConfirm", (await read.Imports.GetSessionAsync(importId))!.Status);
+        Assert.Empty(await CreateBatchServiceTests.AllResourcesAsync(read.Jobs, batchId));
+    }
+
+    [Fact]
+    public async Task ReopenShortfallPreviewIsReadOnlyAndConfirmedApplyPreservesTargetsAndResults()
     {
         await using var database = await BatchTestDatabase.CreateAsync();
         var account = Guid.NewGuid();
@@ -140,9 +230,24 @@ public sealed class AppendCandidatesServiceTests
             [resource], null, [allocation]);
         var service = new ReopenShortfallBatchService(database.UnitOfWorkFactory);
 
-        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
-            service.ReopenAsync(batchId, userConfirmed: false, BatchTestData.Now.AddHours(2)));
-        await service.ReopenAsync(batchId, userConfirmed: true, BatchTestData.Now.AddHours(2));
+        var preview = await service.PreviewAsync(batchId);
+
+        Assert.Equal(batchId, preview.BatchJobId);
+        Assert.Equal("CompletedWithShortfall", preview.JobStatus);
+        Assert.Equal(10, preview.TargetSuccessCount);
+        Assert.Equal(7, preview.EffectiveTargetSuccessCount);
+        Assert.Equal(7, preview.FulfilledCount);
+        Assert.Equal(0, preview.ReservedSlotCount);
+        Assert.Equal(3, preview.ShortfallCount);
+        Assert.Equal(64, preview.ConfirmationToken.Length);
+        await using (var beforeApply = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            Assert.Equal("CompletedWithShortfall", (await beforeApply.Jobs.GetAsync(batchId))!.Status);
+            Assert.Equal(7, Assert.Single((await beforeApply.Jobs.GetAllocationsPageAsync(
+                batchId, new PageQuery(1, 10))).Items).EffectiveTargetSuccessCount);
+        }
+
+        await service.ApplyAsync(batchId, preview.ConfirmationToken, BatchTestData.Now.AddHours(2));
 
         await using var read = await database.UnitOfWorkFactory.BeginAsync();
         var saved = (await read.Jobs.GetAsync(batchId))!;
@@ -156,15 +261,57 @@ public sealed class AppendCandidatesServiceTests
         Assert.Equal("Unused", savedResource.CandidateStatus);
     }
 
+    [Fact]
+    public async Task ReopenShortfallRejectsStaleSnapshotTokenWithoutWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        var completedAt = BatchTestData.Now.AddHours(1);
+        var allocation = Allocation(batchId, account, 10, 7, 1, 1) with { EffectiveTargetSuccessCount = 7 };
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(oldImportId, 0, 0),
+            null,
+            Job(batchId, oldImportId, "CompletedWithShortfall", completedAt, 0),
+            null, null, [allocation]);
+        var service = new ReopenShortfallBatchService(database.UnitOfWorkFactory);
+        var preview = await service.PreviewAsync(batchId);
+        await using (var update = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await update.Jobs.UpdateAllocationsAsync([allocation with { ReservedSlotCount = 1 }]);
+            await update.CommitAsync();
+        }
+
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ApplyAsync(batchId, preview.ConfirmationToken, BatchTestData.Now.AddHours(2)));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var saved = (await read.Jobs.GetAsync(batchId))!;
+        var savedAllocation = Assert.Single((await read.Jobs.GetAllocationsPageAsync(
+            batchId, new PageQuery(1, 10))).Items);
+        Assert.Equal("CompletedWithShortfall", saved.Status);
+        Assert.Equal(completedAt, saved.CompletedAt);
+        Assert.Equal(7, savedAllocation.EffectiveTargetSuccessCount);
+        Assert.Equal(1, savedAllocation.ReservedSlotCount);
+    }
+
     private static BatchJobRecord Job(
         Guid id,
         Guid importId,
         string status,
         DateTimeOffset? completedAt,
-        int resourceCount) =>
+        int resourceCount,
+        string validationMode = "Immediate") =>
         new(id, "Existing", "Excel", "Distribution", "SuccessTarget", "WaitForCandidates",
-            resourceCount, 0, "/", "None", "Skip", "Immediate", status, BatchTestData.Now,
+            resourceCount, 0, "/", "None", "Skip", validationMode, status, BatchTestData.Now,
             completedAt is null ? null : BatchTestData.Now.AddMinutes(1), completedAt, importId, 1);
+
+    private static AppendCandidatesService Service(BatchTestDatabase database, long availableBytes) =>
+        new(database.UnitOfWorkFactory,
+            new ReplicationPreflightEstimator(
+                new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(availableBytes), database.DatabasePath));
 
     private static ResourceItemRecord Resource(
         Guid batchId,

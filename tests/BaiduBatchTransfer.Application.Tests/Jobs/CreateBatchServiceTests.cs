@@ -341,7 +341,8 @@ public sealed class CreateBatchServiceTests
         var resources = await AllResourcesAsync(read.Jobs, draft.BatchJobId);
         var operations = await AllOperationsAsync(read.Jobs, draft.BatchJobId);
         var allocations = (await read.Jobs.GetAllocationsPageAsync(draft.BatchJobId, new PageQuery(1, 10))).Items;
-        Assert.Equal(3, preview.OperationCount);
+        Assert.Equal(5, preview.OperationCount);
+        Assert.Equal(5, preview.StorageEstimate.OperationCount);
         Assert.Empty(operations);
         Assert.Equal(2, resources.Count(resource => resource.CandidateConstraintAccountId == accounts[0]));
         Assert.Equal(2, allocations.Single(allocation => allocation.AccountId == accounts[0]).ExclusiveCandidateCount);
@@ -370,10 +371,9 @@ public sealed class CreateBatchServiceTests
     }
 
     [Theory]
-    [InlineData("Invalid")]
     [InlineData("Conflict")]
     [InlineData("NeedsResolution")]
-    public async Task UnresolvedOrInvalidRowsBlockFinalizationWithoutLeakingContent(string disposition)
+    public async Task ConflictOrNeedsResolutionRowsBlockFinalizationWithoutLeakingContent(string disposition)
     {
         await using var database = await BatchTestDatabase.CreateAsync();
         var sessionId = Guid.NewGuid();
@@ -400,6 +400,37 @@ public sealed class CreateBatchServiceTests
         Assert.DoesNotContain("secret", error.ToString(), StringComparison.Ordinal);
         await using var read = await database.UnitOfWorkFactory.BeginAsync();
         Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task ClassifiedInvalidRowsAreExcludedWithoutBlockingValidResources()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var invalid = BatchTestData.ReadyRow(sessionId, 1) with
+        {
+            Disposition = "Invalid",
+            NormalizedShareId = null,
+            ValidationMessage = "malformed input",
+        };
+        var valid = BatchTestData.ReadyRow(sessionId, 2);
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(sessionId, 2, 1, invalidRows: 1),
+            [invalid, valid]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(1, preview.ResourceCount);
+        Assert.Equal(1, preview.OperationCount);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var resource = Assert.Single(await AllResourcesAsync(read.Jobs, draft.BatchJobId));
+        Assert.Equal(valid.Id, resource.StagedImportRowId);
     }
 
     [Fact]

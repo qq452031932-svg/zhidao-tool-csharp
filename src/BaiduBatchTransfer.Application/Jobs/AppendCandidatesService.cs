@@ -132,9 +132,8 @@ public sealed class AppendCandidatesService
             (session.Status == "Draft" && batch.ValidationMode != "BatchPrecheck");
         if (!confirmableStatus || session.AppendToBatchJobId != draft.BatchJobId || session.CreatedBatchJobId is not null)
             throw new BatchDraftValidationException("The append import is not ready for this batch.");
-        var classified = checked((long)session.ReadyRows + session.InvalidRows + session.DuplicateRows + session.ExcludedRows);
-        if (session.InvalidRows != 0 || classified != session.TotalRows)
-            throw new BatchDraftValidationException("The append import still contains rows that require user action.");
+        await BatchDraftValidator.ValidateSessionCountersAsync(session, unit.Imports, cancellationToken)
+            .ConfigureAwait(false);
 
         var allocations = await ReadAllocationsAsync(unit.Jobs, draft.BatchJobId, cancellationToken).ConfigureAwait(false);
         if (allocations.Count == 0) throw new BatchDraftValidationException("The target batch has no account allocations.");
@@ -176,6 +175,8 @@ public sealed class AppendCandidatesService
             foreach (var row in page)
             {
                 if (row.PrecheckStatus == "Failed") continue;
+                if (batch.ValidationMode == "BatchPrecheck" && row.PrecheckStatus != "Succeeded")
+                    throw new BatchDraftValidationException("An append row has not completed the required batch precheck.");
                 if (string.IsNullOrWhiteSpace(row.NormalizedShareId))
                     throw new BatchDraftValidationException("A ready append row is missing its normalized identity.");
                 if (!existingIds.Add(row.NormalizedShareId)) continue;
@@ -241,7 +242,7 @@ public sealed class AppendCandidatesService
                 reachableTargets[allocation.AccountId]);
         })
             .ToImmutableArray();
-        const long operationCount = 0;
+        var operationCount = (long)rows.Count;
         return new ValidatedAppend(
             batch, session, rows.ToImmutable(), allocations.ToImmutableArray(), confirmations,
             maximumSequence, operationCount,
