@@ -392,7 +392,7 @@ Excel 逐行指定账号在成功配额模式下表示该资源只能用于对�
 - RequestedAccountName
 - MappedAccountId
 - Note
-- Disposition（就绪、格式错误、重复、排除）
+- Disposition（就绪、待解析短链、格式错误、重复、冲突、排除）
 - DuplicateOfStagedRowId
 - ValidationMessage
 - PrecheckStatus
@@ -490,6 +490,9 @@ Excel 逐行指定账号在成功配额模式下表示该资源只能用于对�
 - OutcomeKind（新转存、已存在满足、失败、全局无效、取消）
 - AttemptCount
 - OperationFingerprint
+- ConfirmationDescriptorJson（提交前持久化；含源分享标识、规范化目标目录、预期外层目录/名称指纹、提交时间窗）
+- AdapterRequestId（可空；收到响应后补充）
+- RemoteItemIdsJson（可空；收到响应后补充）
 - SubmitState（未准备、准备提交、提交中、已收到结果、待确认）
 - TargetSlotState（未占用、已占用、已满足、已释放）
 - TargetSlotReservedAt
@@ -502,6 +505,8 @@ Excel 逐行指定账号在成功配额模式下表示该资源只能用于对�
 - UpdatedAt
 
 对所有非“已取消”操作建立条件唯一约束：`ResourceItemId + AssignedAccountId + NormalizedTargetPath + CreateFolderName`。失败重试复用原操作行，不新建重复操作。复制模式在批次确认时批量生成操作；按任务数量分流模式生成一资源一操作；按成功数量分流模式在调度时原子生成操作。
+
+`ConfirmationDescriptorJson` 必须在进入提交边界前写入，因此即使进程在收到响应前或响应落库前崩溃，恢复服务仍能重建确认查询。适配器的确认结果只允许“确认存在”“确认未生效”“无法确认”；仅发现同名资源不足以判定本次操作成功，无法证明时保持结果待确认且不得自动重复提交。
 
 ### 8.8 AccountAllocations
 
