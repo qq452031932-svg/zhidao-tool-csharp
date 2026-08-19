@@ -64,8 +64,16 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
     public async Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(Guid sessionId, string normalizedShareId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(normalizedShareId);
-        await using var c = Command("SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt FROM StagedImportRows WHERE ImportSessionId=$session AND NormalizedShareId=$normalized AND Disposition IN ('Ready','Duplicate') ORDER BY SourceRowNumber,Id LIMIT 1;");
+        await using var c = Command("SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt FROM StagedImportRows WHERE ImportSessionId=$session AND NormalizedShareId=$normalized ORDER BY SourceRowNumber,Id LIMIT 1;");
         Add(c,"$session",Id(sessionId)); Add(c,"$normalized",normalizedShareId);
+        await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadRow(r) : null;
+    }
+
+    public async Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default)
+    {
+        await using var c = Command("SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt FROM StagedImportRows WHERE Id=$id;");
+        Add(c,"$id",Id(rowId));
         await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadRow(r) : null;
     }
@@ -84,6 +92,19 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         if (pageSize is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(pageSize));
         await using var c = Command("SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt FROM StagedImportRows WHERE ImportSessionId=$session AND Disposition=$disposition AND SourceRowNumber>$after ORDER BY SourceRowNumber,Id LIMIT $limit;");
         Add(c,"$session",Id(sessionId)); Add(c,"$disposition",disposition); Add(c,"$after",afterSourceRowNumber); Add(c,"$limit",pageSize);
+        var items = new List<StagedImportRowRecord>();
+        await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(ReadRow(r));
+        return items;
+    }
+
+    public async Task<IReadOnlyList<StagedImportRowRecord>> GetRowsByNormalizedShareIdAfterSourceRowAsync(Guid sessionId, string normalizedShareId, int afterSourceRowNumber, int pageSize, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(normalizedShareId);
+        if (afterSourceRowNumber < 0) throw new ArgumentOutOfRangeException(nameof(afterSourceRowNumber));
+        if (pageSize is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var c = Command("SELECT Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt FROM StagedImportRows WHERE ImportSessionId=$session AND NormalizedShareId=$normalized AND SourceRowNumber>$after ORDER BY SourceRowNumber,Id LIMIT $limit;");
+        Add(c,"$session",Id(sessionId)); Add(c,"$normalized",normalizedShareId); Add(c,"$after",afterSourceRowNumber); Add(c,"$limit",pageSize);
         var items = new List<StagedImportRowRecord>();
         await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(ReadRow(r));

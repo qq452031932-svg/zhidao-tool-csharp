@@ -154,6 +154,69 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task LaterRetryPromotesEarliestSourceRowAndReclassifiesAllLaterRows()
+    {
+        var unavailable = BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+        var resolved = BaiduAdapterResult<ResolvedShareLink>.Success(
+            new ResolvedShareLink("https://pan.baidu.com/s/shared", "shared"));
+        var resolver = new SequenceResolver(
+            unavailable, unavailable, unavailable,
+            unavailable, resolved, resolved,
+            resolved);
+        var store = new ImportStore();
+        var service = CreateService(store, resolver, chunkSize: 1);
+        var sessionId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/scl/fi/one", TargetPath: "/early"),
+                new ImportSourceRow(2, "https://pan.baidu.com/scl/fi/two", TargetPath: "/late"),
+                new ImportSourceRow(3, "https://pan.baidu.com/scl/fi/three", TargetPath: "/early")));
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+        Assert.Equal(new[] { "NeedsResolution", "Ready", "Conflict" }, store.Rows.Select(row => row.Disposition));
+
+        await service.RetryNeedsResolutionAsync(sessionId);
+
+        Assert.Equal("Ready", store.Rows[0].Disposition);
+        Assert.Equal("Conflict", store.Rows[1].Disposition);
+        Assert.Equal("Duplicate", store.Rows[2].Disposition);
+        Assert.Equal(store.Rows[0].Id, store.Rows[2].DuplicateOfStagedRowId);
+        Assert.Equal(1, store.Session!.ReadyRows);
+        Assert.Equal(1, store.Session.DuplicateRows);
+        Assert.Equal(1, store.Session.InvalidRows);
+    }
+
+    [Fact]
+    public async Task RetryReleasesReadUnitOfWorkBeforeWaitingForResolverNetwork()
+    {
+        var store = new ImportStore();
+        var resolver = new BlockingRetryResolver();
+        var service = CreateService(store, resolver);
+        var sessionId = Guid.NewGuid();
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/scl/fi/one")));
+
+        var retry = service.RetryNeedsResolutionAsync(sessionId);
+        await resolver.RetryEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            Assert.Equal(0, store.ActiveUnits);
+            await using var checkpoint = await store.CreateUnitOfWorkAsync(CancellationToken.None);
+            Assert.Equal(1, store.ActiveUnits);
+        }
+        finally
+        {
+            resolver.ReleaseRetry.TrySetResult();
+        }
+
+        await retry;
+        Assert.Equal(0, store.ActiveUnits);
+    }
+
+    [Fact]
     public async Task StagingPersistsSessionFirstAndCommitsBoundedChunks()
     {
         var store = new ImportStore();
@@ -302,24 +365,62 @@ public sealed class ImportStagingServiceTests
             throw new HttpRequestException("secret-token");
     }
 
+    private sealed class BlockingRetryResolver : IShareLinkResolver
+    {
+        private int callCount;
+        public TaskCompletionSource RetryEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseRetry { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<BaiduAdapterResult<ResolvedShareLink>> ResolveAsync(string rawUrl, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref callCount) == 1)
+                return BaiduAdapterResult<ResolvedShareLink>.Failure(BaiduErrorKind.TransientService, null);
+            RetryEntered.TrySetResult();
+            await ReleaseRetry.Task.WaitAsync(cancellationToken);
+            return BaiduAdapterResult<ResolvedShareLink>.Success(
+                new ResolvedShareLink("https://pan.baidu.com/s/resolved", "resolved"));
+        }
+    }
+
     private sealed class ImportStore
     {
         public ImportSessionRecord? Session { get; set; }
         public List<StagedImportRowRecord> Rows { get; } = [];
         public List<string> Events { get; } = [];
         public List<int> AddBatchSizes { get; } = [];
+        public int ActiveUnits { get; private set; }
 
-        public Task<IUnitOfWork> CreateUnitOfWorkAsync(CancellationToken cancellationToken) =>
-            Task.FromResult<IUnitOfWork>(new Unit(this));
-
-        private sealed class Unit(ImportStore store) : IUnitOfWork
+        public Task<IUnitOfWork> CreateUnitOfWorkAsync(CancellationToken cancellationToken)
         {
-            public IImportRepository Imports { get; } = new Repository(store);
+            ActiveUnits++;
+            return Task.FromResult<IUnitOfWork>(new Unit(this));
+        }
+
+        private sealed class Unit : IUnitOfWork
+        {
+            private readonly ImportStore store;
+            private bool disposed;
+
+            public Unit(ImportStore store)
+            {
+                this.store = store;
+                Imports = new Repository(store);
+            }
+
+            public IImportRepository Imports { get; }
             public IJobRepository Jobs => throw new NotSupportedException();
             public IAccountRepository Accounts => throw new NotSupportedException();
             public Task CommitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
             public Task RollbackAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
-            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+            public ValueTask DisposeAsync()
+            {
+                if (!disposed)
+                {
+                    disposed = true;
+                    store.ActiveUnits--;
+                }
+                return ValueTask.CompletedTask;
+            }
         }
 
         private sealed class Repository(ImportStore store) : IImportRepository
@@ -362,7 +463,10 @@ public sealed class ImportStagingServiceTests
 
             public Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(Guid sessionId, string normalizedShareId, CancellationToken cancellationToken = default) =>
                 Task.FromResult(store.Rows.FirstOrDefault(row =>
-                    row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId && row.Disposition is "Ready" or "Duplicate"));
+                    row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId));
+
+            public Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default) =>
+                Task.FromResult(store.Rows.FirstOrDefault(row => row.Id == rowId));
 
             public Task<int> GetLastSourceRowNumberAsync(Guid sessionId, CancellationToken cancellationToken = default) =>
                 Task.FromResult(store.Rows
@@ -379,6 +483,18 @@ public sealed class ImportStagingServiceTests
                 CancellationToken cancellationToken = default) =>
                 Task.FromResult<IReadOnlyList<StagedImportRowRecord>>(store.Rows
                     .Where(row => row.ImportSessionId == sessionId && row.Disposition == disposition && row.SourceRowNumber > afterSourceRowNumber)
+                    .OrderBy(row => row.SourceRowNumber)
+                    .Take(pageSize)
+                    .ToArray());
+
+            public Task<IReadOnlyList<StagedImportRowRecord>> GetRowsByNormalizedShareIdAfterSourceRowAsync(
+                Guid sessionId,
+                string normalizedShareId,
+                int afterSourceRowNumber,
+                int pageSize,
+                CancellationToken cancellationToken = default) =>
+                Task.FromResult<IReadOnlyList<StagedImportRowRecord>>(store.Rows
+                    .Where(row => row.ImportSessionId == sessionId && row.NormalizedShareId == normalizedShareId && row.SourceRowNumber > afterSourceRowNumber)
                     .OrderBy(row => row.SourceRowNumber)
                     .Take(pageSize)
                     .ToArray());

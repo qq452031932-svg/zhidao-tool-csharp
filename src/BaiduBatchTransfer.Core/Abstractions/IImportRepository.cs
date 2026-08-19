@@ -7,6 +7,7 @@ public interface IImportRepository
     Task<ImportSessionRecord?> GetSessionAsync(Guid id, CancellationToken cancellationToken = default);
     Task AddRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
     Task UpdateRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
+    Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default);
     Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(
         Guid sessionId,
         string normalizedShareId,
@@ -15,6 +16,12 @@ public interface IImportRepository
     Task<IReadOnlyList<StagedImportRowRecord>> GetRowsAfterSourceRowAsync(
         Guid sessionId,
         string disposition,
+        int afterSourceRowNumber,
+        int pageSize,
+        CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<StagedImportRowRecord>> GetRowsByNormalizedShareIdAfterSourceRowAsync(
+        Guid sessionId,
+        string normalizedShareId,
         int afterSourceRowNumber,
         int pageSize,
         CancellationToken cancellationToken = default);

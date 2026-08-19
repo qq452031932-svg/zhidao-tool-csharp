@@ -108,20 +108,24 @@ public sealed class ImportStagingService
         var afterSourceRowNumber = 0;
         while (true)
         {
-            await using var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false);
-            var session = await unit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The import session does not exist.");
-            if (session.Status != "Draft")
+            IReadOnlyList<StagedImportRowRecord> page;
+            await using (var readUnit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
             {
-                throw new InvalidOperationException("Only a draft import can retry unresolved links.");
+                var snapshotSession = await readUnit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The import session does not exist.");
+                if (snapshotSession.Status != "Draft")
+                {
+                    throw new InvalidOperationException("Only a draft import can retry unresolved links.");
+                }
+
+                page = await readUnit.Imports.GetRowsAfterSourceRowAsync(
+                    sessionId,
+                    "NeedsResolution",
+                    afterSourceRowNumber,
+                    Math.Min(chunkSize, 1_000),
+                    cancellationToken).ConfigureAwait(false);
             }
 
-            var page = await unit.Imports.GetRowsAfterSourceRowAsync(
-                sessionId,
-                "NeedsResolution",
-                afterSourceRowNumber,
-                Math.Min(chunkSize, 1_000),
-                cancellationToken).ConfigureAwait(false);
             if (page.Count == 0)
             {
                 return;
@@ -131,27 +135,122 @@ public sealed class ImportStagingService
 
             var resolved = await Task.WhenAll(page.Select(row => ReresolveAsync(row, sessionId, cancellationToken)))
                 .ConfigureAwait(false);
-            var updated = new List<StagedImportRowRecord>(resolved.Length);
-            var localFirst = new Dictionary<string, StagedImportRowRecord>(StringComparer.Ordinal);
-            foreach (var candidate in resolved)
+
+            await using var writeUnit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false);
+            var session = await writeUnit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("The import session does not exist.");
+            if (session.Status != "Draft")
             {
-                updated.Add(await ClassifyAsync(
-                    unit.Imports,
-                    candidate,
-                    sessionId,
-                    transferMode,
-                    cancellationToken,
-                    localFirst)
-                    .ConfigureAwait(false));
+                throw new InvalidOperationException("Only a draft import can retry unresolved links.");
             }
 
-            var now = DateTimeOffset.UtcNow;
-            session = ApplyRetryCounters(session, updated) with { UpdatedAt = now };
-            await unit.Imports.UpdateRowsAsync(updated, cancellationToken).ConfigureAwait(false);
-            await unit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
-            await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
+            var transitions = new List<RowTransition>();
+            var normalizedIds = new HashSet<string>(StringComparer.Ordinal);
+            for (var index = 0; index < resolved.Length; index++)
+            {
+                var snapshot = page[index];
+                var current = await writeUnit.Imports.GetRowByIdAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
+                if (current is null || current.Disposition != "NeedsResolution" || current.UpdatedAt != snapshot.UpdatedAt)
+                {
+                    continue;
+                }
+
+                var candidate = resolved[index];
+                await writeUnit.Imports.UpdateRowsAsync([candidate], cancellationToken).ConfigureAwait(false);
+                transitions.Add(new RowTransition(current, candidate));
+                if (candidate.Disposition == "Ready" && candidate.NormalizedShareId is not null)
+                {
+                    normalizedIds.Add(candidate.NormalizedShareId);
+                }
+            }
+
+            foreach (var normalizedId in normalizedIds)
+            {
+                await StabilizeNormalizedGroupAsync(
+                    writeUnit.Imports,
+                    sessionId,
+                    normalizedId,
+                    transferMode,
+                    transitions,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            session = ApplyTransitionCounters(session, transitions) with { UpdatedAt = DateTimeOffset.UtcNow };
+            await writeUnit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
+            await writeUnit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private async Task StabilizeNormalizedGroupAsync(
+        IImportRepository repository,
+        Guid sessionId,
+        string normalizedShareId,
+        TransferMode transferMode,
+        List<RowTransition> transitions,
+        CancellationToken cancellationToken)
+    {
+        var primary = await repository.GetFirstByNormalizedShareIdAsync(
+            sessionId,
+            normalizedShareId,
+            cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("A normalized staging group has no primary row.");
+        var readyPrimary = primary with
+        {
+            Disposition = "Ready",
+            DuplicateOfStagedRowId = null,
+            ValidationMessage = null,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        if (!HasSameClassification(primary, readyPrimary))
+        {
+            await repository.UpdateRowsAsync([readyPrimary], cancellationToken).ConfigureAwait(false);
+            transitions.Add(new RowTransition(primary, readyPrimary));
+        }
+        primary = readyPrimary;
+
+        var afterSourceRowNumber = primary.SourceRowNumber;
+        while (true)
+        {
+            var page = await repository.GetRowsByNormalizedShareIdAfterSourceRowAsync(
+                sessionId,
+                normalizedShareId,
+                afterSourceRowNumber,
+                1_000,
+                cancellationToken).ConfigureAwait(false);
+            if (page.Count == 0) return;
+            afterSourceRowNumber = page[^1].SourceRowNumber;
+            foreach (var later in page)
+            {
+                var classification = conflicts.Classify(transferMode, primary, later);
+                var desired = classification.Kind switch
+                {
+                    DuplicateKind.Duplicate => later with
+                    {
+                        Disposition = "Duplicate",
+                        DuplicateOfStagedRowId = primary.Id,
+                        ValidationMessage = null,
+                        UpdatedAt = DateTimeOffset.UtcNow,
+                    },
+                    DuplicateKind.Conflict => later with
+                    {
+                        Disposition = "Conflict",
+                        DuplicateOfStagedRowId = null,
+                        ValidationMessage = classification.Message,
+                        UpdatedAt = DateTimeOffset.UtcNow,
+                    },
+                    _ => later,
+                };
+                if (HasSameClassification(later, desired)) continue;
+                await repository.UpdateRowsAsync([desired], cancellationToken).ConfigureAwait(false);
+                transitions.Add(new RowTransition(later, desired));
+            }
+        }
+    }
+
+    private static bool HasSameClassification(StagedImportRowRecord left, StagedImportRowRecord right) =>
+        left.Disposition == right.Disposition &&
+        left.DuplicateOfStagedRowId == right.DuplicateOfStagedRowId &&
+        string.Equals(left.ValidationMessage, right.ValidationMessage, StringComparison.Ordinal);
 
     private async Task<StagedImportRowRecord> ReresolveAsync(
         StagedImportRowRecord existing,
@@ -401,13 +500,40 @@ public sealed class ImportStagingService
         };
     }
 
-    private static ImportSessionRecord ApplyRetryCounters(ImportSessionRecord session, IEnumerable<StagedImportRowRecord> rows) =>
-        session with
+    private static ImportSessionRecord ApplyTransitionCounters(
+        ImportSessionRecord session,
+        IEnumerable<RowTransition> transitions)
+    {
+        var ready = session.ReadyRows;
+        var invalid = session.InvalidRows;
+        var duplicate = session.DuplicateRows;
+        var excluded = session.ExcludedRows;
+        foreach (var transition in transitions)
         {
-            ReadyRows = checked(session.ReadyRows + rows.Count(row => row.Disposition == "Ready")),
-            InvalidRows = checked(session.InvalidRows + rows.Count(row => row.Disposition is "Invalid" or "Conflict")),
-            DuplicateRows = checked(session.DuplicateRows + rows.Count(row => row.Disposition == "Duplicate")),
-        };
+            ApplyDispositionDelta(transition.Before.Disposition, -1, ref ready, ref invalid, ref duplicate, ref excluded);
+            ApplyDispositionDelta(transition.After.Disposition, 1, ref ready, ref invalid, ref duplicate, ref excluded);
+        }
+
+        return session with { ReadyRows = ready, InvalidRows = invalid, DuplicateRows = duplicate, ExcludedRows = excluded };
+    }
+
+    private static void ApplyDispositionDelta(
+        string disposition,
+        int delta,
+        ref int ready,
+        ref int invalid,
+        ref int duplicate,
+        ref int excluded)
+    {
+        switch (disposition)
+        {
+            case "Ready": ready = checked(ready + delta); break;
+            case "Invalid":
+            case "Conflict": invalid = checked(invalid + delta); break;
+            case "Duplicate": duplicate = checked(duplicate + delta); break;
+            case "Excluded": excluded = checked(excluded + delta); break;
+        }
+    }
 
     private static ImportSourceRow ToSource(StagedImportRowRecord row) => new(
         row.SourceRowNumber,
@@ -439,4 +565,6 @@ public sealed class ImportStagingService
     {
         public ImportSessionRecord Session { get; set; } = session;
     }
+
+    private sealed record RowTransition(StagedImportRowRecord Before, StagedImportRowRecord After);
 }

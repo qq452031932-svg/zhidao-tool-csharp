@@ -89,6 +89,38 @@ public sealed class OpenXmlStreamingTests : IDisposable
     }
 
     [Fact]
+    public async Task ReaderStopsAtFirstCellBeyondConfiguredWidthWithoutMaterializingTheRow()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "wide-row.xlsx");
+        WriteWideRowWorkbook(path, cellCount: 50_000);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(MaxCellsPerRow: 8)).ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.CellLimitExceeded, error.Code);
+        Assert.Equal(9, error.ObservedCount);
+    }
+
+    [Theory]
+    [InlineData(2u, 2u)]
+    [InlineData(3u, 2u)]
+    public async Task ReaderRejectsDuplicateOrReverseRowIndexesSoResumeCannotSkipRows(uint first, uint second)
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, $"row-order-{first}-{second}.xlsx");
+        WriteRowSequenceWorkbook(path, first, second);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
+
+        Assert.Equal(ExcelImportErrorCode.InvalidRowOrder, error.Code);
+        Assert.DoesNotContain("pan.baidu.com", error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ReaderRejectsArchiveWithTooManyEntries()
     {
         Directory.CreateDirectory(root);
@@ -211,6 +243,26 @@ public sealed class OpenXmlStreamingTests : IDisposable
     }
 
     [Fact]
+    public async Task ResultWriterRollsOverAtConfiguredExcelRowBoundaryAndRepeatsHeaders()
+    {
+        Directory.CreateDirectory(root);
+        var resultPath = Path.Combine(root, "result-rollover.xlsx");
+        await using (var result = File.Create(resultPath))
+            await new OpenXmlResultWriter(maxRowsPerSheet: 3).WriteAsync(result, ResultRows(5));
+
+        using var document = SpreadsheetDocument.Open(resultPath, false);
+        var sheets = document.WorkbookPart!.Workbook!.Sheets!.Elements<Sheet>().ToArray();
+        Assert.Equal(new[] { "导入结果", "导入结果 2", "导入结果 3" }, sheets.Select(sheet => sheet.Name!.Value));
+        Assert.Equal(new[] { 3, 3, 2 }, sheets.Select(sheet =>
+        {
+            var relationshipId = sheet.Id?.Value ?? throw new InvalidDataException("Sheet relationship is missing.");
+            var part = (WorksheetPart)document.WorkbookPart.GetPartById(relationshipId);
+            return CountRowsAndAssertHeader(part);
+        }));
+        Assert.Equal(OpenXmlImportLimits.ExcelMaximumRows, OpenXmlResultWriter.ExcelMaximumRowsPerSheet);
+    }
+
+    [Fact]
     public async Task ReaderHonorsCancellationWithoutReadingRemainingRows()
     {
         Directory.CreateDirectory(root);
@@ -241,6 +293,15 @@ public sealed class OpenXmlStreamingTests : IDisposable
             Note: " =private-note",
             ErrorMessage: "-error");
         await Task.Yield();
+    }
+
+    private static async IAsyncEnumerable<ExcelResultRow> ResultRows(int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            yield return new ExcelResultRow(index + 2, $"https://pan.baidu.com/s/{index}", "ready", null, null, null, null);
+            await Task.Yield();
+        }
     }
 
     private static async Task<List<ImportSourceRow>> ReadAllAsync(IAsyncEnumerable<ImportSourceRow> source)
@@ -307,6 +368,66 @@ public sealed class OpenXmlStreamingTests : IDisposable
         WriteInlineRow(writer, dataRowIndex, "https://pan.baidu.com/s/id");
         writer.WriteEndElement();
         writer.WriteEndElement();
+    }
+
+    private static void WriteWideRowWorkbook(string path, int cellCount)
+    {
+        using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var workbookPart = document.AddWorkbookPart();
+        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+        workbookPart.Workbook = new Workbook(new Sheets(new Sheet
+        {
+            Id = workbookPart.GetIdOfPart(worksheetPart),
+            SheetId = 1,
+            Name = "导入",
+        }));
+        using var writer = OpenXmlWriter.Create(worksheetPart);
+        writer.WriteStartElement(new Worksheet());
+        writer.WriteStartElement(new SheetData());
+        WriteInlineRow(writer, 1, "分享链接");
+        writer.WriteStartElement(new Row { RowIndex = 2 });
+        for (var index = 0; index < cellCount; index++)
+            writer.WriteElement(new Cell(new InlineString(new Text(index == 0 ? "https://pan.baidu.com/s/id" : "x"))) { DataType = CellValues.InlineString });
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static void WriteRowSequenceWorkbook(string path, uint first, uint second)
+    {
+        using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var workbookPart = document.AddWorkbookPart();
+        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+        workbookPart.Workbook = new Workbook(new Sheets(new Sheet
+        {
+            Id = workbookPart.GetIdOfPart(worksheetPart),
+            SheetId = 1,
+            Name = "导入",
+        }));
+        using var writer = OpenXmlWriter.Create(worksheetPart);
+        writer.WriteStartElement(new Worksheet());
+        writer.WriteStartElement(new SheetData());
+        WriteInlineRow(writer, 1, "分享链接");
+        WriteInlineRow(writer, first, "https://pan.baidu.com/s/first");
+        WriteInlineRow(writer, second, "https://pan.baidu.com/s/second");
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static int CountRowsAndAssertHeader(WorksheetPart worksheetPart)
+    {
+        using var reader = OpenXmlReader.Create(worksheetPart);
+        var count = 0;
+        while (reader.Read())
+        {
+            if (reader.ElementType != typeof(Row) || !reader.IsStartElement) continue;
+            var row = reader.LoadCurrentElement() as Row
+                ?? throw new InvalidDataException("Expected a worksheet row.");
+            count++;
+            if (count == 1)
+                Assert.Equal("源行号", row.Elements<Cell>().First().InlineString!.Text!.Text);
+        }
+        return count;
     }
 
     private static void WritePlainZip(string path, int entryCount, int bytesPerEntry)

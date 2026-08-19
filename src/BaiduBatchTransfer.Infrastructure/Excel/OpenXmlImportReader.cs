@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.IO.Compression;
 using System.Runtime.CompilerServices;
+using System.Text;
 using BaiduBatchTransfer.Core.Abstractions;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
@@ -30,6 +31,7 @@ public enum ExcelImportErrorCode
     MissingWorksheet,
     MissingRequiredHeader,
     DuplicateHeader,
+    InvalidRowOrder,
     RowLimitExceeded,
     CellLimitExceeded,
     SharedStringLimitExceeded,
@@ -37,13 +39,23 @@ public enum ExcelImportErrorCode
 
 public sealed class ExcelImportException : Exception
 {
-    public ExcelImportException(ExcelImportErrorCode code, string message, Exception? innerException = null)
-        : base(message, innerException) => Code = code;
+    public ExcelImportException(
+        ExcelImportErrorCode code,
+        string message,
+        Exception? innerException = null,
+        int? observedCount = null)
+        : base(message, innerException)
+    {
+        Code = code;
+        ObservedCount = observedCount;
+    }
 
     public ExcelImportErrorCode Code { get; }
 
+    public int? ObservedCount { get; }
+
     public override string ToString() =>
-        $"ExcelImportException {{ Code = {Code}, Message = {Message} }}";
+        $"ExcelImportException {{ Code = {Code}, ObservedCount = {ObservedCount}, Message = {Message} }}";
 }
 
 public sealed class OpenXmlImportReader
@@ -111,7 +123,7 @@ public sealed class OpenXmlImportReader
             HeaderMap? headers = null;
             var physicalRowCount = 0;
             var dataRowCount = 0;
-            var fallbackRowNumber = 0;
+            uint lastRowNumber = 0;
             while (reader.Read())
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -120,17 +132,19 @@ public sealed class OpenXmlImportReader
                     continue;
                 }
 
-                var row = reader.LoadCurrentElement() as Row
-                    ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet row could not be read.");
                 physicalRowCount++;
-                fallbackRowNumber++;
-                var rawRowNumber = row.RowIndex?.Value ?? (uint)fallbackRowNumber;
+                var rawRowNumber = ReadRowNumber(reader, lastRowNumber);
                 if (rawRowNumber is 0 or > OpenXmlImportLimits.ExcelMaximumRows)
                 {
                     throw new ExcelImportException(ExcelImportErrorCode.RowLimitExceeded, "A worksheet row index exceeds the Excel format boundary.");
                 }
+                if (rawRowNumber <= lastRowNumber)
+                {
+                    throw new ExcelImportException(ExcelImportErrorCode.InvalidRowOrder, "Worksheet row indexes must be strictly increasing.");
+                }
+                lastRowNumber = rawRowNumber;
                 var sourceRowNumber = (int)rawRowNumber;
-                var values = ReadCells(row, sharedStrings);
+                var values = ReadCells(reader, sharedStrings, headers?.Indexes);
                 if (headers is null)
                 {
                     if (values.Count == 0 || values.Values.All(string.IsNullOrWhiteSpace)) continue;
@@ -282,31 +296,109 @@ public sealed class OpenXmlImportReader
         return values;
     }
 
-    private Dictionary<int, string> ReadCells(Row row, IReadOnlyList<string> sharedStrings)
+    private static uint ReadRowNumber(OpenXmlReader reader, uint previousRowNumber)
     {
-        var cells = row.Elements<Cell>().ToArray();
-        if (cells.Length > limits.MaxCellsPerRow)
-            throw new ExcelImportException(ExcelImportErrorCode.CellLimitExceeded, "A worksheet row contains more cells than allowed.");
+        var value = GetAttribute(reader, "r");
+        if (value is null)
+        {
+            return checked(previousRowNumber + 1);
+        }
+        return uint.TryParse(value, out var rowNumber)
+            ? rowNumber
+            : throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet row contains an invalid row index.");
+    }
+
+    private Dictionary<int, string> ReadCells(
+        OpenXmlReader reader,
+        IReadOnlyList<string> sharedStrings,
+        IReadOnlySet<int>? retainedColumns)
+    {
         var values = new Dictionary<int, string>();
         var fallbackColumn = 0;
-        foreach (var cell in cells)
+        var cellCount = 0;
+        var inCell = false;
+        var currentColumn = 0;
+        string? currentDataType = null;
+        string? currentValue = null;
+        StringBuilder? inlineText = null;
+
+        void FinishCell()
         {
-            var column = GetColumnIndex(cell.CellReference?.Value) ?? fallbackColumn;
-            fallbackColumn = column + 1;
-            values[column] = ReadCellValue(cell, sharedStrings);
+            if (!inCell) return;
+            if (retainedColumns is null || retainedColumns.Contains(currentColumn))
+            {
+                values[currentColumn] = ReadCellValue(currentDataType, currentValue, inlineText, sharedStrings);
+            }
+            inCell = false;
+            currentValue = null;
+            inlineText = null;
+        }
+
+        while (reader.Read())
+        {
+            if (reader.ElementType == typeof(Row) && reader.IsEndElement)
+            {
+                FinishCell();
+                break;
+            }
+            if (reader.ElementType == typeof(Cell) && reader.IsStartElement)
+            {
+                FinishCell();
+                cellCount++;
+                if (cellCount > limits.MaxCellsPerRow)
+                {
+                    throw new ExcelImportException(
+                        ExcelImportErrorCode.CellLimitExceeded,
+                        "A worksheet row contains more cells than allowed.",
+                        observedCount: cellCount);
+                }
+
+                currentColumn = GetColumnIndex(GetAttribute(reader, "r")) ?? fallbackColumn;
+                fallbackColumn = checked(currentColumn + 1);
+                currentDataType = GetAttribute(reader, "t");
+                inCell = true;
+                continue;
+            }
+            if (!inCell) continue;
+            if (reader.ElementType == typeof(Cell) && reader.IsEndElement)
+            {
+                FinishCell();
+            }
+            else if (reader.ElementType == typeof(CellValue) && reader.IsStartElement)
+            {
+                currentValue = reader.GetText();
+            }
+            else if (reader.ElementType == typeof(Text) && reader.IsStartElement)
+            {
+                inlineText ??= new StringBuilder();
+                inlineText.Append(reader.GetText());
+            }
         }
 
         return values;
     }
 
-    private static string ReadCellValue(Cell cell, IReadOnlyList<string> sharedStrings)
+    private static string ReadCellValue(
+        string? dataType,
+        string? rawValue,
+        StringBuilder? inlineText,
+        IReadOnlyList<string> sharedStrings)
     {
-        if (cell.DataType?.Value == CellValues.InlineString) return cell.InlineString?.InnerText ?? string.Empty;
-        var raw = cell.CellValue?.Text ?? string.Empty;
-        if (cell.DataType?.Value != CellValues.SharedString) return raw;
+        if (dataType == "inlineStr") return inlineText?.ToString() ?? string.Empty;
+        var raw = rawValue ?? string.Empty;
+        if (dataType != "s") return raw;
         return int.TryParse(raw, out var index) && index >= 0 && index < sharedStrings.Count
             ? sharedStrings[index]
             : throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A shared-string cell contains an invalid reference.");
+    }
+
+    private static string? GetAttribute(OpenXmlReader reader, string localName)
+    {
+        foreach (var attribute in reader.Attributes)
+        {
+            if (string.Equals(attribute.LocalName, localName, StringComparison.Ordinal)) return attribute.Value;
+        }
+        return null;
     }
 
     private static int? GetColumnIndex(string? reference)
@@ -361,6 +453,8 @@ public sealed class OpenXmlImportReader
             indexes.TryGetValue(column, out var index) && values.TryGetValue(index, out var value) && !string.IsNullOrWhiteSpace(value)
                 ? value.Trim()
                 : null;
+
+        public IReadOnlySet<int> Indexes { get; } = indexes.Values.ToHashSet();
 
         private static string SafeName(ImportColumn column) => column switch
         {
