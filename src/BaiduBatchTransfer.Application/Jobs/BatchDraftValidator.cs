@@ -30,7 +30,8 @@ public sealed class BatchDraftValidator
         var accountDrafts = SelectAccounts(draft);
         var accounts = await ValidateAccountsAsync(accountDrafts, unit.Accounts, cancellationToken).ConfigureAwait(false);
         var accountIds = accounts.Select(account => account.Draft.AccountId).ToHashSet();
-        var rows = await ReadEligibleRowsAsync(session, draft, accountIds, cancellationToken, unit.Imports).ConfigureAwait(false);
+        var rules = await ReadDirectoryRulesAsync(accounts, unit.Accounts, cancellationToken).ConfigureAwait(false);
+        var rows = await ReadEligibleRowsAsync(session, draft, accounts, accountIds, rules, cancellationToken, unit.Imports).ConfigureAwait(false);
 
         if (draft.TransferMode == TransferMode.Distribution && draft.QuotaBasis == QuotaBasis.TaskCount)
         {
@@ -164,20 +165,59 @@ public sealed class BatchDraftValidator
             if (account is null || account.IsDeleted || !account.IsEnabled || account.Status != "Active")
                 throw new BatchDraftValidationException("A participating account is unavailable.");
             var normalized = NormalizePath(draft.DefaultTargetPath);
-            result.Add(new ValidatedBatchAccount(draft, normalized));
+            result.Add(new ValidatedBatchAccount(draft, normalized, account));
         }
         return result.MoveToImmutable();
+    }
+
+    private static async Task<ImmutableArray<AccountRule>> ReadDirectoryRulesAsync(
+        ImmutableArray<ValidatedBatchAccount> accounts,
+        IAccountRepository repository,
+        CancellationToken cancellationToken)
+    {
+        var builder = ImmutableArray.CreateBuilder<AccountRule>();
+        foreach (var account in accounts)
+        {
+            for (var pageNumber = 1; ; pageNumber++)
+            {
+                var page = await repository.GetRulesPageAsync(
+                    account.Draft.AccountId, new PageQuery(pageNumber, ReadPageSize), cancellationToken).ConfigureAwait(false);
+                foreach (var rule in page.Items)
+                {
+                    if (!string.Equals(rule.RuleType, "DirectoryPrefix", StringComparison.Ordinal)) continue;
+                    try
+                    {
+                        builder.Add(new AccountRule(rule.Id, rule.RuleValue, rule.AccountId, rule.Priority, rule.IsEnabled));
+                    }
+                    catch (ArgumentException)
+                    {
+                        throw new BatchDraftValidationException("An account directory rule is invalid.");
+                    }
+                }
+                if ((long)pageNumber * ReadPageSize >= page.TotalCount) break;
+            }
+        }
+        return builder.ToImmutable();
     }
 
     private async Task<ImmutableArray<ValidatedStagedRow>> ReadEligibleRowsAsync(
         ImportSessionRecord session,
         BatchDraft draft,
+        ImmutableArray<ValidatedBatchAccount> accounts,
         HashSet<Guid> accountIds,
+        ImmutableArray<AccountRule> rules,
         CancellationToken cancellationToken,
         IImportRepository repository)
     {
         var builder = ImmutableArray.CreateBuilder<ValidatedStagedRow>();
         var normalizedIds = new HashSet<string>(StringComparer.Ordinal);
+        var resolverAccounts = accounts.Select(account => new AccountRuleAccount(
+            account.Draft.AccountId,
+            account.Draft.PriorityOrder,
+            account.Record.IsEnabled,
+            account.Record.IsDeleted,
+            account.Record.Status == "Active")).ToArray();
+        var ruleResolver = new AccountRuleResolver();
         var after = 0;
         var readyRowsSeen = 0;
         while (true)
@@ -196,15 +236,22 @@ public sealed class BatchDraftValidator
                     throw new BatchDraftValidationException("A ready row is missing its normalized identity.");
                 if (!normalizedIds.Add(row.NormalizedShareId))
                     throw new BatchDraftValidationException("The import contains a duplicate normalized resource.");
+                if (row.RequestedAccountName is not null && row.MappedAccountId is null)
+                    throw new BatchDraftValidationException("A requested account name remains unresolved.");
                 if (row.MappedAccountId is { } mapped && !accountIds.Contains(mapped))
                     throw new BatchDraftValidationException("A row is mapped to an account outside the confirmed batch.");
                 if (draft.TransferMode == TransferMode.Replication && row.MappedAccountId is not null && !draft.IgnoreMappedAccountsForReplication)
                     throw new BatchDraftValidationException("Replication requires explicit confirmation to ignore row-level account mappings.");
                 var normalizedTarget = row.TargetPath is null ? null : NormalizePath(row.TargetPath);
+                var resolution = draft.TransferMode == TransferMode.Distribution
+                    ? ruleResolver.Resolve(row.MappedAccountId, row.TargetPath ?? draft.DefaultTargetPath, rules, resolverAccounts)
+                    : new AccountRuleResolution(null, AccountRuleResolutionReason.Public, null, null);
                 builder.Add(new ValidatedStagedRow(
                     row,
                     normalizedTarget,
-                    draft.TransferMode == TransferMode.Distribution ? row.MappedAccountId : null));
+                    resolution.CandidateConstraintAccountId,
+                    resolution.Reason,
+                    resolution.MatchedRuleId));
             }
         }
         if (readyRowsSeen != session.ReadyRows)
@@ -221,12 +268,17 @@ public sealed class BatchDraftValidator
     }
 }
 
-internal sealed record ValidatedBatchAccount(BatchAccountDraft Draft, string NormalizedDefaultTargetPath);
+internal sealed record ValidatedBatchAccount(
+    BatchAccountDraft Draft,
+    string NormalizedDefaultTargetPath,
+    AccountRecord Record);
 
 internal sealed record ValidatedStagedRow(
     StagedImportRowRecord Row,
     string? NormalizedTargetPath,
-    Guid? ConstraintAccountId);
+    Guid? ConstraintAccountId,
+    AccountRuleResolutionReason ConstraintReason = AccountRuleResolutionReason.Public,
+    Guid? MatchedRuleId = null);
 
 internal sealed record ValidatedBatchDraft(
     ImportSessionRecord Session,
@@ -292,6 +344,9 @@ internal static class BatchConfirmationTokens
             Append(hash, item.Row.TargetPath);
             Append(hash, item.Row.CreateFolderName);
             Append(hash, item.Row.MappedAccountId?.ToString("N"));
+            Append(hash, item.ConstraintAccountId?.ToString("N"));
+            Append(hash, item.ConstraintReason.ToString());
+            Append(hash, item.MatchedRuleId?.ToString("N"));
             Append(hash, item.Row.Note);
             Append(hash, item.Row.PrecheckStatus);
             Append(hash, item.Row.PrecheckErrorCode);

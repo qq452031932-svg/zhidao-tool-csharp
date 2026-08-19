@@ -109,6 +109,21 @@ public sealed record BatchStatisticsRecord(
 public sealed record StagedImportRowQuery(Guid ImportSessionId, string? Disposition, int PageNumber, int PageSize)
     : PageQuery(PageNumber, PageSize);
 
+public sealed record RequestedAccountNameGroupRecord(string RequestedAccountName, long RowCount)
+{
+    public override string ToString() =>
+        $"RequestedAccountNameGroupRecord {{ RequestedAccountName = [REDACTED], RowCount = {RowCount} }}";
+}
+
+public sealed record ImportDispositionCounts(
+    int TotalRows,
+    int ReadyRows,
+    int InvalidRows,
+    int DuplicateRows,
+    int ConflictRows,
+    int NeedsResolutionRows,
+    int ExcludedRows);
+
 public sealed record ImportSessionRecord(
     Guid Id, string SourceType, string SourceName, string Status, int TotalRows, int ReadyRows,
     int InvalidRows, int DuplicateRows, int ExcludedRows, Guid? PrecheckAccountId,

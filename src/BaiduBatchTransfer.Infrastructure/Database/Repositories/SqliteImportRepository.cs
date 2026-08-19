@@ -167,5 +167,100 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         return new(items, total, hasMore ? items[^1].SourceRowNumber : null);
     }
 
+    public async Task<IReadOnlyList<string>> GetNormalizedShareIdsPageAsync(
+        Guid sessionId,
+        string? afterNormalizedShareId,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        if (sessionId == Guid.Empty) throw new ArgumentException("An import session is required.", nameof(sessionId));
+        if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var command = Command("""
+            SELECT NormalizedShareId
+            FROM StagedImportRows
+            WHERE ImportSessionId=$session AND NormalizedShareId IS NOT NULL
+              AND Disposition<>'Excluded'
+              AND ($after IS NULL OR NormalizedShareId>$after)
+            GROUP BY NormalizedShareId
+            ORDER BY NormalizedShareId
+            LIMIT $limit;
+            """);
+        Add(command, "$session", Id(sessionId));
+        Add(command, "$after", afterNormalizedShareId);
+        Add(command, "$limit", pageSize);
+        var values = new List<string>(pageSize);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add(reader.GetString(0));
+        return values;
+    }
+
+    public async Task<Page<RequestedAccountNameGroupRecord>> GetRequestedAccountNameGroupsPageAsync(
+        Guid sessionId,
+        PageQuery query,
+        CancellationToken cancellationToken = default)
+    {
+        query.Validate();
+        await using var count = Command("""
+            SELECT COUNT(*) FROM (
+              SELECT RequestedAccountName FROM StagedImportRows
+              WHERE ImportSessionId=$session AND RequestedAccountName IS NOT NULL
+              GROUP BY RequestedAccountName
+            );
+            """);
+        Add(count, "$session", Id(sessionId));
+        var total = Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        await using var command = Command("""
+            SELECT RequestedAccountName,COUNT(*) FROM StagedImportRows
+            WHERE ImportSessionId=$session AND RequestedAccountName IS NOT NULL
+            GROUP BY RequestedAccountName
+            ORDER BY RequestedAccountName
+            LIMIT $limit OFFSET $offset;
+            """);
+        Add(command, "$session", Id(sessionId)); Add(command, "$limit", query.PageSize); Add(command, "$offset", query.Offset);
+        var items = new List<RequestedAccountNameGroupRecord>(query.PageSize);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            items.Add(new(reader.GetString(0), reader.GetInt64(1)));
+        return new(items, total, query.PageNumber, query.PageSize);
+    }
+
+    public async Task<ImportDispositionCounts> GetDispositionCountsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            SELECT COUNT(*),
+              SUM(CASE WHEN Disposition='Ready' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN Disposition='Invalid' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN Disposition='Duplicate' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN Disposition='Conflict' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN Disposition='NeedsResolution' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN Disposition='Excluded' THEN 1 ELSE 0 END)
+            FROM StagedImportRows WHERE ImportSessionId=$session;
+            """);
+        Add(command, "$session", Id(sessionId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        static int Value(SqliteDataReader reader, int index) => reader.IsDBNull(index) ? 0 : reader.GetInt32(index);
+        return new(Value(reader, 0), Value(reader, 1), Value(reader, 2), Value(reader, 3),
+            Value(reader, 4), Value(reader, 5), Value(reader, 6));
+    }
+
+    public async Task<bool> HasDuplicateNormalizedShareIdsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            SELECT EXISTS(
+              SELECT 1 FROM StagedImportRows
+              WHERE ImportSessionId=$session AND NormalizedShareId IS NOT NULL
+                AND Disposition IN ('Ready','Duplicate','Conflict')
+              GROUP BY NormalizedShareId HAVING COUNT(*)>1 LIMIT 1
+            );
+            """);
+        Add(command, "$session", Id(sessionId));
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 0;
+    }
+
     private static StagedImportRowRecord ReadRow(SqliteDataReader r) => new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),r.GetInt32(2),r.GetString(3),r.IsDBNull(4)?null:r.GetString(4),r.IsDBNull(5)?null:r.GetString(5),r.IsDBNull(6)?null:r.GetString(6),r.IsDBNull(7)?null:r.GetString(7),r.IsDBNull(8)?null:r.GetString(8),ReadNullableId(r,9),r.IsDBNull(10)?null:r.GetString(10),r.GetString(11),ReadNullableId(r,12),r.IsDBNull(13)?null:r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),ReadNullableTime(r,16),ReadTime(r,17));
 }
