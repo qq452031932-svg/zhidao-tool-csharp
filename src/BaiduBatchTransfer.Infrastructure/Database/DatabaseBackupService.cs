@@ -8,8 +8,8 @@ public sealed record DatabaseBackupDescriptor(string Path, int SchemaVersion, Da
 
 public sealed partial class DatabaseBackupService
 {
-    private static readonly string[] RequiredTables = ["ImportSessions", "StagedImportRows", "Accounts", "AccountRules", "BatchJobs", "ResourceItems", "TransferOperations", "AccountAllocations", "ExecutionLogs", "SchemaVersions"];
     private readonly SqliteConnectionFactory factory;
+    private readonly DatabaseSchemaValidator schemaValidator = new();
 
     public DatabaseBackupService(SqliteConnectionFactory factory, string backupRoot)
     {
@@ -31,7 +31,7 @@ public sealed partial class DatabaseBackupService
         await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
         source.BackupDatabase(destination);
         var integrity = await QuickCheckAsync(destination, cancellationToken).ConfigureAwait(false);
-        if (!integrity || !await ValidateApplicationIdentityAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false))
+        if (!integrity || !(await schemaValidator.ValidateAsync(destination, schemaVersion, cancellationToken).ConfigureAwait(false)).IsValid)
             throw new InvalidDataException("The SQLite online backup is not a valid application database.");
         return new(path, schemaVersion, createdAt, true);
     }
@@ -46,15 +46,15 @@ public sealed partial class DatabaseBackupService
             var path = EnsureDirectChild(candidate, BackupRoot);
             var match = BackupName().Match(Path.GetFileName(path));
             if (!match.Success) continue;
+            if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var expectedVersion) ||
+                !DateTimeOffset.TryParseExact(match.Groups[2].Value, "yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var created)) continue;
             try
             {
                 var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false };
                 await using var connection = new SqliteConnection(builder.ToString());
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-                var expectedVersion = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
                 if (!await QuickCheckAsync(connection, cancellationToken).ConfigureAwait(false) ||
-                    !await ValidateApplicationIdentityAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)) continue;
-                var created = DateTimeOffset.ParseExact(match.Groups[2].Value, "yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
+                    !(await schemaValidator.ValidateAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)).IsValid) continue;
                 result.Add(new(path, expectedVersion, created, true));
             }
             catch (SqliteException) { }
@@ -69,14 +69,15 @@ public sealed partial class DatabaseBackupService
         if (!File.Exists(path)) return false;
         var match = BackupName().Match(Path.GetFileName(path));
         if (!match.Success) return false;
+        if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var expectedVersion) ||
+            !DateTimeOffset.TryParseExact(match.Groups[2].Value, "yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out _)) return false;
         try
         {
             var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false };
             await using var connection = new SqliteConnection(builder.ToString());
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            var expectedVersion = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
             return await QuickCheckAsync(connection, cancellationToken).ConfigureAwait(false) &&
-                await ValidateApplicationIdentityAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false);
+                (await schemaValidator.ValidateAsync(connection, expectedVersion, cancellationToken).ConfigureAwait(false)).IsValid;
         }
         catch (SqliteException) { return false; }
     }
@@ -102,18 +103,6 @@ public sealed partial class DatabaseBackupService
             if (!string.Equals(reader.GetString(0), "ok", StringComparison.OrdinalIgnoreCase)) return false;
         }
         return any;
-    }
-
-    private static async Task<bool> ValidateApplicationIdentityAsync(SqliteConnection connection, int expectedVersion, CancellationToken cancellationToken)
-    {
-        await using var tablesCommand = connection.CreateCommand(); tablesCommand.CommandText = "SELECT name FROM sqlite_master WHERE type='table';";
-        var tables = new HashSet<string>(StringComparer.Ordinal);
-        await using (var reader = await tablesCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) tables.Add(reader.GetString(0));
-        if (!tables.Contains("SchemaVersions")) return false;
-        if (expectedVersion >= 1 && RequiredTables.Any(table => !tables.Contains(table))) return false;
-        await using var versionCommand = connection.CreateCommand(); versionCommand.CommandText = "SELECT COALESCE(MAX(Version),-1) FROM SchemaVersions;";
-        return Convert.ToInt32(await versionCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture) == expectedVersion;
     }
 
     [GeneratedRegex("^database-v(\\d+)-(\\d{8}T\\d{9}Z)\\.db\\.bak$", RegexOptions.CultureInvariant)]

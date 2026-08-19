@@ -38,6 +38,7 @@ public sealed class MigrationTests : IDisposable
         Assert.Contains("AdapterRequestId", operationColumns);
         Assert.Contains("RemoteItemIdsJson", operationColumns);
         Assert.Equal(1L, await ScalarAsync<long>(connection, "SELECT Version FROM SchemaVersions;"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 1)).IsValid);
     }
 
     [Fact]

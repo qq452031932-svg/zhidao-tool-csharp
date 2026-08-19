@@ -34,9 +34,9 @@ public sealed partial class DiagnosticExportService
             await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, useAsync: true))
             using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: false))
             {
-                await WriteJsonAsync(zip, "manifest.json", new { request.AppVersion, request.SchemaVersion, CreatedAt = DateTimeOffset.UtcNow }, cancellationToken).ConfigureAwait(false);
+                await WriteJsonAsync(zip, "manifest.json", new { AppVersion = SafeMetadata(request.AppVersion), request.SchemaVersion, CreatedAt = DateTimeOffset.UtcNow }, cancellationToken).ConfigureAwait(false);
                 await WriteTextAsync(zip, "integrity.txt", string.Join('\n', request.IntegrityOutput.Select(Sanitize)), cancellationToken).ConfigureAwait(false);
-                var logs = request.Logs.Select(x => new { x.Stage, x.Level, x.EventCode, SanitizedMessage = Sanitize(x.SanitizedMessage) });
+                var logs = request.Logs.Select(x => new { Stage = SafeMetadata(x.Stage), Level = SafeMetadata(x.Level), EventCode = SafeMetadata(x.EventCode), SanitizedMessage = Sanitize(x.SanitizedMessage) });
                 await WriteJsonAsync(zip, "logs.json", logs, cancellationToken).ConfigureAwait(false);
                 var metadata = request.Metadata.Where(x => AllowedMetadata.Contains(x.Key)).ToDictionary(x => x.Key, x => Sanitize(x.Value), StringComparer.OrdinalIgnoreCase);
                 await WriteJsonAsync(zip, "metadata.json", metadata, cancellationToken).ConfigureAwait(false);
@@ -54,7 +54,9 @@ public sealed partial class DiagnosticExportService
     private static string Sanitize(string value)
     {
         var result = ResponseBody().Replace(value ?? string.Empty, "[REDACTED]");
-        result = ShareUrl().Replace(result, "[REDACTED_URL]");
+        result = AnyUrl().Replace(result, "[REDACTED_URL]");
+        result = WindowsPath().Replace(result, "[REDACTED_PATH]");
+        result = SensitiveJsonField().Replace(result, "$1[REDACTED]");
         result = Cookie().Replace(result, "$1[REDACTED]");
         result = Authorization().Replace(result, "$1[REDACTED]");
         result = SessionToken().Replace(result, "$1[REDACTED]");
@@ -63,6 +65,8 @@ public sealed partial class DiagnosticExportService
         result = GuidIdentifier().Replace(result, "[REDACTED_ID]");
         return result;
     }
+
+    private static string SafeMetadata(string value) => value is not null && SafeMetadataPattern().IsMatch(value) ? value : "[REDACTED]";
 
     private static async Task WriteJsonAsync<T>(ZipArchive zip, string name, T value, CancellationToken cancellationToken)
     {
@@ -80,8 +84,12 @@ public sealed partial class DiagnosticExportService
 
     [GeneratedRegex("(?i)response\\s*body\\s*:[^\\r\\n]*")]
     private static partial Regex ResponseBody();
-    [GeneratedRegex("(?i)https?://(?:pan\\.)?baidu\\.com/\\S+")]
-    private static partial Regex ShareUrl();
+    [GeneratedRegex("(?i)[A-Z][A-Z0-9+.-]*://[^\\s\"'<>]+")]
+    private static partial Regex AnyUrl();
+    [GeneratedRegex("(?i)(?:\\b[A-Z]:\\\\|\\\\\\\\)[^\"'\\r\\n]+")]
+    private static partial Regex WindowsPath();
+    [GeneratedRegex("(?i)([\"']?(?:userid|accountid|extractioncode|accesstoken|token|cookie|authorization|bduss|stoken)[\"']?\\s*:\\s*)(?:\\[[^\\]\\r\\n]*\\]|[\"'][^\"'\\r\\n]*[\"']|[^,}\\r\\n]+)")]
+    private static partial Regex SensitiveJsonField();
     [GeneratedRegex("(?i)([\"']?cookie[\"']?\\s*[=:]\\s*(?:\\[\\s*)?[\"']?)[^\"'\\r\\n}]+")]
     private static partial Regex Cookie();
     [GeneratedRegex("(?i)([\"']?authorization[\"']?\\s*[=:]\\s*(?:\\[\\s*)?[\"']?)[^\"'\\r\\n}]+")]
@@ -94,4 +102,6 @@ public sealed partial class DiagnosticExportService
     private static partial Regex ExtractionCode();
     [GeneratedRegex("(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b")]
     private static partial Regex GuidIdentifier();
+    [GeneratedRegex("^[A-Za-z0-9_.-]{1,64}$", RegexOptions.CultureInvariant)]
+    private static partial Regex SafeMetadataPattern();
 }

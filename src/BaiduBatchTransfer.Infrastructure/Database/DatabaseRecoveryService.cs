@@ -9,19 +9,22 @@ public sealed class DatabaseRecoveryService
     private readonly DatabaseMigrator migrator;
     private readonly DatabaseIntegrityService integrityService;
     private readonly string quarantineRoot;
+    private readonly TimeProvider timeProvider;
 
     public DatabaseRecoveryService(
         SqliteConnectionFactory factory,
         DatabaseBackupService backupService,
         DatabaseMigrator migrator,
         DatabaseIntegrityService integrityService,
-        string quarantineRoot)
+        string quarantineRoot,
+        TimeProvider? timeProvider = null)
     {
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
         this.backupService = backupService ?? throw new ArgumentNullException(nameof(backupService));
         this.migrator = migrator ?? throw new ArgumentNullException(nameof(migrator));
         this.integrityService = integrityService ?? throw new ArgumentNullException(nameof(integrityService));
         this.quarantineRoot = Path.GetFullPath(quarantineRoot ?? throw new ArgumentNullException(nameof(quarantineRoot)));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public Task<IReadOnlyList<DatabaseBackupDescriptor>> ListValidatedBackupsAsync(CancellationToken cancellationToken = default) =>
@@ -35,10 +38,11 @@ public sealed class DatabaseRecoveryService
             throw new InvalidDataException("The selected backup is not a validated SQLite backup.");
 
         Directory.CreateDirectory(quarantineRoot);
-        var stamp = DateTimeOffset.UtcNow.ToString("yyyyMMddTHHmmssfffZ");
+        var stamp = timeProvider.GetUtcNow().ToString("yyyyMMddTHHmmssfffZ");
         var quarantine = DatabaseBackupService.EnsureDirectChild(Path.Combine(quarantineRoot, $"database-damaged-{stamp}.db"), quarantineRoot);
         var staging = DatabaseBackupService.EnsureDirectChild(Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, $"database-restore-{Guid.NewGuid():N}.tmp"), Path.GetDirectoryName(factory.DatabasePath)!);
         var moved = new List<(string Original, string Quarantine)>();
+        var installedRestore = false;
         try
         {
             MoveToQuarantineIfPresent(factory.DatabasePath, quarantine, moved);
@@ -46,6 +50,7 @@ public sealed class DatabaseRecoveryService
             MoveToQuarantineIfPresent(factory.DatabasePath + "-shm", quarantine + "-shm", moved);
             File.Copy(backup, staging, overwrite: false);
             File.Move(staging, factory.DatabasePath);
+            installedRestore = true;
             await migrator.MigrateAsync(cancellationToken).ConfigureAwait(false);
             await integrityService.EnsureHealthyAsync(cancellationToken).ConfigureAwait(false);
             return new(backup, quarantine);
@@ -53,9 +58,12 @@ public sealed class DatabaseRecoveryService
         catch
         {
             DeleteExactIfPresent(staging);
-            DeleteExactIfPresent(factory.DatabasePath);
-            DeleteExactIfPresent(factory.DatabasePath + "-wal");
-            DeleteExactIfPresent(factory.DatabasePath + "-shm");
+            if (installedRestore)
+            {
+                DeleteExactIfPresent(factory.DatabasePath);
+                DeleteExactIfPresent(factory.DatabasePath + "-wal");
+                DeleteExactIfPresent(factory.DatabasePath + "-shm");
+            }
             foreach (var (original, quarantined) in moved.AsEnumerable().Reverse())
                 if (File.Exists(quarantined)) File.Move(quarantined, original);
             throw;
