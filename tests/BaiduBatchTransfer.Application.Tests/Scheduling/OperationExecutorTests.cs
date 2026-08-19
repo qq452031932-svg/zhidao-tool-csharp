@@ -39,7 +39,7 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
-    public async Task DirectoryFailureIsClassifiedWithoutCallingSaveOrCrossingSubmitBoundary()
+    public async Task DirectoryFailurePausesAccountWithoutCallingSaveOrCrossingSubmitBoundary()
     {
         var snapshot = Snapshot(createFolderName: "outer");
         var store = new RecordingExecutionStore(snapshot);
@@ -53,9 +53,10 @@ public sealed class OperationExecutorTests
 
         Assert.Equal(0, adapter.SaveCalls);
         Assert.DoesNotContain(store.Events, item => item.Name == "Boundary");
-        Assert.Equal("InvalidTargetPath", store.FailureCode);
-        Assert.Equal("The target path is invalid.", store.FailureMessage);
-        Assert.DoesNotContain("secret", store.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InvalidTargetPath", store.AccountPauseCode);
+        Assert.Equal("The target path is invalid.", store.AccountPauseMessage);
+        Assert.DoesNotContain("secret", store.AccountPauseMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -76,6 +77,30 @@ public sealed class OperationExecutorTests
         Assert.Equal(4, adapter.EnsureCalls);
         Assert.Equal([TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4)], delay.Delays);
         Assert.Contains(store.Events, item => item.Name == "Succeeded");
+    }
+
+    [Fact]
+    public async Task TypedServerRetryDelayFlowsFromAdapterResultIntoActualDelay()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            EnsureResults = new Queue<BaiduAdapterResult<RemoteDirectory>>(
+            [
+                BaiduAdapterResult<RemoteDirectory>.Failure(
+                    BaiduErrorKind.TransientService,
+                    "untrusted response text 99",
+                    TimeSpan.FromSeconds(23)),
+                BaiduAdapterResult<RemoteDirectory>.Success(new RemoteDirectory("directory-id", new RemotePath("/base"))),
+            ]),
+        };
+        var delay = new RecordingDelay();
+
+        await Executor(store, adapter, delay: delay).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal([TimeSpan.FromSeconds(23)], delay.Delays);
+        Assert.True(store.Succeeded);
     }
 
     [Fact]
@@ -110,7 +135,27 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
-    public async Task InvalidSnapshottedOuterDirectoryIsPersistedAsSafePathFailure()
+    public async Task AccountFailureReturnedAfterSubmitPausesAccountForReconciliation()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(
+                BaiduErrorKind.InsufficientCapacity,
+                "private response"),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Contains(store.Events, item => item.Name == "Boundary");
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InsufficientCapacity", store.AccountPauseCode);
+        Assert.Null(store.FailureCode);
+    }
+
+    [Fact]
+    public async Task InvalidSnapshottedOuterDirectoryPausesAccountWithSafePathReason()
     {
         var snapshot = Snapshot(createFolderName: "../private");
         var store = new RecordingExecutionStore(snapshot);
@@ -120,24 +165,84 @@ public sealed class OperationExecutorTests
 
         Assert.Equal(0, adapter.EnsureCalls);
         Assert.Equal(0, adapter.SaveCalls);
-        Assert.Equal("InvalidTargetPath", store.FailureCode);
-        Assert.Equal("The target path is invalid.", store.FailureMessage);
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InvalidTargetPath", store.AccountPauseCode);
+        Assert.Equal("The target path is invalid.", store.AccountPauseMessage);
     }
 
     [Fact]
-    public async Task AccountScopedFailurePausesAccountWithoutConsumingRemainingWork()
+    public async Task ArgumentExceptionWhileBuildingSnapshottedPathCannotStrandPreparingWorker()
+    {
+        var snapshot = Snapshot(createFolderName: "invalid\0folder");
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter();
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal(0, adapter.EnsureCalls);
+        Assert.Equal(0, adapter.SaveCalls);
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InvalidTargetPath", store.AccountPauseCode);
+        Assert.Equal("The target path is invalid.", store.AccountPauseMessage);
+    }
+
+    [Fact]
+    public async Task InvalidPersistedBasePathCannotCrashWorkerOrRetainItsReservation()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot)
+        {
+            LoadException = new ArgumentException("untrusted persisted path"),
+        };
+        var adapter = new RecordingAdapter();
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.DoesNotContain(store.Events, item => item.Name == "Preparing");
+        Assert.Equal(0, adapter.EnsureCalls);
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InvalidTargetPath", store.AccountPauseCode);
+        Assert.Equal("The target path is invalid.", store.AccountPauseMessage);
+        Assert.DoesNotContain("untrusted", store.AccountPauseMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ArgumentExceptionWhileEnsuringDirectoryCannotCrashOrStrandPreparingWorker()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            EnsureException = new ArgumentException("untrusted invalid directory response"),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal(1, adapter.EnsureCalls);
+        Assert.Equal(0, adapter.SaveCalls);
+        Assert.True(store.AccountPaused);
+        Assert.Equal("InvalidTargetPath", store.AccountPauseCode);
+        Assert.Equal("The target path is invalid.", store.AccountPauseMessage);
+        Assert.DoesNotContain("untrusted", store.AccountPauseMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(BaiduErrorKind.ExpiredLogin)]
+    [InlineData(BaiduErrorKind.InsufficientCapacity)]
+    public async Task AccountScopedFailurePausesAccountWithoutConsumingRemainingWork(BaiduErrorKind errorKind)
     {
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot);
         var adapter = new RecordingAdapter
         {
             EnsureResults = new Queue<BaiduAdapterResult<RemoteDirectory>>(
-                [BaiduAdapterResult<RemoteDirectory>.Failure(BaiduErrorKind.ExpiredLogin, "private-cookie")]),
+                [BaiduAdapterResult<RemoteDirectory>.Failure(errorKind, "private-cookie")]),
         };
 
         await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
 
         Assert.True(store.AccountPaused);
+        Assert.Equal(errorKind.ToString(), store.AccountPauseCode);
         Assert.Null(store.FailureCode);
         Assert.Equal(0, adapter.SaveCalls);
     }
@@ -197,6 +302,7 @@ public sealed class OperationExecutorTests
     {
         private int order;
         public OperationExecutionSnapshot Snapshot { get; } = snapshot;
+        public Exception? LoadException { get; init; }
         public List<(int Order, string Name)> Events { get; } = [];
         public string? FailureCode { get; private set; }
         public string? FailureMessage { get; private set; }
@@ -207,9 +313,14 @@ public sealed class OperationExecutorTests
         public bool Succeeded { get; private set; }
         public bool ResultPending { get; private set; }
         public bool AccountPaused { get; private set; }
+        public string? AccountPauseCode { get; private set; }
+        public string? AccountPauseMessage { get; private set; }
 
-        public Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default) =>
-            Task.FromResult<OperationExecutionSnapshot?>(Snapshot);
+        public Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default)
+        {
+            if (LoadException is not null) throw LoadException;
+            return Task.FromResult<OperationExecutionSnapshot?>(Snapshot);
+        }
 
         public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
@@ -264,6 +375,8 @@ public sealed class OperationExecutorTests
         public Task MarkAccountUnavailableAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
             AccountPaused = true;
+            AccountPauseCode = code;
+            AccountPauseMessage = safeMessage;
             Events.Add((++order, "AccountPaused"));
             return Task.CompletedTask;
         }
@@ -272,6 +385,7 @@ public sealed class OperationExecutorTests
     private sealed class RecordingAdapter(List<string>? timeline = null) : IBaiduNetdiskAdapter
     {
         public Queue<BaiduAdapterResult<RemoteDirectory>> EnsureResults { get; init; } = [];
+        public Exception? EnsureException { get; init; }
         public BaiduAdapterResult<TransferReceipt> SaveResult { get; init; } = BaiduAdapterResult<TransferReceipt>.Success(
             new TransferReceipt(Now, "request-1", ["remote-1"]));
         public RemotePath? EnsuredPath { get; private set; }
@@ -284,6 +398,7 @@ public sealed class OperationExecutorTests
         {
             EnsureCalls++;
             EnsuredPath = path;
+            if (EnsureException is not null) throw EnsureException;
             if (EnsureResults.TryDequeue(out var result)) return Task.FromResult(result);
             return Task.FromResult(BaiduAdapterResult<RemoteDirectory>.Success(new RemoteDirectory("directory-id", path)));
         }

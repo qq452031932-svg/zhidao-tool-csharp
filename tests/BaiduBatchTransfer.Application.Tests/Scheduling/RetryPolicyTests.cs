@@ -27,6 +27,18 @@ public sealed class RetryPolicyTests
         Assert.Equal(TimeSpan.FromSeconds(30), decision.Delay);
     }
 
+    [Fact]
+    public void ServerWaitIsClampedToMaximumDelaySupportedByTaskDelay()
+    {
+        var decision = RetryPolicy.Default.Decide(
+            BaiduErrorKind.TransientService,
+            completedRetries: 0,
+            serverWait: TimeSpan.MaxValue);
+
+        Assert.True(decision.ShouldRetry);
+        Assert.Equal(RetryPolicy.MaximumSupportedDelay, decision.Delay);
+    }
+
     [Theory]
     [InlineData(BaiduErrorKind.InvalidLink)]
     [InlineData(BaiduErrorKind.InvalidExtractionCode)]

@@ -100,8 +100,18 @@ public sealed class OperationExecutor : ITransferOperationExecutor
     public async Task ExecuteAsync(Guid operationId, CancellationToken cancellationToken = default)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation ID is required.", nameof(operationId));
-        var snapshot = await store.LoadAsync(operationId, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException("The scheduled operation no longer exists.");
+        OperationExecutionSnapshot? snapshot;
+        try
+        {
+            snapshot = await store.LoadAsync(operationId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ArgumentException)
+        {
+            await PauseAccountAsync(operationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+        if (snapshot is null) throw new InvalidOperationException("The scheduled operation no longer exists.");
         var session = await sessionStore.LoadAsync(snapshot.AccountId.ToString("D"), cancellationToken)
             .ConfigureAwait(false);
         if (session is null)
@@ -118,17 +128,27 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             completePath = CombinePath(snapshot.TargetPath, snapshot.CreateFolderName);
         }
-        catch (InvalidOperationException)
+        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
-            await FailAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, false, cancellationToken)
+            await PauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
-        var directoryResult = await EnsureWithRetryAsync(session, completePath, cancellationToken).ConfigureAwait(false);
+        BaiduAdapterResult<RemoteDirectory> directoryResult;
+        try
+        {
+            directoryResult = await EnsureWithRetryAsync(session, completePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
+        {
+            await PauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
         if (!directoryResult.IsSuccess)
         {
             var error = directoryResult.ErrorKind!.Value;
-            if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+            if (IsAccountPausingFailure(error))
                 await PauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
             else
                 await FailAsync(snapshot.OperationId, error, false, cancellationToken).ConfigureAwait(false);
@@ -163,7 +183,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         if (!saveResult.IsSuccess)
         {
             var errorKind = saveResult.ErrorKind!.Value;
-            if (errorKind is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+            if (IsAccountPausingFailure(errorKind))
             {
                 await PauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
             }
@@ -207,7 +227,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             var result = await adapter.EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
             if (result.IsSuccess) return result;
-            var decision = retryPolicy.Decide(result.ErrorKind!.Value, completedRetries);
+            var decision = retryPolicy.Decide(result.ErrorKind!.Value, completedRetries, result.RetryAfter);
             if (!decision.ShouldRetry) return result;
             completedRetries++;
             await delay.DelayAsync(decision.Delay, cancellationToken).ConfigureAwait(false);
@@ -243,6 +263,12 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             timeProvider.GetUtcNow(),
             cancellationToken);
     }
+
+    private static bool IsAccountPausingFailure(BaiduErrorKind errorKind) =>
+        errorKind is BaiduErrorKind.ExpiredLogin
+            or BaiduErrorKind.VerificationRequired
+            or BaiduErrorKind.InsufficientCapacity
+            or BaiduErrorKind.InvalidTargetPath;
 
     private static RemotePath CombinePath(RemotePath basePath, string? outerDirectory)
     {

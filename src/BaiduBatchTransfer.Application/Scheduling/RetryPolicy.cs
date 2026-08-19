@@ -9,6 +9,9 @@ public sealed record RetryDecision(bool ShouldRetry, TimeSpan Delay)
 
 public sealed class RetryPolicy
 {
+    public static TimeSpan MaximumSupportedDelay { get; } =
+        TimeSpan.FromMilliseconds(uint.MaxValue - 1d);
+
     private readonly TimeSpan[] backoffs;
 
     public RetryPolicy(IEnumerable<TimeSpan> backoffs)
@@ -34,6 +37,7 @@ public sealed class RetryPolicy
 
         var delay = backoffs[completedRetries];
         if (serverWait is { } requested && requested > delay) delay = requested;
+        if (delay > MaximumSupportedDelay) delay = MaximumSupportedDelay;
         return new RetryDecision(true, delay);
     }
 }

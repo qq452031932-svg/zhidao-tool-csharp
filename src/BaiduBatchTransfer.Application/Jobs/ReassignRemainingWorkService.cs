@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Security.Cryptography;
 using System.Text;
 using BaiduBatchTransfer.Core.Domain;
@@ -68,7 +69,8 @@ public sealed record ReassignmentPreview(
     IReadOnlyList<ReassignmentCandidateMove> CandidateMoves,
     IReadOnlyList<ReassignmentAllocationDelta> AllocationDeltas,
     int AffectedCount,
-    string ConfirmationToken);
+    string ConfirmationToken,
+    ReassignmentRequest Request);
 
 public interface IReassignmentStore
 {
@@ -153,6 +155,10 @@ public sealed class ReassignRemainingWorkService
             affectedCount = checked(deltas.Where(item => item.Delta > 0).Sum(item => item.Delta));
         }
 
+        var canonicalRequest = new ReassignmentRequest(
+            request.BatchJobId,
+            request.FailedAccountId,
+            new ReadOnlyDictionary<Guid, int>(new Dictionary<Guid, int>(request.NewTargetCounts)));
         var token = CreateToken(state.BatchJobId, state.BatchVersion, state.QuotaBasis,
             operationMoves, candidateMoves, deltas);
         return new ReassignmentPreview(
@@ -163,7 +169,8 @@ public sealed class ReassignRemainingWorkService
             candidateMoves,
             deltas,
             affectedCount,
-            token);
+            token,
+            canonicalRequest);
     }
 
     public async Task ApplyAsync(
@@ -176,12 +183,28 @@ public sealed class ReassignRemainingWorkService
         if (!FixedTimeEquals(preview.ConfirmationToken, confirmationToken))
             throw new ReassignmentConfirmationException("The reassignment preview must be explicitly confirmed.");
 
-        var mutation = new ReassignmentMutation(
+        var suppliedShapeToken = CreateToken(
             preview.BatchJobId,
+            preview.BatchVersion,
+            preview.QuotaBasis,
             preview.OperationMoves,
             preview.CandidateMoves,
             preview.AllocationDeltas);
-        if (!await store.ApplyAsync(mutation, preview.BatchVersion, cancellationToken).ConfigureAwait(false))
+        if (!FixedTimeEquals(preview.ConfirmationToken, suppliedShapeToken))
+            throw new ReassignmentConfirmationException("The reassignment preview was modified after confirmation.");
+
+        var canonical = await PreviewAsync(preview.Request, cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(canonical.BatchVersion, preview.BatchVersion, StringComparison.Ordinal))
+            throw new ReassignmentStaleStateException("The batch changed; create and confirm a new reassignment preview.");
+        if (!FixedTimeEquals(canonical.ConfirmationToken, preview.ConfirmationToken))
+            throw new ReassignmentConfirmationException("The reassignment request no longer matches its canonical preview.");
+
+        var mutation = new ReassignmentMutation(
+            canonical.BatchJobId,
+            canonical.OperationMoves,
+            canonical.CandidateMoves,
+            canonical.AllocationDeltas);
+        if (!await store.ApplyAsync(mutation, canonical.BatchVersion, cancellationToken).ConfigureAwait(false))
             throw new ReassignmentStaleStateException("The batch changed; create and confirm a new reassignment preview.");
     }
 

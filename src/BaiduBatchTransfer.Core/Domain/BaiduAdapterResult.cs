@@ -2,8 +2,11 @@ namespace BaiduBatchTransfer.Core.Domain;
 
 public static class BaiduAdapterResult
 {
-    public static BaiduAdapterResult<object> Failure(BaiduErrorKind errorKind, string? adapterDiagnostic) =>
-        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic);
+    public static BaiduAdapterResult<object> Failure(
+        BaiduErrorKind errorKind,
+        string? adapterDiagnostic,
+        TimeSpan? retryAfter = null) =>
+        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic, retryAfter);
 
     internal static BaiduErrorScope GetScope(BaiduErrorKind errorKind) => errorKind switch
     {
@@ -42,13 +45,15 @@ public sealed class BaiduAdapterResult<T>
         T? value,
         BaiduErrorKind? errorKind,
         BaiduErrorScope? scope,
-        string? safeMessage)
+        string? safeMessage,
+        TimeSpan? retryAfter)
     {
         IsSuccess = isSuccess;
         Value = value;
         ErrorKind = errorKind;
         Scope = scope;
         SafeMessage = safeMessage;
+        RetryAfter = retryAfter;
     }
 
     public bool IsSuccess { get; }
@@ -61,14 +66,21 @@ public sealed class BaiduAdapterResult<T>
 
     public string? SafeMessage { get; }
 
+    public TimeSpan? RetryAfter { get; }
+
     public static BaiduAdapterResult<T> Success(T value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        return new BaiduAdapterResult<T>(true, value, null, null, null);
+        return new BaiduAdapterResult<T>(true, value, null, null, null, null);
     }
 
-    public static BaiduAdapterResult<T> Failure(BaiduErrorKind errorKind, string? adapterDiagnostic)
+    public static BaiduAdapterResult<T> Failure(
+        BaiduErrorKind errorKind,
+        string? adapterDiagnostic,
+        TimeSpan? retryAfter = null)
     {
+        if (retryAfter < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(retryAfter), "The server retry delay cannot be negative.");
         // Diagnostics may contain credentials and are deliberately excluded from the public result.
         _ = adapterDiagnostic;
         var scope = BaiduAdapterResult.GetScope(errorKind);
@@ -77,6 +89,7 @@ public sealed class BaiduAdapterResult<T>
             default,
             errorKind,
             scope,
-            BaiduAdapterResult.GetSafeMessage(errorKind));
+            BaiduAdapterResult.GetSafeMessage(errorKind),
+            retryAfter);
     }
 }

@@ -88,6 +88,51 @@ public sealed class ReassignRemainingWorkServiceTests
         store.CurrentVersion = "version-2";
         await Assert.ThrowsAsync<ReassignmentStaleStateException>(
             () => service.ApplyAsync(preview, preview.ConfirmationToken));
+        Assert.Equal(0, store.ApplyCalls);
+    }
+
+    [Fact]
+    public async Task ApplyRejectsCallerTamperingAndNeverTrustsPreviewMoves()
+    {
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var movable = Operation(failed, 1, "Waiting", "NotPrepared", false);
+        var store = new RecordingReassignmentStore(new ReassignmentState(
+            batch, "version-1", QuotaBasis.TaskCount,
+            [Allocation(failed, 1), Allocation(replacement, 0)], [movable], []));
+        var service = new ReassignRemainingWorkService(store);
+        var preview = await service.PreviewAsync(new ReassignmentRequest(batch, failed,
+            new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 }));
+        var tampered = preview with
+        {
+            OperationMoves = [new ReassignmentOperationMove(Guid.NewGuid(), failed, replacement)],
+        };
+
+        await Assert.ThrowsAsync<ReassignmentConfirmationException>(() =>
+            service.ApplyAsync(tampered, preview.ConfirmationToken));
+
+        Assert.Equal(0, store.ApplyCalls);
+    }
+
+    [Fact]
+    public async Task ApplyRejectsVersionRaceInsideAtomicStoreMutation()
+    {
+        var batch = Guid.NewGuid();
+        var failed = Guid.NewGuid();
+        var replacement = Guid.NewGuid();
+        var store = new RecordingReassignmentStore(new ReassignmentState(
+            batch, "version-1", QuotaBasis.TaskCount,
+            [Allocation(failed, 1), Allocation(replacement, 0)],
+            [Operation(failed, 1, "Waiting", "NotPrepared", false)], []));
+        var service = new ReassignRemainingWorkService(store);
+        var preview = await service.PreviewAsync(new ReassignmentRequest(batch, failed,
+            new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 }));
+        store.ChangeVersionInsideApply = true;
+
+        await Assert.ThrowsAsync<ReassignmentStaleStateException>(() =>
+            service.ApplyAsync(preview, preview.ConfirmationToken));
+
         Assert.Equal(1, store.ApplyCalls);
     }
 
@@ -136,6 +181,7 @@ public sealed class ReassignRemainingWorkServiceTests
     private sealed class RecordingReassignmentStore(ReassignmentState state) : IReassignmentStore
     {
         public string CurrentVersion { get; set; } = state.BatchVersion;
+        public bool ChangeVersionInsideApply { get; set; }
         public int ApplyCalls { get; private set; }
         public Task<ReassignmentState?> LoadAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
             Task.FromResult<ReassignmentState?>(state with { BatchVersion = CurrentVersion });
@@ -143,6 +189,7 @@ public sealed class ReassignRemainingWorkServiceTests
         public Task<bool> ApplyAsync(ReassignmentMutation mutation, string expectedBatchVersion, CancellationToken cancellationToken = default)
         {
             ApplyCalls++;
+            if (ChangeVersionInsideApply) CurrentVersion = "version-raced";
             return Task.FromResult(string.Equals(CurrentVersion, expectedBatchVersion, StringComparison.Ordinal));
         }
     }
