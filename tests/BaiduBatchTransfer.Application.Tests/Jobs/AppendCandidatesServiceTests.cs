@@ -60,6 +60,43 @@ public sealed class AppendCandidatesServiceTests
     }
 
     [Fact]
+    public async Task AppendPreviewExcludesCandidateBlockedByExistingNonCancelledOperationKey()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var account = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var importId = Guid.NewGuid();
+        var oldImportId = Guid.NewGuid();
+        var blocked = Resource(batchId, 1, "blocked", account, "Unused");
+        var failed = new TransferOperationRecord(
+            Guid.NewGuid(), blocked.Id, batchId, blocked.CandidateSequence, 1,
+            "/account", "/account", "", account, "Exclusive", "Failed", "Failed", 1,
+            "failed-key", "{}", "request", null, "ResultReceived", "Released", null,
+            BatchTestData.Now, BatchTestData.Now, "InsufficientCapacity",
+            "The account has insufficient capacity.", null, BatchTestData.Now, BatchTestData.Now);
+        var job = Job(batchId, oldImportId, "AwaitingCandidates", null, 1) with
+        {
+            OperationCount = 1,
+        };
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(oldImportId, 0, 0),
+            null,
+            job,
+            [blocked],
+            [failed],
+            [Allocation(batchId, account, 2, 0, 1, 1)]);
+        await database.SeedAsync([], BatchTestData.ReadySession(
+                importId, 1, 1, appendToBatchJobId: batchId),
+            [BatchTestData.ReadyRow(importId, 1, mappedAccountId: account, normalizedId: "new")]);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(new AppendCandidatesDraft(batchId, importId));
+
+        Assert.Equal(1, Assert.Single(preview.Accounts).ReachableTargetSuccessCount);
+    }
+
+    [Fact]
     public async Task AppendWithoutMatchingConfirmationDoesNotChangeBatchOrImport()
     {
         await using var database = await BatchTestDatabase.CreateAsync();

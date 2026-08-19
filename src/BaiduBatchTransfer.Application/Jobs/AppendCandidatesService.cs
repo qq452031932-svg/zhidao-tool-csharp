@@ -162,7 +162,7 @@ public sealed class AppendCandidatesService
         if (allocations.Count == 0) throw new BatchDraftValidationException("The target batch has no account allocations.");
         var accountIds = allocations.Select(allocation => allocation.AccountId).ToHashSet();
         var existingIds = new HashSet<string>(StringComparer.Ordinal);
-        var availableCandidates = new List<AllocationCandidate>();
+        var availableCandidates = new List<AppendReachabilityCandidate>();
         long maximumSequence = 0;
         for (var pageNumber = 1; ; pageNumber++)
         {
@@ -175,11 +175,12 @@ public sealed class AppendCandidatesService
                 if (Enum.TryParse<CandidateStatus>(resource.CandidateStatus, out var status) &&
                     status is CandidateStatus.Unallocated or CandidateStatus.Unused)
                 {
-                    availableCandidates.Add(new AllocationCandidate(
+                    availableCandidates.Add(new AppendReachabilityCandidate(
                         resource.Id,
                         checked((int)resource.CandidateSequence),
                         resource.CandidateConstraintAccountId,
-                        status));
+                        resource.NormalizedTargetPathOverride,
+                        resource.CreateFolderName ?? string.Empty));
                 }
             }
             if ((long)pageNumber * PageSize >= page.TotalCount) break;
@@ -222,11 +223,12 @@ public sealed class AppendCandidatesService
         var appendedSequence = maximumSequence;
         foreach (var row in rows)
         {
-            availableCandidates.Add(new AllocationCandidate(
+            availableCandidates.Add(new AppendReachabilityCandidate(
                 row.Row.Id,
                 checked((int)(appendedSequence = checked(appendedSequence + 1))),
                 row.ConstraintAccountId,
-                CandidateStatus.Unallocated));
+                row.NormalizedTargetPath,
+                row.Row.CreateFolderName ?? string.Empty));
         }
         if (!Enum.TryParse<ShortagePolicy>(batch.ShortagePolicy, out var shortagePolicy))
             throw new BatchDraftValidationException("The batch has an unsupported shortage policy.");
@@ -241,9 +243,10 @@ public sealed class AppendCandidatesService
         var reachablePolicy = shortagePolicy == ShortagePolicy.WaitForCandidates
             ? ShortagePolicy.ProportionalReduction
             : shortagePolicy;
-        var reachableTargets = new ShortageSimulator()
-            .Simulate(reachablePolicy, targetAccounts, availableCandidates)
-            .EffectiveTargets;
+        var operationKeys = await ReadNonCancelledOperationKeysAsync(
+            unit.Jobs, draft.BatchJobId, cancellationToken).ConfigureAwait(false);
+        var reachableTargets = SimulateReachableTargets(
+            reachablePolicy, targetAccounts, allocations, availableCandidates, operationKeys);
 
         var confirmations = allocations.OrderBy(allocation => allocation.PriorityOrder).Select(allocation =>
         {
@@ -286,7 +289,126 @@ public sealed class AppendCandidatesService
             if (result.Count >= page.TotalCount) return result;
         }
     }
+
+    private static async Task<HashSet<AppendOperationKey>> ReadNonCancelledOperationKeysAsync(
+        IJobRepository jobs,
+        Guid batchJobId,
+        CancellationToken cancellationToken)
+    {
+        var keys = new HashSet<AppendOperationKey>();
+        for (var pageNumber = 1; ; pageNumber++)
+        {
+            var page = await jobs.GetOperationsPageAsync(
+                batchJobId, new PageQuery(pageNumber, PageSize), cancellationToken).ConfigureAwait(false);
+            foreach (var operation in page.Items)
+            {
+                if (!string.Equals(operation.Status, "Cancelled", StringComparison.Ordinal))
+                {
+                    keys.Add(new AppendOperationKey(
+                        operation.ResourceItemId,
+                        operation.AssignedAccountId,
+                        operation.NormalizedTargetPath,
+                        operation.CreateFolderName));
+                }
+            }
+            if ((long)pageNumber * PageSize >= page.TotalCount) return keys;
+        }
+    }
+
+    private static IReadOnlyDictionary<Guid, int> SimulateReachableTargets(
+        ShortagePolicy policy,
+        IReadOnlyList<SuccessTargetAccount> accounts,
+        IReadOnlyList<AccountAllocationRecord> allocations,
+        IReadOnlyCollection<AppendReachabilityCandidate> candidates,
+        IReadOnlySet<AppendOperationKey> operationKeys)
+    {
+        var current = accounts.ToDictionary(account => account.AccountId);
+        var defaults = allocations.ToDictionary(
+            allocation => allocation.AccountId,
+            allocation => allocation.NormalizedDefaultTargetPath);
+        var ordered = candidates.OrderBy(candidate => candidate.CandidateSequence).ToArray();
+        var exclusive = ordered
+            .Where(candidate => candidate.ConstraintAccountId is not null)
+            .GroupBy(candidate => candidate.ConstraintAccountId!.Value)
+            .ToDictionary(group => group.Key, group => group.ToArray());
+        var publicCandidates = ordered.Where(candidate => candidate.ConstraintAccountId is null).ToArray();
+        var exclusiveOffsets = accounts.ToDictionary(account => account.AccountId, _ => 0);
+        var publicOffsets = accounts.ToDictionary(account => account.AccountId, _ => 0);
+        var consumed = new HashSet<Guid>();
+        var allocator = new SuccessTargetAllocator();
+
+        bool IsBlocked(AppendReachabilityCandidate candidate, Guid accountId) =>
+            operationKeys.Contains(new AppendOperationKey(
+                candidate.ResourceId,
+                accountId,
+                candidate.NormalizedTargetPathOverride ?? defaults[accountId],
+                candidate.CreateFolderName));
+
+        AppendReachabilityCandidate? PeekPool(
+            Guid accountId,
+            IReadOnlyList<AppendReachabilityCandidate> pool,
+            IDictionary<Guid, int> offsets)
+        {
+            var offset = offsets[accountId];
+            while (offset < pool.Count &&
+                   (consumed.Contains(pool[offset].ResourceId) || IsBlocked(pool[offset], accountId)))
+            {
+                offset++;
+            }
+            offsets[accountId] = offset;
+            return offset < pool.Count ? pool[offset] : null;
+        }
+
+        AppendReachabilityCandidate? PeekAccount(Guid accountId)
+        {
+            if (exclusive.TryGetValue(accountId, out var accountCandidates))
+            {
+                var candidate = PeekPool(accountId, accountCandidates, exclusiveOffsets);
+                if (candidate is not null) return candidate;
+            }
+            return PeekPool(accountId, publicCandidates, publicOffsets);
+        }
+
+        while (true)
+        {
+            var eligibleAccountIds = current.Values
+                .Where(account => account.AvailableSlots > 0 && PeekAccount(account.AccountId) is not null)
+                .Select(account => account.AccountId)
+                .ToHashSet();
+            if (eligibleAccountIds.Count == 0) break;
+            var account = policy == ShortagePolicy.AccountPriority
+                ? current.Values
+                    .Where(value => eligibleAccountIds.Contains(value.AccountId))
+                    .OrderBy(value => value.PriorityOrder)
+                    .ThenBy(value => value.AccountId)
+                    .First()
+                : allocator.SelectAccount(current.Values, eligibleAccountIds)!;
+            var candidate = PeekAccount(account.AccountId)!;
+            consumed.Add(candidate.ResourceId);
+            current[account.AccountId] = account.AddSimulatedFulfillment();
+        }
+
+        var hasPendingReservations = accounts.Any(account => account.ReservedSlotCount > 0);
+        return accounts.ToDictionary(
+            account => account.AccountId,
+            account => hasPendingReservations
+                ? account.EffectiveTarget
+                : current[account.AccountId].FulfilledCount + current[account.AccountId].ReservedSlotCount);
+    }
 }
+
+internal sealed record AppendReachabilityCandidate(
+    Guid ResourceId,
+    int CandidateSequence,
+    Guid? ConstraintAccountId,
+    string? NormalizedTargetPathOverride,
+    string CreateFolderName);
+
+internal sealed record AppendOperationKey(
+    Guid ResourceItemId,
+    Guid AccountId,
+    string NormalizedTargetPath,
+    string CreateFolderName);
 
 internal sealed record ValidatedAppend(
     BatchJobRecord Batch,

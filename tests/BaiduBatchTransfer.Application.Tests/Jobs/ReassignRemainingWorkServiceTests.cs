@@ -69,7 +69,7 @@ public sealed class ReassignRemainingWorkServiceTests
     }
 
     [Fact]
-    public async Task SuccessTargetPreviewMovesPublicPausedReservationWithItsNeverSubmittedOperation()
+    public async Task SuccessTargetPreviewRejectsMovingPublicPausedReservation()
     {
         var batch = Guid.NewGuid();
         var failed = Guid.NewGuid();
@@ -78,21 +78,14 @@ public sealed class ReassignRemainingWorkServiceTests
         var operation = Operation(failed, 1, "Waiting", "NotPrepared", false);
         var state = new ReassignmentState(
             batch, "version-1", QuotaBasis.SuccessTarget,
-            [UnavailableAllocation(failed, 1), Allocation(replacement, 0)],
+            [UnavailableAllocation(failed, 1) with { MinimumRetainedTargetCount = 1 }, Allocation(replacement, 0)],
             [operation],
             [new ReassignmentCandidate(resource, 1, "Reserved", failed, null)]);
 
-        var preview = await new ReassignRemainingWorkService(new RecordingReassignmentStore(state))
-            .PreviewAsync(new ReassignmentRequest(
-                batch, failed, new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 }));
-
-        var operationMove = Assert.Single(preview.OperationMoves);
-        Assert.Equal(operation.OperationId, operationMove.OperationId);
-        Assert.Equal(replacement, operationMove.NewAccountId);
-        var candidateMove = Assert.Single(preview.CandidateMoves);
-        Assert.Equal(resource, candidateMove.ResourceItemId);
-        Assert.Equal(failed, candidateMove.OldAccountId);
-        Assert.Equal(replacement, candidateMove.NewAccountId);
+        await Assert.ThrowsAsync<ReassignmentValidationException>(() =>
+            new ReassignRemainingWorkService(new RecordingReassignmentStore(state))
+                .PreviewAsync(new ReassignmentRequest(
+                    batch, failed, new Dictionary<Guid, int> { [failed] = 0, [replacement] = 1 })));
     }
 
     [Fact]

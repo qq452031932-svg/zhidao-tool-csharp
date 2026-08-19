@@ -165,7 +165,7 @@ public sealed class ReassignRemainingWorkService
         }
         else
         {
-            (operationMoves, candidateMoves) = BuildSuccessTargetMoves(state, request, deltas);
+            operationMoves = [];
             affectedCount = checked(deltas.Where(item => item.Delta > 0).Sum(item => item.Delta));
         }
 
@@ -253,42 +253,6 @@ public sealed class ReassignRemainingWorkService
             .ToArray();
         return MatchOperations(eligible, destinationCapacity, required,
             "Not enough never-submitted unlocked operations can be reassigned.");
-    }
-
-    private static (ReassignmentOperationMove[] OperationMoves, ReassignmentCandidateMove[] CandidateMoves) BuildSuccessTargetMoves(
-        ReassignmentState state,
-        ReassignmentRequest request,
-        IReadOnlyList<ReassignmentAllocationDelta> deltas)
-    {
-        var destinationCapacity = DestinationCapacity(request, deltas);
-        var candidatesBySequence = state.Candidates.ToDictionary(item => item.CandidateSequence);
-        var movable = state.Operations
-            .Where(item =>
-                item.AssignedAccountId == request.FailedAccountId &&
-                !item.IsAccountExclusive &&
-                string.Equals(item.Status, "Waiting", StringComparison.Ordinal) &&
-                string.Equals(item.SubmitState, "NotPrepared", StringComparison.Ordinal))
-            .Select(item => (Operation: item, Candidate: candidatesBySequence.GetValueOrDefault(item.SequenceNumber)))
-            .Where(item =>
-                item.Candidate is not null &&
-                string.Equals(item.Candidate.CandidateStatus, "Reserved", StringComparison.Ordinal) &&
-                item.Candidate.ReservedAccountId == request.FailedAccountId &&
-                item.Candidate.ConstraintAccountId is null)
-            .OrderBy(item => item.Operation.SequenceNumber)
-            .ThenBy(item => item.Operation.OperationId)
-            .ToArray();
-        var requiredMoves = Math.Min(destinationCapacity.Values.Sum(), movable.Length);
-        var operationMoves = MatchOperations(movable.Select(item => item.Operation), destinationCapacity, requiredMoves,
-            "Paused reservations cannot be moved to the selected replacement accounts.");
-        var candidateByOperation = movable.ToDictionary(item => item.Operation.OperationId, item => item.Candidate!);
-        var candidateMoves = new List<ReassignmentCandidateMove>(operationMoves.Length);
-        foreach (var move in operationMoves)
-        {
-            var candidate = candidateByOperation[move.OperationId];
-            candidateMoves.Add(new ReassignmentCandidateMove(
-                candidate.ResourceItemId, request.FailedAccountId, move.NewAccountId));
-        }
-        return (operationMoves, candidateMoves.ToArray());
     }
 
     private static SortedDictionary<Guid, int> DestinationCapacity(
