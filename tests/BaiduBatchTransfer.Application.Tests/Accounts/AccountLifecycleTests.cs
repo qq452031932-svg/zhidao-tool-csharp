@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Infrastructure.Security;
 
 namespace BaiduBatchTransfer.Application.Tests.Accounts;
 
@@ -48,7 +49,7 @@ public sealed class AccountLifecycleTests : IDisposable
         var repository = new FakeAccountRepository();
         var factory = new FakeUnitOfWorkFactory(repository) { FailNextCommit = true };
         var service = new AddAccountService(
-            new FakeAdapter("stable-user"), factory, new FakeProtector(), root);
+            new FakeAdapter("stable-user"), factory, new FakeProtector(), new FileSystemAccountProfilePathPolicy(root));
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.AddAsync(CreateAddRequest(), CancellationToken.None));
@@ -79,7 +80,7 @@ public sealed class AccountLifecycleTests : IDisposable
             new FakeAdapter("stable-user", new string('x', 257)),
             new FakeUnitOfWorkFactory(repository),
             new FakeProtector(),
-            root);
+            new FileSystemAccountProfilePathPolicy(root));
 
         var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
 
@@ -164,7 +165,7 @@ public sealed class AccountLifecycleTests : IDisposable
         repository.Seed(account);
         var factory = new FakeUnitOfWorkFactory(repository) { FailCommitAttempt = 2 };
         var profiles = new FakeProfileStore([]);
-        var service = new RemoveAccountService(factory, profiles, root);
+        var service = new RemoveAccountService(factory, profiles, new FileSystemAccountProfilePathPolicy(root));
 
         var first = await service.RemoveAsync(account.Id, Now, CancellationToken.None);
         var retry = await service.RemoveAsync(account.Id, Now.AddMinutes(1), CancellationToken.None);
@@ -227,7 +228,8 @@ public sealed class AccountLifecycleTests : IDisposable
         var repository = new FakeAccountRepository();
         repository.Seed(account);
         var profiles = new FakeProfileStore([]);
-        var service = new RemoveAccountService(new FakeUnitOfWorkFactory(repository), profiles, linkRoot);
+        var policy = new FileSystemAccountProfilePathPolicy(linkRoot);
+        var service = new RemoveAccountService(new FakeUnitOfWorkFactory(repository), profiles, policy);
         try
         {
             Directory.CreateDirectory(Path.Combine(outside, account.Id.ToString("D")));
@@ -258,11 +260,83 @@ public sealed class AccountLifecycleTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task AddRejectsAncestorJunctionIntroducedAfterPathPolicyConstruction()
+    {
+        var anchor = Path.Combine(root, "add-anchor");
+        var profileRoot = Path.Combine(anchor, "profiles");
+        var outside = Path.Combine(root, "add-outside");
+        Directory.CreateDirectory(root);
+        var policy = new FileSystemAccountProfilePathPolicy(profileRoot);
+        Directory.CreateDirectory(Path.Combine(outside, "profiles"));
+        CreateDirectoryJunction(anchor, outside);
+        var repository = new FakeAccountRepository();
+        var service = new AddAccountService(
+            new FakeAdapter("stable-user"),
+            new FakeUnitOfWorkFactory(repository),
+            new FakeProtector(),
+            policy);
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.InvalidProfilePath, result.Status);
+        Assert.Empty(repository.Records);
+        Directory.Delete(anchor, recursive: false);
+    }
+
+    [Fact]
+    public async Task AncestorReplacementDuringCloseLeavesCleanupPendingAndDoesNotTombstone()
+    {
+        var anchor = Path.Combine(root, "delete-anchor");
+        var profileRoot = Path.Combine(anchor, "profiles");
+        var account = ActiveAccount() with
+        {
+            WebView2ProfileDirectory = Path.Combine(profileRoot, CreateAddRequest().AccountId.ToString("D"))
+        };
+        var outside = Path.Combine(root, "delete-outside");
+        var outsideProfile = Path.Combine(outside, "profiles", account.Id.ToString("D"));
+        Directory.CreateDirectory(account.WebView2ProfileDirectory!);
+        Directory.CreateDirectory(outsideProfile);
+        var policy = new FileSystemAccountProfilePathPolicy(profileRoot);
+        var closer = new CallbackProfileCloser(() =>
+        {
+            Directory.Delete(anchor, recursive: true);
+            CreateDirectoryJunction(anchor, outside);
+        });
+        var profiles = new FileSystemWebViewProfileStore(policy, closer);
+        var repository = new FakeAccountRepository();
+        repository.Seed(account);
+        var service = new RemoveAccountService(new FakeUnitOfWorkFactory(repository), profiles, policy);
+
+        var result = await service.RemoveAsync(account.Id, Now, CancellationToken.None);
+
+        Assert.Equal(RemoveAccountStatus.CleanupPending, result.Status);
+        var disabled = Assert.Single(repository.Records);
+        Assert.False(disabled.IsDeleted);
+        Assert.False(disabled.IsEnabled);
+        Assert.Null(disabled.EncryptedSession);
+        Assert.True(Directory.Exists(outsideProfile));
+        Directory.Delete(anchor, recursive: false);
+    }
+
+    private static void CreateDirectoryJunction(string link, string target)
+    {
+        using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            ArgumentList = { "/c", "mklink", "/J", link, target },
+            CreateNoWindow = true,
+            UseShellExecute = false
+        }) ?? throw new InvalidOperationException("Could not start junction creation.");
+        process.WaitForExit();
+        if (process.ExitCode != 0) throw new IOException("Could not create the test junction.");
+    }
+
     private AddAccountService CreateAddService(FakeAccountRepository repository, FakeProtector protector) =>
-        new(new FakeAdapter("stable-user"), new FakeUnitOfWorkFactory(repository), protector, root);
+        new(new FakeAdapter("stable-user"), new FakeUnitOfWorkFactory(repository), protector, new FileSystemAccountProfilePathPolicy(root));
 
     private RemoveAccountService CreateRemoveService(FakeAccountRepository repository, FakeProfileStore profiles) =>
-        new(new FakeUnitOfWorkFactory(repository), profiles, root);
+        new(new FakeUnitOfWorkFactory(repository), profiles, new FileSystemAccountProfilePathPolicy(root));
 
     private static AddAccountRequest CreateAddRequest()
     {
@@ -328,10 +402,19 @@ public sealed class AccountLifecycleTests : IDisposable
             events.Add("close");
             return CloseFailure is null ? Task.CompletedTask : Task.FromException(CloseFailure);
         }
-        public Task DeleteAsync(string exactProfilePath, CancellationToken cancellationToken)
+        public Task DeleteAsync(Guid accountId, string exactProfilePath, CancellationToken cancellationToken)
         {
             events.Add("delete"); DeleteCount++;
             return FailDelete ? Task.FromException(new IOException("locked")) : Task.CompletedTask;
+        }
+    }
+
+    private sealed class CallbackProfileCloser(Action callback) : IWebViewProfileCloser
+    {
+        public Task CloseAsync(Guid accountId, CancellationToken cancellationToken)
+        {
+            callback();
+            return Task.CompletedTask;
         }
     }
 

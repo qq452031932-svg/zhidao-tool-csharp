@@ -20,16 +20,16 @@ public sealed class RemoveAccountService
 {
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly IWebViewProfileStore profileStore;
-    private readonly string profileRoot;
+    private readonly IAccountProfilePathPolicy profilePaths;
 
     public RemoveAccountService(
         IUnitOfWorkFactory unitOfWorkFactory,
         IWebViewProfileStore profileStore,
-        string profileRoot)
+        IAccountProfilePathPolicy profilePaths)
     {
         this.unitOfWorkFactory = unitOfWorkFactory ?? throw new ArgumentNullException(nameof(unitOfWorkFactory));
         this.profileStore = profileStore ?? throw new ArgumentNullException(nameof(profileStore));
-        this.profileRoot = AccountProfilePath.ValidateRoot(profileRoot);
+        this.profilePaths = profilePaths ?? throw new ArgumentNullException(nameof(profilePaths));
     }
 
     public async Task<RemoveAccountResult> RemoveAsync(
@@ -44,14 +44,20 @@ public sealed class RemoveAccountService
         if (account.IsDeleted) return new(RemoveAccountStatus.AlreadyRemoved, "The account was already removed.");
 
         var profilePath = account.WebView2ProfileDirectory;
-        if (profilePath is not null && !AccountProfilePath.IsExactAccountPath(profileRoot, profilePath, accountId))
-            return new(RemoveAccountStatus.CleanupPending, "Profile cleanup is pending because its path is not safe.");
+        if (profilePath is not null)
+        {
+            try { profilePaths.EnsureSafeAccountPath(accountId, profilePath); }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return new(RemoveAccountStatus.CleanupPending, "Profile cleanup is pending because its path is not safe.");
+            }
+        }
 
         try
         {
             await profileStore.CloseAsync(accountId, cancellationToken).ConfigureAwait(false);
             if (profilePath is not null)
-                await profileStore.DeleteAsync(profilePath, cancellationToken).ConfigureAwait(false);
+                await profileStore.DeleteAsync(accountId, profilePath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {

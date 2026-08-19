@@ -27,18 +27,18 @@ public sealed class AddAccountService
     private readonly IBaiduNetdiskAdapter adapter;
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly ISessionProtector sessionProtector;
-    private readonly string profileRoot;
+    private readonly IAccountProfilePathPolicy profilePaths;
 
     public AddAccountService(
         IBaiduNetdiskAdapter adapter,
         IUnitOfWorkFactory unitOfWorkFactory,
         ISessionProtector sessionProtector,
-        string profileRoot)
+        IAccountProfilePathPolicy profilePaths)
     {
         this.adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         this.unitOfWorkFactory = unitOfWorkFactory ?? throw new ArgumentNullException(nameof(unitOfWorkFactory));
         this.sessionProtector = sessionProtector ?? throw new ArgumentNullException(nameof(sessionProtector));
-        this.profileRoot = AccountProfilePath.ValidateRoot(profileRoot);
+        this.profilePaths = profilePaths ?? throw new ArgumentNullException(nameof(profilePaths));
     }
 
     public async Task<AddAccountResult> AddAsync(AddAccountRequest request, CancellationToken cancellationToken)
@@ -58,9 +58,9 @@ public sealed class AddAccountService
         string profilePath;
         try
         {
-            profilePath = AccountProfilePath.ForAccount(profileRoot, request.AccountId);
+            profilePath = profilePaths.GetAccountProfilePath(request.AccountId);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
             return new(AddAccountStatus.InvalidProfilePath, null, "The account profile path is not safe.");
         }
@@ -127,54 +127,4 @@ public sealed class AddAccountService
         !string.IsNullOrWhiteSpace(identity.DisplayName) &&
         identity.DisplayName.Length <= 256 &&
         !identity.DisplayName.Any(char.IsControl);
-}
-
-internal static class AccountProfilePath
-{
-    public static string ValidateRoot(string root)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(root);
-        var canonicalRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
-        if (Path.GetPathRoot(canonicalRoot) == canonicalRoot)
-            throw new ArgumentException("The profile root cannot be a filesystem root.", nameof(root));
-        if (Directory.Exists(canonicalRoot) &&
-            (File.GetAttributes(canonicalRoot) & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("The profile root cannot be a reparse point.");
-        return canonicalRoot;
-    }
-
-    public static string ForAccount(string canonicalRoot, Guid accountId)
-    {
-        if (accountId == Guid.Empty) throw new ArgumentException("A local account ID is required.", nameof(accountId));
-        var path = Path.GetFullPath(Path.Combine(canonicalRoot, accountId.ToString("D")));
-        if (!IsExactAccountPath(canonicalRoot, path, accountId))
-            throw new IOException("The profile path escaped its configured root.");
-        if (File.Exists(path))
-            throw new IOException("The account profile path must be a directory.");
-        if (Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("The account profile cannot be a reparse point.");
-        return path;
-    }
-
-    public static bool IsExactAccountPath(string canonicalRoot, string candidate, Guid accountId)
-    {
-        try
-        {
-            if (File.Exists(canonicalRoot) ||
-                (Directory.Exists(canonicalRoot) &&
-                 (File.GetAttributes(canonicalRoot) & FileAttributes.ReparsePoint) != 0))
-                return false;
-            var canonicalCandidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidate));
-            var parent = Path.GetDirectoryName(canonicalCandidate);
-            return string.Equals(parent, canonicalRoot, StringComparison.OrdinalIgnoreCase) &&
-                   string.Equals(Path.GetFileName(canonicalCandidate), accountId.ToString("D"), StringComparison.OrdinalIgnoreCase) &&
-                   !File.Exists(canonicalCandidate) &&
-                   (!Directory.Exists(canonicalCandidate) ||
-                    (File.GetAttributes(canonicalCandidate) & FileAttributes.ReparsePoint) == 0);
-        }
-        catch (Exception exception) when (exception is ArgumentException or IOException or NotSupportedException)
-        {
-            return false;
-        }
-    }
 }
