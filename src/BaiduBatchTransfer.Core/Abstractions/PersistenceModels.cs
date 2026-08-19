@@ -37,6 +37,9 @@ public sealed record StagedImportRowRecord(
 {
     public static StagedImportRowRecord Create(Guid id, Guid sessionId, int row, string shareUrl, string disposition) =>
         new(id, sessionId, row, shareUrl, null, null, null, null, null, null, null, disposition, null, null, null, null, null, DateTimeOffset.UtcNow);
+
+    public override string ToString() =>
+        $"StagedImportRowRecord {{ Id = {Id}, ImportSessionId = {ImportSessionId}, SourceRowNumber = {SourceRowNumber}, Disposition = {Disposition}, UserContent = [REDACTED] }}";
 }
 
 public sealed record AccountRecord(
