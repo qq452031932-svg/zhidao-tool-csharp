@@ -32,6 +32,11 @@ public sealed class FileSystemAccountProfilePathPolicy : IAccountProfilePathPoli
         return path;
     }
 
+    internal string CanonicalRoot => canonicalRoot;
+
+    internal void EnsureSafeRoot() =>
+        EnsureExistingComponentsAreDirectoriesWithoutReparsePoints(canonicalRoot);
+
     public void EnsureSafeAccountPath(Guid accountId, string candidatePath)
     {
         if (accountId == Guid.Empty) throw new ArgumentException("A local account ID is required.", nameof(accountId));

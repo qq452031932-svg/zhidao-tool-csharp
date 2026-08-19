@@ -5,36 +5,16 @@ namespace BaiduBatchTransfer.Core.Domain;
 public sealed class AccountSession
 {
     public AccountSession(
-        string accountId,
-        IReadOnlyDictionary<string, string> cookies,
+        string captureId,
+        IEnumerable<SessionCookie> cookies,
         DateTimeOffset capturedAt)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(accountId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(captureId);
         ArgumentNullException.ThrowIfNull(cookies);
-
-        var cookieSnapshot = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var (name, value) in cookies)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(name, nameof(cookies));
-            ArgumentException.ThrowIfNullOrWhiteSpace(value, nameof(cookies));
-            cookieSnapshot.Add(name, value);
-        }
-
-        if (cookieSnapshot.Count == 0)
-        {
-            throw new ArgumentException("At least one session cookie is required.", nameof(cookies));
-        }
-
-        AccountId = accountId.Trim();
-        Cookies = new ReadOnlyDictionary<string, string>(cookieSnapshot);
-        SessionCookies = Array.AsReadOnly(cookieSnapshot.Select(pair => new SessionCookie(
-            pair.Key,
-            pair.Value,
-            ".baidu.com",
-            "/",
-            capturedAt.ToUniversalTime().AddDays(1),
-            isSecure: true,
-            isHttpOnly: true)).ToArray());
+        var snapshot = Snapshot(cookies);
+        AccountId = captureId.Trim();
+        SessionCookies = Array.AsReadOnly(snapshot);
+        Cookies = CreateCompatibilityCookieView(snapshot);
         CapturedAtUtc = capturedAt.ToUniversalTime();
     }
 
@@ -48,16 +28,13 @@ public sealed class AccountSession
         ArgumentException.ThrowIfNullOrWhiteSpace(baiduUserId);
         ArgumentNullException.ThrowIfNull(cookies);
 
-        var snapshot = cookies.Select(cookie => cookie ?? throw new ArgumentException("Cookies cannot contain null entries.", nameof(cookies))).ToArray();
-        if (snapshot.Length == 0) throw new ArgumentException("At least one session cookie is required.", nameof(cookies));
+        var snapshot = Snapshot(cookies);
 
         LocalAccountId = localAccountId;
         BaiduUserId = baiduUserId.Trim();
         AccountId = localAccountId.ToString("D");
         SessionCookies = Array.AsReadOnly(snapshot);
-        Cookies = new ReadOnlyDictionary<string, string>(snapshot
-            .GroupBy(cookie => cookie.Name, StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal));
+        Cookies = CreateCompatibilityCookieView(snapshot);
         CapturedAtUtc = capturedAt.ToUniversalTime();
     }
 
@@ -81,4 +58,17 @@ public sealed class AccountSession
 
     public override string ToString() =>
         "AccountSession { AccountBinding = [REDACTED], Cookies = [REDACTED] }";
+
+    private static SessionCookie[] Snapshot(IEnumerable<SessionCookie> cookies)
+    {
+        var snapshot = cookies.Select(cookie =>
+            cookie ?? throw new ArgumentException("Cookies cannot contain null entries.", nameof(cookies))).ToArray();
+        if (snapshot.Length == 0) throw new ArgumentException("At least one session cookie is required.", nameof(cookies));
+        return snapshot;
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateCompatibilityCookieView(SessionCookie[] cookies) =>
+        new ReadOnlyDictionary<string, string>(cookies
+            .GroupBy(cookie => cookie.Name, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal));
 }

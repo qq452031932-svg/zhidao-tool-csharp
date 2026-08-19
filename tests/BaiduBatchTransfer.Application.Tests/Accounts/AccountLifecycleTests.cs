@@ -9,17 +9,22 @@ public sealed class AccountLifecycleTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-account-tests-{Guid.NewGuid():N}");
     private static readonly DateTimeOffset Now = new(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
+    private static readonly Guid ProfileToken = Guid.Parse("f545802a-d747-431c-b953-b76e5fe559ca");
 
     [Fact]
     public async Task AddRejectsDuplicateIdentityIncludingTombstoneHistory()
     {
         var repository = new FakeAccountRepository();
         repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former Name")));
-        var service = CreateAddService(repository, new FakeProtector());
+        var events = new List<string>();
+        var profiles = new FakeProfileStore(events);
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
 
         var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
 
         Assert.Equal(AddAccountStatus.DuplicateIdentity, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Completed, result.ProfileCleanupStatus);
+        Assert.Equal(new[] { "close", "delete" }, events);
         Assert.Single(repository.Records);
     }
 
@@ -41,6 +46,12 @@ public sealed class AccountLifecycleTests : IDisposable
         Assert.Equal(Path.Combine(Path.GetFullPath(root), request.AccountId.ToString("D")), account.WebView2ProfileDirectory);
         Assert.DoesNotContain("cookie-value", account.ToString(), StringComparison.Ordinal);
         Assert.True(protector.LastSession!.IsBoundTo(request.AccountId, "stable-user"));
+        var capturedCookie = Assert.Single(protector.LastSession.SessionCookies);
+        Assert.Equal(".baidu.com", capturedCookie.Domain);
+        Assert.Equal("/", capturedCookie.Path);
+        Assert.Equal(Now.AddHours(2), capturedCookie.ExpiresUtc);
+        Assert.True(capturedCookie.IsSecure);
+        Assert.True(capturedCookie.IsHttpOnly);
     }
 
     [Fact]
@@ -48,14 +59,18 @@ public sealed class AccountLifecycleTests : IDisposable
     {
         var repository = new FakeAccountRepository();
         var factory = new FakeUnitOfWorkFactory(repository) { FailNextCommit = true };
+        var profiles = new FakeProfileStore([]);
         var service = new AddAccountService(
-            new FakeAdapter("stable-user"), factory, new FakeProtector(), new FileSystemAccountProfilePathPolicy(root));
+            new FakeAdapter("stable-user"), factory, new FakeProtector(), profiles, new FileSystemAccountProfilePathPolicy(root));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(
+        var error = await Assert.ThrowsAsync<AddAccountOperationException>(
             () => service.AddAsync(CreateAddRequest(), CancellationToken.None));
 
+        Assert.IsType<InvalidOperationException>(error.InnerException);
+        Assert.Equal(ProfileCleanupStatus.Completed, error.ProfileCleanupStatus);
+        Assert.Equal(1, profiles.DeleteCount);
         Assert.Empty(repository.Records);
-        Assert.Equal(1, factory.RollbackCount);
+        Assert.Equal(3, factory.RollbackCount);
     }
 
     [Fact]
@@ -64,28 +79,143 @@ public sealed class AccountLifecycleTests : IDisposable
         var repository = new FakeAccountRepository();
         var existing = AccountRecord.Create(CreateAddRequest().AccountId, "another-stable-user", "Existing");
         repository.Seed(existing);
-        var service = CreateAddService(repository, new FakeProtector());
+        var profiles = new FakeProfileStore([]);
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
 
         var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
 
         Assert.Equal(AddAccountStatus.AccountIdCollision, result.Status);
+        Assert.Equal(ProfileCleanupStatus.SkippedExistingAccountProtection, result.ProfileCleanupStatus);
+        Assert.Equal(0, profiles.DeleteCount);
         Assert.Equal(existing, Assert.Single(repository.Records));
+    }
+
+    [Fact]
+    public async Task FailedAddDoesNotDeleteProfileWhoseOwnershipChangedAfterDatabaseCheck()
+    {
+        var repository = new FakeAccountRepository();
+        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        var request = CreateAddRequest();
+        var replacement = AccountRecord.Create(request.AccountId, "replacement-user", "Replacement");
+        FakeProfileStore? profiles = null;
+        profiles = new FakeProfileStore([])
+        {
+            BeforeOwnedDelete = () =>
+            {
+                repository.Seed(replacement);
+            }
+        };
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
+
+        var result = await service.AddAsync(request, CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.DuplicateIdentity, result.Status);
+        Assert.Equal(ProfileCleanupStatus.SkippedExistingAccountProtection, result.ProfileCleanupStatus);
+        Assert.Equal(0, profiles.DeleteCount);
+        Assert.Equal(replacement, await repository.GetByIdAsync(request.AccountId));
     }
 
     [Fact]
     public async Task AddRejectsOversizedAdapterIdentityMetadata()
     {
         var repository = new FakeAccountRepository();
+        var profiles = new FakeProfileStore([]);
         var service = new AddAccountService(
             new FakeAdapter("stable-user", new string('x', 257)),
             new FakeUnitOfWorkFactory(repository),
             new FakeProtector(),
+            profiles,
             new FileSystemAccountProfilePathPolicy(root));
 
         var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
 
         Assert.Equal(AddAccountStatus.InvalidIdentity, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Completed, result.ProfileCleanupStatus);
+        Assert.Equal(1, profiles.DeleteCount);
         Assert.Empty(repository.Records);
+    }
+
+    [Fact]
+    public async Task AddCancellationPreservesCancellationAndReportsOwnedProfileCleanup()
+    {
+        var repository = new FakeAccountRepository();
+        var profiles = new FakeProfileStore([]);
+        var service = new AddAccountService(
+            new FakeAdapter("stable-user") { ValidationFailure = new OperationCanceledException("cancelled") },
+            new FakeUnitOfWorkFactory(repository),
+            new FakeProtector(),
+            profiles,
+            new FileSystemAccountProfilePathPolicy(root));
+
+        var error = await Assert.ThrowsAsync<AddAccountCanceledException>(
+            () => service.AddAsync(CreateAddRequest(), CancellationToken.None));
+
+        Assert.Equal(ProfileCleanupStatus.Completed, error.ProfileCleanupStatus);
+        Assert.Equal(1, profiles.DeleteCount);
+        Assert.Empty(repository.Records);
+    }
+
+    [Fact]
+    public async Task AddValidationFailureCleansOwnedProfile()
+    {
+        var repository = new FakeAccountRepository();
+        var profiles = new FakeProfileStore([]);
+        var service = new AddAccountService(
+            new FailingValidationAdapter(),
+            new FakeUnitOfWorkFactory(repository),
+            new FakeProtector(),
+            profiles,
+            new FileSystemAccountProfilePathPolicy(root));
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.SessionRejected, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Completed, result.ProfileCleanupStatus);
+        Assert.Equal(1, profiles.DeleteCount);
+    }
+
+    [Fact]
+    public async Task CleanupFailureDoesNotReplaceDuplicateBusinessResult()
+    {
+        var repository = new FakeAccountRepository();
+        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        var profiles = new FakeProfileStore([]) { FailDelete = true };
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.DuplicateIdentity, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Pending, result.ProfileCleanupStatus);
+    }
+
+    [Fact]
+    public async Task CloseFailureStillAttemptsSafeDeleteAndReportsCleanupPending()
+    {
+        var repository = new FakeAccountRepository();
+        repository.Seed(Tombstone(AccountRecord.Create(Guid.NewGuid(), "stable-user", "Former")));
+        var events = new List<string>();
+        var profiles = new FakeProfileStore(events) { CloseFailure = new IOException("close failed") };
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.DuplicateIdentity, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Pending, result.ProfileCleanupStatus);
+        Assert.Equal(new[] { "close", "delete" }, events);
+    }
+
+    [Fact]
+    public async Task SessionProtectionFailureCleansOwnedProfile()
+    {
+        var repository = new FakeAccountRepository();
+        var profiles = new FakeProfileStore([]);
+        var service = CreateAddService(repository, new FakeProtector { FailProtection = true }, profiles);
+
+        var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.SessionRejected, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Completed, result.ProfileCleanupStatus);
+        Assert.Equal(1, profiles.DeleteCount);
     }
 
     [Fact]
@@ -271,15 +401,20 @@ public sealed class AccountLifecycleTests : IDisposable
         Directory.CreateDirectory(Path.Combine(outside, "profiles"));
         CreateDirectoryJunction(anchor, outside);
         var repository = new FakeAccountRepository();
+        var events = new List<string>();
+        var profiles = new FakeProfileStore(events);
         var service = new AddAccountService(
             new FakeAdapter("stable-user"),
             new FakeUnitOfWorkFactory(repository),
             new FakeProtector(),
+            profiles,
             policy);
 
         var result = await service.AddAsync(CreateAddRequest(), CancellationToken.None);
 
         Assert.Equal(AddAccountStatus.InvalidProfilePath, result.Status);
+        Assert.Equal(ProfileCleanupStatus.Pending, result.ProfileCleanupStatus);
+        Assert.Equal(new[] { "close" }, events);
         Assert.Empty(repository.Records);
         Directory.Delete(anchor, recursive: false);
     }
@@ -332,8 +467,16 @@ public sealed class AccountLifecycleTests : IDisposable
         if (process.ExitCode != 0) throw new IOException("Could not create the test junction.");
     }
 
-    private AddAccountService CreateAddService(FakeAccountRepository repository, FakeProtector protector) =>
-        new(new FakeAdapter("stable-user"), new FakeUnitOfWorkFactory(repository), protector, new FileSystemAccountProfilePathPolicy(root));
+    private AddAccountService CreateAddService(
+        FakeAccountRepository repository,
+        FakeProtector protector,
+        FakeProfileStore? profiles = null) =>
+        new(
+            new FakeAdapter("stable-user"),
+            new FakeUnitOfWorkFactory(repository),
+            protector,
+            profiles ?? new FakeProfileStore([]),
+            new FileSystemAccountProfilePathPolicy(root));
 
     private RemoveAccountService CreateRemoveService(FakeAccountRepository repository, FakeProfileStore profiles) =>
         new(new FakeUnitOfWorkFactory(repository), profiles, new FileSystemAccountProfilePathPolicy(root));
@@ -343,9 +486,9 @@ public sealed class AccountLifecycleTests : IDisposable
         var accountId = Guid.Parse("51f1a6f9-c88b-4dd8-8376-36163ca42bc5");
         var session = new AccountSession(
             "login-candidate",
-            new Dictionary<string, string> { ["BDUSS"] = "cookie-value" },
+            [new SessionCookie("BDUSS", "cookie-value", ".baidu.com", "/", Now.AddHours(2), true, true)],
             Now);
-        return new(accountId, session, Now);
+        return new(accountId, session, Now, AccountProfileOwnership.NewLoginProfile(ProfileToken));
     }
 
     private AccountRecord ActiveAccount()
@@ -371,8 +514,11 @@ public sealed class AccountLifecycleTests : IDisposable
 
     private sealed class FakeAdapter(string stableUserId, string displayName = "Visible Name") : IBaiduNetdiskAdapter
     {
+        public Exception? ValidationFailure { get; set; }
         public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) =>
-            Task.FromResult(BaiduAdapterResult<BaiduAccountIdentity>.Success(new BaiduAccountIdentity(stableUserId, displayName)));
+            ValidationFailure is null
+                ? Task.FromResult(BaiduAdapterResult<BaiduAccountIdentity>.Success(new BaiduAccountIdentity(stableUserId, displayName)))
+                : Task.FromException<BaiduAdapterResult<BaiduAccountIdentity>>(ValidationFailure);
         public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<System.Collections.Immutable.ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
@@ -383,19 +529,36 @@ public sealed class AccountLifecycleTests : IDisposable
 
     private sealed class FakeProtector : ISessionProtector
     {
+        public bool FailProtection { get; set; }
         public AccountSession? LastSession { get; private set; }
         public SessionProtectionResult Protect(AccountSession session)
         {
             LastSession = session;
-            return SessionProtectionResult.Protected([9, 8, 7]);
+            return FailProtection
+                ? SessionProtectionResult.Failed(SessionProtectionFailure.InvalidSession, "Session unavailable.")
+                : SessionProtectionResult.Protected([9, 8, 7]);
         }
         public SessionProtectionResult Unprotect(ReadOnlySpan<byte> protectedBytes, Guid expectedLocalAccountId, string expectedBaiduUserId) => throw new NotSupportedException();
+    }
+
+    private sealed class FailingValidationAdapter : IBaiduNetdiskAdapter
+    {
+        public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<BaiduAccountIdentity>.Failure(BaiduErrorKind.ExpiredLogin, null));
+        public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<System.Collections.Immutable.ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(AccountSession session, TransferConfirmationQuery query, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class FakeProfileStore(List<string> events) : IWebViewProfileStore
     {
         public bool FailDelete { get; set; }
         public Exception? CloseFailure { get; set; }
+        public Guid? CurrentOwnerToken { get; set; } = ProfileToken;
+        public Action? BeforeOwnedDelete { get; set; }
         public int DeleteCount { get; private set; }
         public Task CloseAsync(Guid accountId, CancellationToken cancellationToken)
         {
@@ -406,6 +569,42 @@ public sealed class AccountLifecycleTests : IDisposable
         {
             events.Add("delete"); DeleteCount++;
             return FailDelete ? Task.FromException(new IOException("locked")) : Task.CompletedTask;
+        }
+
+        public Task RegisterOwnershipAsync(Guid accountId, string exactProfilePath, Guid ownershipToken, CancellationToken cancellationToken)
+        {
+            CurrentOwnerToken = ownershipToken;
+            return Task.CompletedTask;
+        }
+
+        public async Task<bool> CommitOwnedAsync(
+            Guid accountId,
+            string exactProfilePath,
+            Guid ownershipToken,
+            Func<CancellationToken, Task> commitAction,
+            CancellationToken cancellationToken)
+        {
+            if (CurrentOwnerToken != ownershipToken) return false;
+            await commitAction(cancellationToken);
+            return true;
+        }
+
+        public async Task<OwnedProfileDeletionStatus> DeleteOwnedAsync(
+            Guid accountId,
+            string exactProfilePath,
+            Guid ownershipToken,
+            Func<CancellationToken, Task<bool>> confirmNoActiveAccount,
+            CancellationToken cancellationToken)
+        {
+            BeforeOwnedDelete?.Invoke();
+            if (CurrentOwnerToken != ownershipToken)
+                return OwnedProfileDeletionStatus.OwnershipMismatch;
+            if (!await confirmNoActiveAccount(cancellationToken))
+                return OwnedProfileDeletionStatus.OwnershipMismatch;
+            events.Add("delete");
+            DeleteCount++;
+            if (FailDelete) throw new IOException("locked");
+            return OwnedProfileDeletionStatus.Completed;
         }
     }
 

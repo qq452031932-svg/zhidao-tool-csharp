@@ -262,7 +262,7 @@ public sealed class AdapterContractTests
 
     private static AccountSession CreateSession() => new(
         "account-1",
-        new Dictionary<string, string> { ["BDUSS"] = "secret" },
+        [new SessionCookie("BDUSS", "secret", ".baidu.com", "/", new DateTimeOffset(2026, 8, 20, 9, 0, 0, TimeSpan.Zero), true, true)],
         new DateTimeOffset(2026, 8, 19, 9, 0, 0, TimeSpan.Zero));
 
     private static void AssertRedacted(string rendered, params string[] secrets)
