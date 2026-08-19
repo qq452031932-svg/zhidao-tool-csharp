@@ -89,9 +89,12 @@ public sealed class ResourceItem
 
     public void MarkGloballyInvalid(DateTimeOffset updatedAt)
     {
-        if (CandidateStatus == CandidateStatus.Expanded)
+        if (CandidateStatus is not (
+            CandidateStatus.Unallocated or
+            CandidateStatus.Reserved or
+            CandidateStatus.Unused))
         {
-            throw new InvalidOperationException("An expanded candidate cannot be invalidated.");
+            throw new InvalidOperationException($"Cannot invalidate a candidate in {CandidateStatus} status.");
         }
 
         EnsureTimestamp(updatedAt);

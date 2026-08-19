@@ -20,6 +20,12 @@ public enum StagedImportDisposition
     Excluded,
 }
 
+public enum StagedRowPrecheckStatus
+{
+    Succeeded,
+    Failed,
+}
+
 public enum AccountStatus
 {
     Active,
@@ -35,4 +41,65 @@ public enum CandidateStatus
     Expanded,
     GloballyInvalid,
     Unused,
+}
+
+public readonly record struct ImportSessionCounters
+{
+    public ImportSessionCounters(
+        int totalRows,
+        int readyRows,
+        int invalidRows,
+        int duplicateRows,
+        int excludedRows)
+    {
+        if (totalRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(totalRows));
+        }
+
+        if (readyRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(readyRows));
+        }
+
+        if (invalidRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(invalidRows));
+        }
+
+        if (duplicateRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(duplicateRows));
+        }
+
+        if (excludedRows < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(excludedRows));
+        }
+
+        var classifiedRows =
+            (long)readyRows + invalidRows + duplicateRows + excludedRows;
+        if (classifiedRows > totalRows)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(totalRows),
+                "Classified row counters cannot exceed total rows.");
+        }
+
+        TotalRows = totalRows;
+        ReadyRows = readyRows;
+        InvalidRows = invalidRows;
+        DuplicateRows = duplicateRows;
+        ExcludedRows = excludedRows;
+    }
+
+    public int TotalRows { get; }
+
+    public int ReadyRows { get; }
+
+    public int InvalidRows { get; }
+
+    public int DuplicateRows { get; }
+
+    public int ExcludedRows { get; }
 }

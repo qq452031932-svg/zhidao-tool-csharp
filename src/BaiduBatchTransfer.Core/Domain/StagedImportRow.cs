@@ -50,6 +50,12 @@ public sealed class StagedImportRow
 
     public string? ValidationMessage { get; private set; }
 
+    public StagedRowPrecheckStatus? PrecheckStatus { get; private set; }
+
+    public string? PrecheckErrorCode { get; private set; }
+
+    public DateTimeOffset? PrecheckedAt { get; private set; }
+
     public DateTimeOffset UpdatedAt { get; private set; }
 
     public void MarkReady(
@@ -61,34 +67,62 @@ public sealed class StagedImportRow
         EnsureTimestamp(updatedAt);
         NormalizedShareId = RequireText(normalizedShareId, nameof(normalizedShareId));
         ExtractionCode = extractionCode;
-        Disposition = StagedImportDisposition.Ready;
-        ValidationMessage = null;
-        UpdatedAt = updatedAt;
+        TransitionDisposition(
+            StagedImportDisposition.Ready,
+            validationMessage: null,
+            duplicateOfStagedRowId: null,
+            updatedAt);
     }
 
     public void MarkInvalid(string message, DateTimeOffset updatedAt) =>
-        SetDisposition(StagedImportDisposition.Invalid, message, updatedAt);
+        TransitionDisposition(StagedImportDisposition.Invalid, message, null, updatedAt);
 
     public void MarkConflict(string message, DateTimeOffset updatedAt) =>
-        SetDisposition(StagedImportDisposition.Conflict, message, updatedAt);
+        TransitionDisposition(StagedImportDisposition.Conflict, message, null, updatedAt);
+
+    public void MarkNeedsResolution(string message, DateTimeOffset updatedAt) =>
+        TransitionDisposition(StagedImportDisposition.NeedsResolution, message, null, updatedAt);
 
     public void MarkDuplicate(Guid duplicateOfStagedRowId, DateTimeOffset updatedAt)
     {
-        EnsureMutable();
-        EnsureTimestamp(updatedAt);
-        DuplicateOfStagedRowId = duplicateOfStagedRowId;
-        Disposition = StagedImportDisposition.Duplicate;
-        UpdatedAt = updatedAt;
+        TransitionDisposition(
+            StagedImportDisposition.Duplicate,
+            validationMessage: null,
+            duplicateOfStagedRowId,
+            updatedAt);
     }
 
     public void Exclude(string? reason, DateTimeOffset updatedAt) =>
-        SetDisposition(StagedImportDisposition.Excluded, reason, updatedAt);
+        TransitionDisposition(StagedImportDisposition.Excluded, reason, null, updatedAt);
+
+    public void RecordPrecheck(
+        StagedRowPrecheckStatus status,
+        string? errorCode,
+        DateTimeOffset precheckedAt)
+    {
+        if (Disposition != StagedImportDisposition.Ready)
+        {
+            throw new InvalidOperationException("Only a ready staging row can be prechecked.");
+        }
+
+        if (status == StagedRowPrecheckStatus.Failed && string.IsNullOrWhiteSpace(errorCode))
+        {
+            throw new ArgumentException("A failed precheck requires an error code.", nameof(errorCode));
+        }
+
+        EnsureTimestamp(precheckedAt);
+        PrecheckStatus = status;
+        PrecheckErrorCode = status == StagedRowPrecheckStatus.Failed ? errorCode : null;
+        PrecheckedAt = precheckedAt;
+        UpdatedAt = precheckedAt;
+    }
 
     public void MapAccount(Guid accountId, DateTimeOffset updatedAt)
     {
         EnsureMutable();
         EnsureTimestamp(updatedAt);
         MappedAccountId = accountId;
+        ClearPrecheck();
         UpdatedAt = updatedAt;
     }
 
@@ -105,19 +139,38 @@ public sealed class StagedImportRow
         CreateFolderName = createFolderName;
         RequestedAccountName = requestedAccountName;
         Note = note;
+        ClearPrecheck();
         UpdatedAt = updatedAt;
     }
 
-    private void SetDisposition(
+    private void TransitionDisposition(
         StagedImportDisposition disposition,
-        string? message,
+        string? validationMessage,
+        Guid? duplicateOfStagedRowId,
         DateTimeOffset updatedAt)
     {
         EnsureMutable();
         EnsureTimestamp(updatedAt);
         Disposition = disposition;
-        ValidationMessage = message;
+        DuplicateOfStagedRowId = disposition == StagedImportDisposition.Duplicate
+            ? duplicateOfStagedRowId
+            : null;
+        ValidationMessage = disposition is
+            StagedImportDisposition.Invalid or
+            StagedImportDisposition.Conflict or
+            StagedImportDisposition.NeedsResolution or
+            StagedImportDisposition.Excluded
+                ? validationMessage
+                : null;
+        ClearPrecheck();
         UpdatedAt = updatedAt;
+    }
+
+    private void ClearPrecheck()
+    {
+        PrecheckStatus = null;
+        PrecheckErrorCode = null;
+        PrecheckedAt = null;
     }
 
     private void EnsureMutable()

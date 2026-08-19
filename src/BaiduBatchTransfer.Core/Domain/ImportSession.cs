@@ -7,13 +7,19 @@ public sealed class ImportSession
         string sourceType,
         string sourceName,
         DateTimeOffset createdAt,
-        Guid? appendToBatchJobId = null)
+        Guid? appendToBatchJobId = null,
+        ImportSessionCounters counters = default)
     {
         Id = id;
         SourceType = RequireText(sourceType, nameof(sourceType));
         SourceName = RequireText(sourceName, nameof(sourceName));
         AppendToBatchJobId = appendToBatchJobId;
         Status = ImportSessionStatus.Parsing;
+        TotalRows = counters.TotalRows;
+        ReadyRows = counters.ReadyRows;
+        InvalidRows = counters.InvalidRows;
+        DuplicateRows = counters.DuplicateRows;
+        ExcludedRows = counters.ExcludedRows;
         CreatedAt = createdAt;
         UpdatedAt = createdAt;
     }
@@ -50,24 +56,33 @@ public sealed class ImportSession
     {
         EnsureStatus(ImportSessionStatus.Parsing);
         EnsureTimestamp(updatedAt);
-        TotalRows++;
+        var totalRows = checked(TotalRows + 1);
+        var readyRows = ReadyRows;
+        var invalidRows = InvalidRows;
+        var duplicateRows = DuplicateRows;
+        var excludedRows = ExcludedRows;
         switch (disposition)
         {
             case StagedImportDisposition.Ready:
-                ReadyRows++;
+                readyRows = checked(readyRows + 1);
                 break;
             case StagedImportDisposition.Invalid:
             case StagedImportDisposition.Conflict:
-                InvalidRows++;
+                invalidRows = checked(invalidRows + 1);
                 break;
             case StagedImportDisposition.Duplicate:
-                DuplicateRows++;
+                duplicateRows = checked(duplicateRows + 1);
                 break;
             case StagedImportDisposition.Excluded:
-                ExcludedRows++;
+                excludedRows = checked(excludedRows + 1);
                 break;
         }
 
+        TotalRows = totalRows;
+        ReadyRows = readyRows;
+        InvalidRows = invalidRows;
+        DuplicateRows = duplicateRows;
+        ExcludedRows = excludedRows;
         UpdatedAt = updatedAt;
     }
 

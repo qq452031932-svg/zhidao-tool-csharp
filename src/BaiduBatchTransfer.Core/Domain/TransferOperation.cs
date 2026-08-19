@@ -7,14 +7,21 @@ public sealed class TransferOperation
         Guid resourceItemId,
         Guid batchJobId,
         Guid assignedAccountId,
-        DateTimeOffset createdAt)
+        DateTimeOffset createdAt,
+        int attemptCount)
     {
+        if (attemptCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(attemptCount));
+        }
+
         Id = id;
         ResourceItemId = resourceItemId;
         BatchJobId = batchJobId;
         AssignedAccountId = assignedAccountId;
         Status = OperationStatus.Waiting;
         TargetSlotState = TargetSlotState.Unoccupied;
+        AttemptCount = attemptCount;
         CreatedAt = createdAt;
         UpdatedAt = createdAt;
     }
@@ -52,22 +59,25 @@ public sealed class TransferOperation
         Guid resourceItemId,
         Guid batchJobId,
         Guid assignedAccountId,
-        DateTimeOffset createdAt) =>
-        new(id, resourceItemId, batchJobId, assignedAccountId, createdAt);
+        DateTimeOffset createdAt,
+        int attemptCount = 0) =>
+        new(id, resourceItemId, batchJobId, assignedAccountId, createdAt, attemptCount);
 
     public static TransferOperation CreateReserved(
         Guid id,
         Guid resourceItemId,
         Guid batchJobId,
         Guid assignedAccountId,
-        DateTimeOffset reservedAt)
+        DateTimeOffset reservedAt,
+        int attemptCount = 0)
     {
         var operation = new TransferOperation(
             id,
             resourceItemId,
             batchJobId,
             assignedAccountId,
-            reservedAt);
+            reservedAt,
+            attemptCount);
         operation.ReserveTargetSlot(reservedAt);
         return operation;
     }
@@ -92,8 +102,9 @@ public sealed class TransferOperation
         EnsureStatus(OperationStatus.Reserved);
         EnsureReservedSlot();
         EnsureTimestamp(preparedAt);
+        var nextAttemptCount = checked(AttemptCount + 1);
         Status = OperationStatus.Preparing;
-        AttemptCount++;
+        AttemptCount = nextAttemptCount;
         LastErrorCode = null;
         LastErrorMessage = null;
         UpdatedAt = preparedAt;

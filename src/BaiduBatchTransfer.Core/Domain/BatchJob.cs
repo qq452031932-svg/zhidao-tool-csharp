@@ -46,9 +46,12 @@ public sealed class BatchJob
             throw new InvalidOperationException($"Cannot activate a batch in {Status} status.");
         }
 
-        if (startedAt < CreatedAt)
+        var earliestStart = StartedAt ?? CreatedAt;
+        if (startedAt < earliestStart)
         {
-            throw new ArgumentOutOfRangeException(nameof(startedAt), "Start time cannot precede creation.");
+            throw new ArgumentOutOfRangeException(
+                nameof(startedAt),
+                "A resume time cannot precede the original start time.");
         }
 
         Status = BatchStatus.Active;
@@ -79,6 +82,25 @@ public sealed class BatchJob
         EnsureCompletionTime(completedAt);
         Status = hasShortfall ? BatchStatus.CompletedWithShortfall : BatchStatus.Completed;
         CompletedAt = completedAt;
+    }
+
+    public void ReopenAfterShortfall(bool userConfirmed, DateTimeOffset reopenedAt)
+    {
+        EnsureStatus(BatchStatus.CompletedWithShortfall);
+        if (!userConfirmed)
+        {
+            throw new InvalidOperationException("Explicit user confirmation is required to reopen a shortfall batch.");
+        }
+
+        if (CompletedAt is null || reopenedAt < CompletedAt.Value)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(reopenedAt),
+                "Reopen time cannot precede shortfall completion.");
+        }
+
+        Status = BatchStatus.PausedReady;
+        CompletedAt = null;
     }
 
     public void Cancel(DateTimeOffset cancelledAt)

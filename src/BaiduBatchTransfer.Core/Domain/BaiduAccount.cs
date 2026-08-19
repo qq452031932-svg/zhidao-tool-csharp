@@ -60,9 +60,27 @@ public sealed class BaiduAccount
         UpdatedAt = updatedAt;
     }
 
+    public void Disable(DateTimeOffset updatedAt) =>
+        ChangeAvailabilityFromActive(AccountStatus.Disabled, updatedAt);
+
+    public void MarkInvalid(DateTimeOffset updatedAt) =>
+        ChangeAvailabilityFromActive(AccountStatus.Invalid, updatedAt);
+
+    public void Reactivate(DateTimeOffset updatedAt)
+    {
+        if (Status is not (AccountStatus.Disabled or AccountStatus.Invalid))
+        {
+            throw new InvalidOperationException($"Cannot reactivate an account in {Status} status.");
+        }
+
+        EnsureTimestamp(updatedAt);
+        Status = AccountStatus.Active;
+        UpdatedAt = updatedAt;
+    }
+
     public void Tombstone(DateTimeOffset deletedAt)
     {
-        EnsureActive();
+        EnsureNotDeleted();
         EnsureTimestamp(deletedAt);
         EncryptedSession = null;
         WebView2ProfileDirectory = null;
@@ -74,10 +92,26 @@ public sealed class BaiduAccount
 
     private void EnsureActive()
     {
+        if (Status != AccountStatus.Active)
+        {
+            throw new InvalidOperationException($"An account in {Status} status cannot be changed as active.");
+        }
+    }
+
+    private void EnsureNotDeleted()
+    {
         if (IsDeleted)
         {
             throw new InvalidOperationException("A tombstoned account cannot be changed.");
         }
+    }
+
+    private void ChangeAvailabilityFromActive(AccountStatus nextStatus, DateTimeOffset updatedAt)
+    {
+        EnsureActive();
+        EnsureTimestamp(updatedAt);
+        Status = nextStatus;
+        UpdatedAt = updatedAt;
     }
 
     private void EnsureTimestamp(DateTimeOffset timestamp)
