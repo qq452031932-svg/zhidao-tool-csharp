@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Web.WebView2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
+    <ProjectReference Include="..\BaiduBatchTransfer.Application\BaiduBatchTransfer.Application.csproj" />
+    <ProjectReference Include="..\BaiduBatchTransfer.Infrastructure\BaiduBatchTransfer.Infrastructure.csproj" />
+    <ProjectReference Include="..\BaiduBatchTransfer.BaiduAdapter\BaiduBatchTransfer.BaiduAdapter.csproj" />
+  </ItemGroup>
+
+</Project>
