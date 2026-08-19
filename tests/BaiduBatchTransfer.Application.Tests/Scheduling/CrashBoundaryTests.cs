@@ -170,7 +170,7 @@ public sealed class CrashBoundaryTests
             await using var connection = await factory.OpenConnectionAsync();
             await using var command = connection.CreateCommand();
             command.CommandText = "SELECT MAX(Version) FROM SchemaVersions;";
-            Assert.Equal(2, Convert.ToInt32(await command.ExecuteScalarAsync()));
+            Assert.Equal(3, Convert.ToInt32(await command.ExecuteScalarAsync()));
         }
         finally
         {
