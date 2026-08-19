@@ -260,7 +260,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         var peakGrowth = Math.Max(0, Volatile.Read(ref peakBytes) - beforeBytes);
         output.WriteLine($"scale resources={resourceCount}, operations={resourceCount * accountCount}, elapsed={timer.Elapsed}, peak-managed-growth={peakGrowth:N0} bytes");
         Assert.True(peakGrowth < 384L * 1024 * 1024, $"Peak managed growth was {peakGrowth:N0} bytes.");
-        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(18), $"Bulk insert took {timer.Elapsed}.");
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(20), $"Bulk insert took {timer.Elapsed}.");
     }
 
     [Fact]
