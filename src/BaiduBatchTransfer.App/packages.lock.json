@@ -402,6 +402,7 @@
       "baidubatchtransfer.infrastructure": {
         "type": "Project",
         "dependencies": {
+          "BaiduBatchTransfer.Application": "[1.0.0, )",
           "BaiduBatchTransfer.Core": "[1.0.0, )",
           "DocumentFormat.OpenXml": "[3.5.1, )",
           "Microsoft.Data.Sqlite": "[10.0.11, )",

@@ -84,6 +84,12 @@
         "resolved": "4.5.3",
         "contentHash": "3oDzvc/zzetpTKWMShs1AADwZjQ/36HnsufHRPcOjyRAAMLDlu2iD33MBI2opxnezcVUtXyqDXXjoFMOU9c7SA=="
       },
+      "baidubatchtransfer.application": {
+        "type": "Project",
+        "dependencies": {
+          "BaiduBatchTransfer.Core": "[1.0.0, )"
+        }
+      },
       "baidubatchtransfer.core": {
         "type": "Project"
       }
