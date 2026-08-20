@@ -87,6 +87,13 @@ public sealed record AccountRemovalPreparation(
         "SensitiveData = [REDACTED] }";
 }
 
+/// <summary>
+/// Provides account-scoped listing, removal preview, atomic removal preparation, and tombstone finalization.
+/// </summary>
+/// <remarks>
+/// Implementations own the database transaction that disables an account and clears its credentials.
+/// External profile cleanup is deliberately outside that transaction and begins only after a committed preparation.
+/// </remarks>
 public interface IAccountRemovalStore
 {
     Task<AccountPage> GetAccountsPageAsync(int pageNumber, int pageSize, CancellationToken token);
@@ -96,10 +103,27 @@ public interface IAccountRemovalStore
         AccountExitHistoryMode mode,
         CancellationToken token);
 
+    /// <summary>
+    /// Atomically validates the confirmation and prepares the requested account for external profile cleanup.
+    /// </summary>
+    /// <remarks>
+    /// If this method throws, or returns any status other than
+    /// <see cref="AccountRemovalPreparationStatus.Prepared"/>, it must have committed zero writes.
+    /// A <see cref="AccountRemovalPreparationStatus.Prepared"/> result whose
+    /// <see cref="AccountRemovalPreparation.DatabasePrepared"/> value is <see langword="true"/> guarantees that
+    /// the account-disable and credential-clearing state has committed and must not be rolled back by later cleanup.
+    /// </remarks>
     Task<AccountRemovalPreparation> PrepareRemovalAsync(
         AccountExitRequest request,
         CancellationToken token);
 
+    /// <summary>
+    /// Finalizes the already-disabled, credential-free account as a tombstone.
+    /// </summary>
+    /// <remarks>
+    /// Implementations must be idempotent. They must refuse to finalize a row that has been re-enabled or still
+    /// contains account credentials.
+    /// </remarks>
     Task FinalizeTombstoneAsync(
         Guid accountId,
         DateTimeOffset removedAt,

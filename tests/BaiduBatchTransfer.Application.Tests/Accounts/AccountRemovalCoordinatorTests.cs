@@ -146,6 +146,52 @@ public sealed class AccountRemovalCoordinatorTests
     }
 
     [Fact]
+    public async Task CancellationDuringPreparationPropagatesWithoutProfileCleanup()
+    {
+        var events = new List<string>();
+        var cancellation = new OperationCanceledException("prepare-cancelled");
+        var store = new FakeRemovalStore(events) { PreparationFailure = cancellation };
+        var profiles = new FakeProfileStore(events);
+        var coordinator = new AccountRemovalCoordinator(store, profiles, new FakePathPolicy(events));
+
+        var actual = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None));
+
+        Assert.Same(cancellation, actual);
+        Assert.Equal(new[] { "prepare" }, events);
+        Assert.Equal(0, store.FinalizeCount);
+    }
+
+    [Theory]
+    [InlineData(CancellationBoundary.Close)]
+    [InlineData(CancellationBoundary.Delete)]
+    [InlineData(CancellationBoundary.Finalize)]
+    public async Task CancellationAfterCommittedPreparationReturnsCleanupPendingAndStopsAtBoundary(
+        CancellationBoundary boundary)
+    {
+        var events = new List<string>();
+        var cancellation = new OperationCanceledException($"{boundary}-cancelled");
+        var store = new FakeRemovalStore(events)
+        {
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true),
+            FinalizeFailure = boundary == CancellationBoundary.Finalize ? cancellation : null
+        };
+        var profiles = new FakeProfileStore(events)
+        {
+            CloseFailure = boundary == CancellationBoundary.Close ? cancellation : null,
+            DeleteFailure = boundary == CancellationBoundary.Delete ? cancellation : null
+        };
+        var coordinator = new AccountRemovalCoordinator(store, profiles, new FakePathPolicy(events));
+
+        var result = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+
+        Assert.Equal(AccountExitStatus.CleanupPending, result.Status);
+        Assert.Equal("账号已禁用且凭据已清除；本机登录目录清理或墓碑终结仍待完成。", result.SafeMessage);
+        Assert.Equal(ExpectedEvents(boundary), events);
+        Assert.Equal(boundary == CancellationBoundary.Finalize ? 1 : 0, store.FinalizeCount);
+    }
+
+    [Fact]
     public async Task ProfileCleanupFailureAfterCommittedPreparationReturnsCleanupPending()
     {
         var store = new FakeRemovalStore
@@ -247,6 +293,21 @@ public sealed class AccountRemovalCoordinatorTests
         bool databasePrepared) =>
         new(status, accountId, profilePath, databasePrepared, $"safe-{status}");
 
+    private static string[] ExpectedEvents(CancellationBoundary boundary) => boundary switch
+    {
+        CancellationBoundary.Close => ["prepare", "close"],
+        CancellationBoundary.Delete => ["prepare", "close", "validate-path", "delete"],
+        CancellationBoundary.Finalize => ["prepare", "close", "validate-path", "delete", "finalize"],
+        _ => throw new ArgumentOutOfRangeException(nameof(boundary))
+    };
+
+    public enum CancellationBoundary
+    {
+        Close,
+        Delete,
+        Finalize
+    }
+
     private sealed class FakeRemovalStore(List<string>? events = null) : IAccountRemovalStore
     {
         public AccountPage PageResult { get; set; } = new([], 1, 25, 0);
@@ -256,6 +317,7 @@ public sealed class AccountRemovalCoordinatorTests
             Preparation(AccountRemovalPreparationStatus.NotFound, AccountB, null, false);
         public Func<AccountExitRequest, AccountRemovalPreparation>? PrepareHandler { get; set; }
         public Exception? PreparationFailure { get; set; }
+        public Exception? FinalizeFailure { get; set; }
         public (int PageNumber, int PageSize)? LastPageRequest { get; private set; }
         public (Guid AccountId, AccountExitHistoryMode Mode)? LastPreviewRequest { get; private set; }
         public AccountExitRequest? LastPreparationRequest { get; private set; }
@@ -293,7 +355,7 @@ public sealed class AccountRemovalCoordinatorTests
             events?.Add("finalize");
             FinalizeCount++;
             LastFinalizeRequest = (accountId, removedAt);
-            return Task.CompletedTask;
+            return FinalizeFailure is null ? Task.CompletedTask : Task.FromException(FinalizeFailure);
         }
     }
 
