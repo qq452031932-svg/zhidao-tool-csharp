@@ -69,10 +69,12 @@ public sealed record AccountListItem(
     Guid AccountId,
     string DisplayName,
     string Status,
-    bool IsEnabled)
+    bool IsEnabled,
+    bool IsCleanupPending = false)
 {
     public override string ToString() =>
-        $"AccountListItem {{ Status = {Status}, IsEnabled = {IsEnabled}, SensitiveData = [REDACTED] }}";
+        $"AccountListItem {{ Status = {Status}, IsEnabled = {IsEnabled}, " +
+        $"IsCleanupPending = {IsCleanupPending}, SensitiveData = [REDACTED] }}";
 }
 
 public sealed record AccountRemovalPreparation(

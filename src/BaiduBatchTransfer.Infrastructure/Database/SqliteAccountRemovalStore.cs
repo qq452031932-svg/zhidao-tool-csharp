@@ -32,6 +32,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     private const string NotFoundMessage = "账号不存在。";
     private const string RemovedMessage = "账号已经退出。";
     private const string StaleMessage = "确认信息已过期，请重新确认。";
+    private const string CleanupPendingMessage = "账号退出清理仍待完成。";
     private readonly SqliteConnectionFactory factory;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot;
@@ -71,13 +72,18 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         var total = await ScalarLongAsync(connection, null,
             "SELECT COUNT(*) FROM Accounts WHERE IsDeleted=0 AND Status<>'Deleted';", token).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT Id,DisplayName,Status,IsEnabled FROM Accounts WHERE IsDeleted=0 AND Status<>'Deleted' ORDER BY SortOrder,DisplayName,Id LIMIT $limit OFFSET $offset;");
+            "SELECT Id,DisplayName,Status,IsEnabled,RemovalState FROM Accounts WHERE IsDeleted=0 AND Status<>'Deleted' ORDER BY SortOrder,DisplayName,Id LIMIT $limit OFFSET $offset;");
         Add(command, "$limit", pageSize);
         Add(command, "$offset", offset);
         var items = new List<AccountListItem>();
         await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         while (await reader.ReadAsync(token).ConfigureAwait(false))
-            items.Add(new AccountListItem(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), reader.GetInt64(3) != 0));
+            items.Add(new AccountListItem(
+                Guid.Parse(reader.GetString(0)),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetInt64(3) != 0,
+                string.Equals(reader.GetString(4), "CleanupPending", StringComparison.Ordinal)));
         return new AccountPage(items, pageNumber, pageSize, total);
     }
 
@@ -97,6 +103,11 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         {
             await transaction.CommitAsync(token).ConfigureAwait(false);
             return Preview(AccountExitStatus.AlreadyRemoved, account.DisplayName, RemovedMessage);
+        }
+        if (account.RemovalState == "CleanupPending")
+        {
+            await transaction.CommitAsync(token).ConfigureAwait(false);
+            return Preview(AccountExitStatus.CleanupPending, account.DisplayName, CleanupPendingMessage);
         }
         var manifest = await BuildManifestAsync(connection, transaction, account, mode, token).ConfigureAwait(false);
         if (await HasActiveWorkAsync(connection, transaction, accountId, mode, token).ConfigureAwait(false))
@@ -119,6 +130,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.NotFound, request.AccountId, NotFoundMessage).ConfigureAwait(false);
         if (account.IsDeleted || account.Status == "Deleted")
             return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.AlreadyRemoved, request.AccountId, RemovedMessage).ConfigureAwait(false);
+        if (account.RemovalState != "None" || account.RemovalGeneration is not null)
+            return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.StaleConfirmation, request.AccountId, StaleMessage).ConfigureAwait(false);
         var manifest = await BuildManifestAsync(connection, transaction, account, request.HistoryMode, token).ConfigureAwait(false);
         if (await HasActiveWorkAsync(connection, transaction, request.AccountId, request.HistoryMode, token).ConfigureAwait(false))
             return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.ActiveWorkBlocked, request.AccountId, BlockedMessage).ConfigureAwait(false);
@@ -130,13 +143,17 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         if (afterFinalValidation is not null)
             await afterFinalValidation(connection, transaction, token).ConfigureAwait(false);
 
+        var removalGeneration = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         await using (var update = Command(connection, transaction, """
             UPDATE Accounts
-            SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL
-            WHERE Id=$id AND IsDeleted=0 AND Status<>'Deleted';
+            SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL,
+                RemovalState='CleanupPending',RemovalGeneration=$generation
+            WHERE Id=$id AND IsDeleted=0 AND Status<>'Deleted'
+              AND RemovalState='None' AND RemovalGeneration IS NULL;
             """))
         {
             Add(update, "$id", Id(request.AccountId));
+            Add(update, "$generation", removalGeneration);
             if (await update.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
                 return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.StaleConfirmation, request.AccountId, StaleMessage).ConfigureAwait(false);
         }
@@ -178,6 +195,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                     account.EncryptedSession is null &&
                     account.ProfilePath is null &&
                     account.LastValidatedAt is null &&
+                    account.RemovalState == "None" &&
+                    account.RemovalGeneration is null &&
                     await ScalarLongAsync(
                         connection,
                         transaction,
@@ -195,7 +214,9 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             if (account.Status != "Disabled" ||
                 account.IsEnabled ||
                 account.EncryptedSession is not null ||
-                account.LastValidatedAt is not null)
+                account.LastValidatedAt is not null ||
+                account.RemovalState != "CleanupPending" ||
+                !IsValidRemovalGeneration(account.RemovalGeneration))
             {
                 throw new InvalidOperationException("Account completion preconditions were not satisfied.");
             }
@@ -204,12 +225,15 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
 
             await using var update = Command(connection, transaction, """
                 UPDATE Accounts
-                SET Status='Deleted',IsDeleted=1,DeletedAt=$removed,WebView2ProfileDirectory=NULL
+                SET Status='Deleted',IsDeleted=1,DeletedAt=$removed,WebView2ProfileDirectory=NULL,
+                    RemovalState='None',RemovalGeneration=NULL
                 WHERE Id=$id AND Status='Disabled' AND IsEnabled=0 AND EncryptedSession IS NULL
-                  AND LastValidatedAt IS NULL AND IsDeleted=0;
+                  AND LastValidatedAt IS NULL AND IsDeleted=0
+                  AND RemovalState='CleanupPending' AND RemovalGeneration=$generation;
                 """);
             Add(update, "$removed", Time(removedAt));
             Add(update, "$id", Id(accountId));
+            Add(update, "$generation", account.RemovalGeneration);
             if (await update.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
                 throw new InvalidOperationException("Account completion preconditions were not satisfied.");
 
@@ -321,7 +345,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     {
         await using var command = Command(connection, transaction, """
             SELECT Id,BaiduUserId,DisplayName,EncryptedSession,WebView2ProfileDirectory,LoginMethod,Status,CapacityTotal,CapacityUsed,
-              DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,IsDeleted,DeletedAt
+              DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,IsDeleted,DeletedAt,
+              RemovalState,RemovalGeneration
             FROM Accounts WHERE Id=$id;
             """);
         Add(command, "$id", Id(accountId));
@@ -329,7 +354,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         if (!await reader.ReadAsync(token).ConfigureAwait(false)) return null;
         return new AccountSnapshot(accountId, reader.GetString(1), reader.GetString(2), ReadBlob(reader, 3),
             reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetInt64(12) != 0,
-            reader.IsDBNull(13) ? null : reader.GetString(13), reader.GetInt64(15) != 0);
+            reader.IsDBNull(13) ? null : reader.GetString(13), reader.GetInt64(15) != 0,
+            reader.GetString(17), reader.IsDBNull(18) ? null : reader.GetString(18));
     }
 
     private static async Task<Manifest> BuildManifestAsync(
@@ -342,7 +368,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         var includeCleanupClosure = mode == AccountExitHistoryMode.RemoveTerminalHistory;
         await MaterializeManifestClosureAsync(connection, transaction, account.Id, includeCleanupClosure, token).ConfigureAwait(false);
         using var writer = new CanonicalWriter();
-        writer.Value("manifest-version", "2");
+        writer.Value("manifest-version", "3");
         writer.Value("history-mode", mode.ToString());
         writer.Value("account-id", Id(account.Id));
         writer.Value("identity-fingerprint", Fingerprint(account.BaiduUserId));
@@ -350,6 +376,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         await AppendQueryAsync(connection, transaction, writer, "Accounts", """
             SELECT Id,DisplayName,EncryptedSession,WebView2ProfileDirectory,LoginMethod,Status,CapacityTotal,CapacityUsed,DailyLimit,
               DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,IsDeleted,DeletedAt
+              ,RemovalState,RemovalGeneration
             FROM Accounts WHERE Id=$account ORDER BY Id;
             """, token, ["LastValidatedAt", "DeletedAt"], ["EncryptedSession", "WebView2ProfileDirectory"], ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
 
@@ -902,8 +929,13 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     private static string Id(Guid id) => id.ToString("D");
     private static string Time(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
+    private static bool IsValidRemovalGeneration(string? value) =>
+        value is { Length: 64 } && value.All(character =>
+            character is >= '0' and <= '9' or >= 'A' and <= 'F');
+
     private sealed record AccountSnapshot(Guid Id, string BaiduUserId, string DisplayName, byte[]? EncryptedSession,
-        string? ProfilePath, string Status, bool IsEnabled, string? LastValidatedAt, bool IsDeleted);
+        string? ProfilePath, string Status, bool IsEnabled, string? LastValidatedAt, bool IsDeleted,
+        string RemovalState, string? RemovalGeneration);
     private sealed record Manifest(byte[] Digest, int TerminalOperations, int TerminalBatches, int SharedBatches);
 
     private sealed class CanonicalWriter : IDisposable

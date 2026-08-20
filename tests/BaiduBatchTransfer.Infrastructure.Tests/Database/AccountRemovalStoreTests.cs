@@ -42,6 +42,76 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task PreparationPersistsOpaqueMarkerAndOnlyThatAccountIsListedAsCleanupPending()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+
+        var prepared = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt),
+            default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, prepared.Status);
+        var generation = await ScalarTextAsync(factory,
+            "SELECT RemovalGeneration FROM Accounts WHERE Id=$id;", ("$id", Id(B)));
+        Assert.Matches("^[0-9A-F]{64}$", generation);
+        Assert.Equal("CleanupPending", await ScalarTextAsync(factory,
+            "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", Id(B))));
+        var page = await store.GetAccountsPageAsync(1, 100, default);
+        Assert.True(Assert.Single(page.Items, item => item.AccountId == B).IsCleanupPending);
+        Assert.All(page.Items.Where(item => item.AccountId != B), item => Assert.False(item.IsCleanupPending));
+        Assert.DoesNotContain(generation, page.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GenericDisabledCredentialFreeRowCannotEnterExternalCleanup()
+    {
+        var (factory, store, _) = await CreateAsync();
+        await ExecuteAsync(factory,
+            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;",
+            ("$id", Id(B)));
+        var cleanupCount = 0;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.CompletePreparedRemovalAsync(
+            B,
+            RemovedAt,
+            (_, _, _) =>
+            {
+                cleanupCount++;
+                return Task.CompletedTask;
+            },
+            default));
+
+        Assert.Equal(0, cleanupCount);
+        Assert.Equal("None", await ScalarTextAsync(factory,
+            "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", Id(B))));
+        Assert.False((await ReadAccountAsync(factory, B)).Deleted);
+    }
+
+    [Fact]
+    public async Task RepositoryUpsertCannotReenableAnAccountWithPendingRemovalMarker()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt),
+            default);
+        await using var unit = await SqliteUnitOfWork.BeginAsync(factory);
+        var pending = Assert.IsType<AccountRecord>(await unit.Accounts.GetByIdAsync(B));
+
+        await Assert.ThrowsAsync<SqliteException>(() => unit.Accounts.UpsertAsync(pending with
+        {
+            Status = "Active",
+            IsEnabled = true,
+            EncryptedSession = [1, 2, 3],
+            LastValidatedAt = RemovedAt,
+        }));
+
+        Assert.Equal("CleanupPending", await ScalarTextAsync(factory,
+            "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", Id(B))));
+    }
+
+    [Fact]
     public async Task RepositorySeededDashedIdAndBlobSessionSupportsPagePreviewAndPrepare()
     {
         var (factory, store, _) = await CreateAsync();
@@ -909,12 +979,11 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal("Active", await ScalarTextAsync(factory, $"SELECT Status FROM BatchJobs WHERE Id='{Id(g.BBatch)}';"));
         Assert.Equal(1, await ScalarAsync(factory,
             "SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=$batch AND CandidateStatus='Unallocated';", ("$batch", Id(g.BBatch))));
-        await ExecuteAsync(factory, "UPDATE Accounts SET Status='Active',IsEnabled=1,EncryptedSession=$session WHERE Id=$id;",
-            ("$session", new byte[] { 4, 5, 6 }), ("$id", Id(B)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(factory,
+            "UPDATE Accounts SET Status='Active',IsEnabled=1,EncryptedSession=$session WHERE Id=$id;",
+            ("$session", new byte[] { 4, 5, 6 }), ("$id", Id(B))));
         var eligible = await scheduler.TryReserveNextAsync(g.BBatch, RemovedAt.AddMinutes(1), RemovedAt.AddMinutes(6), default);
-        Assert.NotNull(eligible);
-        Assert.Equal(B, eligible.AccountId);
-        Assert.Equal(g.BBatch, eligible.BatchJobId);
+        Assert.Null(eligible);
     }
 
     [Fact]
@@ -963,7 +1032,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var (factory, store, _) = await CreateAsync();
         await Assert.ThrowsAsync<InvalidOperationException>(() => CompleteAsync(store, B, RemovedAt));
         await AssertUnchangedAsync(factory);
-        await ExecuteAsync(factory, "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;", ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
         await CompleteAsync(store, B, RemovedAt);
         await CompleteAsync(store, B, RemovedAt.AddHours(1));
         var state = await ReadAccountAsync(factory, B);
@@ -1008,9 +1077,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task TombstoneFailureAfterExternalDeleteCanRetryWithAbsentProfile()
     {
         var (factory, store, _) = await CreateAsync();
-        await ExecuteAsync(factory,
-            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;",
-            ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
         await ExecuteAsync(factory, $"""
             CREATE TRIGGER fail_account_tombstone
             BEFORE UPDATE OF Status ON Accounts
@@ -1058,9 +1125,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task ExternalCleanupCancellationRollsBackCompletionLease()
     {
         var (factory, store, _) = await CreateAsync();
-        await ExecuteAsync(factory,
-            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;",
-            ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
         var cancellation = new OperationCanceledException("profile-cancelled");
 
         var actual = await Assert.ThrowsAsync<OperationCanceledException>(() => store.CompletePreparedRemovalAsync(
@@ -1085,9 +1150,8 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task CompletionRefusesUnsafeCurrentStateBeforeExternalCleanup(string corruption)
     {
         var (factory, store, _) = await CreateAsync();
-        await ExecuteAsync(factory,
-            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;",
-            ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
+        await ExecuteAsync(factory, "DROP TRIGGER TR_Accounts_RemovalState_Update;");
         await ExecuteAsync(factory, corruption, ("$id", Id(B)));
         var cleanupCount = 0;
 
@@ -1109,9 +1173,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task CompletionLeasePreventsStaleRepositoryWriterFromReenablingAfterCleanup()
     {
         var (factory, store, _) = await CreateAsync(busyTimeout: 250);
-        await ExecuteAsync(factory,
-            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;",
-            ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
         var writerRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseWriter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var writerAttempting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1198,8 +1260,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task FinalizeRefusesUnsafeRowsThatOnlyClaimToBeDeleted(string corruption)
     {
         var (factory, store, _) = await CreateAsync();
-        await ExecuteAsync(factory,
-            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;", ("$id", Id(B)));
+        await PreparePendingAsync(store, B);
         await CompleteAsync(store, B, RemovedAt);
         await ExecuteAsync(factory, corruption, ("$id", Id(B)));
         var before = await ReadAccountAsync(factory, B);
@@ -1548,6 +1609,18 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     private static string Id(Guid id) => id.ToString("D");
+    private static async Task PreparePendingAsync(
+        SqliteAccountRemovalStore store,
+        Guid accountId)
+    {
+        var preview = await store.PreviewAsync(accountId, AccountExitHistoryMode.KeepHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        var result = await store.PrepareRemovalAsync(
+            new(accountId, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt),
+            default);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+    }
+
     private static Task CompleteAsync(
         SqliteAccountRemovalStore store,
         Guid accountId,
