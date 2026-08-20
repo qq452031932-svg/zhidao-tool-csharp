@@ -287,6 +287,44 @@ public sealed class AccountLifecycleTests : IDisposable
         Assert.Null(disabled.EncryptedSession);
     }
 
+    [Theory]
+    [InlineData(LegacyCancellationBoundary.Close)]
+    [InlineData(LegacyCancellationBoundary.Delete)]
+    [InlineData(LegacyCancellationBoundary.Tombstone)]
+    public async Task LegacyRemoveCancellationPropagatesAfterCredentialsAreCleared(
+        LegacyCancellationBoundary boundary)
+    {
+        var repository = new FakeAccountRepository();
+        var account = ActiveAccount();
+        repository.Seed(account);
+        var cancellation = new OperationCanceledException($"{boundary}-cancelled");
+        var events = new List<string>();
+        var factory = new FakeUnitOfWorkFactory(repository)
+        {
+            CommitFailureAttempt = boundary == LegacyCancellationBoundary.Tombstone ? 2 : null,
+            CommitFailure = boundary == LegacyCancellationBoundary.Tombstone ? cancellation : null
+        };
+        var profiles = new FakeProfileStore(events)
+        {
+            CloseFailure = boundary == LegacyCancellationBoundary.Close ? cancellation : null,
+            DeleteFailure = boundary == LegacyCancellationBoundary.Delete ? cancellation : null
+        };
+        var service = new RemoveAccountService(
+            factory,
+            profiles,
+            new FileSystemAccountProfilePathPolicy(root));
+
+        var actual = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => service.RemoveAsync(account.Id, Now, CancellationToken.None));
+
+        Assert.Same(cancellation, actual);
+        Assert.Equal(ExpectedLegacyCancellationEvents(boundary), events);
+        var disabled = Assert.Single(repository.Records);
+        Assert.False(disabled.IsEnabled);
+        Assert.False(disabled.IsDeleted);
+        Assert.Null(disabled.EncryptedSession);
+    }
+
     [Fact]
     public async Task TombstoneCommitFailureLeavesRetryableDisabledState()
     {
@@ -317,12 +355,14 @@ public sealed class AccountLifecycleTests : IDisposable
             ? root
             : Path.Combine(root, maliciousLeaf, Guid.NewGuid().ToString("D"));
         repository.Seed(account with { WebView2ProfileDirectory = badPath });
-        var profiles = new FakeProfileStore([]);
+        var events = new List<string>();
+        var profiles = new FakeProfileStore(events);
         var service = CreateRemoveService(repository, profiles);
 
         var result = await service.RemoveAsync(account.Id, Now, CancellationToken.None);
 
         Assert.Equal(RemoveAccountStatus.CleanupPending, result.Status);
+        Assert.Empty(events);
         Assert.Equal(0, profiles.DeleteCount);
         Assert.Null(Assert.Single(repository.Records).EncryptedSession);
     }
@@ -481,6 +521,13 @@ public sealed class AccountLifecycleTests : IDisposable
     private RemoveAccountService CreateRemoveService(FakeAccountRepository repository, FakeProfileStore profiles) =>
         new(new FakeUnitOfWorkFactory(repository), profiles, new FileSystemAccountProfilePathPolicy(root));
 
+    private static string[] ExpectedLegacyCancellationEvents(LegacyCancellationBoundary boundary) => boundary switch
+    {
+        LegacyCancellationBoundary.Close => ["close"],
+        LegacyCancellationBoundary.Delete or LegacyCancellationBoundary.Tombstone => ["close", "delete"],
+        _ => throw new ArgumentOutOfRangeException(nameof(boundary))
+    };
+
     private static AddAccountRequest CreateAddRequest()
     {
         var accountId = Guid.Parse("51f1a6f9-c88b-4dd8-8376-36163ca42bc5");
@@ -557,6 +604,7 @@ public sealed class AccountLifecycleTests : IDisposable
     {
         public bool FailDelete { get; set; }
         public Exception? CloseFailure { get; set; }
+        public Exception? DeleteFailure { get; set; }
         public Guid? CurrentOwnerToken { get; set; } = ProfileToken;
         public Action? BeforeOwnedDelete { get; set; }
         public int DeleteCount { get; private set; }
@@ -568,6 +616,7 @@ public sealed class AccountLifecycleTests : IDisposable
         public Task DeleteAsync(Guid accountId, string exactProfilePath, CancellationToken cancellationToken)
         {
             events.Add("delete"); DeleteCount++;
+            if (DeleteFailure is not null) return Task.FromException(DeleteFailure);
             return FailDelete ? Task.FromException(new IOException("locked")) : Task.CompletedTask;
         }
 
@@ -621,6 +670,8 @@ public sealed class AccountLifecycleTests : IDisposable
     {
         public bool FailNextCommit { get; set; }
         public int? FailCommitAttempt { get; set; }
+        public int? CommitFailureAttempt { get; set; }
+        public Exception? CommitFailure { get; set; }
         public int CommitAttempts { get; private set; }
         public int RollbackCount { get; private set; }
         public Task<IUnitOfWork> BeginAsync(CancellationToken cancellationToken = default) =>
@@ -641,6 +692,8 @@ public sealed class AccountLifecycleTests : IDisposable
             public Task CommitAsync(CancellationToken cancellationToken = default)
             {
                 owner.CommitAttempts++;
+                if (owner.CommitFailureAttempt == owner.CommitAttempts && owner.CommitFailure is not null)
+                    throw owner.CommitFailure;
                 if (owner.FailNextCommit || owner.FailCommitAttempt == owner.CommitAttempts)
                 {
                     owner.FailNextCommit = false;
@@ -672,5 +725,12 @@ public sealed class AccountLifecycleTests : IDisposable
         public Task<Page<AccountRecord>> GetPageAsync(PageQuery query, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task UpsertRuleAsync(AccountRuleRecord rule, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<Page<AccountRuleRecord>> GetRulesPageAsync(Guid accountId, PageQuery query, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    public enum LegacyCancellationBoundary
+    {
+        Close,
+        Delete,
+        Tombstone
     }
 }

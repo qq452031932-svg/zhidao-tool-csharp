@@ -61,6 +61,7 @@ public sealed class RemoveAccountService
             preparation,
             removedAt,
             TombstoneAsync,
+            CleanupPolicy.Legacy,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -77,6 +78,7 @@ public sealed class RemoveAccountService
             preparation,
             removedAt,
             removalStore.FinalizeTombstoneAsync,
+            CleanupPolicy.Prepared,
             cancellationToken);
     }
 
@@ -84,6 +86,7 @@ public sealed class RemoveAccountService
         AccountRemovalPreparation preparation,
         DateTimeOffset removedAt,
         Func<Guid, DateTimeOffset, CancellationToken, Task> finalizeTombstone,
+        CleanupPolicy policy,
         CancellationToken cancellationToken)
     {
         if (preparation.Status != AccountRemovalPreparationStatus.Prepared ||
@@ -95,29 +98,36 @@ public sealed class RemoveAccountService
                 "The prepared account snapshot could not be finalized safely.");
         }
 
-        try
-        {
-            await profileStore.CloseAsync(preparation.AccountId, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception)
-        {
-            return new(RemoveAccountStatus.CleanupPending, "The account is disabled and credential-free; profile cleanup is pending.");
-        }
-
-        if (preparation.ProfilePath is not null)
+        if (policy.ValidatePathBeforeClose && preparation.ProfilePath is not null)
         {
             try
             {
                 profilePaths.EnsureSafeAccountPath(preparation.AccountId, preparation.ProfilePath);
+            }
+            catch (Exception exception) when (IsUnsafePathException(exception))
+            {
+                return new(
+                    RemoveAccountStatus.CleanupPending,
+                    "Profile cleanup is pending because its path is not safe.");
+            }
+        }
+
+        try
+        {
+            await profileStore.CloseAsync(preparation.AccountId, cancellationToken).ConfigureAwait(false);
+            if (preparation.ProfilePath is not null)
+            {
+                if (!policy.ValidatePathBeforeClose)
+                    profilePaths.EnsureSafeAccountPath(preparation.AccountId, preparation.ProfilePath);
                 await profileStore.DeleteAsync(
                     preparation.AccountId,
                     preparation.ProfilePath,
                     cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception)
-            {
-                return new(RemoveAccountStatus.CleanupPending, "The account is disabled and credential-free; profile cleanup is pending.");
-            }
+        }
+        catch (Exception exception) when (policy.CaptureCancellation || exception is not OperationCanceledException)
+        {
+            return new(RemoveAccountStatus.CleanupPending, "The account is disabled and credential-free; profile cleanup is pending.");
         }
 
         try
@@ -128,10 +138,19 @@ public sealed class RemoveAccountService
                 cancellationToken).ConfigureAwait(false);
             return new(RemoveAccountStatus.Removed, "The account was removed.");
         }
-        catch (Exception)
+        catch (Exception exception) when (policy.CaptureCancellation || exception is not OperationCanceledException)
         {
             return new(RemoveAccountStatus.CleanupPending, "Profile cleanup completed; account finalization is pending.");
         }
+    }
+
+    private static bool IsUnsafePathException(Exception exception) =>
+        exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
+
+    private readonly record struct CleanupPolicy(bool ValidatePathBeforeClose, bool CaptureCancellation)
+    {
+        public static CleanupPolicy Legacy { get; } = new(true, false);
+        public static CleanupPolicy Prepared { get; } = new(false, true);
     }
 
     private async Task<AccountRecord?> DisableAndClearCredentialsAsync(Guid accountId, CancellationToken cancellationToken)
