@@ -42,13 +42,15 @@ public sealed record WizardAccountOption(
     int ReachableTargetSuccessCount,
     int FulfilledCount,
     int ReservedSlotCount,
-    bool IsSelected = false,
+    BatchAccountSelectionDecision SelectionDecision,
     bool ShareEnabled = true,
     long PlannedTransferCount = 0,
     long PlannedShareCount = 0)
 {
+    public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
+
     public override string ToString() =>
-        $"WizardAccountOption {{ Identity = [REDACTED], DisplayName = [REDACTED], Status = {Status}, IsEnabled = {IsEnabled}, IsDeleted = {IsDeleted}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount} }}";
+        $"WizardAccountOption {{ Identity = [REDACTED], DisplayName = [REDACTED], Status = {Status}, IsEnabled = {IsEnabled}, IsDeleted = {IsDeleted}, SelectionDecision = {SelectionDecision}, ShareEnabled = {ShareEnabled}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount} }}";
 }
 
 public sealed record ImportWizardContext(
@@ -120,11 +122,13 @@ public sealed record WizardAccountDraft(
     string DefaultTargetPath,
     int TargetItemCount,
     int TargetSuccessCount,
-    bool IsSelected = true,
+    BatchAccountSelectionDecision SelectionDecision,
     bool ShareEnabled = true)
 {
+    public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
+
     public override string ToString() =>
-        $"WizardAccountDraft {{ Identity = [REDACTED], PriorityOrder = {PriorityOrder}, TargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled} }}";
+        $"WizardAccountDraft {{ Identity = [REDACTED], PriorityOrder = {PriorityOrder}, TargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, SelectionDecision = {SelectionDecision}, ShareEnabled = {ShareEnabled} }}";
 }
 
 public sealed record WizardBatchDraft(
@@ -343,7 +347,7 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
             account.DefaultTargetPath,
             account.TargetItemCount,
             account.TargetSuccessCount,
-            account.IsSelected,
+            account.SelectionDecision,
             account.ShareEnabled)).ToArray(),
         draft.DefaultTargetPath,
         draft.FolderCreationMode,

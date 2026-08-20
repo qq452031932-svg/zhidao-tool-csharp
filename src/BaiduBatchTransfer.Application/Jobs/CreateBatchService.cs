@@ -26,6 +26,8 @@ public sealed class CreateBatchService
         BatchDraft draft,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(draft);
+        BatchDraftValidator.ValidateSelectionSnapshot(draft);
         await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
         var validated = await validator.ValidateAsync(draft, unit, cancellationToken).ConfigureAwait(false);
         var estimate = await preflightEstimator.EstimateAsync(

@@ -7,6 +7,21 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class CreateJobWizardViewModelTests
 {
+    [Theory]
+    [InlineData(BatchAccountSelectionDecision.Unspecified)]
+    [InlineData((BatchAccountSelectionDecision)99)]
+    public void WizardRejectsMissingOrInvalidAccountSelectionDecision(
+        BatchAccountSelectionDecision selectionDecision)
+    {
+        var option = Account("A") with { SelectionDecision = selectionDecision };
+
+        Assert.Throws<ArgumentException>(() => new AccountAllocationRowViewModel(option, "/目标"));
+        var error = Assert.Throws<ArgumentException>(() => new CreateJobWizardViewModel(
+            [option], new FakePageSource([], 1, null), new FakeBatchGateway(), new FakeDialogService()));
+
+        Assert.Contains("明确选择", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void AdaptiveStepsKeepPrecheckVisibleButSkipItWhenDisabled()
     {
@@ -46,7 +61,7 @@ public sealed class CreateJobWizardViewModelTests
     {
         var option = Account("A") with
         {
-            IsSelected = true,
+            SelectionDecision = BatchAccountSelectionDecision.Selected,
             ShareEnabled = false,
             PlannedTransferCount = 200_000,
             PlannedShareCount = 0,
@@ -79,16 +94,20 @@ public sealed class CreateJobWizardViewModelTests
         await vm.PrepareConfirmationAsync();
 
         var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
-        var selected = Assert.Single(draft.Accounts);
+        Assert.Equal(2, draft.Accounts.Count);
+        var selected = Assert.Single(draft.Accounts, account => account.IsSelected);
         Assert.True(selected.IsSelected);
         Assert.False(selected.ShareEnabled);
+        Assert.Equal(BatchAccountSelectionDecision.NotSelected,
+            Assert.Single(draft.Accounts, account => !account.IsSelected).SelectionDecision);
     }
 
     [Fact]
     public void WorkloadContractsRedactIdsPathsCodesNamesAndConfirmationTokens()
     {
         var accountId = Guid.NewGuid();
-        var account = new WizardAccountDraft(accountId, 0, "/敏感目录", 1, 1, true, true);
+        var account = new WizardAccountDraft(
+            accountId, 0, "/敏感目录", 1, 1, BatchAccountSelectionDecision.Selected, true);
         var draft = new WizardBatchDraft(
             Guid.NewGuid(), Guid.NewGuid(), "敏感任务", TransferMode.Distribution, QuotaBasis.TaskCount,
             ShortagePolicy.ProportionalReduction, [account], "/敏感目录", "None", DuplicatePolicy.Skip,
@@ -485,6 +504,18 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Throws<ArgumentOutOfRangeException>(() => vm.ReloadAccounts(Accounts(1_001)));
     }
 
+    [Fact]
+    public void ReloadAccountsRejectsMissingSelectionDecisionWithoutReplacingExistingSnapshot()
+    {
+        var original = Accounts(2);
+        var vm = Create(original, ready: 1);
+        var missing = Account("C") with { SelectionDecision = BatchAccountSelectionDecision.Unspecified };
+
+        Assert.Throws<ArgumentException>(() => vm.ReloadAccounts([missing]));
+
+        Assert.Equal(original.Select(account => account.AccountId), vm.Accounts.Select(account => account.AccountId));
+    }
+
     private static CreateJobWizardViewModel Create(
         IReadOnlyList<WizardAccountOption> accounts,
         int ready,
@@ -523,11 +554,12 @@ public sealed class CreateJobWizardViewModelTests
         int reserved = 0,
         int unused = 0) =>
         new(Guid.NewGuid(), name, status, enabled, deleted, 2_000_000_000, 500_000_000,
-            locked, exclusive, publicCandidates, unused, original, effective, reachable, fulfilled, reserved);
+            locked, exclusive, publicCandidates, unused, original, effective, reachable, fulfilled, reserved,
+            BatchAccountSelectionDecision.NotSelected);
 
     private static WizardAccountOption AccountWithCapacity(string name, long remaining) =>
         new(Guid.NewGuid(), name, "Active", true, false, remaining, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0);
+            0, 0, 0, 0, 0, 0, 0, 0, 0, BatchAccountSelectionDecision.NotSelected);
 
     private static ImportPreviewRow Row(int number) =>
         new(Guid.NewGuid(), number, $"https://pan.baidu.com/s/{number}", null, null, "就绪", null);
@@ -573,7 +605,8 @@ public sealed class CreateJobWizardViewModelTests
             return Task.FromResult(new WizardConfirmationSummary(
                 draft.ReadyResourceCount,
                 draft.TransferMode == TransferMode.Replication
-                    ? draft.ReadyResourceCount * draft.Accounts.Count
+                    ? draft.ReadyResourceCount * draft.Accounts.Count(account =>
+                        account.SelectionDecision == BatchAccountSelectionDecision.Selected)
                     : draft.ReadyResourceCount,
                 "preview-token",
                 true));

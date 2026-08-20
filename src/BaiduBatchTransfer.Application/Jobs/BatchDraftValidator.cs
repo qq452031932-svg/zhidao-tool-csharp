@@ -19,6 +19,7 @@ public sealed class BatchDraftValidator
     {
         ArgumentNullException.ThrowIfNull(draft);
         ArgumentNullException.ThrowIfNull(unit);
+        ValidateSelectionSnapshot(draft);
         var session = await unit.Imports.GetSessionAsync(draft.ImportSessionId, cancellationToken).ConfigureAwait(false)
             ?? throw new BatchDraftValidationException("The import draft does not exist.");
         var confirmableStatus = session.Status == "ReadyToConfirm" ||
@@ -33,15 +34,18 @@ public sealed class BatchDraftValidator
         var rules = await ReadDirectoryRulesAsync(accounts, unit.Accounts, cancellationToken).ConfigureAwait(false);
         var rows = await ReadEligibleRowsAsync(session, draft, accounts, accountIds, rules, cancellationToken, unit.Imports).ConfigureAwait(false);
         var columnDefinitions = await unit.Imports.GetColumnDefinitionsAsync(session.Id, cancellationToken).ConfigureAwait(false);
-        var workloadInputs = accounts.Select(account => new BatchWorkloadAccountInput(
-            account.Draft.AccountId,
-            account.Draft.PriorityOrder,
-            account.Record.DisplayName,
-            true,
-            account.Draft.ShareEnabled,
+        var selectedRecords = accounts.ToDictionary(account => account.Draft.AccountId);
+        var workloadInputs = draft.Accounts.Select(account => new BatchWorkloadAccountInput(
+            account.AccountId,
+            account.PriorityOrder,
+            selectedRecords.TryGetValue(account.AccountId, out var selectedAccount)
+                ? selectedAccount.Record.DisplayName
+                : string.Empty,
+            account.SelectionDecision,
+            account.ShareEnabled,
             draft.TransferMode == TransferMode.Distribution && draft.QuotaBasis == QuotaBasis.TaskCount
-                ? account.Draft.TargetItemCount
-                : account.Draft.TargetSuccessCount)).ToArray();
+                ? account.TargetItemCount
+                : account.TargetSuccessCount)).ToArray();
         var mappedCounts = rows.Where(row => row.ConstraintAccountId.HasValue)
             .GroupBy(row => row.ConstraintAccountId!.Value)
             .ToDictionary(group => group.Key, group => (long)group.Count());
@@ -166,20 +170,23 @@ public sealed class BatchDraftValidator
 
     private static ImmutableArray<BatchAccountDraft> SelectAccounts(BatchDraft draft)
     {
-        var hasExplicitSelection = draft.Accounts.Any(account => account.HasExplicitSelection);
-        var selected = hasExplicitSelection
-            ? draft.Accounts.Where(account => account.IsSelected).ToImmutableArray()
-            : draft.TransferMode == TransferMode.Replication
-                ? draft.Accounts
-                : draft.Accounts.Where(account => draft.QuotaBasis == QuotaBasis.TaskCount
-                    ? account.TargetItemCount > 0
-                    : account.TargetSuccessCount > 0).ToImmutableArray();
-        if (selected.IsDefaultOrEmpty)
-            throw new BatchDraftValidationException("At least one participating account is required.");
-        if (selected.Select(account => account.AccountId).Distinct().Count() != selected.Length ||
-            selected.Select(account => account.PriorityOrder).Distinct().Count() != selected.Length)
-            throw new BatchDraftValidationException("Participating accounts and priorities must be unique.");
-        return selected.OrderBy(account => account.PriorityOrder).ToImmutableArray();
+        return draft.Accounts.Where(account => account.SelectionDecision == BatchAccountSelectionDecision.Selected)
+            .OrderBy(account => account.PriorityOrder)
+            .ToImmutableArray();
+    }
+
+    internal static void ValidateSelectionSnapshot(BatchDraft draft)
+    {
+        if (draft.Accounts.IsDefaultOrEmpty ||
+            draft.Accounts.Any(account => account.SelectionDecision == BatchAccountSelectionDecision.Unspecified))
+            throw new BatchDraftValidationException("每个候选账号都必须明确选择或不选择。");
+        if (draft.Accounts.Any(account => !Enum.IsDefined(account.SelectionDecision)))
+            throw new BatchDraftValidationException("账号选择决定无效。");
+        if (draft.Accounts.Select(account => account.AccountId).Distinct().Count() != draft.Accounts.Length ||
+            draft.Accounts.Select(account => account.PriorityOrder).Distinct().Count() != draft.Accounts.Length)
+            throw new BatchDraftValidationException("候选账号和顺序必须唯一。");
+        if (!draft.Accounts.Any(account => account.SelectionDecision == BatchAccountSelectionDecision.Selected))
+            throw new BatchDraftValidationException("请至少选择一个参与账号。");
     }
 
     private async Task<ImmutableArray<ValidatedBatchAccount>> ValidateAccountsAsync(
@@ -345,6 +352,7 @@ internal static class BatchConfirmationTokens
             draft.ExistingSharePolicy,
             draft.ShareSettingsFingerprint,
             session.ColumnMappingFingerprint ?? string.Empty,
+            HashAccountSelections(draft.Accounts),
             rows.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
             operationCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
             HashRows(rows),
@@ -421,6 +429,22 @@ internal static class BatchConfirmationTokens
             Append(hash, definition.SourceHeader);
             Append(hash, definition.MappedRole);
             Append(hash, definition.IsRequired.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static string HashAccountSelections(IEnumerable<BatchAccountDraft> accounts)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var account in accounts.OrderBy(value => value.PriorityOrder))
+        {
+            Append(hash, account.AccountId.ToString("N"));
+            Append(hash, account.PriorityOrder.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, account.SelectionDecision.ToString());
+            Append(hash, account.TargetItemCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, account.TargetSuccessCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, account.ShareEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, Hash(account.DefaultTargetPath));
         }
         return Convert.ToHexString(hash.GetHashAndReset());
     }

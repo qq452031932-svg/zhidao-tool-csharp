@@ -203,7 +203,8 @@ public sealed class WizardAccountProvider(IUnitOfWorkFactory unitOfWorkFactory) 
                     account.IsDeleted,
                     account.CapacityTotal,
                     account.CapacityUsed,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0));
+                    0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    BatchAccountSelectionDecision.NotSelected));
                 if (result.Count == MaximumSnapshotSize) break;
             }
             if (pageNumber * page.PageSize >= page.TotalCount) break;

@@ -3,6 +3,13 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Jobs;
 
+public enum BatchAccountSelectionDecision
+{
+    Unspecified,
+    Selected,
+    NotSelected,
+}
+
 public sealed class BatchAccountDraft
 {
     public BatchAccountDraft(
@@ -11,7 +18,7 @@ public sealed class BatchAccountDraft
         string defaultTargetPath,
         int targetItemCount,
         int targetSuccessCount,
-        bool? isSelected = null,
+        BatchAccountSelectionDecision selectionDecision,
         bool shareEnabled = true)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(priorityOrder);
@@ -24,8 +31,9 @@ public sealed class BatchAccountDraft
             : defaultTargetPath;
         TargetItemCount = targetItemCount;
         TargetSuccessCount = targetSuccessCount;
-        IsSelected = isSelected ?? true;
-        HasExplicitSelection = isSelected.HasValue;
+        if (!Enum.IsDefined(selectionDecision))
+            throw new ArgumentOutOfRangeException(nameof(selectionDecision));
+        SelectionDecision = selectionDecision;
         ShareEnabled = shareEnabled;
     }
 
@@ -34,12 +42,12 @@ public sealed class BatchAccountDraft
     public string DefaultTargetPath { get; }
     public int TargetItemCount { get; }
     public int TargetSuccessCount { get; }
-    public bool IsSelected { get; }
-    internal bool HasExplicitSelection { get; }
+    public BatchAccountSelectionDecision SelectionDecision { get; }
+    public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
     public bool ShareEnabled { get; }
 
     public override string ToString() =>
-        $"BatchAccountDraft {{ AccountId = [REDACTED], PriorityOrder = {PriorityOrder}, DefaultTargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled} }}";
+        $"BatchAccountDraft {{ AccountId = [REDACTED], PriorityOrder = {PriorityOrder}, DefaultTargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, SelectionDecision = {SelectionDecision}, ShareEnabled = {ShareEnabled} }}";
 }
 
 public sealed class BatchDraft

@@ -63,6 +63,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         IWizardPrecheckWorkflow? precheckWorkflow = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
+        ValidateSelectionDecisions(accounts, nameof(accounts));
         this.pageSource = pageSource ?? throw new ArgumentNullException(nameof(pageSource));
         this.batchService = batchService ?? throw new ArgumentNullException(nameof(batchService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
@@ -296,6 +297,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public void ReloadAccounts(IReadOnlyList<WizardAccountOption> accounts)
     {
         ArgumentNullException.ThrowIfNull(accounts);
+        ValidateSelectionDecisions(accounts, nameof(accounts));
         if (accounts.Count > 1_000)
             throw new ArgumentOutOfRangeException(nameof(accounts), "账号列表一次最多可刷新 1,000 项。");
 
@@ -682,14 +684,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private WizardBatchDraft BuildDraft()
     {
         var mode = transferMode ?? throw new InvalidOperationException("尚未选择转存模式。");
-        var selected = Accounts.Where(x => x.IsSelected).ToArray();
-        var accountDrafts = selected.Select((account, index) => new WizardAccountDraft(
+        var accountDrafts = Accounts.Select((account, index) => new WizardAccountDraft(
             account.AccountId,
             index,
             account.DefaultTargetPath,
             account.TargetItemCount,
             account.TargetSuccessCount,
-            account.IsSelected,
+            account.IsSelected ? BatchAccountSelectionDecision.Selected : BatchAccountSelectionDecision.NotSelected,
             account.ShareEnabled)).ToArray();
         return new(
             batchJobId,
@@ -705,6 +706,16 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             UseBulkPrecheck ? "BatchPrecheck" : "Immediate",
             mode == Core.Domain.TransferMode.Replication && ExcelAccountHandling == ExcelAccountHandling.IgnoreColumn,
             readyResourceCount);
+    }
+
+    private static void ValidateSelectionDecisions(
+        IReadOnlyList<WizardAccountOption> accounts,
+        string parameterName)
+    {
+        if (accounts.Any(account =>
+                account.SelectionDecision != BatchAccountSelectionDecision.Selected &&
+                account.SelectionDecision != BatchAccountSelectionDecision.NotSelected))
+            throw new ArgumentException("每个候选账号都必须明确选择或不选择。", parameterName);
     }
 
     private string EvaluateValidation()

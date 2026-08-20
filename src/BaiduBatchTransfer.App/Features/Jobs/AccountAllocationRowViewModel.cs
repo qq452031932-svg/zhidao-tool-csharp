@@ -1,4 +1,5 @@
 using CommunityToolkit.Mvvm.ComponentModel;
+using BaiduBatchTransfer.Application.Jobs;
 
 namespace BaiduBatchTransfer.App.Features.Jobs;
 
@@ -12,6 +13,9 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
 
     public AccountAllocationRowViewModel(WizardAccountOption option, string initialTargetPath)
     {
+        if (option.SelectionDecision != BatchAccountSelectionDecision.Selected &&
+            option.SelectionDecision != BatchAccountSelectionDecision.NotSelected)
+            throw new ArgumentException("每个候选账号都必须明确选择或不选择。", nameof(option));
         AccountId = option.AccountId;
         DisplayName = option.DisplayName;
         StatusText = option.Status == "Active" ? "可用" : "不可用";

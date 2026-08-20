@@ -8,11 +8,102 @@ namespace BaiduBatchTransfer.Application.Tests.Jobs;
 public sealed class CreateBatchServiceTests
 {
     [Fact]
+    public async Task MissingSelectionRejectsBeforeOpeningUnitOfWork()
+    {
+        var factory = new RejectingUnitOfWorkFactory();
+        var probe = new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue);
+        var service = new CreateBatchService(factory, new BatchDraftValidator(),
+            new ReplicationPreflightEstimator(probe, "jobs.db"));
+        var draft = Draft(Guid.NewGuid(), TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(Guid.NewGuid(), 0, "/target", 1, 0, BatchAccountSelectionDecision.Unspecified)]);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        Assert.Equal(0, factory.BeginCount);
+        Assert.Null(probe.LastPath);
+    }
+
+    [Fact]
+    public async Task MissingExplicitSelectionDecisionRejectsBeforeDiskProbeAndWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        var probe = new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue);
+        var service = new CreateBatchService(database.UnitOfWorkFactory, new BatchDraftValidator(),
+            new ReplicationPreflightEstimator(probe, database.DatabasePath));
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Unspecified)]);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        Assert.Null(probe.LastPath);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task AllAccountsExplicitlyNotSelectedRejectsWithZeroWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.NotSelected)]);
+        var probe = new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue);
+        var service = new CreateBatchService(database.UnitOfWorkFactory, new BatchDraftValidator(),
+            new ReplicationPreflightEstimator(probe, database.DatabasePath));
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        Assert.Null(probe.LastPath);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task NonselectedAccountQuotaAndRowMappingCannotAuthorizeWork()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var selected = Guid.NewGuid();
+        var notSelected = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(selected, "a"), BatchTestData.Account(notSelected, "b")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1, mappedAccountId: notSelected)]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [
+                new BatchAccountDraft(selected, 0, "/a", 1, 0, BatchAccountSelectionDecision.Selected),
+                new BatchAccountDraft(notSelected, 1, "/b", 999, 999, BatchAccountSelectionDecision.NotSelected),
+            ]);
+        var probe = new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue);
+        var service = new CreateBatchService(database.UnitOfWorkFactory, new BatchDraftValidator(),
+            new ReplicationPreflightEstimator(probe, database.DatabasePath));
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        Assert.Null(probe.LastPath);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
     public void WorkloadPlannerUsesOnlySelectedAccountForTwoHundredThousandRows()
     {
         var accounts = Enumerable.Range(0, 10)
             .Select(index => new BatchWorkloadAccountInput(
-                Guid.NewGuid(), index, $"账号{index + 1}", index == 0, true, index == 0 ? 200_000 : 0))
+                Guid.NewGuid(), index, $"账号{index + 1}",
+                index == 0 ? BatchAccountSelectionDecision.Selected : BatchAccountSelectionDecision.NotSelected,
+                true, index == 0 ? 200_000 : 999_999))
             .ToArray();
 
         var plan = new BatchWorkloadPlanner().Plan(200_000, TransferMode.Distribution, accounts);
@@ -76,11 +167,13 @@ public sealed class CreateBatchServiceTests
         var planner = new BatchWorkloadPlanner();
 
         Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Distribution,
-            [new(id, 0, "A", false, true, 1)]));
+            [new(id, 0, "A", BatchAccountSelectionDecision.Unspecified, true, 1)]));
+        Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Distribution,
+            [new(id, 0, "A", BatchAccountSelectionDecision.NotSelected, true, 1)]));
         Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Replication,
-            [new(id, 0, "A", true, true, 1), new(id, 1, "B", true, true, 1)]));
+            [new(id, 0, "A", BatchAccountSelectionDecision.Selected, true, 1), new(id, 1, "B", BatchAccountSelectionDecision.Selected, true, 1)]));
         Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Replication,
-            [new(id, 0, "A", true, true, 1, IsAvailable: false)]));
+            [new(id, 0, "A", BatchAccountSelectionDecision.Selected, true, 1, IsAvailable: false)]));
     }
 
     [Fact]
@@ -97,7 +190,7 @@ public sealed class CreateBatchServiceTests
             builder.Build(source.Append("额外原始列").ToArray(), accounts));
         var collision = builder.Build(
             ["转存结果_解析后标题", "转存结果_原分享链接"],
-            [new(Guid.NewGuid(), 0, "同名", true, true, 1), new(Guid.NewGuid(), 1, "同名", true, true, 1)]);
+            [new(Guid.NewGuid(), 0, "同名", BatchAccountSelectionDecision.Selected, true, 1), new(Guid.NewGuid(), 1, "同名", BatchAccountSelectionDecision.Selected, true, 1)]);
         Assert.Equal(10, collision.ColumnCount);
         Assert.Equal("转存结果_解析后标题（系统2）", collision.ResolvedTitleHeader);
         Assert.Equal("转存结果_原分享链接（系统2）", collision.OriginalShareUrlHeader);
@@ -117,7 +210,7 @@ public sealed class CreateBatchServiceTests
             "to\u200Bken=obfuscated-value",
         };
         var accounts = sensitive.Select((name, index) =>
-            new BatchWorkloadAccountInput(Guid.NewGuid(), index, name, true, true, 1)).ToArray();
+            new BatchWorkloadAccountInput(Guid.NewGuid(), index, name, BatchAccountSelectionDecision.Selected, true, 1)).ToArray();
 
         var layout = new ResultColumnLayoutBuilder().Build([], accounts);
         var allHeaders = layout.Accounts.SelectMany(account => new[]
@@ -134,7 +227,7 @@ public sealed class CreateBatchServiceTests
     {
         var accounts = new[] { "同名", "同名（1）", "同名" }
             .Select((name, index) => new BatchWorkloadAccountInput(
-                Guid.NewGuid(), index, name, true, true, 1))
+                Guid.NewGuid(), index, name, BatchAccountSelectionDecision.Selected, true, 1))
             .ToArray();
 
         var labels = new ResultColumnLayoutBuilder().Build([], accounts).Accounts.Select(x => x.OutputLabel).ToArray();
@@ -179,14 +272,14 @@ public sealed class CreateBatchServiceTests
         var original = new BatchDraft(
             Guid.NewGuid(), sessionId, "Batch", TransferMode.Distribution, QuotaBasis.TaskCount,
             ShortagePolicy.ProportionalReduction,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0, isSelected: true, shareEnabled: true)],
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true)],
             "/", "None", DuplicatePolicy.Skip, "Immediate", 1, true);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(original);
         var changed = new BatchDraft(
             original.BatchJobId, sessionId, original.Name, original.TransferMode, original.QuotaBasis,
             original.ShortagePolicy,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0, isSelected: true, shareEnabled: false)],
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: false)],
             original.DefaultTargetPath, original.FolderCreationMode, original.DuplicatePolicy,
             original.ValidationMode, original.QueueOrder, original.IgnoreMappedAccountsForReplication,
             extractionCodeBehavior: ShareExtractionCodeBehavior.Fixed,
@@ -217,7 +310,7 @@ public sealed class CreateBatchServiceTests
             await seed.CommitAsync();
         }
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         await using (var update = await database.UnitOfWorkFactory.BeginAsync())
@@ -237,6 +330,7 @@ public sealed class CreateBatchServiceTests
 
     [Theory]
     [InlineData("selection")]
+    [InlineData("nonselected-candidate")]
     [InlineData("order")]
     [InlineData("allocation")]
     [InlineData("share-enabled")]
@@ -268,6 +362,7 @@ public sealed class CreateBatchServiceTests
         var fixedBaseline = mutation == "fixed-code";
         var original = TokenDraft(
             Guid.NewGuid(), sessionId, accounts,
+            selectSecond: mutation != "nonselected-candidate",
             extractionCodeBehavior: fixedBaseline ? ShareExtractionCodeBehavior.Fixed : ShareExtractionCodeBehavior.Random,
             fixedExtractionCode: fixedBaseline ? "a1b2" : null);
         var service = Service(database, long.MaxValue);
@@ -275,6 +370,8 @@ public sealed class CreateBatchServiceTests
         var changed = mutation switch
         {
             "selection" => TokenDraft(original.BatchJobId, sessionId, accounts, selectSecond: false),
+            "nonselected-candidate" => TokenDraft(
+                original.BatchJobId, sessionId, [accounts[0], Guid.NewGuid()], selectSecond: false),
             "order" => TokenDraft(original.BatchJobId, sessionId, accounts, reverseOrder: true),
             "allocation" => TokenDraft(original.BatchJobId, sessionId, accounts, allocateToSecond: true),
             "share-enabled" => TokenDraft(original.BatchJobId, sessionId, accounts, firstShareEnabled: false),
@@ -328,7 +425,7 @@ public sealed class CreateBatchServiceTests
             new BatchDraftValidator(),
             new ReplicationPreflightEstimator(probe, database.DatabasePath));
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
 
         await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
 
@@ -348,7 +445,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1) with { Status = "Draft" },
             [BatchTestData.ReadyRow(sessionId, 1)]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
 
         var preview = await service.PreviewAsync(draft);
@@ -370,7 +467,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1)]);
         var draft = Draft(sessionId, TransferMode.Replication, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 1)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 1, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         await using (var connection = await database.ConnectionFactory.OpenConnectionAsync())
@@ -405,7 +502,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1)]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         await using (var update = await database.UnitOfWorkFactory.BeginAsync())
@@ -434,7 +531,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [row]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         await using (var update = await database.UnitOfWorkFactory.BeginAsync())
@@ -461,7 +558,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1)]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         var changed = new BatchDraft(
@@ -490,7 +587,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1, note: sensitiveNote) with { ShareUrl = sensitiveUrl, ExtractionCode = sensitiveCode }]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
         await service.ConfirmAsync(draft, preview.ConfirmationToken);
@@ -520,7 +617,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1, mappedAccountId: zero)]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.SuccessTarget,
-            [new BatchAccountDraft(positive, 0, "/positive", 0, 1), new BatchAccountDraft(zero, 1, "/zero", 0, 0)]);
+            [new BatchAccountDraft(positive, 0, "/positive", 0, 1, BatchAccountSelectionDecision.Selected), new BatchAccountDraft(zero, 1, "/zero", 0, 0, BatchAccountSelectionDecision.NotSelected)]);
 
         await Assert.ThrowsAsync<BatchDraftValidationException>(() => Service(database, long.MaxValue).PreviewAsync(draft));
     }
@@ -543,7 +640,7 @@ public sealed class CreateBatchServiceTests
             QuotaBasis.TaskCount,
             accountIds.Select((id, index) => new BatchAccountDraft(
                 id, index, $"/account-{index}", index == 0 ? 0 : index * 17,
-                index == 0 ? 0 : index * 123)).ToArray());
+                index == 0 ? 0 : index * 123, BatchAccountSelectionDecision.Selected)).ToArray());
         var service = Service(database, long.MaxValue);
 
         var preview = await service.PreviewAsync(draft);
@@ -601,7 +698,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 1, 1),
             [BatchTestData.ReadyRow(sessionId, 1)]);
         var draft = Draft(sessionId, TransferMode.Replication, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 1)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 1, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, 0);
 
         var preview = await service.PreviewAsync(draft);
@@ -632,9 +729,9 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 6, 6), rows);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
             [
-                new BatchAccountDraft(accounts[0], 0, "/a", 3, 0),
-                new BatchAccountDraft(accounts[1], 1, "/b", 3, 0),
-                new BatchAccountDraft(accounts[2], 2, "/removed", 0, 0),
+                new BatchAccountDraft(accounts[0], 0, "/a", 3, 0, BatchAccountSelectionDecision.Selected),
+                new BatchAccountDraft(accounts[1], 1, "/b", 3, 0, BatchAccountSelectionDecision.Selected),
+                new BatchAccountDraft(accounts[2], 2, "/removed", 0, 0, BatchAccountSelectionDecision.NotSelected),
             ]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
@@ -672,9 +769,9 @@ public sealed class CreateBatchServiceTests
                 sessionId, row, mappedAccountId: row <= 2 ? accounts[0] : null)));
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.SuccessTarget,
             [
-                new BatchAccountDraft(accounts[0], 0, "/a", 0, 2),
-                new BatchAccountDraft(accounts[1], 1, "/b", 0, 1),
-                new BatchAccountDraft(accounts[2], 2, "/removed", 0, 0),
+                new BatchAccountDraft(accounts[0], 0, "/a", 0, 2, BatchAccountSelectionDecision.Selected),
+                new BatchAccountDraft(accounts[1], 1, "/b", 0, 1, BatchAccountSelectionDecision.Selected),
+                new BatchAccountDraft(accounts[2], 2, "/removed", 0, 0, BatchAccountSelectionDecision.NotSelected),
             ]);
         var service = Service(database, long.MaxValue);
         var preview = await service.PreviewAsync(draft);
@@ -704,7 +801,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 4, 4),
             Enumerable.Range(1, 4).Select(row => BatchTestData.ReadyRow(sessionId, row, mappedAccountId: accounts[0])));
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.SuccessTarget,
-            [new BatchAccountDraft(accounts[0], 0, "/a", 0, 2), new BatchAccountDraft(accounts[1], 1, "/b", 0, 2)]);
+            [new BatchAccountDraft(accounts[0], 0, "/a", 0, 2, BatchAccountSelectionDecision.Selected), new BatchAccountDraft(accounts[1], 1, "/b", 0, 2, BatchAccountSelectionDecision.Selected)]);
 
         var preview = await Service(database, long.MaxValue).PreviewAsync(draft);
 
@@ -736,7 +833,7 @@ public sealed class CreateBatchServiceTests
         await database.SeedAsync([BatchTestData.Account(account, "a")], session, [row]);
         var service = Service(database, long.MaxValue);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 0, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 0, 0, BatchAccountSelectionDecision.Selected)]);
 
         var error = await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
 
@@ -764,7 +861,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 2, 1, invalidRows: 1),
             [invalid, valid]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
 
         var preview = await service.PreviewAsync(draft);
@@ -792,7 +889,7 @@ public sealed class CreateBatchServiceTests
             BatchTestData.ReadySession(sessionId, 4, 2, duplicateRows: 1, excludedRows: 1),
             [ready, failedPrecheck, duplicate, excluded]);
         var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
-            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected)]);
         var service = Service(database, long.MaxValue);
 
         var preview = await service.PreviewAsync(draft);
@@ -820,7 +917,7 @@ public sealed class CreateBatchServiceTests
         int priority,
         long distributionCount,
         bool shareEnabled = true) =>
-        new(Guid.NewGuid(), priority, $"账号{priority + 1}", true, shareEnabled, distributionCount);
+        new(Guid.NewGuid(), priority, $"账号{priority + 1}", BatchAccountSelectionDecision.Selected, shareEnabled, distributionCount);
 
     private static BatchDraft TokenDraft(
         Guid batchJobId,
@@ -843,10 +940,11 @@ public sealed class CreateBatchServiceTests
             [
                 new BatchAccountDraft(
                     accounts[0], reverseOrder ? 1 : 0, "/a", allocateToSecond ? 0 : 1, 0,
-                    isSelected: true, shareEnabled: firstShareEnabled),
+                    BatchAccountSelectionDecision.Selected, shareEnabled: firstShareEnabled),
                 new BatchAccountDraft(
                     accounts[1], reverseOrder ? 0 : 1, "/b", allocateToSecond ? 1 : 0, 0,
-                    isSelected: selectSecond, shareEnabled: true),
+                    selectSecond ? BatchAccountSelectionDecision.Selected : BatchAccountSelectionDecision.NotSelected,
+                    shareEnabled: true),
             ],
             "/",
             "None",
@@ -877,6 +975,17 @@ public sealed class CreateBatchServiceTests
             var current = await jobs.GetOperationsPageAsync(batchJobId, new PageQuery(page, 1_000));
             result.AddRange(current.Items);
             if (result.Count >= current.TotalCount) return result;
+        }
+    }
+
+    private sealed class RejectingUnitOfWorkFactory : IUnitOfWorkFactory
+    {
+        public int BeginCount { get; private set; }
+
+        public Task<IUnitOfWork> BeginAsync(CancellationToken cancellationToken = default)
+        {
+            BeginCount++;
+            throw new InvalidOperationException("选择快照校验失败时不得打开工作单元。");
         }
     }
 }

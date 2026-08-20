@@ -395,9 +395,9 @@ public sealed class DraftWorkflowServicesTests
         }
         var service = CreateService(database);
         var draft = Draft(sessionId, [
-            new BatchAccountDraft(explicitAccount, 0, "/e", 1, 0),
-            new BatchAccountDraft(directoryAccount, 1, "/d", 1, 0),
-            new BatchAccountDraft(publicAccount, 2, "/p", 1, 0),
+            new BatchAccountDraft(explicitAccount, 0, "/e", 1, 0, BatchAccountSelectionDecision.Selected),
+            new BatchAccountDraft(directoryAccount, 1, "/d", 1, 0, BatchAccountSelectionDecision.Selected),
+            new BatchAccountDraft(publicAccount, 2, "/p", 1, 0, BatchAccountSelectionDecision.Selected),
         ]);
 
         var preview = await service.PreviewAsync(draft);
@@ -424,7 +424,7 @@ public sealed class DraftWorkflowServicesTests
         const string sensitiveName = "客户私密账号名";
         await database.SeedAsync([Jobs.BatchTestData.Account(account, "a")], Session(sessionId, 1, ready: 1),
             [Row(sessionId, 1, "one", requested: sensitiveName)]);
-        var draft = Draft(sessionId, [new BatchAccountDraft(account, 0, "/", 1, 0)]);
+        var draft = Draft(sessionId, [new BatchAccountDraft(account, 0, "/", 1, 0, BatchAccountSelectionDecision.Selected)]);
 
         var error = await Assert.ThrowsAsync<BatchDraftValidationException>(() => CreateService(database).PreviewAsync(draft));
 

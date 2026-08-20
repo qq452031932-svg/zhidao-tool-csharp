@@ -8,13 +8,15 @@ public sealed record BatchWorkloadAccountInput(
     Guid AccountId,
     int PriorityOrder,
     string DisplayName,
-    bool IsSelected,
+    BatchAccountSelectionDecision SelectionDecision,
     bool ShareEnabled,
     long DistributionCount,
     bool IsAvailable = true)
 {
+    public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
+
     public override string ToString() =>
-        $"BatchWorkloadAccountInput {{ Identity = [REDACTED], PriorityOrder = {PriorityOrder}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled}, DistributionCount = {DistributionCount}, IsAvailable = {IsAvailable}, DisplayName = [REDACTED] }}";
+        $"BatchWorkloadAccountInput {{ Identity = [REDACTED], PriorityOrder = {PriorityOrder}, SelectionDecision = {SelectionDecision}, ShareEnabled = {ShareEnabled}, DistributionCount = {DistributionCount}, IsAvailable = {IsAvailable}, DisplayName = [REDACTED] }}";
 }
 
 public sealed record BatchAccountWorkload(
@@ -60,16 +62,21 @@ public sealed class BatchWorkloadPlanner
     {
         ArgumentOutOfRangeException.ThrowIfNegative(resourceCount);
         ArgumentNullException.ThrowIfNull(accounts);
+        if (accounts.Count == 0 || accounts.Any(account => account.SelectionDecision == BatchAccountSelectionDecision.Unspecified))
+            throw new BatchDraftValidationException("每个候选账号都必须明确选择或不选择。");
+        if (accounts.Any(account => !Enum.IsDefined(account.SelectionDecision)))
+            throw new BatchDraftValidationException("账号选择决定无效。");
+        if (accounts.Any(account => account.AccountId == Guid.Empty) ||
+            accounts.Select(account => account.AccountId).Distinct().Count() != accounts.Count ||
+            accounts.Select(account => account.PriorityOrder).Distinct().Count() != accounts.Count)
+            throw new BatchDraftValidationException("候选账号和顺序必须唯一。");
         var selected = accounts.Where(account => account.IsSelected)
             .OrderBy(account => account.PriorityOrder)
             .ToArray();
         if (selected.Length == 0)
             throw new BatchDraftValidationException("请至少选择一个参与账号。");
-        if (selected.Any(account => account.AccountId == Guid.Empty || !account.IsAvailable))
+        if (selected.Any(account => !account.IsAvailable))
             throw new BatchDraftValidationException("所选账号已失效、停用或不可用。");
-        if (selected.Select(account => account.AccountId).Distinct().Count() != selected.Length ||
-            selected.Select(account => account.PriorityOrder).Distinct().Count() != selected.Length)
-            throw new BatchDraftValidationException("参与账号和顺序必须唯一。");
         if (selected.Any(account => account.DistributionCount < 0))
             throw new BatchDraftValidationException("账号工作量不能为负数。");
 

@@ -4,6 +4,7 @@ using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -170,7 +171,8 @@ public sealed class AppBootstrapTests : IDisposable
         false,
         null,
         null,
-        0, 0, 0, 0, 0, 0, 0, 0, 0);
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+        BatchAccountSelectionDecision.NotSelected);
 
     private sealed class ControlledWizardAccountProvider : IWizardAccountProvider
     {

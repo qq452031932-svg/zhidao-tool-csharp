@@ -57,6 +57,8 @@ public sealed partial class ResultColumnLayoutBuilder
     {
         ArgumentNullException.ThrowIfNull(sourceHeaders);
         ArgumentNullException.ThrowIfNull(accounts);
+        if (accounts.Count == 0 || accounts.Any(account => account.SelectionDecision == BatchAccountSelectionDecision.Unspecified))
+            throw new BatchDraftValidationException("每个候选账号都必须明确选择或不选择。");
         var selected = accounts.Where(account => account.IsSelected)
             .OrderBy(account => account.PriorityOrder)
             .ToArray();
