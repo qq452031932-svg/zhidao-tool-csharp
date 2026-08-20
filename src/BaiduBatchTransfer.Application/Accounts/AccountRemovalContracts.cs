@@ -78,7 +78,6 @@ public sealed record AccountListItem(
 public sealed record AccountRemovalPreparation(
     AccountRemovalPreparationStatus Status,
     Guid AccountId,
-    string? ProfilePath,
     bool DatabasePrepared,
     string SafeMessage)
 {
@@ -92,7 +91,8 @@ public sealed record AccountRemovalPreparation(
 /// </summary>
 /// <remarks>
 /// Implementations own the database transaction that disables an account and clears its credentials.
-/// External profile cleanup is deliberately outside that transaction and begins only after a committed preparation.
+/// External profile cleanup begins only after a committed preparation. Completion implementations hold a database
+/// writer lease across profile cleanup and the conditional tombstone commit.
 /// </remarks>
 public interface IAccountRemovalStore
 {
@@ -118,14 +118,16 @@ public interface IAccountRemovalStore
         CancellationToken token);
 
     /// <summary>
-    /// Finalizes the already-disabled, credential-free account as a tombstone.
+    /// Completes profile cleanup and tombstoning while holding the database writer lease.
     /// </summary>
     /// <remarks>
-    /// Implementations must be idempotent. They must refuse to finalize a row that has been re-enabled or still
-    /// contains account credentials.
+    /// Implementations must read the persisted profile path while holding the lease, invoke
+    /// <paramref name="externalCleanup"/> before tombstoning, and roll back if cleanup or finalization fails.
+    /// They must refuse the callback when the row has been re-enabled or contains credentials.
     /// </remarks>
-    Task FinalizeTombstoneAsync(
+    Task CompletePreparedRemovalAsync(
         Guid accountId,
         DateTimeOffset removedAt,
+        Func<Guid, string?, CancellationToken, Task> externalCleanup,
         CancellationToken token);
 }

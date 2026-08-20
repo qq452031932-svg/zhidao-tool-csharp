@@ -59,7 +59,7 @@ public sealed class AccountRemovalCoordinatorTests
     {
         var store = new FakeRemovalStore
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.NotFound, Guid.Empty, null, false)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.NotFound, Guid.Empty, false)
         };
         var profiles = new FakeProfileStore();
         var coordinator = CreateCoordinator(store, profiles);
@@ -81,7 +81,7 @@ public sealed class AccountRemovalCoordinatorTests
     {
         var store = new FakeRemovalStore
         {
-            PreparationResult = Preparation(preparationStatus, AccountB, null, false)
+            PreparationResult = Preparation(preparationStatus, AccountB, false)
         };
         var profiles = new FakeProfileStore();
         var coordinator = CreateCoordinator(store, profiles);
@@ -99,7 +99,7 @@ public sealed class AccountRemovalCoordinatorTests
         var store = new FakeRemovalStore
         {
             PrepareHandler = request => request.AccountId == AccountB && request.ConfirmationToken == "token-for-a"
-                ? Preparation(AccountRemovalPreparationStatus.StaleConfirmation, AccountB, null, false)
+                ? Preparation(AccountRemovalPreparationStatus.StaleConfirmation, AccountB, false)
                 : throw new InvalidOperationException("Unexpected request.")
         };
         var profiles = new FakeProfileStore();
@@ -117,7 +117,7 @@ public sealed class AccountRemovalCoordinatorTests
     {
         var store = new FakeRemovalStore
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.StaleConfirmation, AccountB, null, false)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.StaleConfirmation, AccountB, false)
         };
         var profiles = new FakeProfileStore();
         var coordinator = CreateCoordinator(store, profiles);
@@ -173,7 +173,7 @@ public sealed class AccountRemovalCoordinatorTests
         var cancellation = new OperationCanceledException($"{boundary}-cancelled");
         var store = new FakeRemovalStore(events)
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true),
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true),
             FinalizeFailure = boundary == CancellationBoundary.Finalize ? cancellation : null
         };
         var profiles = new FakeProfileStore(events)
@@ -196,7 +196,7 @@ public sealed class AccountRemovalCoordinatorTests
     {
         var store = new FakeRemovalStore
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true)
         };
         var profiles = new FakeProfileStore { DeleteFailure = new IOException("profile-locked") };
         var coordinator = CreateCoordinator(store, profiles);
@@ -218,7 +218,7 @@ public sealed class AccountRemovalCoordinatorTests
         var unitOfWorkFactory = new RejectingUnitOfWorkFactory();
         var store = new FakeRemovalStore(events)
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true)
         };
         var profiles = new FakeProfileStore(events);
         var paths = new FakePathPolicy(events);
@@ -241,7 +241,8 @@ public sealed class AccountRemovalCoordinatorTests
         var events = new List<string>();
         var store = new FakeRemovalStore(events)
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, null, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true),
+            CompletionProfilePath = null
         };
         var profiles = new FakeProfileStore(events);
         var coordinator = new AccountRemovalCoordinator(store, profiles, new FakePathPolicy(events));
@@ -259,7 +260,7 @@ public sealed class AccountRemovalCoordinatorTests
         var events = new List<string>();
         var store = new FakeRemovalStore(events)
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true)
         };
         var profiles = new FakeProfileStore(events);
         var paths = new FakePathPolicy(events) { ValidationFailure = new UnauthorizedAccessException("secret-path") };
@@ -274,13 +275,13 @@ public sealed class AccountRemovalCoordinatorTests
     }
 
     [Fact]
-    public async Task PreparedCleanupRetryClosesDeletesAndConditionallyFinalizesWithoutLegacyDisable()
+    public async Task ResumeCleanupClosesDeletesAndConditionallyFinalizesWithoutPreparationOrLegacyDisable()
     {
         var events = new List<string>();
         var unitOfWorkFactory = new RejectingUnitOfWorkFactory();
         var store = new FakeRemovalStore(events)
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, true)
         };
         var profiles = new FakeProfileStore(events) { DeleteFailure = new IOException("locked-profile") };
         var removalService = new RemoveAccountService(
@@ -291,7 +292,7 @@ public sealed class AccountRemovalCoordinatorTests
 
         var first = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
         profiles.DeleteFailure = null;
-        var retry = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+        var retry = await coordinator.ResumeCleanupAsync(AccountB, RemovedAt, CancellationToken.None);
 
         Assert.Equal(AccountExitStatus.CleanupPending, first.Status);
         Assert.Equal(AccountExitStatus.Removed, retry.Status);
@@ -299,7 +300,7 @@ public sealed class AccountRemovalCoordinatorTests
             new[]
             {
                 "prepare", "close", "validate-path", "delete",
-                "prepare", "close", "validate-path", "delete", "finalize"
+                "close", "validate-path", "delete", "finalize"
             },
             events);
         Assert.Equal(1, store.FinalizeCount);
@@ -311,7 +312,7 @@ public sealed class AccountRemovalCoordinatorTests
     {
         var store = new FakeRemovalStore
         {
-            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountA, ProfilePath, true)
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountA, true)
         };
         var profiles = new FakeProfileStore();
         var coordinator = CreateCoordinator(store, profiles);
@@ -328,7 +329,6 @@ public sealed class AccountRemovalCoordinatorTests
     {
         const string displayName = "Sensitive Display Name";
         const string token = "sensitive-confirmation-token";
-        const string path = @"C:\secret\profile";
         var request = new AccountExitRequest(AccountB, AccountExitHistoryMode.KeepHistory, token, RemovedAt);
         var preview = new AccountExitPreview(AccountExitStatus.Ready, displayName, 1, 2, 3, token, "safe");
         var item = new AccountListItem(AccountB, displayName, "Active", true);
@@ -336,7 +336,6 @@ public sealed class AccountRemovalCoordinatorTests
         var preparation = new AccountRemovalPreparation(
             AccountRemovalPreparationStatus.Prepared,
             AccountB,
-            path,
             true,
             "safe");
 
@@ -348,8 +347,11 @@ public sealed class AccountRemovalCoordinatorTests
             Assert.DoesNotContain(AccountB.ToString("D"), text, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain(displayName, text, StringComparison.Ordinal);
             Assert.DoesNotContain(token, text, StringComparison.Ordinal);
-            Assert.DoesNotContain(path, text, StringComparison.OrdinalIgnoreCase);
         }
+
+        Assert.DoesNotContain(
+            typeof(AccountRemovalPreparation).GetProperties(),
+            property => property.Name.Contains("ProfilePath", StringComparison.Ordinal));
     }
 
     private static AccountRemovalCoordinator CreateCoordinator(
@@ -363,9 +365,8 @@ public sealed class AccountRemovalCoordinatorTests
     private static AccountRemovalPreparation Preparation(
         AccountRemovalPreparationStatus status,
         Guid accountId,
-        string? profilePath,
         bool databasePrepared) =>
-        new(status, accountId, profilePath, databasePrepared, $"safe-{status}");
+        new(status, accountId, databasePrepared, $"safe-{status}");
 
     private static string[] ExpectedEvents(CancellationBoundary boundary) => boundary switch
     {
@@ -388,7 +389,8 @@ public sealed class AccountRemovalCoordinatorTests
         public AccountExitPreview PreviewResult { get; set; } =
             new(AccountExitStatus.NotFound, string.Empty, 0, 0, 0, string.Empty, "safe-not-found");
         public AccountRemovalPreparation PreparationResult { get; set; } =
-            Preparation(AccountRemovalPreparationStatus.NotFound, AccountB, null, false);
+            Preparation(AccountRemovalPreparationStatus.NotFound, AccountB, false);
+        public string? CompletionProfilePath { get; set; } = ProfilePath;
         public Func<AccountExitRequest, AccountRemovalPreparation>? PrepareHandler { get; set; }
         public Exception? PreparationFailure { get; set; }
         public Exception? FinalizeFailure { get; set; }
@@ -424,12 +426,17 @@ public sealed class AccountRemovalCoordinatorTests
             return Task.FromResult(PrepareHandler?.Invoke(request) ?? PreparationResult);
         }
 
-        public Task FinalizeTombstoneAsync(Guid accountId, DateTimeOffset removedAt, CancellationToken token)
+        public async Task CompletePreparedRemovalAsync(
+            Guid accountId,
+            DateTimeOffset removedAt,
+            Func<Guid, string?, CancellationToken, Task> externalCleanup,
+            CancellationToken token)
         {
+            await externalCleanup(accountId, CompletionProfilePath, token);
             events?.Add("finalize");
             FinalizeCount++;
             LastFinalizeRequest = (accountId, removedAt);
-            return FinalizeFailure is null ? Task.CompletedTask : Task.FromException(FinalizeFailure);
+            if (FinalizeFailure is not null) throw FinalizeFailure;
         }
     }
 

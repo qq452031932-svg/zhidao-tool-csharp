@@ -40,6 +40,9 @@ public sealed class AccountRemovalCoordinator
         CancellationToken cancellationToken) =>
         store.PreviewAsync(accountId, mode, cancellationToken);
 
+    /// <summary>
+    /// Applies a confirmed removal once. A request replayed after preparation remains stale and is not a cleanup retry.
+    /// </summary>
     public async Task<AccountExitPreview> ApplyAsync(
         AccountExitRequest request,
         CancellationToken cancellationToken)
@@ -67,14 +70,37 @@ public sealed class AccountRemovalCoordinator
         }
 
         var cleanup = await removalService.FinalizePreparedAsync(
-            preparation,
+            request.AccountId,
             request.RemovedAt,
             store,
             cancellationToken).ConfigureAwait(false);
-        return cleanup.Status == RemoveAccountStatus.Removed
+        return CleanupResult(cleanup);
+    }
+
+    /// <summary>
+    /// Resumes only the leased cleanup/tombstone phase for an already disabled, credential-free account.
+    /// </summary>
+    /// <remarks>This path does not validate a confirmation token or repeat history deletion.</remarks>
+    public async Task<AccountExitPreview> ResumeCleanupAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty)
+            return Result(AccountExitStatus.Failed, FailedMessage);
+
+        var cleanup = await removalService.FinalizePreparedAsync(
+            accountId,
+            removedAt,
+            store,
+            cancellationToken).ConfigureAwait(false);
+        return CleanupResult(cleanup);
+    }
+
+    private static AccountExitPreview CleanupResult(RemoveAccountResult cleanup) =>
+        cleanup.Status == RemoveAccountStatus.Removed
             ? Result(AccountExitStatus.Removed, RemovedMessage)
             : Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
-    }
 
     private static AccountExitStatus Map(AccountRemovalPreparationStatus status) => status switch
     {

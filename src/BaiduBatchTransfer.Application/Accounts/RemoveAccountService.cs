@@ -51,107 +51,84 @@ public sealed class RemoveAccountService
         if (account is null) return new(RemoveAccountStatus.NotFound, "The account was not found.");
         if (account.IsDeleted) return new(RemoveAccountStatus.AlreadyRemoved, "The account was already removed.");
 
-        var preparation = new AccountRemovalPreparation(
-            AccountRemovalPreparationStatus.Prepared,
-            account.Id,
-            account.WebView2ProfileDirectory,
-            true,
-            "The account is disabled and credential-free.");
-        return await FinalizePreparedCoreAsync(
-            preparation,
-            removedAt,
-            TombstoneAsync,
-            CleanupPolicy.Legacy,
-            cancellationToken).ConfigureAwait(false);
-    }
-
-    public Task<RemoveAccountResult> FinalizePreparedAsync(
-        AccountRemovalPreparation preparation,
-        DateTimeOffset removedAt,
-        IAccountRemovalStore removalStore,
-        CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(preparation);
-        ArgumentNullException.ThrowIfNull(removalStore);
-
-        return FinalizePreparedCoreAsync(
-            preparation,
-            removedAt,
-            removalStore.FinalizeTombstoneAsync,
-            CleanupPolicy.Prepared,
-            cancellationToken);
-    }
-
-    private async Task<RemoveAccountResult> FinalizePreparedCoreAsync(
-        AccountRemovalPreparation preparation,
-        DateTimeOffset removedAt,
-        Func<Guid, DateTimeOffset, CancellationToken, Task> finalizeTombstone,
-        CleanupPolicy policy,
-        CancellationToken cancellationToken)
-    {
-        if (preparation.Status != AccountRemovalPreparationStatus.Prepared ||
-            !preparation.DatabasePrepared ||
-            preparation.AccountId == Guid.Empty)
-        {
-            return new(
-                RemoveAccountStatus.CleanupPending,
-                "The prepared account snapshot could not be finalized safely.");
-        }
-
-        if (policy.ValidatePathBeforeClose && preparation.ProfilePath is not null)
-        {
-            try
-            {
-                profilePaths.EnsureSafeAccountPath(preparation.AccountId, preparation.ProfilePath);
-            }
-            catch (Exception exception) when (IsUnsafePathException(exception))
-            {
-                return new(
-                    RemoveAccountStatus.CleanupPending,
-                    "Profile cleanup is pending because its path is not safe.");
-            }
-        }
-
         try
         {
-            await profileStore.CloseAsync(preparation.AccountId, cancellationToken).ConfigureAwait(false);
-            if (preparation.ProfilePath is not null)
-            {
-                if (!policy.ValidatePathBeforeClose)
-                    profilePaths.EnsureSafeAccountPath(preparation.AccountId, preparation.ProfilePath);
-                await profileStore.DeleteAsync(
-                    preparation.AccountId,
-                    preparation.ProfilePath,
-                    cancellationToken).ConfigureAwait(false);
-            }
+            await CleanupProfileAsync(
+                account.Id,
+                account.WebView2ProfileDirectory,
+                validateBeforeClose: true,
+                cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception exception) when (policy.CaptureCancellation || exception is not OperationCanceledException)
+        catch (Exception exception) when (IsUnsafePathException(exception))
+        {
+            return new(RemoveAccountStatus.CleanupPending, "Profile cleanup is pending because its path is not safe.");
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return new(RemoveAccountStatus.CleanupPending, "The account is disabled and credential-free; profile cleanup is pending.");
         }
 
         try
         {
-            await finalizeTombstone(
-                preparation.AccountId,
-                removedAt,
-                cancellationToken).ConfigureAwait(false);
+            await TombstoneAsync(account.Id, removedAt, cancellationToken).ConfigureAwait(false);
             return new(RemoveAccountStatus.Removed, "The account was removed.");
         }
-        catch (Exception exception) when (policy.CaptureCancellation || exception is not OperationCanceledException)
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return new(RemoveAccountStatus.CleanupPending, "Profile cleanup completed; account finalization is pending.");
         }
     }
 
+    internal async Task<RemoveAccountResult> FinalizePreparedAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        IAccountRemovalStore removalStore,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(removalStore);
+        if (accountId == Guid.Empty)
+            return new(
+                RemoveAccountStatus.CleanupPending,
+                "The prepared account snapshot could not be finalized safely.");
+
+        try
+        {
+            await removalStore.CompletePreparedRemovalAsync(
+                accountId,
+                removedAt,
+                (leasedAccountId, leasedProfilePath, token) => CleanupProfileAsync(
+                    leasedAccountId,
+                    leasedProfilePath,
+                    validateBeforeClose: false,
+                    token),
+                cancellationToken).ConfigureAwait(false);
+            return new(RemoveAccountStatus.Removed, "The account was removed.");
+        }
+        catch (Exception)
+        {
+            return new(RemoveAccountStatus.CleanupPending, "The account is disabled and credential-free; profile cleanup is pending.");
+        }
+    }
+
+    private async Task CleanupProfileAsync(
+        Guid accountId,
+        string? profilePath,
+        bool validateBeforeClose,
+        CancellationToken cancellationToken)
+    {
+        if (validateBeforeClose && profilePath is not null)
+            profilePaths.EnsureSafeAccountPath(accountId, profilePath);
+
+        await profileStore.CloseAsync(accountId, cancellationToken).ConfigureAwait(false);
+        if (profilePath is null) return;
+
+        if (!validateBeforeClose)
+            profilePaths.EnsureSafeAccountPath(accountId, profilePath);
+        await profileStore.DeleteAsync(accountId, profilePath, cancellationToken).ConfigureAwait(false);
+    }
+
     private static bool IsUnsafePathException(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
-
-    private readonly record struct CleanupPolicy(bool ValidatePathBeforeClose, bool CaptureCancellation)
-    {
-        public static CleanupPolicy Legacy { get; } = new(true, false);
-        public static CleanupPolicy Prepared { get; } = new(false, true);
-    }
 
     private async Task<AccountRecord?> DisableAndClearCredentialsAsync(Guid accountId, CancellationToken cancellationToken)
     {

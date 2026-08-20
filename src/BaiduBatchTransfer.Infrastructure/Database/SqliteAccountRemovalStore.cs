@@ -146,46 +146,81 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
 
         await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
         await transaction.CommitAsync(token).ConfigureAwait(false);
-        return new AccountRemovalPreparation(AccountRemovalPreparationStatus.Prepared, request.AccountId,
-            account.ProfilePath, true, "账号已安全退出。");
+        return new AccountRemovalPreparation(
+            AccountRemovalPreparationStatus.Prepared,
+            request.AccountId,
+            true,
+            "账号已安全退出。");
     }
 
-    public async Task FinalizeTombstoneAsync(Guid accountId, DateTimeOffset removedAt, CancellationToken token)
+    public async Task CompletePreparedRemovalAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        Func<Guid, string?, CancellationToken, Task> externalCleanup,
+        CancellationToken token)
     {
+        ArgumentNullException.ThrowIfNull(externalCleanup);
+        if (accountId == Guid.Empty)
+            throw new InvalidOperationException("Account completion preconditions were not satisfied.");
+
         await using var connection = await factory.OpenConnectionAsync(token).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
-        await using var command = Command(connection, transaction, """
-            UPDATE Accounts
-            SET Status='Deleted',IsDeleted=1,DeletedAt=$removed,WebView2ProfileDirectory=NULL
-            WHERE Id=$id AND Status='Disabled' AND IsEnabled=0 AND EncryptedSession IS NULL
-              AND LastValidatedAt IS NULL AND IsDeleted=0;
-            """);
-        Add(command, "$removed", Time(removedAt));
-        Add(command, "$id", Id(accountId));
-        var changed = await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
-        if (changed != 1)
+        try
         {
-            var alreadyDeleted = await ScalarLongAsync(connection, transaction,
-                """
-                SELECT COUNT(*) FROM Accounts
-                WHERE Id=$id
-                  AND Status='Deleted'
-                  AND IsDeleted=1
-                  AND IsEnabled=0
-                  AND EncryptedSession IS NULL
-                  AND WebView2ProfileDirectory IS NULL
-                  AND LastValidatedAt IS NULL
-                  AND DeletedAt IS NOT NULL;
-                """,
-                token, ("$id", Id(accountId))).ConfigureAwait(false) == 1;
-            if (!alreadyDeleted)
+            var account = await ReadAccountAsync(connection, transaction, accountId, token).ConfigureAwait(false);
+            if (account is null)
+                throw new InvalidOperationException("Account completion preconditions were not satisfied.");
+
+            if (account.IsDeleted)
             {
-                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                throw new InvalidOperationException("Account tombstone preconditions were not satisfied.");
+                var safeTombstone = account.Status == "Deleted" &&
+                    !account.IsEnabled &&
+                    account.EncryptedSession is null &&
+                    account.ProfilePath is null &&
+                    account.LastValidatedAt is null &&
+                    await ScalarLongAsync(
+                        connection,
+                        transaction,
+                        "SELECT COUNT(*) FROM Accounts WHERE Id=$id AND DeletedAt IS NOT NULL;",
+                        token,
+                        ("$id", Id(accountId))).ConfigureAwait(false) == 1;
+                if (!safeTombstone)
+                    throw new InvalidOperationException("Account completion preconditions were not satisfied.");
+
+                await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
+                await transaction.CommitAsync(token).ConfigureAwait(false);
+                return;
             }
+
+            if (account.Status != "Disabled" ||
+                account.IsEnabled ||
+                account.EncryptedSession is not null ||
+                account.LastValidatedAt is not null)
+            {
+                throw new InvalidOperationException("Account completion preconditions were not satisfied.");
+            }
+
+            await externalCleanup(accountId, account.ProfilePath, token).ConfigureAwait(false);
+
+            await using var update = Command(connection, transaction, """
+                UPDATE Accounts
+                SET Status='Deleted',IsDeleted=1,DeletedAt=$removed,WebView2ProfileDirectory=NULL
+                WHERE Id=$id AND Status='Disabled' AND IsEnabled=0 AND EncryptedSession IS NULL
+                  AND LastValidatedAt IS NULL AND IsDeleted=0;
+                """);
+            Add(update, "$removed", Time(removedAt));
+            Add(update, "$id", Id(accountId));
+            if (await update.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException("Account completion preconditions were not satisfied.");
+
+            await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
+            await transaction.CommitAsync(token).ConfigureAwait(false);
         }
-        await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
-        await transaction.CommitAsync(token).ConfigureAwait(false);
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
     }
 
     private static AccountExitPreview Preview(AccountExitStatus status, string displayName, string message) =>
@@ -198,7 +233,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         string message)
     {
         await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-        return new AccountRemovalPreparation(status, accountId, null, false, message);
+        return new AccountRemovalPreparation(status, accountId, false, message);
     }
 
     private static bool TokenEquals(byte[] expected, string? suppliedToken)
@@ -293,7 +328,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         if (!await reader.ReadAsync(token).ConfigureAwait(false)) return null;
         return new AccountSnapshot(accountId, reader.GetString(1), reader.GetString(2), ReadBlob(reader, 3),
-            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetInt64(12) != 0, reader.GetInt64(15) != 0);
+            reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetInt64(12) != 0,
+            reader.IsDBNull(13) ? null : reader.GetString(13), reader.GetInt64(15) != 0);
     }
 
     private static async Task<Manifest> BuildManifestAsync(
@@ -867,7 +903,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     private static string Time(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
     private sealed record AccountSnapshot(Guid Id, string BaiduUserId, string DisplayName, byte[]? EncryptedSession,
-        string? ProfilePath, string Status, bool IsEnabled, bool IsDeleted);
+        string? ProfilePath, string Status, bool IsEnabled, string? LastValidatedAt, bool IsDeleted);
     private sealed record Manifest(byte[] Digest, int TerminalOperations, int TerminalBatches, int SharedBatches);
 
     private sealed class CanonicalWriter : IDisposable
