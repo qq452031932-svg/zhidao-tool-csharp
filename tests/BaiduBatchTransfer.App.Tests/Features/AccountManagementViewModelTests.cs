@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using System.Windows;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -21,7 +22,7 @@ public sealed class AccountManagementViewModelTests
                 [1] = new AccountPage(
                 [
                     new(activeId, "账号甲", "Active", true),
-                    new(pendingId, "账号乙", "Disabled", false),
+                    new(pendingId, "账号乙", "Disabled", false, true),
                     new(Guid.NewGuid(), "账号丙", "Invalid", true),
                 ], 1, 100, 203),
             },
@@ -95,7 +96,7 @@ public sealed class AccountManagementViewModelTests
     {
         var operations = SingleAccount(Guid.NewGuid(), "账号甲");
         operations.Preview = Ready("账号甲", "token-a");
-        var dialogs = new FakeDialogService { ConfirmResult = true };
+        var dialogs = new FakeConfirmation { ConfirmResult = true };
         var vm = Create(operations, dialogs);
         await vm.LoadFirstPageAsync();
         await vm.BeginAccountActionAsync(vm.Accounts[0]);
@@ -103,9 +104,20 @@ public sealed class AccountManagementViewModelTests
         vm.RemoveTerminalHistorySelected = true;
         await vm.ConfirmRemovalAsync();
 
-        Assert.False(vm.IsConfirmationVisible);
+        Assert.True(vm.IsConfirmationVisible);
+        Assert.True(vm.NeedsPreviewRefresh);
+        Assert.True(vm.ReloadPreviewCommand.CanExecute(null));
+        Assert.False(vm.ConfirmRemovalCommand.CanExecute(null));
         Assert.Empty(operations.ApplyRequests);
         Assert.Empty(dialogs.ConfirmMessages);
+
+        operations.Preview = Ready("账号甲", "token-b");
+        await vm.ReloadPreviewAsync();
+        await vm.ConfirmRemovalAsync();
+
+        var applied = Assert.Single(operations.ApplyRequests);
+        Assert.Equal(AccountExitHistoryMode.RemoveTerminalHistory, applied.HistoryMode);
+        Assert.Equal("token-b", applied.ConfirmationToken);
     }
 
     [Fact]
@@ -124,7 +136,7 @@ public sealed class AccountManagementViewModelTests
         };
         operations.PreviewHandler = (id, _) =>
             Task.FromResult(id == accountA ? Ready("账号甲", "token-a") : Ready("账号乙", "token-b"));
-        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        var vm = Create(operations, new FakeConfirmation { ConfirmResult = true });
         await vm.LoadFirstPageAsync();
 
         await vm.BeginAccountActionAsync(vm.Accounts[0]);
@@ -153,7 +165,7 @@ public sealed class AccountManagementViewModelTests
             },
             Preview = Ready("账号甲", "token-a"),
         };
-        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        var vm = Create(operations, new FakeConfirmation { ConfirmResult = true });
         await vm.LoadFirstPageAsync();
         await vm.BeginAccountActionAsync(vm.Accounts[0]);
         Assert.True(vm.CanConfirm);
@@ -172,7 +184,7 @@ public sealed class AccountManagementViewModelTests
         var operations = SingleAccount(Guid.NewGuid(), "账号甲");
         var previewGate = new TaskCompletionSource<AccountExitPreview>(TaskCreationOptions.RunContinuationsAsynchronously);
         operations.PreviewHandler = (_, _) => previewGate.Task;
-        var dialogs = new FakeDialogService { ConfirmResult = false };
+        var dialogs = new FakeConfirmation { ConfirmResult = false };
         var vm = Create(operations, dialogs);
         await vm.LoadFirstPageAsync();
 
@@ -219,7 +231,7 @@ public sealed class AccountManagementViewModelTests
         operations.Preview = Ready("账号乙", "original-token");
         operations.ApplyResult = new(
             AccountExitStatus.CleanupPending, "", 0, 0, 0, "leaked-token", "exception text");
-        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        var vm = Create(operations, new FakeConfirmation { ConfirmResult = true });
         AccountManagementRefreshEventArgs? refresh = null;
         vm.RefreshRequested += (_, args) => refresh = args;
         await vm.LoadFirstPageAsync();
@@ -241,7 +253,7 @@ public sealed class AccountManagementViewModelTests
     public async Task DisabledRowRetriesCleanupWithoutPreviewOrConfirmationToken()
     {
         var accountId = Guid.NewGuid();
-        var operations = SingleAccount(accountId, "账号乙", "Disabled", false);
+        var operations = SingleAccount(accountId, "账号乙", "Disabled", false, true);
         operations.ResumeResult = new(AccountExitStatus.Removed, "", 0, 0, 0, "secret", "exception");
         var vm = Create(operations);
         AccountManagementRefreshEventArgs? refresh = null;
@@ -260,7 +272,7 @@ public sealed class AccountManagementViewModelTests
     [Fact]
     public async Task FailedCleanupRetryStaysListedAndShowsSafeChineseStatus()
     {
-        var operations = SingleAccount(Guid.NewGuid(), "账号乙", "Disabled", false);
+        var operations = SingleAccount(Guid.NewGuid(), "账号乙", "Disabled", false, true);
         operations.ResumeResult = new(AccountExitStatus.Failed, "", 0, 0, 0, "token", "InvalidOperationException C:\\profile");
         var vm = Create(operations);
         var refreshCount = 0;
@@ -273,6 +285,170 @@ public sealed class AccountManagementViewModelTests
         Assert.Equal(0, refreshCount);
         Assert.Single(vm.Accounts);
         AssertSafeVisibleText(vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task GenericDisabledRowDoesNotExposeCleanupRetry()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "普通停用账号", "Disabled", false, false);
+        var vm = Create(operations);
+
+        await vm.LoadFirstPageAsync();
+
+        var row = Assert.Single(vm.Accounts);
+        Assert.Equal("不可操作", row.ActionText);
+        Assert.False(row.ActionCommand.CanExecute(null));
+        Assert.Empty(operations.ResumeRequests);
+    }
+
+    [Fact]
+    public async Task AttachedLifetimeCancelsDelayedPreviewAndDisablesCommands()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号甲");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = false;
+        operations.PreviewHandlerWithToken = async (_, _, token) =>
+        {
+            started.SetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                cancellationObserved = true;
+                throw;
+            }
+            return Ready("账号甲", "unused");
+        };
+        using var lifetime = new CancellationTokenSource();
+        var vm = Create(operations);
+        vm.AttachLifetime(lifetime.Token);
+        await vm.LoadFirstPageAsync();
+
+        var preview = vm.BeginAccountActionAsync(vm.Accounts[0]);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        lifetime.Cancel();
+        await preview;
+
+        Assert.True(cancellationObserved);
+        Assert.True(vm.IsLifetimeEnded);
+        Assert.False(vm.IsConfirmationVisible);
+        Assert.False(vm.LoadFirstPageCommand.CanExecute(null));
+        Assert.False(vm.ConfirmRemovalCommand.CanExecute(null));
+        Assert.False(vm.Accounts[0].ActionCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task LifetimeCancellationAfterCommittedPrepareStillRaisesCleanupPendingRefresh()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号甲");
+        using var lifetime = new CancellationTokenSource();
+        operations.ApplyHandlerWithToken = (_, _) =>
+        {
+            lifetime.Cancel();
+            return Task.FromResult(new AccountExitPreview(
+                AccountExitStatus.CleanupPending, "账号甲", 0, 0, 0, "", "raw exception"));
+        };
+        var confirmation = new FakeConfirmation { ConfirmResult = true };
+        var vm = Create(operations, confirmation);
+        vm.AttachLifetime(lifetime.Token);
+        AccountManagementRefreshEventArgs? refresh = null;
+        vm.RefreshRequested += (_, args) => refresh = args;
+        await vm.LoadFirstPageAsync();
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        await vm.ConfirmRemovalAsync();
+
+        Assert.True(vm.IsLifetimeEnded);
+        Assert.Equal(AccountExitStatus.CleanupPending, Assert.IsType<AccountManagementRefreshEventArgs>(refresh).Status);
+        Assert.Equal(AccountManagementUiText.CleanupPending, vm.StatusMessage);
+        Assert.False(vm.IsConfirmationVisible);
+    }
+
+    [Fact]
+    public void OwnedConfirmationAlwaysSuppliesAttachedWindowAndHonorsPreCancellation()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var prompt = new FakeOwnedPrompt { Result = true };
+                var confirmation = new OwnedAccountManagementConfirmation(prompt);
+                var owner = new Window();
+                confirmation.AttachOwner(owner);
+
+                Assert.True(confirmation.ConfirmAsync("确认退出账号", "确认内容", default).GetAwaiter().GetResult());
+                Assert.Same(owner, prompt.Owner);
+                Assert.Equal("确认退出账号", prompt.Title);
+
+                using var cancelled = new CancellationTokenSource();
+                cancelled.Cancel();
+                Assert.Throws<OperationCanceledException>(() =>
+                    confirmation.ConfirmAsync("确认退出账号", "不应显示", cancelled.Token).GetAwaiter().GetResult());
+                Assert.Equal(1, prompt.Calls);
+                owner.Close();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(5)), "STA owner test timed out.");
+        Assert.Null(failure);
+    }
+
+    [Fact]
+    public async Task ConfirmationUsesFreshPreviewDisplayNameAfterConcurrentRename()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "旧名称");
+        operations.Preview = Ready("新名称", "fresh-token");
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Contains("新名称", vm.ConfirmationMessage);
+        Assert.DoesNotContain("旧名称", vm.ConfirmationMessage);
+    }
+
+    [Fact]
+    public async Task ConfirmationSanitizesControlBidiUrlPathAndOversizedPreviewName()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "旧名称");
+        var adversarial = "新\u202E名称\r\nC:\\private\\profile https://evil.invalid/" + new string('长', 200);
+        operations.Preview = Ready(adversarial, "fresh-token");
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.DoesNotContain("\u202E", vm.ConfirmationMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", vm.ConfirmationMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", vm.ConfirmationMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("C:\\", vm.ConfirmationMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("https://", vm.ConfirmationMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.InRange(vm.ConfirmationMessage.Length, 1, 300);
+        AssertSafeVisibleText(vm.ConfirmationMessage);
+    }
+
+    [Theory]
+    [InlineData("cookie-secret")]
+    [InlineData("token-secret")]
+    [InlineData("profile-secret")]
+    [InlineData("exception-secret")]
+    [InlineData("账号 11111111-1111-1111-1111-111111111111")]
+    public async Task ConfirmationReplacesSensitiveMarkerLikePreviewNames(string previewName)
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "旧名称");
+        operations.Preview = Ready(previewName, "fresh-token");
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Contains("已选择的账号", vm.ConfirmationMessage);
+        AssertSafeVisibleText(vm.ConfirmationMessage);
     }
 
     [Fact]
@@ -371,29 +547,38 @@ public sealed class AccountManagementViewModelTests
         Assert.Contains("Content=\"退出账号，并清理该账号的终态任务历史\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Content=\"取消\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Content=\"确认退出\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"重新加载确认信息\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"{Binding ActionAutomationName}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"ConfirmRemovalButton\"", xaml, StringComparison.Ordinal);
         Assert.Contains("TabIndex=", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("云端", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("日期筛选", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("全部账号", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("cookie", xaml, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", xaml, StringComparison.OrdinalIgnoreCase);
+
+        var codeBehind = File.ReadAllText(Path.ChangeExtension(path, ".xaml.cs"));
+        Assert.Contains("viewModel.AttachLifetime(lifetime.Token)", codeBehind, StringComparison.Ordinal);
+        Assert.Contains("e.Cancel = true", codeBehind, StringComparison.Ordinal);
+        Assert.Contains("ConfirmRemovalButton.Focus()", codeBehind, StringComparison.Ordinal);
     }
 
     private static AccountManagementViewModel Create(
         FakeOperations operations,
-        FakeDialogService? dialogs = null) =>
-        new(operations, dialogs ?? new FakeDialogService(), new FixedTimeProvider(Now));
+        FakeConfirmation? confirmation = null) =>
+        new(operations, confirmation ?? new FakeConfirmation(), new FixedTimeProvider(Now));
 
     private static FakeOperations SingleAccount(
         Guid accountId,
         string displayName,
         string status = "Active",
-        bool isEnabled = true) =>
+        bool isEnabled = true,
+        bool isCleanupPending = false) =>
         new()
         {
             Pages =
             {
-                [1] = new AccountPage([new(accountId, displayName, status, isEnabled)], 1, 100, 1),
+                [1] = new AccountPage([new(accountId, displayName, status, isEnabled, isCleanupPending)], 1, 100, 1),
             },
             Preview = Ready(displayName, "preview-token"),
         };
@@ -437,6 +622,8 @@ public sealed class AccountManagementViewModelTests
         public AccountExitPreview ResumeResult { get; set; } =
             new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
         public Func<Guid, AccountExitHistoryMode, Task<AccountExitPreview>>? PreviewHandler { get; set; }
+        public Func<Guid, AccountExitHistoryMode, CancellationToken, Task<AccountExitPreview>>? PreviewHandlerWithToken { get; set; }
+        public Func<AccountExitRequest, CancellationToken, Task<AccountExitPreview>>? ApplyHandlerWithToken { get; set; }
 
         public Task<AccountPage> GetAccountsPageAsync(
             int pageNumber,
@@ -455,7 +642,9 @@ public sealed class AccountManagementViewModelTests
             CancellationToken cancellationToken)
         {
             PreviewRequests.Add((accountId, mode));
-            return PreviewHandler?.Invoke(accountId, mode) ?? Task.FromResult(Preview);
+            return PreviewHandlerWithToken?.Invoke(accountId, mode, cancellationToken)
+                ?? PreviewHandler?.Invoke(accountId, mode)
+                ?? Task.FromResult(Preview);
         }
 
         public Task<AccountExitPreview> ApplyAsync(
@@ -463,7 +652,7 @@ public sealed class AccountManagementViewModelTests
             CancellationToken cancellationToken)
         {
             ApplyRequests.Add(request);
-            return Task.FromResult(ApplyResult);
+            return ApplyHandlerWithToken?.Invoke(request, cancellationToken) ?? Task.FromResult(ApplyResult);
         }
 
         public Task<AccountExitPreview> ResumeCleanupAsync(
@@ -476,7 +665,7 @@ public sealed class AccountManagementViewModelTests
         }
     }
 
-    private sealed class FakeDialogService : IDialogService
+    private sealed class FakeConfirmation : IAccountManagementConfirmation
     {
         public bool ConfirmResult { get; set; }
         public List<string> ConfirmMessages { get; } = [];
@@ -487,15 +676,27 @@ public sealed class AccountManagementViewModelTests
             return Task.FromResult(ConfirmResult);
         }
 
-        public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
-            Task.CompletedTask;
-
-        public string? PickExcelFile() => null;
     }
 
     private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => value;
+    }
+
+    private sealed class FakeOwnedPrompt : IAccountManagementOwnedPrompt
+    {
+        public bool Result { get; set; }
+        public Window? Owner { get; private set; }
+        public string? Title { get; private set; }
+        public int Calls { get; private set; }
+
+        public bool Show(Window owner, string title, string message)
+        {
+            Owner = owner;
+            Title = title;
+            Calls++;
+            return Result;
+        }
     }
 
     private sealed class FakePresenter : IAccountManagementWindowPresenter

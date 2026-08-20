@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Text;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -49,6 +51,11 @@ public interface IAccountRemovalOperations
         CancellationToken cancellationToken);
 }
 
+public interface IAccountManagementConfirmation
+{
+    Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken);
+}
+
 public sealed class AccountRemovalOperations(AccountRemovalCoordinator coordinator) : IAccountRemovalOperations
 {
     private readonly AccountRemovalCoordinator coordinator =
@@ -80,36 +87,44 @@ public sealed class AccountRemovalOperations(AccountRemovalCoordinator coordinat
 
 public sealed class AccountManagementRowViewModel
 {
-    private readonly Func<AccountManagementRowViewModel, Task> action;
+    private readonly Func<AccountManagementRowViewModel, CancellationToken, Task> action;
+    private readonly Func<bool> canExecute;
 
     internal AccountManagementRowViewModel(
         AccountListItem account,
-        Func<AccountManagementRowViewModel, Task> action)
+        Func<AccountManagementRowViewModel, CancellationToken, Task> action,
+        Func<bool> canExecute)
     {
         ArgumentNullException.ThrowIfNull(account);
         this.action = action ?? throw new ArgumentNullException(nameof(action));
+        this.canExecute = canExecute ?? throw new ArgumentNullException(nameof(canExecute));
         AccountId = account.AccountId;
         DisplayName = string.IsNullOrWhiteSpace(account.DisplayName) ? "未命名账号" : account.DisplayName.Trim();
         LoginStatusText = MapLoginStatus(account.Status);
         EnabledStateText = account.IsEnabled ? "已启用" : "已禁用";
-        IsCleanupPending = !account.IsEnabled &&
-            string.Equals(account.Status, "Disabled", StringComparison.OrdinalIgnoreCase);
-        ActionText = IsCleanupPending ? "重试清理" : "退出账号";
-        ActionCommand = new AsyncRelayCommand(ExecuteActionAsync);
+        IsCleanupPending = account.IsCleanupPending;
+        CanAct = IsCleanupPending || account.IsEnabled;
+        ActionText = IsCleanupPending ? "重试清理" : CanAct ? "退出账号" : "不可操作";
+        ActionCommand = new AsyncRelayCommand(ExecuteActionAsync, () => CanAct && this.canExecute());
     }
 
     internal Guid AccountId { get; }
     internal bool IsCleanupPending { get; }
+    internal bool CanAct { get; }
     public string DisplayName { get; }
     public string LoginStatusText { get; }
     public string EnabledStateText { get; }
     public string ActionText { get; }
+    public string ActionAutomationName => $"{ActionText}：{DisplayName}";
     public IAsyncRelayCommand ActionCommand { get; }
 
     public override string ToString() =>
         $"账号行：{DisplayName}，{LoginStatusText}，{EnabledStateText}，操作为{ActionText}";
 
-    private Task ExecuteActionAsync() => action(this);
+    private Task ExecuteActionAsync(CancellationToken cancellationToken) =>
+        action(this, cancellationToken);
+
+    internal void NotifyCanExecuteChanged() => ActionCommand.NotifyCanExecuteChanged();
 
     private static string MapLoginStatus(string status) => status switch
     {
@@ -125,8 +140,11 @@ public sealed class AccountManagementViewModel : ObservableObject
     public const int PageSize = 100;
 
     private readonly IAccountRemovalOperations operations;
-    private readonly IDialogService dialogService;
+    private readonly IAccountManagementConfirmation confirmation;
     private readonly TimeProvider timeProvider;
+    private CancellationToken lifetimeToken;
+    private CancellationTokenRegistration lifetimeRegistration;
+    private bool lifetimeAttached;
     private AccountManagementRowViewModel? selectedAccount;
     private AccountExitPreview? preview;
     private Guid previewAccountId;
@@ -135,6 +153,8 @@ public sealed class AccountManagementViewModel : ObservableObject
     private long previewVersion;
     private bool isBusy;
     private bool isConfirmationVisible;
+    private bool needsPreviewRefresh;
+    private bool isLifetimeEnded;
     private int pageNumber = 1;
     private long totalCount;
     private int terminalOperationCount;
@@ -145,16 +165,17 @@ public sealed class AccountManagementViewModel : ObservableObject
 
     public AccountManagementViewModel(
         IAccountRemovalOperations operations,
-        IDialogService dialogService,
+        IAccountManagementConfirmation confirmation,
         TimeProvider? timeProvider = null)
     {
         this.operations = operations ?? throw new ArgumentNullException(nameof(operations));
-        this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
+        this.confirmation = confirmation ?? throw new ArgumentNullException(nameof(confirmation));
         this.timeProvider = timeProvider ?? TimeProvider.System;
-        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => !IsBusy);
-        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanLoadNextPage && !IsBusy);
-        LoadPreviousPageCommand = new AsyncRelayCommand(LoadPreviousPageAsync, () => PageNumber > 1 && !IsBusy);
-        CancelConfirmationCommand = new RelayCommand(CancelConfirmation, () => IsConfirmationVisible && !IsBusy);
+        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => !IsBusy && !IsLifetimeEnded);
+        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanLoadNextPage && !IsBusy && !IsLifetimeEnded);
+        LoadPreviousPageCommand = new AsyncRelayCommand(LoadPreviousPageAsync, () => PageNumber > 1 && !IsBusy && !IsLifetimeEnded);
+        ReloadPreviewCommand = new AsyncRelayCommand(ReloadPreviewAsync, () => NeedsPreviewRefresh && selectedAccount is not null && !IsBusy && !IsLifetimeEnded);
+        CancelConfirmationCommand = new RelayCommand(CancelConfirmation, () => IsConfirmationVisible && !IsBusy && !IsLifetimeEnded);
         ConfirmRemovalCommand = new AsyncRelayCommand(ConfirmRemovalAsync, () => CanConfirm);
     }
 
@@ -168,6 +189,7 @@ public sealed class AccountManagementViewModel : ObservableObject
     public IAsyncRelayCommand LoadFirstPageCommand { get; }
     public IAsyncRelayCommand LoadNextPageCommand { get; }
     public IAsyncRelayCommand LoadPreviousPageCommand { get; }
+    public IAsyncRelayCommand ReloadPreviewCommand { get; }
     public IRelayCommand CancelConfirmationCommand { get; }
     public IAsyncRelayCommand ConfirmRemovalCommand { get; }
 
@@ -183,6 +205,15 @@ public sealed class AccountManagementViewModel : ObservableObject
     }
 
     public bool IsLoading => IsBusy;
+    public bool IsLifetimeEnded
+    {
+        get => isLifetimeEnded;
+        private set
+        {
+            if (!SetProperty(ref isLifetimeEnded, value)) return;
+            NotifyCommands();
+        }
+    }
     public bool HasAccounts => Accounts.Count > 0;
     public bool IsEmpty => !IsBusy && Accounts.Count == 0;
     public AccountManagementRowViewModel? SelectedAccount
@@ -210,7 +241,16 @@ public sealed class AccountManagementViewModel : ObservableObject
         }
     }
 
-    public bool CanConfirm => IsConfirmationVisible && preview is not null && !IsBusy;
+    public bool NeedsPreviewRefresh
+    {
+        get => needsPreviewRefresh;
+        private set
+        {
+            if (!SetProperty(ref needsPreviewRefresh, value)) return;
+            NotifyCommands();
+        }
+    }
+    public bool CanConfirm => IsConfirmationVisible && preview is not null && !NeedsPreviewRefresh && !IsBusy && !IsLifetimeEnded;
     public int TerminalOperationCount
     {
         get => terminalOperationCount;
@@ -258,12 +298,39 @@ public sealed class AccountManagementViewModel : ObservableObject
     public Task LoadPreviousPageAsync(CancellationToken cancellationToken = default) =>
         PageNumber > 1 ? LoadPageAsync(PageNumber - 1, cancellationToken) : Task.CompletedTask;
 
+    public Task ReloadPreviewAsync(CancellationToken cancellationToken = default) =>
+        selectedAccount is { } row && NeedsPreviewRefresh
+            ? BeginAccountActionAsync(row, cancellationToken)
+            : Task.CompletedTask;
+
+    public void AttachLifetime(CancellationToken cancellationToken)
+    {
+        if (lifetimeAttached) throw new InvalidOperationException("账号管理窗口生命周期已绑定。");
+        lifetimeAttached = true;
+        lifetimeToken = cancellationToken;
+        lifetimeRegistration = cancellationToken.Register(EndLifetime);
+        if (cancellationToken.IsCancellationRequested) EndLifetime();
+    }
+
+    public void EndLifetime()
+    {
+        if (IsLifetimeEnded) return;
+        IsLifetimeEnded = true;
+        InvalidatePreview(clearSelection: true);
+    }
+
+    public void DetachLifetime()
+    {
+        EndLifetime();
+        lifetimeRegistration.Dispose();
+    }
+
     public async Task BeginAccountActionAsync(
         AccountManagementRowViewModel row,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(row);
-        if (IsBusy || !Accounts.Contains(row)) return;
+        if (IsBusy || IsLifetimeEnded || !row.CanAct || !Accounts.Contains(row)) return;
         InvalidatePreview(clearSelection: true);
         SelectedAccount = row;
         if (row.IsCleanupPending)
@@ -275,15 +342,19 @@ public sealed class AccountManagementViewModel : ObservableObject
         var version = previewVersion;
         var accountId = row.AccountId;
         var mode = historyMode;
+        IsConfirmationVisible = true;
+        NeedsPreviewRefresh = true;
         IsBusy = true;
         StatusMessage = AccountManagementUiText.LoadingPreview;
+        using var linked = CreateOperationTokenSource(cancellationToken);
         try
         {
-            var result = await operations.PreviewAsync(accountId, mode, cancellationToken).ConfigureAwait(true);
+            var result = await operations.PreviewAsync(accountId, mode, linked.Token).ConfigureAwait(true);
             if (version != previewVersion || selectedAccount != row || historyMode != mode) return;
             if (result.Status != AccountExitStatus.Ready)
             {
                 StatusMessage = MapPreviewStatus(result.Status);
+                IsConfirmationVisible = false;
                 return;
             }
 
@@ -293,13 +364,13 @@ public sealed class AccountManagementViewModel : ObservableObject
             TerminalOperationCount = Math.Max(0, result.TerminalOperationCount);
             TerminalBatchCount = Math.Max(0, result.TerminalBatchCount);
             SharedBatchCount = Math.Max(0, result.SharedBatchCount);
-            ConfirmationMessage = BuildConfirmationMessage(row.DisplayName, mode);
-            IsConfirmationVisible = true;
+            ConfirmationMessage = BuildConfirmationMessage(SanitizeDisplayName(result.DisplayName), mode);
+            NeedsPreviewRefresh = false;
             StatusMessage = AccountManagementUiText.Ready;
         }
         catch (OperationCanceledException)
         {
-            StatusMessage = AccountManagementUiText.Cancelled;
+            if (!IsLifetimeEnded) StatusMessage = AccountManagementUiText.Cancelled;
         }
         catch (Exception)
         {
@@ -320,10 +391,11 @@ public sealed class AccountManagementViewModel : ObservableObject
         var confirmationToken = preview.ConfirmationToken;
         var message = ConfirmationMessage;
         IsBusy = true;
+        using var linked = CreateOperationTokenSource(cancellationToken);
         try
         {
-            var confirmed = await dialogService
-                .ConfirmAsync(AccountManagementUiText.ConfirmTitle, message, cancellationToken)
+            var confirmed = await confirmation
+                .ConfirmAsync(AccountManagementUiText.ConfirmTitle, message, linked.Token)
                 .ConfigureAwait(true);
             if (!confirmed) return;
             if (version != previewVersion || selectedAccount.AccountId != accountId || historyMode != mode) return;
@@ -333,12 +405,12 @@ public sealed class AccountManagementViewModel : ObservableObject
                 mode,
                 confirmationToken,
                 timeProvider.GetUtcNow());
-            var result = await operations.ApplyAsync(request, cancellationToken).ConfigureAwait(true);
+            var result = await operations.ApplyAsync(request, linked.Token).ConfigureAwait(true);
             HandleApplyResult(result.Status);
         }
         catch (OperationCanceledException)
         {
-            StatusMessage = AccountManagementUiText.Cancelled;
+            if (!IsLifetimeEnded) StatusMessage = AccountManagementUiText.Cancelled;
         }
         catch (Exception)
         {
@@ -356,16 +428,18 @@ public sealed class AccountManagementViewModel : ObservableObject
         InvalidatePreview(clearSelection: true);
         IsBusy = true;
         StatusMessage = AccountManagementUiText.Loading;
+        using var linked = CreateOperationTokenSource(cancellationToken);
         try
         {
             var page = await operations
-                .GetAccountsPageAsync(requestedPage, PageSize, cancellationToken)
+                .GetAccountsPageAsync(requestedPage, PageSize, linked.Token)
                 .ConfigureAwait(true);
             Accounts.Clear();
             foreach (var account in page.Items.Take(PageSize))
                 Accounts.Add(new AccountManagementRowViewModel(
                     account,
-                    row => BeginAccountActionAsync(row)));
+                    (row, token) => BeginAccountActionAsync(row, token),
+                    () => !IsBusy && !IsLifetimeEnded));
             PageNumber = Math.Max(1, page.PageNumber);
             TotalCount = Math.Max(0, page.TotalCount);
             StatusMessage = Accounts.Count == 0 ? AccountManagementUiText.Empty : string.Empty;
@@ -377,7 +451,7 @@ public sealed class AccountManagementViewModel : ObservableObject
         }
         catch (OperationCanceledException)
         {
-            StatusMessage = AccountManagementUiText.Cancelled;
+            if (!IsLifetimeEnded) StatusMessage = AccountManagementUiText.Cancelled;
         }
         catch (Exception)
         {
@@ -396,10 +470,11 @@ public sealed class AccountManagementViewModel : ObservableObject
     {
         IsBusy = true;
         StatusMessage = AccountManagementUiText.RetryingCleanup;
+        using var linked = CreateOperationTokenSource(cancellationToken);
         try
         {
             var result = await operations
-                .ResumeCleanupAsync(row.AccountId, timeProvider.GetUtcNow(), cancellationToken)
+                .ResumeCleanupAsync(row.AccountId, timeProvider.GetUtcNow(), linked.Token)
                 .ConfigureAwait(true);
             if (result.Status == AccountExitStatus.Removed)
             {
@@ -418,7 +493,7 @@ public sealed class AccountManagementViewModel : ObservableObject
         }
         catch (OperationCanceledException)
         {
-            StatusMessage = AccountManagementUiText.Cancelled;
+            if (!IsLifetimeEnded) StatusMessage = AccountManagementUiText.Cancelled;
         }
         catch (Exception)
         {
@@ -451,7 +526,12 @@ public sealed class AccountManagementViewModel : ObservableObject
     {
         if (historyMode == value) return;
         historyMode = value;
-        InvalidatePreview(clearSelection: false);
+        InvalidatePreview(clearSelection: false, preservePanel: selectedAccount is not null);
+        if (selectedAccount is not null)
+        {
+            NeedsPreviewRefresh = true;
+            StatusMessage = "退出方式已更改，请重新加载确认信息。";
+        }
         OnPropertyChanged(nameof(KeepHistorySelected));
         OnPropertyChanged(nameof(RemoveTerminalHistorySelected));
     }
@@ -462,12 +542,13 @@ public sealed class AccountManagementViewModel : ObservableObject
         StatusMessage = AccountManagementUiText.Cancelled;
     }
 
-    private void InvalidatePreview(bool clearSelection)
+    private void InvalidatePreview(bool clearSelection, bool preservePanel = false)
     {
         previewVersion++;
         preview = null;
         previewAccountId = Guid.Empty;
-        IsConfirmationVisible = false;
+        IsConfirmationVisible = preservePanel;
+        NeedsPreviewRefresh = preservePanel;
         TerminalOperationCount = 0;
         TerminalBatchCount = 0;
         SharedBatchCount = 0;
@@ -508,5 +589,44 @@ public sealed class AccountManagementViewModel : ObservableObject
         LoadPreviousPageCommand.NotifyCanExecuteChanged();
         CancelConfirmationCommand.NotifyCanExecuteChanged();
         ConfirmRemovalCommand.NotifyCanExecuteChanged();
+        ReloadPreviewCommand.NotifyCanExecuteChanged();
+        foreach (var account in Accounts) account.NotifyCanExecuteChanged();
+    }
+
+    private CancellationTokenSource CreateOperationTokenSource(CancellationToken commandToken) =>
+        CancellationTokenSource.CreateLinkedTokenSource(commandToken, lifetimeToken);
+
+    private static string SanitizeDisplayName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "未命名账号";
+        var builder = new StringBuilder(Math.Min(value.Length, 80));
+        foreach (var rune in value.EnumerateRunes())
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is UnicodeCategory.Control or UnicodeCategory.Format or
+                UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                continue;
+            builder.Append(rune.ToString());
+            if (builder.Length >= 80) break;
+        }
+        var sanitized = builder.ToString().Trim();
+        if (sanitized.Length == 0 || LooksSensitiveOrPathLike(sanitized))
+            return "已选择的账号";
+        return sanitized;
+    }
+
+    private static bool LooksSensitiveOrPathLike(string value)
+    {
+        if (value.Contains('/') || value.Contains('\\') ||
+            value.Contains("cookie", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("token", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("profile", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("exception", StringComparison.OrdinalIgnoreCase))
+            return true;
+        for (var index = 0; index + 36 <= value.Length; index++)
+        {
+            if (Guid.TryParse(value.AsSpan(index, 36), out _)) return true;
+        }
+        return false;
     }
 }
