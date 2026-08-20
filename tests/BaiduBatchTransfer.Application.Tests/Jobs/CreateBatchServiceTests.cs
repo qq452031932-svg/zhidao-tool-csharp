@@ -2,12 +2,10 @@ using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
-using System.Diagnostics;
-using Xunit.Abstractions;
 
 namespace BaiduBatchTransfer.Application.Tests.Jobs;
 
-public sealed class CreateBatchServiceTests(ITestOutputHelper output)
+public sealed class CreateBatchServiceTests
 {
     [Fact]
     public async Task MissingSelectionRejectsBeforeOpeningUnitOfWork()
@@ -118,10 +116,46 @@ public sealed class CreateBatchServiceTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task PreviewCountsMixedMappingsLinearlyForTwoHundredThousandRowsAndOneThousandAccounts()
+    public async Task ValidatorCountsMixedMappingsInLinearPassesForTwoHundredThousandRowsAndOneThousandAccounts()
     {
         const int rowCount = 200_000;
         const int accountCount = 1_000;
+        var sessionId = Guid.NewGuid();
+        var accountIds = Enumerable.Range(0, accountCount).Select(_ => Guid.NewGuid()).ToArray();
+        var rows = Enumerable.Range(1, rowCount).Select(row => BatchTestData.ReadyRow(
+            sessionId,
+            row,
+            mappedAccountId: row <= rowCount / 2 ? accountIds[(row - 1) % accountCount] : null)).ToArray();
+        var accountRecords = accountIds.Select((id, index) => BatchTestData.Account(id, index.ToString())).ToArray();
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            accountIds.Select((id, index) => new BatchAccountDraft(
+                id, index, $"/账号{index}", rowCount / accountCount, 0,
+                BatchAccountSelectionDecision.Selected, shareEnabled: index % 2 == 0)).ToArray());
+        var observer = new BatchDraftValidationComplexityObserver();
+        var unit = new InMemoryValidationUnitOfWork(
+            BatchTestData.ReadySession(sessionId, rowCount, rowCount), rows, accountRecords);
+
+        var validated = await new BatchDraftValidator(observer).ValidateAsync(draft, unit);
+
+        Assert.Equal(rowCount, validated.OperationCount);
+        Assert.Equal(rowCount / 2, validated.ShareOperationCount);
+        Assert.Equal(rowCount, validated.Rows.Length);
+        Assert.All(validated.Accounts, account => Assert.Equal(rowCount / accountCount / 2, account.LockedItemCount));
+        Assert.Equal(rowCount, observer.ConstraintRowVisits);
+        Assert.Equal(accountCount * 2L, observer.ConstraintAccountLookups);
+        Assert.Equal(1, observer.RuleResolverPreparationCount);
+        Assert.Equal(accountCount, observer.RuleResolverAccountPreparations);
+        Assert.Equal(rowCount, observer.RuleResolutionCalls);
+        Assert.Equal(rowCount, unit.ImportsStore.ReadyRowReads);
+        Assert.Equal(accountCount, unit.AccountsStore.AccountReads);
+        Assert.Equal(accountCount, unit.AccountsStore.RulePageReads);
+    }
+
+    [Fact]
+    public async Task SqlitePreviewPreservesMixedMappedAndUnmappedDistributionSemantics()
+    {
+        const int rowCount = 200;
+        const int accountCount = 10;
         await using var database = await BatchTestDatabase.CreateAsync();
         var sessionId = Guid.NewGuid();
         var accountIds = Enumerable.Range(0, accountCount).Select(_ => Guid.NewGuid()).ToArray();
@@ -137,26 +171,13 @@ public sealed class CreateBatchServiceTests(ITestOutputHelper output)
             accountIds.Select((id, index) => new BatchAccountDraft(
                 id, index, $"/账号{index}", rowCount / accountCount, 0,
                 BatchAccountSelectionDecision.Selected, shareEnabled: index % 2 == 0)).ToArray());
-        var observer = new BatchDraftValidationComplexityObserver();
-        var service = new CreateBatchService(
-            database.UnitOfWorkFactory,
-            new BatchDraftValidator(observer),
-            new ReplicationPreflightEstimator(
-                new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue),
-                database.DatabasePath));
-        var stopwatch = Stopwatch.StartNew();
 
-        var preview = await service.PreviewAsync(draft);
+        var preview = await Service(database, long.MaxValue).PreviewAsync(draft);
 
-        stopwatch.Stop();
-        output.WriteLine($"200k/1000 preview diagnostic: {stopwatch.Elapsed}.");
         Assert.Equal(rowCount, preview.TransferCount);
         Assert.Equal(rowCount / 2, preview.ShareCount);
-        Assert.Equal(rowCount, observer.ConstraintRowVisits);
-        Assert.InRange(observer.ConstraintAccountLookups, accountCount, accountCount * 2L);
-        Assert.Equal(1, observer.RuleResolverPreparationCount);
-        Assert.Equal(accountCount, observer.RuleResolverAccountPreparations);
-        Assert.Equal(rowCount, observer.RuleResolutionCalls);
+        Assert.All(preview.Accounts, account => Assert.Equal(rowCount / accountCount / 2, account.LockedItemCount));
+        Assert.Equal(rowCount, preview.Accounts.Sum(account => account.PlannedTransferCount));
     }
 
     [Fact]
@@ -1069,6 +1090,100 @@ public sealed class CreateBatchServiceTests(ITestOutputHelper output)
             result.AddRange(current.Items);
             if (result.Count >= current.TotalCount) return result;
         }
+    }
+
+    private sealed class InMemoryValidationUnitOfWork(
+        ImportSessionRecord session,
+        IReadOnlyList<StagedImportRowRecord> rows,
+        IReadOnlyList<AccountRecord> accounts) : IUnitOfWork
+    {
+        public InMemoryImportRepository ImportsStore { get; } = new(session, rows);
+        public InMemoryAccountRepository AccountsStore { get; } = new(accounts);
+        public IImportRepository Imports => ImportsStore;
+        public IAccountRepository Accounts => AccountsStore;
+        public IJobRepository Jobs => throw new NotSupportedException();
+        public Task CommitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task RollbackAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class InMemoryImportRepository(
+        ImportSessionRecord session,
+        IReadOnlyList<StagedImportRowRecord> rows) : IImportRepository
+    {
+        private readonly StagedImportRowRecord[] readyRows = rows.ToArray();
+
+        public long ReadyRowReads { get; private set; }
+
+        public Task<ImportSessionRecord?> GetSessionAsync(Guid id, CancellationToken cancellationToken = default) =>
+            Task.FromResult<ImportSessionRecord?>(id == session.Id ? session : null);
+
+        public Task<IReadOnlyList<StagedImportRowRecord>> GetRowsAfterSourceRowAsync(
+            Guid sessionId,
+            string disposition,
+            int afterSourceRowNumber,
+            int pageSize,
+            CancellationToken cancellationToken = default)
+        {
+            if (sessionId != session.Id || disposition != "Ready" || afterSourceRowNumber >= readyRows.Length)
+                return Task.FromResult<IReadOnlyList<StagedImportRowRecord>>([]);
+            var start = Math.Max(0, afterSourceRowNumber);
+            var count = Math.Min(pageSize, readyRows.Length - start);
+            var page = readyRows.AsSpan(start, count).ToArray();
+            ReadyRowReads = checked(ReadyRowReads + page.Length);
+            return Task.FromResult<IReadOnlyList<StagedImportRowRecord>>(page);
+        }
+
+        public Task<IReadOnlyList<ImportColumnDefinitionRecord>> GetColumnDefinitionsAsync(
+            Guid sessionId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<ImportColumnDefinitionRecord>>([]);
+
+        public Task AddSessionAsync(ImportSessionRecord value, CancellationToken cancellationToken = default) => Unsupported();
+        public Task UpdateSessionAsync(ImportSessionRecord value, CancellationToken cancellationToken = default) => Unsupported();
+        public Task AddRowsAsync(IEnumerable<StagedImportRowRecord> values, CancellationToken cancellationToken = default) => Unsupported();
+        public Task UpdateRowsAsync(IEnumerable<StagedImportRowRecord> values, CancellationToken cancellationToken = default) => Unsupported();
+        public Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default) => Unsupported<StagedImportRowRecord?>();
+        public Task<StagedImportRowRecord?> GetFirstByNormalizedShareIdAsync(Guid sessionId, string normalizedShareId, CancellationToken cancellationToken = default) => Unsupported<StagedImportRowRecord?>();
+        public Task<int> GetLastSourceRowNumberAsync(Guid sessionId, CancellationToken cancellationToken = default) => Unsupported<int>();
+        public Task<IReadOnlyList<StagedImportRowRecord>> GetRowsByNormalizedShareIdAfterSourceRowAsync(Guid sessionId, string normalizedShareId, int afterSourceRowNumber, int pageSize, CancellationToken cancellationToken = default) => Unsupported<IReadOnlyList<StagedImportRowRecord>>();
+        public Task<Page<StagedImportRowRecord>> GetRowsPageAsync(StagedImportRowQuery query, CancellationToken cancellationToken = default) => Unsupported<Page<StagedImportRowRecord>>();
+        public Task<KeysetPage<StagedImportRowRecord>> GetRowsKeysetPageAsync(StagedImportKeysetQuery query, CancellationToken cancellationToken = default) => Unsupported<KeysetPage<StagedImportRowRecord>>();
+
+        private static Task Unsupported() => throw new NotSupportedException();
+        private static Task<T> Unsupported<T>() => throw new NotSupportedException();
+    }
+
+    private sealed class InMemoryAccountRepository(IReadOnlyList<AccountRecord> accounts) : IAccountRepository
+    {
+        private readonly IReadOnlyDictionary<Guid, AccountRecord> records = accounts.ToDictionary(account => account.Id);
+
+        public long AccountReads { get; private set; }
+        public long RulePageReads { get; private set; }
+
+        public Task<AccountRecord?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default)
+        {
+            AccountReads++;
+            return Task.FromResult(records.TryGetValue(id, out var account) ? account : null);
+        }
+
+        public Task<Page<AccountRuleRecord>> GetRulesPageAsync(
+            Guid accountId,
+            PageQuery query,
+            CancellationToken cancellationToken = default)
+        {
+            RulePageReads++;
+            return Task.FromResult(new Page<AccountRuleRecord>([], 0, query.PageNumber, query.PageSize));
+        }
+
+        public Task UpsertAsync(AccountRecord account, CancellationToken cancellationToken = default) => Unsupported();
+        public Task<AccountRecord?> GetByBaiduUserIdAsync(string baiduUserId, CancellationToken cancellationToken = default) => Unsupported<AccountRecord?>();
+        public Task SetEncryptedSessionAsync(Guid id, byte[]? encryptedSession, CancellationToken cancellationToken = default) => Unsupported();
+        public Task<Page<AccountRecord>> GetPageAsync(PageQuery query, CancellationToken cancellationToken = default) => Unsupported<Page<AccountRecord>>();
+        public Task UpsertRuleAsync(AccountRuleRecord rule, CancellationToken cancellationToken = default) => Unsupported();
+
+        private static Task Unsupported() => throw new NotSupportedException();
+        private static Task<T> Unsupported<T>() => throw new NotSupportedException();
     }
 
     private sealed class RejectingUnitOfWorkFactory : IUnitOfWorkFactory

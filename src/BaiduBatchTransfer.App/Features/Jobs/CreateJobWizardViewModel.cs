@@ -823,6 +823,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     {
         if (transferMode != Core.Domain.TransferMode.Distribution || quotaBasis != Core.Domain.QuotaBasis.SuccessTarget)
             return string.Empty;
+        if (!Accounts.Any(account => account.IsSelected && account.HasCurrentConfirmation))
+            return string.Empty;
         var warnings = new List<string>();
         if (ReserveCandidateCount == 0) warnings.Add("当前没有候补资源，任一资源失效都可能产生目标缺口。");
         foreach (var account in Accounts.Where(x => x.IsSelected && x.ReachableTargetSuccessCount < x.TargetSuccessCount))
@@ -887,6 +889,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         draftGeneration++;
         isFinalConfirmationChecked = false;
         OnPropertyChanged(nameof(IsFinalConfirmationChecked));
+        OnPropertyChanged(nameof(WarningMessage));
         ValidationMessage = EvaluateValidation();
         RaiseDerived();
     }

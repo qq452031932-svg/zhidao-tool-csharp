@@ -5,6 +5,7 @@ namespace BaiduBatchTransfer.App.Features.Jobs;
 
 public sealed class AccountAllocationRowViewModel : ObservableObject
 {
+    // Baseline identity/capacity and mutable draft inputs survive preview invalidation.
     private bool isSelected;
     private bool shareEnabled;
     private int targetItemCount;
@@ -21,20 +22,8 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         StatusText = option.Status == "Active" ? "可用" : "不可用";
         CapacityTotal = option.CapacityTotal;
         CapacityUsed = option.CapacityUsed;
-        LockedItemCount = option.LockedItemCount;
-        ExclusiveCandidateCount = option.ExclusiveCandidateCount;
-        PublicCandidateCount = option.PublicCandidateCount;
-        UnusedExclusiveCandidateCount = option.UnusedExclusiveCandidateCount;
-        OriginalTargetSuccessCount = option.OriginalTargetSuccessCount;
-        EffectiveTargetSuccessCount = option.EffectiveTargetSuccessCount;
-        ReachableTargetSuccessCount = option.ReachableTargetSuccessCount;
-        FulfilledCount = option.FulfilledCount;
-        ReservedSlotCount = option.ReservedSlotCount;
-        targetSuccessCount = option.OriginalTargetSuccessCount;
         isSelected = option.IsSelected;
         shareEnabled = option.ShareEnabled;
-        PlannedTransferCount = option.PlannedTransferCount;
-        PlannedShareCount = option.PlannedShareCount;
         defaultTargetPath = initialTargetPath;
     }
 
@@ -44,6 +33,9 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     public long? CapacityTotal { get; }
     public long? CapacityUsed { get; }
     public long? RemainingCapacity => CapacityTotal is null || CapacityUsed is null ? null : Math.Max(0, CapacityTotal.Value - CapacityUsed.Value);
+
+    // Server preview outputs are meaningful only while HasCurrentConfirmation is true.
+    public bool HasCurrentConfirmation { get; private set; }
     public int LockedItemCount { get; private set; }
     public int ExclusiveCandidateCount { get; private set; }
     public int PublicCandidateCount { get; private set; }
@@ -53,7 +45,9 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     public int ReachableTargetSuccessCount { get; private set; }
     public int FulfilledCount { get; private set; }
     public int ReservedSlotCount { get; private set; }
-    public int ShortfallCount => Math.Max(0, TargetSuccessCount - ReachableTargetSuccessCount);
+    public int ShortfallCount => HasCurrentConfirmation
+        ? Math.Max(0, TargetSuccessCount - ReachableTargetSuccessCount)
+        : 0;
     public double AllocationPercentage { get; internal set; }
     public long PlannedTransferCount { get; private set; }
     public long PlannedShareCount { get; private set; }
@@ -81,10 +75,10 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
             throw new ArgumentException("账号确认结果与当前账号不匹配。", nameof(value));
         if (value.ShareEnabled != ShareEnabled)
             throw new ArgumentException("账号分享设置与当前草稿不匹配。", nameof(value));
-        ValidateCount(value.PlannedTransferCount, nameof(value.PlannedTransferCount));
-        ValidateCount(value.PlannedShareCount, nameof(value.PlannedShareCount));
-        ValidateCount(value.ConfirmedTransferCount, nameof(value.ConfirmedTransferCount));
-        ValidateCount(value.ConfirmedShareCount, nameof(value.ConfirmedShareCount));
+        var plannedTransfer = RequireCount(value.PlannedTransferCount, nameof(value.PlannedTransferCount));
+        var plannedShare = RequireCount(value.PlannedShareCount, nameof(value.PlannedShareCount));
+        var confirmedTransfer = RequireCount(value.ConfirmedTransferCount, nameof(value.ConfirmedTransferCount));
+        var confirmedShare = RequireCount(value.ConfirmedShareCount, nameof(value.ConfirmedShareCount));
         OriginalTargetSuccessCount = value.OriginalTarget;
         EffectiveTargetSuccessCount = value.EffectiveTarget;
         ReachableTargetSuccessCount = value.ReachableTarget;
@@ -94,27 +88,37 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         ExclusiveCandidateCount = value.Exclusive;
         PublicCandidateCount = value.Public;
         UnusedExclusiveCandidateCount = value.Unused;
-        if (value.PlannedTransferCount is { } plannedTransfer) PlannedTransferCount = plannedTransfer;
-        if (value.PlannedShareCount is { } plannedShare) PlannedShareCount = plannedShare;
-        if (value.ConfirmedTransferCount is { } confirmedTransfer) ConfirmedTransferCount = confirmedTransfer;
-        if (value.ConfirmedShareCount is { } confirmedShare) ConfirmedShareCount = confirmedShare;
+        PlannedTransferCount = plannedTransfer;
+        PlannedShareCount = plannedShare;
+        ConfirmedTransferCount = confirmedTransfer;
+        ConfirmedShareCount = confirmedShare;
+        HasCurrentConfirmation = true;
         OnPropertyChanged(string.Empty);
     }
 
     public void ClearConfirmation()
     {
+        HasCurrentConfirmation = false;
+        OriginalTargetSuccessCount = 0;
+        EffectiveTargetSuccessCount = 0;
+        ReachableTargetSuccessCount = 0;
+        FulfilledCount = 0;
+        ReservedSlotCount = 0;
+        LockedItemCount = 0;
+        ExclusiveCandidateCount = 0;
+        PublicCandidateCount = 0;
+        UnusedExclusiveCandidateCount = 0;
         PlannedTransferCount = 0;
         PlannedShareCount = 0;
         ConfirmedTransferCount = 0;
         ConfirmedShareCount = 0;
-        OnPropertyChanged(nameof(PlannedTransferCount));
-        OnPropertyChanged(nameof(PlannedShareCount));
-        OnPropertyChanged(nameof(ConfirmedTransferCount));
-        OnPropertyChanged(nameof(ConfirmedShareCount));
+        OnPropertyChanged(string.Empty);
     }
 
-    private static void ValidateCount(long? value, string parameterName)
+    private static long RequireCount(long? value, string parameterName)
     {
+        if (value is null) throw new ArgumentException("账号确认结果缺少工作量。", parameterName);
         if (value < 0) throw new ArgumentOutOfRangeException(parameterName);
+        return value.Value;
     }
 }

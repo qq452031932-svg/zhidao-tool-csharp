@@ -67,9 +67,13 @@ public sealed class CreateJobWizardViewModelTests
             PlannedShareCount = 0,
         };
         var row = new AccountAllocationRowViewModel(option, "/目标");
+        Assert.False(row.HasCurrentConfirmation);
+        Assert.Equal(0, row.PlannedTransferCount);
+        Assert.Equal(0, row.PlannedShareCount);
 
         row.ApplyConfirmation(new WizardAccountConfirmation(
             option.AccountId, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+            PlannedTransferCount: 200_000, PlannedShareCount: 0,
             ConfirmedTransferCount: 200_000, ConfirmedShareCount: 0, ShareEnabled: false));
 
         Assert.True(row.IsSelected);
@@ -78,6 +82,21 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Equal(0, row.PlannedShareCount);
         Assert.Equal(200_000, row.ConfirmedTransferCount);
         Assert.Equal(0, row.ConfirmedShareCount);
+    }
+
+    [Fact]
+    public void AccountRowRejectsIncompletePreviewWithoutApplyingPartialDerivedState()
+    {
+        var row = new AccountAllocationRowViewModel(Account("A"), "/目标");
+
+        Assert.Throws<ArgumentException>(() => row.ApplyConfirmation(new WizardAccountConfirmation(
+            row.AccountId, 10, 8, 7, 3, 2, 1, 4, 5, 6)));
+
+        Assert.False(row.HasCurrentConfirmation);
+        Assert.Equal(0, row.OriginalTargetSuccessCount);
+        Assert.Equal(0, row.EffectiveTargetSuccessCount);
+        Assert.Equal(0, row.ReachableTargetSuccessCount);
+        Assert.Equal(0, row.LockedItemCount);
     }
 
     [Fact]
@@ -192,19 +211,32 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
-    public void TaskQuotaMustEqualReadyResourcesAndCoverLockedAssignments()
+    public async Task CurrentPreviewLockedAssignmentsBlockContinuationUntilTheDraftChanges()
     {
-        var vm = Create(
-            [Account("A", locked: 30), Account("B")],
-            ready: 100);
+        var accounts = Accounts(2);
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                100, 100, "server-token", true,
+                [new WizardAccountConfirmation(
+                    accounts[0].AccountId, 0, 0, 0, 0, 0, 30, 0, 100, 0,
+                    20, 20, 20, 20),
+                 new WizardAccountConfirmation(
+                    accounts[1].AccountId, 0, 0, 0, 0, 0, 0, 0, 100, 0,
+                    80, 80, 80, 80)],
+                TransferCount: 100, ShareCount: 100, TotalActionCount: 200, ResultColumnCount: 8),
+        };
+        var vm = Create(accounts, ready: 100, gateway: gateway);
         vm.SelectMode(TransferMode.Distribution);
         vm.QuotaBasis = QuotaBasis.TaskCount;
         vm.Accounts[0].IsSelected = vm.Accounts[1].IsSelected = true;
         vm.Accounts[0].TargetItemCount = 20;
         vm.Accounts[1].TargetItemCount = 80;
 
+        await vm.PrepareConfirmationAsync();
+
         Assert.False(vm.CanContinue);
-        Assert.Contains("锁定任务 30 条", vm.ValidationMessage);
+        Assert.Equal(30, vm.Accounts[0].LockedItemCount);
 
         vm.Accounts[0].TargetItemCount = 30;
         vm.Accounts[1].TargetItemCount = 60;
@@ -230,17 +262,29 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
-    public void SuccessTargetsExposeReserveAndPerAccountReachabilityWarnings()
+    public async Task SuccessTargetPreviewExposesReserveAndPerAccountReachabilityWarnings()
     {
-        var vm = Create(
-            [Account("A", exclusive: 8, original: 10, effective: 8, reachable: 8, fulfilled: 2, reserved: 1, unused: 3),
-             Account("B", publicCandidates: 12, original: 10, effective: 10, reachable: 10)],
-            ready: 20);
+        var accounts = Accounts(2);
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                20, 20, "server-token", true,
+                [new WizardAccountConfirmation(
+                    accounts[0].AccountId, 10, 8, 8, 2, 1, 0, 8, 12, 3,
+                    10, 10, 10, 10),
+                 new WizardAccountConfirmation(
+                    accounts[1].AccountId, 10, 10, 10, 0, 0, 0, 0, 12, 0,
+                    10, 10, 10, 10)],
+                TransferCount: 20, ShareCount: 20, TotalActionCount: 40, ResultColumnCount: 8),
+        };
+        var vm = Create(accounts, ready: 20, gateway: gateway);
         vm.SelectMode(TransferMode.Distribution);
         vm.QuotaBasis = QuotaBasis.SuccessTarget;
         foreach (var account in vm.Accounts) account.IsSelected = true;
         vm.Accounts[0].TargetSuccessCount = 10;
         vm.Accounts[1].TargetSuccessCount = 10;
+
+        await vm.PrepareConfirmationAsync();
 
         Assert.Equal(0, vm.ReserveCandidateCount);
         Assert.Contains("没有候补资源", vm.WarningMessage);
@@ -375,6 +419,77 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Equal(2, vm.Accounts[0].ReservedSlotCount);
         Assert.Equal(9, vm.Accounts[0].ConfirmedTransferCount);
         Assert.Equal(7, vm.Accounts[0].ConfirmedShareCount);
+        Assert.True(vm.Accounts[0].HasCurrentConfirmation);
+    }
+
+    [Theory]
+    [InlineData("quota")]
+    [InlineData("shortage")]
+    [InlineData("mapping")]
+    [InlineData("share")]
+    [InlineData("selection")]
+    public async Task EveryDraftEditClearsEveryPreviewDerivedAccountValue(string mutation)
+    {
+        var account = Account("A", locked: 99, exclusive: 99, publicCandidates: 99,
+            original: 99, effective: 99, reachable: 99, fulfilled: 99, reserved: 99, unused: 99);
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                10, 10, "server-token", true,
+                [new WizardAccountConfirmation(
+                    account.AccountId, 10, 8, 7, 3, 2, 1, 4, 5, 6,
+                    PlannedTransferCount: 10, PlannedShareCount: 10,
+                    ConfirmedTransferCount: 10, ConfirmedShareCount: 10)],
+                TransferCount: 10, ShareCount: 10, TotalActionCount: 20, ResultColumnCount: 5),
+        };
+        var vm = Create([account], ready: 10, hasExcelAccounts: true, gateway: gateway);
+        vm.QuotaBasis = QuotaBasis.SuccessTarget;
+        vm.ExcelAccountHandling = ExcelAccountHandling.KeepMappings;
+
+        await vm.PrepareConfirmationAsync();
+
+        var row = Assert.Single(vm.Accounts);
+        Assert.True(row.HasCurrentConfirmation);
+        Assert.Equal(10, row.OriginalTargetSuccessCount);
+        Assert.Equal(8, row.EffectiveTargetSuccessCount);
+        Assert.Equal(7, row.ReachableTargetSuccessCount);
+        Assert.Equal(3, row.FulfilledCount);
+        Assert.Equal(2, row.ReservedSlotCount);
+        Assert.Equal(1, row.LockedItemCount);
+        Assert.Equal(4, row.ExclusiveCandidateCount);
+        Assert.Equal(5, row.PublicCandidateCount);
+        Assert.Equal(6, row.UnusedExclusiveCandidateCount);
+        Assert.Equal(3, row.ShortfallCount);
+        Assert.NotEmpty(vm.WarningMessage);
+
+        switch (mutation)
+        {
+            case "quota": row.TargetSuccessCount = 9; break;
+            case "shortage": vm.ShortagePolicy = ShortagePolicy.AccountPriority; break;
+            case "mapping": vm.ExcelAccountHandling = ExcelAccountHandling.OverrideAll; break;
+            case "share": row.ShareEnabled = false; break;
+            case "selection": row.IsSelected = false; break;
+            default: throw new InvalidOperationException(mutation);
+        }
+
+        AssertNoPreviewDerivedState(vm, row);
+    }
+
+    [Fact]
+    public async Task FailedRepreviewClearsDerivedStateAndNotifiesBindableWarning()
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(1), ready: 10, gateway: gateway);
+        await vm.PrepareConfirmationAsync();
+        Assert.NotEmpty(vm.WarningMessage);
+        var notifications = new List<string?>();
+        vm.PropertyChanged += (_, args) => notifications.Add(args.PropertyName);
+        gateway.ThrowDiskShortage = true;
+
+        await vm.PrepareConfirmationAsync();
+
+        AssertNoPreviewDerivedState(vm, Assert.Single(vm.Accounts));
+        Assert.Contains(nameof(CreateJobWizardViewModel.WarningMessage), notifications);
     }
 
     [Fact]
@@ -733,6 +848,29 @@ public sealed class CreateJobWizardViewModelTests
             PlannedTransferCount: 2, PlannedShareCount: 2,
             ConfirmedTransferCount: 2, ConfirmedShareCount: 2);
 
+    private static void AssertNoPreviewDerivedState(
+        CreateJobWizardViewModel vm,
+        AccountAllocationRowViewModel row)
+    {
+        Assert.False(row.HasCurrentConfirmation);
+        Assert.Equal(0, row.OriginalTargetSuccessCount);
+        Assert.Equal(0, row.EffectiveTargetSuccessCount);
+        Assert.Equal(0, row.ReachableTargetSuccessCount);
+        Assert.Equal(0, row.FulfilledCount);
+        Assert.Equal(0, row.ReservedSlotCount);
+        Assert.Equal(0, row.LockedItemCount);
+        Assert.Equal(0, row.ExclusiveCandidateCount);
+        Assert.Equal(0, row.PublicCandidateCount);
+        Assert.Equal(0, row.UnusedExclusiveCandidateCount);
+        Assert.Equal(0, row.PlannedTransferCount);
+        Assert.Equal(0, row.PlannedShareCount);
+        Assert.Equal(0, row.ConfirmedTransferCount);
+        Assert.Equal(0, row.ConfirmedShareCount);
+        Assert.Equal(0, row.ShortfallCount);
+        Assert.Empty(vm.WarningMessage);
+        Assert.Null(vm.ConfirmationToken);
+    }
+
     private static ImportPreviewRow Row(int number) =>
         new(Guid.NewGuid(), number, $"https://pan.baidu.com/s/{number}", null, null, "就绪", null);
 
@@ -764,7 +902,7 @@ public sealed class CreateJobWizardViewModelTests
     {
         public int PreviewCalls { get; private set; }
         public string? ConfirmedToken { get; private set; }
-        public bool ThrowDiskShortage { get; init; }
+        public bool ThrowDiskShortage { get; set; }
         public WizardConfirmationSummary? Summary { get; init; }
         public WizardBatchDraft? LastPreviewDraft { get; private set; }
 
