@@ -60,6 +60,8 @@ public interface IImportWorkflow
         IProgress<ImportCommittedProgress> committedProgress,
         CancellationToken cancellationToken) =>
         ResumeAsync(sessionId, cancellationToken);
+    bool HasResumableReplaySource(Guid sessionId) => true;
+    void DiscardReplaySource(Guid sessionId) { }
     Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
     Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
 }
@@ -90,6 +92,7 @@ public sealed class ImportViewModel : ObservableObject
     private string statisticsText = "尚未导入数据";
     private bool isBusy;
     private bool canResumeImport;
+    private bool durableSessionObserved;
     private long totalRows;
     private long? nextCursor;
     private ImportPreviewRow? selectedRow;
@@ -165,6 +168,7 @@ public sealed class ImportViewModel : ObservableObject
     public void AttachSession(Guid value)
     {
         if (value == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(value));
+        durableSessionObserved = true;
         sessionId = value;
         pageGeneration++;
         OnPropertyChanged(nameof(SessionId));
@@ -178,19 +182,24 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
+        if (IsBusy) return;
         var newSessionId = Guid.NewGuid();
-        AttachSession(newSessionId);
+        BeginNewImport();
         await RunImportAsync(
+            newSessionId,
+            isResume: false,
             (progress, token) => workflow.ImportTextAsync(newSessionId, TextContent, progress, token),
             cancellationToken);
     }
 
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(filePath)) return;
+        if (string.IsNullOrWhiteSpace(filePath) || IsBusy) return;
         var newSessionId = Guid.NewGuid();
-        AttachSession(newSessionId);
+        BeginNewImport();
         await RunImportAsync(
+            newSessionId,
+            isResume: false,
             (progress, token) => workflow.ImportExcelAsync(newSessionId, filePath, progress, token),
             cancellationToken);
     }
@@ -211,8 +220,10 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
-        if (sessionId is null) return;
+        if (sessionId is null || IsBusy) return;
         await RunImportAsync(
+            sessionId.Value,
+            isResume: true,
             (progress, token) => workflow.ResumeAsync(sessionId.Value, progress, token),
             cancellationToken);
     }
@@ -270,16 +281,20 @@ public sealed class ImportViewModel : ObservableObject
     }
 
     private async Task RunImportAsync(
+        Guid operationSessionId,
+        bool isResume,
         Func<IProgress<ImportCommittedProgress>, CancellationToken, Task<ImportWorkflowResult>> action,
         CancellationToken externalCancellation)
     {
         if (IsBusy) return;
+        if (isResume) durableSessionObserved = true;
         operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(externalCancellation);
         IsBusy = true;
         StatusMessage = "正在流式导入，已保存的批次会持续写入本机数据库…";
         try
         {
-            var progress = new UiProgress<ImportCommittedProgress>(ApplyCommittedProgress);
+            var progress = new UiProgress<ImportCommittedProgress>(
+                value => ApplyCommittedProgress(operationSessionId, value));
             var result = await action(progress, operationCancellation.Token);
             AttachSession(result.SessionId);
             ApplyStatistics(result.Statistics);
@@ -290,16 +305,26 @@ public sealed class ImportViewModel : ObservableObject
         }
         catch (OperationCanceledException)
         {
-            CanResumeImport = sessionId is not null;
-            StatusMessage = "导入已取消，已保存的进度可以继续。";
+            CanResumeImport = HasResumableReplaySource();
+            StatusMessage = CanResumeImport
+                ? "导入已取消，已保存的进度可以继续。"
+                : durableSessionObserved
+                    ? "导入已取消，草稿已保存，但没有可继续的解析进度。"
+                    : "导入已取消，尚未保存可继续的草稿。";
         }
         catch (ImportWorkflowException error)
         {
-            StatusMessage = SafeError(error.Error);
+            CanResumeImport = HasResumableReplaySource();
+            StatusMessage = CanResumeImport
+                ? "导入中断，已保存的进度可以继续。"
+                : SafeError(error.Error);
         }
         catch (Exception)
         {
-            StatusMessage = SafeError(ImportUiError.Unknown);
+            CanResumeImport = HasResumableReplaySource();
+            StatusMessage = CanResumeImport
+                ? "导入中断，已保存的进度可以继续。"
+                : SafeError(ImportUiError.Unknown);
         }
         finally
         {
@@ -340,8 +365,28 @@ public sealed class ImportViewModel : ObservableObject
 
     private void Cancel() => operationCancellation?.Cancel();
 
-    private void ApplyCommittedProgress(ImportCommittedProgress progress)
+    private bool HasResumableReplaySource() =>
+        durableSessionObserved &&
+        sessionId is { } persistedSessionId &&
+        workflow.HasResumableReplaySource(persistedSessionId);
+
+    private void BeginNewImport()
     {
+        if (sessionId is { } previousSessionId)
+            workflow.DiscardReplaySource(previousSessionId);
+        durableSessionObserved = false;
+        CanResumeImport = false;
+        if (sessionId is null) return;
+        sessionId = null;
+        pageGeneration++;
+        OnPropertyChanged(nameof(SessionId));
+        RaiseCommands();
+    }
+
+    private void ApplyCommittedProgress(Guid operationSessionId, ImportCommittedProgress progress)
+    {
+        if (progress.Kind == ImportProgressKind.SessionCreated)
+            AttachSession(operationSessionId);
         StatusMessage = progress.Kind switch
         {
             ImportProgressKind.SessionCreated => "正在解析并写入草稿",

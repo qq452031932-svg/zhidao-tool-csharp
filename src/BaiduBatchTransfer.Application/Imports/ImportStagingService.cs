@@ -83,7 +83,9 @@ public sealed class ImportStagingService
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        committedProgress?.Report(new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0));
+        ReportCommittedProgress(
+            committedProgress,
+            new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0));
 
         await ProcessWithDraftRecoveryAsync(
                 progress,
@@ -322,7 +324,7 @@ public sealed class ImportStagingService
                 {
                     progress.Session = await PersistChunkAsync(progress.Session, transferMode, chunk, cancellationToken)
                         .ConfigureAwait(false);
-                    committedProgress?.Report(new ImportCommittedProgress(
+                    ReportCommittedProgress(committedProgress, new ImportCommittedProgress(
                         ImportProgressKind.ChunkCommitted,
                         progress.Session.TotalRows));
                     chunk.Clear();
@@ -333,7 +335,7 @@ public sealed class ImportStagingService
             {
                 progress.Session = await PersistChunkAsync(progress.Session, transferMode, chunk, cancellationToken)
                     .ConfigureAwait(false);
-                committedProgress?.Report(new ImportCommittedProgress(
+                ReportCommittedProgress(committedProgress, new ImportCommittedProgress(
                     ImportProgressKind.ChunkCommitted,
                     progress.Session.TotalRows));
             }
@@ -376,6 +378,20 @@ public sealed class ImportStagingService
         await unit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
         await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         return session;
+    }
+
+    private static void ReportCommittedProgress(
+        IProgress<ImportCommittedProgress>? progress,
+        ImportCommittedProgress value)
+    {
+        try
+        {
+            progress?.Report(value);
+        }
+        catch (Exception)
+        {
+            // Persistence is already committed; observers are best-effort only.
+        }
     }
 
     private async Task<StagedImportRowRecord> ResolveAsync(

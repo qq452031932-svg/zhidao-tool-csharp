@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.IO;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Core.Abstractions;
@@ -28,7 +27,11 @@ public sealed class LocalImportWorkflow(
     DraftRowEditingService editingService,
     IUnitOfWorkFactory unitOfWorkFactory) : IImportWorkflow
 {
-    private readonly ConcurrentDictionary<Guid, ReplaySource> replaySources = new();
+    // Replay content can include pasted links or absolute paths. Keep only a small LRU set of unfinished drafts.
+    private const int MaxRetainedReplaySources = 8;
+    private readonly object replayGate = new();
+    private readonly Dictionary<Guid, ReplayEntry> replaySources = [];
+    private long replaySequence;
 
     public Task<ImportWorkflowResult> ImportTextAsync(
         Guid sessionId,
@@ -45,20 +48,29 @@ public sealed class LocalImportWorkflow(
         if (sessionId == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(sessionId));
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         var source = ReplaySource.ForText(text);
-        replaySources[sessionId] = source;
+        RememberReplaySource(sessionId, source);
+        var replayProgress = new ReplayProgress(committedProgress);
+        var stagingCompleted = false;
         try
         {
             await stagingService.StageAsync(
                 new ImportRequest(sessionId, "Text", "[PASTED]"),
                 ReadTextAsync(source.Text!, cancellationToken),
-                committedProgress,
+                replayProgress,
                 cancellationToken).ConfigureAwait(false);
+            stagingCompleted = true;
+            RemoveReplaySource(sessionId);
             return await LoadResultAsync(sessionId, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception error) when (error is not ImportWorkflowException)
         {
             throw new ImportWorkflowException(ImportUiError.InvalidData, error);
+        }
+        finally
+        {
+            if (!stagingCompleted && !replayProgress.SessionCreated)
+                RemoveReplaySource(sessionId);
         }
     }
 
@@ -78,14 +90,18 @@ public sealed class LocalImportWorkflow(
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         var fullPath = Path.GetFullPath(filePath);
         var source = ReplaySource.ForExcel(fullPath);
-        replaySources[sessionId] = source;
+        RememberReplaySource(sessionId, source);
+        var replayProgress = new ReplayProgress(committedProgress);
+        var stagingCompleted = false;
         try
         {
             await stagingService.StageAsync(
                 new ImportRequest(sessionId, "Excel", "[REDACTED]"),
                 ReadExcelAsync(fullPath, cancellationToken),
-                committedProgress,
+                replayProgress,
                 cancellationToken).ConfigureAwait(false);
+            stagingCompleted = true;
+            RemoveReplaySource(sessionId);
             return await LoadResultAsync(sessionId, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
@@ -96,6 +112,11 @@ public sealed class LocalImportWorkflow(
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException)
         {
             throw new ImportWorkflowException(ImportUiError.InvalidWorkbook, error);
+        }
+        finally
+        {
+            if (!stagingCompleted && !replayProgress.SessionCreated)
+                RemoveReplaySource(sessionId);
         }
     }
 
@@ -109,7 +130,7 @@ public sealed class LocalImportWorkflow(
         IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken)
     {
-        if (!replaySources.TryGetValue(sessionId, out var source))
+        if (!TryGetReplaySource(sessionId, out var source))
             throw new ImportWorkflowException(ImportUiError.InvalidData);
         var rows = source.Kind == ReplaySourceKind.Text
             ? ReadTextAsync(source.Text!, cancellationToken)
@@ -122,6 +143,7 @@ public sealed class LocalImportWorkflow(
                 TransferMode.Distribution,
                 committedProgress,
                 cancellationToken).ConfigureAwait(false);
+            RemoveReplaySource(sessionId);
             return await LoadResultAsync(sessionId, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
@@ -129,6 +151,14 @@ public sealed class LocalImportWorkflow(
         {
             throw new ImportWorkflowException(MapExcelError(error.Code), error);
         }
+    }
+
+    public void DiscardReplaySource(Guid sessionId) => RemoveReplaySource(sessionId);
+
+    public bool HasResumableReplaySource(Guid sessionId)
+    {
+        lock (replayGate)
+            return replaySources.ContainsKey(sessionId);
     }
 
     public async Task UpdateLinkAsync(
@@ -208,6 +238,41 @@ public sealed class LocalImportWorkflow(
             (int)Math.Min(int.MaxValue, accountGroups.TotalCount)));
     }
 
+    private void RememberReplaySource(Guid sessionId, ReplaySource source)
+    {
+        lock (replayGate)
+        {
+            replaySources[sessionId] = new ReplayEntry(source, ++replaySequence);
+            while (replaySources.Count > MaxRetainedReplaySources)
+            {
+                var oldest = replaySources.MinBy(pair => pair.Value.LastAccessSequence).Key;
+                replaySources.Remove(oldest);
+            }
+        }
+    }
+
+    private bool TryGetReplaySource(Guid sessionId, out ReplaySource source)
+    {
+        lock (replayGate)
+        {
+            if (!replaySources.TryGetValue(sessionId, out var entry))
+            {
+                source = null!;
+                return false;
+            }
+
+            source = entry.Source;
+            replaySources[sessionId] = entry with { LastAccessSequence = ++replaySequence };
+            return true;
+        }
+    }
+
+    private void RemoveReplaySource(Guid sessionId)
+    {
+        lock (replayGate)
+            replaySources.Remove(sessionId);
+    }
+
     private static ImportUiError MapExcelError(ExcelImportErrorCode code) => code switch
     {
         ExcelImportErrorCode.UnsafePackage => ImportUiError.UnsafeWorkbook,
@@ -223,5 +288,20 @@ public sealed class LocalImportWorkflow(
         public static ReplaySource ForText(string text) => new(ReplaySourceKind.Text, text, null);
         public static ReplaySource ForExcel(string path) => new(ReplaySourceKind.Excel, null, path);
         public override string ToString() => "ReplaySource { Content = [REDACTED] }";
+    }
+
+    private sealed record ReplayEntry(ReplaySource Source, long LastAccessSequence);
+
+    private sealed class ReplayProgress(IProgress<ImportCommittedProgress>? inner)
+        : IProgress<ImportCommittedProgress>
+    {
+        public bool SessionCreated { get; private set; }
+
+        public void Report(ImportCommittedProgress value)
+        {
+            if (value.Kind == ImportProgressKind.SessionCreated)
+                SessionCreated = true;
+            inner?.Report(value);
+        }
     }
 }

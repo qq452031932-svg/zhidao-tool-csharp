@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.Application.Imports;
+using BaiduBatchTransfer.Application.Tests.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
@@ -358,6 +359,61 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task ProgressObserverFailureCannotTurnCommittedWorkIntoImportFailure()
+    {
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver(), chunkSize: 2);
+
+        await service.StageAsync(
+            new ImportRequest(Guid.NewGuid(), "Text", "paste"),
+            ToAsync(
+                new ImportSourceRow(1, "https://pan.baidu.com/s/id-1"),
+                new ImportSourceRow(2, "https://pan.baidu.com/s/id-2")),
+            new InlineProgress<ImportCommittedProgress>(_ =>
+                throw new InvalidOperationException("Observer failed.")),
+            CancellationToken.None);
+
+        Assert.Equal("Draft", store.Session!.Status);
+        Assert.Equal(2, store.Session.TotalRows);
+        Assert.Equal(2, store.Rows.Count);
+    }
+
+    [Fact]
+    public async Task FailedSqliteChunkRollsBackRowsAndCountersAndStopsProgressAtLastCommit()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var failingFactory = new FailingCommitFactory(database.UnitOfWorkFactory, failCommitAttempt: 3);
+        var service = new ImportStagingService(
+            failingFactory.BeginAsync,
+            new SequenceResolver(),
+            chunkSize: 3,
+            maxResolutionConcurrency: 2);
+        var sessionId = Guid.NewGuid();
+        var progress = new List<ImportCommittedProgress>();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.StageAsync(
+            new ImportRequest(sessionId, "Excel", "rows.xlsx"),
+            ToAsync(Enumerable.Range(1, 7)
+                .Select(i => new ImportSourceRow(i, $"https://pan.baidu.com/s/id-{i}"))
+                .ToArray()),
+            new InlineProgress<ImportCommittedProgress>(progress.Add),
+            CancellationToken.None));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var session = await read.Imports.GetSessionAsync(sessionId);
+        var rows = await read.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10));
+        Assert.Equal(3, session!.TotalRows);
+        Assert.Equal(3, session.ReadyRows);
+        Assert.Equal(3, rows.TotalCount);
+        Assert.Equal(
+            [
+                new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0),
+                new ImportCommittedProgress(ImportProgressKind.ChunkCommitted, 3),
+            ],
+            progress);
+    }
+
+    [Fact]
     public async Task SourceOverridesAndAccountFieldsAreCopiedAndDifferencesBecomeConflict()
     {
         var store = new ImportStore();
@@ -530,6 +586,39 @@ public sealed class ImportStagingServiceTests
     private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
     {
         public void Report(T value) => report(value);
+    }
+
+    private sealed class FailingCommitFactory(IUnitOfWorkFactory inner, int failCommitAttempt)
+    {
+        private int commitAttempts;
+
+        public async Task<IUnitOfWork> BeginAsync(CancellationToken cancellationToken) =>
+            new FailingCommitUnit(
+                await inner.BeginAsync(cancellationToken),
+                this,
+                failCommitAttempt);
+
+        private sealed class FailingCommitUnit(
+            IUnitOfWork inner,
+            FailingCommitFactory owner,
+            int failCommitAttempt) : IUnitOfWork
+        {
+            public IImportRepository Imports => inner.Imports;
+            public IJobRepository Jobs => inner.Jobs;
+            public IAccountRepository Accounts => inner.Accounts;
+
+            public async Task CommitAsync(CancellationToken cancellationToken = default)
+            {
+                if (Interlocked.Increment(ref owner.commitAttempts) == failCommitAttempt)
+                    throw new InvalidOperationException("Injected SQLite commit failure.");
+                await inner.CommitAsync(cancellationToken);
+            }
+
+            public Task RollbackAsync(CancellationToken cancellationToken = default) =>
+                inner.RollbackAsync(cancellationToken);
+
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
     }
 
     private sealed class ImportStore

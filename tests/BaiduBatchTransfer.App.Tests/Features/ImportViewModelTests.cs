@@ -2,13 +2,19 @@ using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
+using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Infrastructure.Database;
+using BaiduBatchTransfer.Infrastructure.Excel;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Spreadsheet;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class ImportViewModelTests
 {
     [Fact]
-    public async Task TextAndExcelImportsRunAsynchronouslyAndCancellationLeavesAResumableDraft()
+    public async Task CancellationBeforeSessionCommitDoesNotClaimAResumableDraft()
     {
         var workflow = new FakeImportWorkflow { Cancel = true };
         var vm = Create(workflow);
@@ -16,13 +22,64 @@ public sealed class ImportViewModelTests
 
         await vm.ImportTextAsync();
 
-        Assert.True(vm.CanResumeImport);
-        Assert.NotNull(vm.SessionId);
-        Assert.Equal("导入已取消，已保存的进度可以继续。", vm.StatusMessage);
+        Assert.False(vm.CanResumeImport);
+        Assert.Null(vm.SessionId);
+        Assert.Equal("导入已取消，尚未保存可继续的草稿。", vm.StatusMessage);
 
         workflow.Cancel = false;
         await vm.ImportExcelAsync("D:\\data.xlsx");
         Assert.Equal(1, workflow.ExcelCalls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailureAfterDurableSessionEnablesResume(bool reportCommittedChunk)
+    {
+        var workflow = new FailingAfterProgressWorkflow(reportCommittedChunk);
+        var vm = Create(workflow);
+        vm.TextContent = "https://pan.baidu.com/s/abc1";
+
+        await vm.ImportTextAsync();
+
+        Assert.True(vm.CanResumeImport);
+        Assert.NotNull(vm.SessionId);
+        Assert.Equal("导入中断，已保存的进度可以继续。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task NewPrecommitFailureClearsAnOlderResumableSessionAndReplaySource()
+    {
+        var workflow = new DurableThenPrecommitFailureWorkflow();
+        var vm = Create(workflow);
+        vm.TextContent = "https://pan.baidu.com/s/abc1";
+        await vm.ImportTextAsync();
+        var oldSessionId = Assert.IsType<Guid>(vm.SessionId);
+        Assert.True(vm.CanResumeImport);
+
+        await vm.ImportTextAsync();
+
+        Assert.False(vm.CanResumeImport);
+        Assert.Null(vm.SessionId);
+        Assert.Equal([oldSessionId], workflow.DiscardedSessionIds);
+        Assert.Equal("导入失败，请检查文件后重试。", vm.StatusMessage);
+    }
+
+    [Theory]
+    [InlineData(false, "导入失败，请检查文件后重试。")]
+    [InlineData(true, "导入已取消，草稿已保存，但没有可继续的解析进度。")]
+    public async Task PostStagingFailureWithoutReplayDoesNotClaimResume(
+        bool cancellation,
+        string expectedMessage)
+    {
+        var vm = Create(new PostStagingFailureWorkflow(cancellation));
+        vm.TextContent = "https://pan.baidu.com/s/abc1";
+
+        await vm.ImportTextAsync();
+
+        Assert.False(vm.CanResumeImport);
+        Assert.NotNull(vm.SessionId);
+        Assert.Equal(expectedMessage, vm.StatusMessage);
     }
 
     [Theory]
@@ -127,7 +184,8 @@ public sealed class ImportViewModelTests
         Assert.Contains("正在解析并写入草稿，已保存 3 行", statuses);
         Assert.DoesNotContain(statuses, status => status.Contains("6 行", StringComparison.Ordinal));
         Assert.All(statuses, status => Assert.DoesNotContain("abc1", status, StringComparison.Ordinal));
-        Assert.Equal("导入失败，请检查文件后重试。", vm.StatusMessage);
+        Assert.True(vm.CanResumeImport);
+        Assert.Equal("导入中断，已保存的进度可以继续。", vm.StatusMessage);
     }
 
     [Fact]
@@ -219,6 +277,113 @@ public sealed class ImportViewModelTests
         Assert.NotNull(handoff);
         Assert.Equal(import.SessionId, handoff.SessionId);
         Assert.Equal(1, handoff.Statistics.Ready);
+    }
+
+    [Fact]
+    public async Task SuccessfulTextImportDoesNotRetainPastedReplayContent()
+    {
+        await using var context = await LocalWorkflowTestContext.CreateAsync();
+        var sessionId = Guid.NewGuid();
+
+        await context.Workflow.ImportTextAsync(
+            sessionId,
+            "https://pan.baidu.com/s/text-success",
+            CancellationToken.None);
+
+        Assert.False(context.Workflow.HasResumableReplaySource(sessionId));
+        var error = await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            context.Workflow.ResumeAsync(sessionId, CancellationToken.None));
+        Assert.Equal(ImportUiError.InvalidData, error.Error);
+    }
+
+    [Fact]
+    public async Task SuccessfulExcelImportDoesNotRetainAbsoluteWorkbookPath()
+    {
+        await using var context = await LocalWorkflowTestContext.CreateAsync();
+        var workbookPath = Path.Combine(context.Root, "private-workbook.xlsx");
+        WriteWorkbook(workbookPath, "https://pan.baidu.com/s/excel-success");
+        var sessionId = Guid.NewGuid();
+
+        await context.Workflow.ImportExcelAsync(sessionId, workbookPath, CancellationToken.None);
+
+        Assert.False(context.Workflow.HasResumableReplaySource(sessionId));
+        var error = await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            context.Workflow.ResumeAsync(sessionId, CancellationToken.None));
+        Assert.Equal(ImportUiError.InvalidData, error.Error);
+    }
+
+    [Fact]
+    public async Task ReplaySourceRemainsAfterDurableCancellationAndIsRemovedAfterResumeSucceeds()
+    {
+        await using var context = await LocalWorkflowTestContext.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        using var cancellation = new CancellationTokenSource();
+        var progress = new InlineProgress<ImportCommittedProgress>(value =>
+        {
+            if (value.Kind == ImportProgressKind.SessionCreated) cancellation.Cancel();
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            context.Workflow.ImportTextAsync(
+                sessionId,
+                "https://pan.baidu.com/s/cancelled",
+                progress,
+                cancellation.Token));
+
+        Assert.True(context.Workflow.HasResumableReplaySource(sessionId));
+        var resumed = await context.Workflow.ResumeAsync(sessionId, CancellationToken.None);
+        Assert.Equal(sessionId, resumed.SessionId);
+        Assert.False(context.Workflow.HasResumableReplaySource(sessionId));
+        await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            context.Workflow.ResumeAsync(sessionId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ReplaySourceRemainsAfterDurableChunkFailure()
+    {
+        await using var context = await LocalWorkflowTestContext.CreateAsync(failCommitAttempt: 2);
+        var sessionId = Guid.NewGuid();
+
+        await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            context.Workflow.ImportTextAsync(
+                sessionId,
+                "https://pan.baidu.com/s/failed-chunk",
+                CancellationToken.None));
+
+        Assert.True(context.Workflow.HasResumableReplaySource(sessionId));
+        var resumed = await context.Workflow.ResumeAsync(sessionId, CancellationToken.None);
+        Assert.Equal(sessionId, resumed.SessionId);
+    }
+
+    [Fact]
+    public async Task ReplaySourceCacheEvictsTheOldestAbandonedDraftAtItsHardBound()
+    {
+        await using var context = await LocalWorkflowTestContext.CreateAsync();
+        var sessions = new List<Guid>();
+        for (var index = 0; index < 9; index++)
+        {
+            var sessionId = Guid.NewGuid();
+            sessions.Add(sessionId);
+            using var cancellation = new CancellationTokenSource();
+            var progress = new InlineProgress<ImportCommittedProgress>(value =>
+            {
+                if (value.Kind == ImportProgressKind.SessionCreated) cancellation.Cancel();
+            });
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                context.Workflow.ImportTextAsync(
+                    sessionId,
+                    $"https://pan.baidu.com/s/abandoned-{index}",
+                    progress,
+                    cancellation.Token));
+        }
+
+        var evicted = await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            context.Workflow.ResumeAsync(sessions[0], CancellationToken.None));
+        Assert.Equal(ImportUiError.InvalidData, evicted.Error);
+        Assert.False(context.Workflow.HasResumableReplaySource(sessions[0]));
+        Assert.True(context.Workflow.HasResumableReplaySource(sessions[^1]));
+        var newest = await context.Workflow.ResumeAsync(sessions[^1], CancellationToken.None);
+        Assert.Equal(sessions[^1], newest.SessionId);
     }
 
     private static ImportViewModel Create(
@@ -338,9 +503,210 @@ public sealed class ImportViewModelTests
             throw new NotSupportedException();
     }
 
+    private sealed class FailingAfterProgressWorkflow(bool reportCommittedChunk) : IImportWorkflow
+    {
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            IProgress<ImportCommittedProgress> committedProgress,
+            CancellationToken cancellationToken)
+        {
+            committedProgress.Report(new(ImportProgressKind.SessionCreated, 0));
+            if (reportCommittedChunk)
+                committedProgress.Report(new(ImportProgressKind.ChunkCommitted, 3));
+            throw new ImportWorkflowException(ImportUiError.Unknown);
+        }
+
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class DurableThenPrecommitFailureWorkflow : IImportWorkflow
+    {
+        private int callCount;
+        public List<Guid> DiscardedSessionIds { get; } = [];
+
+        public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            IProgress<ImportCommittedProgress> committedProgress,
+            CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref callCount) == 1)
+                committedProgress.Report(new(ImportProgressKind.SessionCreated, 0));
+            throw new ImportWorkflowException(ImportUiError.Unknown);
+        }
+
+        public void DiscardReplaySource(Guid sessionId) => DiscardedSessionIds.Add(sessionId);
+
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class PostStagingFailureWorkflow(bool cancellation) : IImportWorkflow
+    {
+        public bool HasResumableReplaySource(Guid sessionId) => false;
+
+        public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            IProgress<ImportCommittedProgress> committedProgress,
+            CancellationToken cancellationToken)
+        {
+            committedProgress.Report(new(ImportProgressKind.SessionCreated, 0));
+            if (cancellation) throw new OperationCanceledException();
+            throw new ImportWorkflowException(ImportUiError.Unknown);
+        }
+
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
     private sealed class TransferUnavailable : IAdapterAvailability
     {
         public bool CanStartTransfers => false;
         public string StatusMessage => "实际转存尚未开放。";
+    }
+
+    private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
+    }
+
+    private sealed class LocalWorkflowTestContext : IAsyncDisposable
+    {
+        private LocalWorkflowTestContext(string root, LocalImportWorkflow workflow)
+        {
+            Root = root;
+            Workflow = workflow;
+        }
+
+        public string Root { get; }
+        public LocalImportWorkflow Workflow { get; }
+
+        public static async Task<LocalWorkflowTestContext> CreateAsync(int? failCommitAttempt = null)
+        {
+            var root = Path.Combine(Path.GetTempPath(), $"bbt-local-import-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(root);
+            var connectionFactory = new SqliteConnectionFactory(Path.Combine(root, "imports.db"));
+            await new DatabaseMigrator(
+                connectionFactory,
+                new DatabaseBackupService(connectionFactory, Path.Combine(root, "backups")),
+                "task2-followup-test").MigrateAsync();
+            IUnitOfWorkFactory unitOfWorkFactory = new SqliteUnitOfWorkFactory(connectionFactory);
+            if (failCommitAttempt is { } attempt)
+                unitOfWorkFactory = new FailOnceUnitOfWorkFactory(unitOfWorkFactory, attempt);
+            var staging = new ImportStagingService(
+                unitOfWorkFactory.BeginAsync,
+                new DeferredShareLinkResolver(),
+                chunkSize: 1,
+                maxResolutionConcurrency: 1);
+            var workflow = new LocalImportWorkflow(
+                staging,
+                new TextImportParser(),
+                new OpenXmlImportReader(),
+                new DraftRowEditingService(unitOfWorkFactory),
+                unitOfWorkFactory);
+            return new(root, workflow);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Task.Yield();
+            if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+        }
+    }
+
+    private sealed class FailOnceUnitOfWorkFactory(IUnitOfWorkFactory inner, int failCommitAttempt)
+        : IUnitOfWorkFactory
+    {
+        private int commitAttempts;
+
+        public async Task<IUnitOfWork> BeginAsync(CancellationToken cancellationToken = default) =>
+            new FailOnceUnitOfWork(
+                await inner.BeginAsync(cancellationToken),
+                this,
+                failCommitAttempt);
+
+        private sealed class FailOnceUnitOfWork(
+            IUnitOfWork inner,
+            FailOnceUnitOfWorkFactory owner,
+            int failCommitAttempt) : IUnitOfWork
+        {
+            public IImportRepository Imports => inner.Imports;
+            public IJobRepository Jobs => inner.Jobs;
+            public IAccountRepository Accounts => inner.Accounts;
+
+            public async Task CommitAsync(CancellationToken cancellationToken = default)
+            {
+                if (Interlocked.Increment(ref owner.commitAttempts) == failCommitAttempt)
+                    throw new InvalidOperationException("Injected commit failure.");
+                await inner.CommitAsync(cancellationToken);
+            }
+
+            public Task RollbackAsync(CancellationToken cancellationToken = default) =>
+                inner.RollbackAsync(cancellationToken);
+
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
+    }
+
+    private static void WriteWorkbook(string path, string shareUrl)
+    {
+        using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var workbookPart = document.AddWorkbookPart();
+        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+        workbookPart.Workbook = new Workbook(new Sheets(new Sheet
+        {
+            Id = workbookPart.GetIdOfPart(worksheetPart),
+            SheetId = 1,
+            Name = "导入",
+        }));
+        using var writer = OpenXmlWriter.Create(worksheetPart);
+        writer.WriteStartElement(new Worksheet());
+        writer.WriteStartElement(new SheetData());
+        WriteInlineRow(writer, 1, "分享链接");
+        WriteInlineRow(writer, 2, shareUrl);
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static void WriteInlineRow(OpenXmlWriter writer, uint rowIndex, params string[] values)
+    {
+        writer.WriteStartElement(new Row { RowIndex = rowIndex });
+        foreach (var value in values)
+            writer.WriteElement(new Cell(new InlineString(new Text(value)))
+                { DataType = CellValues.InlineString });
+        writer.WriteEndElement();
     }
 }
