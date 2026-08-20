@@ -48,11 +48,15 @@ public sealed record AppDataPaths
 
 public static class AppBootstrap
 {
-    public static IHost CreateHost(string dataRoot)
+    public static IHost CreateHost(string dataRoot, Action<IServiceCollection>? configure = null)
     {
         var paths = new AppDataPaths(dataRoot);
         return Host.CreateDefaultBuilder()
-            .ConfigureServices(services => ConfigureServices(services, paths))
+            .ConfigureServices(services =>
+            {
+                ConfigureServices(services, paths);
+                configure?.Invoke(services);
+            })
             .Build();
     }
 
@@ -81,6 +85,9 @@ public static class AppBootstrap
         services.AddSingleton<IImportPreviewPageSource, ImportPreviewPageSource>();
         services.AddSingleton<TextImportParser>();
         services.AddSingleton<OpenXmlImportReader>();
+        services.AddSingleton<OpenXmlWorkbookInspector>();
+        services.AddSingleton<ExcelColumnSuggestionEngine>();
+        services.AddSingleton<IExcelColumnMappingPresenter, ExcelColumnMappingPresenter>();
         services.AddSingleton<IShareLinkResolver, DeferredShareLinkResolver>();
         services.AddSingleton(sp => new ImportStagingService(
             cancellationToken => sp.GetRequiredService<IUnitOfWorkFactory>().BeginAsync(cancellationToken),

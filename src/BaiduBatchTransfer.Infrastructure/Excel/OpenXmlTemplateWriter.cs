@@ -6,7 +6,7 @@ namespace BaiduBatchTransfer.Infrastructure.Excel;
 
 public sealed class OpenXmlTemplateWriter
 {
-    private static readonly string[] Headers = ["分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注"];
+    private static readonly string[] Headers = ["源标题", "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注"];
 
     public Task WriteAsync(Stream stream, CancellationToken cancellationToken = default)
     {
@@ -20,8 +20,9 @@ public sealed class OpenXmlTemplateWriter
         using var writer = OpenXmlWriter.Create(worksheetPart);
         writer.WriteStartElement(new Worksheet());
         writer.WriteStartElement(new Columns());
-        writer.WriteElement(new Column { Min = 1, Max = 1, Width = 48, CustomWidth = true, Style = 1 });
-        writer.WriteElement(new Column { Min = 2, Max = 6, Width = 22, CustomWidth = true, Style = 1 });
+        writer.WriteElement(new Column { Min = 1, Max = 1, Width = 28, CustomWidth = true, Style = 1 });
+        writer.WriteElement(new Column { Min = 2, Max = 2, Width = 48, CustomWidth = true, Style = 1 });
+        writer.WriteElement(new Column { Min = 3, Max = 7, Width = 22, CustomWidth = true, Style = 1 });
         writer.WriteEndElement();
         writer.WriteStartElement(new SheetData());
         writer.WriteStartElement(new Row { RowIndex = 1 });

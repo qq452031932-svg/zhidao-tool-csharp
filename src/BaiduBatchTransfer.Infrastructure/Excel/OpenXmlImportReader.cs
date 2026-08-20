@@ -3,6 +3,7 @@ using System.IO.Compression;
 using System.Runtime.CompilerServices;
 using System.Text;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Services;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
@@ -22,6 +23,7 @@ public sealed record OpenXmlImportLimits(
 {
     public const int ExcelMaximumRows = 1_048_576;
     public const int ExcelMaximumDataRows = ExcelMaximumRows - 1;
+    public const int ExcelMaximumColumns = 16_384;
 }
 
 public enum ExcelImportErrorCode
@@ -31,6 +33,7 @@ public enum ExcelImportErrorCode
     MissingWorksheet,
     MissingRequiredHeader,
     DuplicateHeader,
+    ColumnMappingMismatch,
     InvalidRowOrder,
     RowLimitExceeded,
     CellLimitExceeded,
@@ -78,9 +81,11 @@ public sealed class OpenXmlImportReader
 
     public async IAsyncEnumerable<ImportSourceRow> ReadAsync(
         Stream stream,
+        ConfirmedImportColumnMapping mapping,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(mapping);
         if (!stream.CanRead || !stream.CanSeek)
         {
             throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "The workbook stream must be readable and seekable.");
@@ -100,17 +105,7 @@ public sealed class OpenXmlImportReader
 
         using (document)
         {
-            if (document.DocumentType != SpreadsheetDocumentType.Workbook)
-            {
-                throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "Macro-enabled and template workbook types are not accepted.");
-            }
-
-            var workbookPart = document.WorkbookPart
-                ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "The workbook part is missing.");
-            if (workbookPart.VbaProjectPart is not null || workbookPart.ExternalWorkbookParts.Any())
-            {
-                throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "Workbooks containing macros or external workbook links are not accepted.");
-            }
+            var workbookPart = ValidateDocument(document);
 
             var relationshipId = ReadFirstWorksheetRelationshipId(workbookPart);
             if (relationshipId is null || workbookPart.GetPartById(relationshipId) is not WorksheetPart worksheetPart)
@@ -120,7 +115,8 @@ public sealed class OpenXmlImportReader
 
             var sharedStrings = ReadSharedStrings(workbookPart.SharedStringTablePart);
             using var reader = OpenXmlReader.Create(worksheetPart);
-            HeaderMap? headers = null;
+            var extractor = new BaiduShareUrlExtractor();
+            var normalizer = new BaiduShareNormalizer();
             var physicalRowCount = 0;
             var dataRowCount = 0;
             uint lastRowNumber = 0;
@@ -144,11 +140,15 @@ public sealed class OpenXmlImportReader
                 }
                 lastRowNumber = rawRowNumber;
                 var sourceRowNumber = (int)rawRowNumber;
-                var values = ReadCells(reader, sharedStrings, headers?.Indexes);
-                if (headers is null)
+                var values = ReadCells(reader, sharedStrings);
+                if (values.Keys.Any(columnIndex => columnIndex >= mapping.SourceColumnCount))
                 {
-                    if (values.Count == 0 || values.Values.All(string.IsNullOrWhiteSpace)) continue;
-                    headers = HeaderMap.Create(values);
+                    throw new ExcelImportException(
+                        ExcelImportErrorCode.ColumnMappingMismatch,
+                        "A worksheet row contains a source column that was not present in the confirmed mapping.");
+                }
+                if (rawRowNumber == mapping.HeaderRowNumber)
+                {
                     continue;
                 }
 
@@ -159,27 +159,48 @@ public sealed class OpenXmlImportReader
                 }
 
                 if (values.Count == 0 || values.Values.All(string.IsNullOrWhiteSpace)) continue;
-                var shareUrl = headers.Get(values, ImportColumn.ShareUrl);
+                var rawValues = ToOrderedValues(values, Math.Max(mapping.SourceColumnCount, values.Count == 0 ? 0 : values.Keys.Max() + 1));
+                var rawShareCell = Get(rawValues, mapping.ShareUrlColumnIndex);
+                var originalExtractedUrl = extractor.ExtractSupportedUrl(rawShareCell);
+                string? shareUrl = null;
+                string? urlExtractionCode = null;
+                if (originalExtractedUrl is not null)
+                {
+                    var normalized = normalizer.Normalize(originalExtractedUrl);
+                    shareUrl = normalized.CanonicalUrl;
+                    urlExtractionCode = normalized.ExtractionCode;
+                }
+                var extractionCode = BaiduShareUrlExtractor.NormalizeExtractionCode(
+                    mapping.ExtractionCodeColumnIndex is int codeColumn ? Get(rawValues, codeColumn) : null)
+                    ?? urlExtractionCode;
                 yield return new ImportSourceRow(
                     sourceRowNumber,
                     shareUrl ?? string.Empty,
-                    headers.Get(values, ImportColumn.ExtractionCode),
-                    headers.Get(values, ImportColumn.TargetPath),
-                    headers.Get(values, ImportColumn.OuterFolder),
-                    headers.Get(values, ImportColumn.Account),
-                    Note: headers.Get(values, ImportColumn.Note),
-                    ValidationError: string.IsNullOrWhiteSpace(shareUrl) ? "The share link is missing." : null);
+                    extractionCode,
+                    ValidationError: shareUrl is null ? "The mapped share-link cell does not contain a supported Baidu URL." : null,
+                    SourceTitle: mapping.SourceTitleColumnIndex is int titleColumn ? Get(rawValues, titleColumn) : null,
+                    OriginalExtractedUrl: originalExtractedUrl,
+                    RawValues: rawValues);
                 if ((physicalRowCount & 255) == 0) await Task.Yield();
-            }
-
-            if (headers is null)
-            {
-                throw new ExcelImportException(ExcelImportErrorCode.MissingRequiredHeader, "The required share-link header is missing.");
             }
         }
     }
 
-    private async Task ValidatePackageAsync(Stream stream, CancellationToken cancellationToken)
+    private static string Get(IReadOnlyList<string> values, int index) =>
+        index < values.Count ? values[index] : string.Empty;
+
+    internal static IReadOnlyList<string> ToOrderedValues(IReadOnlyDictionary<int, string> values, int width)
+    {
+        var ordered = new string[width];
+        Array.Fill(ordered, string.Empty);
+        foreach (var (index, value) in values)
+        {
+            if (index >= 0 && index < ordered.Length) ordered[index] = value;
+        }
+        return ordered;
+    }
+
+    internal async Task ValidatePackageAsync(Stream stream, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (stream.Length > limits.MaxWorkbookBytes)
@@ -259,7 +280,56 @@ public sealed class OpenXmlImportReader
         }
     }
 
-    private static string? ReadFirstWorksheetRelationshipId(WorkbookPart workbookPart)
+    internal static WorkbookPart ValidateDocument(SpreadsheetDocument document)
+    {
+        if (document.DocumentType != SpreadsheetDocumentType.Workbook)
+            throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "Macro-enabled and template workbook types are not accepted.");
+        var workbookPart = document.WorkbookPart
+            ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "The workbook part is missing.");
+        if (workbookPart.VbaProjectPart is not null || workbookPart.ExternalWorkbookParts.Any() || HasExternalRelationships(document))
+            throw new ExcelImportException(ExcelImportErrorCode.UnsafePackage, "Workbooks containing macros or external relationships are not accepted.");
+        return workbookPart;
+    }
+
+    private static bool HasExternalRelationships(OpenXmlPartContainer container)
+    {
+        const int maximumRelationshipEdges = 8_192;
+        return HasUnsafeRelationshipGraph(
+            container,
+            current => current.ExternalRelationships.Any() || current.HyperlinkRelationships.Any(),
+            current => current.Parts.Select(pair => (OpenXmlPartContainer)pair.OpenXmlPart),
+            maximumRelationshipEdges);
+    }
+
+    internal static bool HasUnsafeRelationshipGraph<TNode>(
+        TNode root,
+        Func<TNode, bool> hasExternalRelationship,
+        Func<TNode, IEnumerable<TNode>> getChildren,
+        int maximumEdges)
+        where TNode : class
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        ArgumentNullException.ThrowIfNull(hasExternalRelationship);
+        ArgumentNullException.ThrowIfNull(getChildren);
+        if (maximumEdges <= 0) throw new ArgumentOutOfRangeException(nameof(maximumEdges));
+
+        var pending = new Stack<TNode>();
+        var visited = new HashSet<TNode>(ReferenceEqualityComparer.Instance) { root };
+        pending.Push(root);
+        var edgeCount = 0;
+        while (pending.TryPop(out var current))
+        {
+            if (hasExternalRelationship(current)) return true;
+            foreach (var child in getChildren(current))
+            {
+                if (++edgeCount > maximumEdges) return true;
+                if (visited.Add(child)) pending.Push(child);
+            }
+        }
+        return false;
+    }
+
+    internal static string? ReadFirstWorksheetRelationshipId(WorkbookPart workbookPart)
     {
         using var reader = OpenXmlReader.Create(workbookPart);
         while (reader.Read())
@@ -267,13 +337,17 @@ public sealed class OpenXmlImportReader
             if (reader.ElementType != typeof(Sheet) || !reader.IsStartElement) continue;
             var sheet = reader.LoadCurrentElement() as Sheet
                 ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet declaration could not be read.");
-            if (!string.IsNullOrWhiteSpace(sheet.Id?.Value)) return sheet.Id!.Value;
+            if (!string.IsNullOrWhiteSpace(sheet.Id?.Value) &&
+                workbookPart.GetPartById(sheet.Id!.Value) is WorksheetPart)
+            {
+                return sheet.Id.Value;
+            }
         }
 
         return null;
     }
 
-    private IReadOnlyList<string> ReadSharedStrings(SharedStringTablePart? part)
+    internal IReadOnlyList<string> ReadSharedStrings(SharedStringTablePart? part)
     {
         if (part is null) return Array.Empty<string>();
         var values = new List<string>();
@@ -296,7 +370,7 @@ public sealed class OpenXmlImportReader
         return values;
     }
 
-    private static uint ReadRowNumber(OpenXmlReader reader, uint previousRowNumber)
+    internal static uint ReadRowNumber(OpenXmlReader reader, uint previousRowNumber)
     {
         var value = GetAttribute(reader, "r");
         if (value is null)
@@ -308,10 +382,9 @@ public sealed class OpenXmlImportReader
             : throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet row contains an invalid row index.");
     }
 
-    private Dictionary<int, string> ReadCells(
+    internal Dictionary<int, string> ReadCells(
         OpenXmlReader reader,
-        IReadOnlyList<string> sharedStrings,
-        IReadOnlySet<int>? retainedColumns)
+        IReadOnlyList<string> sharedStrings)
     {
         var values = new Dictionary<int, string>();
         var fallbackColumn = 0;
@@ -325,10 +398,7 @@ public sealed class OpenXmlImportReader
         void FinishCell()
         {
             if (!inCell) return;
-            if (retainedColumns is null || retainedColumns.Contains(currentColumn))
-            {
-                values[currentColumn] = ReadCellValue(currentDataType, currentValue, inlineText, sharedStrings);
-            }
+            values[currentColumn] = ReadCellValue(currentDataType, currentValue, inlineText, sharedStrings);
             inCell = false;
             currentValue = null;
             inlineText = null;
@@ -411,60 +481,14 @@ public sealed class OpenXmlImportReader
             if (character is not (>= 'A' and <= 'Z') and not (>= 'a' and <= 'z')) break;
             value = checked(value * 26 + char.ToUpperInvariant(character) - 'A' + 1);
             letters++;
+            if (value > OpenXmlImportLimits.ExcelMaximumColumns)
+                throw new ExcelImportException(
+                    ExcelImportErrorCode.CellLimitExceeded,
+                    "A worksheet cell reference exceeds the Excel column boundary.",
+                    observedCount: value);
         }
 
         return letters == 0 ? null : value - 1;
     }
 
-    private enum ImportColumn { ShareUrl, ExtractionCode, TargetPath, OuterFolder, Account, Note }
-
-    private sealed class HeaderMap(Dictionary<ImportColumn, int> indexes)
-    {
-        private static readonly Dictionary<string, ImportColumn> Aliases = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["分享链接"] = ImportColumn.ShareUrl, ["链接"] = ImportColumn.ShareUrl,
-            ["share url"] = ImportColumn.ShareUrl, ["share link"] = ImportColumn.ShareUrl,
-            ["url"] = ImportColumn.ShareUrl, ["link"] = ImportColumn.ShareUrl,
-            ["提取码"] = ImportColumn.ExtractionCode, ["访问码"] = ImportColumn.ExtractionCode,
-            ["extraction code"] = ImportColumn.ExtractionCode, ["code"] = ImportColumn.ExtractionCode,
-            ["目标目录"] = ImportColumn.TargetPath, ["目标路径"] = ImportColumn.TargetPath, ["target path"] = ImportColumn.TargetPath,
-            ["外层目录"] = ImportColumn.OuterFolder, ["创建目录名称"] = ImportColumn.OuterFolder, ["outer folder"] = ImportColumn.OuterFolder,
-            ["指定账号"] = ImportColumn.Account, ["账号"] = ImportColumn.Account, ["account"] = ImportColumn.Account,
-            ["备注"] = ImportColumn.Note, ["note"] = ImportColumn.Note,
-        };
-
-        public static HeaderMap Create(IReadOnlyDictionary<int, string> values)
-        {
-            var indexes = new Dictionary<ImportColumn, int>();
-            foreach (var (index, rawValue) in values)
-            {
-                var value = string.Join(' ', rawValue.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-                if (!Aliases.TryGetValue(value, out var column)) continue;
-                if (!indexes.TryAdd(column, index))
-                    throw new ExcelImportException(ExcelImportErrorCode.DuplicateHeader, $"The workbook maps more than one header to {SafeName(column)}.");
-            }
-
-            if (!indexes.ContainsKey(ImportColumn.ShareUrl))
-                throw new ExcelImportException(ExcelImportErrorCode.MissingRequiredHeader, "The required share-link header is missing.");
-            return new HeaderMap(indexes);
-        }
-
-        public string? Get(IReadOnlyDictionary<int, string> values, ImportColumn column) =>
-            indexes.TryGetValue(column, out var index) && values.TryGetValue(index, out var value) && !string.IsNullOrWhiteSpace(value)
-                ? value.Trim()
-                : null;
-
-        public IReadOnlySet<int> Indexes { get; } = indexes.Values.ToHashSet();
-
-        private static string SafeName(ImportColumn column) => column switch
-        {
-            ImportColumn.ShareUrl => "share link",
-            ImportColumn.ExtractionCode => "extraction code",
-            ImportColumn.TargetPath => "target path",
-            ImportColumn.OuterFolder => "outer folder",
-            ImportColumn.Account => "account",
-            ImportColumn.Note => "note",
-            _ => "column",
-        };
-    }
 }

@@ -144,6 +144,14 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
                 UpdatedAt = DateTimeOffset.UtcNow,
             };
             await unit.Imports.UpdateRowsAsync([desired], cancellationToken).ConfigureAwait(false);
+            if (invalidatesPrecheck)
+            {
+                var payload = await unit.Imports.GetRowPayloadAsync(row.Id, cancellationToken).ConfigureAwait(false);
+                if (payload is not null)
+                    await unit.Imports.UpdateRowPayloadAsync(
+                        payload with { ResolvedOutputTitle = null },
+                        cancellationToken).ConfigureAwait(false);
+            }
         }, cancellationToken);
     }
 

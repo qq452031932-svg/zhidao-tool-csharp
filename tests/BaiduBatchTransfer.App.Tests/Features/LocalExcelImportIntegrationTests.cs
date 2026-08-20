@@ -4,6 +4,7 @@ using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
+using BaiduBatchTransfer.Infrastructure.Excel;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
@@ -29,7 +30,9 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
                 ["https://pan.baidu.com/s/integration-alpha", "a1b2"],
                 ["https://pan.baidu.com/s/integration-beta", "c3d4"],
             ]);
-        using var host = AppBootstrap.CreateHost(root);
+        var presenter = new ConfirmingMappingPresenter();
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(presenter));
         await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
         var availability = host.Services.GetRequiredService<IAdapterAvailability>();
         var vm = new ImportViewModel(
@@ -60,9 +63,14 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             var persisted = await unit.Imports.GetSessionAsync(completed.SessionId);
             Assert.NotNull(persisted);
             Assert.Equal("Excel", persisted.SourceType);
-            Assert.Equal("[REDACTED]", persisted.SourceName);
+            Assert.Equal("private-user-workbook.xlsx", persisted.SourceName);
+            Assert.NotNull(persisted.ColumnMappingFingerprint);
             Assert.Equal(2, persisted.TotalRows);
             Assert.Equal(2, persisted.ReadyRows);
+            Assert.Equal(2, (await unit.Imports.GetColumnDefinitionsAsync(completed.SessionId)).Count);
+            var staged = (await unit.Imports.GetRowsPageAsync(new(completed.SessionId, null, 1, 10))).Items;
+            foreach (var row in staged) Assert.NotNull(await unit.Imports.GetRowPayloadAsync(row.Id));
+            Assert.Equal(presenter.LastMapping!.Fingerprint, persisted.ColumnMappingFingerprint);
             await unit.RollbackAsync();
         }
 
@@ -97,6 +105,7 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         Assert.Contains(statuses, status => status.Contains("正在解析并写入草稿", StringComparison.Ordinal));
         Assert.Contains("导入完成，请分页检查异常、重复和账号映射。", statuses);
         Assert.All(statuses, status => Assert.DoesNotContain(workbookPath, status, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(1, presenter.ConfirmationCount);
     }
 
     [Fact]
@@ -105,7 +114,9 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         Directory.CreateDirectory(root);
         var workbookPath = Path.Combine(root, "secret-token-invalid.xlsx");
         await File.WriteAllTextAsync(workbookPath, "not an Open XML workbook");
-        using var host = AppBootstrap.CreateHost(root);
+        var presenter = new ConfirmingMappingPresenter();
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(presenter));
         await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
         var vm = new ImportViewModel(
             host.Services.GetRequiredService<IImportWorkflow>(),
@@ -115,11 +126,41 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
 
         await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
 
-        Assert.True(vm.CanResumeImport);
-        Assert.Equal("导入中断，已保存的进度可以继续。", vm.StatusMessage);
+        Assert.False(vm.CanResumeImport);
+        Assert.Equal("Excel 文件无法读取，请确认文件未损坏且格式为 .xlsx。", vm.StatusMessage);
         Assert.DoesNotContain(workbookPath, vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("OpenXml", vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Exception", vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, presenter.ConfirmationCount);
+        await using var connection = await host.Services.GetRequiredService<SqliteConnectionFactory>().OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM ImportSessions;";
+        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
+    }
+
+    [Fact]
+    public async Task CancellingColumnMappingCreatesNoImportSession()
+    {
+        Directory.CreateDirectory(root);
+        var workbookPath = Path.Combine(root, "cancelled.xlsx");
+        WriteWorkbook(workbookPath, [["https://pan.baidu.com/s/id", "a1b2"]]);
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(new CancellingMappingPresenter()));
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var vm = new ImportViewModel(
+            host.Services.GetRequiredService<IImportWorkflow>(),
+            host.Services.GetRequiredService<IImportPreviewPageSource>(),
+            new FakeDialogService(workbookPath),
+            host.Services.GetRequiredService<IAdapterAvailability>());
+
+        await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
+
+        Assert.Null(vm.SessionId);
+        Assert.False(vm.CanResumeImport);
+        await using var connection = await host.Services.GetRequiredService<SqliteConnectionFactory>().OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM ImportSessions;";
+        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
     }
 
     public void Dispose()
@@ -176,5 +217,30 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public string? PickExcelFile() => selectedPath;
+    }
+
+    private sealed class ConfirmingMappingPresenter : IExcelColumnMappingPresenter
+    {
+        public int ConfirmationCount { get; private set; }
+        public ConfirmedImportColumnMapping? LastMapping { get; private set; }
+
+        public Task<ConfirmedImportColumnMapping?> ConfirmAsync(
+            TabularWorkbookInspection inspection,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ConfirmationCount++;
+            var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+            LastMapping = new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns);
+            return Task.FromResult<ConfirmedImportColumnMapping?>(LastMapping);
+        }
+    }
+
+    private sealed class CancellingMappingPresenter : IExcelColumnMappingPresenter
+    {
+        public Task<ConfirmedImportColumnMapping?> ConfirmAsync(
+            TabularWorkbookInspection inspection,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<ConfirmedImportColumnMapping?>(null);
     }
 }

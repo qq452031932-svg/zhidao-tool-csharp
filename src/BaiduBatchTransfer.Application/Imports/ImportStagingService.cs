@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Core.Services;
+using System.Text.Json;
 
 namespace BaiduBatchTransfer.Application.Imports;
 
@@ -19,7 +20,9 @@ public sealed record ImportRequest(
     string SourceType,
     string SourceName,
     TransferMode TransferMode = TransferMode.Distribution,
-    Guid? AppendToBatchJobId = null)
+    Guid? AppendToBatchJobId = null,
+    ConfirmedImportColumnMapping? ColumnMapping = null,
+    IReadOnlyList<TabularInspectionColumn>? SourceColumns = null)
 {
     public override string ToString() =>
         $"ImportRequest {{ SessionId = {SessionId}, SourceType = {SourceType}, SourceName = [REDACTED], TransferMode = {TransferMode}, AppendToBatchJobId = {AppendToBatchJobId} }}";
@@ -75,11 +78,30 @@ public sealed class ImportStagingService
             "Parsing",
             0, 0, 0, 0, 0,
             null, null, request.AppendToBatchJobId,
-            now, now));
+            now, now,
+            request.ColumnMapping?.Fingerprint));
 
         await using (var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
         {
             await unit.Imports.AddSessionAsync(progress.Session, cancellationToken).ConfigureAwait(false);
+            if (request.ColumnMapping is not null)
+            {
+                var headers = (request.SourceColumns ?? Enumerable.Range(0, request.ColumnMapping.SourceColumnCount)
+                    .Select(index => new TabularInspectionColumn(index, null)).ToArray())
+                    .ToDictionary(column => column.SourceColumnIndex);
+                if (headers.Count != request.ColumnMapping.SourceColumnCount ||
+                    request.ColumnMapping.Columns.Any(column => !headers.ContainsKey(column.SourceColumnIndex)))
+                    throw new ArgumentException("Confirmed mapping columns must match inspected source columns.", nameof(request));
+                await unit.Imports.SetColumnDefinitionsAsync(
+                    request.SessionId,
+                    request.ColumnMapping.Columns.Select(column => new ImportColumnDefinitionRecord(
+                        request.SessionId,
+                        column.SourceColumnIndex,
+                        headers[column.SourceColumnIndex].Header,
+                        PersistedRole(column.Role),
+                        column.Role == TabularImportColumnRole.ShareUrl)),
+                    cancellationToken).ConfigureAwait(false);
+            }
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -355,8 +377,11 @@ public sealed class ImportStagingService
         IReadOnlyList<ImportSourceRow> chunk,
         CancellationToken cancellationToken)
     {
-        var candidates = await Task.WhenAll(chunk.Select(row => ResolveAsync(row, session.Id, cancellationToken)))
+        var resolved = await Task.WhenAll(chunk.Select(async source => new ResolvedCandidate(
+            await ResolveAsync(source, session.Id, cancellationToken).ConfigureAwait(false),
+            source)))
             .ConfigureAwait(false);
+        var candidates = resolved.Select(item => item.Row).ToArray();
         await using var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false);
         var classified = new List<StagedImportRowRecord>(candidates.Length);
         var localFirst = new Dictionary<string, StagedImportRowRecord>(StringComparer.Ordinal);
@@ -375,6 +400,12 @@ public sealed class ImportStagingService
         var now = DateTimeOffset.UtcNow;
         session = ApplyCounters(session, classified) with { UpdatedAt = now };
         await unit.Imports.AddRowsAsync(classified, cancellationToken).ConfigureAwait(false);
+        await unit.Imports.AddRowPayloadsAsync(resolved.Select(item => new StagedImportRowPayloadRecord(
+            item.Row.Id,
+            item.Source.SourceTitle,
+            item.Source.SourceTitle,
+            item.Source.OriginalExtractedUrl ?? item.Source.ShareUrl,
+            JsonSerializer.Serialize(item.Source.RawValues))), cancellationToken).ConfigureAwait(false);
         await unit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
         await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         return session;
@@ -628,4 +659,14 @@ public sealed class ImportStagingService
     }
 
     private sealed record RowTransition(StagedImportRowRecord Before, StagedImportRowRecord After);
+
+    private sealed record ResolvedCandidate(StagedImportRowRecord Row, ImportSourceRow Source);
+
+    private static string PersistedRole(TabularImportColumnRole role) => role switch
+    {
+        TabularImportColumnRole.SourceTitle => "Title",
+        TabularImportColumnRole.ShareUrl => "ShareUrl",
+        TabularImportColumnRole.ExtractionCode => "ExtractionCode",
+        _ => "Preserve",
+    };
 }

@@ -7,6 +7,7 @@ using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
+using BaiduBatchTransfer.Infrastructure.Excel;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace BaiduBatchTransfer.App.Tests;
@@ -30,6 +31,9 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.IsType<UnavailableAdapterAvailability>(host.Services.GetRequiredService<IAdapterAvailability>());
         Assert.IsType<BaiduAccountLoginLauncher>(host.Services.GetRequiredService<IAccountLoginLauncher>());
         Assert.IsType<LocalImportWorkflow>(host.Services.GetRequiredService<IImportWorkflow>());
+        Assert.IsType<ExcelColumnMappingPresenter>(host.Services.GetRequiredService<IExcelColumnMappingPresenter>());
+        Assert.NotNull(host.Services.GetRequiredService<OpenXmlWorkbookInspector>());
+        Assert.NotNull(host.Services.GetRequiredService<ExcelColumnSuggestionEngine>());
         Assert.NotNull(host.Services.GetRequiredService<IImportPreviewPageSource>());
         Assert.NotNull(host.Services.GetRequiredService<IWizardBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());

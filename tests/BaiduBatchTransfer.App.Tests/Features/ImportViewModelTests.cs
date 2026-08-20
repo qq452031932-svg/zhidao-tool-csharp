@@ -14,6 +14,37 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class ImportViewModelTests
 {
     [Fact]
+    public void ImportWorkflowExceptionToStringDoesNotExposeInnerPathOrContent()
+    {
+        var error = new ImportWorkflowException(
+            ImportUiError.InvalidWorkbook,
+            new IOException(@"C:\private\secret-workbook.xlsx contains https://pan.baidu.com/s/private"));
+
+        Assert.DoesNotContain("secret-workbook", error.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("pan.baidu.com", error.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ExcelMappingViewModelSupportsManualRemapAndRequiresOneLinkColumn()
+    {
+        var inspection = new TabularWorkbookInspection(
+            1,
+            [new(0, "名称"), new(1, "未知列")],
+            [new(2, ["课程", "https://pan.baidu.com/s/id"])]);
+        var vm = new ExcelColumnMappingViewModel(
+            inspection,
+            new ExcelColumnSuggestionEngine().Suggest(inspection));
+
+        vm.Columns[0].Role = TabularImportColumnRole.Preserve;
+        vm.Columns[1].Role = TabularImportColumnRole.ShareUrl;
+        Assert.True(vm.TryConfirm());
+        Assert.Equal(1, vm.ConfirmedMapping!.ShareUrlColumnIndex);
+
+        vm.Columns[1].Role = TabularImportColumnRole.Preserve;
+        Assert.False(vm.TryConfirm());
+        Assert.Equal("必须且只能选择一列作为分享链接。", vm.ValidationMessage);
+    }
+    [Fact]
     public async Task CancellationBeforeSessionCommitDoesNotClaimAResumableDraft()
     {
         var workflow = new FakeImportWorkflow { Cancel = true };
@@ -635,6 +666,8 @@ public sealed class ImportViewModelTests
                 staging,
                 new TextImportParser(),
                 new OpenXmlImportReader(),
+                new OpenXmlWorkbookInspector(),
+                new ConfirmingMappingPresenter(),
                 new DraftRowEditingService(unitOfWorkFactory),
                 unitOfWorkFactory);
             return new(root, workflow);
@@ -644,6 +677,18 @@ public sealed class ImportViewModelTests
         {
             await Task.Yield();
             if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+        }
+    }
+
+    private sealed class ConfirmingMappingPresenter : IExcelColumnMappingPresenter
+    {
+        public Task<ConfirmedImportColumnMapping?> ConfirmAsync(
+            TabularWorkbookInspection inspection,
+            CancellationToken cancellationToken = default)
+        {
+            var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+            return Task.FromResult<ConfirmedImportColumnMapping?>(
+                new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns));
         }
     }
 

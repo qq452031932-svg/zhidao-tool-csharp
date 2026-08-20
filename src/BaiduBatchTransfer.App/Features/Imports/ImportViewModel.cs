@@ -21,6 +21,9 @@ public sealed class ImportWorkflowException(ImportUiError error, Exception? inne
     : Exception("The import workflow failed.", innerException)
 {
     public ImportUiError Error { get; } = error;
+
+    public override string ToString() =>
+        $"ImportWorkflowException {{ Error = {Error}, Details = [REDACTED] }}";
 }
 
 public sealed record ImportDraftStatistics(

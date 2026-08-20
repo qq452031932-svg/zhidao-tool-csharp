@@ -200,6 +200,44 @@ public sealed class DraftWorkflowServicesTests
     }
 
     [Fact]
+    public async Task LinkAndCodeEditsPreserveOriginalPayloadButInvalidateDerivedTitle()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var row = Row(sessionId, 1, "old") with
+        {
+            PrecheckStatus = "Succeeded",
+            PrecheckedAt = Jobs.BatchTestData.Now,
+        };
+        await database.SeedAsync([], Session(sessionId, 1, ready: 1), [row]);
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.AddRowPayloadsAsync([
+                new(row.Id, "原始标题", "解析后标题", "https://pan.baidu.com/s/old", "[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]"),
+            ]);
+            await seed.CommitAsync();
+        }
+
+        await new DraftRowEditingService(database.UnitOfWorkFactory).EditAsync(
+            new DraftRowEditRequest(
+                sessionId,
+                row.Id,
+                shareUrl: "https://pan.baidu.com/s/new",
+                extractionCode: "n3w4"),
+            TransferMode.Distribution);
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var edited = await read.Imports.GetRowByIdAsync(row.Id);
+        var payload = await read.Imports.GetRowPayloadAsync(row.Id);
+        Assert.Null(edited!.PrecheckStatus);
+        Assert.Equal("https://pan.baidu.com/s/new", edited.ShareUrl);
+        Assert.Equal("原始标题", payload!.SourceTitle);
+        Assert.Null(payload.ResolvedOutputTitle);
+        Assert.Equal("https://pan.baidu.com/s/old", payload.OriginalShareUrl);
+        Assert.Equal("[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]", payload.RawValuesJson);
+    }
+
+    [Fact]
     public async Task ConflictResolutionPreservesInvalidAndExcludedRowsInTheSameIdentityGroup()
     {
         await using var database = await Jobs.BatchTestDatabase.CreateAsync();

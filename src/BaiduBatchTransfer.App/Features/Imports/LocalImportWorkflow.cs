@@ -1,4 +1,5 @@
 using System.IO;
+using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -24,6 +25,8 @@ public sealed class LocalImportWorkflow(
     ImportStagingService stagingService,
     TextImportParser textParser,
     OpenXmlImportReader excelReader,
+    OpenXmlWorkbookInspector excelInspector,
+    IExcelColumnMappingPresenter mappingPresenter,
     DraftRowEditingService editingService,
     IUnitOfWorkFactory unitOfWorkFactory) : IImportWorkflow
 {
@@ -89,15 +92,23 @@ public sealed class LocalImportWorkflow(
         if (sessionId == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(sessionId));
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         var fullPath = Path.GetFullPath(filePath);
-        var source = ReplaySource.ForExcel(fullPath);
-        RememberReplaySource(sessionId, source);
         var replayProgress = new ReplayProgress(committedProgress);
         var stagingCompleted = false;
         try
         {
+            var inspection = await InspectExcelAsync(fullPath, cancellationToken).ConfigureAwait(false);
+            var mapping = await mappingPresenter.ConfirmAsync(inspection, cancellationToken).ConfigureAwait(false);
+            if (mapping is null) throw new OperationCanceledException("Excel column mapping was cancelled.");
+            var source = ReplaySource.ForExcel(fullPath, mapping, inspection.Columns);
+            RememberReplaySource(sessionId, source);
             await stagingService.StageAsync(
-                new ImportRequest(sessionId, "Excel", "[REDACTED]"),
-                ReadExcelAsync(fullPath, cancellationToken),
+                new ImportRequest(
+                    sessionId,
+                    "Excel",
+                    Path.GetFileName(fullPath),
+                    ColumnMapping: mapping,
+                    SourceColumns: inspection.Columns),
+                ReadExcelAsync(fullPath, mapping, cancellationToken),
                 replayProgress,
                 cancellationToken).ConfigureAwait(false);
             stagingCompleted = true;
@@ -134,7 +145,7 @@ public sealed class LocalImportWorkflow(
             throw new ImportWorkflowException(ImportUiError.InvalidData);
         var rows = source.Kind == ReplaySourceKind.Text
             ? ReadTextAsync(source.Text!, cancellationToken)
-            : ReadExcelAsync(source.FilePath!, cancellationToken);
+            : ReadExcelAsync(source.FilePath!, source.Mapping!, cancellationToken);
         try
         {
             await stagingService.ResumeAsync(
@@ -204,6 +215,7 @@ public sealed class LocalImportWorkflow(
 
     private async IAsyncEnumerable<ImportSourceRow> ReadExcelAsync(
         string filePath,
+        ConfirmedImportColumnMapping mapping,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await using var stream = new FileStream(
@@ -213,8 +225,22 @@ public sealed class LocalImportWorkflow(
             FileShare.Read,
             bufferSize: 64 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        await foreach (var row in excelReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false))
+        await foreach (var row in excelReader.ReadAsync(stream, mapping, cancellationToken).ConfigureAwait(false))
             yield return row;
+    }
+
+    private async Task<TabularWorkbookInspection> InspectExcelAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = new FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 64 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return await excelInspector.InspectAsync(stream, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ImportWorkflowResult> LoadResultAsync(
@@ -283,10 +309,19 @@ public sealed class LocalImportWorkflow(
 
     private enum ReplaySourceKind { Text, Excel }
 
-    private sealed record ReplaySource(ReplaySourceKind Kind, string? Text, string? FilePath)
+    private sealed record ReplaySource(
+        ReplaySourceKind Kind,
+        string? Text,
+        string? FilePath,
+        ConfirmedImportColumnMapping? Mapping,
+        IReadOnlyList<TabularInspectionColumn>? SourceColumns)
     {
-        public static ReplaySource ForText(string text) => new(ReplaySourceKind.Text, text, null);
-        public static ReplaySource ForExcel(string path) => new(ReplaySourceKind.Excel, null, path);
+        public static ReplaySource ForText(string text) => new(ReplaySourceKind.Text, text, null, null, null);
+        public static ReplaySource ForExcel(
+            string path,
+            ConfirmedImportColumnMapping mapping,
+            IReadOnlyList<TabularInspectionColumn> sourceColumns) =>
+            new(ReplaySourceKind.Excel, null, path, mapping, sourceColumns.ToArray());
         public override string ToString() => "ReplaySource { Content = [REDACTED] }";
     }
 

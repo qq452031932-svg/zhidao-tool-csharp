@@ -3,6 +3,7 @@ using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Tests.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using System.Text.Json;
 
 namespace BaiduBatchTransfer.Application.Tests.Imports;
 
@@ -315,6 +316,60 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task ExcelStagingPersistsConfirmedMappingAndRawPayloadWithTheSameRowIdentity()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var service = new ImportStagingService(
+            database.UnitOfWorkFactory.BeginAsync,
+            new SequenceResolver(),
+            chunkSize: 2,
+            maxResolutionConcurrency: 2);
+        var sessionId = Guid.NewGuid();
+        var mapping = new ConfirmedImportColumnMapping(1,
+        [
+            new(0, TabularImportColumnRole.SourceTitle),
+            new(1, TabularImportColumnRole.ShareUrl),
+            new(2, TabularImportColumnRole.ExtractionCode),
+            new(3, TabularImportColumnRole.Preserve),
+            new(4, TabularImportColumnRole.Preserve),
+        ]);
+        var raw = new[] { "  标题  ", "说明 https://pan.baidu.com/s/id", " a1b2 ", "\t=RAW()  ", "" };
+
+        await service.StageAsync(
+            new ImportRequest(
+                sessionId,
+                "Excel",
+                "rows.xlsx",
+                ColumnMapping: mapping,
+                SourceColumns:
+                [
+                    new(0, "标题"), new(1, "链接"), new(2, "提取码"), new(3, "原字段"), new(4, "空字段"),
+                ]),
+            ToAsync(new ImportSourceRow(
+                2,
+                "https://pan.baidu.com/s/id",
+                "a1b2",
+                SourceTitle: "标题",
+                OriginalExtractedUrl: "https://pan.baidu.com/s/id",
+                RawValues: raw)));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var session = await read.Imports.GetSessionAsync(sessionId);
+        var definitions = await read.Imports.GetColumnDefinitionsAsync(sessionId);
+        var staged = Assert.Single((await read.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10))).Items);
+        var payload = await read.Imports.GetRowPayloadAsync(staged.Id);
+
+        Assert.Equal(mapping.Fingerprint, session!.ColumnMappingFingerprint);
+        Assert.Equal(new[] { "Title", "ShareUrl", "ExtractionCode", "Preserve", "Preserve" }, definitions.Select(x => x.MappedRole));
+        Assert.NotNull(payload);
+        Assert.Equal(staged.Id, payload!.StagedImportRowId);
+        Assert.Equal("标题", payload.SourceTitle);
+        Assert.Equal("标题", payload.ResolvedOutputTitle);
+        Assert.Equal("https://pan.baidu.com/s/id", payload.OriginalShareUrl);
+        Assert.Equal(raw, JsonSerializer.Deserialize<string[]>(payload.RawValuesJson));
+    }
+
+    [Fact]
     public async Task ProgressReportsOnlyTheSessionAndChunksWhoseTransactionsCommitted()
     {
         var store = new ImportStore { FailCommitAttempt = 3 };
@@ -405,6 +460,7 @@ public sealed class ImportStagingServiceTests
         Assert.Equal(3, session!.TotalRows);
         Assert.Equal(3, session.ReadyRows);
         Assert.Equal(3, rows.TotalCount);
+        foreach (var row in rows.Items) Assert.NotNull(await read.Imports.GetRowPayloadAsync(row.Id));
         Assert.Equal(
             [
                 new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0),
@@ -625,6 +681,7 @@ public sealed class ImportStagingServiceTests
     {
         public ImportSessionRecord? Session { get; set; }
         public List<StagedImportRowRecord> Rows { get; } = [];
+        public Dictionary<Guid, StagedImportRowPayloadRecord> Payloads { get; } = [];
         public List<string> Events { get; } = [];
         public List<int> AddBatchSizes { get; } = [];
         public int ActiveUnits { get; private set; }
@@ -719,7 +776,7 @@ public sealed class ImportStagingServiceTests
 
             public Task<int> GetLastSourceRowNumberAsync(Guid sessionId, CancellationToken cancellationToken = default) =>
                 Task.FromResult(store.Rows
-                    .Where(row => row.ImportSessionId == sessionId)
+                    .Where(row => row.ImportSessionId == sessionId && store.Payloads.ContainsKey(row.Id))
                     .Select(row => row.SourceRowNumber)
                     .DefaultIfEmpty(0)
                     .Max());
@@ -781,6 +838,27 @@ public sealed class ImportStagingServiceTests
                     candidates,
                     filtered.LongLength,
                     hasMore ? candidates[^1].SourceRowNumber : null));
+            }
+
+            public Task AddRowPayloadsAsync(
+                IEnumerable<StagedImportRowPayloadRecord> payloads,
+                CancellationToken cancellationToken = default)
+            {
+                foreach (var payload in payloads) store.Payloads.Add(payload.StagedImportRowId, payload);
+                return Task.CompletedTask;
+            }
+
+            public Task<StagedImportRowPayloadRecord?> GetRowPayloadAsync(
+                Guid stagedImportRowId,
+                CancellationToken cancellationToken = default) =>
+                Task.FromResult(store.Payloads.GetValueOrDefault(stagedImportRowId));
+
+            public Task UpdateRowPayloadAsync(
+                StagedImportRowPayloadRecord payload,
+                CancellationToken cancellationToken = default)
+            {
+                store.Payloads[payload.StagedImportRowId] = payload;
+                return Task.CompletedTask;
             }
         }
     }

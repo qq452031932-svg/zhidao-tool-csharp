@@ -81,7 +81,7 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
 
     public async Task<int> GetLastSourceRowNumberAsync(Guid sessionId, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("SELECT COALESCE(MAX(SourceRowNumber),0) FROM StagedImportRows WHERE ImportSessionId=$session;");
+        await using var c = Command("SELECT COALESCE(MAX(r.SourceRowNumber),0) FROM StagedImportRows r JOIN StagedImportRowPayloads p ON p.StagedImportRowId=r.Id WHERE r.ImportSessionId=$session;");
         Add(c,"$session",Id(sessionId));
         return Convert.ToInt32(await c.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
     }
@@ -364,6 +364,23 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             ? new(Guid.Parse(reader.GetString(0)), reader.IsDBNull(1) ? null : reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetString(3), reader.GetString(4))
             : null;
+    }
+
+    public async Task UpdateRowPayloadAsync(
+        StagedImportRowPayloadRecord payload,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        using var document = JsonDocument.Parse(payload.RawValuesJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array ||
+            document.RootElement.EnumerateArray().Any(value => value.ValueKind is not (JsonValueKind.String or JsonValueKind.Null)))
+            throw new ArgumentException("Raw import values must be a positional JSON array.", nameof(payload));
+        await using var command = Command("UPDATE StagedImportRowPayloads SET SourceTitle=$source,ResolvedOutputTitle=$resolved,OriginalShareUrl=$url,RawValuesJson=$raw WHERE StagedImportRowId=$row;");
+        Add(command, "$source", payload.SourceTitle); Add(command, "$resolved", payload.ResolvedOutputTitle);
+        Add(command, "$url", payload.OriginalShareUrl); Add(command, "$raw", payload.RawValuesJson);
+        Add(command, "$row", Id(payload.StagedImportRowId));
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidOperationException("The staged import row payload no longer exists.");
     }
 
     private static StagedImportRowRecord ReadRow(SqliteDataReader r) => new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),r.GetInt32(2),r.GetString(3),r.IsDBNull(4)?null:r.GetString(4),r.IsDBNull(5)?null:r.GetString(5),r.IsDBNull(6)?null:r.GetString(6),r.IsDBNull(7)?null:r.GetString(7),r.IsDBNull(8)?null:r.GetString(8),ReadNullableId(r,9),r.IsDBNull(10)?null:r.GetString(10),r.GetString(11),ReadNullableId(r,12),r.IsDBNull(13)?null:r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),ReadNullableTime(r,16),ReadTime(r,17));

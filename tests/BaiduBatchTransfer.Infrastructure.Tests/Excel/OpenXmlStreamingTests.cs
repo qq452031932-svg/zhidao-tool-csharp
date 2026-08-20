@@ -10,6 +10,38 @@ namespace BaiduBatchTransfer.Infrastructure.Tests.Excel;
 public sealed class OpenXmlStreamingTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-openxml-{Guid.NewGuid():N}");
+    private static readonly ConfirmedImportColumnMapping StandardMapping = new(
+        headerRowNumber: 1,
+        [
+            new(0, TabularImportColumnRole.ShareUrl),
+            new(1, TabularImportColumnRole.ExtractionCode),
+            new(2, TabularImportColumnRole.Preserve),
+            new(3, TabularImportColumnRole.Preserve),
+            new(4, TabularImportColumnRole.Preserve),
+            new(5, TabularImportColumnRole.Preserve),
+        ]);
+
+    [Fact]
+    public void RelationshipGraphTraversalTerminatesOnCyclesAndRejectsExcessiveEdges()
+    {
+        var first = new RelationshipNode();
+        var second = new RelationshipNode();
+        first.Children.Add(second);
+        second.Children.Add(first);
+
+        Assert.False(OpenXmlImportReader.HasUnsafeRelationshipGraph(
+            first,
+            node => node.External,
+            node => node.Children,
+            maximumEdges: 2));
+
+        first.Children.Add(new RelationshipNode());
+        Assert.True(OpenXmlImportReader.HasUnsafeRelationshipGraph(
+            first,
+            node => node.External,
+            node => node.Children,
+            maximumEdges: 2));
+    }
 
     [Fact]
     public async Task ReaderMapsHeadersSharedStringsAndPreservesSourceRowNumber()
@@ -19,20 +51,21 @@ public sealed class OpenXmlStreamingTests : IDisposable
         WriteSharedStringWorkbook(path);
 
         await using var stream = File.OpenRead(path);
-        var rows = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream));
+        var rows = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, StandardMapping));
 
         var row = Assert.Single(rows);
         Assert.Equal(3, row.SourceRowNumber);
         Assert.Equal("https://pan.baidu.com/s/id", row.ShareUrl);
         Assert.Equal("a1B2", row.ExtractionCode);
-        Assert.Equal("/课程", row.TargetPath);
-        Assert.Equal("外层", row.CreateFolderName);
-        Assert.Equal("账号甲", row.RequestedAccountName);
-        Assert.Equal("备注", row.Note);
+        Assert.Null(row.TargetPath);
+        Assert.Null(row.CreateFolderName);
+        Assert.Null(row.RequestedAccountName);
+        Assert.Null(row.Note);
+        Assert.Equal(new[] { "https://pan.baidu.com/s/id", "a1B2", "/课程", "外层", "账号甲", "备注" }, row.RawValues);
     }
 
     [Fact]
-    public async Task ReaderReportsMissingAndDuplicateMappedHeadersSafely()
+    public async Task ConfirmedMappingReplacesImplicitHeaderAuthorization()
     {
         Directory.CreateDirectory(root);
         var missing = Path.Combine(root, "missing.xlsx");
@@ -42,17 +75,22 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using (var stream = File.OpenRead(missing))
         {
-            var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-                ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
-            Assert.Equal(ExcelImportErrorCode.MissingRequiredHeader, error.Code);
-            Assert.DoesNotContain("text", error.ToString(), StringComparison.Ordinal);
+            var rows = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(
+                stream,
+                new ConfirmedImportColumnMapping(1, [new(0, TabularImportColumnRole.ShareUrl)])));
+            Assert.Single(rows);
         }
 
         await using (var stream = File.OpenRead(duplicate))
         {
-            var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-                ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
-            Assert.Equal(ExcelImportErrorCode.DuplicateHeader, error.Code);
+            var rows = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(
+                stream,
+                new ConfirmedImportColumnMapping(1,
+                [
+                    new(0, TabularImportColumnRole.ShareUrl),
+                    new(1, TabularImportColumnRole.Preserve),
+                ])));
+            Assert.Empty(rows);
         }
     }
 
@@ -65,7 +103,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using var stream = File.OpenRead(path);
         var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(MaxRows: 1)).ReadAsync(stream)));
+            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(MaxRows: 1)).ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.RowLimitExceeded, error.Code);
     }
@@ -83,7 +121,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using var stream = File.OpenRead(path);
         var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
+            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.RowLimitExceeded, error.Code);
     }
@@ -97,7 +135,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using var stream = File.OpenRead(path);
         var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(MaxCellsPerRow: 8)).ReadAsync(stream)));
+            ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(MaxCellsPerRow: 8)).ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.CellLimitExceeded, error.Code);
         Assert.Equal(9, error.ObservedCount);
@@ -114,7 +152,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using var stream = File.OpenRead(path);
         var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream)));
+            ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.InvalidRowOrder, error.Code);
         Assert.DoesNotContain("pan.baidu.com", error.ToString(), StringComparison.Ordinal);
@@ -130,7 +168,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
         await using var stream = File.OpenRead(path);
         var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
             ReadAllAsync(new OpenXmlImportReader(
-                new OpenXmlImportLimits(MaxArchiveEntries: 2)).ReadAsync(stream)));
+                new OpenXmlImportLimits(MaxArchiveEntries: 2)).ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
     }
@@ -147,7 +185,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
             ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(
                 MaxPartBytes: 1_024,
                 MaxArchiveEntries: 10,
-                MaxTotalUncompressedBytes: 1_000)).ReadAsync(stream)));
+                MaxTotalUncompressedBytes: 1_000)).ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
     }
@@ -165,7 +203,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
             ReadAllAsync(new OpenXmlImportReader(new OpenXmlImportLimits(
                 MaxPartBytes: 1_024,
                 MaxArchiveEntries: 10,
-                MaxTotalUncompressedBytes: 1_024)).ReadAsync(stream)));
+                MaxTotalUncompressedBytes: 1_024)).ReadAsync(stream, StandardMapping)));
 
         Assert.Equal(ExcelImportErrorCode.UnsafePackage, error.Code);
     }
@@ -183,7 +221,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await using (var stream = File.OpenRead(path))
         {
-            await foreach (var row in new OpenXmlImportReader().ReadAsync(stream))
+            await foreach (var row in new OpenXmlImportReader().ReadAsync(stream, StandardMapping))
             {
                 count++;
                 if ((count & 4095) == 0) peak = Math.Max(peak, GC.GetTotalMemory(forceFullCollection: false));
@@ -210,7 +248,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
             await new OpenXmlResultWriter().WriteAsync(result, ResultRows());
 
         Assert.Equal(
-            new[] { "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注" },
+            new[] { "源标题", "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注" },
             ReadHeader(templatePath));
         Assert.Equal(
             new[] { "源行号", "分享链接", "状态", "账号", "目标目录", "备注", "错误" },
@@ -274,7 +312,7 @@ public sealed class OpenXmlStreamingTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var _ in new OpenXmlImportReader().ReadAsync(stream, cancellation.Token))
+            await foreach (var _ in new OpenXmlImportReader().ReadAsync(stream, StandardMapping, cancellation.Token))
             {
                 if (++count == 100) cancellation.Cancel();
             }
@@ -557,5 +595,11 @@ public sealed class OpenXmlStreamingTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+    }
+
+    private sealed class RelationshipNode
+    {
+        public bool External { get; init; }
+        public List<RelationshipNode> Children { get; } = [];
     }
 }

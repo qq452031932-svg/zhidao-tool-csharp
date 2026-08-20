@@ -67,4 +67,8 @@ public interface IImportRepository
         Guid stagedImportRowId,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Raw import payloads are not supported by this repository.");
+    Task UpdateRowPayloadAsync(
+        StagedImportRowPayloadRecord payload,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Raw import payload updates are not supported by this repository.");
 }

@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace BaiduBatchTransfer.Core.Abstractions;
 
 public sealed record ImportSourceRow
@@ -11,7 +13,10 @@ public sealed record ImportSourceRow
         string? RequestedAccountName = null,
         Guid? MappedAccountId = null,
         string? Note = null,
-        string? ValidationError = null)
+        string? ValidationError = null,
+        string? SourceTitle = null,
+        string? OriginalExtractedUrl = null,
+        IEnumerable<string>? RawValues = null)
     {
         if (SourceRowNumber <= 0)
         {
@@ -27,6 +32,9 @@ public sealed record ImportSourceRow
         this.MappedAccountId = MappedAccountId;
         this.Note = EmptyToNull(Note);
         this.ValidationError = EmptyToNull(ValidationError);
+        this.SourceTitle = EmptyToNull(SourceTitle);
+        this.OriginalExtractedUrl = EmptyToNull(OriginalExtractedUrl);
+        this.RawValues = (RawValues ?? []).Select(value => value ?? string.Empty).ToImmutableArray();
     }
 
     public int SourceRowNumber { get; }
@@ -38,6 +46,9 @@ public sealed record ImportSourceRow
     public Guid? MappedAccountId { get; }
     public string? Note { get; }
     public string? ValidationError { get; }
+    public string? SourceTitle { get; }
+    public string? OriginalExtractedUrl { get; }
+    public IReadOnlyList<string> RawValues { get; }
 
     public override string ToString() =>
         $"ImportSourceRow {{ SourceRowNumber = {SourceRowNumber}, UserContent = [REDACTED], ValidationError = {(ValidationError is null ? "none" : "present")} }}";
