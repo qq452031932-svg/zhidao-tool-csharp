@@ -266,7 +266,7 @@ public sealed class DpapiSessionProtectorTests
         "cookie-value",
         ".baidu.com",
         "/",
-        new DateTimeOffset(2026, 8, 20, 9, 0, 0, TimeSpan.Zero),
+        new DateTimeOffset(2100, 1, 1, 0, 0, 0, TimeSpan.Zero),
         isSecure: true,
         isHttpOnly: true);
 }

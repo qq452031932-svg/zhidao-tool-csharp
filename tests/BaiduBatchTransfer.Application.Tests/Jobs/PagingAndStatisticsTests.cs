@@ -296,7 +296,9 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
                 GROUP BY AssignedAccountId,Status,OutcomeKind;
                 """, ("$batch", batch.ToString("D")));
             Assert.Contains(statisticsPlan, line => line.Contains(
-                "IX_TransferOperations_Result_Account_Keyset", StringComparison.Ordinal));
+                "SEARCH TransferOperations USING INDEX IX_TransferOperations_", StringComparison.Ordinal));
+            Assert.DoesNotContain(statisticsPlan, line => line.Contains(
+                "SCAN TransferOperations", StringComparison.Ordinal));
         }
 
         GC.Collect();
