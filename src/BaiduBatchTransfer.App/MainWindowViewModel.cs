@@ -11,7 +11,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private readonly object createJobPage;
     private readonly IAccountLoginLauncher loginLauncher;
     private readonly IAccountManagementLauncher? accountManagementLauncher;
-    private readonly Func<CancellationToken, Task<int>>? refreshAccounts;
+    private readonly Func<Action<int>, CancellationToken, Task>? refreshAccounts;
     private object currentContent;
     private string currentPageTitle = "导入与草稿";
     private string statusMessage = "就绪";
@@ -23,7 +23,7 @@ public sealed class MainWindowViewModel : ObservableObject
         object createJobPage,
         IAccountLoginLauncher loginLauncher,
         IAccountManagementLauncher? accountManagementLauncher = null,
-        Func<CancellationToken, Task<int>>? refreshAccounts = null,
+        Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
         int initialActiveAccountCount = 0)
     {
         this.importPage = importPage ?? throw new ArgumentNullException(nameof(importPage));
@@ -141,8 +141,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private async Task RefreshAccountsAsync(CancellationToken cancellationToken)
     {
         if (refreshAccounts is null) return;
-        var count = await refreshAccounts(cancellationToken).ConfigureAwait(true);
-        AccountStatusMessage = FormatAccountStatus(count);
+        await refreshAccounts(
+            count => AccountStatusMessage = FormatAccountStatus(count),
+            cancellationToken).ConfigureAwait(true);
     }
 
     private static string FormatAccountStatus(int count) =>

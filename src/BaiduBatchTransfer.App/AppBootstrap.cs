@@ -152,25 +152,38 @@ public interface IWizardAccountProvider
     Task<IReadOnlyList<WizardAccountOption>> LoadEligibleAsync(CancellationToken cancellationToken = default);
 }
 
-public sealed class WizardAccountSummaryProvider(IWizardAccountProvider accountProvider) : IAccountSummaryProvider
+public sealed class WizardAccountSummaryProvider(SqliteConnectionFactory connectionFactory) : IAccountSummaryProvider
 {
-    public async Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default) =>
-        (await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(false)).Count;
+    public async Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await connectionFactory
+            .OpenConnectionAsync(cancellationToken)
+            .ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM Accounts WHERE Status='Active' AND IsEnabled=1 AND IsDeleted=0;";
+        var count = (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) ?? 0L);
+        return checked((int)count);
+    }
 }
 
 public sealed class WizardAccountProvider(IUnitOfWorkFactory unitOfWorkFactory) : IWizardAccountProvider
 {
+    private const int MaximumSnapshotSize = 1_000;
+
     public async Task<IReadOnlyList<WizardAccountOption>> LoadEligibleAsync(CancellationToken cancellationToken = default)
     {
-        var result = new List<WizardAccountOption>();
+        var result = new List<WizardAccountOption>(MaximumSnapshotSize);
         var pageNumber = 1;
-        while (true)
+        while (result.Count < MaximumSnapshotSize)
         {
             await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
-            var page = await unit.Accounts.GetPageAsync(new(pageNumber, 1_000), cancellationToken).ConfigureAwait(false);
-            result.AddRange(page.Items
-                .Where(account => account.Status == "Active" && account.IsEnabled && !account.IsDeleted)
-                .Select(account => new WizardAccountOption(
+            var page = await unit.Accounts
+                .GetPageAsync(new(pageNumber, MaximumSnapshotSize), cancellationToken)
+                .ConfigureAwait(false);
+            foreach (var account in page.Items)
+            {
+                if (account.Status != "Active" || !account.IsEnabled || account.IsDeleted) continue;
+                result.Add(new WizardAccountOption(
                     account.Id,
                     account.DisplayName,
                     account.Status,
@@ -178,11 +191,60 @@ public sealed class WizardAccountProvider(IUnitOfWorkFactory unitOfWorkFactory) 
                     account.IsDeleted,
                     account.CapacityTotal,
                     account.CapacityUsed,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0)));
+                    0, 0, 0, 0, 0, 0, 0, 0, 0));
+                if (result.Count == MaximumSnapshotSize) break;
+            }
             if (pageNumber * page.PageSize >= page.TotalCount) break;
             pageNumber++;
         }
         return result;
+    }
+}
+
+public sealed class AccountRefreshCoordinator
+{
+    private readonly IWizardAccountProvider accountProvider;
+    private readonly IAccountSummaryProvider accountSummaryProvider;
+    private readonly Action<IReadOnlyList<WizardAccountOption>> applySnapshot;
+    private readonly Func<Action, Task> dispatchAsync;
+    private readonly object generationGate = new();
+    private long refreshGeneration;
+
+    public AccountRefreshCoordinator(
+        IWizardAccountProvider accountProvider,
+        IAccountSummaryProvider accountSummaryProvider,
+        Action<IReadOnlyList<WizardAccountOption>> applySnapshot,
+        Func<Action, Task> dispatchAsync)
+    {
+        this.accountProvider = accountProvider ?? throw new ArgumentNullException(nameof(accountProvider));
+        this.accountSummaryProvider = accountSummaryProvider ?? throw new ArgumentNullException(nameof(accountSummaryProvider));
+        this.applySnapshot = applySnapshot ?? throw new ArgumentNullException(nameof(applySnapshot));
+        this.dispatchAsync = dispatchAsync ?? throw new ArgumentNullException(nameof(dispatchAsync));
+    }
+
+    public async Task RefreshAsync(
+        Action<int> applyActiveCount,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(applyActiveCount);
+        long generation;
+        lock (generationGate) generation = ++refreshGeneration;
+
+        var snapshotTask = accountProvider.LoadEligibleAsync(cancellationToken);
+        var countTask = accountSummaryProvider.GetActiveAccountCountAsync(cancellationToken);
+        await Task.WhenAll(snapshotTask, countTask).ConfigureAwait(false);
+        var snapshot = await snapshotTask.ConfigureAwait(false);
+        var activeCount = await countTask.ConfigureAwait(false);
+
+        await dispatchAsync(() =>
+        {
+            lock (generationGate)
+            {
+                if (generation != refreshGeneration) return;
+                applySnapshot(snapshot);
+                applyActiveCount(activeCount);
+            }
+        }).ConfigureAwait(false);
     }
 }
 
@@ -202,6 +264,7 @@ public sealed class AppShellFactory(
     IAdapterAvailability adapterAvailability,
     IAccountLoginLauncher loginLauncher,
     IAccountManagementLauncher accountManagementLauncher,
+    IAccountSummaryProvider accountSummaryProvider,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -209,23 +272,24 @@ public sealed class AppShellFactory(
         var accounts = runtimeState.CoordinatorMayStart
             ? await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(true)
             : [];
+        var initialActiveAccountCount = runtimeState.CoordinatorMayStart
+            ? await accountSummaryProvider.GetActiveAccountCountAsync(cancellationToken).ConfigureAwait(true)
+            : 0;
         var importViewModel = new ImportViewModel(importWorkflow, pageSource, dialogService, adapterAvailability);
         var wizardViewModel = new CreateJobWizardViewModel(
             accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow);
-        long refreshGeneration = 0;
-        async Task<int> RefreshAccountsAsync(CancellationToken token)
-        {
-            var generation = Interlocked.Increment(ref refreshGeneration);
-            var refreshed = await accountProvider.LoadEligibleAsync(token).ConfigureAwait(true);
-            if (generation != Volatile.Read(ref refreshGeneration))
-                return wizardViewModel.Accounts.Count;
 
-            void Apply() => wizardViewModel.ReloadAccounts(refreshed);
+        async Task DispatchOnUiAsync(Action action)
+        {
             var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher is null || dispatcher.CheckAccess()) Apply();
-            else await dispatcher.InvokeAsync(Apply);
-            return refreshed.Count;
+            if (dispatcher is null || dispatcher.CheckAccess()) action();
+            else await dispatcher.InvokeAsync(action);
         }
+        var accountRefresh = new AccountRefreshCoordinator(
+            accountProvider,
+            accountSummaryProvider,
+            wizardViewModel.ReloadAccounts,
+            DispatchOnUiAsync);
         importViewModel.DraftReady += (_, draft) => wizardViewModel.Initialize(new ImportWizardContext(
             draft.SessionId,
             $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
@@ -242,8 +306,8 @@ public sealed class AppShellFactory(
             wizardView,
             loginLauncher,
             accountManagementLauncher,
-            RefreshAccountsAsync,
-            accounts.Count);
+            accountRefresh.RefreshAsync,
+            initialActiveAccountCount);
         return new MainWindow(mainViewModel);
     }
 }

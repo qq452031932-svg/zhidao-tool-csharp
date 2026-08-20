@@ -71,6 +71,70 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
+    public async Task EligibleAccountSnapshotIsStableAndBoundedWhileVisibleCountRemainsExact()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            for (var index = 1; index <= 1_001; index++)
+            {
+                var account = AccountRecord.Create(
+                    Guid.Parse($"00000000-0000-0000-0000-{index:000000000000}"),
+                    $"baidu-{index:0000}",
+                    $"账号 {index:0000}") with
+                {
+                    SortOrder = index,
+                };
+                await unit.Accounts.UpsertAsync(account);
+            }
+            await unit.CommitAsync();
+        }
+
+        var snapshot = await host.Services.GetRequiredService<IWizardAccountProvider>().LoadEligibleAsync();
+        var visibleCount = await host.Services.GetRequiredService<IAccountSummaryProvider>()
+            .GetActiveAccountCountAsync();
+
+        Assert.Equal(1_000, snapshot.Count);
+        Assert.Equal("00000000-0000-0000-0000-000000000001", snapshot[0].AccountId.ToString("D"));
+        Assert.Equal("00000000-0000-0000-0000-000000001000", snapshot[^1].AccountId.ToString("D"));
+        Assert.Equal(1_001, visibleCount);
+    }
+
+    [Fact]
+    public async Task OlderQueuedRefreshCannotApplyAfterANewerGenerationStarts()
+    {
+        var provider = new ControlledWizardAccountProvider();
+        var dispatcher = new QueuedDispatcher();
+        IReadOnlyList<WizardAccountOption> applied = [];
+        int? olderVisibleCount = null;
+        int? newerVisibleCount = null;
+        var coordinator = new AccountRefreshCoordinator(
+            provider,
+            new FixedAccountSummaryProvider(2),
+            snapshot => applied = snapshot,
+            dispatcher.DispatchAsync);
+
+        var older = coordinator.RefreshAsync(count => olderVisibleCount = count);
+        provider.Complete(0, [AccountOption(1)]);
+        await dispatcher.FirstQueued.Task;
+
+        var newer = coordinator.RefreshAsync(count => newerVisibleCount = count);
+        provider.Complete(1, [AccountOption(2), AccountOption(3)]);
+        await dispatcher.SecondQueued.Task;
+
+        dispatcher.Run(0);
+        await older;
+        Assert.Empty(applied);
+        Assert.Null(olderVisibleCount);
+
+        dispatcher.Run(1);
+        await newer;
+        Assert.Equal(2, newerVisibleCount);
+        Assert.Equal([AccountOption(2).AccountId, AccountOption(3).AccountId], applied.Select(x => x.AccountId));
+    }
+
+    [Fact]
     public void BootstrapUsesOnlyTheSuppliedLocalDataRoot()
     {
         using var host = AppBootstrap.CreateHost(root);
@@ -85,5 +149,61 @@ public sealed class AppBootstrapTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
+    private static WizardAccountOption AccountOption(int value) => new(
+        Guid.Parse($"00000000-0000-0000-0000-{value:000000000000}"),
+        $"账号 {value}",
+        "Active",
+        true,
+        false,
+        null,
+        null,
+        0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    private sealed class ControlledWizardAccountProvider : IWizardAccountProvider
+    {
+        private readonly List<TaskCompletionSource<IReadOnlyList<WizardAccountOption>>> calls = [];
+
+        public Task<IReadOnlyList<WizardAccountOption>> LoadEligibleAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var completion = new TaskCompletionSource<IReadOnlyList<WizardAccountOption>>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            calls.Add(completion);
+            return completion.Task.WaitAsync(cancellationToken);
+        }
+
+        public void Complete(int index, IReadOnlyList<WizardAccountOption> accounts) =>
+            calls[index].TrySetResult(accounts);
+    }
+
+    private sealed class FixedAccountSummaryProvider(int count) : IAccountSummaryProvider
+    {
+        public Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(count);
+    }
+
+    private sealed class QueuedDispatcher
+    {
+        private readonly List<(Action Action, TaskCompletionSource Completion)> queue = [];
+        public TaskCompletionSource FirstQueued { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondQueued { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task DispatchAsync(Action action)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            queue.Add((action, completion));
+            if (queue.Count == 1) FirstQueued.TrySetResult();
+            if (queue.Count == 2) SecondQueued.TrySetResult();
+            return completion.Task;
+        }
+
+        public void Run(int index)
+        {
+            var item = queue[index];
+            item.Action();
+            item.Completion.TrySetResult();
+        }
     }
 }

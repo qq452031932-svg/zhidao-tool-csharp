@@ -43,10 +43,11 @@ public sealed class MainWindowViewModelTests
         var refreshCalls = 0;
         var vm = new MainWindowViewModel(
             new object(), new object(), login,
-            refreshAccounts: _ =>
+            refreshAccounts: (applyCount, _) =>
             {
                 refreshCalls++;
-                return Task.FromResult(1);
+                applyCount(1);
+                return Task.CompletedTask;
             },
             initialActiveAccountCount: 0);
 
@@ -73,10 +74,11 @@ public sealed class MainWindowViewModelTests
         var vm = new MainWindowViewModel(
             new object(), new object(), new FakeLoginLauncher { IsAvailableValue = true },
             management,
-            _ =>
+            (applyCount, _) =>
             {
                 refreshCalls++;
-                return Task.FromResult(2);
+                applyCount(2);
+                return Task.CompletedTask;
             },
             initialActiveAccountCount: 3);
 
