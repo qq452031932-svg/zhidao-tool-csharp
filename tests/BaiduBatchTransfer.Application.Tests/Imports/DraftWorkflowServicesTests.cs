@@ -214,7 +214,7 @@ public sealed class DraftWorkflowServicesTests
             PrecheckStatus = "Succeeded",
             PrecheckedAt = Jobs.BatchTestData.Now,
         };
-        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled]);
+        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled], seedDefaultPayloads: false);
         await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
         {
             await seed.Imports.AddRowPayloadsAsync([
@@ -262,7 +262,7 @@ public sealed class DraftWorkflowServicesTests
         var sessionId = Guid.NewGuid();
         var titled = Row(sessionId, 1, "titled");
         var untitled = Row(sessionId, 2, "untitled");
-        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled]);
+        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled], seedDefaultPayloads: false);
         await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
         {
             await seed.Imports.AddRowPayloadsAsync([

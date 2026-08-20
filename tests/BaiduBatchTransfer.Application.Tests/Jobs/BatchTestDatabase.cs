@@ -39,12 +39,20 @@ internal sealed class BatchTestDatabase : IAsyncDisposable
         BatchJobRecord? job = null,
         IEnumerable<ResourceItemRecord>? resources = null,
         IEnumerable<TransferOperationRecord>? operations = null,
-        IEnumerable<AccountAllocationRecord>? allocations = null)
+        IEnumerable<AccountAllocationRecord>? allocations = null,
+        IEnumerable<StagedImportRowPayloadRecord>? payloads = null,
+        bool seedDefaultPayloads = true)
     {
+        var rowSnapshot = rows?.ToArray();
         await using var unit = await UnitOfWorkFactory.BeginAsync();
         foreach (var account in accounts) await unit.Accounts.UpsertAsync(account);
         if (session is not null) await unit.Imports.AddSessionAsync(session);
-        if (rows is not null) await unit.Imports.AddRowsAsync(rows);
+        if (rowSnapshot is not null) await unit.Imports.AddRowsAsync(rowSnapshot);
+        if (payloads is not null)
+            await unit.Imports.AddRowPayloadsAsync(payloads);
+        else if (rowSnapshot is not null && seedDefaultPayloads)
+            await unit.Imports.AddRowPayloadsAsync(rowSnapshot.Select(row =>
+                new StagedImportRowPayloadRecord(row.Id, "source", $"resolved-{row.SourceRowNumber}", row.ShareUrl, "[]")));
         if (job is not null) await unit.Jobs.AddAsync(job);
         if (resources is not null) await unit.Jobs.AddResourcesAsync(resources);
         if (operations is not null) await unit.Jobs.AddOperationsAsync(operations);

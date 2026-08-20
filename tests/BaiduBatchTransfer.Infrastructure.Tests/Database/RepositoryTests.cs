@@ -269,6 +269,40 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task ImportBatchCreationBoundaryUsesSnapshotCompareAndSwap()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = new DateTimeOffset(2026, 8, 21, 1, 2, 3, TimeSpan.Zero);
+        var session = new ImportSessionRecord(
+            Guid.NewGuid(), "Excel", "source.xlsx", "ReadyToConfirm", 1, 1, 0, 0, 0,
+            null, null, null, now, now, new string('a', 64));
+        await using (var seed = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await seed.Imports.AddSessionAsync(session);
+            await seed.CommitAsync();
+        }
+
+        await using (var stale = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            Assert.False(await stale.Imports.TryFinalizeBatchCreationAsync(
+                session with { UpdatedAt = now.AddSeconds(-1) }, Guid.NewGuid(), now.AddSeconds(1)));
+            await stale.CommitAsync();
+        }
+        await using (var current = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            var batchId = Guid.NewGuid();
+            await current.Jobs.AddAsync(new BatchJobRecord(
+                batchId, "Batch", "Excel", "Distribution", "TaskCount", "ProportionalReduction",
+                0, 0, "/", "None", "Skip", "Immediate", "Queued", now, null, null, null, 1));
+            Assert.True(await current.Imports.TryFinalizeBatchCreationAsync(session, batchId, now.AddSeconds(1)));
+            var saved = Assert.IsType<ImportSessionRecord>(await current.Imports.GetSessionAsync(session.Id));
+            Assert.Equal("BatchCreated", saved.Status);
+            Assert.Equal(batchId, saved.CreatedBatchJobId);
+            await current.RollbackAsync();
+        }
+    }
+
+    [Fact]
     public async Task ShareConfirmationSnapshotsAndShareProjectionFieldsRoundTripAndAreImmutable()
     {
         var factory = await CreateFactoryAsync();
@@ -375,6 +409,37 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         direct.Parameters.AddWithValue("$now", operation.CreatedAt.ToString("O"));
         await Assert.ThrowsAsync<SqliteException>(() => direct.ExecuteNonQueryAsync());
         Assert.Equal(0, await CountTableAsync(disabled.Factory, "ShareOperations"));
+    }
+
+    [Fact]
+    public async Task PendingShareCreationKeepsExactEvidenceNullAndRejectsPrematureRemoteItems()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, shareEnabled: true, plannedShareCount: 1);
+        var exact = Assert.Single(graph.Operations);
+        var pending = new PendingShareOperationRecord(
+            exact.Id, exact.TransferOperationId, exact.ResourceItemId, exact.BatchJobId,
+            exact.AccountId, exact.OutputOrdinal, exact.SettingsFingerprint, exact.CreatedAt);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddPendingShareOperationsAsync([pending]);
+            await unit.CommitAsync();
+        }
+
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using (var inspect = connection.CreateCommand())
+        {
+            inspect.CommandText = "SELECT Status,ExactItemSetFingerprint,(SELECT COUNT(*) FROM ShareOperationGenerations WHERE ShareOperationId=ShareOperations.Id) FROM ShareOperations WHERE Id=$id;";
+            inspect.Parameters.AddWithValue("$id", pending.Id.ToString("D"));
+            await using var reader = await inspect.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal("WaitingTransfer", reader.GetString(0));
+            Assert.True(reader.IsDBNull(1));
+            Assert.Equal(0, reader.GetInt64(2));
+        }
+        await using var insert = connection.CreateCommand();
+        insert.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($operation,0,'premature',X'01','premature');";
+        insert.Parameters.AddWithValue("$operation", pending.Id.ToString("D"));
+        await Assert.ThrowsAsync<SqliteException>(() => insert.ExecuteNonQueryAsync());
     }
 
     [Fact]

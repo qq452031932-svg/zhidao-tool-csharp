@@ -58,6 +58,50 @@ CREATE TABLE BatchShareSettings (
 CREATE UNIQUE INDEX UX_BatchShareSettings_Batch_Fingerprint
 ON BatchShareSettings(BatchJobId, SettingsFingerprint);
 
+CREATE TRIGGER TR_BatchShareSettings_Immutable
+BEFORE UPDATE ON BatchShareSettings
+BEGIN
+    SELECT RAISE(ABORT, 'confirmed share settings are immutable');
+END;
+
+CREATE TABLE BatchCreationReceipts (
+    CommandFingerprint TEXT PRIMARY KEY
+      CHECK(length(CommandFingerprint)=64 AND CommandFingerprint NOT GLOB '*[^0-9A-Fa-f]*'),
+    ConfirmationTokenHash TEXT NOT NULL
+      CHECK(length(ConfirmationTokenHash)=64 AND ConfirmationTokenHash NOT GLOB '*[^0-9A-Fa-f]*'),
+    SnapshotFingerprint TEXT NOT NULL
+      CHECK(length(SnapshotFingerprint)=64 AND SnapshotFingerprint NOT GLOB '*[^0-9A-Fa-f]*'),
+    ImportSessionId TEXT NOT NULL,
+    BatchJobId TEXT NOT NULL UNIQUE,
+    CreatedAt TEXT NOT NULL,
+    FOREIGN KEY(ImportSessionId) REFERENCES ImportSessions(Id),
+    FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER TR_BatchCreationReceipts_Immutable
+BEFORE UPDATE ON BatchCreationReceipts
+BEGIN
+    SELECT RAISE(ABORT, 'batch creation receipts are immutable');
+END;
+
+CREATE TABLE BatchSourceColumns (
+    BatchJobId TEXT NOT NULL,
+    ColumnOrdinal INTEGER NOT NULL CHECK(typeof(ColumnOrdinal)='integer' AND ColumnOrdinal >= 0),
+    SourceHeader TEXT NULL,
+    MappedRole TEXT NOT NULL CHECK(MappedRole IN (
+      'ShareUrl','Title','ExtractionCode','TargetPath','OuterFolderName','RequestedAccountName','Note','Preserve')),
+    IsRequired INTEGER NOT NULL CHECK(IsRequired IN (0,1)),
+    PRIMARY KEY(BatchJobId, ColumnOrdinal),
+    FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
+    CHECK((MappedRole='ShareUrl' AND IsRequired=1) OR (MappedRole<>'ShareUrl' AND IsRequired=0))
+);
+
+CREATE TRIGGER TR_BatchSourceColumns_Immutable
+BEFORE UPDATE ON BatchSourceColumns
+BEGIN
+    SELECT RAISE(ABORT, 'confirmed source columns are immutable');
+END;
+
 CREATE TABLE BatchOutputAccounts (
     BatchJobId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
@@ -178,7 +222,7 @@ CREATE TABLE ShareOperations (
     AccountId TEXT NOT NULL,
     OutputOrdinal INTEGER NOT NULL CHECK(typeof(OutputOrdinal)='integer' AND OutputOrdinal > 0),
     Status TEXT NOT NULL CHECK(Status IN ('WaitingTransfer','WaitingShare','Reserved','Preparing','Submitting','ResultPending','Succeeded','Failed','Paused','ReusedExisting','Cancelled')),
-    ExactItemSetFingerprint TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NULL,
     SettingsFingerprint TEXT NOT NULL CHECK(length(trim(SettingsFingerprint))>0),
     Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
     RequestDescriptorJson TEXT NULL,
@@ -205,6 +249,12 @@ CREATE TABLE ShareOperations (
     FOREIGN KEY(BatchJobId,AccountId,OutputOrdinal) REFERENCES BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal) ON DELETE CASCADE,
     FOREIGN KEY(TransferOperationId,ResourceItemId,BatchJobId,AccountId)
       REFERENCES TransferOperations(Id,ResourceItemId,BatchJobId,AssignedAccountId) ON DELETE CASCADE,
+    CHECK((Status='WaitingTransfer' AND ExactItemSetFingerprint IS NULL AND Generation=1
+             AND RequestDescriptorJson IS NULL AND AdapterRequestId IS NULL
+             AND SubmissionAcceptance='Unknown' AND AttemptCount=0 AND LeaseGeneration=0
+             AND LeaseExpiresAt IS NULL AND SubmitStartedAt IS NULL AND NextReconcileAt IS NULL)
+       OR (Status<>'WaitingTransfer' AND ExactItemSetFingerprint IS NOT NULL
+             AND length(trim(ExactItemSetFingerprint))>0)),
     CHECK((BaselineCompletedAt IS NULL AND BaselineGeneration IS NULL AND BaselineFingerprint IS NULL AND BaselineShareCount=0)
        OR (BaselineCompletedAt IS NOT NULL AND BaselineGeneration IS NOT NULL AND BaselineFingerprint IS NOT NULL))
 );
@@ -267,6 +317,7 @@ CREATE TABLE ShareOperationGenerations (
 
 CREATE TRIGGER TR_ShareOperations_RecordInitialGeneration
 AFTER INSERT ON ShareOperations
+WHEN NEW.ExactItemSetFingerprint IS NOT NULL
 BEGIN
     INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
       ExactItemSetFingerprint,SettingsFingerprint)
@@ -276,7 +327,7 @@ END;
 
 CREATE TRIGGER TR_ShareOperations_RecordNextGeneration
 AFTER UPDATE OF Generation ON ShareOperations
-WHEN NEW.Generation <> OLD.Generation
+WHEN NEW.Generation <> OLD.Generation AND NEW.ExactItemSetFingerprint IS NOT NULL
 BEGIN
     INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
       ExactItemSetFingerprint,SettingsFingerprint)
@@ -305,6 +356,17 @@ CREATE INDEX IX_ShareOperationRemoteItems_Operation_Ordinal_Id
 ON ShareOperationRemoteItems(ShareOperationId, ItemOrdinal, RemoteItemId);
 CREATE INDEX IX_ShareOperationRemoteItems_Operation_CanonicalSortKey
 ON ShareOperationRemoteItems(ShareOperationId, CanonicalSortKey);
+
+CREATE TRIGGER TR_ShareOperationRemoteItems_RequireExactBoundary
+BEFORE INSERT ON ShareOperationRemoteItems
+BEGIN
+    SELECT CASE WHEN NOT EXISTS(
+        SELECT 1 FROM ShareOperations operation
+        WHERE operation.Id=NEW.ShareOperationId
+          AND operation.Status<>'WaitingTransfer'
+          AND operation.ExactItemSetFingerprint IS NOT NULL)
+      THEN RAISE(ABORT, 'exact remote items require an exact share boundary') END;
+END;
 
 CREATE TABLE ShareDiscoveryBaselines (
     ShareOperationId TEXT NOT NULL,

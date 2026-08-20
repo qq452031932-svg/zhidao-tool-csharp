@@ -276,6 +276,43 @@ public sealed record BatchOutputAccountRecord(
         $"BatchOutputAccountRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount}, ShareEnabled = {ShareEnabled}, OutputLabel = [REDACTED] }}";
 }
 
+public sealed record BatchSourceColumnRecord(
+    Guid BatchJobId,
+    int ColumnOrdinal,
+    string? SourceHeader,
+    string MappedRole,
+    bool IsRequired)
+{
+    public override string ToString() =>
+        $"BatchSourceColumnRecord {{ Identity = [REDACTED], ColumnOrdinal = {ColumnOrdinal}, MappedRole = {MappedRole}, IsRequired = {IsRequired}, Header = [REDACTED] }}";
+}
+
+public sealed record BatchCreationReceiptRecord(
+    string CommandFingerprint,
+    string ConfirmationTokenHash,
+    string SnapshotFingerprint,
+    Guid ImportSessionId,
+    Guid BatchJobId,
+    DateTimeOffset CreatedAt)
+{
+    public override string ToString() =>
+        "BatchCreationReceiptRecord { Identity = [REDACTED], Fingerprints = [REDACTED] }";
+}
+
+public sealed record PendingShareOperationRecord(
+    Guid Id,
+    Guid TransferOperationId,
+    Guid ResourceItemId,
+    Guid BatchJobId,
+    Guid AccountId,
+    int OutputOrdinal,
+    string SettingsFingerprint,
+    DateTimeOffset CreatedAt)
+{
+    public override string ToString() =>
+        $"PendingShareOperationRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, Status = WaitingTransfer }}";
+}
+
 public sealed record ShareOperationRecord(
     Guid Id,
     Guid TransferOperationId,

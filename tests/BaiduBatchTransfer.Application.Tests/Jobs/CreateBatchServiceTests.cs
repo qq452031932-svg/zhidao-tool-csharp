@@ -609,6 +609,209 @@ public sealed class CreateBatchServiceTests
     }
 
     [Fact]
+    public async Task ConfirmationAtomicallyPersistsSharePipelineSettingsLayoutTitlesAndCounts()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accounts = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        var rows = Enumerable.Range(1, 3).Select(row => BatchTestData.ReadyRow(sessionId, row)).ToArray();
+        await database.SeedAsync(
+            [BatchTestData.Account(accounts[0], "first") with { DisplayName = "同名" },
+             BatchTestData.Account(accounts[1], "second") with { DisplayName = "同名" }],
+            BatchTestData.ReadySession(sessionId, 3, 3) with { ColumnMappingFingerprint = new string('a', 64) },
+            rows,
+            payloads: rows.Select((row, index) => new StagedImportRowPayloadRecord(
+                row.Id, $"source-{index}", $"resolved-{index}", row.ShareUrl, "[]")));
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.SetColumnDefinitionsAsync(sessionId,
+                [new(sessionId, 0, "原链接", "ShareUrl", true), new(sessionId, 1, "标题", "Title", false)]);
+            await seed.CommitAsync();
+        }
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Batch", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [new BatchAccountDraft(accounts[0], 0, "/a", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true),
+             new BatchAccountDraft(accounts[1], 1, "/b", 2, 0, BatchAccountSelectionDecision.Selected, shareEnabled: false)],
+            "/", "None", DuplicatePolicy.Skip, "Immediate", 1, true,
+            extractionCodeBehavior: ShareExtractionCodeBehavior.Fixed,
+            fixedExtractionCode: "a1b2", existingSharePolicy: "Ask");
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(draft.BatchJobId, created.BatchJobId);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await read.Jobs.GetAsync(draft.BatchJobId));
+        Assert.Equal(3, job.OperationCount);
+        Assert.Equal(1, job.ShareOperationCount);
+        Assert.Equal(["resolved-0", "resolved-1", "resolved-2"],
+            (await AllResourcesAsync(read.Jobs, draft.BatchJobId)).Select(resource => resource.ResolvedOutputTitle));
+        var settings = Assert.IsType<BatchShareSettingsRecord>(await read.Jobs.GetShareSettingsAsync(draft.BatchJobId));
+        Assert.True(settings.IsPermanent);
+        Assert.True(settings.IsAccessUnlimited);
+        Assert.Equal("Fixed", settings.ExtractionCodeMode);
+        Assert.Equal("a1b2", settings.FixedExtractionCode);
+        Assert.Equal("Ask", settings.ExistingSharePolicy);
+        Assert.Equal(draft.ShareSettingsFingerprint, settings.SettingsFingerprint);
+        var outputs = await read.Jobs.GetOutputAccountsAsync(draft.BatchJobId);
+        Assert.Equal(new[] { 1, 2 }, outputs.Select(output => output.OutputOrdinal));
+        Assert.Equal(new long[] { 1, 2 }, outputs.Select(output => (long)output.PlannedTransferCount));
+        Assert.Equal(new long[] { 1, 0 }, outputs.Select(output => (long)output.PlannedShareCount));
+
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT s.Status,s.ExactItemSetFingerprint,s.TransferOperationId,s.ResourceItemId,s.AccountId,
+                   t.Id,t.ResourceItemId,t.AssignedAccountId,
+                   (SELECT COUNT(*) FROM ShareOperationRemoteItems WHERE ShareOperationId=s.Id),
+                   (SELECT COUNT(*) FROM BatchSourceColumns WHERE BatchJobId=s.BatchJobId),
+                   (SELECT COUNT(*) FROM BatchCreationReceipts WHERE BatchJobId=s.BatchJobId)
+            FROM ShareOperations s JOIN TransferOperations t ON t.Id=s.TransferOperationId
+            WHERE s.BatchJobId=$batch;
+            """;
+        command.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("WaitingTransfer", reader.GetString(0));
+        Assert.True(reader.IsDBNull(1));
+        Assert.Equal(reader.GetString(2), reader.GetString(5));
+        Assert.Equal(reader.GetString(3), reader.GetString(6));
+        Assert.Equal(reader.GetString(4), reader.GetString(7));
+        Assert.Equal(0, reader.GetInt64(8));
+        Assert.Equal(2, reader.GetInt64(9));
+        Assert.Equal(1, reader.GetInt64(10));
+        Assert.False(await reader.ReadAsync());
+    }
+
+    [Fact]
+    public async Task FailureAfterPendingShareInsertRollsBackEntireCreationGraphAndSession()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(sessionId, 1, 1), [row],
+            payloads: [new(row.Id, "source", "resolved", row.ShareUrl, "[]")]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true)]);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+        await using (var connection = await database.ConnectionFactory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "CREATE TRIGGER FailAfterPendingShare BEFORE INSERT ON AccountAllocations BEGIN SELECT RAISE(ABORT, 'forced post-share rollback'); END;";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAsync<SqliteException>(() => service.ConfirmAsync(draft, preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+        Assert.Empty(await AllResourcesAsync(read.Jobs, draft.BatchJobId));
+        Assert.Null(await read.Jobs.GetShareSettingsAsync(draft.BatchJobId));
+        Assert.Empty(await read.Jobs.GetOutputAccountsAsync(draft.BatchJobId));
+        Assert.Equal("ReadyToConfirm", (await read.Imports.GetSessionAsync(sessionId))!.Status);
+        await using var verify = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var count = verify.CreateCommand();
+        count.CommandText = "SELECT (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch) + (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch) + (SELECT COUNT(*) FROM BatchSourceColumns WHERE BatchJobId=$batch) + (SELECT COUNT(*) FROM BatchCreationReceipts WHERE BatchJobId=$batch) + (SELECT COUNT(*) FROM ExecutionLogs WHERE BatchJobId=$batch);";
+        count.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        Assert.Equal(0L, await count.ExecuteScalarAsync());
+    }
+
+    [Fact]
+    public async Task ShareEnabledConfirmationRejectsBlankResolvedTitleWithoutWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(sessionId, 1, 1), [row],
+            payloads: [new(row.Id, null, "  ", row.ShareUrl, "[]")]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true)]);
+        var service = Service(database, long.MaxValue);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task ExactConfirmationReplayReturnsExistingJobWithoutDuplicatingGraph()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")], BatchTestData.ReadySession(sessionId, 1, 1), [row],
+            payloads: [new(row.Id, "source", "resolved", row.ShareUrl, "[]")]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true)]);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+
+        var first = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+        var replay = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(first.BatchJobId, replay.BatchJobId);
+        Assert.Equal(first.Confirmation.ConfirmationToken, replay.Confirmation.ConfirmationToken);
+        Assert.Equal(first.Confirmation.ResourceCount, replay.Confirmation.ResourceCount);
+        Assert.Equal(first.Confirmation.OperationCount, replay.Confirmation.OperationCount);
+        Assert.Equal(first.Confirmation.ResultColumnLayout!.Fingerprint,
+            replay.Confirmation.ResultColumnLayout!.Fingerprint);
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ConfirmAsync(draft, new string('0', 64)));
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT (SELECT COUNT(*) FROM BatchJobs WHERE Id=$batch), (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch), (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch), (SELECT COUNT(*) FROM BatchCreationReceipts WHERE BatchJobId=$batch);";
+        count.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        await using var reader = await count.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1, reader.GetInt64(0));
+        Assert.Equal(1, reader.GetInt64(1));
+        Assert.Equal(1, reader.GetInt64(2));
+        Assert.Equal(1, reader.GetInt64(3));
+    }
+
+    [Fact]
+    public async Task SelectedZeroWorkAccountPersistsAsEffectiveShareDisabledWithoutPlaceholderWork()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accounts = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        await database.SeedAsync(
+            accounts.Select((id, index) => BatchTestData.Account(id, index.ToString())),
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(accounts[0], 0, "/a", 1, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true),
+             new BatchAccountDraft(accounts[1], 1, "/b", 0, 0, BatchAccountSelectionDecision.Selected, shareEnabled: true)]);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+
+        await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var outputs = await read.Jobs.GetOutputAccountsAsync(draft.BatchJobId);
+        Assert.True(outputs.Single(output => output.AccountId == accounts[0]).ShareEnabled);
+        var zero = outputs.Single(output => output.AccountId == accounts[1]);
+        Assert.Equal(0, zero.PlannedTransferCount);
+        Assert.Equal(0, zero.PlannedShareCount);
+        Assert.False(zero.ShareEnabled);
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch;";
+        count.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        Assert.Equal(1L, await count.ExecuteScalarAsync());
+    }
+
+    [Fact]
     public async Task ConfirmationTokenBecomesStaleWhenImportChangesAndWritesNothing()
     {
         await using var database = await BatchTestDatabase.CreateAsync();
@@ -1141,6 +1344,12 @@ public sealed class CreateBatchServiceTests
             Guid sessionId,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<ImportColumnDefinitionRecord>>([]);
+
+        public Task<IReadOnlyList<StagedImportRowPayloadRecord>> GetRowPayloadsAsync(
+            IEnumerable<Guid> stagedImportRowIds,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<StagedImportRowPayloadRecord>>(stagedImportRowIds.Select(id =>
+                new StagedImportRowPayloadRecord(id, "source", "resolved", "[REDACTED]", "[]")).ToArray());
 
         public Task AddSessionAsync(ImportSessionRecord value, CancellationToken cancellationToken = default) => Unsupported();
         public Task UpdateSessionAsync(ImportSessionRecord value, CancellationToken cancellationToken = default) => Unsupported();

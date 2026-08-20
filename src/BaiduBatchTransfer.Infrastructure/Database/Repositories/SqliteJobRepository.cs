@@ -164,11 +164,28 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddAllocationsAsync(IEnumerable<AccountAllocationRecord> allocations, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(allocations);
+        await using var c = Command("INSERT INTO AccountAllocations(Id,BatchJobId,AccountId,PriorityOrder,DefaultTargetPath,NormalizedDefaultTargetPath,TargetItemCount,TargetSuccessCount,EffectiveTargetSuccessCount,AssignedItemCount,AttemptedItemCount,NewSuccessItemCount,AlreadySatisfiedItemCount,SuccessItemCount,FailedItemCount,LockedItemCount,ExclusiveCandidateCount,UnusedCandidateCount,ReservedSlotCount,FulfilledCount) VALUES($id,$job,$account,$priority,$target,$normalized,$targetItems,$targetSuccess,$effective,$assigned,$attempted,$newSuccess,$satisfied,$success,$failed,$locked,$exclusive,$unused,$reserved,$fulfilled);");
+        var id=c.Parameters.Add("$id",SqliteType.Text); var job=c.Parameters.Add("$job",SqliteType.Text);
+        var account=c.Parameters.Add("$account",SqliteType.Text); var priority=c.Parameters.Add("$priority",SqliteType.Integer);
+        var target=c.Parameters.Add("$target",SqliteType.Text); var normalized=c.Parameters.Add("$normalized",SqliteType.Text);
+        var targetItems=c.Parameters.Add("$targetItems",SqliteType.Integer); var targetSuccess=c.Parameters.Add("$targetSuccess",SqliteType.Integer);
+        var effective=c.Parameters.Add("$effective",SqliteType.Integer); var assigned=c.Parameters.Add("$assigned",SqliteType.Integer);
+        var attempted=c.Parameters.Add("$attempted",SqliteType.Integer); var newSuccess=c.Parameters.Add("$newSuccess",SqliteType.Integer);
+        var satisfied=c.Parameters.Add("$satisfied",SqliteType.Integer); var success=c.Parameters.Add("$success",SqliteType.Integer);
+        var failed=c.Parameters.Add("$failed",SqliteType.Integer); var locked=c.Parameters.Add("$locked",SqliteType.Integer);
+        var exclusive=c.Parameters.Add("$exclusive",SqliteType.Integer); var unused=c.Parameters.Add("$unused",SqliteType.Integer);
+        var reserved=c.Parameters.Add("$reserved",SqliteType.Integer); var fulfilled=c.Parameters.Add("$fulfilled",SqliteType.Integer);
+        c.Prepare();
         foreach (var x in allocations)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await using var c = Command("INSERT INTO AccountAllocations(Id,BatchJobId,AccountId,PriorityOrder,DefaultTargetPath,NormalizedDefaultTargetPath,TargetItemCount,TargetSuccessCount,EffectiveTargetSuccessCount,AssignedItemCount,AttemptedItemCount,NewSuccessItemCount,AlreadySatisfiedItemCount,SuccessItemCount,FailedItemCount,LockedItemCount,ExclusiveCandidateCount,UnusedCandidateCount,ReservedSlotCount,FulfilledCount) VALUES($id,$job,$account,$priority,$target,$normalized,$targetItems,$targetSuccess,$effective,$assigned,$attempted,$newSuccess,$satisfied,$success,$failed,$locked,$exclusive,$unused,$reserved,$fulfilled);");
-            Add(c,"$id",Id(x.Id)); Add(c,"$job",Id(x.BatchJobId)); Add(c,"$account",Id(x.AccountId)); Add(c,"$priority",x.PriorityOrder); Add(c,"$target",x.DefaultTargetPath); Add(c,"$normalized",x.NormalizedDefaultTargetPath); Add(c,"$targetItems",x.TargetItemCount); Add(c,"$targetSuccess",x.TargetSuccessCount); Add(c,"$effective",x.EffectiveTargetSuccessCount); Add(c,"$assigned",x.AssignedItemCount); Add(c,"$attempted",x.AttemptedItemCount); Add(c,"$newSuccess",x.NewSuccessItemCount); Add(c,"$satisfied",x.AlreadySatisfiedItemCount); Add(c,"$success",x.SuccessItemCount); Add(c,"$failed",x.FailedItemCount); Add(c,"$locked",x.LockedItemCount); Add(c,"$exclusive",x.ExclusiveCandidateCount); Add(c,"$unused",x.UnusedCandidateCount); Add(c,"$reserved",x.ReservedSlotCount); Add(c,"$fulfilled",x.FulfilledCount);
+            id.Value=Id(x.Id); job.Value=Id(x.BatchJobId); account.Value=Id(x.AccountId); priority.Value=x.PriorityOrder;
+            target.Value=x.DefaultTargetPath; normalized.Value=x.NormalizedDefaultTargetPath;
+            targetItems.Value=x.TargetItemCount; targetSuccess.Value=x.TargetSuccessCount; effective.Value=x.EffectiveTargetSuccessCount;
+            assigned.Value=x.AssignedItemCount; attempted.Value=x.AttemptedItemCount; newSuccess.Value=x.NewSuccessItemCount;
+            satisfied.Value=x.AlreadySatisfiedItemCount; success.Value=x.SuccessItemCount; failed.Value=x.FailedItemCount;
+            locked.Value=x.LockedItemCount; exclusive.Value=x.ExclusiveCandidateCount; unused.Value=x.UnusedCandidateCount;
+            reserved.Value=x.ReservedSlotCount; fulfilled.Value=x.FulfilledCount;
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -415,14 +432,21 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             throw new InvalidOperationException("The confirmed batch output-account snapshot cannot be changed.");
         }
         await using var command = Command("INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled) VALUES($batch,$account,$ordinal,$label,$transfers,$shares,$enabled);");
+        var batch = command.Parameters.Add("$batch", SqliteType.Text);
+        var account = command.Parameters.Add("$account", SqliteType.Text);
+        var ordinal = command.Parameters.Add("$ordinal", SqliteType.Integer);
+        var label = command.Parameters.Add("$label", SqliteType.Text);
+        var transfers = command.Parameters.Add("$transfers", SqliteType.Integer);
+        var shares = command.Parameters.Add("$shares", SqliteType.Integer);
+        var enabled = command.Parameters.Add("$enabled", SqliteType.Integer);
+        command.Prepare();
         foreach (var value in snapshot)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            command.Parameters.Clear();
-            Add(command,"$batch",Id(value.BatchJobId)); Add(command,"$account",Id(value.AccountId));
-            Add(command,"$ordinal",value.OutputOrdinal); Add(command,"$label",value.OutputLabel);
-            Add(command,"$transfers",value.PlannedTransferCount); Add(command,"$shares",value.PlannedShareCount);
-            Add(command,"$enabled",value.ShareEnabled ? 1 : 0);
+            batch.Value=Id(value.BatchJobId); account.Value=Id(value.AccountId);
+            ordinal.Value=value.OutputOrdinal; label.Value=value.OutputLabel;
+            transfers.Value=value.PlannedTransferCount; shares.Value=value.PlannedShareCount;
+            enabled.Value=value.ShareEnabled ? 1 : 0;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -437,6 +461,118 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             values.Add(new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetInt32(2),reader.GetString(3),reader.GetInt32(4),reader.GetInt32(5),reader.GetInt64(6)!=0));
         return values;
     }
+
+    public async Task AddSourceColumnsAsync(
+        IEnumerable<BatchSourceColumnRecord> columns,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        await using var command = Command("INSERT INTO BatchSourceColumns(BatchJobId,ColumnOrdinal,SourceHeader,MappedRole,IsRequired) VALUES($batch,$ordinal,$header,$role,$required);");
+        var batch = command.Parameters.Add("$batch", SqliteType.Text);
+        var ordinal = command.Parameters.Add("$ordinal", SqliteType.Integer);
+        var header = command.Parameters.Add("$header", SqliteType.Text);
+        var role = command.Parameters.Add("$role", SqliteType.Text);
+        var required = command.Parameters.Add("$required", SqliteType.Integer);
+        command.Prepare();
+        foreach (var value in columns)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (value.BatchJobId == Guid.Empty || value.ColumnOrdinal < 0 || string.IsNullOrWhiteSpace(value.MappedRole))
+                throw new ArgumentException("The source-column snapshot is invalid.", nameof(columns));
+            batch.Value=Id(value.BatchJobId); ordinal.Value=value.ColumnOrdinal;
+            header.Value=value.SourceHeader ?? (object)DBNull.Value; role.Value=value.MappedRole;
+            required.Value=value.IsRequired ? 1 : 0;
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public async Task<IReadOnlyList<BatchSourceColumnRecord>> GetSourceColumnsAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("SELECT BatchJobId,ColumnOrdinal,SourceHeader,MappedRole,IsRequired FROM BatchSourceColumns WHERE BatchJobId=$batch ORDER BY ColumnOrdinal;");
+        Add(command,"$batch",Id(batchJobId));
+        var values = new List<BatchSourceColumnRecord>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            values.Add(new(Guid.Parse(reader.GetString(0)),reader.GetInt32(1),reader.IsDBNull(2)?null:reader.GetString(2),reader.GetString(3),reader.GetInt64(4)!=0));
+        return values;
+    }
+
+    public async Task AddCreationReceiptAsync(
+        BatchCreationReceiptRecord receipt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(receipt);
+        if (!IsSha256(receipt.CommandFingerprint) || !IsSha256(receipt.ConfirmationTokenHash) ||
+            !IsSha256(receipt.SnapshotFingerprint) || receipt.ImportSessionId == Guid.Empty || receipt.BatchJobId == Guid.Empty)
+            throw new ArgumentException("The batch creation receipt is invalid.", nameof(receipt));
+        await using var command = Command("INSERT INTO BatchCreationReceipts(CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,CreatedAt) VALUES($command,$token,$snapshot,$session,$batch,$created);");
+        Add(command,"$command",receipt.CommandFingerprint); Add(command,"$token",receipt.ConfirmationTokenHash);
+        Add(command,"$snapshot",receipt.SnapshotFingerprint); Add(command,"$session",Id(receipt.ImportSessionId));
+        Add(command,"$batch",Id(receipt.BatchJobId)); Add(command,"$created",Time(receipt.CreatedAt));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<BatchCreationReceiptRecord?> GetCreationReceiptAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("SELECT CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,CreatedAt FROM BatchCreationReceipts WHERE BatchJobId=$batch;");
+        Add(command,"$batch",Id(batchJobId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new(reader.GetString(0),reader.GetString(1),reader.GetString(2),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),ReadTime(reader,5))
+            : null;
+    }
+
+    public async Task AddPendingShareOperationsAsync(
+        IEnumerable<PendingShareOperationRecord> operations,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(operations);
+        var snapshot = TakeBounded(operations, 500, nameof(operations));
+        if (snapshot.Any(value => value.Id == Guid.Empty || value.TransferOperationId == Guid.Empty ||
+            value.ResourceItemId == Guid.Empty || value.BatchJobId == Guid.Empty || value.AccountId == Guid.Empty ||
+            value.OutputOrdinal <= 0 || string.IsNullOrWhiteSpace(value.SettingsFingerprint)))
+            throw new ArgumentException("The pending share operation is invalid.", nameof(operations));
+        await ValidatePendingShareOutputsAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        await using var command = Command("""
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,
+              AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created);
+            """);
+        var prepared = false;
+        foreach (var value in snapshot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Bind(command,"$id",Id(value.Id),!prepared); Bind(command,"$transfer",Id(value.TransferOperationId),!prepared);
+            Bind(command,"$resource",Id(value.ResourceItemId),!prepared); Bind(command,"$batch",Id(value.BatchJobId),!prepared);
+            Bind(command,"$account",Id(value.AccountId),!prepared); Bind(command,"$ordinal",value.OutputOrdinal,!prepared);
+            Bind(command,"$settings",value.SettingsFingerprint,!prepared); Bind(command,"$created",Time(value.CreatedAt),!prepared);
+            if (!prepared) { command.Prepare(); prepared = true; }
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ValidatePendingShareOutputsAsync(
+        IReadOnlyList<PendingShareOperationRecord> operations,
+        CancellationToken cancellationToken)
+    {
+        foreach (var group in operations.GroupBy(value => (value.BatchJobId,value.AccountId,value.OutputOrdinal)))
+        {
+            await using var command = Command("SELECT ShareEnabled,PlannedShareCount,CreatedShareOperationCount FROM BatchOutputAccounts WHERE BatchJobId=$batch AND AccountId=$account AND OutputOrdinal=$ordinal;");
+            Add(command,"$batch",Id(group.Key.BatchJobId)); Add(command,"$account",Id(group.Key.AccountId)); Add(command,"$ordinal",group.Key.OutputOrdinal);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false) || reader.GetInt64(0)!=1 ||
+                reader.GetInt64(2)+group.Count()>reader.GetInt64(1))
+                throw new InvalidOperationException("The confirmed output account cannot accept pending share work.");
+        }
+    }
+
+    private static bool IsSha256(string value) => value.Length == 64 && value.All(character =>
+        character is >= '0' and <= '9' or >= 'A' and <= 'F' or >= 'a' and <= 'f');
 
     public async Task AddShareOperationsAsync(
         IEnumerable<ShareOperationRecord> operations,
@@ -521,8 +657,10 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var counts = new Dictionary<Guid, int>(operations.Count);
         if (operations.Any(value => !counts.TryAdd(value.Id, 0)))
             throw new ArgumentException("Share operation identifiers must be unique.", nameof(operations));
-        if (operations.Any(operation => string.IsNullOrWhiteSpace(operation.SettingsFingerprint)))
-            throw new ArgumentException("Each share operation requires an immutable settings fingerprint.", nameof(operations));
+        if (operations.Any(operation => operation.Status == "WaitingTransfer" ||
+            string.IsNullOrWhiteSpace(operation.ExactItemSetFingerprint) ||
+            string.IsNullOrWhiteSpace(operation.SettingsFingerprint)))
+            throw new ArgumentException("Exact share operations require immutable settings and exact-item fingerprints.", nameof(operations));
         return counts;
     }
 

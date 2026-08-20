@@ -4,6 +4,12 @@ public interface IImportRepository
 {
     Task AddSessionAsync(ImportSessionRecord session, CancellationToken cancellationToken = default);
     Task UpdateSessionAsync(ImportSessionRecord session, CancellationToken cancellationToken = default);
+    Task<bool> TryFinalizeBatchCreationAsync(
+        ImportSessionRecord expectedSession,
+        Guid batchJobId,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Atomic import-session batch finalization is not supported by this repository.");
     Task<ImportSessionRecord?> GetSessionAsync(Guid id, CancellationToken cancellationToken = default);
     Task<ImportSessionRecord?> GetLatestResumableExcelSessionAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<ImportSessionRecord?>(null);
@@ -69,6 +75,10 @@ public interface IImportRepository
         Guid stagedImportRowId,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Raw import payloads are not supported by this repository.");
+    Task<IReadOnlyList<StagedImportRowPayloadRecord>> GetRowPayloadsAsync(
+        IEnumerable<Guid> stagedImportRowIds,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Raw import payload paging is not supported by this repository.");
     Task UpdateRowPayloadAsync(
         StagedImportRowPayloadRecord payload,
         CancellationToken cancellationToken = default) =>

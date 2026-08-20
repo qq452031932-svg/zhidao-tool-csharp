@@ -47,7 +47,10 @@ public sealed class CreateBatchService
         string confirmationToken,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(draft);
         ArgumentException.ThrowIfNullOrWhiteSpace(confirmationToken);
+        var replay = await TryReplayAsync(draft, confirmationToken, cancellationToken).ConfigureAwait(false);
+        if (replay is not null) return replay;
         var preview = await PreviewAsync(draft, cancellationToken).ConfigureAwait(false);
         if (!FixedTimeEquals(preview.ConfirmationToken, confirmationToken))
             throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
@@ -64,10 +67,20 @@ public sealed class CreateBatchService
                 throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
             if (validated.ImmediateOperationCount > int.MaxValue)
                 throw new BatchDraftValidationException("The immediate operation count exceeds the supported database counter range.");
+            var currentEstimate = await preflightEstimator.EstimateAsync(
+                validated.Rows.Length,
+                validated.OperationCount,
+                validated.Accounts.Length,
+                validated.ShareOperationCount,
+                validated.ShareOperationCount,
+                validated.Accounts.Length,
+                validated.ResultColumnLayout.ColumnCount,
+                cancellationToken).ConfigureAwait(false);
+            if (!currentEstimate.HasSufficientSpace)
+                throw new StorageCapacityException(currentEstimate.RequiredFreeBytes, currentEstimate.AvailableFreeBytes);
 
             var now = DateTimeOffset.UtcNow;
             var resources = CreateResources(draft, validated, now);
-            var operations = CreateOperations(draft, validated, resources, now);
             var allocations = CreateAllocations(draft, validated, resources);
             var job = new BatchJobRecord(
                 draft.BatchJobId,
@@ -87,30 +100,132 @@ public sealed class CreateBatchService
                 null,
                 null,
                 draft.ImportSessionId,
-                draft.QueueOrder);
+                draft.QueueOrder,
+                checked((int)validated.ShareOperationCount));
 
             await unit.Jobs.AddAsync(job, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.SetShareSettingsAsync(new(
+                draft.BatchJobId,
+                draft.IsSharePermanent,
+                draft.IsShareAccessUnlimited,
+                draft.ExtractionCodeBehavior.ToString(),
+                draft.FixedExtractionCode,
+                draft.ExistingSharePolicy,
+                now,
+                draft.ShareSettingsFingerprint), cancellationToken).ConfigureAwait(false);
+            var outputAccounts = validated.Accounts.Select(account => new BatchOutputAccountRecord(
+                draft.BatchJobId,
+                account.AccountId,
+                account.OutputOrdinal,
+                account.OutputLabel!,
+                checked((int)account.PlannedTransferCount),
+                checked((int)account.PlannedShareCount),
+                account.ShareEnabled && account.PlannedShareCount > 0)).ToArray();
+            await unit.Jobs.AddOutputAccountsAsync(outputAccounts, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.AddSourceColumnsAsync(validated.ColumnDefinitions.Select(column => new BatchSourceColumnRecord(
+                draft.BatchJobId,
+                column.ColumnOrdinal,
+                column.SourceHeader,
+                column.MappedRole,
+                column.IsRequired)), cancellationToken).ConfigureAwait(false);
             await unit.Jobs.AddResourcesAsync(resources, cancellationToken).ConfigureAwait(false);
-            await unit.Jobs.AddOperationsAsync(operations, cancellationToken).ConfigureAwait(false);
+            var outputByAccount = outputAccounts.ToDictionary(account => account.AccountId);
+            foreach (var chunk in CreateOperations(draft, validated, resources, now).Chunk(500))
+            {
+                await unit.Jobs.AddOperationsAsync(chunk, cancellationToken).ConfigureAwait(false);
+                await unit.Jobs.AddPendingShareOperationsAsync(
+                    chunk.Where(operation => outputByAccount[operation.AssignedAccountId].ShareEnabled)
+                        .Select(operation => new PendingShareOperationRecord(
+                            Guid.NewGuid(),
+                            operation.Id,
+                            operation.ResourceItemId,
+                            operation.BatchJobId,
+                            operation.AssignedAccountId,
+                            outputByAccount[operation.AssignedAccountId].OutputOrdinal,
+                            draft.ShareSettingsFingerprint,
+                            now)),
+                    cancellationToken).ConfigureAwait(false);
+            }
             await unit.Jobs.AddAllocationsAsync(allocations, cancellationToken).ConfigureAwait(false);
             await unit.Jobs.WriteAuditAsync(
                 new AuditEventRecord(Guid.NewGuid(), draft.BatchJobId, null, null, null,
                     AuditEventKind.BatchCreated, now), cancellationToken).ConfigureAwait(false);
-            await unit.Imports.UpdateSessionAsync(validated.Session with
-            {
-                Status = "BatchCreated",
-                CreatedBatchJobId = draft.BatchJobId,
-                UpdatedAt = now,
-            }, cancellationToken).ConfigureAwait(false);
+            await unit.Jobs.AddCreationReceiptAsync(new(
+                BatchConfirmationTokens.ForCommand(draft),
+                HashToken(confirmationToken),
+                validated.ConfirmationToken,
+                draft.ImportSessionId,
+                draft.BatchJobId,
+                now), cancellationToken).ConfigureAwait(false);
+            if (!await unit.Imports.TryFinalizeBatchCreationAsync(
+                    validated.Session, draft.BatchJobId, now, cancellationToken).ConfigureAwait(false))
+                throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new CreatedBatchResult(draft.BatchJobId, preview);
         }
         catch
         {
             await TryRollbackAsync(unit).ConfigureAwait(false);
+            var existing = await TryReplayAsync(draft, confirmationToken, cancellationToken).ConfigureAwait(false);
+            if (existing is not null) return existing;
             throw;
         }
     }
+
+    private async Task<CreatedBatchResult?> TryReplayAsync(
+        BatchDraft draft,
+        string confirmationToken,
+        CancellationToken cancellationToken)
+    {
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var receipt = await unit.Jobs.GetCreationReceiptAsync(draft.BatchJobId, cancellationToken).ConfigureAwait(false);
+        if (receipt is null) return null;
+        if (receipt.ImportSessionId != draft.ImportSessionId ||
+            !FixedTimeEquals(receipt.CommandFingerprint, BatchConfirmationTokens.ForCommand(draft)) ||
+            !FixedTimeEquals(receipt.ConfirmationTokenHash, HashToken(confirmationToken)) ||
+            !FixedTimeEquals(receipt.SnapshotFingerprint, confirmationToken))
+            throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
+
+        var job = await unit.Jobs.GetAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The durable batch creation receipt is incomplete.");
+        var outputs = await unit.Jobs.GetOutputAccountsAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false);
+        var allocations = new List<AccountAllocationRecord>();
+        for (var pageNumber = 1; ; pageNumber++)
+        {
+            var page = await unit.Jobs.GetAllocationsPageAsync(receipt.BatchJobId, new PageQuery(pageNumber, 1_000), cancellationToken).ConfigureAwait(false);
+            allocations.AddRange(page.Items);
+            if (allocations.Count >= page.TotalCount) break;
+        }
+        var allocationByAccount = allocations.ToDictionary(value => value.AccountId);
+        var accounts = outputs.Select(output =>
+        {
+            var allocation = allocationByAccount[output.AccountId];
+            return new BatchAccountConfirmation(
+                output.AccountId, allocation.PriorityOrder, allocation.DefaultTargetPath,
+                allocation.NormalizedDefaultTargetPath, allocation.TargetItemCount, allocation.TargetSuccessCount,
+                allocation.LockedItemCount, allocation.ExclusiveCandidateCount,
+                allocation.EffectiveTargetSuccessCount, allocation.FulfilledCount, allocation.ReservedSlotCount,
+                allocation.UnusedCandidateCount, 0, allocation.EffectiveTargetSuccessCount,
+                output.PlannedTransferCount, output.PlannedShareCount, output.ShareEnabled,
+                output.OutputOrdinal, output.OutputLabel);
+        }).ToArray();
+        var sourceColumns = await unit.Jobs.GetSourceColumnsAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false);
+        var layoutInputs = outputs.Select(output => new BatchWorkloadAccountInput(
+            output.AccountId, output.OutputOrdinal, output.OutputLabel,
+            BatchAccountSelectionDecision.Selected, output.ShareEnabled, output.PlannedTransferCount)).ToArray();
+        var layout = new ResultColumnLayoutBuilder().Build(
+            sourceColumns.Select(column => column.SourceHeader).ToArray(), layoutInputs);
+        var estimate = await preflightEstimator.EstimateAsync(
+            job.ResourceCount, job.OperationCount, outputs.Count, job.ShareOperationCount,
+            job.ShareOperationCount, outputs.Count, layout.ColumnCount, cancellationToken).ConfigureAwait(false);
+        var summary = new BatchConfirmationSummary(
+            receipt.ImportSessionId, receipt.CreatedAt, job.ResourceCount, job.OperationCount,
+            accounts, estimate, confirmationToken, layout);
+        return new CreatedBatchResult(receipt.BatchJobId, summary);
+    }
+
+    private static string HashToken(string confirmationToken) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(confirmationToken)));
 
     private static BatchConfirmationSummary ToSummary(
         ValidatedBatchDraft validated,
@@ -149,7 +264,8 @@ public sealed class CreateBatchService
                 null,
                 null,
                 now,
-                now));
+                now,
+                item.ResolvedOutputTitle));
         }
         return resources;
     }

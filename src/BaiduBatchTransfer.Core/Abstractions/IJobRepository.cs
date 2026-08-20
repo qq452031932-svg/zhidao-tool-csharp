@@ -33,6 +33,18 @@ public interface IJobRepository
         throw new NotSupportedException("Batch output snapshots are not supported by this repository.");
     Task<IReadOnlyList<BatchOutputAccountRecord>> GetOutputAccountsAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Batch output snapshots are not supported by this repository.");
+    Task AddSourceColumnsAsync(IEnumerable<BatchSourceColumnRecord> columns, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch source-column snapshots are not supported by this repository.");
+    Task<IReadOnlyList<BatchSourceColumnRecord>> GetSourceColumnsAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch source-column snapshots are not supported by this repository.");
+    Task AddCreationReceiptAsync(BatchCreationReceiptRecord receipt, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch creation receipts are not supported by this repository.");
+    Task<BatchCreationReceiptRecord?> GetCreationReceiptAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch creation receipts are not supported by this repository.");
+    Task AddPendingShareOperationsAsync(
+        IEnumerable<PendingShareOperationRecord> operations,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Pending share operations are not supported by this repository.");
     Task AddShareOperationsAsync(
         IEnumerable<ShareOperationRecord> operations,
         IEnumerable<ShareOperationRemoteItemRecord> remoteItems,

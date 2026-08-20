@@ -62,6 +62,7 @@ public sealed class BatchDraftValidator
             mappedCounts[accountId] = checked(mappedCounts.GetValueOrDefault(accountId) + 1L);
         }
         var workload = new BatchWorkloadPlanner().Plan(rows.Length, draft.TransferMode, workloadInputs, mappedCounts);
+        ValidateResolvedTitles(draft, rows, accounts, workload);
         var outputLayout = new ResultColumnLayoutBuilder().Build(
             columnDefinitions.OrderBy(column => column.ColumnOrdinal)
                 .Select(column => column.SourceHeader).ToArray(),
@@ -149,6 +150,7 @@ public sealed class BatchDraftValidator
             immediateOperationCount,
             workload.ShareCount,
             outputLayout,
+            columnDefinitions.OrderBy(column => column.ColumnOrdinal).ToImmutableArray(),
             BatchConfirmationTokens.ForCreate(
                 draft, session, rows, operationCount, confirmations, rules, columnDefinitions, outputLayout));
     }
@@ -286,6 +288,9 @@ public sealed class BatchDraftValidator
             if (page.Count == 0) break;
             after = page[^1].SourceRowNumber;
             readyRowsSeen = checked(readyRowsSeen + page.Count);
+            var payloads = (await repository.GetRowPayloadsAsync(
+                    page.Select(row => row.Id), cancellationToken).ConfigureAwait(false))
+                .ToDictionary(payload => payload.StagedImportRowId);
             foreach (var row in page)
             {
                 if (row.PrecheckStatus == "Failed") continue;
@@ -317,7 +322,8 @@ public sealed class BatchDraftValidator
                     normalizedTarget,
                     resolution.CandidateConstraintAccountId,
                     resolution.Reason,
-                    resolution.MatchedRuleId));
+                    resolution.MatchedRuleId,
+                    payloads.TryGetValue(row.Id, out var payload) ? payload.ResolvedOutputTitle : null));
             }
         }
         if (readyRowsSeen != session.ReadyRows)
@@ -325,6 +331,33 @@ public sealed class BatchDraftValidator
         if (builder.Count == 0)
             throw new BatchDraftValidationException("The import has no included ready resources.");
         return builder.ToImmutable();
+    }
+
+    private static void ValidateResolvedTitles(
+        BatchDraft draft,
+        ImmutableArray<ValidatedStagedRow> rows,
+        ImmutableArray<ValidatedBatchAccount> accounts,
+        BatchWorkloadPlan workload)
+    {
+        if (workload.ShareCount == 0) return;
+        var shareEnabled = workload.Accounts.Where(account => account.ShareEnabled)
+            .Select(account => account.AccountId).ToHashSet();
+        if (draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.SuccessTarget)
+        {
+            if (rows.Any(row => string.IsNullOrWhiteSpace(row.ResolvedOutputTitle)))
+                throw new BatchDraftValidationException("A share-enabled included row is missing its resolved output title.");
+            return;
+        }
+
+        var candidates = rows.Select((row, index) => new TaskQuotaCandidate(
+            row.Row.Id, index + 1, row.ConstraintAccountId)).ToArray();
+        var quotas = accounts.Select(account => new TaskQuotaAccount(
+            account.Draft.AccountId, account.Draft.TargetItemCount, account.Draft.PriorityOrder)).ToArray();
+        var assignments = new TaskQuotaAllocator().Allocate(quotas, candidates)
+            .ToDictionary(assignment => assignment.ResourceId, assignment => assignment.AccountId);
+        if (rows.Any(row => shareEnabled.Contains(assignments[row.Row.Id]) &&
+                            string.IsNullOrWhiteSpace(row.ResolvedOutputTitle)))
+            throw new BatchDraftValidationException("A share-enabled included row is missing its resolved output title.");
     }
 
     private string NormalizePath(string value)
@@ -362,7 +395,8 @@ internal sealed record ValidatedStagedRow(
     string? NormalizedTargetPath,
     Guid? ConstraintAccountId,
     AccountRuleResolutionReason ConstraintReason = AccountRuleResolutionReason.Public,
-    Guid? MatchedRuleId = null);
+    Guid? MatchedRuleId = null,
+    string? ResolvedOutputTitle = null);
 
 internal sealed record ValidatedBatchDraft(
     ImportSessionRecord Session,
@@ -372,10 +406,35 @@ internal sealed record ValidatedBatchDraft(
     long ImmediateOperationCount,
     long ShareOperationCount,
     ResultColumnLayout ResultColumnLayout,
+    ImmutableArray<ImportColumnDefinitionRecord> ColumnDefinitions,
     string ConfirmationToken);
 
 internal static class BatchConfirmationTokens
 {
+    public static string ForCommand(BatchDraft draft)
+    {
+        using var writer = new CanonicalHashWriter("batch-create-command/v1");
+        writer.WriteGuid("batch-job-id", draft.BatchJobId);
+        writer.WriteGuid("import-session-id", draft.ImportSessionId);
+        writer.WriteString("batch-name", draft.Name);
+        writer.WriteInt32("transfer-mode", (int)draft.TransferMode);
+        writer.WriteInt32("quota-basis", (int)draft.QuotaBasis);
+        writer.WriteInt32("shortage-policy", (int)draft.ShortagePolicy);
+        writer.WriteString("default-target-path", draft.DefaultTargetPath);
+        writer.WriteString("folder-creation-mode", draft.FolderCreationMode);
+        writer.WriteInt32("duplicate-policy", (int)draft.DuplicatePolicy);
+        writer.WriteString("validation-mode", draft.ValidationMode);
+        writer.WriteInt64("queue-order", draft.QueueOrder);
+        writer.WriteBoolean("ignore-mapped-accounts-for-replication", draft.IgnoreMappedAccountsForReplication);
+        writer.WriteBoolean("share-permanent", draft.IsSharePermanent);
+        writer.WriteBoolean("share-access-unlimited", draft.IsShareAccessUnlimited);
+        writer.WriteInt32("extraction-code-behavior", (int)draft.ExtractionCodeBehavior);
+        writer.WriteString("fixed-extraction-code", draft.FixedExtractionCode);
+        writer.WriteString("existing-share-policy", draft.ExistingSharePolicy);
+        WriteAccountSelections(writer, draft.Accounts);
+        return writer.GetHashHex();
+    }
+
     public static string ForCreate(
         BatchDraft draft,
         ImportSessionRecord session,
@@ -455,7 +514,7 @@ internal static class BatchConfirmationTokens
         writer.BeginCollection("rows", rows.Count);
         foreach (var item in rows)
         {
-            writer.BeginObject("row", 14);
+            writer.BeginObject("row", 15);
             writer.WriteGuid("id", item.Row.Id);
             writer.WriteInt64("source-row-number", item.Row.SourceRowNumber);
             writer.WriteString("share-url", item.Row.ShareUrl);
@@ -470,6 +529,7 @@ internal static class BatchConfirmationTokens
             writer.WriteString("note", item.Row.Note);
             writer.WriteString("precheck-status", item.Row.PrecheckStatus);
             writer.WriteString("precheck-error-code", item.Row.PrecheckErrorCode);
+            writer.WriteString("resolved-output-title", item.ResolvedOutputTitle);
         }
     }
 

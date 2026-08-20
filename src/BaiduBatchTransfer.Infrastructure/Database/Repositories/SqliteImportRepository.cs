@@ -316,6 +316,31 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             Value(reader, 4), Value(reader, 5), Value(reader, 6));
     }
 
+    public async Task<bool> TryFinalizeBatchCreationAsync(
+        ImportSessionRecord expectedSession,
+        Guid batchJobId,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expectedSession);
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        await using var command = Command("""
+            UPDATE ImportSessions
+            SET Status='BatchCreated',CreatedBatchJobId=$batch,UpdatedAt=$updated
+            WHERE Id=$id AND Status=$status AND CreatedBatchJobId IS NULL AND AppendToBatchJobId IS NULL
+              AND UpdatedAt=$expectedUpdated AND TotalRows=$total AND ReadyRows=$ready
+              AND InvalidRows=$invalid AND DuplicateRows=$duplicate AND ExcludedRows=$excluded
+              AND ColumnMappingFingerprint IS $mapping;
+            """);
+        Add(command,"$batch",Id(batchJobId)); Add(command,"$updated",Time(updatedAt));
+        Add(command,"$id",Id(expectedSession.Id)); Add(command,"$status",expectedSession.Status);
+        Add(command,"$expectedUpdated",Time(expectedSession.UpdatedAt)); Add(command,"$total",expectedSession.TotalRows);
+        Add(command,"$ready",expectedSession.ReadyRows); Add(command,"$invalid",expectedSession.InvalidRows);
+        Add(command,"$duplicate",expectedSession.DuplicateRows); Add(command,"$excluded",expectedSession.ExcludedRows);
+        Add(command,"$mapping",expectedSession.ColumnMappingFingerprint);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+    }
+
     public async Task SetColumnDefinitionsAsync(
         Guid sessionId,
         IEnumerable<ImportColumnDefinitionRecord> definitions,
@@ -396,6 +421,27 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             ? new(Guid.Parse(reader.GetString(0)), reader.IsDBNull(1) ? null : reader.GetString(1),
                 reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetString(3), reader.GetString(4))
             : null;
+    }
+
+    public async Task<IReadOnlyList<StagedImportRowPayloadRecord>> GetRowPayloadsAsync(
+        IEnumerable<Guid> stagedImportRowIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stagedImportRowIds);
+        var result = new List<StagedImportRowPayloadRecord>();
+        await using var command = Command("SELECT StagedImportRowId,SourceTitle,ResolvedOutputTitle,OriginalShareUrl,RawValuesJson FROM StagedImportRowPayloads WHERE StagedImportRowId=$row;");
+        var row = command.Parameters.Add("$row", SqliteType.Text);
+        command.Prepare();
+        foreach (var id in stagedImportRowIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            row.Value = Id(id);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                result.Add(new(Guid.Parse(reader.GetString(0)), reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetString(3), reader.GetString(4)));
+        }
+        return result;
     }
 
     public async Task UpdateRowPayloadAsync(
