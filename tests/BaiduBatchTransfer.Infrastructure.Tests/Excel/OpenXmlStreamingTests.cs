@@ -237,6 +237,30 @@ public sealed class OpenXmlStreamingTests : IDisposable
     }
 
     [Fact]
+    public async Task InspectorDiscoversLateColumnsAcrossTwoHundredThousandRowsWithBoundedMemory()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "inspect-large.xlsx");
+        WriteLargeWorkbook(
+            path,
+            200_000,
+            includeLatePreservedColumn: true,
+            includeHeader: false);
+        var before = GC.GetTotalMemory(forceFullCollection: true);
+
+        await using var stream = File.OpenRead(path);
+        var inspection = await new OpenXmlWorkbookInspector().InspectAsync(stream);
+        var delta = Math.Max(0, GC.GetTotalMemory(forceFullCollection: true) - before);
+        var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+
+        Assert.Equal(20, inspection.SampleRows.Count);
+        Assert.Equal(20, inspection.ObservedRows.Count);
+        Assert.Equal(3, inspection.Columns.Count);
+        Assert.Equal(TabularImportColumnRole.Preserve, suggestion.Columns[2].Role);
+        Assert.True(delta < 96L * 1024 * 1024, $"Inspector retained {delta:N0} managed bytes.");
+    }
+
+    [Fact]
     public async Task TemplateAndResultWriterUseExpectedColumnsAndExplicitTextCells()
     {
         Directory.CreateDirectory(root);
@@ -396,7 +420,11 @@ public sealed class OpenXmlStreamingTests : IDisposable
         return [];
     }
 
-    private static void WriteLargeWorkbook(string path, int rowCount)
+    private static void WriteLargeWorkbook(
+        string path,
+        int rowCount,
+        bool includeLatePreservedColumn = false,
+        bool includeHeader = true)
     {
         using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
         var workbookPart = document.AddWorkbookPart();
@@ -413,9 +441,15 @@ public sealed class OpenXmlStreamingTests : IDisposable
         using var sheetWriter = OpenXmlWriter.Create(worksheetPart);
         sheetWriter.WriteStartElement(new Worksheet());
         sheetWriter.WriteStartElement(new SheetData());
-        WriteInlineRow(sheetWriter, 1, "分享链接", "备注");
+        uint nextRow = 1;
+        if (includeHeader) WriteInlineRow(sheetWriter, nextRow++, "分享链接", "备注");
         for (var index = 1; index <= rowCount; index++)
-            WriteInlineRow(sheetWriter, (uint)(index + 1), $"https://pan.baidu.com/s/id-{index}", $"note-{index}");
+        {
+            if (includeLatePreservedColumn && index == rowCount)
+                WriteInlineRow(sheetWriter, checked((uint)index + nextRow - 1), $"https://pan.baidu.com/s/id-{index}", $"note-{index}", "late-preserved");
+            else
+                WriteInlineRow(sheetWriter, checked((uint)index + nextRow - 1), $"https://pan.baidu.com/s/id-{index}", $"note-{index}");
+        }
         sheetWriter.WriteEndElement();
         sheetWriter.WriteEndElement();
     }

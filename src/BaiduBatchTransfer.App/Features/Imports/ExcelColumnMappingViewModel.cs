@@ -23,8 +23,14 @@ public sealed class ExcelColumnMappingViewModel : ObservableObject
                 value.SourceColumnIndex == column.SourceColumnIndex)?.Role ?? TabularImportColumnRole.Preserve;
             return new ExcelColumnMappingChoice(column.SourceColumnIndex, column.Header, role);
         }));
-        PreviewRows = new ObservableCollection<ExcelMappingPreviewRow>(inspection.SampleRows.Select(row =>
-            new ExcelMappingPreviewRow(row.SourceRowNumber, string.Join("　|　", row.RawValues))));
+        foreach (var column in Columns) column.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName != nameof(ExcelColumnMappingChoice.Role)) return;
+            ConfirmedMapping = null;
+            ValidationMessage = string.Empty;
+        };
+        PreviewRows = [];
+        RebuildSnapshot();
     }
 
     public ObservableCollection<ExcelColumnMappingChoice> Columns { get; }
@@ -34,7 +40,13 @@ public sealed class ExcelColumnMappingViewModel : ObservableObject
     public bool FirstRowIsHeader
     {
         get => firstRowIsHeader;
-        set => SetProperty(ref firstRowIsHeader, value);
+        set
+        {
+            if (!SetProperty(ref firstRowIsHeader, value)) return;
+            ConfirmedMapping = null;
+            ValidationMessage = string.Empty;
+            RebuildSnapshot();
+        }
     }
 
     public string ValidationMessage
@@ -54,7 +66,8 @@ public sealed class ExcelColumnMappingViewModel : ObservableObject
                 : null;
             ConfirmedMapping = new ConfirmedImportColumnMapping(
                 headerRow,
-                Columns.Select(column => new TabularImportColumnMapping(column.SourceColumnIndex, column.Role)));
+                Columns.Select(column => new TabularImportColumnMapping(column.SourceColumnIndex, column.Role)),
+                Columns.Select(column => new TabularInspectionColumn(column.SourceColumnIndex, column.SourceHeader)));
             ValidationMessage = string.Empty;
             return true;
         }
@@ -65,22 +78,49 @@ public sealed class ExcelColumnMappingViewModel : ObservableObject
             return false;
         }
     }
+
+    private void RebuildSnapshot()
+    {
+        var firstObserved = inspection.ObservedRows.FirstOrDefault();
+        foreach (var column in Columns)
+        {
+            var sourceHeader = FirstRowIsHeader && firstObserved is not null &&
+                column.SourceColumnIndex < firstObserved.RawValues.Count
+                ? firstObserved.RawValues[column.SourceColumnIndex]
+                : FirstRowIsHeader
+                    ? inspection.Columns.FirstOrDefault(value => value.SourceColumnIndex == column.SourceColumnIndex)?.Header
+                    : $"第 {column.SourceColumnIndex + 1} 列";
+            column.SetSourceHeader(sourceHeader);
+        }
+        PreviewRows.Clear();
+        var rows = FirstRowIsHeader ? inspection.ObservedRows.Skip(1) : inspection.ObservedRows;
+        foreach (var row in rows.Take(20))
+            PreviewRows.Add(new ExcelMappingPreviewRow(row.SourceRowNumber, string.Join("　|　", row.RawValues)));
+    }
 }
 
 public sealed class ExcelColumnMappingChoice : ObservableObject
 {
     private TabularImportColumnRole role;
+    private string header;
 
     public ExcelColumnMappingChoice(int sourceColumnIndex, string? header, TabularImportColumnRole role)
     {
         SourceColumnIndex = sourceColumnIndex;
-        Header = string.IsNullOrWhiteSpace(header) ? $"第 {sourceColumnIndex + 1} 列" : header;
+        SourceHeader = header;
+        this.header = string.IsNullOrEmpty(header) ? $"第 {sourceColumnIndex + 1} 列" : header;
         this.role = role;
     }
 
     public int SourceColumnIndex { get; }
 
-    public string Header { get; }
+    public string Header
+    {
+        get => header;
+        private set => SetProperty(ref header, value);
+    }
+
+    public string? SourceHeader { get; private set; }
 
     public TabularImportColumnRole Role
     {
@@ -89,6 +129,13 @@ public sealed class ExcelColumnMappingChoice : ObservableObject
     }
 
     public IReadOnlyList<ExcelColumnRoleOption> RoleOptions => ExcelColumnRoleOption.All;
+
+    internal void SetSourceHeader(string? value)
+    {
+        var snapshot = string.IsNullOrEmpty(value) ? $"第 {SourceColumnIndex + 1} 列" : value;
+        SourceHeader = snapshot;
+        Header = snapshot;
+    }
 
     public override string ToString() =>
         $"ExcelColumnMappingChoice {{ SourceColumnIndex = {SourceColumnIndex}, Role = {Role}, Header = [REDACTED] }}";

@@ -88,25 +88,41 @@ public sealed class ExcelColumnMappingTests : IDisposable
         Assert.Equal(21, inspection.SampleRows[^1].SourceRowNumber);
     }
 
-    [Fact]
-    public async Task ReaderRejectsColumnsThatAppearOnlyAfterTheBoundedConfirmationSample()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("A1:B22")]
+    public async Task InspectorPreservesColumnsFirstPopulatedAfterTheUiSample(string? worksheetDimension)
     {
         var rows = Enumerable.Range(1, 20)
             .Select(index => new[] { $"标题 {index}", $"https://pan.baidu.com/s/{index}" })
             .Append(["标题 21", "https://pan.baidu.com/s/21", "未确认字段"])
             .ToArray();
-        var path = WriteWorkbook(["标题", "链接"], rows);
+        var path = WriteWorkbook(["标题", "链接"], rows, worksheetDimension);
         await using var inspectStream = File.OpenRead(path);
         var inspection = await new OpenXmlWorkbookInspector().InspectAsync(inspectStream);
         var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
         var mapping = new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns);
 
+        Assert.Equal(3, inspection.Columns.Count);
+        Assert.Null(inspection.Columns[2].Header);
+        Assert.Equal(TabularImportColumnRole.Preserve, Role(suggestion, 2));
         await using var readStream = File.OpenRead(path);
-        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
-            ReadAllAsync(new OpenXmlImportReader().ReadAsync(readStream, mapping)));
+        var imported = await ReadAllAsync(new OpenXmlImportReader().ReadAsync(readStream, mapping));
 
-        Assert.Equal(ExcelImportErrorCode.ColumnMappingMismatch, error.Code);
-        Assert.DoesNotContain("未确认字段", error.ToString(), StringComparison.Ordinal);
+        Assert.Equal("未确认字段", imported[^1].RawValues[2]);
+    }
+
+    [Fact]
+    public async Task InspectorRejectsWorksheetDimensionBeyondExcelColumnBoundary()
+    {
+        var path = WriteWorkbook(["标题", "链接"], [], "A1:XFE2");
+        await using var stream = File.OpenRead(path);
+
+        var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+            new OpenXmlWorkbookInspector().InspectAsync(stream));
+
+        Assert.Equal(ExcelImportErrorCode.CellLimitExceeded, error.Code);
+        Assert.Equal(16_385, error.ObservedCount);
     }
 
     [Fact]
@@ -320,7 +336,10 @@ public sealed class ExcelColumnMappingTests : IDisposable
     private static TabularImportColumnRole Role(ImportColumnMappingSuggestion suggestion, int index) =>
         suggestion.Columns.Single(column => column.SourceColumnIndex == index).Role;
 
-    private string WriteWorkbook(string[]? headers, string[][] rows)
+    private string WriteWorkbook(
+        string[]? headers,
+        string[][] rows,
+        string? worksheetDimension = null)
     {
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, $"{Guid.NewGuid():N}.xlsx");
@@ -335,6 +354,8 @@ public sealed class ExcelColumnMappingTests : IDisposable
         }));
         using var writer = OpenXmlWriter.Create(worksheetPart);
         writer.WriteStartElement(new Worksheet());
+        if (worksheetDimension is not null)
+            writer.WriteElement(new SheetDimension { Reference = worksheetDimension });
         writer.WriteStartElement(new SheetData());
         uint rowNumber = 1;
         if (headers is not null) WriteInlineRow(writer, rowNumber++, headers);

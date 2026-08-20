@@ -99,7 +99,9 @@ public sealed class LocalImportWorkflow(
             var inspection = await InspectExcelAsync(fullPath, cancellationToken).ConfigureAwait(false);
             var mapping = await mappingPresenter.ConfirmAsync(inspection, cancellationToken).ConfigureAwait(false);
             if (mapping is null) throw new OperationCanceledException("Excel column mapping was cancelled.");
-            var source = ReplaySource.ForExcel(fullPath, mapping, inspection.Columns);
+            if (mapping.SourceColumns.Count != mapping.SourceColumnCount)
+                throw new ImportWorkflowException(ImportUiError.InvalidData);
+            var source = ReplaySource.ForExcel(fullPath, mapping, mapping.SourceColumns);
             RememberReplaySource(sessionId, source);
             await stagingService.StageAsync(
                 new ImportRequest(
@@ -107,7 +109,7 @@ public sealed class LocalImportWorkflow(
                     "Excel",
                     Path.GetFileName(fullPath),
                     ColumnMapping: mapping,
-                    SourceColumns: inspection.Columns),
+                    SourceColumns: mapping.SourceColumns),
                 ReadExcelAsync(fullPath, mapping, cancellationToken),
                 replayProgress,
                 cancellationToken).ConfigureAwait(false);

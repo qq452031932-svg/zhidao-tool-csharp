@@ -67,7 +67,8 @@ public sealed record TabularWorkbookInspection
     public TabularWorkbookInspection(
         int? headerRowNumber,
         IEnumerable<TabularInspectionColumn> columns,
-        IEnumerable<TabularInspectionRow> sampleRows)
+        IEnumerable<TabularInspectionRow> sampleRows,
+        IEnumerable<TabularInspectionRow>? observedRows = null)
     {
         if (headerRowNumber <= 0) throw new ArgumentOutOfRangeException(nameof(headerRowNumber));
         ArgumentNullException.ThrowIfNull(columns);
@@ -75,6 +76,7 @@ public sealed record TabularWorkbookInspection
         HeaderRowNumber = headerRowNumber;
         Columns = columns.ToImmutableArray();
         SampleRows = sampleRows.ToImmutableArray();
+        ObservedRows = (observedRows ?? RebuildObservedRows()).ToImmutableArray();
     }
 
     public int? HeaderRowNumber { get; }
@@ -83,8 +85,21 @@ public sealed record TabularWorkbookInspection
 
     public IReadOnlyList<TabularInspectionRow> SampleRows { get; }
 
+    public IReadOnlyList<TabularInspectionRow> ObservedRows { get; }
+
     public override string ToString() =>
         $"TabularWorkbookInspection {{ HasSuggestedHeader = {HeaderRowNumber is not null}, ColumnCount = {Columns.Count}, SampleRowCount = {SampleRows.Count}, UserContent = [REDACTED] }}";
+
+    private IEnumerable<TabularInspectionRow> RebuildObservedRows()
+    {
+        if (HeaderRowNumber is int headerRowNumber)
+        {
+            yield return new TabularInspectionRow(
+                headerRowNumber,
+                Columns.OrderBy(column => column.SourceColumnIndex).Select(column => column.Header ?? string.Empty));
+        }
+        foreach (var row in SampleRows) yield return row;
+    }
 }
 
 public sealed record ImportColumnMappingSuggestion
@@ -111,7 +126,8 @@ public sealed record ConfirmedImportColumnMapping
 {
     public ConfirmedImportColumnMapping(
         int? headerRowNumber,
-        IEnumerable<TabularImportColumnMapping> columns)
+        IEnumerable<TabularImportColumnMapping> columns,
+        IEnumerable<TabularInspectionColumn>? sourceColumns = null)
     {
         if (headerRowNumber <= 0) throw new ArgumentOutOfRangeException(nameof(headerRowNumber));
         ArgumentNullException.ThrowIfNull(columns);
@@ -131,12 +147,22 @@ public sealed record ConfirmedImportColumnMapping
 
         HeaderRowNumber = headerRowNumber;
         Columns = ordered;
-        Fingerprint = ComputeFingerprint(headerRowNumber, ordered);
+        SourceColumns = (sourceColumns ?? []).OrderBy(column => column.SourceColumnIndex).ToImmutableArray();
+        if (SourceColumns.Count != 0 &&
+            (SourceColumns.Count != ordered.Length ||
+             SourceColumns.Select(column => column.SourceColumnIndex).Distinct().Count() != SourceColumns.Count ||
+             SourceColumns.Where((column, index) => column.SourceColumnIndex != index).Any()))
+        {
+            throw new ArgumentException("Confirmed source columns must match the mapping snapshot.", nameof(sourceColumns));
+        }
+        Fingerprint = ComputeFingerprint(headerRowNumber, ordered, SourceColumns);
     }
 
     public int? HeaderRowNumber { get; }
 
     public IReadOnlyList<TabularImportColumnMapping> Columns { get; }
+
+    public IReadOnlyList<TabularInspectionColumn> SourceColumns { get; }
 
     public int SourceColumnCount => Columns.Count;
 
@@ -157,9 +183,10 @@ public sealed record ConfirmedImportColumnMapping
 
     private static string ComputeFingerprint(
         int? headerRowNumber,
-        IEnumerable<TabularImportColumnMapping> columns)
+        IEnumerable<TabularImportColumnMapping> columns,
+        IReadOnlyList<TabularInspectionColumn> sourceColumns)
     {
-        var canonical = new StringBuilder("tabular-import-mapping-v1\n")
+        var canonical = new StringBuilder("tabular-import-mapping-v2\n")
             .Append(headerRowNumber?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "none")
             .Append('\n');
         foreach (var column in columns)
@@ -168,6 +195,14 @@ public sealed record ConfirmedImportColumnMapping
                 .Append(':')
                 .Append((int)column.Role)
                 .Append('\n');
+        }
+        canonical.Append("headers:").Append(sourceColumns.Count).Append('\n');
+        foreach (var column in sourceColumns)
+        {
+            canonical.Append(column.SourceColumnIndex).Append(':');
+            if (column.Header is null) canonical.Append("null");
+            else canonical.Append(Convert.ToBase64String(Encoding.UTF8.GetBytes(column.Header)));
+            canonical.Append('\n');
         }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString())))
             .ToLowerInvariant();

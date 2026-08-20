@@ -163,6 +163,54 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
     }
 
+    [Theory]
+    [InlineData(false, "第 1 列", 3)]
+    [InlineData(true, "https://pan.baidu.com/s/header-value", 1)]
+    public async Task HeaderOverrideSnapshotFlowsFromPresenterThroughWorkflowIntoDatabase(
+        bool firstRowIsHeader,
+        string expectedFirstHeader,
+        int expectedRows)
+    {
+        Directory.CreateDirectory(root);
+        var workbookPath = Path.Combine(root, $"header-override-{firstRowIsHeader}.xlsx");
+        if (firstRowIsHeader)
+        {
+            WriteWorkbook(
+                workbookPath,
+                [
+                    ["https://pan.baidu.com/s/header-value", "a1b2"],
+                    ["https://pan.baidu.com/s/imported", "c3d4"],
+                ],
+                includeTemplateHeader: false);
+        }
+        else
+        {
+            WriteWorkbook(
+                workbookPath,
+                [
+                    ["https://pan.baidu.com/s/one", "a1b2"],
+                    ["https://pan.baidu.com/s/two", "c3d4"],
+                ]);
+        }
+        var presenter = new HeaderOverrideMappingPresenter(firstRowIsHeader);
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(presenter));
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sessionId = Guid.NewGuid();
+
+        await host.Services.GetRequiredService<IImportWorkflow>()
+            .ImportExcelAsync(sessionId, workbookPath, CancellationToken.None);
+
+        await using var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync();
+        var session = await unit.Imports.GetSessionAsync(sessionId);
+        var definitions = await unit.Imports.GetColumnDefinitionsAsync(sessionId);
+        Assert.Equal(expectedRows, session!.TotalRows);
+        Assert.Equal(presenter.LastMapping!.Fingerprint, session.ColumnMappingFingerprint);
+        Assert.Equal(expectedFirstHeader, definitions[0].SourceHeader);
+        Assert.Equal(presenter.LastMapping.SourceColumns.Select(column => column.Header), definitions.Select(column => column.SourceHeader));
+        Assert.NotEqual(presenter.InitialFingerprint, presenter.LastMapping.Fingerprint);
+    }
+
     public void Dispose()
     {
         var fullRoot = Path.GetFullPath(root);
@@ -174,7 +222,10 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             Directory.Delete(fullRoot, recursive: true);
     }
 
-    private static void WriteWorkbook(string path, IReadOnlyList<string[]> rows)
+    private static void WriteWorkbook(
+        string path,
+        IReadOnlyList<string[]> rows,
+        bool includeTemplateHeader = true)
     {
         using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
         var workbookPart = document.AddWorkbookPart();
@@ -188,9 +239,10 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         using var writer = OpenXmlWriter.Create(worksheetPart);
         writer.WriteStartElement(new Worksheet());
         writer.WriteStartElement(new SheetData());
-        WriteInlineRow(writer, 1, ["分享链接", "提取码"]);
+        uint nextRow = 1;
+        if (includeTemplateHeader) WriteInlineRow(writer, nextRow++, ["分享链接", "提取码"]);
         for (var index = 0; index < rows.Count; index++)
-            WriteInlineRow(writer, checked((uint)index + 2), rows[index]);
+            WriteInlineRow(writer, checked((uint)index + nextRow), rows[index]);
         writer.WriteEndElement();
         writer.WriteEndElement();
     }
@@ -231,7 +283,10 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             ConfirmationCount++;
             var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
-            LastMapping = new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns);
+            LastMapping = new ConfirmedImportColumnMapping(
+                suggestion.HeaderRowNumber,
+                suggestion.Columns,
+                inspection.Columns);
             return Task.FromResult<ConfirmedImportColumnMapping?>(LastMapping);
         }
     }
@@ -242,5 +297,29 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             TabularWorkbookInspection inspection,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<ConfirmedImportColumnMapping?>(null);
+    }
+
+    private sealed class HeaderOverrideMappingPresenter(bool firstRowIsHeader) : IExcelColumnMappingPresenter
+    {
+        public string? InitialFingerprint { get; private set; }
+        public ConfirmedImportColumnMapping? LastMapping { get; private set; }
+
+        public Task<ConfirmedImportColumnMapping?> ConfirmAsync(
+            TabularWorkbookInspection inspection,
+            CancellationToken cancellationToken = default)
+        {
+            var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+            InitialFingerprint = new ConfirmedImportColumnMapping(
+                suggestion.HeaderRowNumber,
+                suggestion.Columns,
+                inspection.Columns).Fingerprint;
+            var viewModel = new ExcelColumnMappingViewModel(inspection, suggestion)
+            {
+                FirstRowIsHeader = firstRowIsHeader,
+            };
+            Assert.True(viewModel.TryConfirm());
+            LastMapping = viewModel.ConfirmedMapping;
+            return Task.FromResult(LastMapping);
+        }
     }
 }

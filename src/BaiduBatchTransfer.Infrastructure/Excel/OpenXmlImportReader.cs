@@ -491,4 +491,26 @@ public sealed class OpenXmlImportReader
         return letters == 0 ? null : value - 1;
     }
 
+    internal static void ValidateWorksheetDimensionReference(string? reference)
+    {
+        if (string.IsNullOrWhiteSpace(reference)) return;
+        var components = reference.Split(':');
+        if (components.Length is < 1 or > 2)
+            throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet dimension reference is invalid.");
+        foreach (var component in components)
+        {
+            var columnIndex = GetColumnIndex(component);
+            if (columnIndex is null)
+                throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A worksheet dimension reference is invalid.");
+            var digitOffset = 0;
+            while (digitOffset < component.Length && char.IsLetter(component[digitOffset])) digitOffset++;
+            if (digitOffset == component.Length ||
+                !uint.TryParse(component.AsSpan(digitOffset), out var rowNumber) ||
+                rowNumber is 0 or > OpenXmlImportLimits.ExcelMaximumRows)
+            {
+                throw new ExcelImportException(ExcelImportErrorCode.RowLimitExceeded, "A worksheet dimension exceeds the Excel row boundary.");
+            }
+        }
+    }
+
 }

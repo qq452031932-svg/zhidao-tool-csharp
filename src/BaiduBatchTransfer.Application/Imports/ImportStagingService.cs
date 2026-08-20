@@ -69,11 +69,15 @@ public sealed class ImportStagingService
         if (request.SessionId == Guid.Empty) throw new ArgumentException("A session id is required.", nameof(request));
         ArgumentException.ThrowIfNullOrWhiteSpace(request.SourceType);
         ArgumentException.ThrowIfNullOrWhiteSpace(request.SourceName);
+        var sourceType = NormalizeSourceType(request.SourceType);
+        var columnDefinitions = sourceType == "Excel"
+            ? ValidateExcelMapping(request)
+            : null;
 
         var now = DateTimeOffset.UtcNow;
         var progress = new ProgressState(new ImportSessionRecord(
             request.SessionId,
-            request.SourceType,
+            sourceType,
             request.SourceName,
             "Parsing",
             0, 0, 0, 0, 0,
@@ -84,24 +88,11 @@ public sealed class ImportStagingService
         await using (var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
         {
             await unit.Imports.AddSessionAsync(progress.Session, cancellationToken).ConfigureAwait(false);
-            if (request.ColumnMapping is not null)
-            {
-                var headers = (request.SourceColumns ?? Enumerable.Range(0, request.ColumnMapping.SourceColumnCount)
-                    .Select(index => new TabularInspectionColumn(index, null)).ToArray())
-                    .ToDictionary(column => column.SourceColumnIndex);
-                if (headers.Count != request.ColumnMapping.SourceColumnCount ||
-                    request.ColumnMapping.Columns.Any(column => !headers.ContainsKey(column.SourceColumnIndex)))
-                    throw new ArgumentException("Confirmed mapping columns must match inspected source columns.", nameof(request));
+            if (columnDefinitions is not null)
                 await unit.Imports.SetColumnDefinitionsAsync(
                     request.SessionId,
-                    request.ColumnMapping.Columns.Select(column => new ImportColumnDefinitionRecord(
-                        request.SessionId,
-                        column.SourceColumnIndex,
-                        headers[column.SourceColumnIndex].Header,
-                        PersistedRole(column.Role),
-                        column.Role == TabularImportColumnRole.ShareUrl)),
+                    columnDefinitions,
                     cancellationToken).ConfigureAwait(false);
-            }
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -664,9 +655,64 @@ public sealed class ImportStagingService
 
     private static string PersistedRole(TabularImportColumnRole role) => role switch
     {
+        TabularImportColumnRole.Preserve => "Preserve",
         TabularImportColumnRole.SourceTitle => "Title",
         TabularImportColumnRole.ShareUrl => "ShareUrl",
         TabularImportColumnRole.ExtractionCode => "ExtractionCode",
-        _ => "Preserve",
+        _ => throw new ArgumentOutOfRangeException(nameof(role)),
     };
+
+    private static string NormalizeSourceType(string value)
+    {
+        var normalized = value.Trim();
+        if (string.Equals(normalized, "Excel", StringComparison.OrdinalIgnoreCase)) return "Excel";
+        if (string.Equals(normalized, "Text", StringComparison.OrdinalIgnoreCase)) return "Text";
+        throw new ArgumentException("The import source type is not supported.", nameof(value));
+    }
+
+    private static IReadOnlyList<ImportColumnDefinitionRecord> ValidateExcelMapping(ImportRequest request)
+    {
+        var mapping = request.ColumnMapping
+            ?? throw new ArgumentException("Excel imports require a confirmed column mapping.", nameof(request));
+        if (string.IsNullOrWhiteSpace(mapping.Fingerprint) ||
+            mapping.SourceColumns.Count != mapping.SourceColumnCount ||
+            mapping.Columns.Any(column => !Enum.IsDefined(column.Role)) ||
+            mapping.Columns.Count(column => column.Role == TabularImportColumnRole.ShareUrl) != 1 ||
+            mapping.Columns.Count(column => column.Role == TabularImportColumnRole.SourceTitle) > 1 ||
+            mapping.Columns.Count(column => column.Role == TabularImportColumnRole.ExtractionCode) > 1)
+        {
+            throw new ArgumentException("The confirmed Excel mapping is invalid.", nameof(request));
+        }
+        var canonical = new ConfirmedImportColumnMapping(
+            mapping.HeaderRowNumber,
+            mapping.Columns,
+            mapping.SourceColumns);
+        if (!string.Equals(canonical.Fingerprint, mapping.Fingerprint, StringComparison.Ordinal))
+            throw new ArgumentException("The confirmed Excel mapping fingerprint is invalid.", nameof(request));
+        if (request.SourceColumns is null)
+            throw new ArgumentException("Excel imports require confirmed source-column definitions.", nameof(request));
+        Dictionary<int, TabularInspectionColumn> headers;
+        try
+        {
+            headers = request.SourceColumns.ToDictionary(column => column.SourceColumnIndex);
+        }
+        catch (ArgumentException)
+        {
+            throw new ArgumentException("Confirmed mapping columns must match inspected source columns.", nameof(request));
+        }
+        if (headers.Count != mapping.SourceColumnCount ||
+            mapping.Columns.Any(column => !headers.ContainsKey(column.SourceColumnIndex)) ||
+            mapping.SourceColumns.Any(column =>
+                !headers.TryGetValue(column.SourceColumnIndex, out var requested) ||
+                !string.Equals(column.Header, requested.Header, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException("Confirmed mapping columns must match inspected source columns.", nameof(request));
+        }
+        return mapping.Columns.Select(column => new ImportColumnDefinitionRecord(
+            request.SessionId,
+            column.SourceColumnIndex,
+            headers[column.SourceColumnIndex].Header,
+            PersistedRole(column.Role),
+            column.Role == TabularImportColumnRole.ShareUrl)).ToArray();
+    }
 }

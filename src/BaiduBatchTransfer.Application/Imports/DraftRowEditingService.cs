@@ -149,7 +149,12 @@ public sealed class DraftRowEditingService(IUnitOfWorkFactory unitOfWorkFactory)
                 var payload = await unit.Imports.GetRowPayloadAsync(row.Id, cancellationToken).ConfigureAwait(false);
                 if (payload is not null)
                     await unit.Imports.UpdateRowPayloadAsync(
-                        payload with { ResolvedOutputTitle = null },
+                        payload with
+                        {
+                            ResolvedOutputTitle = string.IsNullOrWhiteSpace(payload.SourceTitle)
+                                ? null
+                                : payload.SourceTitle,
+                        },
                         cancellationToken).ConfigureAwait(false);
             }
         }, cancellationToken);

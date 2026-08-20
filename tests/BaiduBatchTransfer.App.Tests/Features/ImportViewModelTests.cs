@@ -44,6 +44,44 @@ public sealed class ImportViewModelTests
         Assert.False(vm.TryConfirm());
         Assert.Equal("必须且只能选择一列作为分享链接。", vm.ValidationMessage);
     }
+
+    [Fact]
+    public void ExcelMappingViewModelRebuildsHeadersPreviewAndFingerprintForHeaderOverride()
+    {
+        var inspection = new TabularWorkbookInspection(
+            1,
+            [new(0, "原表头"), new(1, "分享链接"), new(2, null)],
+            [new(2, ["课程", "https://pan.baidu.com/s/id", "保留值"])],
+            observedRows:
+            [
+                new(1, ["  原表头  ", "分享链接", ""]),
+                new(2, ["课程", "https://pan.baidu.com/s/id", "保留值"]),
+            ]);
+        var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+        var vm = new ExcelColumnMappingViewModel(inspection, suggestion);
+
+        Assert.True(vm.TryConfirm());
+        var headerMapping = vm.ConfirmedMapping!;
+        Assert.Equal("  原表头  ", headerMapping.SourceColumns[0].Header);
+        Assert.Equal("第 3 列", headerMapping.SourceColumns[2].Header);
+        Assert.Equal(2, Assert.Single(vm.PreviewRows).SourceRowNumber);
+
+        vm.FirstRowIsHeader = false;
+        Assert.Null(vm.ConfirmedMapping);
+        Assert.Equal("第 1 列", vm.Columns[0].Header);
+        Assert.Equal(1, vm.PreviewRows[0].SourceRowNumber);
+        Assert.True(vm.TryConfirm());
+        var headerlessMapping = vm.ConfirmedMapping!;
+        Assert.Null(headerlessMapping.HeaderRowNumber);
+        Assert.Equal("第 1 列", headerlessMapping.SourceColumns[0].Header);
+        Assert.NotEqual(headerMapping.Fingerprint, headerlessMapping.Fingerprint);
+
+        vm.FirstRowIsHeader = true;
+        Assert.Equal("  原表头  ", vm.Columns[0].Header);
+        Assert.True(vm.TryConfirm());
+        Assert.Equal("  原表头  ", vm.ConfirmedMapping!.SourceColumns[0].Header);
+        Assert.Equal(headerMapping.Fingerprint, vm.ConfirmedMapping.Fingerprint);
+    }
     [Fact]
     public async Task CancellationBeforeSessionCommitDoesNotClaimAResumableDraft()
     {
@@ -688,7 +726,10 @@ public sealed class ImportViewModelTests
         {
             var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
             return Task.FromResult<ConfirmedImportColumnMapping?>(
-                new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns));
+                new ConfirmedImportColumnMapping(
+                    suggestion.HeaderRowNumber,
+                    suggestion.Columns,
+                    inspection.Columns));
         }
     }
 

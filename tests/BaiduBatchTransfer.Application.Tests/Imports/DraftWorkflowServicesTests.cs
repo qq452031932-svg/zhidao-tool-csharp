@@ -200,41 +200,86 @@ public sealed class DraftWorkflowServicesTests
     }
 
     [Fact]
-    public async Task LinkAndCodeEditsPreserveOriginalPayloadButInvalidateDerivedTitle()
+    public async Task LinkAndCodeEditsRestoreUserTitleButClearUntitledFallback()
     {
         await using var database = await Jobs.BatchTestDatabase.CreateAsync();
         var sessionId = Guid.NewGuid();
-        var row = Row(sessionId, 1, "old") with
+        var titled = Row(sessionId, 1, "old") with
         {
             PrecheckStatus = "Succeeded",
             PrecheckedAt = Jobs.BatchTestData.Now,
         };
-        await database.SeedAsync([], Session(sessionId, 1, ready: 1), [row]);
+        var untitled = Row(sessionId, 2, "untitled") with
+        {
+            PrecheckStatus = "Succeeded",
+            PrecheckedAt = Jobs.BatchTestData.Now,
+        };
+        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled]);
         await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
         {
             await seed.Imports.AddRowPayloadsAsync([
-                new(row.Id, "原始标题", "解析后标题", "https://pan.baidu.com/s/old", "[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]"),
+                new(titled.Id, "  原始标题  ", "解析后标题", "https://pan.baidu.com/s/old", "[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]"),
+                new(untitled.Id, null, "无标题回退", "https://pan.baidu.com/s/untitled", "[\"\",\"https://pan.baidu.com/s/untitled\"]"),
             ]);
             await seed.CommitAsync();
         }
 
-        await new DraftRowEditingService(database.UnitOfWorkFactory).EditAsync(
+        var service = new DraftRowEditingService(database.UnitOfWorkFactory);
+        await service.EditAsync(
             new DraftRowEditRequest(
                 sessionId,
-                row.Id,
+                titled.Id,
                 shareUrl: "https://pan.baidu.com/s/new",
                 extractionCode: "n3w4"),
             TransferMode.Distribution);
+        await service.EditAsync(
+            new DraftRowEditRequest(
+                sessionId,
+                untitled.Id,
+                extractionCode: "z9y8"),
+            TransferMode.Distribution);
 
         await using var read = await database.UnitOfWorkFactory.BeginAsync();
-        var edited = await read.Imports.GetRowByIdAsync(row.Id);
-        var payload = await read.Imports.GetRowPayloadAsync(row.Id);
+        var edited = await read.Imports.GetRowByIdAsync(titled.Id);
+        var titledPayload = await read.Imports.GetRowPayloadAsync(titled.Id);
+        var untitledPayload = await read.Imports.GetRowPayloadAsync(untitled.Id);
         Assert.Null(edited!.PrecheckStatus);
         Assert.Equal("https://pan.baidu.com/s/new", edited.ShareUrl);
-        Assert.Equal("原始标题", payload!.SourceTitle);
-        Assert.Null(payload.ResolvedOutputTitle);
-        Assert.Equal("https://pan.baidu.com/s/old", payload.OriginalShareUrl);
-        Assert.Equal("[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]", payload.RawValuesJson);
+        Assert.Equal("  原始标题  ", titledPayload!.SourceTitle);
+        Assert.Equal("  原始标题  ", titledPayload.ResolvedOutputTitle);
+        Assert.Equal("https://pan.baidu.com/s/old", titledPayload.OriginalShareUrl);
+        Assert.Equal("[\"  原始标题  \",\"https://pan.baidu.com/s/old\",\"\"]", titledPayload.RawValuesJson);
+        Assert.Null(untitledPayload!.SourceTitle);
+        Assert.Null(untitledPayload.ResolvedOutputTitle);
+        Assert.Equal("https://pan.baidu.com/s/untitled", untitledPayload.OriginalShareUrl);
+        Assert.Equal("[\"\",\"https://pan.baidu.com/s/untitled\"]", untitledPayload.RawValuesJson);
+    }
+
+    [Fact]
+    public async Task BulkUnrelatedEditsPreserveTitledAndUntitledResolvedOutputTitles()
+    {
+        await using var database = await Jobs.BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var titled = Row(sessionId, 1, "titled");
+        var untitled = Row(sessionId, 2, "untitled");
+        await database.SeedAsync([], Session(sessionId, 2, ready: 2), [titled, untitled]);
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.AddRowPayloadsAsync([
+                new(titled.Id, "源标题", "源标题", "https://pan.baidu.com/s/titled", "[\"源标题\"]"),
+                new(untitled.Id, null, "已解析回退", "https://pan.baidu.com/s/untitled", "[\"\"]"),
+            ]);
+            await seed.CommitAsync();
+        }
+
+        await new DraftRowEditingService(database.UnitOfWorkFactory).ApplyBulkOverridesAsync(
+            sessionId,
+            new DraftBulkOverride(Note: "批量备注"),
+            TransferMode.Distribution);
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("源标题", (await read.Imports.GetRowPayloadAsync(titled.Id))!.ResolvedOutputTitle);
+        Assert.Equal("已解析回退", (await read.Imports.GetRowPayloadAsync(untitled.Id))!.ResolvedOutputTitle);
     }
 
     [Fact]
