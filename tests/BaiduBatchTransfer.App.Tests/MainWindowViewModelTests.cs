@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using System.ComponentModel;
 using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
@@ -194,9 +195,53 @@ public sealed class MainWindowViewModelTests
             "MainWindow.xaml"));
 
         Assert.Contains("Content=\"刷新账号\" Command=\"{Binding RefreshAccountsCommand}\"", xaml);
-        Assert.Contains("AutomationProperties.Name=\"当前百度账号数量\"", xaml);
-        Assert.Contains("AutomationProperties.Name=\"账号管理状态\"", xaml);
+        Assert.Contains("x:Name=\"AccountStatusLiveRegion\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"{Binding AccountStatusMessage}\"", xaml);
+        Assert.Contains("x:Name=\"OperationStatusLiveRegion\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"{Binding StatusMessage}\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"{Binding AccountManagementStatusMessage}\"", xaml);
         Assert.Equal(2, xaml.Split("AutomationProperties.LiveSetting=\"Polite\"").Length - 1);
+
+        var codeBehind = File.ReadAllText(Path.ChangeExtension(
+            Path.Combine(FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "MainWindow.xaml"),
+            ".xaml.cs"));
+        Assert.Contains("DataContextChanged += OnDataContextChanged", codeBehind);
+        Assert.Contains("Closed += OnClosed", codeBehind);
+        Assert.Contains("liveRegionNotifier?.Dispose()", codeBehind);
+        Assert.Contains("AutomationEvents.LiveRegionChanged", codeBehind);
+    }
+
+    [Fact]
+    public void LiveRegionNotifierDispatchesTrackedChangesAndStopsAfterDispose()
+    {
+        var source = new FakePropertyChanges();
+        var dispatched = new List<Action>();
+        var announcements = new List<string>();
+        var notifier = new PropertyChangeLiveRegionNotifier(
+            source,
+            new Dictionary<string, Action>
+            {
+                [nameof(MainWindowViewModel.AccountStatusMessage)] = () => announcements.Add("account"),
+                [nameof(MainWindowViewModel.StatusMessage)] = () => announcements.Add("operation"),
+            },
+            action => dispatched.Add(action));
+
+        source.Raise(nameof(MainWindowViewModel.CurrentPageTitle));
+        Assert.Empty(dispatched);
+
+        source.Raise(nameof(MainWindowViewModel.AccountStatusMessage));
+        var accountAnnouncement = Assert.Single(dispatched);
+        Assert.Empty(announcements);
+        accountAnnouncement();
+        Assert.Equal(["account"], announcements);
+
+        source.Raise(nameof(MainWindowViewModel.StatusMessage));
+        Assert.Equal(2, dispatched.Count);
+        notifier.Dispose();
+        dispatched[1]();
+        Assert.Equal(["account"], announcements);
+        source.Raise(nameof(MainWindowViewModel.StatusMessage));
+        Assert.Equal(2, dispatched.Count);
     }
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
@@ -223,6 +268,14 @@ public sealed class MainWindowViewModelTests
             OpenCalls++;
             return Throw ? throw new InvalidOperationException("secret") : Task.CompletedTask;
         }
+    }
+
+    private sealed class FakePropertyChanges : INotifyPropertyChanged
+    {
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        public void Raise(string propertyName) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
     private sealed class FakeManagementLauncher : IAccountManagementLauncher
