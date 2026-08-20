@@ -263,7 +263,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(AccountExitStatus.Ready, preview.Status);
         Assert.Equal(2, preview.TerminalOperationCount);
         Assert.Equal(3, preview.TerminalBatchCount);
-        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(2, preview.SharedBatchCount);
         Assert.Equal(64, preview.ConfirmationToken.Length);
         Assert.DoesNotContain(Id(B), preview.ToString(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(preview.ConfirmationToken, preview.ToString(), StringComparison.Ordinal);
@@ -327,6 +327,8 @@ public sealed class AccountRemovalStoreTests : IDisposable
         await InsertOperationAsync(factory, cOperation, cResource, graph.SharedBatch, C, 3, "Succeeded");
         await InsertOperationAsync(factory, sharedDeletedOperation, sharedDeletedResource, graph.SharedBatch, B, 4, "Failed");
         await InsertOperationAsync(factory, sharedAOperation, graph.BResource, graph.SharedBatch, A, 5, "Succeeded");
+        await ExecuteAsync(factory, "UPDATE ResourceItems SET CandidateConstraintAccountId=$account WHERE Id=$id;",
+            ("$account", Id(B)), ("$id", Id(graph.BOnlyPublic)));
         await ExecuteAsync(factory, "UPDATE BatchJobs SET ResourceCount=6,OperationCount=5 WHERE Id=$id;", ("$id", Id(graph.SharedBatch)));
         await ExecuteAsync(factory, "UPDATE AccountAllocations SET AssignedItemCount=99,AttemptedItemCount=99,NewSuccessItemCount=99,AlreadySatisfiedItemCount=99,SuccessItemCount=99,FailedItemCount=99,LockedItemCount=99,ExclusiveCandidateCount=99,UnusedCandidateCount=99,ReservedSlotCount=99,FulfilledCount=99 WHERE BatchJobId=$batch AND AccountId<>$account;", ("$batch", Id(graph.SharedBatch)), ("$account", Id(B)));
 
@@ -335,7 +337,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
         await ExecuteAsync(factory, "UPDATE ImportSessions SET CreatedBatchJobId=$batch,AppendToBatchJobId=$batch WHERE Id=$id;", ("$batch", Id(shortfallBatch)), ("$id", Id(shortfallImport)));
         await InsertAllocationAsync(factory, Guid.NewGuid(), shortfallBatch, B, "/shortfall");
         await InsertResourceAsync(factory, shortfallResource, shortfallBatch, 1, B, "Expanded", "https://shortfall.invalid");
-        await InsertResourceAsync(factory, shortfallPublic, shortfallBatch, 2, null, "Unallocated", "https://shortfall-public.invalid");
+        await InsertResourceAsync(factory, shortfallPublic, shortfallBatch, 2, B, "Unused", "https://shortfall-public.invalid");
         await InsertOperationAsync(factory, shortfallOperation, shortfallResource, shortfallBatch, B, 1, "Cancelled");
 
         await InsertLogAsync(factory, publicAudit, graph.SharedBatch, null, null, null);
@@ -480,6 +482,66 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(batch))));
         Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(aResource))));
         Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(bResource))));
+    }
+
+    [Fact]
+    public async Task PublicNoOpResourcePreservesMinimalTerminalBatchAndImportContext()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var import = Guid.NewGuid();
+        var batch = Guid.NewGuid();
+        var bResource = Guid.NewGuid();
+        var bOperation = Guid.NewGuid();
+        var publicResource = Guid.NewGuid();
+        var publicAudit = Guid.NewGuid();
+        await InsertImportAsync(factory, import, "BatchCreated", B);
+        await InsertBatchAsync(factory, batch, "Completed", import, 2, 1);
+        await ExecuteAsync(factory, "UPDATE ImportSessions SET CreatedBatchJobId=$batch,AppendToBatchJobId=$batch WHERE Id=$id;",
+            ("$batch", Id(batch)), ("$id", Id(import)));
+        await InsertAllocationAsync(factory, Guid.NewGuid(), batch, B, "/bravo");
+        await InsertResourceAsync(factory, bResource, batch, 1, B, "Expanded", "https://bravo.invalid");
+        await InsertResourceAsync(factory, publicResource, batch, 2, null, "Unallocated", "https://public.invalid");
+        await InsertOperationAsync(factory, bOperation, bResource, batch, B, 1, "Succeeded");
+        await InsertLogAsync(factory, publicAudit, batch, null, null, null);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(1, preview.TerminalOperationCount);
+        Assert.Equal(1, preview.TerminalBatchCount);
+        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal("1,0", await ScalarTextAsync(factory,
+            "SELECT ResourceCount||','||OperationCount FROM BatchJobs WHERE Id='" + Id(batch) + "';"));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(publicResource))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(bResource))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM TransferOperations WHERE Id=$id;", ("$id", Id(bOperation))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=$batch AND AccountId=$account;",
+            ("$batch", Id(batch)), ("$account", Id(B))));
+        Assert.Equal(1, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id AND CreatedBatchJobId=$batch AND AppendToBatchJobId=$batch;",
+            ("$id", Id(import)), ("$batch", Id(batch))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id=$id;", ("$id", Id(publicAudit))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Theory]
+    [InlineData("Submitting")]
+    [InlineData("PendingConfirmation")]
+    public async Task TerminalStatusWithUnsafeSubmitStateBlocksPreviewAndPrepareWithoutWrites(string submitState)
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, "UPDATE TransferOperations SET SubmitState=$submit WHERE Id=$id;",
+            ("$submit", submitState), ("$id", Id(graph.BOperation)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
     }
 
     [Fact]

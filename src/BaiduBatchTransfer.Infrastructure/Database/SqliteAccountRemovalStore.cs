@@ -219,7 +219,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             )
             SELECT
               (SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account
-                 AND Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending'))
+                 AND (Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending')
+                      OR SubmitState IN ('Submitting','PendingConfirmation')))
               +
               (SELECT COUNT(*) FROM AccountAllocations allocation
                  JOIN BatchJobs batch ON batch.Id=allocation.BatchJobId
@@ -445,20 +446,6 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             WHERE operation.AssignedAccountId=$account
               AND operation.Status IN ('Succeeded','Failed','Cancelled');
 
-            INSERT OR IGNORE INTO temp.AccountRemovalManifestBOnlyBatches(Id)
-            SELECT terminal.Id FROM temp.AccountRemovalManifestTerminalBatches terminal
-            WHERE NOT EXISTS(
-                    SELECT 1 FROM TransferOperations operation
-                    WHERE operation.BatchJobId=terminal.Id AND operation.AssignedAccountId<>$account)
-              AND NOT EXISTS(
-                    SELECT 1 FROM AccountAllocations allocation
-                    WHERE allocation.BatchJobId=terminal.Id AND allocation.AccountId<>$account)
-              AND NOT EXISTS(
-                    SELECT 1 FROM ResourceItems resource
-                    WHERE resource.BatchJobId=terminal.Id
-                      AND ((resource.CandidateConstraintAccountId IS NOT NULL AND resource.CandidateConstraintAccountId<>$account)
-                        OR (resource.ReservedAccountId IS NOT NULL AND resource.ReservedAccountId<>$account)));
-
             INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetResources(Id)
             SELECT resource.Id FROM ResourceItems resource
             JOIN temp.AccountRemovalManifestTerminalBatches terminal ON terminal.Id=resource.BatchJobId
@@ -472,9 +459,19 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                       AND NOT EXISTS(SELECT 1 FROM temp.AccountRemovalManifestTargetOperations target
                                      WHERE target.Id=survivor.Id));
 
-            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetResources(Id)
-            SELECT resource.Id FROM ResourceItems resource
-            JOIN temp.AccountRemovalManifestBOnlyBatches onlyB ON onlyB.Id=resource.BatchJobId;
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestBOnlyBatches(Id)
+            SELECT terminal.Id FROM temp.AccountRemovalManifestTerminalBatches terminal
+            WHERE NOT EXISTS(
+                    SELECT 1 FROM TransferOperations operation
+                    WHERE operation.BatchJobId=terminal.Id AND operation.AssignedAccountId<>$account)
+              AND NOT EXISTS(
+                    SELECT 1 FROM AccountAllocations allocation
+                    WHERE allocation.BatchJobId=terminal.Id AND allocation.AccountId<>$account)
+              AND NOT EXISTS(
+                    SELECT 1 FROM ResourceItems resource
+                    WHERE resource.BatchJobId=terminal.Id
+                      AND NOT EXISTS(SELECT 1 FROM temp.AccountRemovalManifestTargetResources target
+                                     WHERE target.Id=resource.Id));
 
             INSERT OR IGNORE INTO temp.AccountRemovalManifestCleanupImports(Id)
             SELECT batch.ImportSessionId FROM BatchJobs batch
