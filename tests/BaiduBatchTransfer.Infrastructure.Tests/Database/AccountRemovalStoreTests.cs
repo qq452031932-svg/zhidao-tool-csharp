@@ -448,6 +448,22 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task FinalizeRefusesDisabledCredentialFreeRowWithStaleValidationTimestamp()
+    {
+        var (factory, store, _) = await CreateAsync();
+        await ExecuteAsync(factory,
+            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL WHERE Id=$id;", ("$id", Id(B)));
+        var beforeAccount = await ReadAccountAsync(factory, B);
+        var beforeDatabase = await ReadAllPersistentDataAsync(factory);
+        Assert.NotNull(beforeAccount.ValidatedAt);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(B, RemovedAt, default));
+
+        Assert.Equal(beforeAccount, await ReadAccountAsync(factory, B));
+        Assert.Equal(beforeDatabase, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
     public async Task FinalizeRefusesReenabledOrCredentialBearingRows()
     {
         var (factory, store, _) = await CreateAsync();

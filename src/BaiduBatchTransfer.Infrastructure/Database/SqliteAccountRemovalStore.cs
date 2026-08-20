@@ -140,7 +140,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         await using var command = Command(connection, transaction, """
             UPDATE Accounts
             SET Status='Deleted',IsDeleted=1,DeletedAt=$removed,WebView2ProfileDirectory=NULL
-            WHERE Id=$id AND Status='Disabled' AND IsEnabled=0 AND EncryptedSession IS NULL AND IsDeleted=0;
+            WHERE Id=$id AND Status='Disabled' AND IsEnabled=0 AND EncryptedSession IS NULL
+              AND LastValidatedAt IS NULL AND IsDeleted=0;
             """);
         Add(command, "$removed", Time(removedAt));
         Add(command, "$id", Id(accountId));
