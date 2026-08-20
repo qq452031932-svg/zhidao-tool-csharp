@@ -682,7 +682,7 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
-    public async Task CancellationLeavesCommittedProgressAsResumableDraft()
+    public async Task CancellationLeavesCommittedProgressInResumableParsingState()
     {
         var store = new ImportStore();
         var service = CreateService(store, new SequenceResolver(), chunkSize: 2);
@@ -705,7 +705,7 @@ public sealed class ImportStagingServiceTests
             cancellation.Token));
 
         Assert.NotNull(store.Session);
-        Assert.Equal("Draft", store.Session!.Status);
+        Assert.Equal("Parsing", store.Session!.Status);
         Assert.Equal(2, store.Session.TotalRows);
         Assert.Equal(2, store.Rows.Count);
     }

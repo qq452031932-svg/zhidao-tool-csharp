@@ -392,11 +392,11 @@ public sealed class ImportStagingService
                     progress.Session.TotalRows));
             }
 
-            await PersistDraftAsync(progress.Session, CancellationToken.None).ConfigureAwait(false);
+            await PersistStatusAsync(progress.Session, "Draft", CancellationToken.None).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            await PersistDraftAsync(progress.Session, CancellationToken.None).ConfigureAwait(false);
+            await PersistStatusAsync(progress.Session, "Parsing", CancellationToken.None).ConfigureAwait(false);
             throw;
         }
     }
@@ -600,11 +600,14 @@ public sealed class ImportStagingService
         };
     }
 
-    private async Task PersistDraftAsync(ImportSessionRecord session, CancellationToken cancellationToken)
+    private async Task PersistStatusAsync(
+        ImportSessionRecord session,
+        string status,
+        CancellationToken cancellationToken)
     {
         await using var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false);
         await unit.Imports.UpdateSessionAsync(
-            session with { Status = "Draft", UpdatedAt = DateTimeOffset.UtcNow },
+            session with { Status = status, UpdatedAt = DateTimeOffset.UtcNow },
             cancellationToken).ConfigureAwait(false);
         await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
     }

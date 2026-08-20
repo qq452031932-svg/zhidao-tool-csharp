@@ -153,6 +153,14 @@ public sealed class OpenXmlImportReader
                         ExcelImportErrorCode.ColumnMappingMismatch,
                         "A worksheet row contains a source column that was not present in the confirmed mapping.");
                 }
+                if (!headerValidated && mapping.HeaderRowNumber is int expectedHeaderRowNumber)
+                {
+                    if (rawRowNumber < expectedHeaderRowNumber) continue;
+                    if (rawRowNumber > expectedHeaderRowNumber)
+                        throw new ExcelImportException(
+                            ExcelImportErrorCode.ColumnMappingMismatch,
+                            "The confirmed workbook header row is missing.");
+                }
                 if (rawRowNumber == mapping.HeaderRowNumber)
                 {
                     if (mapping.SourceColumns.Count == mapping.SourceColumnCount)

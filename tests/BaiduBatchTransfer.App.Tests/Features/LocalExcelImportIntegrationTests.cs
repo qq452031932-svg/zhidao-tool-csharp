@@ -83,7 +83,7 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task NewWorkflowInstanceReselectsAndValidatesWorkbookBeforeDurableResume()
+    public async Task NewViewModelKeepsDurableResumeReachableAfterWrongWorkbookAndClearsAfterSuccess()
     {
         Directory.CreateDirectory(root);
         var workbookPath = Path.Combine(root, "restart-source.xlsx");
@@ -123,23 +123,88 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
                     SourceColumns: mapping.SourceColumns,
                     SourceContentFingerprint: digest),
                 OneRow(firstRow));
+            await using var interrupted = await firstHost.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync();
+            var session = (await interrupted.Imports.GetSessionAsync(sessionId))!;
+            await interrupted.Imports.UpdateSessionAsync(session with { Status = "Parsing" });
+            await interrupted.CommitAsync();
         }
 
         var wrongPath = Path.Combine(root, "wrong-reselection.xlsx");
         WriteWorkbook(wrongPath, [["https://pan.baidu.com/s/wrong", "zzzz"]]);
         using var resumedHost = AppBootstrap.CreateHost(root, services =>
             services.AddSingleton<IDialogService>(new SequenceDialogService(wrongPath, workbookPath)));
-        var workflow = resumedHost.Services.GetRequiredService<IImportWorkflow>();
-        await Assert.ThrowsAsync<ImportWorkflowException>(() =>
-            workflow.ResumeAsync(sessionId, CancellationToken.None));
+        var vm = new ImportViewModel(
+            resumedHost.Services.GetRequiredService<IImportWorkflow>(),
+            resumedHost.Services.GetRequiredService<IImportPreviewPageSource>(),
+            resumedHost.Services.GetRequiredService<IDialogService>());
+        await vm.InitializeAsync();
+        Assert.Equal(sessionId, vm.SessionId);
+        Assert.True(vm.CanResumeImport);
 
-        var result = await workflow
-            .ResumeAsync(sessionId, CancellationToken.None);
+        await vm.ResumeImportAsync();
+        Assert.True(vm.CanResumeImport);
+        Assert.DoesNotContain(wrongPath, vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
 
-        Assert.Equal(2, result.Statistics.Total);
+        await vm.ResumeImportAsync();
+
+        Assert.False(vm.CanResumeImport);
+        Assert.Equal(2, vm.TotalRows);
         await using var unit = await resumedHost.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync();
         Assert.Equal("Draft", (await unit.Imports.GetSessionAsync(sessionId))!.Status);
         Assert.Equal(2, (await unit.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10))).TotalCount);
+    }
+
+    [Fact]
+    public async Task NewViewModelDiscoversLatestDurableExcelResumeWithoutReplayPath()
+    {
+        using var firstHost = AppBootstrap.CreateHost(root);
+        await firstHost.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var now = DateTimeOffset.UtcNow;
+        var older = Guid.NewGuid();
+        var latest = Guid.NewGuid();
+        var completed = Guid.NewGuid();
+        await using (var unit = await firstHost.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            foreach (var (id, status, updatedAt) in new[]
+            {
+                (older, "Parsing", now.AddMinutes(-1)),
+                (latest, "Parsing", now),
+                (completed, "Draft", now.AddMinutes(1)),
+            })
+            {
+                var columns = new[] { new TabularInspectionColumn(0, "链接") };
+                var mapping = new ConfirmedImportColumnMapping(
+                    1,
+                    [new(0, TabularImportColumnRole.ShareUrl)],
+                    columns);
+                await unit.Imports.AddSessionAsync(ImportSessionRecord.Create(id, "Excel", $"{id:N}.xlsx") with
+                {
+                    Status = status,
+                    ColumnMappingFingerprint = mapping.Fingerprint,
+                    SourceContentFingerprint = new string('a', 64),
+                    HeaderRowNumber = 1,
+                    UpdatedAt = updatedAt,
+                });
+                await unit.Imports.SetColumnDefinitionsAsync(id,
+                [
+                    new(id, 0, "链接", "ShareUrl", true),
+                ]);
+            }
+            await unit.Imports.AddSessionAsync(ImportSessionRecord.Create(Guid.NewGuid(), "Text", "paste") with
+            {
+                Status = "Parsing",
+                UpdatedAt = now.AddMinutes(2),
+            });
+            await unit.CommitAsync();
+        }
+
+        using var restartedHost = AppBootstrap.CreateHost(root);
+        var vm = await restartedHost.Services.GetRequiredService<IImportWorkspaceFactory>()
+            .CreateAsync();
+
+        Assert.Equal(latest, vm.SessionId);
+        Assert.True(vm.CanResumeImport);
+        Assert.DoesNotContain(".xlsx", vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -393,7 +458,11 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             string message,
             CancellationToken cancellationToken = default) => Task.CompletedTask;
 
-        public string? PickExcelFile() => selectedPath;
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(selectedPath);
+        }
     }
 
     private sealed class SequenceDialogService(params string?[] selectedPaths) : IDialogService
@@ -410,7 +479,11 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             string message,
             CancellationToken cancellationToken = default) => Task.CompletedTask;
 
-        public string? PickExcelFile() => selections.Dequeue();
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(selections.Dequeue());
+        }
     }
 
     private static void AppendTemplateRow(string path, IReadOnlyList<string> values)

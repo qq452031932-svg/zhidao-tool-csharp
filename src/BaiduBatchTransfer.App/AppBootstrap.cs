@@ -149,9 +149,12 @@ public static class AppBootstrap
         services.AddSingleton<AppRuntimeState>();
         services.AddSingleton<IAppRecoveryRunner, StartupRecoveryRunner>();
         services.AddSingleton<AppStartupController>();
+        services.AddSingleton<IUiDispatcher, WpfUiDispatcher>();
+        services.AddSingleton<IExcelFileDialog, WpfExcelFileDialog>();
         services.AddSingleton<IDialogService, DialogService>();
         services.AddSingleton<IWizardAccountProvider, WizardAccountProvider>();
         services.AddSingleton<IAccountSummaryProvider, WizardAccountSummaryProvider>();
+        services.AddSingleton<IImportWorkspaceFactory, ImportWorkspaceFactory>();
         services.AddSingleton<IAppShellFactory, AppShellFactory>();
     }
 }
@@ -257,6 +260,25 @@ public sealed class AccountRefreshCoordinator
     }
 }
 
+public interface IImportWorkspaceFactory
+{
+    Task<ImportViewModel> CreateAsync(CancellationToken cancellationToken = default);
+}
+
+public sealed class ImportWorkspaceFactory(
+    IImportWorkflow workflow,
+    IImportPreviewPageSource pageSource,
+    IDialogService dialogService,
+    IAdapterAvailability adapterAvailability) : IImportWorkspaceFactory
+{
+    public async Task<ImportViewModel> CreateAsync(CancellationToken cancellationToken = default)
+    {
+        var viewModel = new ImportViewModel(workflow, pageSource, dialogService, adapterAvailability);
+        await viewModel.InitializeAsync(cancellationToken).ConfigureAwait(true);
+        return viewModel;
+    }
+}
+
 public interface IAppShellFactory
 {
     Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default);
@@ -264,7 +286,7 @@ public interface IAppShellFactory
 
 public sealed class AppShellFactory(
     IWizardAccountProvider accountProvider,
-    IImportWorkflow importWorkflow,
+    IImportWorkspaceFactory importWorkspaceFactory,
     IImportPreviewPageSource pageSource,
     IWizardBatchService batchService,
     IWizardDraftWorkflow draftWorkflow,
@@ -284,7 +306,7 @@ public sealed class AppShellFactory(
         var initialActiveAccountCount = runtimeState.CoordinatorMayStart
             ? await accountSummaryProvider.GetActiveAccountCountAsync(cancellationToken).ConfigureAwait(true)
             : 0;
-        var importViewModel = new ImportViewModel(importWorkflow, pageSource, dialogService, adapterAvailability);
+        var importViewModel = await importWorkspaceFactory.CreateAsync(cancellationToken).ConfigureAwait(true);
         var wizardViewModel = new CreateJobWizardViewModel(
             accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow);
 

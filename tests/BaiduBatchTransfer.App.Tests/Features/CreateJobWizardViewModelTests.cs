@@ -550,7 +550,8 @@ public sealed class CreateJobWizardViewModelTests
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
-        public string? PickExcelFile() => null;
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult<string?>(null);
     }
 
     private sealed class FakeDraftWorkflow : IWizardDraftWorkflow

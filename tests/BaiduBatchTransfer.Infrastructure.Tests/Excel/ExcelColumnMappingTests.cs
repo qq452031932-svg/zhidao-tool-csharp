@@ -331,6 +331,32 @@ public sealed class ExcelColumnMappingTests : IDisposable
     }
 
     [Fact]
+    public async Task MissingConfirmedHeaderThrowsBeforeConsumerReceivesAnyRows()
+    {
+        var path = WriteWorkbook(
+            null,
+            [
+                ["https://pan.baidu.com/s/first"],
+                ["https://pan.baidu.com/s/second"],
+            ]);
+        var mapping = new ConfirmedImportColumnMapping(
+            5,
+            [new(0, TabularImportColumnRole.ShareUrl)],
+            [new(0, "链接")]);
+        var yielded = 0;
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(async () =>
+        {
+            await foreach (var _ in new OpenXmlImportReader().ReadAsync(stream, mapping))
+                yielded++;
+        });
+
+        Assert.Equal(ExcelImportErrorCode.ColumnMappingMismatch, error.Code);
+        Assert.Equal(0, yielded);
+    }
+
+    [Fact]
     public async Task InspectorEnforcesSharedStringAndOversizedRowLimits()
     {
         var sharedPath = WriteSharedStringWorkbook();

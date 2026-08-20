@@ -5,6 +5,8 @@ public interface IImportRepository
     Task AddSessionAsync(ImportSessionRecord session, CancellationToken cancellationToken = default);
     Task UpdateSessionAsync(ImportSessionRecord session, CancellationToken cancellationToken = default);
     Task<ImportSessionRecord?> GetSessionAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<ImportSessionRecord?> GetLatestResumableExcelSessionAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult<ImportSessionRecord?>(null);
     Task AddRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
     Task UpdateRowsAsync(IEnumerable<StagedImportRowRecord> rows, CancellationToken cancellationToken = default);
     Task<StagedImportRowRecord?> GetRowByIdAsync(Guid rowId, CancellationToken cancellationToken = default);

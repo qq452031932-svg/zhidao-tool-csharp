@@ -25,6 +25,34 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetInt32(4),r.GetInt32(5),r.GetInt32(6),r.GetInt32(7),r.GetInt32(8),ReadNullableId(r,9),ReadNullableId(r,10),ReadNullableId(r,11),ReadTime(r,12),ReadTime(r,13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetInt32(16)) : null;
     }
 
+    public async Task<ImportSessionRecord?> GetLatestResumableExcelSessionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var c = Command("""
+            SELECT Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,
+                   PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt,
+                   ColumnMappingFingerprint,SourceContentFingerprint,HeaderRowNumber
+            FROM ImportSessions s
+            WHERE s.SourceType='Excel' AND s.Status='Parsing'
+              AND length(s.ColumnMappingFingerprint)=64
+              AND s.ColumnMappingFingerprint NOT GLOB '*[^0-9a-f]*'
+              AND length(s.SourceContentFingerprint)=64
+              AND s.SourceContentFingerprint NOT GLOB '*[^0-9a-f]*'
+              AND (SELECT COUNT(*) FROM ImportColumnDefinitions d WHERE d.ImportSessionId=s.Id) > 0
+              AND (SELECT MIN(d.ColumnOrdinal) FROM ImportColumnDefinitions d WHERE d.ImportSessionId=s.Id)=0
+              AND (SELECT MAX(d.ColumnOrdinal)+1 FROM ImportColumnDefinitions d WHERE d.ImportSessionId=s.Id)=
+                  (SELECT COUNT(*) FROM ImportColumnDefinitions d WHERE d.ImportSessionId=s.Id)
+              AND (SELECT COUNT(*) FROM ImportColumnDefinitions d
+                   WHERE d.ImportSessionId=s.Id AND d.MappedRole='ShareUrl' AND d.IsRequired=1)=1
+            ORDER BY s.UpdatedAt DESC,s.CreatedAt DESC,s.Id DESC
+            LIMIT 1;
+            """);
+        await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetInt32(4),r.GetInt32(5),r.GetInt32(6),r.GetInt32(7),r.GetInt32(8),ReadNullableId(r,9),ReadNullableId(r,10),ReadNullableId(r,11),ReadTime(r,12),ReadTime(r,13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetInt32(16))
+            : null;
+    }
+
     public async Task UpdateSessionAsync(ImportSessionRecord s, CancellationToken cancellationToken = default)
     {
         await using var c = Command("UPDATE ImportSessions SET Status=$status,TotalRows=$total,ReadyRows=$ready,InvalidRows=$invalid,DuplicateRows=$duplicate,ExcludedRows=$excluded,PrecheckAccountId=$precheck,CreatedBatchJobId=$createdJob,ColumnMappingFingerprint=$mapping,SourceContentFingerprint=$content,HeaderRowNumber=$headerRow,UpdatedAt=$updated WHERE Id=$id;");

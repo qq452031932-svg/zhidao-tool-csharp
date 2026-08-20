@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System.Windows;
+using System.Windows.Threading;
 
 namespace BaiduBatchTransfer.App.Services;
 
@@ -7,10 +8,50 @@ public interface IDialogService
 {
     Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default);
     Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default);
-    string? PickExcelFile();
+    Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default);
 }
 
-public sealed class DialogService : IDialogService
+public interface IUiDispatcher
+{
+    Task<T> InvokeAsync<T>(Func<T> action, CancellationToken cancellationToken = default);
+}
+
+public sealed class WpfUiDispatcher : IUiDispatcher
+{
+    public Task<T> InvokeAsync<T>(Func<T> action, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        cancellationToken.ThrowIfCancellationRequested();
+        var dispatcher = System.Windows.Application.Current?.Dispatcher
+            ?? throw new InvalidOperationException("The application UI dispatcher is unavailable.");
+        if (dispatcher.CheckAccess()) return Task.FromResult(action());
+        return dispatcher.InvokeAsync(action, DispatcherPriority.Normal, cancellationToken).Task;
+    }
+}
+
+public interface IExcelFileDialog
+{
+    string? Show();
+}
+
+public sealed class WpfExcelFileDialog : IExcelFileDialog
+{
+    public string? Show()
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "选择 Excel 导入文件",
+            Filter = "Excel 工作簿 (*.xlsx)|*.xlsx",
+            CheckFileExists = true,
+            Multiselect = false,
+        };
+        var owner = System.Windows.Application.Current?.MainWindow;
+        var accepted = owner is null ? dialog.ShowDialog() : dialog.ShowDialog(owner);
+        return accepted == true ? dialog.FileName : null;
+    }
+}
+
+public sealed class DialogService(IUiDispatcher dispatcher, IExcelFileDialog excelFileDialog) : IDialogService
 {
     public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
     {
@@ -26,17 +67,8 @@ public sealed class DialogService : IDialogService
         return Task.CompletedTask;
     }
 
-    public string? PickExcelFile()
-    {
-        var dialog = new OpenFileDialog
-        {
-            Title = "选择 Excel 导入文件",
-            Filter = "Excel 工作簿 (*.xlsx)|*.xlsx",
-            CheckFileExists = true,
-            Multiselect = false,
-        };
-        return dialog.ShowDialog() == true ? dialog.FileName : null;
-    }
+    public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) =>
+        dispatcher.InvokeAsync(excelFileDialog.Show, cancellationToken);
 }
 
 public interface IAccountLoginLauncher

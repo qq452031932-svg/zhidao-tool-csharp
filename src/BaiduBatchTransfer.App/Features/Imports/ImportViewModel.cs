@@ -63,6 +63,10 @@ public interface IImportWorkflow
         IProgress<ImportCommittedProgress> committedProgress,
         CancellationToken cancellationToken) =>
         ResumeAsync(sessionId, cancellationToken);
+    Task<Guid?> FindLatestResumableExcelSessionAsync(CancellationToken cancellationToken = default) =>
+        Task.FromResult<Guid?>(null);
+    Task<bool> CanResumeAsync(Guid sessionId, CancellationToken cancellationToken = default) =>
+        Task.FromResult(HasResumableReplaySource(sessionId));
     bool HasResumableReplaySource(Guid sessionId) => true;
     void DiscardReplaySource(Guid sessionId) { }
     Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
@@ -183,6 +187,15 @@ public sealed class ImportViewModel : ObservableObject
         StatisticsText = $"总计 {statistics.Total:N0} · 就绪 {statistics.Ready:N0} · 重复 {statistics.Duplicate:N0} · 异常 {statistics.Invalid:N0} · 已排除 {statistics.Excluded:N0} · 冲突 {statistics.Conflict:N0} · 待解析 {statistics.NeedsResolution:N0}";
     }
 
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        var resumableSessionId = await workflow.FindLatestResumableExcelSessionAsync(cancellationToken);
+        if (resumableSessionId is not { } value) return;
+        AttachSession(value);
+        CanResumeImport = true;
+        StatusMessage = "发现未完成的 Excel 导入，可以继续。";
+    }
+
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
         if (IsBusy) return;
@@ -210,7 +223,7 @@ public sealed class ImportViewModel : ObservableObject
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
         StatusMessage = "请选择 Excel 文件";
-        var path = dialogService.PickExcelFile();
+        var path = await dialogService.PickExcelFileAsync(cancellationToken);
         if (path is null)
         {
             StatusMessage = "未选择文件";
@@ -308,7 +321,7 @@ public sealed class ImportViewModel : ObservableObject
         }
         catch (OperationCanceledException)
         {
-            CanResumeImport = HasResumableReplaySource();
+            CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入已取消，已保存的进度可以继续。"
                 : durableSessionObserved
@@ -317,14 +330,14 @@ public sealed class ImportViewModel : ObservableObject
         }
         catch (ImportWorkflowException error)
         {
-            CanResumeImport = HasResumableReplaySource();
+            CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入中断，已保存的进度可以继续。"
                 : SafeError(error.Error);
         }
         catch (Exception)
         {
-            CanResumeImport = HasResumableReplaySource();
+            CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入中断，已保存的进度可以继续。"
                 : SafeError(ImportUiError.Unknown);
@@ -368,10 +381,12 @@ public sealed class ImportViewModel : ObservableObject
 
     private void Cancel() => operationCancellation?.Cancel();
 
-    private bool HasResumableReplaySource() =>
+    private Task<bool> HasResumableSourceAsync(Guid operationSessionId) =>
         durableSessionObserved &&
         sessionId is { } persistedSessionId &&
-        workflow.HasResumableReplaySource(persistedSessionId);
+        persistedSessionId == operationSessionId
+            ? workflow.CanResumeAsync(persistedSessionId, CancellationToken.None)
+            : Task.FromResult(false);
 
     private void BeginNewImport()
     {

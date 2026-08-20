@@ -400,8 +400,9 @@ public sealed class ImportViewModelTests
         await context.Workflow.ImportExcelAsync(sessionId, workbookPath, CancellationToken.None);
 
         Assert.False(context.Workflow.HasResumableReplaySource(sessionId));
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+        var error = await Assert.ThrowsAsync<ImportWorkflowException>(() =>
             context.Workflow.ResumeAsync(sessionId, CancellationToken.None));
+        Assert.Equal(ImportUiError.InvalidData, error.Error);
     }
 
     [Fact]
@@ -545,7 +546,11 @@ public sealed class ImportViewModelTests
             Task.FromResult(true);
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
-        public string? PickExcelFile() => excelFile;
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(excelFile);
+        }
     }
 
     private sealed class ControlledProgressWorkflow : IImportWorkflow

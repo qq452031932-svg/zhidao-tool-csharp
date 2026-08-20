@@ -129,6 +129,48 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task LatestResumableExcelSessionUsesDurableParsingStateAndDeterministicOrder()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var older = DurableExcelSession(Guid.NewGuid(), "Parsing", now.AddMinutes(-1));
+        var latest = DurableExcelSession(Guid.NewGuid(), "Parsing", now);
+        var completed = DurableExcelSession(Guid.NewGuid(), "Draft", now.AddMinutes(1));
+        var text = ImportSessionRecord.Create(Guid.NewGuid(), "Text", "paste") with
+        {
+            Status = "Parsing",
+            UpdatedAt = now.AddMinutes(2),
+        };
+
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            foreach (var session in new[] { older, latest, completed })
+            {
+                await unit.Imports.AddSessionAsync(session);
+                await unit.Imports.SetColumnDefinitionsAsync(session.Id,
+                [
+                    new(session.Id, 0, "链接", "ShareUrl", true),
+                ]);
+            }
+            await unit.Imports.AddSessionAsync(text);
+            await unit.CommitAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(factory);
+        Assert.Equal(latest.Id, (await read.Imports.GetLatestResumableExcelSessionAsync())!.Id);
+    }
+
+    private static ImportSessionRecord DurableExcelSession(Guid id, string status, DateTimeOffset updatedAt) =>
+        ImportSessionRecord.Create(id, "Excel", "source.xlsx") with
+        {
+            Status = status,
+            ColumnMappingFingerprint = new string('a', 64),
+            SourceContentFingerprint = new string('b', 64),
+            HeaderRowNumber = 1,
+            UpdatedAt = updatedAt,
+        };
+
+    [Fact]
     public void SharePersistenceModelsRedactIdentifiersCursorsAndRawUserContent()
     {
         var markerId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");

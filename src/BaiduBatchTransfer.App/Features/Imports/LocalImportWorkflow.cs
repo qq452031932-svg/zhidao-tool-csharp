@@ -212,6 +212,34 @@ public sealed class LocalImportWorkflow(
             return replaySources.ContainsKey(sessionId);
     }
 
+    public async Task<Guid?> FindLatestResumableExcelSessionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var session = await unit.Imports.GetLatestResumableExcelSessionAsync(cancellationToken).ConfigureAwait(false);
+        if (session is null)
+        {
+            await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        var definitions = await unit.Imports.GetColumnDefinitionsAsync(session.Id, cancellationToken).ConfigureAwait(false);
+        await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return TryReconstructMapping(session, definitions, out _) ? session.Id : null;
+    }
+
+    public async Task<bool> CanResumeAsync(Guid sessionId, CancellationToken cancellationToken = default)
+    {
+        if (sessionId == Guid.Empty) return false;
+        if (HasResumableReplaySource(sessionId)) return true;
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        var session = await unit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        var definitions = session is null
+            ? []
+            : await unit.Imports.GetColumnDefinitionsAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return session is not null && TryReconstructMapping(session, definitions, out _);
+    }
+
     public async Task UpdateLinkAsync(
         Guid rowId,
         string shareUrl,
@@ -339,13 +367,32 @@ public sealed class LocalImportWorkflow(
             definitions = await unit.Imports.GetColumnDefinitionsAsync(sessionId, cancellationToken).ConfigureAwait(false);
             await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
         }
-        if (!string.Equals(session.SourceType, "Excel", StringComparison.Ordinal) ||
-            session.ColumnMappingFingerprint is null ||
-            session.SourceContentFingerprint is null ||
-            definitions.Count == 0)
+        if (!TryReconstructMapping(session, definitions, out var mapping))
             throw new ImportWorkflowException(ImportUiError.InvalidData);
 
-        ConfirmedImportColumnMapping mapping;
+        var selectedPath = await dialogService.PickExcelFileAsync(cancellationToken).ConfigureAwait(false);
+        if (selectedPath is null) throw new OperationCanceledException("Excel resume source selection was cancelled.");
+        var source = ReplaySource.ForExcel(
+            Path.GetFullPath(selectedPath),
+            mapping,
+            mapping.SourceColumns,
+            session.SourceContentFingerprint!);
+        return source;
+    }
+
+    private static bool TryReconstructMapping(
+        ImportSessionRecord session,
+        IReadOnlyList<ImportColumnDefinitionRecord> definitions,
+        out ConfirmedImportColumnMapping mapping)
+    {
+        mapping = null!;
+        if (!string.Equals(session.SourceType, "Excel", StringComparison.Ordinal) ||
+            !string.Equals(session.Status, "Parsing", StringComparison.Ordinal) ||
+            session.ColumnMappingFingerprint is null ||
+            session.SourceContentFingerprint is not { Length: 64 } ||
+            definitions.Count == 0)
+            return false;
+
         try
         {
             mapping = new ConfirmedImportColumnMapping(
@@ -357,21 +404,11 @@ public sealed class LocalImportWorkflow(
                     definition.ColumnOrdinal,
                     definition.SourceHeader)));
         }
-        catch (ArgumentException error)
+        catch (ArgumentException)
         {
-            throw new ImportWorkflowException(ImportUiError.InvalidData, error);
+            return false;
         }
-        if (!string.Equals(mapping.Fingerprint, session.ColumnMappingFingerprint, StringComparison.Ordinal))
-            throw new ImportWorkflowException(ImportUiError.InvalidData);
-
-        var selectedPath = dialogService.PickExcelFile();
-        if (selectedPath is null) throw new OperationCanceledException("Excel resume source selection was cancelled.");
-        var source = ReplaySource.ForExcel(
-            Path.GetFullPath(selectedPath),
-            mapping,
-            mapping.SourceColumns,
-            session.SourceContentFingerprint);
-        return source;
+        return string.Equals(mapping.Fingerprint, session.ColumnMappingFingerprint, StringComparison.Ordinal);
     }
 
     private static TabularImportColumnRole ParsePersistedRole(string role) => role switch
