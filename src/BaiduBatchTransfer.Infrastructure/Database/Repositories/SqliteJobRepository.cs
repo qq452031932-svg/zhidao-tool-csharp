@@ -356,18 +356,16 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         await using var command = Command("""
             INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
             VALUES($batch,$permanent,$unlimited,$mode,$code,$policy,$fingerprint,$created)
-            ON CONFLICT(BatchJobId) DO UPDATE SET
-              IsPermanent=excluded.IsPermanent,IsAccessUnlimited=excluded.IsAccessUnlimited,
-              ExtractionCodeMode=excluded.ExtractionCodeMode,FixedExtractionCode=excluded.FixedExtractionCode,
-              ExistingSharePolicy=excluded.ExistingSharePolicy,SettingsFingerprint=excluded.SettingsFingerprint,
-              CreatedAt=excluded.CreatedAt;
+            ON CONFLICT(BatchJobId) DO NOTHING;
             """);
         Add(command,"$batch",Id(settings.BatchJobId)); Add(command,"$permanent",settings.IsPermanent ? 1 : 0);
         Add(command,"$unlimited",settings.IsAccessUnlimited ? 1 : 0); Add(command,"$mode",settings.ExtractionCodeMode);
         Add(command,"$code",settings.FixedExtractionCode); Add(command,"$policy",settings.ExistingSharePolicy);
         Add(command,"$fingerprint",settings.SettingsFingerprint);
         Add(command,"$created",Time(settings.CreatedAt));
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1) return;
+        if (await GetShareSettingsAsync(settings.BatchJobId, cancellationToken).ConfigureAwait(false) == settings) return;
+        throw new InvalidOperationException("The confirmed batch share settings cannot be changed.");
     }
 
     public async Task<BatchShareSettingsRecord?> GetShareSettingsAsync(Guid batchJobId, CancellationToken cancellationToken = default)
@@ -384,8 +382,22 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddOutputAccountsAsync(IEnumerable<BatchOutputAccountRecord> accounts, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(accounts);
+        var snapshot = accounts.OrderBy(value => value.OutputOrdinal).ThenBy(value => value.AccountId).ToArray();
+        if (snapshot.Length == 0) return;
+        var batchJobId = snapshot[0].BatchJobId;
+        if (batchJobId == Guid.Empty || snapshot.Any(value => value.BatchJobId != batchJobId || value.AccountId == Guid.Empty) ||
+            snapshot.Select(value => value.AccountId).Distinct().Count() != snapshot.Length ||
+            snapshot.Select(value => value.OutputOrdinal).Distinct().Count() != snapshot.Length ||
+            snapshot.Select(value => value.OutputLabel).Distinct(StringComparer.Ordinal).Count() != snapshot.Length)
+            throw new ArgumentException("The batch output-account snapshot is invalid.", nameof(accounts));
+        var existing = await GetOutputAccountsAsync(batchJobId, cancellationToken).ConfigureAwait(false);
+        if (existing.Count != 0)
+        {
+            if (existing.SequenceEqual(snapshot)) return;
+            throw new InvalidOperationException("The confirmed batch output-account snapshot cannot be changed.");
+        }
         await using var command = Command("INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled) VALUES($batch,$account,$ordinal,$label,$transfers,$shares,$enabled);");
-        foreach (var value in accounts)
+        foreach (var value in snapshot)
         {
             cancellationToken.ThrowIfCancellationRequested();
             command.Parameters.Clear();
@@ -420,9 +432,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         ValidateExactRemoteItems(operationSnapshot, itemSnapshot);
         await using (var command = Command("""
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
-              ExactItemSetFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
               LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
-            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$generation,$descriptor,$request,
+            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$settings,$generation,$descriptor,$request,
               $acceptance,$attempts,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
             """))
         {
@@ -434,6 +446,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 Add(command,"$resource",Id(value.ResourceItemId)); Add(command,"$batch",Id(value.BatchJobId));
                 Add(command,"$account",Id(value.AccountId)); Add(command,"$ordinal",value.OutputOrdinal);
                 Add(command,"$status",value.Status); Add(command,"$fingerprint",value.ExactItemSetFingerprint);
+                Add(command,"$settings",value.SettingsFingerprint);
                 Add(command,"$generation",value.Generation); Add(command,"$descriptor",value.RequestDescriptorJson);
                 Add(command,"$request",value.AdapterRequestId); Add(command,"$acceptance",value.SubmissionAcceptance);
                 Add(command,"$attempts",value.AttemptCount); Add(command,"$lease",NullableTime(value.LeaseExpiresAt));
@@ -464,6 +477,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
 
         foreach (var operation in operations)
         {
+            if (string.IsNullOrWhiteSpace(operation.SettingsFingerprint))
+                throw new ArgumentException("Each share operation requires an immutable settings fingerprint.", nameof(operations));
             var items = remoteItems.Where(value => value.ShareOperationId == operation.Id)
                 .OrderBy(value => value.ItemOrdinal).ToArray();
             if (items.Length == 0 || items.Where((value, index) => value.ItemOrdinal != index).Any())

@@ -122,6 +122,42 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public void SharePersistenceModelsRedactIdentifiersCursorsAndRawUserContent()
+    {
+        var markerId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        const string marker = "secret-cursor-url-code-fingerprint-raw";
+        var values = new object[]
+        {
+            new StringKeysetPage<string>([marker], marker),
+            new CursorKeysetPage<string, SecretCursor>([marker], new(marker)),
+            new ShareResultKeysetQuery(markerId, 10, new(4, markerId, markerId)),
+            new ImportColumnDefinitionRecord(markerId, 0, marker, "Preserve", false),
+            new StagedImportRowPayloadRecord(markerId, marker, marker, marker, marker),
+            new BatchShareSettingsRecord(markerId, true, true, "Fixed", marker, "Ask", DateTimeOffset.UnixEpoch, marker),
+            new BatchOutputAccountRecord(markerId, markerId, 1, marker, 1, 1, true),
+            new ShareOperationRecord(markerId, markerId, markerId, markerId, markerId, 1, "WaitingShare", marker,
+                marker, 1, marker, marker, "Unknown", 0, null, null, null, marker, marker,
+                DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch),
+            new ShareOperationRemoteItemRecord(markerId, 0, marker, marker),
+            new ShareDiscoveryBaselineRecord(markerId, marker),
+            new ShareDiscoveryBaselineStateRecord(markerId, 1, marker, 1, true, DateTimeOffset.UnixEpoch),
+            new BatchShareDecisionSnapshotRecord(markerId, markerId, marker, "Cancel", marker, 1, 0, 0,
+                marker, DateTimeOffset.UnixEpoch),
+            new BaiduShareResultRecord(markerId, markerId, markerId, markerId, markerId, marker, marker, 1,
+                marker, marker, marker, true, true, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch),
+            new ShareResultCursor(4, markerId, markerId),
+            new AdapterCapabilityAcceptanceRecord("BaiduShare", "v1", "build", DateTimeOffset.UnixEpoch, marker),
+        };
+
+        foreach (var value in values)
+        {
+            var rendered = value.ToString()!;
+            Assert.DoesNotContain(marker, rendered);
+            Assert.DoesNotContain(markerId.ToString("D"), rendered);
+        }
+    }
+
+    [Fact]
     public async Task ColumnDefinitionValidationRequiresExactlyOneShareUrlAndUniqueMappedRoles()
     {
         var factory = await CreateFactoryAsync();
@@ -179,6 +215,65 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(resource, Assert.Single((await read.Jobs.GetResourcesPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(operation, Assert.Single((await read.Jobs.GetOperationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(allocation, Assert.Single((await read.Jobs.GetAllocationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
+    }
+
+    [Fact]
+    public async Task ShareConfirmationSnapshotsAndShareProjectionFieldsRoundTripAndAreImmutable()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = new DateTimeOffset(2026, 8, 21, 1, 2, 3, TimeSpan.Zero);
+        var first = AccountRecord.Create(Guid.NewGuid(), "first-user", "First");
+        var second = AccountRecord.Create(Guid.NewGuid(), "second-user", "Second");
+        var job = new BatchJobRecord(Guid.NewGuid(), "Job", "Excel", "Distribution", "TaskCount",
+            "ProportionalReduction", 1, 1, "/", "None", "Skip", "Immediate", "Queued",
+            now, null, null, null, 1, 3);
+        var resource = new ResourceItemRecord(Guid.NewGuid(), job.Id, null, 1, "url", "share", null, null,
+            null, null, null, "None", "Valid", null, "Expanded", null, null, now, now, "Resolved title");
+        var settings = new BatchShareSettingsRecord(job.Id, true, true, "Random", null, "Ask", now, "settings-v1");
+        var outputs = new[]
+        {
+            new BatchOutputAccountRecord(job.Id, second.Id, 2, "Second label", 4, 2, false),
+            new BatchOutputAccountRecord(job.Id, first.Id, 1, "First label", 7, 3, true),
+        };
+
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(first);
+            await unit.Accounts.UpsertAsync(second);
+            await unit.Jobs.AddAsync(job);
+            await unit.Jobs.AddResourcesAsync([resource]);
+            await unit.Jobs.SetShareSettingsAsync(settings);
+            await unit.Jobs.AddOutputAccountsAsync(outputs);
+            await unit.CommitAsync();
+        }
+
+        await using (var read = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            Assert.Equal(3, (await read.Jobs.GetAsync(job.Id))!.ShareOperationCount);
+            Assert.Equal("Resolved title", Assert.Single((await read.Jobs.GetResourcesPageAsync(
+                job.Id, new PageQuery(1, 10))).Items).ResolvedOutputTitle);
+            Assert.Equal(settings, await read.Jobs.GetShareSettingsAsync(job.Id));
+            Assert.Equal(outputs.OrderBy(value => value.OutputOrdinal), await read.Jobs.GetOutputAccountsAsync(job.Id));
+        }
+
+        await using (var replay = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await replay.Jobs.SetShareSettingsAsync(settings);
+            await replay.Jobs.AddOutputAccountsAsync(outputs.Reverse());
+            await replay.CommitAsync();
+        }
+
+        await using (var changed = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => changed.Jobs.SetShareSettingsAsync(
+                settings with { ExistingSharePolicy = "Regenerate" }));
+            await Assert.ThrowsAsync<InvalidOperationException>(() => changed.Jobs.AddOutputAccountsAsync(
+                outputs.Select(value => value with { OutputOrdinal = 3 - value.OutputOrdinal })));
+        }
+
+        await using var verify = await SqliteUnitOfWork.BeginAsync(factory);
+        Assert.Equal(settings, await verify.Jobs.GetShareSettingsAsync(job.Id));
+        Assert.Equal(outputs.OrderBy(value => value.OutputOrdinal), await verify.Jobs.GetOutputAccountsAsync(job.Id));
     }
 
     [Fact]
@@ -448,6 +543,8 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             current = observed;
         }
     }
+
+    private sealed record SecretCursor(string Value);
 
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }

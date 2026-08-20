@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IShareSchedulingStore
@@ -22,7 +24,6 @@ public interface IShareSchedulingStore
         CancellationToken cancellationToken = default);
     Task<bool> TryCompleteDiscoveryBaselineAsync(
         Guid shareOperationId,
-        string expectedStatus,
         int expectedGeneration,
         string baselineFingerprint,
         int expectedShareCount,
@@ -37,7 +38,7 @@ public interface IShareSchedulingStore
         DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
     Task<bool> TryMarkResultPendingAsync(Guid shareOperationId, int expectedGeneration,
         DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
-    Task<bool> TryStartNextGenerationAsync(Guid shareOperationId, string expectedStatus, int expectedGeneration,
+    Task<bool> TryStartNextGenerationAsync(Guid shareOperationId, ShareOperationStatus expectedStatus, int expectedGeneration,
         DateTimeOffset leaseExpiresAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
     Task SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default);
     Task<BatchShareDecisionSnapshotRecord?> GetDecisionSnapshotAsync(
@@ -46,7 +47,7 @@ public interface IShareSchedulingStore
         CancellationToken cancellationToken = default);
     Task<bool> AcceptResultAsync(
         Guid shareOperationId,
-        string expectedStatus,
+        ShareOperationStatus expectedStatus,
         BaiduShareResultRecord result,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);

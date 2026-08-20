@@ -15,10 +15,18 @@ public sealed record Page<T>(IReadOnlyList<T> Items, long TotalCount, int PageNu
 
 public sealed record KeysetPage<T>(IReadOnlyList<T> Items, long? TotalCount, long? NextCursor);
 
-public sealed record StringKeysetPage<T>(IReadOnlyList<T> Items, string? NextCursor);
+public sealed record StringKeysetPage<T>(IReadOnlyList<T> Items, string? NextCursor)
+{
+    public override string ToString() =>
+        $"StringKeysetPage {{ Count = {Items.Count}, HasNext = {NextCursor is not null}, Cursor = [REDACTED], Items = [REDACTED] }}";
+}
 
 public sealed record CursorKeysetPage<T, TCursor>(IReadOnlyList<T> Items, TCursor? NextCursor)
-    where TCursor : class;
+    where TCursor : class
+{
+    public override string ToString() =>
+        $"CursorKeysetPage {{ Count = {Items.Count}, HasNext = {NextCursor is not null}, Cursor = [REDACTED], Items = [REDACTED] }}";
+}
 
 public sealed record StagedImportKeysetQuery(
     Guid ImportSessionId,
@@ -275,6 +283,7 @@ public sealed record ShareOperationRecord(
     int OutputOrdinal,
     string Status,
     string ExactItemSetFingerprint,
+    string SettingsFingerprint,
     int Generation,
     string? RequestDescriptorJson,
     string? AdapterRequestId,
@@ -323,6 +332,7 @@ public sealed record ShareDiscoveryBaselineStateRecord(
 public sealed record BatchShareDecisionSnapshotRecord(
     Guid BatchJobId,
     Guid AccountId,
+    string SettingsFingerprint,
     string Decision,
     string DiscoveryFingerprint,
     int DiscoveredCount,
@@ -372,6 +382,9 @@ public sealed record ShareResultKeysetQuery(Guid BatchJobId, int PageSize, Share
         if (After is { AccountId: var accountId } && accountId == Guid.Empty) throw new ArgumentException("A result cursor account is required.", nameof(After));
         if (After is { ResultId: var resultId } && resultId == Guid.Empty) throw new ArgumentException("A result cursor identity is required.", nameof(After));
     }
+
+    public override string ToString() =>
+        $"ShareResultKeysetQuery {{ PageSize = {PageSize}, HasCursor = {After is not null}, Identity = [REDACTED] }}";
 }
 
 public sealed record AdapterCapabilityAcceptanceRecord(

@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
@@ -25,6 +26,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 SELECT operation.Id
                 FROM ShareOperations operation
                 JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
+                  AND settings.SettingsFingerprint=operation.SettingsFingerprint
                 JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
                   AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
                 WHERE (operation.Status='WaitingShare' AND
@@ -48,7 +50,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 UPDATE ShareOperations SET Status='Reserved',LeaseExpiresAt=$lease,UpdatedAt=$now
                 WHERE Id=$id AND (
                   (Status='WaitingShare' AND (LeaseExpiresAt IS NULL OR julianday(LeaseExpiresAt)<=julianday($now)))
-                  OR (Status='Reserved' AND LeaseExpiresAt IS NOT NULL AND julianday(LeaseExpiresAt)<=julianday($now)));
+                  OR (Status='Reserved' AND LeaseExpiresAt IS NOT NULL AND julianday(LeaseExpiresAt)<=julianday($now)))
+                  AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                    WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                      AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
                 """))
             {
                 Add(update,"$id",id); Add(update,"$lease",Time(now + leaseDuration)); Add(update,"$now",Time(now));
@@ -102,7 +107,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         try
         {
             await using var command = Command(connection, transaction,
-                "INSERT OR IGNORE INTO ShareDiscoveryBaselines(ShareOperationId,Generation,ShareId) SELECT $operation,$generation,$share WHERE EXISTS(SELECT 1 FROM ShareOperations WHERE Id=$operation AND Generation=$generation AND BaselineCompletedAt IS NULL);");
+                "INSERT OR IGNORE INTO ShareDiscoveryBaselines(ShareOperationId,Generation,ShareId) SELECT $operation,$generation,$share WHERE EXISTS(SELECT 1 FROM ShareOperations operation JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId AND settings.SettingsFingerprint=operation.SettingsFingerprint WHERE operation.Id=$operation AND operation.Generation=$generation AND operation.BaselineCompletedAt IS NULL);");
             foreach (var entry in entries)
             {
                 if (entry.ShareOperationId != shareOperationId || string.IsNullOrWhiteSpace(entry.ShareId))
@@ -113,6 +118,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                     SELECT EXISTS(
                       SELECT 1 FROM ShareDiscoveryBaselines baseline
                       JOIN ShareOperations operation ON operation.Id=baseline.ShareOperationId
+                      JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
+                        AND settings.SettingsFingerprint=operation.SettingsFingerprint
                       WHERE baseline.ShareOperationId=$operation AND baseline.Generation=$generation
                         AND baseline.ShareId=$share AND operation.Generation=$generation);
                     """);
@@ -151,11 +158,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
     }
 
     public async Task<bool> TryCompleteDiscoveryBaselineAsync(
-        Guid shareOperationId, string expectedStatus, int expectedGeneration, string baselineFingerprint,
+        Guid shareOperationId, int expectedGeneration, string baselineFingerprint,
         int expectedShareCount, DateTimeOffset completedAt, CancellationToken cancellationToken = default)
     {
         if (shareOperationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(shareOperationId));
-        ArgumentException.ThrowIfNullOrWhiteSpace(expectedStatus);
         ArgumentException.ThrowIfNullOrWhiteSpace(baselineFingerprint);
         if (expectedGeneration < 1) throw new ArgumentOutOfRangeException(nameof(expectedGeneration));
         if (expectedShareCount < 0) throw new ArgumentOutOfRangeException(nameof(expectedShareCount));
@@ -167,12 +173,15 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 UPDATE ShareOperations
                 SET Status='Preparing',BaselineGeneration=$generation,BaselineFingerprint=$fingerprint,
                   BaselineShareCount=$count,BaselineCompletedAt=$completed,UpdatedAt=$completed
-                WHERE Id=$id AND Status=$status AND Generation=$generation AND BaselineCompletedAt IS NULL
+                WHERE Id=$id AND Status='Reserved' AND Generation=$generation AND BaselineCompletedAt IS NULL
+                  AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                    WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                      AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
                   AND (SELECT COUNT(*) FROM ShareDiscoveryBaselines WHERE ShareOperationId=$id AND Generation=$generation)=$count;
                 """);
             Add(command,"$generation",expectedGeneration); Add(command,"$fingerprint",baselineFingerprint);
             Add(command,"$count",expectedShareCount); Add(command,"$completed",Time(completedAt));
-            Add(command,"$id",Id(shareOperationId)); Add(command,"$status",expectedStatus);
+            Add(command,"$id",Id(shareOperationId));
             var changed=await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false)==1;
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return changed;
@@ -206,7 +215,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
               SubmitStartedAt=$updated,NextReconcileAt=NULL,UpdatedAt=$updated
             WHERE Id=$id AND Status='Preparing' AND Generation=$generation
               AND BaselineGeneration=$generation AND BaselineCompletedAt IS NOT NULL
-              AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL;
+              AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL
+              AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
             """, shareOperationId, expectedGeneration, submittedAt,
             [("$descriptor", requestDescriptorJson)], cancellationToken);
     }
@@ -220,7 +232,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             UPDATE ShareOperations SET AdapterRequestId=$request,UpdatedAt=$updated
             WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND Generation=$generation
               AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL
-              AND AdapterRequestId IS NULL;
+              AND AdapterRequestId IS NULL
+              AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
             """, shareOperationId, expectedGeneration, updatedAt,
             [("$request", adapterRequestId)], cancellationToken);
     }
@@ -234,16 +249,19 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             UPDATE ShareOperations SET Status='ResultPending',LeaseExpiresAt=NULL,
               NextReconcileAt=$reconcile,UpdatedAt=$updated
             WHERE Id=$id AND Status='Submitting' AND Generation=$generation
-              AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL;
+              AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL
+              AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
             """, shareOperationId, expectedGeneration, updatedAt,
             [("$reconcile", Time(nextReconcileAt))], cancellationToken);
     }
 
     public Task<bool> TryStartNextGenerationAsync(
-        Guid shareOperationId, string expectedStatus, int expectedGeneration, DateTimeOffset leaseExpiresAt,
+        Guid shareOperationId, ShareOperationStatus expectedStatus, int expectedGeneration, DateTimeOffset leaseExpiresAt,
         DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
     {
-        if (expectedStatus is not ("Succeeded" or "Failed" or "ReusedExisting"))
+        if (expectedStatus is not (ShareOperationStatus.Succeeded or ShareOperationStatus.Failed or ShareOperationStatus.ReusedExisting))
             throw new ArgumentException("Only terminal share work can start another generation.", nameof(expectedStatus));
         if (leaseExpiresAt <= updatedAt) throw new ArgumentOutOfRangeException(nameof(leaseExpiresAt));
         return TryTransitionAsync("""
@@ -251,15 +269,19 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
               AdapterRequestId=NULL,SubmissionAcceptance='Unknown',LeaseExpiresAt=$lease,SubmitStartedAt=NULL,
               NextReconcileAt=NULL,BaselineGeneration=NULL,BaselineFingerprint=NULL,BaselineShareCount=0,
               BaselineCompletedAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$updated
-            WHERE Id=$id AND Status=$status AND Generation=$generation;
+            WHERE Id=$id AND Status=$status AND Generation=$generation
+              AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
             """, shareOperationId, expectedGeneration, updatedAt,
-            [("$status", expectedStatus), ("$lease", Time(leaseExpiresAt))], cancellationToken);
+            [("$status", expectedStatus.ToString()), ("$lease", Time(leaseExpiresAt))], cancellationToken);
     }
 
     public async Task SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        if (snapshot.Decision is not ("Reuse" or "Regenerate" or "Cancel") || snapshot.DiscoveredCount < 0 ||
+        if (string.IsNullOrWhiteSpace(snapshot.SettingsFingerprint) ||
+            snapshot.Decision is not ("Reuse" or "Regenerate" or "Cancel") || snapshot.DiscoveredCount < 0 ||
             snapshot.CompatibleCount < 0 || snapshot.IncompatibleCount < 0 ||
             snapshot.CompatibleCount + snapshot.IncompatibleCount > snapshot.DiscoveredCount)
             throw new ArgumentException("The share decision snapshot is invalid.",nameof(snapshot));
@@ -268,17 +290,23 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         try
         {
             await using var command = Command(connection,transaction,"""
-                INSERT INTO BatchShareDecisionSnapshots(BatchJobId,AccountId,Decision,DiscoveryFingerprint,DiscoveredCount,
+                INSERT INTO BatchShareDecisionSnapshots(BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,
                   CompatibleCount,IncompatibleCount,Generation,ConfirmedAt)
-                VALUES($batch,$account,$decision,$fingerprint,$discovered,$compatible,$incompatible,$generation,$confirmed)
-                ;
+                SELECT $batch,$account,$settings,$decision,$fingerprint,$discovered,$compatible,$incompatible,$generation,$confirmed
+                WHERE EXISTS(SELECT 1 FROM BatchShareSettings settings
+                    WHERE settings.BatchJobId=$batch AND settings.SettingsFingerprint=$settings)
+                  AND EXISTS(SELECT 1 FROM ShareOperations operation
+                    WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+                      AND operation.SettingsFingerprint=$settings);
                 """);
             Add(command,"$batch",Id(snapshot.BatchJobId)); Add(command,"$account",Id(snapshot.AccountId));
+            Add(command,"$settings",snapshot.SettingsFingerprint);
             Add(command,"$decision",snapshot.Decision); Add(command,"$fingerprint",snapshot.DiscoveryFingerprint);
             Add(command,"$discovered",snapshot.DiscoveredCount); Add(command,"$compatible",snapshot.CompatibleCount);
             Add(command,"$incompatible",snapshot.IncompatibleCount); Add(command,"$generation",snapshot.Generation);
             Add(command,"$confirmed",Time(snapshot.ConfirmedAt));
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException("Sharing is not enabled for this confirmed batch.");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
@@ -289,23 +317,23 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred:true);
-        await using var command = Command(connection,transaction,"SELECT BatchJobId,AccountId,Decision,DiscoveryFingerprint,DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,ConfirmedAt FROM BatchShareDecisionSnapshots WHERE BatchJobId=$batch AND AccountId=$account;");
+        await using var command = Command(connection,transaction,"SELECT BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,ConfirmedAt FROM BatchShareDecisionSnapshots WHERE BatchJobId=$batch AND AccountId=$account;");
         Add(command,"$batch",Id(batchJobId)); Add(command,"$account",Id(accountId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         var value = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new BatchShareDecisionSnapshotRecord(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetString(2),reader.GetString(3),reader.GetInt32(4),reader.GetInt32(5),reader.GetInt32(6),reader.GetString(7),ReadTime(reader,8))
+            ? new BatchShareDecisionSnapshotRecord(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetInt32(5),reader.GetInt32(6),reader.GetInt32(7),reader.GetString(8),ReadTime(reader,9))
             : null;
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return value;
     }
 
     public Task<bool> AcceptResultAsync(
-        Guid shareOperationId, string expectedStatus, BaiduShareResultRecord result, DateTimeOffset updatedAt,
+        Guid shareOperationId, ShareOperationStatus expectedStatus, BaiduShareResultRecord result, DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default)
     {
-        if (expectedStatus is not ("Submitting" or "ResultPending"))
+        if (expectedStatus is not (ShareOperationStatus.Submitting or ShareOperationStatus.ResultPending))
             return Task.FromResult(false);
-        return PersistResultAsync(shareOperationId, expectedStatus, "Succeeded", result,
+        return PersistResultAsync(shareOperationId, expectedStatus.ToString(), "Succeeded", result,
             baselineMustContainShare: false, updatedAt, cancellationToken);
     }
 
@@ -329,11 +357,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             await using (var update = Command(connection,transaction,"""
                 UPDATE ShareOperations SET Status=$final,LeaseExpiresAt=NULL,UpdatedAt=$updated
                 WHERE Id=$id AND Status=$expected AND BatchJobId=$batch AND ResourceItemId=$resource
-                  AND AccountId=$account AND ExactItemSetFingerprint=$items AND Generation=$generation
+                  AND AccountId=$account AND ExactItemSetFingerprint=$items AND SettingsFingerprint=$settings
+                  AND Generation=$generation
                   AND BaselineGeneration=$generation AND BaselineCompletedAt IS NOT NULL
                   AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                     WHERE settings.BatchJobId=ShareOperations.BatchJobId
-                      AND settings.SettingsFingerprint=$settings)
+                      AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
                   AND (($baselineMustContain=1 AND EXISTS(
                     SELECT 1 FROM ShareDiscoveryBaselines baseline
                     WHERE baseline.ShareOperationId=ShareOperations.Id AND baseline.Generation=$generation
@@ -421,10 +450,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
 
     private static async Task<ShareOperationRecord> GetOperationAsync(SqliteConnection connection, SqliteTransaction transaction, string id, CancellationToken token)
     {
-        await using var command = Command(connection,transaction,"SELECT Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt FROM ShareOperations WHERE Id=$id;");
+        await using var command = Command(connection,transaction,"SELECT Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt FROM ShareOperations WHERE Id=$id;");
         Add(command,"$id",id); await using var reader=await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         if(!await reader.ReadAsync(token).ConfigureAwait(false))throw new InvalidDataException("Reserved share work disappeared.");
-        return new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),reader.GetInt32(5),reader.GetString(6),reader.GetString(7),reader.GetInt32(8),reader.IsDBNull(9)?null:reader.GetString(9),reader.IsDBNull(10)?null:reader.GetString(10),reader.GetString(11),reader.GetInt32(12),ReadNullableTime(reader,13),ReadNullableTime(reader,14),ReadNullableTime(reader,15),reader.IsDBNull(16)?null:reader.GetString(16),reader.IsDBNull(17)?null:reader.GetString(17),ReadTime(reader,18),ReadTime(reader,19));
+        return new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),reader.GetInt32(5),reader.GetString(6),reader.GetString(7),reader.GetString(8),reader.GetInt32(9),reader.IsDBNull(10)?null:reader.GetString(10),reader.IsDBNull(11)?null:reader.GetString(11),reader.GetString(12),reader.GetInt32(13),ReadNullableTime(reader,14),ReadNullableTime(reader,15),ReadNullableTime(reader,16),reader.IsDBNull(17)?null:reader.GetString(17),reader.IsDBNull(18)?null:reader.GetString(18),ReadTime(reader,19),ReadTime(reader,20));
     }
 
     private async Task<bool> TryTransitionAsync(

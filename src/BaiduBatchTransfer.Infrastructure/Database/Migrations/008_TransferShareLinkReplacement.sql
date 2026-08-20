@@ -46,6 +46,9 @@ CREATE TABLE BatchShareSettings (
           (ExtractionCodeMode='Fixed' AND FixedExtractionCode IS NOT NULL AND length(trim(FixedExtractionCode))>0))
 );
 
+CREATE UNIQUE INDEX UX_BatchShareSettings_Batch_Fingerprint
+ON BatchShareSettings(BatchJobId, SettingsFingerprint);
+
 CREATE TABLE BatchOutputAccounts (
     BatchJobId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
@@ -162,6 +165,7 @@ CREATE TABLE ShareOperations (
     OutputOrdinal INTEGER NOT NULL CHECK(typeof(OutputOrdinal)='integer' AND OutputOrdinal > 0),
     Status TEXT NOT NULL CHECK(Status IN ('WaitingTransfer','WaitingShare','Reserved','Preparing','Submitting','ResultPending','Succeeded','Failed','Paused','ReusedExisting','Cancelled')),
     ExactItemSetFingerprint TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL CHECK(length(trim(SettingsFingerprint))>0),
     Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
     RequestDescriptorJson TEXT NULL,
     AdapterRequestId TEXT NULL,
@@ -182,6 +186,7 @@ CREATE TABLE ShareOperations (
     FOREIGN KEY(ResourceItemId) REFERENCES ResourceItems(Id) ON DELETE CASCADE,
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint),
     FOREIGN KEY(BatchJobId,AccountId,OutputOrdinal) REFERENCES BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal) ON DELETE CASCADE,
     FOREIGN KEY(TransferOperationId,ResourceItemId,BatchJobId,AccountId)
       REFERENCES TransferOperations(Id,ResourceItemId,BatchJobId,AssignedAccountId) ON DELETE CASCADE,
@@ -190,7 +195,7 @@ CREATE TABLE ShareOperations (
 );
 
 CREATE UNIQUE INDEX UX_ShareOperations_ActiveCreateKey
-ON ShareOperations(AccountId, ExactItemSetFingerprint, Generation)
+ON ShareOperations(AccountId, ExactItemSetFingerprint, SettingsFingerprint, Generation)
 WHERE Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused');
 CREATE INDEX IX_ShareOperations_Status_Lease_Id
 ON ShareOperations(Status, LeaseExpiresAt, Id);
@@ -261,6 +266,7 @@ ON BaiduShareResults(BatchJobId, ResourceItemId, AccountId, Id);
 CREATE TABLE BatchShareDecisionSnapshots (
     BatchJobId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL CHECK(length(trim(SettingsFingerprint))>0),
     Decision TEXT NOT NULL CHECK(Decision IN ('Reuse','Regenerate','Cancel')),
     DiscoveryFingerprint TEXT NOT NULL,
     DiscoveredCount INTEGER NOT NULL CHECK(typeof(DiscoveredCount)='integer' AND DiscoveredCount >= 0),
@@ -271,6 +277,7 @@ CREATE TABLE BatchShareDecisionSnapshots (
     PRIMARY KEY(BatchJobId, AccountId),
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint),
     FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE,
     CHECK(CompatibleCount + IncompatibleCount <= DiscoveredCount)
 );
