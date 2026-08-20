@@ -324,6 +324,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 if (previous.TryGetValue(option.AccountId, out var existing))
                 {
                     replacement.IsSelected = existing.IsSelected;
+                    replacement.ShareEnabled = existing.ShareEnabled;
                     replacement.TargetItemCount = existing.TargetItemCount;
                     replacement.TargetSuccessCount = existing.TargetSuccessCount;
                     replacement.DefaultTargetPath = existing.DefaultTargetPath;

@@ -406,30 +406,62 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
-    public async Task ReloadAccountsPreservesSurvivingSettingsAndInvalidatesConfirmation()
+    public async Task ReloadAccountsPreservesSurvivingSettingsIncludingShareChoiceByAccountIdentity()
     {
         var original = Accounts(3);
-        var vm = Create(original, ready: 3);
-        vm.SelectMode(TransferMode.Distribution);
+        var gateway = new FakeBatchGateway();
+        var vm = Create(original, ready: 3, gateway: gateway);
+        vm.SelectMode(TransferMode.Replication);
         foreach (var account in vm.Accounts)
         {
             account.IsSelected = true;
             account.TargetSuccessCount = 1;
         }
-        vm.Accounts[0].DefaultTargetPath = "/A";
-        vm.Accounts[2].DefaultTargetPath = "/C";
+        var first = vm.Accounts.Single(account => account.AccountId == original[0].AccountId);
+        var third = vm.Accounts.Single(account => account.AccountId == original[2].AccountId);
+        first.ShareEnabled = false;
+        first.DefaultTargetPath = "/A";
+        third.ShareEnabled = true;
+        third.DefaultTargetPath = "/C";
         await vm.PrepareConfirmationAsync();
         vm.IsFinalConfirmationChecked = true;
         Assert.Equal("preview-token", vm.ConfirmationToken);
+        Assert.Equal(9, vm.ConfirmedOperationCount);
 
-        vm.ReloadAccounts([original[0], original[2]]);
+        var added = Account("M");
+        vm.ReloadAccounts(
+        [
+            original[2] with { DisplayName = "A-刷新", ShareEnabled = false },
+            added,
+            original[0] with { DisplayName = "Z-刷新", ShareEnabled = true },
+        ]);
 
-        Assert.Equal([original[0].AccountId, original[2].AccountId], vm.Accounts.Select(x => x.AccountId));
-        Assert.All(vm.Accounts, account => Assert.True(account.IsSelected));
-        Assert.Equal(["/A", "/C"], vm.Accounts.Select(x => x.DefaultTargetPath));
-        Assert.All(vm.Accounts, account => Assert.Equal(1, account.TargetSuccessCount));
+        Assert.DoesNotContain(vm.Accounts, account => account.AccountId == original[1].AccountId);
+        first = vm.Accounts.Single(account => account.AccountId == original[0].AccountId);
+        third = vm.Accounts.Single(account => account.AccountId == original[2].AccountId);
+        var newAccount = vm.Accounts.Single(account => account.AccountId == added.AccountId);
+        Assert.True(first.IsSelected);
+        Assert.False(first.ShareEnabled);
+        Assert.Equal("/A", first.DefaultTargetPath);
+        Assert.True(third.IsSelected);
+        Assert.True(third.ShareEnabled);
+        Assert.Equal("/C", third.DefaultTargetPath);
+        Assert.False(newAccount.IsSelected);
+        Assert.True(newAccount.ShareEnabled);
+        Assert.Equal(6, vm.OperationCount);
         Assert.Null(vm.ConfirmationToken);
         Assert.False(vm.IsFinalConfirmationChecked);
+        Assert.Equal(0, vm.ConfirmedOperationCount);
+
+        newAccount.IsSelected = true;
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Equal(2, gateway.PreviewCalls);
+        Assert.Equal(9, vm.ConfirmedOperationCount);
+        var refreshedDraft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        Assert.False(refreshedDraft.Accounts.Single(account => account.AccountId == first.AccountId).ShareEnabled);
+        Assert.True(refreshedDraft.Accounts.Single(account => account.AccountId == newAccount.AccountId).IsSelected);
+        Assert.True(refreshedDraft.Accounts.Single(account => account.AccountId == newAccount.AccountId).ShareEnabled);
     }
 
     [Fact]
@@ -479,7 +511,7 @@ public sealed class CreateJobWizardViewModelTests
         var accounts = Accounts(2);
         var gateway = new DelayedBatchGateway();
         var vm = Create(accounts, ready: 2, gateway: gateway);
-        vm.SelectMode(TransferMode.Distribution);
+        vm.SelectMode(TransferMode.Replication);
         foreach (var account in vm.Accounts)
         {
             account.IsSelected = true;
@@ -494,6 +526,8 @@ public sealed class CreateJobWizardViewModelTests
 
         Assert.Null(vm.ConfirmationToken);
         Assert.False(vm.IsFinalConfirmationChecked);
+        Assert.Equal(2, vm.OperationCount);
+        Assert.Equal(0, vm.ConfirmedOperationCount);
     }
 
     [Fact]
