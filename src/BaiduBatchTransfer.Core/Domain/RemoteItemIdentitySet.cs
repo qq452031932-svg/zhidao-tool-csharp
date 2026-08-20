@@ -7,6 +7,10 @@ namespace BaiduBatchTransfer.Core.Domain;
 
 public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
 {
+    private static readonly Encoding StrictUtf8 = new UTF8Encoding(
+        encoderShouldEmitUTF8Identifier: false,
+        throwOnInvalidBytes: true);
+
     public RemoteItemIdentitySet(IEnumerable<RemoteItemIdentity> items)
     {
         ArgumentNullException.ThrowIfNull(items);
@@ -16,6 +20,7 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
             .ToImmutableArray();
         if (snapshot.IsEmpty)
             throw new ArgumentException("At least one exact remote item identity is required.", nameof(items));
+        foreach (var item in snapshot) ValidateExactId(item.ExactId, nameof(items));
         if (snapshot.Zip(snapshot.Skip(1), (left, right) =>
                 string.Equals(left.ExactId, right.ExactId, StringComparison.Ordinal)).Any(equal => equal))
         {
@@ -61,12 +66,26 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
         Span<byte> length = stackalloc byte[sizeof(int)];
         foreach (var item in items)
         {
-            var encoded = Encoding.UTF8.GetBytes(item.ExactId);
+            var encoded = StrictUtf8.GetBytes(item.ExactId);
             BinaryPrimitives.WriteInt32BigEndian(length, encoded.Length);
             hash.AppendData(length);
             hash.AppendData(encoded);
         }
 
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static void ValidateExactId(string exactId, string parameterName)
+    {
+        try
+        {
+            _ = StrictUtf8.GetByteCount(exactId);
+        }
+        catch (EncoderFallbackException)
+        {
+            throw new ArgumentException(
+                "Exact remote item identities must contain valid UTF-16 text.",
+                parameterName);
+        }
     }
 }

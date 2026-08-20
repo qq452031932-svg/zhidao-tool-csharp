@@ -5,6 +5,7 @@ using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -21,6 +22,11 @@ public sealed class AppBootstrapTests : IDisposable
 
         Assert.IsType<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
+        Assert.IsType<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>(
+            host.Services.GetRequiredService<IBaiduShareAdapter>());
+        var capability = host.Services.GetRequiredService<AdapterCapability>();
+        Assert.False(capability.TransferValidated);
+        Assert.False(capability.ShareValidated);
         Assert.IsType<UnavailableAdapterAvailability>(host.Services.GetRequiredService<IAdapterAvailability>());
         Assert.IsType<BaiduAccountLoginLauncher>(host.Services.GetRequiredService<IAccountLoginLauncher>());
         Assert.IsType<LocalImportWorkflow>(host.Services.GetRequiredService<IImportWorkflow>());

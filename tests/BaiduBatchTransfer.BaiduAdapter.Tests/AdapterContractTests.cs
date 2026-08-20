@@ -459,7 +459,13 @@ public sealed class AdapterContractTests
                     request,
                     "share-42",
                     "https://pan.baidu.com/s/share-42",
-                    "a1b2")));
+                    new EffectiveShareSettings(
+                        isPermanent: true,
+                        isAccessUnlimited: true,
+                        request.UsesRandomExtractionCode
+                            ? ShareExtractionCodeBehavior.Random
+                            : ShareExtractionCodeBehavior.Fixed,
+                        request.FixedExtractionCode ?? "a1b2"))));
 
         public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
             AccountSession session,

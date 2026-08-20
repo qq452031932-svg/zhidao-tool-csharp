@@ -62,6 +62,38 @@ public sealed class RemoteItemIdentitySetTests
         Assert.Equal(new string('界', 255), identity.DisplayedTopLevelName);
         Assert.DoesNotContain(identity.DisplayedTopLevelName, char.IsSurrogate);
     }
+
+    [Fact]
+    public void RejectsLoneHighSurrogateBeforeFingerprinting()
+    {
+        var malformedId = "prefix\ud800";
+        var identity = new RemoteItemIdentity(malformedId, "文件");
+
+        var error = Assert.Throws<ArgumentException>(() => new RemoteItemIdentitySet([identity]));
+
+        Assert.DoesNotContain(malformedId, error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RejectsLoneLowSurrogateBeforeFingerprinting()
+    {
+        var malformedId = "prefix\udc00";
+        var identity = new RemoteItemIdentity(malformedId, "文件");
+
+        var error = Assert.Throws<ArgumentException>(() => new RemoteItemIdentitySet([identity]));
+
+        Assert.DoesNotContain(malformedId, error.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RejectsDistinctMalformedIdsThatWouldCollapseUnderReplacementFallback()
+    {
+        var loneHighSurrogate = new RemoteItemIdentity("same-prefix\ud800", "文件甲");
+        var loneLowSurrogate = new RemoteItemIdentity("same-prefix\udc00", "文件乙");
+
+        Assert.Throws<ArgumentException>(() => new RemoteItemIdentitySet([loneHighSurrogate]));
+        Assert.Throws<ArgumentException>(() => new RemoteItemIdentitySet([loneLowSurrogate]));
+    }
 }
 
 public sealed class BaiduAdapterShareResultTests
@@ -80,7 +112,11 @@ public sealed class BaiduAdapterShareResultTests
             request,
             "share-42",
             "https://pan.baidu.com/s/private-share",
-            "a1B2");
+            new EffectiveShareSettings(
+                isPermanent: true,
+                isAccessUnlimited: true,
+                ShareExtractionCodeBehavior.Fixed,
+                "a1B2"));
         var record = new BaiduShareRecord(
             "share-42",
             exactItems,
@@ -94,12 +130,15 @@ public sealed class BaiduAdapterShareResultTests
         Assert.Equal(exactItems, receipt.Request.RemoteItems);
         Assert.True(receipt.Request.IsPermanent);
         Assert.True(receipt.Request.IsAccessUnlimited);
+        Assert.Equal(ShareSettingsMatchStatus.Matched, receipt.SettingsMatchStatus);
+        Assert.True(receipt.IsFinalAcceptance);
         Assert.Equal(exactItems, page.Items.Single().RemoteItems);
         Assert.True(page.Items.Single().IsPermanent);
         Assert.True(page.Items.Single().IsAccessUnlimited);
         Assert.DoesNotContain("private-share", receipt.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("a1B2", receipt.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("private-next-cursor", page.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("a1B2", receipt.EffectiveSettings.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -130,4 +169,83 @@ public sealed class BaiduAdapterShareResultTests
         Assert.Contains(ShareOperationStatus.WaitingShare, Enum.GetValues<ShareOperationStatus>());
         Assert.Contains(ShareOperationStatus.ReusedExisting, Enum.GetValues<ShareOperationStatus>());
     }
+
+    [Theory]
+    [InlineData(false, true, ShareExtractionCodeBehavior.Fixed, "a1B2")]
+    [InlineData(true, false, ShareExtractionCodeBehavior.Fixed, "a1B2")]
+    [InlineData(true, true, ShareExtractionCodeBehavior.Fixed, "z9Y8")]
+    [InlineData(true, true, ShareExtractionCodeBehavior.Random, "a1B2")]
+    public void ReceiptMarksObservedSettingsThatDoNotMatchTheFixedRequest(
+        bool isPermanent,
+        bool isAccessUnlimited,
+        ShareExtractionCodeBehavior codeBehavior,
+        string effectiveCode)
+    {
+        var request = RequestWithFixedCode();
+        var receipt = Receipt(
+            request,
+            new EffectiveShareSettings(
+                isPermanent,
+                isAccessUnlimited,
+                codeBehavior,
+                effectiveCode));
+
+        Assert.Equal(ShareSettingsMatchStatus.Mismatched, receipt.SettingsMatchStatus);
+        Assert.False(receipt.IsFinalAcceptance);
+    }
+
+    [Fact]
+    public void UnconfirmedEffectiveSettingsKeepReceiptPending()
+    {
+        var receipt = Receipt(RequestWithFixedCode(), EffectiveShareSettings.Unconfirmed);
+
+        Assert.Equal(ShareSettingsMatchStatus.Pending, receipt.SettingsMatchStatus);
+        Assert.False(receipt.IsFinalAcceptance);
+        Assert.Null(receipt.ExtractionCode);
+    }
+
+    [Fact]
+    public void RandomCodeRequestRequiresObservedRandomBehaviorAndGeneratedCode()
+    {
+        var items = ExactItems();
+        var request = new PermanentShareRequest(items);
+        var receipt = Receipt(
+            request,
+            new EffectiveShareSettings(
+                isPermanent: true,
+                isAccessUnlimited: true,
+                ShareExtractionCodeBehavior.Random,
+                "r4Nd"));
+
+        Assert.Equal(ShareSettingsMatchStatus.Matched, receipt.SettingsMatchStatus);
+        Assert.Equal("r4Nd", receipt.ExtractionCode);
+        Assert.True(receipt.IsFinalAcceptance);
+    }
+
+    [Theory]
+    [InlineData("安全原因\u202e")]
+    [InlineData("安全\u2066原因")]
+    [InlineData("安全原因\u2028下一行")]
+    [InlineData("安全原因\u2029下一段")]
+    public void AdapterCapabilityRejectsUnsafeUnicodeReasonCharacters(string unsafeReason)
+    {
+        Assert.Throws<ArgumentException>(() => new AdapterCapability(false, false, unsafeReason));
+    }
+
+    private static RemoteItemIdentitySet ExactItems() => new(
+    [
+        new RemoteItemIdentity("remote-1", "顶层文件夹"),
+    ]);
+
+    private static PermanentShareRequest RequestWithFixedCode() => new(ExactItems(), "a1B2");
+
+    private static ShareCreationReceipt Receipt(
+        PermanentShareRequest request,
+        EffectiveShareSettings effectiveSettings) => new(
+            new DateTimeOffset(2026, 8, 20, 8, 0, 0, TimeSpan.Zero),
+            "request-42",
+            request,
+            "share-42",
+            "https://pan.baidu.com/s/private-share",
+            effectiveSettings);
 }
