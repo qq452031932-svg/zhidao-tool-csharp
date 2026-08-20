@@ -15,6 +15,7 @@ public interface IShareSchedulingStore
         CancellationToken cancellationToken = default);
     Task AppendDiscoveryBaselinePageAsync(
         Guid shareOperationId,
+        long expectedLeaseGeneration,
         IEnumerable<ShareDiscoveryBaselineRecord> entries,
         CancellationToken cancellationToken = default);
     Task<StringKeysetPage<ShareDiscoveryBaselineRecord>> GetDiscoveryBaselineKeysetPageAsync(
@@ -25,6 +26,7 @@ public interface IShareSchedulingStore
     Task<bool> TryCompleteDiscoveryBaselineAsync(
         Guid shareOperationId,
         int expectedGeneration,
+        long expectedLeaseGeneration,
         string baselineFingerprint,
         int expectedShareCount,
         DateTimeOffset completedAt,
@@ -32,14 +34,22 @@ public interface IShareSchedulingStore
     Task<ShareDiscoveryBaselineStateRecord?> GetDiscoveryBaselineStateAsync(
         Guid shareOperationId,
         CancellationToken cancellationToken = default);
-    Task<bool> TryMarkSubmittingAsync(Guid shareOperationId, int expectedGeneration, string requestDescriptorJson,
+    Task<bool> TryMarkSubmittingAsync(Guid shareOperationId, int expectedGeneration, long expectedLeaseGeneration, string requestDescriptorJson,
         DateTimeOffset submittedAt, CancellationToken cancellationToken = default);
-    Task<bool> TryRecordAdapterRequestAsync(Guid shareOperationId, int expectedGeneration, string adapterRequestId,
+    Task<bool> TryRecordAdapterRequestAsync(Guid shareOperationId, int expectedGeneration, long expectedLeaseGeneration, string adapterRequestId,
         DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
-    Task<bool> TryMarkResultPendingAsync(Guid shareOperationId, int expectedGeneration,
+    Task<bool> TryMarkResultPendingAsync(Guid shareOperationId, int expectedGeneration, long expectedLeaseGeneration,
         DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
-    Task<bool> TryStartNextGenerationAsync(Guid shareOperationId, ShareOperationStatus expectedStatus, int expectedGeneration,
+    Task<bool> TryStartNextGenerationAsync(Guid shareOperationId, ShareOperationStatus expectedStatus, int expectedGeneration, long expectedLeaseGeneration,
         DateTimeOffset leaseExpiresAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
+    Task<bool> TrySaveDiscoverySnapshotAsync(
+        BatchShareDiscoverySnapshotRecord snapshot,
+        CancellationToken cancellationToken = default);
+    Task<BatchShareDiscoverySnapshotRecord?> GetDiscoverySnapshotAsync(
+        Guid batchJobId,
+        Guid accountId,
+        string settingsFingerprint,
+        CancellationToken cancellationToken = default);
     Task SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default);
     Task<BatchShareDecisionSnapshotRecord?> GetDecisionSnapshotAsync(
         Guid batchJobId,
@@ -48,10 +58,11 @@ public interface IShareSchedulingStore
     Task<bool> AcceptResultAsync(
         Guid shareOperationId,
         ShareOperationStatus expectedStatus,
+        long expectedLeaseGeneration,
         BaiduShareResultRecord result,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
-    Task<bool> ReuseExistingResultAsync(Guid shareOperationId, BaiduShareResultRecord result,
+    Task<bool> ReuseExistingResultAsync(Guid shareOperationId, long expectedLeaseGeneration, BaiduShareResultRecord result,
         DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
     Task<BaiduShareResultRecord?> GetAcceptedResultAsync(Guid shareOperationId, CancellationToken cancellationToken = default);
     Task<CursorKeysetPage<BaiduShareResultRecord, ShareResultCursor>> GetResultsKeysetPageAsync(

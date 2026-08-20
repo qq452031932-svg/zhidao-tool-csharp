@@ -295,7 +295,8 @@ public sealed record ShareOperationRecord(
     string? LastErrorCode,
     string? LastErrorMessage,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt)
+    DateTimeOffset UpdatedAt,
+    long LeaseGeneration = 0)
 {
     public override string ToString() =>
         $"ShareOperationRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, Status = {Status}, Generation = {Generation}, UserContent = [REDACTED] }}";
@@ -339,10 +340,27 @@ public sealed record BatchShareDecisionSnapshotRecord(
     int CompatibleCount,
     int IncompatibleCount,
     string Generation,
-    DateTimeOffset ConfirmedAt)
+    DateTimeOffset ConfirmedAt,
+    long DiscoveryVersion = 1)
 {
     public override string ToString() =>
         $"BatchShareDecisionSnapshotRecord {{ Identity = [REDACTED], Decision = {Decision}, DiscoveredCount = {DiscoveredCount}, CompatibleCount = {CompatibleCount}, IncompatibleCount = {IncompatibleCount}, Discovery = [REDACTED] }}";
+}
+
+public sealed record BatchShareDiscoverySnapshotRecord(
+    Guid BatchJobId,
+    Guid AccountId,
+    string SettingsFingerprint,
+    string DiscoveryFingerprint,
+    int DiscoveredCount,
+    int CompatibleCount,
+    int IncompatibleCount,
+    string Generation,
+    DateTimeOffset CompletedAt,
+    long Version)
+{
+    public override string ToString() =>
+        $"BatchShareDiscoverySnapshotRecord {{ Identity = [REDACTED], Version = {Version}, DiscoveredCount = {DiscoveredCount}, CompatibleCount = {CompatibleCount}, IncompatibleCount = {IncompatibleCount}, Discovery = [REDACTED] }}";
 }
 
 public sealed record BaiduShareResultRecord(

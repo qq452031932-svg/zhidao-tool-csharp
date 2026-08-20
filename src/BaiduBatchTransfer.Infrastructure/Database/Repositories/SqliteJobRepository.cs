@@ -353,6 +353,19 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             string.IsNullOrWhiteSpace(settings.SettingsFingerprint) ||
             (settings.ExtractionCodeMode == "Random") != (settings.FixedExtractionCode is null))
             throw new ArgumentException("The batch share settings are invalid.", nameof(settings));
+        var behavior = settings.ExtractionCodeMode == "Random"
+            ? ShareExtractionCodeBehavior.Random
+            : ShareExtractionCodeBehavior.Fixed;
+        if (settings.FixedExtractionCode is not null &&
+            !string.Equals(settings.FixedExtractionCode, settings.FixedExtractionCode.Trim(), StringComparison.Ordinal))
+            throw new ArgumentException("The fixed extraction code must be canonical.", nameof(settings));
+        var canonicalFingerprint = ShareSettingsFingerprint.Compute(
+            settings.IsPermanent,
+            settings.IsAccessUnlimited,
+            behavior,
+            settings.FixedExtractionCode);
+        if (!string.Equals(canonicalFingerprint, settings.SettingsFingerprint, StringComparison.Ordinal))
+            throw new ArgumentException("The settings fingerprint is not canonical.", nameof(settings));
         await using var command = Command("""
             INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
             VALUES($batch,$permanent,$unlimited,$mode,$code,$policy,$fingerprint,$created)
@@ -388,7 +401,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         if (batchJobId == Guid.Empty || snapshot.Any(value => value.BatchJobId != batchJobId || value.AccountId == Guid.Empty) ||
             snapshot.Select(value => value.AccountId).Distinct().Count() != snapshot.Length ||
             snapshot.Select(value => value.OutputOrdinal).Distinct().Count() != snapshot.Length ||
-            snapshot.Select(value => value.OutputLabel).Distinct(StringComparer.Ordinal).Count() != snapshot.Length)
+            snapshot.Select(value => value.OutputLabel).Distinct(StringComparer.Ordinal).Count() != snapshot.Length ||
+            snapshot.Any(value => value.OutputOrdinal <= 0 || string.IsNullOrWhiteSpace(value.OutputLabel) ||
+                value.PlannedTransferCount < 0 || value.PlannedShareCount < 0 ||
+                value.PlannedShareCount > value.PlannedTransferCount ||
+                (value.ShareEnabled ? value.PlannedShareCount <= 0 : value.PlannedShareCount != 0)))
             throw new ArgumentException("The batch output-account snapshot is invalid.", nameof(accounts));
         var existing = await GetOutputAccountsAsync(batchJobId, cancellationToken).ConfigureAwait(false);
         if (existing.Count != 0)
@@ -427,60 +444,72 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     {
         ArgumentNullException.ThrowIfNull(operations);
         ArgumentNullException.ThrowIfNull(remoteItems);
-        var operationSnapshot = operations.ToArray();
-        var itemSnapshot = remoteItems.ToArray();
-        ValidateExactRemoteItems(operationSnapshot, itemSnapshot);
+        var operationSnapshot = TakeBounded(operations, 500, nameof(operations));
+        var itemSnapshot = TakeBounded(remoteItems, 1000, nameof(remoteItems));
+        var itemsByOperation = ValidateExactRemoteItems(operationSnapshot, itemSnapshot);
+        await ValidateShareOutputsAsync(operationSnapshot, cancellationToken).ConfigureAwait(false);
         await using (var command = Command("""
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
-              LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+              LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
             VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$settings,$generation,$descriptor,$request,
-              $acceptance,$attempts,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
+              $acceptance,$attempts,$leaseGeneration,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
             """))
         {
+            var prepared = false;
             foreach (var value in operationSnapshot)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                command.Parameters.Clear();
-                Add(command,"$id",Id(value.Id)); Add(command,"$transfer",Id(value.TransferOperationId));
-                Add(command,"$resource",Id(value.ResourceItemId)); Add(command,"$batch",Id(value.BatchJobId));
-                Add(command,"$account",Id(value.AccountId)); Add(command,"$ordinal",value.OutputOrdinal);
-                Add(command,"$status",value.Status); Add(command,"$fingerprint",value.ExactItemSetFingerprint);
-                Add(command,"$settings",value.SettingsFingerprint);
-                Add(command,"$generation",value.Generation); Add(command,"$descriptor",value.RequestDescriptorJson);
-                Add(command,"$request",value.AdapterRequestId); Add(command,"$acceptance",value.SubmissionAcceptance);
-                Add(command,"$attempts",value.AttemptCount); Add(command,"$lease",NullableTime(value.LeaseExpiresAt));
-                Add(command,"$submitted",NullableTime(value.SubmitStartedAt)); Add(command,"$reconcile",NullableTime(value.NextReconcileAt));
-                Add(command,"$errorCode",value.LastErrorCode); Add(command,"$errorMessage",value.LastErrorMessage);
-                Add(command,"$created",Time(value.CreatedAt)); Add(command,"$updated",Time(value.UpdatedAt));
+                BindShareOperation(command, value, add: !prepared);
+                if (!prepared)
+                {
+                    command.Prepare();
+                    prepared = true;
+                }
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
         }
         await using var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName) VALUES($operation,$ordinal,$remote,$name);");
-        foreach (var value in itemSnapshot)
+        var itemPrepared = false;
+        foreach (var operation in operationSnapshot)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            item.Parameters.Clear();
-            Add(item,"$operation",Id(value.ShareOperationId)); Add(item,"$ordinal",value.ItemOrdinal);
-            Add(item,"$remote",value.RemoteItemId); Add(item,"$name",value.DisplayName);
-            await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var value in itemsByOperation[operation.Id])
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Bind(item,"$operation",Id(value.ShareOperationId),!itemPrepared);
+                Bind(item,"$ordinal",value.ItemOrdinal,!itemPrepared);
+                Bind(item,"$remote",value.RemoteItemId,!itemPrepared);
+                Bind(item,"$name",value.DisplayName,!itemPrepared);
+                if (!itemPrepared)
+                {
+                    item.Prepare();
+                    itemPrepared = true;
+                }
+                await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 
-    private static void ValidateExactRemoteItems(
+    private static IReadOnlyDictionary<Guid, ShareOperationRemoteItemRecord[]> ValidateExactRemoteItems(
         IReadOnlyList<ShareOperationRecord> operations,
         IReadOnlyList<ShareOperationRemoteItemRecord> remoteItems)
     {
         var operationIds = operations.Select(value => value.Id).ToHashSet();
+        if (operationIds.Count != operations.Count)
+            throw new ArgumentException("Share operation identifiers must be unique.", nameof(operations));
         if (remoteItems.Any(value => !operationIds.Contains(value.ShareOperationId)))
             throw new ArgumentException("Every exact remote item must belong to the supplied share operations.", nameof(remoteItems));
+
+        var grouped = remoteItems
+            .GroupBy(value => value.ShareOperationId)
+            .ToDictionary(group => group.Key, group => group.OrderBy(value => value.ItemOrdinal).ToArray());
 
         foreach (var operation in operations)
         {
             if (string.IsNullOrWhiteSpace(operation.SettingsFingerprint))
                 throw new ArgumentException("Each share operation requires an immutable settings fingerprint.", nameof(operations));
-            var items = remoteItems.Where(value => value.ShareOperationId == operation.Id)
-                .OrderBy(value => value.ItemOrdinal).ToArray();
+            if (!grouped.TryGetValue(operation.Id, out var items))
+                items = [];
             if (items.Length == 0 || items.Where((value, index) => value.ItemOrdinal != index).Any())
                 throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", nameof(remoteItems));
             var fingerprint = new RemoteItemIdentitySet(items.Select(value =>
@@ -488,6 +517,60 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
                 throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
         }
+
+        return grouped;
+    }
+
+    private async Task ValidateShareOutputsAsync(
+        IReadOnlyList<ShareOperationRecord> operations,
+        CancellationToken cancellationToken)
+    {
+        foreach (var group in operations.GroupBy(value => (value.BatchJobId, value.AccountId, value.OutputOrdinal)))
+        {
+            await using var command = Command("""
+                SELECT ShareEnabled,PlannedShareCount,CreatedShareOperationCount
+                FROM BatchOutputAccounts output
+                WHERE BatchJobId=$batch AND AccountId=$account AND OutputOrdinal=$ordinal;
+                """);
+            Add(command, "$batch", Id(group.Key.BatchJobId));
+            Add(command, "$account", Id(group.Key.AccountId));
+            Add(command, "$ordinal", group.Key.OutputOrdinal);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false) || reader.GetInt64(0) != 1 ||
+                reader.GetInt64(2) + group.Count() > reader.GetInt64(1))
+                throw new InvalidOperationException("The confirmed output account cannot accept this share work.");
+        }
+    }
+
+    private static T[] TakeBounded<T>(IEnumerable<T> source, int maximum, string parameterName)
+    {
+        var snapshot = source.Take(maximum + 1).ToArray();
+        if (snapshot.Length > maximum)
+            throw new ArgumentOutOfRangeException(parameterName, $"A single write chunk cannot exceed {maximum} records.");
+        return snapshot;
+    }
+
+    private static void BindShareOperation(SqliteCommand command, ShareOperationRecord value, bool add)
+    {
+        Bind(command,"$id",Id(value.Id),add); Bind(command,"$transfer",Id(value.TransferOperationId),add);
+        Bind(command,"$resource",Id(value.ResourceItemId),add); Bind(command,"$batch",Id(value.BatchJobId),add);
+        Bind(command,"$account",Id(value.AccountId),add); Bind(command,"$ordinal",value.OutputOrdinal,add);
+        Bind(command,"$status",value.Status,add); Bind(command,"$fingerprint",value.ExactItemSetFingerprint,add);
+        Bind(command,"$settings",value.SettingsFingerprint,add); Bind(command,"$generation",value.Generation,add);
+        Bind(command,"$descriptor",value.RequestDescriptorJson,add); Bind(command,"$request",value.AdapterRequestId,add);
+        Bind(command,"$acceptance",value.SubmissionAcceptance,add); Bind(command,"$attempts",value.AttemptCount,add);
+        Bind(command,"$leaseGeneration",value.LeaseGeneration,add); Bind(command,"$lease",NullableTime(value.LeaseExpiresAt),add);
+        Bind(command,"$submitted",NullableTime(value.SubmitStartedAt),add); Bind(command,"$reconcile",NullableTime(value.NextReconcileAt),add);
+        Bind(command,"$errorCode",value.LastErrorCode,add); Bind(command,"$errorMessage",value.LastErrorMessage,add);
+        Bind(command,"$created",Time(value.CreatedAt),add); Bind(command,"$updated",Time(value.UpdatedAt),add);
+    }
+
+    private static void Bind(SqliteCommand command, string name, object? value, bool add)
+    {
+        if (add)
+            Add(command, name, value);
+        else
+            command.Parameters[name].Value = value ?? DBNull.Value;
     }
 
     private static void BindOperationFilters(SqliteCommand command, OperationResultKeysetQuery query)

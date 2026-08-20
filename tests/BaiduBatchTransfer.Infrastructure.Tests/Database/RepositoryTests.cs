@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Database.Repositories;
+using Microsoft.Data.Sqlite;
 using Xunit.Abstractions;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
@@ -143,6 +145,8 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             new ShareDiscoveryBaselineStateRecord(markerId, 1, marker, 1, true, DateTimeOffset.UnixEpoch),
             new BatchShareDecisionSnapshotRecord(markerId, markerId, marker, "Cancel", marker, 1, 0, 0,
                 marker, DateTimeOffset.UnixEpoch),
+            new BatchShareDiscoverySnapshotRecord(markerId, markerId, marker, marker, 1, 0, 0,
+                marker, DateTimeOffset.UnixEpoch, 1),
             new BaiduShareResultRecord(markerId, markerId, markerId, markerId, markerId, marker, marker, 1,
                 marker, marker, marker, true, true, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch),
             new ShareResultCursor(4, markerId, markerId),
@@ -229,10 +233,12 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             now, null, null, null, 1, 3);
         var resource = new ResourceItemRecord(Guid.NewGuid(), job.Id, null, 1, "url", "share", null, null,
             null, null, null, "None", "Valid", null, "Expanded", null, null, now, now, "Resolved title");
-        var settings = new BatchShareSettingsRecord(job.Id, true, true, "Random", null, "Ask", now, "settings-v1");
+        var settingsFingerprint = ShareSettingsFingerprint.Compute(
+            true, true, ShareExtractionCodeBehavior.Random, null);
+        var settings = new BatchShareSettingsRecord(job.Id, true, true, "Random", null, "Ask", now, settingsFingerprint);
         var outputs = new[]
         {
-            new BatchOutputAccountRecord(job.Id, second.Id, 2, "Second label", 4, 2, false),
+            new BatchOutputAccountRecord(job.Id, second.Id, 2, "Second label", 4, 0, false),
             new BatchOutputAccountRecord(job.Id, first.Id, 1, "First label", 7, 3, true),
         };
 
@@ -265,6 +271,15 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
 
         await using (var changed = await SqliteUnitOfWork.BeginAsync(factory))
         {
+            await Assert.ThrowsAsync<ArgumentException>(() => changed.Jobs.SetShareSettingsAsync(
+                settings with
+                {
+                    ExtractionCodeMode = "Fixed", FixedExtractionCode = " abcd ",
+                    SettingsFingerprint = ShareSettingsFingerprint.Compute(
+                        true, true, ShareExtractionCodeBehavior.Fixed, "abcd")
+                }));
+            await Assert.ThrowsAsync<ArgumentException>(() => changed.Jobs.SetShareSettingsAsync(
+                settings with { SettingsFingerprint = new string('0', 64) }));
             await Assert.ThrowsAsync<InvalidOperationException>(() => changed.Jobs.SetShareSettingsAsync(
                 settings with { ExistingSharePolicy = "Regenerate" }));
             await Assert.ThrowsAsync<InvalidOperationException>(() => changed.Jobs.AddOutputAccountsAsync(
@@ -274,6 +289,45 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         await using var verify = await SqliteUnitOfWork.BeginAsync(factory);
         Assert.Equal(settings, await verify.Jobs.GetShareSettingsAsync(job.Id));
         Assert.Equal(outputs.OrderBy(value => value.OutputOrdinal), await verify.Jobs.GetOutputAccountsAsync(job.Id));
+    }
+
+    [Fact]
+    public async Task ShareOperationInsertIsBoundedAndRejectsDisabledOrInvalidPlannedOutputBeforeWriting()
+    {
+        var graph = await CreateShareInsertGraphAsync(501, shareEnabled: true, plannedShareCount: 501);
+        await using (var oversized = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => oversized.Jobs.AddShareOperationsAsync(
+                graph.Operations, graph.RemoteItems));
+        }
+        Assert.Equal(0, await CountTableAsync(graph.Factory, "ShareOperations"));
+
+        var disabled = await CreateShareInsertGraphAsync(1, shareEnabled: false, plannedShareCount: 0);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(disabled.Factory))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => unit.Jobs.AddShareOperationsAsync(
+                disabled.Operations, disabled.RemoteItems));
+        }
+        Assert.Equal(0, await CountTableAsync(disabled.Factory, "ShareOperations"));
+
+        await using var connection = await disabled.Factory.OpenConnectionAsync();
+        await using var direct = connection.CreateCommand();
+        direct.CommandText = """
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt)
+            VALUES($id,$transfer,$resource,$batch,$account,1,'WaitingShare',$items,$settings,1,'Unknown',0,$now,$now);
+            """;
+        var operation = Assert.Single(disabled.Operations);
+        direct.Parameters.AddWithValue("$id", operation.Id.ToString("D"));
+        direct.Parameters.AddWithValue("$transfer", operation.TransferOperationId.ToString("D"));
+        direct.Parameters.AddWithValue("$resource", operation.ResourceItemId.ToString("D"));
+        direct.Parameters.AddWithValue("$batch", operation.BatchJobId.ToString("D"));
+        direct.Parameters.AddWithValue("$account", operation.AccountId.ToString("D"));
+        direct.Parameters.AddWithValue("$items", operation.ExactItemSetFingerprint);
+        direct.Parameters.AddWithValue("$settings", operation.SettingsFingerprint);
+        direct.Parameters.AddWithValue("$now", operation.CreatedAt.ToString("O"));
+        await Assert.ThrowsAsync<SqliteException>(() => direct.ExecuteNonQueryAsync());
+        Assert.Equal(0, await CountTableAsync(disabled.Factory, "ShareOperations"));
     }
 
     [Fact]
@@ -408,6 +462,94 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task ShareWritesStreamSixHundredThousandOperationsInBoundedChunksAndMemory()
+    {
+        const int resourceCount = 200_000;
+        const int accountCount = 3;
+        const int chunkSize = 500;
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var accounts = Enumerable.Range(0, accountCount)
+            .Select(index => AccountRecord.Create(StableGuid(index + 1), $"share-scale-{index}", $"Share Scale {index}"))
+            .ToArray();
+        var job = new BatchJobRecord(StableGuid(900_002), "Share Scale", "Text", "Replication", "TaskCount",
+            "ProportionalReduction", resourceCount, resourceCount * accountCount, "/", "None", "Skip",
+            "Immediate", "Active", now, now, null, null, 1, resourceCount * accountCount);
+        var settingsFingerprint = ShareSettingsFingerprint.Compute(
+            true, true, ShareExtractionCodeBehavior.Random, null);
+        var beforeBytes = GC.GetTotalMemory(forceFullCollection: true);
+        var peakBytes = beforeBytes;
+        using var sampling = new CancellationTokenSource();
+        var sampler = Task.Run(async () =>
+        {
+            while (!sampling.IsCancellationRequested)
+            {
+                UpdateMaximum(ref peakBytes, GC.GetTotalMemory(forceFullCollection: false));
+                await Task.Delay(10);
+            }
+        });
+        var timer = Stopwatch.StartNew();
+        try
+        {
+            await using var unit = await SqliteUnitOfWork.BeginAsync(factory);
+            foreach (var account in accounts) await unit.Accounts.UpsertAsync(account);
+            await unit.Jobs.AddAsync(job);
+            await unit.Jobs.AddResourcesAsync(ScaleResources(job.Id, resourceCount, now));
+            await unit.Jobs.AddOperationsAsync(ScaleOperations(job.Id, accounts, resourceCount, now));
+            await unit.Jobs.SetShareSettingsAsync(new(
+                job.Id, true, true, "Random", null, "Ask", now, settingsFingerprint));
+            await unit.Jobs.AddOutputAccountsAsync(accounts.Select((account, index) =>
+                new BatchOutputAccountRecord(job.Id, account.Id, index + 1, $"Output {index + 1}",
+                    resourceCount, resourceCount, true)));
+
+            for (var start = 0; start < resourceCount * accountCount; start += chunkSize)
+            {
+                var operations = new List<ShareOperationRecord>(chunkSize);
+                var remoteItems = new List<ShareOperationRemoteItemRecord>(chunkSize);
+                for (var offset = 0; offset < chunkSize; offset++)
+                {
+                    var ordinal = start + offset + 1;
+                    var resourceIndex = (ordinal - 1) / accountCount + 1;
+                    var accountIndex = (ordinal - 1) % accountCount;
+                    var shareId = StableGuid(3_000_000 + ordinal);
+                    var remoteId = $"remote-{ordinal}";
+                    var itemFingerprint = new RemoteItemIdentitySet([new(remoteId, remoteId)]).Fingerprint;
+                    operations.Add(new(shareId, StableGuid(2_000_000 + ordinal), StableGuid(1_000_000 + resourceIndex),
+                        job.Id, accounts[accountIndex].Id, accountIndex + 1, "WaitingShare", itemFingerprint,
+                        settingsFingerprint, 1, null, null, "Unknown", 0, null, null, null, null, null, now, now));
+                    remoteItems.Add(new(shareId, 0, remoteId, remoteId));
+                }
+                await unit.Jobs.AddShareOperationsAsync(operations, remoteItems);
+            }
+            await unit.CommitAsync();
+        }
+        finally
+        {
+            timer.Stop();
+            sampling.Cancel();
+            await sampler;
+        }
+
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT COUNT(*),(SELECT COUNT(*) FROM ShareOperationRemoteItems) FROM ShareOperations;";
+        await using var reader = await count.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(resourceCount * accountCount, reader.GetInt32(0));
+        Assert.Equal(resourceCount * accountCount, reader.GetInt32(1));
+        var claimTimer = Stopwatch.StartNew();
+        var store = new SqliteShareSchedulingStore(factory);
+        for (var index = 0; index < 200; index++)
+            Assert.NotNull(await store.TryReserveNextAsync(now, TimeSpan.FromMinutes(5)));
+        claimTimer.Stop();
+        var peakGrowth = Math.Max(0, Volatile.Read(ref peakBytes) - beforeBytes);
+        output.WriteLine($"share scale resources={resourceCount}, share-operations={resourceCount * accountCount}, elapsed={timer.Elapsed}, repeated-claims={claimTimer.Elapsed}, peak-managed-growth={peakGrowth:N0} bytes");
+        Assert.True(peakGrowth < 384L * 1024 * 1024, $"Peak managed growth was {peakGrowth:N0} bytes.");
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(120), $"Share pipeline insert took {timer.Elapsed}.");
+        Assert.True(claimTimer.Elapsed < TimeSpan.FromSeconds(10), $"Repeated indexed claims took {claimTimer.Elapsed}.");
+    }
+
+    [Fact]
     public async Task OperationSubmitLifecyclePersistsDescriptorBeforeResponseIdentifiers()
     {
         var factory = await CreateFactoryAsync(); var now = DateTimeOffset.UtcNow;
@@ -495,6 +637,67 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         return factory;
     }
 
+    private async Task<ShareInsertGraph> CreateShareInsertGraphAsync(
+        int count,
+        bool shareEnabled,
+        int plannedShareCount)
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, $"{Guid.NewGuid():N}.db"));
+        await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
+        var now = new DateTimeOffset(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
+        var account = AccountRecord.Create(Guid.NewGuid(), $"bounded-{Guid.NewGuid():N}", "Bounded");
+        var batch = new BatchJobRecord(Guid.NewGuid(), "Bounded", "Excel", "Distribution", "TaskCount",
+            "ProportionalReduction", count, count, "/", "None", "Skip", "Immediate", "Active", now,
+            now, null, null, 1, count);
+        var settingsFingerprint = ShareSettingsFingerprint.Compute(
+            true, true, ShareExtractionCodeBehavior.Random, null);
+        var operations = new List<ShareOperationRecord>(count);
+        var remoteItems = new List<ShareOperationRemoteItemRecord>(count);
+        var resources = new List<ResourceItemRecord>(count);
+        var transfers = new List<TransferOperationRecord>(count);
+        for (var index = 1; index <= count; index++)
+        {
+            var resourceId = Guid.NewGuid();
+            var transferId = Guid.NewGuid();
+            var shareId = Guid.NewGuid();
+            var remoteId = $"remote-{index}";
+            var itemFingerprint = new RemoteItemIdentitySet([new(remoteId, remoteId)]).Fingerprint;
+            resources.Add(new(resourceId, batch.Id, null, index, $"url-{index}", $"share-{index}", null, null,
+                null, null, null, "None", "Valid", null, "Expanded", null, null, now, now));
+            transfers.Add(new(transferId, resourceId, batch.Id, index, index, "/", "/", "", account.Id,
+                "Rule", "Succeeded", "NewTransfer", 1, $"transfer-{index}", "{}", "request", $"[\"{remoteId}\"]",
+                "ResultReceived", "Fulfilled", now, now, now, null, null, null, now, now));
+            operations.Add(new(shareId, transferId, resourceId, batch.Id, account.Id, 1, "WaitingShare",
+                itemFingerprint, settingsFingerprint, 1, null, null, "Unknown", 0, null, null, null, null, null, now, now));
+            remoteItems.Add(new(shareId, 0, remoteId, remoteId));
+        }
+
+        await using var unit = await SqliteUnitOfWork.BeginAsync(factory);
+        await unit.Accounts.UpsertAsync(account);
+        await unit.Jobs.AddAsync(batch);
+        await unit.Jobs.AddResourcesAsync(resources);
+        await unit.Jobs.AddOperationsAsync(transfers);
+        await unit.Jobs.SetShareSettingsAsync(new(batch.Id, true, true, "Random", null, "Ask", now, settingsFingerprint));
+        await unit.Jobs.AddOutputAccountsAsync([
+            new(batch.Id, account.Id, 1, "Bounded", count, plannedShareCount, shareEnabled)]);
+        await unit.CommitAsync();
+        return new(factory, operations, remoteItems);
+    }
+
+    private static async Task<int> CountTableAsync(SqliteConnectionFactory factory, string table)
+    {
+        var sql = table switch
+        {
+            "ShareOperations" => "SELECT COUNT(*) FROM ShareOperations;",
+            _ => throw new ArgumentOutOfRangeException(nameof(table)),
+        };
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt32(await command.ExecuteScalarAsync());
+    }
+
     private static IEnumerable<ResourceItemRecord> ScaleResources(
         Guid batchJobId,
         int count,
@@ -545,6 +748,10 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     private sealed record SecretCursor(string Value);
+    private sealed record ShareInsertGraph(
+        SqliteConnectionFactory Factory,
+        IReadOnlyList<ShareOperationRecord> Operations,
+        IReadOnlyList<ShareOperationRemoteItemRecord> RemoteItems);
 
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }

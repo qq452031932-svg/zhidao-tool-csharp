@@ -57,12 +57,17 @@ CREATE TABLE BatchOutputAccounts (
     PlannedTransferCount INTEGER NOT NULL CHECK(typeof(PlannedTransferCount)='integer' AND PlannedTransferCount >= 0),
     PlannedShareCount INTEGER NOT NULL CHECK(typeof(PlannedShareCount)='integer' AND PlannedShareCount >= 0),
     ShareEnabled INTEGER NOT NULL CHECK(ShareEnabled IN (0,1)),
+    CreatedShareOperationCount INTEGER NOT NULL DEFAULT 0
+      CHECK(typeof(CreatedShareOperationCount)='integer' AND CreatedShareOperationCount >= 0
+        AND CreatedShareOperationCount <= PlannedShareCount),
     PRIMARY KEY(BatchJobId, AccountId),
     UNIQUE(BatchJobId, OutputOrdinal),
     UNIQUE(BatchJobId, OutputLabel),
     UNIQUE(BatchJobId, AccountId, OutputOrdinal),
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
+    ,CHECK(PlannedShareCount <= PlannedTransferCount)
+    ,CHECK((ShareEnabled=0 AND PlannedShareCount=0) OR (ShareEnabled=1 AND PlannedShareCount>0))
 );
 
 CREATE INDEX IX_BatchOutputAccounts_Batch_Ordinal
@@ -171,6 +176,7 @@ CREATE TABLE ShareOperations (
     AdapterRequestId TEXT NULL,
     SubmissionAcceptance TEXT NOT NULL CHECK(SubmissionAcceptance IN ('Unknown','DefinitelyNotAccepted')),
     AttemptCount INTEGER NOT NULL DEFAULT 0 CHECK(typeof(AttemptCount)='integer' AND AttemptCount >= 0),
+    LeaseGeneration INTEGER NOT NULL DEFAULT 0 CHECK(typeof(LeaseGeneration)='integer' AND LeaseGeneration >= 0),
     LeaseExpiresAt TEXT NULL,
     SubmitStartedAt TEXT NULL,
     NextReconcileAt TEXT NULL,
@@ -205,6 +211,77 @@ CREATE INDEX IX_ShareOperations_Batch_Status_Resource_Id
 ON ShareOperations(BatchJobId, Status, ResourceItemId, Id);
 CREATE INDEX IX_ShareOperations_Resource_Account_Status_Id
 ON ShareOperations(ResourceItemId, AccountId, Status, Id);
+CREATE INDEX IX_ShareOperations_Batch_Status_Lease_Output_Id
+ON ShareOperations(BatchJobId, Status, LeaseExpiresAt, OutputOrdinal, Id);
+CREATE INDEX IX_ShareOperations_Batch_Status_Output_Id_Lease
+ON ShareOperations(BatchJobId, Status, OutputOrdinal, Id, LeaseExpiresAt);
+CREATE INDEX IX_BatchJobs_Status_Queue_Created_Id
+ON BatchJobs(Status, QueueOrder, CreatedAt, Id);
+
+CREATE TRIGGER TR_ShareOperations_RequireEnabledPlannedOutput
+BEFORE INSERT ON ShareOperations
+BEGIN
+    SELECT CASE WHEN NOT EXISTS(
+        SELECT 1 FROM BatchOutputAccounts output
+        WHERE output.BatchJobId=NEW.BatchJobId
+          AND output.AccountId=NEW.AccountId
+          AND output.OutputOrdinal=NEW.OutputOrdinal
+          AND output.ShareEnabled=1
+          AND output.CreatedShareOperationCount < output.PlannedShareCount)
+      THEN RAISE(ABORT, 'confirmed output cannot accept share work') END;
+END;
+
+CREATE TRIGGER TR_ShareOperations_IncrementPlannedOutput
+AFTER INSERT ON ShareOperations
+BEGIN
+    UPDATE BatchOutputAccounts SET CreatedShareOperationCount=CreatedShareOperationCount+1
+    WHERE BatchJobId=NEW.BatchJobId AND AccountId=NEW.AccountId;
+END;
+
+CREATE TRIGGER TR_ShareOperations_DecrementPlannedOutput
+AFTER DELETE ON ShareOperations
+BEGIN
+    UPDATE BatchOutputAccounts SET CreatedShareOperationCount=CreatedShareOperationCount-1
+    WHERE BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId;
+END;
+
+CREATE TABLE ShareOperationGenerations (
+    ShareOperationId TEXT NOT NULL,
+    Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
+    BatchJobId TEXT NOT NULL,
+    ResourceItemId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    PRIMARY KEY(ShareOperationId,Generation),
+    UNIQUE(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,ExactItemSetFingerprint,SettingsFingerprint),
+    FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER TR_ShareOperations_RecordInitialGeneration
+AFTER INSERT ON ShareOperations
+BEGIN
+    INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+      ExactItemSetFingerprint,SettingsFingerprint)
+    VALUES(NEW.Id,NEW.Generation,NEW.BatchJobId,NEW.ResourceItemId,NEW.AccountId,
+      NEW.ExactItemSetFingerprint,NEW.SettingsFingerprint);
+END;
+
+CREATE TRIGGER TR_ShareOperations_RecordNextGeneration
+AFTER UPDATE OF Generation ON ShareOperations
+WHEN NEW.Generation <> OLD.Generation
+BEGIN
+    INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+      ExactItemSetFingerprint,SettingsFingerprint)
+    VALUES(NEW.Id,NEW.Generation,NEW.BatchJobId,NEW.ResourceItemId,NEW.AccountId,
+      NEW.ExactItemSetFingerprint,NEW.SettingsFingerprint);
+END;
+
+CREATE TRIGGER TR_ShareOperationGenerations_Immutable
+BEFORE UPDATE ON ShareOperationGenerations
+BEGIN
+    SELECT RAISE(ABORT, 'share generation lineage is immutable');
+END;
 
 CREATE TABLE ShareOperationRemoteItems (
     ShareOperationId TEXT NOT NULL,
@@ -250,6 +327,10 @@ CREATE TABLE BaiduShareResults (
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(ResourceItemId) REFERENCES ResourceItems(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
+    ,FOREIGN KEY(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+      ExactItemSetFingerprint,SettingsFingerprint)
+      REFERENCES ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+        ExactItemSetFingerprint,SettingsFingerprint)
 );
 
 CREATE UNIQUE INDEX UX_BaiduShareResults_AcceptedCurrentSet
@@ -263,6 +344,25 @@ ON BaiduShareResults(ShareOperationId, Generation, Id);
 CREATE INDEX IX_BaiduShareResults_Batch_Resource_Account_Id
 ON BaiduShareResults(BatchJobId, ResourceItemId, AccountId, Id);
 
+CREATE TABLE BatchShareDiscoverySnapshots (
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    DiscoveryFingerprint TEXT NOT NULL,
+    DiscoveredCount INTEGER NOT NULL CHECK(typeof(DiscoveredCount)='integer' AND DiscoveredCount >= 0),
+    CompatibleCount INTEGER NOT NULL CHECK(typeof(CompatibleCount)='integer' AND CompatibleCount >= 0),
+    IncompatibleCount INTEGER NOT NULL CHECK(typeof(IncompatibleCount)='integer' AND IncompatibleCount >= 0),
+    Generation TEXT NOT NULL CHECK(length(trim(Generation))>0),
+    CompletedAt TEXT NOT NULL,
+    Version INTEGER NOT NULL CHECK(typeof(Version)='integer' AND Version > 0),
+    PRIMARY KEY(BatchJobId,AccountId,SettingsFingerprint),
+    UNIQUE(BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,DiscoveredCount,
+      CompatibleCount,IncompatibleCount,Generation,Version),
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint),
+    FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE,
+    CHECK(CompatibleCount + IncompatibleCount <= DiscoveredCount)
+);
+
 CREATE TABLE BatchShareDecisionSnapshots (
     BatchJobId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
@@ -274,11 +374,16 @@ CREATE TABLE BatchShareDecisionSnapshots (
     IncompatibleCount INTEGER NOT NULL CHECK(typeof(IncompatibleCount)='integer' AND IncompatibleCount >= 0),
     Generation TEXT NOT NULL,
     ConfirmedAt TEXT NOT NULL,
+    DiscoveryVersion INTEGER NOT NULL CHECK(typeof(DiscoveryVersion)='integer' AND DiscoveryVersion > 0),
     PRIMARY KEY(BatchJobId, AccountId),
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
     FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint),
     FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE,
+    FOREIGN KEY(BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,DiscoveredCount,
+      CompatibleCount,IncompatibleCount,Generation,DiscoveryVersion)
+      REFERENCES BatchShareDiscoverySnapshots(BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,
+        DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,Version),
     CHECK(CompatibleCount + IncompatibleCount <= DiscoveredCount)
 );
 
