@@ -111,18 +111,63 @@ public sealed class ImportViewModelTests
     [Fact]
     public async Task ExcelSelectionStartsLocalWorkflowWhenTransfersAreUnavailable()
     {
+        const string selectedPath = "D:\\imports\\selected.xlsx";
         var workflow = new FakeImportWorkflow();
         var vm = new ImportViewModel(
             workflow,
             new FakePageSource([], 0, null),
-            new FakeDialogService("D:\\imports\\selected.xlsx"),
+            new FakeDialogService(selectedPath),
             new TransferUnavailable());
 
         await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
 
         Assert.Equal(1, workflow.ExcelCalls);
+        Assert.Equal(selectedPath, workflow.LastExcelFilePath);
         Assert.NotNull(vm.SessionId);
         Assert.Equal("导入完成，请分页检查异常、重复和账号映射。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ExcelSelectionWithoutAFileDoesNotStartWorkflow()
+    {
+        var workflow = new FakeImportWorkflow();
+        var vm = Create(workflow);
+
+        await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
+
+        Assert.Equal(0, workflow.ExcelCalls);
+        Assert.Null(vm.SessionId);
+        Assert.Equal("未选择文件", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ExcelSelectionReportsSafeStatusSequenceWithoutExposingPath()
+    {
+        const string selectedPath = "D:\\imports\\selected.xlsx";
+        string[] expectedStatuses =
+        [
+            "请选择 Excel 文件",
+            "已选择 Excel 文件，正在检查",
+            "导入完成，请分页检查异常、重复和账号映射。",
+        ];
+        var workflow = new FakeImportWorkflow();
+        var vm = new ImportViewModel(
+            workflow,
+            new FakePageSource([], 0, null),
+            new FakeDialogService(selectedPath));
+        var statusMessages = new List<string>();
+        vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(ImportViewModel.StatusMessage))
+            {
+                statusMessages.Add(vm.StatusMessage);
+            }
+        };
+
+        await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
+
+        Assert.Equal(expectedStatuses, statusMessages.Where(expectedStatuses.Contains));
+        Assert.All(statusMessages, status => Assert.DoesNotContain(selectedPath, status));
     }
 
     [Fact]
@@ -150,6 +195,7 @@ public sealed class ImportViewModelTests
         public bool Cancel { get; set; }
         public ImportUiError? Error { get; set; }
         public int ExcelCalls { get; private set; }
+        public string? LastExcelFilePath { get; private set; }
         public (Guid, string, string?) LastEdit { get; private set; }
         public (Guid, bool) LastExclusion { get; private set; }
         public List<(Guid, bool)> Exclusions { get; } = [];
@@ -160,6 +206,7 @@ public sealed class ImportViewModelTests
         public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken)
         {
             ExcelCalls++;
+            LastExcelFilePath = filePath;
             return Result();
         }
 
