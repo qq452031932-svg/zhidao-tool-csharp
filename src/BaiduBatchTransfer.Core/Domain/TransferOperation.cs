@@ -199,6 +199,17 @@ public sealed class TransferOperation
         UpdatedAt = cancelledAt;
     }
 
+    public void PauseBeforeSubmission(string errorCode, string safeMessage, DateTimeOffset pausedAt)
+    {
+        if (SubmissionMayHaveOccurred || Status is not (OperationStatus.Waiting or OperationStatus.Reserved or OperationStatus.Preparing))
+            throw new InvalidOperationException("Only pre-submission work can be paused without reconciliation.");
+        EnsureTimestamp(pausedAt);
+        Status = OperationStatus.Paused;
+        LastErrorCode = string.IsNullOrWhiteSpace(errorCode) ? null : errorCode;
+        LastErrorMessage = string.IsNullOrWhiteSpace(safeMessage) ? null : safeMessage;
+        UpdatedAt = pausedAt;
+    }
+
     public void ResetForRetry(DateTimeOffset updatedAt)
     {
         EnsureStatus(OperationStatus.Failed);

@@ -25,4 +25,17 @@ public interface IJobRepository
     Task<BatchStatisticsRecord> GetBatchStatisticsAsync(
         Guid batchJobId,
         CancellationToken cancellationToken = default);
+    Task SetShareSettingsAsync(BatchShareSettingsRecord settings, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch share settings are not supported by this repository.");
+    Task<BatchShareSettingsRecord?> GetShareSettingsAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch share settings are not supported by this repository.");
+    Task AddOutputAccountsAsync(IEnumerable<BatchOutputAccountRecord> accounts, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch output snapshots are not supported by this repository.");
+    Task<IReadOnlyList<BatchOutputAccountRecord>> GetOutputAccountsAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch output snapshots are not supported by this repository.");
+    Task AddShareOperationsAsync(
+        IEnumerable<ShareOperationRecord> operations,
+        IEnumerable<ShareOperationRemoteItemRecord> remoteItems,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Share operations are not supported by this repository.");
 }

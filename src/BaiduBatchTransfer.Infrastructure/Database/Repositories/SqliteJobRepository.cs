@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database.Repositories;
@@ -9,30 +10,30 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
 
     public async Task AddAsync(BatchJobRecord j, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder) VALUES($id,$name,$source,$mode,$quota,$shortage,$resources,$operations,$target,$folder,$duplicate,$validation,$status,$created,$started,$completed,$import,$queue);");
-        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$created",Time(j.CreatedAt)); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder);
+        await using var c = Command("INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount) VALUES($id,$name,$source,$mode,$quota,$shortage,$resources,$operations,$target,$folder,$duplicate,$validation,$status,$created,$started,$completed,$import,$queue,$shares);");
+        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$created",Time(j.CreatedAt)); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder); Add(c,"$shares",j.ShareOperationCount);
         await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task UpdateAsync(BatchJobRecord j, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("UPDATE BatchJobs SET Name=$name,SourceType=$source,TransferMode=$mode,QuotaBasis=$quota,ShortagePolicy=$shortage,ResourceCount=$resources,OperationCount=$operations,DefaultTargetPath=$target,FolderCreationMode=$folder,DuplicatePolicy=$duplicate,ValidationMode=$validation,Status=$status,StartedAt=$started,CompletedAt=$completed,ImportSessionId=$import,QueueOrder=$queue WHERE Id=$id;");
-        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder);
+        await using var c = Command("UPDATE BatchJobs SET Name=$name,SourceType=$source,TransferMode=$mode,QuotaBasis=$quota,ShortagePolicy=$shortage,ResourceCount=$resources,OperationCount=$operations,ShareOperationCount=$shares,DefaultTargetPath=$target,FolderCreationMode=$folder,DuplicatePolicy=$duplicate,ValidationMode=$validation,Status=$status,StartedAt=$started,CompletedAt=$completed,ImportSessionId=$import,QueueOrder=$queue WHERE Id=$id;");
+        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$shares",j.ShareOperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder);
         if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             throw new InvalidOperationException("The batch no longer exists.");
     }
 
     public async Task<BatchJobRecord?> GetAsync(Guid id, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder FROM BatchJobs WHERE Id=$id;"); Add(c,"$id",Id(id));
+        await using var c = Command("SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount FROM BatchJobs WHERE Id=$id;"); Add(c,"$id",Id(id));
         await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetString(4),r.GetString(5),r.GetInt32(6),r.GetInt32(7),r.GetString(8),r.GetString(9),r.GetString(10),r.GetString(11),r.GetString(12),ReadTime(r,13),ReadNullableTime(r,14),ReadNullableTime(r,15),ReadNullableId(r,16),r.GetInt64(17)) : null;
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetString(4),r.GetString(5),r.GetInt32(6),r.GetInt32(7),r.GetString(8),r.GetString(9),r.GetString(10),r.GetString(11),r.GetString(12),ReadTime(r,13),ReadNullableTime(r,14),ReadNullableTime(r,15),ReadNullableId(r,16),r.GetInt64(17),r.GetInt32(18)) : null;
     }
 
     public async Task AddResourcesAsync(IEnumerable<ResourceItemRecord> resources, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(resources);
-        await using var c = Command("INSERT INTO ResourceItems(Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$job,$staged,$sequence,$url,$share,$code,$note,$target,$normalizedTarget,$folder,$folderMode,$validity,$constraint,$status,$reserved,$expires,$created,$updated);");
+        await using var c = Command("INSERT INTO ResourceItems(Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt,ResolvedOutputTitle) VALUES($id,$job,$staged,$sequence,$url,$share,$code,$note,$target,$normalizedTarget,$folder,$folderMode,$validity,$constraint,$status,$reserved,$expires,$created,$updated,$title);");
         var id = c.Parameters.Add("$id", SqliteType.Text);
         var job = c.Parameters.Add("$job", SqliteType.Text);
         var staged = c.Parameters.Add("$staged", SqliteType.Text);
@@ -52,6 +53,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var expires = c.Parameters.Add("$expires", SqliteType.Text);
         var created = c.Parameters.Add("$created", SqliteType.Text);
         var updated = c.Parameters.Add("$updated", SqliteType.Text);
+        var title = c.Parameters.Add("$title", SqliteType.Text);
         c.Prepare();
         foreach (var x in resources)
         {
@@ -65,6 +67,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             validity.Value = x.GlobalValidityStatus; constraint.Value = NullableId(x.CandidateConstraintAccountId);
             status.Value = x.CandidateStatus; reserved.Value = NullableId(x.ReservedAccountId);
             expires.Value = NullableTime(x.ReservationExpiresAt); created.Value = Time(x.CreatedAt); updated.Value = Time(x.UpdatedAt);
+            title.Value = x.ResolvedOutputTitle ?? (object)DBNull.Value;
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -73,9 +76,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     {
         query.Validate(); cancellationToken.ThrowIfCancellationRequested();
         var total = await CountAsync("ResourceItems", batchJobId, cancellationToken).ConfigureAwait(false);
-        await using var c = Command("SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt FROM ResourceItems WHERE BatchJobId=$job ORDER BY CandidateSequence,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
+        await using var c = Command("SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt,ResolvedOutputTitle FROM ResourceItems WHERE BatchJobId=$job ORDER BY CandidateSequence,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
         var items = new List<ResourceItemRecord>(); await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),ReadNullableId(r,2),r.GetInt64(3),r.GetString(4),r.GetString(5),r.IsDBNull(6)?null:r.GetString(6),r.IsDBNull(7)?null:r.GetString(7),r.IsDBNull(8)?null:r.GetString(8),r.IsDBNull(9)?null:r.GetString(9),r.IsDBNull(10)?null:r.GetString(10),r.GetString(11),r.GetString(12),ReadNullableId(r,13),r.GetString(14),ReadNullableId(r,15),ReadNullableTime(r,16),ReadTime(r,17),ReadTime(r,18)));
+        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),ReadNullableId(r,2),r.GetInt64(3),r.GetString(4),r.GetString(5),r.IsDBNull(6)?null:r.GetString(6),r.IsDBNull(7)?null:r.GetString(7),r.IsDBNull(8)?null:r.GetString(8),r.IsDBNull(9)?null:r.GetString(9),r.IsDBNull(10)?null:r.GetString(10),r.GetString(11),r.GetString(12),ReadNullableId(r,13),r.GetString(14),ReadNullableId(r,15),ReadNullableTime(r,16),ReadTime(r,17),ReadTime(r,18),r.IsDBNull(19)?null:r.GetString(19)));
         return new(items,total,query.PageNumber,query.PageSize);
     }
 
@@ -235,7 +238,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var total = Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
 
         await using var command = Command(
-            "SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt " +
+            "SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt,ResolvedOutputTitle " +
             "FROM ResourceItems WHERE BatchJobId=$job" + filter +
             " AND CandidateSequence>$after ORDER BY CandidateSequence,Id LIMIT $limit;");
         Add(command, "$job", Id(query.BatchJobId));
@@ -254,7 +257,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.IsDBNull(8) ? null : reader.GetString(8), reader.IsDBNull(9) ? null : reader.GetString(9),
                 reader.IsDBNull(10) ? null : reader.GetString(10), reader.GetString(11), reader.GetString(12),
                 ReadNullableId(reader, 13), reader.GetString(14), ReadNullableId(reader, 15),
-                ReadNullableTime(reader, 16), ReadTime(reader, 17), ReadTime(reader, 18)));
+                ReadNullableTime(reader, 16), ReadTime(reader, 17), ReadTime(reader, 18),
+                reader.IsDBNull(19) ? null : reader.GetString(19)));
         }
         var hasMore = items.Count > query.PageSize;
         if (hasMore) items.RemoveAt(items.Count - 1);
@@ -339,6 +343,136 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6)));
         }
         return new(batchJobId, resourceCount, operationCount, accounts);
+    }
+
+    public async Task SetShareSettingsAsync(BatchShareSettingsRecord settings, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        if (settings.BatchJobId == Guid.Empty || settings.ExtractionCodeMode is not ("Random" or "Fixed") ||
+            settings.ExistingSharePolicy is not ("Ask" or "Reuse" or "Regenerate" or "Cancel") ||
+            string.IsNullOrWhiteSpace(settings.SettingsFingerprint) ||
+            (settings.ExtractionCodeMode == "Random") != (settings.FixedExtractionCode is null))
+            throw new ArgumentException("The batch share settings are invalid.", nameof(settings));
+        await using var command = Command("""
+            INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,$permanent,$unlimited,$mode,$code,$policy,$fingerprint,$created)
+            ON CONFLICT(BatchJobId) DO UPDATE SET
+              IsPermanent=excluded.IsPermanent,IsAccessUnlimited=excluded.IsAccessUnlimited,
+              ExtractionCodeMode=excluded.ExtractionCodeMode,FixedExtractionCode=excluded.FixedExtractionCode,
+              ExistingSharePolicy=excluded.ExistingSharePolicy,SettingsFingerprint=excluded.SettingsFingerprint,
+              CreatedAt=excluded.CreatedAt;
+            """);
+        Add(command,"$batch",Id(settings.BatchJobId)); Add(command,"$permanent",settings.IsPermanent ? 1 : 0);
+        Add(command,"$unlimited",settings.IsAccessUnlimited ? 1 : 0); Add(command,"$mode",settings.ExtractionCodeMode);
+        Add(command,"$code",settings.FixedExtractionCode); Add(command,"$policy",settings.ExistingSharePolicy);
+        Add(command,"$fingerprint",settings.SettingsFingerprint);
+        Add(command,"$created",Time(settings.CreatedAt));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<BatchShareSettingsRecord?> GetShareSettingsAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("SELECT BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,ExistingSharePolicy,CreatedAt,SettingsFingerprint FROM BatchShareSettings WHERE BatchJobId=$batch;");
+        Add(command,"$batch",Id(batchJobId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new(Guid.Parse(reader.GetString(0)),reader.GetInt64(1)!=0,reader.GetInt64(2)!=0,reader.GetString(3),
+                reader.IsDBNull(4)?null:reader.GetString(4),reader.GetString(5),ReadTime(reader,6),reader.GetString(7))
+            : null;
+    }
+
+    public async Task AddOutputAccountsAsync(IEnumerable<BatchOutputAccountRecord> accounts, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(accounts);
+        await using var command = Command("INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled) VALUES($batch,$account,$ordinal,$label,$transfers,$shares,$enabled);");
+        foreach (var value in accounts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            command.Parameters.Clear();
+            Add(command,"$batch",Id(value.BatchJobId)); Add(command,"$account",Id(value.AccountId));
+            Add(command,"$ordinal",value.OutputOrdinal); Add(command,"$label",value.OutputLabel);
+            Add(command,"$transfers",value.PlannedTransferCount); Add(command,"$shares",value.PlannedShareCount);
+            Add(command,"$enabled",value.ShareEnabled ? 1 : 0);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public async Task<IReadOnlyList<BatchOutputAccountRecord>> GetOutputAccountsAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("SELECT BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled FROM BatchOutputAccounts WHERE BatchJobId=$batch ORDER BY OutputOrdinal,AccountId;");
+        Add(command,"$batch",Id(batchJobId));
+        var values = new List<BatchOutputAccountRecord>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            values.Add(new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetInt32(2),reader.GetString(3),reader.GetInt32(4),reader.GetInt32(5),reader.GetInt64(6)!=0));
+        return values;
+    }
+
+    public async Task AddShareOperationsAsync(
+        IEnumerable<ShareOperationRecord> operations,
+        IEnumerable<ShareOperationRemoteItemRecord> remoteItems,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(operations);
+        ArgumentNullException.ThrowIfNull(remoteItems);
+        var operationSnapshot = operations.ToArray();
+        var itemSnapshot = remoteItems.ToArray();
+        ValidateExactRemoteItems(operationSnapshot, itemSnapshot);
+        await using (var command = Command("""
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
+              LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$generation,$descriptor,$request,
+              $acceptance,$attempts,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
+            """))
+        {
+            foreach (var value in operationSnapshot)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                command.Parameters.Clear();
+                Add(command,"$id",Id(value.Id)); Add(command,"$transfer",Id(value.TransferOperationId));
+                Add(command,"$resource",Id(value.ResourceItemId)); Add(command,"$batch",Id(value.BatchJobId));
+                Add(command,"$account",Id(value.AccountId)); Add(command,"$ordinal",value.OutputOrdinal);
+                Add(command,"$status",value.Status); Add(command,"$fingerprint",value.ExactItemSetFingerprint);
+                Add(command,"$generation",value.Generation); Add(command,"$descriptor",value.RequestDescriptorJson);
+                Add(command,"$request",value.AdapterRequestId); Add(command,"$acceptance",value.SubmissionAcceptance);
+                Add(command,"$attempts",value.AttemptCount); Add(command,"$lease",NullableTime(value.LeaseExpiresAt));
+                Add(command,"$submitted",NullableTime(value.SubmitStartedAt)); Add(command,"$reconcile",NullableTime(value.NextReconcileAt));
+                Add(command,"$errorCode",value.LastErrorCode); Add(command,"$errorMessage",value.LastErrorMessage);
+                Add(command,"$created",Time(value.CreatedAt)); Add(command,"$updated",Time(value.UpdatedAt));
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        await using var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName) VALUES($operation,$ordinal,$remote,$name);");
+        foreach (var value in itemSnapshot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            item.Parameters.Clear();
+            Add(item,"$operation",Id(value.ShareOperationId)); Add(item,"$ordinal",value.ItemOrdinal);
+            Add(item,"$remote",value.RemoteItemId); Add(item,"$name",value.DisplayName);
+            await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static void ValidateExactRemoteItems(
+        IReadOnlyList<ShareOperationRecord> operations,
+        IReadOnlyList<ShareOperationRemoteItemRecord> remoteItems)
+    {
+        var operationIds = operations.Select(value => value.Id).ToHashSet();
+        if (remoteItems.Any(value => !operationIds.Contains(value.ShareOperationId)))
+            throw new ArgumentException("Every exact remote item must belong to the supplied share operations.", nameof(remoteItems));
+
+        foreach (var operation in operations)
+        {
+            var items = remoteItems.Where(value => value.ShareOperationId == operation.Id)
+                .OrderBy(value => value.ItemOrdinal).ToArray();
+            if (items.Length == 0 || items.Where((value, index) => value.ItemOrdinal != index).Any())
+                throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", nameof(remoteItems));
+            var fingerprint = new RemoteItemIdentitySet(items.Select(value =>
+                new RemoteItemIdentity(value.RemoteItemId, value.DisplayName))).Fingerprint;
+            if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
+        }
     }
 
     private static void BindOperationFilters(SqliteCommand command, OperationResultKeysetQuery query)

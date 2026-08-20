@@ -50,4 +50,21 @@ public interface IImportRepository
         Guid sessionId,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Disposition aggregation is not supported by this repository.");
+    Task SetColumnDefinitionsAsync(
+        Guid sessionId,
+        IEnumerable<ImportColumnDefinitionRecord> definitions,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Import column definitions are not supported by this repository.");
+    Task<IReadOnlyList<ImportColumnDefinitionRecord>> GetColumnDefinitionsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Import column definitions are not supported by this repository.");
+    Task AddRowPayloadsAsync(
+        IEnumerable<StagedImportRowPayloadRecord> payloads,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Raw import payloads are not supported by this repository.");
+    Task<StagedImportRowPayloadRecord?> GetRowPayloadAsync(
+        Guid stagedImportRowId,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Raw import payloads are not supported by this repository.");
 }

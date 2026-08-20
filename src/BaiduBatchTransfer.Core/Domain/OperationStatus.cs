@@ -9,5 +9,6 @@ public enum OperationStatus
     ResultPending,
     Succeeded,
     Failed,
+    Paused,
     Cancelled,
 }

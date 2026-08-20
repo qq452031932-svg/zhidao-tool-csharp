@@ -4,7 +4,7 @@ namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class DatabaseMigrator
 {
-    public const int LatestVersion = 7;
+    public const int LatestVersion = 8;
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseBackupService backupService;
     private readonly DatabaseIntegrityService integrityService;
@@ -50,7 +50,7 @@ public sealed class DatabaseMigrator
         return Convert.ToInt32(await version.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
     }
 
-    private async Task ApplyMigrationAsync(int version, CancellationToken cancellationToken)
+    internal async Task ApplyMigrationAsync(int version, CancellationToken cancellationToken)
     {
         var sql = ReadMigrationSql(version);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -65,6 +65,12 @@ public sealed class DatabaseMigrator
             await versionCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             var schema = await schemaValidator.ValidateAsync(connection, version, cancellationToken, (SqliteTransaction)transaction).ConfigureAwait(false);
             if (!schema.IsValid) throw new InvalidDataException($"Database schema validation failed before commit: {string.Join("; ", schema.Errors)}");
+            await using var foreignKeys = connection.CreateCommand();
+            foreignKeys.Transaction = (SqliteTransaction)transaction;
+            foreignKeys.CommandText = "PRAGMA foreign_key_check;";
+            await using var violations = await foreignKeys.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await violations.ReadAsync(cancellationToken).ConfigureAwait(false))
+                throw new InvalidDataException("Database relationship validation failed before commit.");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }

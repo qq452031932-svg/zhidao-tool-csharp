@@ -15,6 +15,11 @@ public sealed record Page<T>(IReadOnlyList<T> Items, long TotalCount, int PageNu
 
 public sealed record KeysetPage<T>(IReadOnlyList<T> Items, long? TotalCount, long? NextCursor);
 
+public sealed record StringKeysetPage<T>(IReadOnlyList<T> Items, string? NextCursor);
+
+public sealed record CursorKeysetPage<T, TCursor>(IReadOnlyList<T> Items, TCursor? NextCursor)
+    where TCursor : class;
+
 public sealed record StagedImportKeysetQuery(
     Guid ImportSessionId,
     string? Disposition,
@@ -127,13 +132,17 @@ public sealed record ImportDispositionCounts(
 public sealed record ImportSessionRecord(
     Guid Id, string SourceType, string SourceName, string Status, int TotalRows, int ReadyRows,
     int InvalidRows, int DuplicateRows, int ExcludedRows, Guid? PrecheckAccountId,
-    Guid? CreatedBatchJobId, Guid? AppendToBatchJobId, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt)
+    Guid? CreatedBatchJobId, Guid? AppendToBatchJobId, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
+    string? ColumnMappingFingerprint = null)
 {
     public static ImportSessionRecord Create(Guid id, string sourceType, string sourceName)
     {
         var now = DateTimeOffset.UtcNow;
         return new(id, sourceType, sourceName, "Parsing", 0, 0, 0, 0, 0, null, null, null, now, now);
     }
+
+    public override string ToString() =>
+        $"ImportSessionRecord {{ Status = {Status}, TotalRows = {TotalRows}, MappingConfigured = {ColumnMappingFingerprint is not null}, UserContent = [REDACTED] }}";
 }
 
 public sealed record StagedImportRowRecord(
@@ -170,14 +179,20 @@ public sealed record BatchJobRecord(
     Guid Id, string Name, string SourceType, string TransferMode, string QuotaBasis, string ShortagePolicy,
     int ResourceCount, int OperationCount, string DefaultTargetPath, string FolderCreationMode,
     string DuplicatePolicy, string ValidationMode, string Status, DateTimeOffset CreatedAt,
-    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt, Guid? ImportSessionId, long QueueOrder);
+    DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt, Guid? ImportSessionId, long QueueOrder,
+    int ShareOperationCount = 0)
+{
+    public override string ToString() =>
+        $"BatchJobRecord {{ Status = {Status}, ResourceCount = {ResourceCount}, OperationCount = {OperationCount}, ShareOperationCount = {ShareOperationCount}, UserContent = [REDACTED] }}";
+}
 
 public sealed record ResourceItemRecord(
     Guid Id, Guid BatchJobId, Guid? StagedImportRowId, long CandidateSequence, string ShareUrl,
     string NormalizedShareId, string? ExtractionCode, string? Note, string? TargetPathOverride,
     string? NormalizedTargetPathOverride, string? CreateFolderName, string FolderCreationModeOverride,
     string GlobalValidityStatus, Guid? CandidateConstraintAccountId, string CandidateStatus,
-    Guid? ReservedAccountId, DateTimeOffset? ReservationExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt)
+    Guid? ReservedAccountId, DateTimeOffset? ReservationExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
+    string? ResolvedOutputTitle = null)
 {
     public override string ToString() =>
         $"ResourceItemRecord {{ Id = {Id}, BatchJobId = {BatchJobId}, CandidateSequence = {CandidateSequence}, CandidateStatus = {CandidateStatus}, UserContent = [REDACTED] }}";
@@ -201,6 +216,174 @@ public sealed record OperationSubmissionPreparation(
 
 public sealed record OperationSubmissionResponse(
     Guid OperationId, string? AdapterRequestId, string? RemoteItemIdsJson, string SubmitState, string Status, DateTimeOffset UpdatedAt);
+
+public sealed record ImportColumnDefinitionRecord(
+    Guid ImportSessionId,
+    int ColumnOrdinal,
+    string? SourceHeader,
+    string MappedRole,
+    bool IsRequired)
+{
+    public override string ToString() =>
+        $"ImportColumnDefinitionRecord {{ ColumnOrdinal = {ColumnOrdinal}, MappedRole = {MappedRole}, IsRequired = {IsRequired}, UserContent = [REDACTED] }}";
+}
+
+public sealed record StagedImportRowPayloadRecord(
+    Guid StagedImportRowId,
+    string? SourceTitle,
+    string? ResolvedOutputTitle,
+    string OriginalShareUrl,
+    string RawValuesJson)
+{
+    public override string ToString() =>
+        "StagedImportRowPayloadRecord { Identity = [REDACTED], UserContent = [REDACTED] }";
+}
+
+public sealed record BatchShareSettingsRecord(
+    Guid BatchJobId,
+    bool IsPermanent,
+    bool IsAccessUnlimited,
+    string ExtractionCodeMode,
+    string? FixedExtractionCode,
+    string ExistingSharePolicy,
+    DateTimeOffset CreatedAt,
+    string SettingsFingerprint)
+{
+    public override string ToString() =>
+        $"BatchShareSettingsRecord {{ Identity = [REDACTED], IsPermanent = {IsPermanent}, IsAccessUnlimited = {IsAccessUnlimited}, ExtractionCodeMode = {ExtractionCodeMode}, ExistingSharePolicy = {ExistingSharePolicy}, FixedExtractionCode = [REDACTED], Fingerprint = [REDACTED] }}";
+}
+
+public sealed record BatchOutputAccountRecord(
+    Guid BatchJobId,
+    Guid AccountId,
+    int OutputOrdinal,
+    string OutputLabel,
+    int PlannedTransferCount,
+    int PlannedShareCount,
+    bool ShareEnabled)
+{
+    public override string ToString() =>
+        $"BatchOutputAccountRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount}, ShareEnabled = {ShareEnabled}, OutputLabel = [REDACTED] }}";
+}
+
+public sealed record ShareOperationRecord(
+    Guid Id,
+    Guid TransferOperationId,
+    Guid ResourceItemId,
+    Guid BatchJobId,
+    Guid AccountId,
+    int OutputOrdinal,
+    string Status,
+    string ExactItemSetFingerprint,
+    int Generation,
+    string? RequestDescriptorJson,
+    string? AdapterRequestId,
+    string SubmissionAcceptance,
+    int AttemptCount,
+    DateTimeOffset? LeaseExpiresAt,
+    DateTimeOffset? SubmitStartedAt,
+    DateTimeOffset? NextReconcileAt,
+    string? LastErrorCode,
+    string? LastErrorMessage,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt)
+{
+    public override string ToString() =>
+        $"ShareOperationRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, Status = {Status}, Generation = {Generation}, UserContent = [REDACTED] }}";
+}
+
+public sealed record ShareOperationRemoteItemRecord(
+    Guid ShareOperationId,
+    int ItemOrdinal,
+    string RemoteItemId,
+    string DisplayName)
+{
+    public override string ToString() =>
+        $"ShareOperationRemoteItemRecord {{ Identity = [REDACTED], ItemOrdinal = {ItemOrdinal}, RemoteItem = [REDACTED] }}";
+}
+
+public sealed record ShareDiscoveryBaselineRecord(Guid ShareOperationId, string ShareId, int Generation = 1)
+{
+    public override string ToString() =>
+        $"ShareDiscoveryBaselineRecord {{ Identity = [REDACTED], Generation = {Generation}, ShareId = [REDACTED] }}";
+}
+
+public sealed record ShareDiscoveryBaselineStateRecord(
+    Guid ShareOperationId,
+    int Generation,
+    string? Fingerprint,
+    int ShareCount,
+    bool IsComplete,
+    DateTimeOffset? CompletedAt)
+{
+    public override string ToString() =>
+        $"ShareDiscoveryBaselineStateRecord {{ Identity = [REDACTED], Generation = {Generation}, ShareCount = {ShareCount}, IsComplete = {IsComplete}, Discovery = [REDACTED] }}";
+}
+
+public sealed record BatchShareDecisionSnapshotRecord(
+    Guid BatchJobId,
+    Guid AccountId,
+    string Decision,
+    string DiscoveryFingerprint,
+    int DiscoveredCount,
+    int CompatibleCount,
+    int IncompatibleCount,
+    string Generation,
+    DateTimeOffset ConfirmedAt)
+{
+    public override string ToString() =>
+        $"BatchShareDecisionSnapshotRecord {{ Identity = [REDACTED], Decision = {Decision}, DiscoveredCount = {DiscoveredCount}, CompatibleCount = {CompatibleCount}, IncompatibleCount = {IncompatibleCount}, Discovery = [REDACTED] }}";
+}
+
+public sealed record BaiduShareResultRecord(
+    Guid Id,
+    Guid ShareOperationId,
+    Guid BatchJobId,
+    Guid ResourceItemId,
+    Guid AccountId,
+    string ExactItemSetFingerprint,
+    string SettingsFingerprint,
+    int Generation,
+    string ShareId,
+    string ShareUrl,
+    string ExtractionCode,
+    bool IsAccepted,
+    bool IsCurrent,
+    DateTimeOffset SharedAt,
+    DateTimeOffset UpdatedAt)
+{
+    public override string ToString() =>
+        $"BaiduShareResultRecord {{ Identity = [REDACTED], Generation = {Generation}, IsAccepted = {IsAccepted}, IsCurrent = {IsCurrent}, UserContent = [REDACTED] }}";
+}
+
+public sealed record ShareResultCursor(long CandidateSequence, Guid AccountId, Guid ResultId)
+{
+    public override string ToString() =>
+        $"ShareResultCursor {{ CandidateSequence = {CandidateSequence}, Identity = [REDACTED] }}";
+}
+
+public sealed record ShareResultKeysetQuery(Guid BatchJobId, int PageSize, ShareResultCursor? After = null)
+{
+    public void Validate()
+    {
+        if (BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(BatchJobId));
+        if (PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(PageSize));
+        if (After is { CandidateSequence: < 0 }) throw new ArgumentOutOfRangeException(nameof(After));
+        if (After is { AccountId: var accountId } && accountId == Guid.Empty) throw new ArgumentException("A result cursor account is required.", nameof(After));
+        if (After is { ResultId: var resultId } && resultId == Guid.Empty) throw new ArgumentException("A result cursor identity is required.", nameof(After));
+    }
+}
+
+public sealed record AdapterCapabilityAcceptanceRecord(
+    string AdapterKind,
+    string ProtocolVersion,
+    string AdapterBuildVersion,
+    DateTimeOffset AcceptedAt,
+    string EvidenceHash)
+{
+    public override string ToString() =>
+        $"AdapterCapabilityAcceptanceRecord {{ AdapterKind = {AdapterKind}, ProtocolVersion = {ProtocolVersion}, AdapterBuildVersion = {AdapterBuildVersion}, AcceptedAt = {AcceptedAt:O}, EvidenceHash = [REDACTED] }}";
+}
 
 public sealed record AccountAllocationRecord(
     Guid Id, Guid BatchJobId, Guid AccountId, int PriorityOrder, string DefaultTargetPath,

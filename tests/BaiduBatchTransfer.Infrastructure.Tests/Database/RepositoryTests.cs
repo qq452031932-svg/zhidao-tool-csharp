@@ -86,6 +86,55 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task ImportColumnDefinitionsAndPositionalRawPayloadRoundTripWithoutRewritingValues()
+    {
+        var factory = await CreateFactoryAsync();
+        var session = ImportSessionRecord.Create(Guid.NewGuid(), "Excel", "source.xlsx") with
+        {
+            ColumnMappingFingerprint = "mapping-fingerprint"
+        };
+        var row = StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 1, "normalized-url", "Ready");
+        var definitions = new[]
+        {
+            new ImportColumnDefinitionRecord(session.Id, 0, "标题", "Title", false),
+            new ImportColumnDefinitionRecord(session.Id, 1, "链接", "ShareUrl", true),
+            new ImportColumnDefinitionRecord(session.Id, 2, null, "Preserve", false),
+        };
+        const string rawJson = "[\"  title  \",\"https://pan.baidu.com/s/private 提取码 abcd\",\"=SUM(A1:A2)\"]";
+        var payload = new StagedImportRowPayloadRecord(
+            row.Id, "  title  ", "  title  ", "https://pan.baidu.com/s/private", rawJson);
+
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Imports.AddSessionAsync(session);
+            await unit.Imports.SetColumnDefinitionsAsync(session.Id, definitions);
+            await unit.Imports.AddRowsAsync([row]);
+            await unit.Imports.AddRowPayloadsAsync([payload]);
+            await unit.CommitAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(factory);
+        Assert.Equal(session.ColumnMappingFingerprint, (await read.Imports.GetSessionAsync(session.Id))!.ColumnMappingFingerprint);
+        Assert.Equal(definitions, await read.Imports.GetColumnDefinitionsAsync(session.Id));
+        Assert.Equal(payload, await read.Imports.GetRowPayloadAsync(row.Id));
+        await Assert.ThrowsAsync<ArgumentException>(() => read.Imports.AddRowPayloadsAsync([
+            payload with { RawValuesJson = "[{\"not\":\"a raw cell\"}]" }]));
+    }
+
+    [Fact]
+    public async Task ColumnDefinitionValidationRequiresExactlyOneShareUrlAndUniqueMappedRoles()
+    {
+        var factory = await CreateFactoryAsync();
+        var session = ImportSessionRecord.Create(Guid.NewGuid(), "Excel", "source.xlsx");
+        await using var unit = await SqliteUnitOfWork.BeginAsync(factory);
+        await unit.Imports.AddSessionAsync(session);
+        await Assert.ThrowsAsync<ArgumentException>(() => unit.Imports.SetColumnDefinitionsAsync(session.Id,
+            [new(session.Id, 0, "标题", "Title", false)]));
+        await Assert.ThrowsAsync<ArgumentException>(() => unit.Imports.SetColumnDefinitionsAsync(session.Id,
+            [new(session.Id, 0, "链接1", "ShareUrl", true), new(session.Id, 1, "链接2", "ShareUrl", true)]));
+    }
+
+    [Fact]
     public async Task RepositoryOperationsHonorPreCancelledToken()
     {
         var factory = await CreateFactoryAsync();
