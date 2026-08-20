@@ -1,0 +1,512 @@
+using System.Text.RegularExpressions;
+using BaiduBatchTransfer.App.Features.Accounts;
+using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Accounts;
+
+namespace BaiduBatchTransfer.App.Tests.Features;
+
+public sealed class AccountManagementViewModelTests
+{
+    private static readonly DateTimeOffset Now = new(2026, 8, 20, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public async Task FirstPageIsBoundedAndRowsExposeOnlySafeChineseDisplayFields()
+    {
+        var activeId = Guid.NewGuid();
+        var pendingId = Guid.NewGuid();
+        var operations = new FakeOperations
+        {
+            Pages =
+            {
+                [1] = new AccountPage(
+                [
+                    new(activeId, "账号甲", "Active", true),
+                    new(pendingId, "账号乙", "Disabled", false),
+                    new(Guid.NewGuid(), "账号丙", "Invalid", true),
+                ], 1, 100, 203),
+            },
+        };
+        var vm = Create(operations);
+
+        await vm.LoadFirstPageAsync();
+
+        var request = Assert.Single(operations.PageRequests);
+        Assert.Equal((1, 100), request);
+        Assert.InRange(request.PageSize, 1, 1_000);
+        Assert.Equal(3, vm.Accounts.Count);
+        Assert.Equal("账号甲", vm.Accounts[0].DisplayName);
+        Assert.Equal("已登录", vm.Accounts[0].LoginStatusText);
+        Assert.Equal("已启用", vm.Accounts[0].EnabledStateText);
+        Assert.Equal("退出账号", vm.Accounts[0].ActionText);
+        Assert.Equal("重试清理", vm.Accounts[1].ActionText);
+        Assert.Equal("登录已失效", vm.Accounts[2].LoginStatusText);
+        Assert.Equal("第 1 页，共 3 页", vm.PageSummary);
+
+        var visible = vm.Accounts.SelectMany(row => new[]
+        {
+            row.DisplayName,
+            row.LoginStatusText,
+            row.EnabledStateText,
+            row.ActionText,
+            row.ToString(),
+        }).Append(vm.PageSummary).ToArray();
+        Assert.All(visible, AssertSafeVisibleText);
+        Assert.DoesNotContain(visible, value => value.Contains(activeId.ToString(), StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(visible, value => value.Contains(pendingId.ToString(), StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task PreviewUsesSelectedAccountAndModeAndBuildsAccountScopedChineseConfirmation()
+    {
+        var accountId = Guid.NewGuid();
+        var operations = SingleAccount(accountId, "账号乙");
+        operations.Preview = new(
+            AccountExitStatus.Ready,
+            "账号乙",
+            12,
+            3,
+            2,
+            "preview-token-secret",
+            "exception profile C:\\private cookie");
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+        vm.RemoveTerminalHistorySelected = true;
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Equal((accountId, AccountExitHistoryMode.RemoveTerminalHistory), Assert.Single(operations.PreviewRequests));
+        Assert.True(vm.IsConfirmationVisible);
+        Assert.Equal(12, vm.TerminalOperationCount);
+        Assert.Equal(3, vm.TerminalBatchCount);
+        Assert.Equal(2, vm.SharedBatchCount);
+        Assert.Contains("账号乙", vm.ConfirmationMessage);
+        Assert.Contains("其他账号不受影响", vm.ConfirmationMessage);
+        Assert.Contains("终态任务 12", vm.ConfirmationMessage);
+        Assert.Contains("终态批次 3", vm.ConfirmationMessage);
+        Assert.Contains("共享批次 2", vm.ConfirmationMessage);
+        Assert.Contains("公共上下文将保留", vm.ConfirmationMessage);
+        Assert.DoesNotContain("preview-token-secret", vm.ConfirmationMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", vm.ConfirmationMessage, StringComparison.OrdinalIgnoreCase);
+        AssertSafeVisibleText(vm.ConfirmationMessage);
+    }
+
+    [Fact]
+    public async Task ModeSwitchInvalidatesPreviewAndOriginalTokenCannotBeConfirmed()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号甲");
+        operations.Preview = Ready("账号甲", "token-a");
+        var dialogs = new FakeDialogService { ConfirmResult = true };
+        var vm = Create(operations, dialogs);
+        await vm.LoadFirstPageAsync();
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        vm.RemoveTerminalHistorySelected = true;
+        await vm.ConfirmRemovalAsync();
+
+        Assert.False(vm.IsConfirmationVisible);
+        Assert.Empty(operations.ApplyRequests);
+        Assert.Empty(dialogs.ConfirmMessages);
+    }
+
+    [Fact]
+    public async Task PreviewTokenFromAccountACannotBeReusedForAccountB()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var operations = new FakeOperations
+        {
+            Pages =
+            {
+                [1] = new AccountPage(
+                    [new(accountA, "账号甲", "Active", true), new(accountB, "账号乙", "Active", true)],
+                    1, 100, 2),
+            },
+        };
+        operations.PreviewHandler = (id, _) =>
+            Task.FromResult(id == accountA ? Ready("账号甲", "token-a") : Ready("账号乙", "token-b"));
+        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+        await vm.BeginAccountActionAsync(vm.Accounts[1]);
+        await vm.ConfirmRemovalAsync();
+
+        var request = Assert.Single(operations.ApplyRequests);
+        Assert.Equal(accountB, request.AccountId);
+        Assert.Equal(AccountExitHistoryMode.KeepHistory, request.HistoryMode);
+        Assert.Equal("token-b", request.ConfirmationToken);
+        Assert.DoesNotContain(operations.ApplyRequests, item => item.ConfirmationToken == "token-a");
+    }
+
+    [Fact]
+    public async Task VisibleRowSelectionChangeInvalidatesThePreviousAccountsPreview()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var operations = new FakeOperations
+        {
+            Pages =
+            {
+                [1] = new AccountPage(
+                    [new(accountA, "账号甲", "Active", true), new(accountB, "账号乙", "Active", true)],
+                    1, 100, 2),
+            },
+            Preview = Ready("账号甲", "token-a"),
+        };
+        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        await vm.LoadFirstPageAsync();
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+        Assert.True(vm.CanConfirm);
+
+        vm.SelectedAccount = vm.Accounts[1];
+        await vm.ConfirmRemovalAsync();
+
+        Assert.False(vm.IsConfirmationVisible);
+        Assert.False(vm.CanConfirm);
+        Assert.Empty(operations.ApplyRequests);
+    }
+
+    [Fact]
+    public async Task UserCancelNeverAppliesAndBusyStateDisablesConfirmation()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号甲");
+        var previewGate = new TaskCompletionSource<AccountExitPreview>(TaskCreationOptions.RunContinuationsAsynchronously);
+        operations.PreviewHandler = (_, _) => previewGate.Task;
+        var dialogs = new FakeDialogService { ConfirmResult = false };
+        var vm = Create(operations, dialogs);
+        await vm.LoadFirstPageAsync();
+
+        var loading = vm.BeginAccountActionAsync(vm.Accounts[0]);
+        Assert.True(vm.IsBusy);
+        Assert.False(vm.ConfirmRemovalCommand.CanExecute(null));
+        previewGate.SetResult(Ready("账号甲", "token-a"));
+        await loading;
+        Assert.True(vm.ConfirmRemovalCommand.CanExecute(null));
+
+        await vm.ConfirmRemovalAsync();
+
+        Assert.Empty(operations.ApplyRequests);
+        Assert.Single(dialogs.ConfirmMessages);
+    }
+
+    [Theory]
+    [InlineData(AccountExitStatus.ActiveWorkBlocked, "账号仍有未完成工作，暂时不能退出。")]
+    [InlineData(AccountExitStatus.StaleConfirmation, "确认信息已过期，请重新预览后再试。")]
+    [InlineData(AccountExitStatus.Failed, "账号操作失败，请稍后重试。")]
+    [InlineData(AccountExitStatus.NotFound, "账号不存在或已被移除。")]
+    [InlineData(AccountExitStatus.AlreadyRemoved, "账号已经退出。")]
+    public async Task PreviewOutcomesMapToStableChineseWithoutRawMessages(
+        AccountExitStatus status,
+        string expected)
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号甲");
+        operations.Preview = new(status, "账号甲", 0, 0, 0, "secret-token", "exception cookie profile C:\\secret");
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Equal(expected, vm.StatusMessage);
+        Assert.False(vm.IsConfirmationVisible);
+        AssertSafeVisibleText(vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task CleanupPendingApplyRaisesRefreshAndUsesOriginalPreviewRequest()
+    {
+        var accountId = Guid.NewGuid();
+        var operations = SingleAccount(accountId, "账号乙");
+        operations.Preview = Ready("账号乙", "original-token");
+        operations.ApplyResult = new(
+            AccountExitStatus.CleanupPending, "", 0, 0, 0, "leaked-token", "exception text");
+        var vm = Create(operations, new FakeDialogService { ConfirmResult = true });
+        AccountManagementRefreshEventArgs? refresh = null;
+        vm.RefreshRequested += (_, args) => refresh = args;
+        await vm.LoadFirstPageAsync();
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        await vm.ConfirmRemovalAsync();
+
+        var request = Assert.Single(operations.ApplyRequests);
+        Assert.Equal(accountId, request.AccountId);
+        Assert.Equal(AccountExitHistoryMode.KeepHistory, request.HistoryMode);
+        Assert.Equal("original-token", request.ConfirmationToken);
+        Assert.Equal(Now, request.RemovedAt);
+        Assert.Equal(AccountExitStatus.CleanupPending, Assert.IsType<AccountManagementRefreshEventArgs>(refresh).Status);
+        Assert.Equal("账号已退出，仍需重试清理本机登录数据。", vm.StatusMessage);
+        AssertSafeVisibleText(vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task DisabledRowRetriesCleanupWithoutPreviewOrConfirmationToken()
+    {
+        var accountId = Guid.NewGuid();
+        var operations = SingleAccount(accountId, "账号乙", "Disabled", false);
+        operations.ResumeResult = new(AccountExitStatus.Removed, "", 0, 0, 0, "secret", "exception");
+        var vm = Create(operations);
+        AccountManagementRefreshEventArgs? refresh = null;
+        vm.RefreshRequested += (_, args) => refresh = args;
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Empty(operations.PreviewRequests);
+        Assert.Empty(operations.ApplyRequests);
+        Assert.Equal((accountId, Now), Assert.Single(operations.ResumeRequests));
+        Assert.Equal("账号已退出并完成清理。", vm.StatusMessage);
+        Assert.Equal(AccountExitStatus.Removed, Assert.IsType<AccountManagementRefreshEventArgs>(refresh).Status);
+    }
+
+    [Fact]
+    public async Task FailedCleanupRetryStaysListedAndShowsSafeChineseStatus()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号乙", "Disabled", false);
+        operations.ResumeResult = new(AccountExitStatus.Failed, "", 0, 0, 0, "token", "InvalidOperationException C:\\profile");
+        var vm = Create(operations);
+        var refreshCount = 0;
+        vm.RefreshRequested += (_, _) => refreshCount++;
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Equal("清理未完成，请稍后重试。", vm.StatusMessage);
+        Assert.Equal(0, refreshCount);
+        Assert.Single(vm.Accounts);
+        AssertSafeVisibleText(vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task PaginationKeepsOnlyCurrentPageAndInvalidatesConfirmation()
+    {
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+        var operations = new FakeOperations
+        {
+            Pages =
+            {
+                [1] = new AccountPage([new(firstId, "账号甲", "Active", true)], 1, 100, 101),
+                [2] = new AccountPage([new(secondId, "账号乙", "Active", true)], 2, 100, 101),
+            },
+            Preview = Ready("账号甲", "page-one-token"),
+        };
+        var vm = Create(operations);
+        await vm.LoadFirstPageAsync();
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+        Assert.True(vm.IsConfirmationVisible);
+
+        await vm.LoadNextPageAsync();
+
+        Assert.False(vm.IsConfirmationVisible);
+        Assert.Single(vm.Accounts);
+        Assert.Equal("账号乙", vm.Accounts[0].DisplayName);
+        Assert.Equal([(1, 100), (2, 100)], operations.PageRequests);
+        Assert.True(vm.LoadPreviousPageCommand.CanExecute(null));
+        Assert.False(vm.LoadNextPageCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task LauncherReturnsPresenterOutcomeAndRaisesRefreshOnlyWhenCommitted()
+    {
+        var presenter = new FakePresenter
+        {
+            Result = new AccountManagementRefreshResult(true, AccountExitStatus.CleanupPending),
+        };
+        var launcher = new AccountManagementLauncher(presenter);
+        AccountManagementRefreshEventArgs? raised = null;
+        launcher.RefreshRequested += (_, args) => raised = args;
+
+        var result = await launcher.OpenAsync();
+
+        Assert.Equal(presenter.Result, result);
+        Assert.Equal(AccountExitStatus.CleanupPending, Assert.IsType<AccountManagementRefreshEventArgs>(raised).Status);
+        Assert.Equal(1, presenter.ShowCalls);
+    }
+
+    [Fact]
+    public void PublicUiTextOffersOnlyTheTwoApprovedExitChoicesAndContainsNoSensitiveMarkers()
+    {
+        var choices = new[]
+        {
+            AccountManagementUiText.KeepHistoryChoice,
+            AccountManagementUiText.RemoveTerminalHistoryChoice,
+        };
+        Assert.Equal("仅退出账号，保留历史记录", choices[0]);
+        Assert.Equal("退出账号，并清理该账号的终态任务历史", choices[1]);
+
+        var visible = typeof(AccountManagementUiText).GetFields()
+            .Where(field => field.IsLiteral && field.FieldType == typeof(string))
+            .Select(field => (string)field.GetRawConstantValue()!)
+            .ToArray();
+        Assert.NotEmpty(visible);
+        Assert.All(visible, AssertSafeVisibleText);
+        Assert.DoesNotContain(visible, text => text.Contains("云端", StringComparison.Ordinal));
+        Assert.DoesNotContain(visible, text => text.Contains("日期", StringComparison.Ordinal));
+        Assert.DoesNotContain(visible, text => text.Contains("全部账号", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WindowXamlIsModalReadyVirtualizedChineseAndAccountScoped()
+    {
+        var repository = FindRepositoryRoot();
+        var path = Path.Combine(
+            repository,
+            "src",
+            "BaiduBatchTransfer.App",
+            "Features",
+            "Accounts",
+            "AccountManagementWindow.xaml");
+
+        var xaml = File.ReadAllText(path);
+
+        Assert.Contains("Title=\"账号管理\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"账号名称\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"登录状态\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"启用状态\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"操作\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("EnableRowVirtualization=\"True\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("EnableColumnVirtualization=\"True\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("VirtualizationMode=\"Recycling\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("SelectedItem=\"{Binding SelectedAccount", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"仅退出账号，保留历史记录\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"退出账号，并清理该账号的终态任务历史\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"取消\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"确认退出\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("TabIndex=", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("云端", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("日期筛选", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("全部账号", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("cookie", xaml, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", xaml, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static AccountManagementViewModel Create(
+        FakeOperations operations,
+        FakeDialogService? dialogs = null) =>
+        new(operations, dialogs ?? new FakeDialogService(), new FixedTimeProvider(Now));
+
+    private static FakeOperations SingleAccount(
+        Guid accountId,
+        string displayName,
+        string status = "Active",
+        bool isEnabled = true) =>
+        new()
+        {
+            Pages =
+            {
+                [1] = new AccountPage([new(accountId, displayName, status, isEnabled)], 1, 100, 1),
+            },
+            Preview = Ready(displayName, "preview-token"),
+        };
+
+    private static AccountExitPreview Ready(string displayName, string token) =>
+        new(AccountExitStatus.Ready, displayName, 1, 1, 0, token, "raw safe message");
+
+    private static void AssertSafeVisibleText(string value)
+    {
+        Assert.Matches("[\\u4e00-\\u9fff]", value);
+        Assert.DoesNotContain("cookie", value, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", value, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("profile", value, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("exception", value, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotMatch(new Regex("[A-Fa-f0-9]{8}-[A-Fa-f0-9-]{27,}", RegexOptions.CultureInvariant), value);
+        Assert.DoesNotMatch(new Regex("[A-Za-z]:\\\\", RegexOptions.CultureInvariant), value);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "BaiduBatchTransfer.sln")))
+                return current.FullName;
+            current = current.Parent;
+        }
+        throw new DirectoryNotFoundException("未找到测试仓库目录。");
+    }
+
+    private sealed class FakeOperations : IAccountRemovalOperations
+    {
+        public Dictionary<int, AccountPage> Pages { get; } = [];
+        public List<(int PageNumber, int PageSize)> PageRequests { get; } = [];
+        public List<(Guid AccountId, AccountExitHistoryMode Mode)> PreviewRequests { get; } = [];
+        public List<AccountExitRequest> ApplyRequests { get; } = [];
+        public List<(Guid AccountId, DateTimeOffset RemovedAt)> ResumeRequests { get; } = [];
+        public AccountExitPreview Preview { get; set; } = Ready("账号", "preview-token");
+        public AccountExitPreview ApplyResult { get; set; } =
+            new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
+        public AccountExitPreview ResumeResult { get; set; } =
+            new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
+        public Func<Guid, AccountExitHistoryMode, Task<AccountExitPreview>>? PreviewHandler { get; set; }
+
+        public Task<AccountPage> GetAccountsPageAsync(
+            int pageNumber,
+            int pageSize,
+            CancellationToken cancellationToken)
+        {
+            PageRequests.Add((pageNumber, pageSize));
+            return Task.FromResult(Pages.TryGetValue(pageNumber, out var page)
+                ? page
+                : new AccountPage([], pageNumber, pageSize, 0));
+        }
+
+        public Task<AccountExitPreview> PreviewAsync(
+            Guid accountId,
+            AccountExitHistoryMode mode,
+            CancellationToken cancellationToken)
+        {
+            PreviewRequests.Add((accountId, mode));
+            return PreviewHandler?.Invoke(accountId, mode) ?? Task.FromResult(Preview);
+        }
+
+        public Task<AccountExitPreview> ApplyAsync(
+            AccountExitRequest request,
+            CancellationToken cancellationToken)
+        {
+            ApplyRequests.Add(request);
+            return Task.FromResult(ApplyResult);
+        }
+
+        public Task<AccountExitPreview> ResumeCleanupAsync(
+            Guid accountId,
+            DateTimeOffset removedAt,
+            CancellationToken cancellationToken)
+        {
+            ResumeRequests.Add((accountId, removedAt));
+            return Task.FromResult(ResumeResult);
+        }
+    }
+
+    private sealed class FakeDialogService : IDialogService
+    {
+        public bool ConfirmResult { get; set; }
+        public List<string> ConfirmMessages { get; } = [];
+
+        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
+        {
+            ConfirmMessages.Add(message);
+            return Task.FromResult(ConfirmResult);
+        }
+
+        public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public string? PickExcelFile() => null;
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => value;
+    }
+
+    private sealed class FakePresenter : IAccountManagementWindowPresenter
+    {
+        public AccountManagementRefreshResult Result { get; set; } = AccountManagementRefreshResult.None;
+        public int ShowCalls { get; private set; }
+
+        public Task<AccountManagementRefreshResult> ShowAsync(CancellationToken cancellationToken)
+        {
+            ShowCalls++;
+            return Task.FromResult(Result);
+        }
+    }
+}

@@ -1,0 +1,145 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.Accounts.AccountManagementWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:automation="clr-namespace:System.Windows.Automation;assembly=PresentationCore"
+        Title="账号管理"
+        Width="900"
+        Height="680"
+        MinWidth="720"
+        MinHeight="540"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock Text="已添加账号" FontSize="22" FontWeight="SemiBold" />
+            <TextBlock Text="每次只操作所选账号，其他账号不受影响。"
+                       Foreground="{StaticResource MutedBrush}"
+                       Margin="0,5,0,0" />
+        </StackPanel>
+
+        <Grid Grid.Row="1">
+            <DataGrid ItemsSource="{Binding Accounts}"
+                      AutoGenerateColumns="False"
+                      CanUserAddRows="False"
+                      CanUserDeleteRows="False"
+                      IsReadOnly="True"
+                      SelectionMode="Single"
+                      SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+                      EnableRowVirtualization="True"
+                      EnableColumnVirtualization="True"
+                      VirtualizingPanel.IsVirtualizing="True"
+                      VirtualizingPanel.VirtualizationMode="Recycling"
+                      ScrollViewer.CanContentScroll="True"
+                      TabIndex="0"
+                      automation:AutomationProperties.Name="账号列表">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="账号名称" Binding="{Binding DisplayName}" Width="*" />
+                    <DataGridTextColumn Header="登录状态" Binding="{Binding LoginStatusText}" Width="130" />
+                    <DataGridTextColumn Header="启用状态" Binding="{Binding EnabledStateText}" Width="130" />
+                    <DataGridTemplateColumn Header="操作" Width="140">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Button Content="{Binding ActionText}"
+                                        Command="{Binding ActionCommand}"
+                                        IsTabStop="True"
+                                        automation:AutomationProperties.Name="{Binding ActionText}" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+
+            <Border Background="{StaticResource SurfaceBrush}"
+                    Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <ProgressBar IsIndeterminate="True" Width="180" Height="6" />
+                    <TextBlock Text="正在加载，请稍候……" Margin="0,12,0,0" HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
+
+            <Border Background="{StaticResource SurfaceBrush}"
+                    Visibility="{Binding IsEmpty, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <TextBlock Text="还没有已添加的账号。"
+                           Foreground="{StaticResource MutedBrush}"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center" />
+            </Border>
+        </Grid>
+
+        <Grid Grid.Row="2" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="{Binding StatusMessage}"
+                       TextWrapping="Wrap"
+                       Foreground="#B54708"
+                       VerticalAlignment="Center"
+                       automation:AutomationProperties.LiveSetting="Polite" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button Content="上一页"
+                        Command="{Binding LoadPreviousPageCommand}"
+                        TabIndex="1"
+                        automation:AutomationProperties.Name="加载上一页账号" />
+                <TextBlock Text="{Binding PageSummary}"
+                           VerticalAlignment="Center"
+                           Margin="8,0,16,0" />
+                <Button Content="下一页"
+                        Command="{Binding LoadNextPageCommand}"
+                        TabIndex="2"
+                        automation:AutomationProperties.Name="加载下一页账号" />
+            </StackPanel>
+        </Grid>
+
+        <Border Grid.Row="3"
+                Style="{StaticResource Card}"
+                Margin="0,16,0,0"
+                Visibility="{Binding IsConfirmationVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+            <StackPanel>
+                <TextBlock Text="确认退出所选账号" FontSize="18" FontWeight="SemiBold" />
+                <TextBlock Text="{Binding ConfirmationMessage}"
+                           TextWrapping="Wrap"
+                           Margin="0,8,0,12" />
+                <RadioButton Content="仅退出账号，保留历史记录"
+                             GroupName="退出方式"
+                             IsChecked="{Binding KeepHistorySelected}"
+                             TabIndex="3"
+                             automation:AutomationProperties.Name="仅退出账号，保留历史记录" />
+                <RadioButton Content="退出账号，并清理该账号的终态任务历史"
+                             GroupName="退出方式"
+                             IsChecked="{Binding RemoveTerminalHistorySelected}"
+                             Margin="0,8,0,0"
+                             TabIndex="4"
+                             automation:AutomationProperties.Name="退出账号，并清理该账号的终态任务历史" />
+                <UniformGrid Columns="3" Margin="0,14,0,4">
+                    <TextBlock Text="{Binding TerminalOperationCount, StringFormat=终态任务：{0}}" />
+                    <TextBlock Text="{Binding TerminalBatchCount, StringFormat=终态批次：{0}}" />
+                    <TextBlock Text="{Binding SharedBatchCount, StringFormat=共享批次：{0}}" />
+                </UniformGrid>
+                <TextBlock Text="清理终态历史时，共享批次的公共上下文和其他账号仍在使用的数据会保留。"
+                           Foreground="{StaticResource MutedBrush}"
+                           TextWrapping="Wrap"
+                           Margin="0,4,0,14" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="取消"
+                            Command="{Binding CancelConfirmationCommand}"
+                            TabIndex="5"
+                            automation:AutomationProperties.Name="取消退出" />
+                    <Button Content="确认退出"
+                            Command="{Binding ConfirmRemovalCommand}"
+                            Style="{StaticResource PrimaryButton}"
+                            TabIndex="6"
+                            IsDefault="True"
+                            automation:AutomationProperties.Name="确认退出所选账号" />
+                </StackPanel>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>
