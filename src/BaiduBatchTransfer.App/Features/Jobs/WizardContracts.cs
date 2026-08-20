@@ -183,10 +183,10 @@ public sealed record WizardAccountConfirmation(
     int Exclusive,
     int Public,
     int Unused,
-    long PlannedTransferCount = -1,
-    long PlannedShareCount = -1,
-    long ConfirmedTransferCount = -1,
-    long ConfirmedShareCount = -1,
+    long? PlannedTransferCount = null,
+    long? PlannedShareCount = null,
+    long? ConfirmedTransferCount = null,
+    long? ConfirmedShareCount = null,
     bool ShareEnabled = true)
 {
     public override string ToString() =>

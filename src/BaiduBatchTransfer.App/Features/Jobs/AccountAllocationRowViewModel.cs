@@ -76,6 +76,15 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
 
     public void ApplyConfirmation(WizardAccountConfirmation value)
     {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.AccountId != AccountId)
+            throw new ArgumentException("账号确认结果与当前账号不匹配。", nameof(value));
+        if (value.ShareEnabled != ShareEnabled)
+            throw new ArgumentException("账号分享设置与当前草稿不匹配。", nameof(value));
+        ValidateCount(value.PlannedTransferCount, nameof(value.PlannedTransferCount));
+        ValidateCount(value.PlannedShareCount, nameof(value.PlannedShareCount));
+        ValidateCount(value.ConfirmedTransferCount, nameof(value.ConfirmedTransferCount));
+        ValidateCount(value.ConfirmedShareCount, nameof(value.ConfirmedShareCount));
         OriginalTargetSuccessCount = value.OriginalTarget;
         EffectiveTargetSuccessCount = value.EffectiveTarget;
         ReachableTargetSuccessCount = value.ReachableTarget;
@@ -85,11 +94,27 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         ExclusiveCandidateCount = value.Exclusive;
         PublicCandidateCount = value.Public;
         UnusedExclusiveCandidateCount = value.Unused;
-        if (value.PlannedTransferCount >= 0) PlannedTransferCount = value.PlannedTransferCount;
-        if (value.PlannedShareCount >= 0) PlannedShareCount = value.PlannedShareCount;
-        if (value.ConfirmedTransferCount >= 0) ConfirmedTransferCount = value.ConfirmedTransferCount;
-        if (value.ConfirmedShareCount >= 0) ConfirmedShareCount = value.ConfirmedShareCount;
-        ShareEnabled = value.ShareEnabled;
+        if (value.PlannedTransferCount is { } plannedTransfer) PlannedTransferCount = plannedTransfer;
+        if (value.PlannedShareCount is { } plannedShare) PlannedShareCount = plannedShare;
+        if (value.ConfirmedTransferCount is { } confirmedTransfer) ConfirmedTransferCount = confirmedTransfer;
+        if (value.ConfirmedShareCount is { } confirmedShare) ConfirmedShareCount = confirmedShare;
         OnPropertyChanged(string.Empty);
+    }
+
+    public void ClearConfirmation()
+    {
+        PlannedTransferCount = 0;
+        PlannedShareCount = 0;
+        ConfirmedTransferCount = 0;
+        ConfirmedShareCount = 0;
+        OnPropertyChanged(nameof(PlannedTransferCount));
+        OnPropertyChanged(nameof(PlannedShareCount));
+        OnPropertyChanged(nameof(ConfirmedTransferCount));
+        OnPropertyChanged(nameof(ConfirmedShareCount));
+    }
+
+    private static void ValidateCount(long? value, string parameterName)
+    {
+        if (value < 0) throw new ArgumentOutOfRangeException(parameterName);
     }
 }

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Domain;
@@ -51,6 +52,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private long availableFreeBytes;
     private long confirmedResourceCount;
     private long confirmedOperationCount;
+    private long transferCount;
+    private long shareCount;
+    private long totalActionCount;
+    private int resultColumnCount;
+    private ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random;
+    private string fixedExtractionCode = string.Empty;
+    private string existingSharePolicy = "Ask";
     private string precheckStatusMessage = string.Empty;
 
     public CreateJobWizardViewModel(
@@ -246,6 +254,51 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public long AvailableFreeBytes { get => availableFreeBytes; private set => SetProperty(ref availableFreeBytes, value); }
     public long ConfirmedResourceCount { get => confirmedResourceCount; private set => SetProperty(ref confirmedResourceCount, value); }
     public long ConfirmedOperationCount { get => confirmedOperationCount; private set => SetProperty(ref confirmedOperationCount, value); }
+    public long TransferCount { get => transferCount; private set => SetProperty(ref transferCount, value); }
+    public long ShareCount { get => shareCount; private set => SetProperty(ref shareCount, value); }
+    public long TotalActionCount { get => totalActionCount; private set => SetProperty(ref totalActionCount, value); }
+    public int ResultColumnCount { get => resultColumnCount; private set => SetProperty(ref resultColumnCount, value); }
+    public bool IsSharePermanent => true;
+    public bool IsShareAccessUnlimited => true;
+    public string ShareValidityText => "永久";
+    public string ShareAccessText => "不限次数";
+    public bool UsesFixedExtractionCode => extractionCodeBehavior == ShareExtractionCodeBehavior.Fixed;
+    public string ExtractionCodeBehaviorText => UsesFixedExtractionCode ? "固定提取码" : "随机提取码";
+    public ShareExtractionCodeBehavior ExtractionCodeBehavior
+    {
+        get => extractionCodeBehavior;
+        set
+        {
+            if (value is not ShareExtractionCodeBehavior.Random and not ShareExtractionCodeBehavior.Fixed)
+                throw new ArgumentOutOfRangeException(nameof(value));
+            if (!SetAndInvalidate(ref extractionCodeBehavior, value)) return;
+            OnPropertyChanged(nameof(UsesFixedExtractionCode));
+            OnPropertyChanged(nameof(ExtractionCodeBehaviorText));
+        }
+    }
+    public string FixedExtractionCode
+    {
+        get => fixedExtractionCode;
+        set => SetAndInvalidate(ref fixedExtractionCode, value ?? string.Empty);
+    }
+    public string ExistingSharePolicy
+    {
+        get => existingSharePolicy;
+        set
+        {
+            if (value is not ("Ask" or "Reuse" or "Regenerate" or "Cancel"))
+                throw new ArgumentOutOfRangeException(nameof(value));
+            if (SetAndInvalidate(ref existingSharePolicy, value))
+                OnPropertyChanged(nameof(ExistingSharePolicyText));
+        }
+    }
+    public string ExistingSharePolicyText => existingSharePolicy switch
+    {
+        "Reuse" => "复用已有分享",
+        "Regenerate" => "重新生成分享",
+        "Cancel" => "取消任务",
+        _ => "每次询问",
+    };
     public string PrecheckStatusMessage { get => precheckStatusMessage; private set => SetProperty(ref precheckStatusMessage, value); }
     public string WarningMessage => BuildWarning();
     public bool CanContinue => string.IsNullOrEmpty(EvaluateValidation());
@@ -586,13 +639,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             if (generation != draftGeneration || session != importSessionId) return;
             if (!summary.HasSufficientDiskSpace)
                 throw new StorageCapacityException(0, 0);
-            if (summary.Accounts is not null)
-                foreach (var confirmation in summary.Accounts)
-                    Accounts.FirstOrDefault(x => x.AccountId == confirmation.AccountId)?.ApplyConfirmation(confirmation);
-            RequiredFreeBytes = summary.RequiredFreeBytes;
-            AvailableFreeBytes = summary.AvailableFreeBytes;
-            ConfirmedResourceCount = summary.ResourceCount;
-            ConfirmedOperationCount = summary.OperationCount;
+            ApplyConfirmationSummary(summary);
             ConfirmationToken = summary.ConfirmationToken;
             StatusMessage = $"预览完成：{summary.ResourceCount:N0} 个资源，{summary.OperationCount:N0} 次转存操作。";
             IsFinalConfirmationChecked = false;
@@ -706,7 +753,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             DuplicatePolicy,
             UseBulkPrecheck ? "BatchPrecheck" : "Immediate",
             mode == Core.Domain.TransferMode.Replication && ExcelAccountHandling == ExcelAccountHandling.IgnoreColumn,
-            readyResourceCount);
+            readyResourceCount,
+            IsSharePermanent,
+            IsShareAccessUnlimited,
+            ExtractionCodeBehavior,
+            ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed ? FixedExtractionCode.Trim() : null,
+            ExistingSharePolicy);
     }
 
     private static void ValidateSelectionDecisions(
@@ -729,6 +781,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (transferMode is null) return "多个账号时必须选择多账号复制或多账号分流。";
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length == 0) return "请至少选择一个参与账号。";
+        if (ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
+            string.IsNullOrWhiteSpace(FixedExtractionCode))
+            return "固定提取码模式必须填写固定提取码。";
         if (string.IsNullOrWhiteSpace(JobName)) return "请输入任务名称。";
         if (string.IsNullOrWhiteSpace(DefaultTargetPath)) return "请选择默认目标目录。";
         if (UseBulkPrecheck && (PrecheckAccountId is null || Accounts.All(x => x.AccountId != PrecheckAccountId)))
@@ -791,9 +846,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         RaiseAll();
     }
 
-    private bool SetAndInvalidate<T>(ref T field, T value)
+    private bool SetAndInvalidate<T>(
+        ref T field,
+        T value,
+        [CallerMemberName] string? propertyName = null)
     {
-        if (!SetProperty(ref field, value)) return false;
+        if (!SetProperty(ref field, value, propertyName)) return false;
         InvalidateConfirmation();
         RaiseAll();
         return true;
@@ -811,13 +869,91 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         ConfirmationToken = null;
         ConfirmedResourceCount = 0;
         ConfirmedOperationCount = 0;
+        TransferCount = 0;
+        ShareCount = 0;
+        TotalActionCount = 0;
+        ResultColumnCount = 0;
         RequiredFreeBytes = 0;
         AvailableFreeBytes = 0;
+        suppressInvalidation = true;
+        try
+        {
+            foreach (var account in Accounts) account.ClearConfirmation();
+        }
+        finally
+        {
+            suppressInvalidation = false;
+        }
         draftGeneration++;
         isFinalConfirmationChecked = false;
         OnPropertyChanged(nameof(IsFinalConfirmationChecked));
         ValidationMessage = EvaluateValidation();
         RaiseDerived();
+    }
+
+    private void ApplyConfirmationSummary(WizardConfirmationSummary summary)
+    {
+        ArgumentNullException.ThrowIfNull(summary);
+        if (summary.ResourceCount < 0 || summary.OperationCount < 0 || summary.TransferCount < 0 ||
+            summary.ShareCount < 0 || summary.TotalActionCount < 0 || summary.ResultColumnCount < 0 ||
+            summary.RequiredFreeBytes < 0 || summary.AvailableFreeBytes < 0 ||
+            summary.OperationCount != summary.TransferCount ||
+            summary.TotalActionCount != checked(summary.TransferCount + summary.ShareCount))
+            throw new BatchDraftValidationException("预览汇总计数无效。");
+
+        var selected = Accounts.Where(account => account.IsSelected).ToDictionary(account => account.AccountId);
+        var confirmations = summary.Accounts?.ToArray()
+            ?? throw new BatchDraftValidationException("预览缺少账号确认快照。");
+        if (confirmations.Select(value => value.AccountId).Distinct().Count() != confirmations.Length ||
+            confirmations.Length != selected.Count ||
+            confirmations.Any(value => !selected.ContainsKey(value.AccountId)))
+            throw new BatchDraftValidationException("预览账号确认快照与当前选择不一致。");
+        if (confirmations.Any(value => selected[value.AccountId].ShareEnabled != value.ShareEnabled))
+            throw new BatchDraftValidationException("预览账号分享设置与当前草稿不一致。");
+        if (confirmations.Any(value =>
+                value.PlannedTransferCount is null or < 0 ||
+                value.PlannedShareCount is null or < 0 ||
+                value.ConfirmedTransferCount is null or < 0 ||
+                value.ConfirmedShareCount is null or < 0))
+            throw new BatchDraftValidationException("预览账号工作量无效。");
+        try
+        {
+            var plannedTransfers = confirmations.Sum(value => value.PlannedTransferCount.GetValueOrDefault());
+            var plannedShares = confirmations.Sum(value => value.PlannedShareCount.GetValueOrDefault());
+            var confirmedTransfers = confirmations.Sum(value => value.ConfirmedTransferCount.GetValueOrDefault());
+            var confirmedShares = confirmations.Sum(value => value.ConfirmedShareCount.GetValueOrDefault());
+            if (plannedTransfers != summary.TransferCount || confirmedTransfers != summary.TransferCount ||
+                plannedShares != summary.ShareCount || confirmedShares != summary.ShareCount ||
+                confirmations.Any(value =>
+                    value.PlannedShareCount > value.PlannedTransferCount ||
+                    value.ConfirmedShareCount > value.ConfirmedTransferCount ||
+                    (!value.ShareEnabled &&
+                        (value.PlannedShareCount != 0 || value.ConfirmedShareCount != 0))))
+                throw new BatchDraftValidationException("预览账号工作量与汇总不一致。");
+        }
+        catch (OverflowException)
+        {
+            throw new BatchDraftValidationException("预览账号工作量超出支持范围。");
+        }
+
+        suppressInvalidation = true;
+        try
+        {
+            foreach (var confirmation in confirmations)
+                selected[confirmation.AccountId].ApplyConfirmation(confirmation);
+            RequiredFreeBytes = summary.RequiredFreeBytes;
+            AvailableFreeBytes = summary.AvailableFreeBytes;
+            ConfirmedResourceCount = summary.ResourceCount;
+            ConfirmedOperationCount = summary.OperationCount;
+            TransferCount = summary.TransferCount;
+            ShareCount = summary.ShareCount;
+            TotalActionCount = summary.TotalActionCount;
+            ResultColumnCount = summary.ResultColumnCount;
+        }
+        finally
+        {
+            suppressInvalidation = false;
+        }
     }
 
     private void RaiseAll()

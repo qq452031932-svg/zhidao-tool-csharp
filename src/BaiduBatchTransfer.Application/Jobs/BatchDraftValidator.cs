@@ -1,6 +1,4 @@
 using System.Collections.Immutable;
-using System.Security.Cryptography;
-using System.Text;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Core.Services;
@@ -11,6 +9,16 @@ public sealed class BatchDraftValidator
 {
     private const int ReadPageSize = 1_000;
     private readonly BaiduPathNormalizer pathNormalizer = new();
+    private readonly BatchDraftValidationComplexityObserver? complexityObserver;
+
+    public BatchDraftValidator()
+    {
+    }
+
+    internal BatchDraftValidator(BatchDraftValidationComplexityObserver complexityObserver)
+    {
+        this.complexityObserver = complexityObserver ?? throw new ArgumentNullException(nameof(complexityObserver));
+    }
 
     internal async Task<ValidatedBatchDraft> ValidateAsync(
         BatchDraft draft,
@@ -46,9 +54,13 @@ public sealed class BatchDraftValidator
             draft.TransferMode == TransferMode.Distribution && draft.QuotaBasis == QuotaBasis.TaskCount
                 ? account.TargetItemCount
                 : account.TargetSuccessCount)).ToArray();
-        var mappedCounts = rows.Where(row => row.ConstraintAccountId.HasValue)
-            .GroupBy(row => row.ConstraintAccountId!.Value)
-            .ToDictionary(group => group.Key, group => (long)group.Count());
+        var mappedCounts = new Dictionary<Guid, long>();
+        foreach (var row in rows)
+        {
+            complexityObserver?.RecordConstraintRowVisit();
+            if (row.ConstraintAccountId is not { } accountId) continue;
+            mappedCounts[accountId] = checked(mappedCounts.GetValueOrDefault(accountId) + 1L);
+        }
         var workload = new BatchWorkloadPlanner().Plan(rows.Length, draft.TransferMode, workloadInputs, mappedCounts);
         var outputLayout = new ResultColumnLayoutBuilder().Build(
             columnDefinitions.OrderBy(column => column.ColumnOrdinal)
@@ -62,7 +74,7 @@ public sealed class BatchDraftValidator
                 throw new BatchDraftValidationException("The task quota total must equal the included resource count.");
             foreach (var account in accounts)
             {
-                var locked = rows.Count(row => row.ConstraintAccountId == account.Draft.AccountId);
+                var locked = ConstraintCount(mappedCounts, account.Draft.AccountId);
                 if (locked > account.Draft.TargetItemCount)
                     throw new BatchDraftValidationException("A locked assignment count exceeds its confirmed account quota.");
             }
@@ -102,7 +114,7 @@ public sealed class BatchDraftValidator
         var confirmationWorkloads = workload.Accounts.ToDictionary(account => account.AccountId);
         var confirmations = accounts.Select(account =>
         {
-            var constraintCount = rows.Count(row => row.ConstraintAccountId == account.Draft.AccountId);
+            var constraintCount = ConstraintCount(mappedCounts, account.Draft.AccountId);
             var replicationTarget = draft.TransferMode == TransferMode.Replication ? rows.Length : (int?)null;
             var planned = confirmationWorkloads[account.Draft.AccountId];
             return new BatchAccountConfirmation(
@@ -139,6 +151,12 @@ public sealed class BatchDraftValidator
             outputLayout,
             BatchConfirmationTokens.ForCreate(
                 draft, session, rows, operationCount, confirmations, rules, columnDefinitions, outputLayout));
+    }
+
+    private int ConstraintCount(IReadOnlyDictionary<Guid, long> mappedCounts, Guid accountId)
+    {
+        complexityObserver?.RecordConstraintAccountLookup();
+        return checked((int)mappedCounts.GetValueOrDefault(accountId));
     }
 
     internal static async Task ValidateSessionCountersAsync(
@@ -253,7 +271,12 @@ public sealed class BatchDraftValidator
             account.Record.IsEnabled,
             account.Record.IsDeleted,
             account.Record.Status == "Active")).ToArray();
-        var ruleResolver = new AccountRuleResolver();
+        PreparedAccountRuleResolver? ruleResolver = null;
+        if (draft.TransferMode == TransferMode.Distribution)
+        {
+            complexityObserver?.RecordRuleResolverPreparation(resolverAccounts.Length);
+            ruleResolver = new AccountRuleResolver().Prepare(rules, resolverAccounts);
+        }
         var after = 0;
         var readyRowsSeen = 0;
         while (true)
@@ -279,9 +302,16 @@ public sealed class BatchDraftValidator
                 if (draft.TransferMode == TransferMode.Replication && row.MappedAccountId is not null && !draft.IgnoreMappedAccountsForReplication)
                     throw new BatchDraftValidationException("Replication requires explicit confirmation to ignore row-level account mappings.");
                 var normalizedTarget = row.TargetPath is null ? null : NormalizePath(row.TargetPath);
-                var resolution = draft.TransferMode == TransferMode.Distribution
-                    ? ruleResolver.Resolve(row.MappedAccountId, row.TargetPath ?? draft.DefaultTargetPath, rules, resolverAccounts)
-                    : new AccountRuleResolution(null, AccountRuleResolutionReason.Public, null, null);
+                AccountRuleResolution resolution;
+                if (ruleResolver is not null)
+                {
+                    complexityObserver?.RecordRuleResolution();
+                    resolution = ruleResolver.Resolve(row.MappedAccountId, row.TargetPath ?? draft.DefaultTargetPath);
+                }
+                else
+                {
+                    resolution = new AccountRuleResolution(null, AccountRuleResolutionReason.Public, null, null);
+                }
                 builder.Add(new ValidatedStagedRow(
                     row,
                     normalizedTarget,
@@ -302,6 +332,24 @@ public sealed class BatchDraftValidator
         try { return pathNormalizer.Normalize(value).ComparisonValue; }
         catch (ArgumentException) { throw new BatchDraftValidationException("A confirmed target path is invalid."); }
     }
+}
+
+internal sealed class BatchDraftValidationComplexityObserver
+{
+    public long ConstraintRowVisits { get; private set; }
+    public long ConstraintAccountLookups { get; private set; }
+    public long RuleResolverPreparationCount { get; private set; }
+    public long RuleResolverAccountPreparations { get; private set; }
+    public long RuleResolutionCalls { get; private set; }
+
+    internal void RecordConstraintRowVisit() => ConstraintRowVisits++;
+    internal void RecordConstraintAccountLookup() => ConstraintAccountLookups++;
+    internal void RecordRuleResolverPreparation(int accountCount)
+    {
+        RuleResolverPreparationCount++;
+        RuleResolverAccountPreparations = checked(RuleResolverAccountPreparations + accountCount);
+    }
+    internal void RecordRuleResolution() => RuleResolutionCalls++;
 }
 
 internal sealed record ValidatedBatchAccount(
@@ -336,31 +384,39 @@ internal static class BatchConfirmationTokens
         IEnumerable<BatchAccountConfirmation> accounts,
         IEnumerable<AccountRule> rules,
         IEnumerable<ImportColumnDefinitionRecord> columnDefinitions,
-        ResultColumnLayout outputLayout) =>
-        Hash(string.Join('|', new[]
-        {
-            "create-vNext", draft.BatchJobId.ToString("N"), session.Id.ToString("N"), session.UpdatedAt.ToString("O"),
-            draft.TransferMode.ToString(), draft.QuotaBasis.ToString(), draft.ShortagePolicy.ToString(),
-            Hash(draft.Name), Hash(draft.DefaultTargetPath), draft.FolderCreationMode,
-            draft.DuplicatePolicy.ToString(), draft.ValidationMode,
-            draft.QueueOrder.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            draft.IgnoreMappedAccountsForReplication.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            draft.IsSharePermanent.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            draft.IsShareAccessUnlimited.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            draft.ExtractionCodeBehavior.ToString(),
-            Hash(draft.FixedExtractionCode ?? string.Empty),
-            draft.ExistingSharePolicy,
-            draft.ShareSettingsFingerprint,
-            session.ColumnMappingFingerprint ?? string.Empty,
-            HashAccountSelections(draft.Accounts),
-            rows.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            operationCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            HashRows(rows),
-            string.Join(';', accounts.Select(account => $"{account.AccountId:N}:{account.PriorityOrder}:{account.TargetItemCount}:{account.TargetSuccessCount}:{account.ShareEnabled}:{account.PlannedTransferCount}:{account.PlannedShareCount}:{account.OutputOrdinal}:{Hash(account.OutputLabel ?? string.Empty)}:{Hash(account.NormalizedDefaultTargetPath)}")),
-            HashRules(rules),
-            HashColumnDefinitions(columnDefinitions),
-            outputLayout.Fingerprint,
-        }));
+        ResultColumnLayout outputLayout)
+    {
+        using var writer = new CanonicalHashWriter("batch-confirmation/create-vNext");
+        writer.WriteGuid("batch-job-id", draft.BatchJobId);
+        writer.WriteGuid("session-id", session.Id);
+        writer.WriteDateTimeOffset("session-updated-at", session.UpdatedAt);
+        writer.WriteInt32("transfer-mode", (int)draft.TransferMode);
+        writer.WriteInt32("quota-basis", (int)draft.QuotaBasis);
+        writer.WriteInt32("shortage-policy", (int)draft.ShortagePolicy);
+        writer.WriteString("batch-name", draft.Name);
+        writer.WriteString("default-target-path", draft.DefaultTargetPath);
+        writer.WriteString("folder-creation-mode", draft.FolderCreationMode);
+        writer.WriteInt32("duplicate-policy", (int)draft.DuplicatePolicy);
+        writer.WriteString("validation-mode", draft.ValidationMode);
+        writer.WriteInt64("queue-order", draft.QueueOrder);
+        writer.WriteBoolean("ignore-mapped-accounts-for-replication", draft.IgnoreMappedAccountsForReplication);
+        writer.WriteBoolean("share-permanent", draft.IsSharePermanent);
+        writer.WriteBoolean("share-access-unlimited", draft.IsShareAccessUnlimited);
+        writer.WriteInt32("extraction-code-behavior", (int)draft.ExtractionCodeBehavior);
+        writer.WriteString("fixed-extraction-code", draft.FixedExtractionCode);
+        writer.WriteString("existing-share-policy", draft.ExistingSharePolicy);
+        writer.WriteString("share-settings-fingerprint", draft.ShareSettingsFingerprint);
+        writer.WriteString("column-mapping-fingerprint", session.ColumnMappingFingerprint);
+        WriteAccountSelections(writer, draft.Accounts);
+        writer.WriteInt32("row-count", rows.Count);
+        writer.WriteInt64("operation-count", operationCount);
+        WriteRows(writer, rows);
+        WriteCreateConfirmations(writer, accounts);
+        WriteRules(writer, rules);
+        WriteColumnDefinitions(writer, columnDefinitions);
+        WriteOutputLayout(writer, outputLayout);
+        return writer.GetHashHex();
+    }
 
     public static string ForAppend(
         AppendCandidatesDraft draft,
@@ -368,92 +424,166 @@ internal static class BatchConfirmationTokens
         BatchJobRecord batch,
         IReadOnlyList<ValidatedStagedRow> rows,
         IReadOnlyList<BatchAccountConfirmation> accounts,
-        long operationCount) =>
-        Hash(string.Join('|', new[]
-        {
-            "append-v1", draft.BatchJobId.ToString("N"), draft.ImportSessionId.ToString("N"),
-            session.UpdatedAt.ToString("O"), Hash(batch.Name), batch.SourceType, batch.TransferMode,
-            batch.QuotaBasis, batch.ShortagePolicy, batch.ResourceCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            batch.OperationCount.ToString(System.Globalization.CultureInfo.InvariantCulture), Hash(batch.DefaultTargetPath),
-            batch.FolderCreationMode, batch.DuplicatePolicy, batch.ValidationMode, batch.Status,
-            batch.QueueOrder.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            rows.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            operationCount.ToString(System.Globalization.CultureInfo.InvariantCulture), HashRows(rows),
-            string.Join(';', accounts.Select(account =>
-                $"{account.AccountId:N}:{account.PriorityOrder}:{account.TargetItemCount}:{account.TargetSuccessCount}:{account.EffectiveTargetSuccessCount}:{account.FulfilledCount}:{account.ReservedSlotCount}:{account.LockedItemCount}:{account.ExclusiveCandidateCount}:{account.UnusedCandidateCount}:{account.NewExclusiveCandidateCount}:{account.ReachableTargetSuccessCount}:{Hash(account.NormalizedDefaultTargetPath)}")),
-        }));
-
-    private static string HashRows(IEnumerable<ValidatedStagedRow> rows)
+        long operationCount)
     {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var writer = new CanonicalHashWriter("batch-confirmation/append-v1");
+        writer.WriteGuid("batch-job-id", draft.BatchJobId);
+        writer.WriteGuid("import-session-id", draft.ImportSessionId);
+        writer.WriteDateTimeOffset("session-updated-at", session.UpdatedAt);
+        writer.WriteString("batch-name", batch.Name);
+        writer.WriteString("source-type", batch.SourceType);
+        writer.WriteString("transfer-mode", batch.TransferMode);
+        writer.WriteString("quota-basis", batch.QuotaBasis);
+        writer.WriteString("shortage-policy", batch.ShortagePolicy);
+        writer.WriteInt32("resource-count", batch.ResourceCount);
+        writer.WriteInt32("stored-operation-count", batch.OperationCount);
+        writer.WriteString("default-target-path", batch.DefaultTargetPath);
+        writer.WriteString("folder-creation-mode", batch.FolderCreationMode);
+        writer.WriteString("duplicate-policy", batch.DuplicatePolicy);
+        writer.WriteString("validation-mode", batch.ValidationMode);
+        writer.WriteString("status", batch.Status);
+        writer.WriteInt64("queue-order", batch.QueueOrder);
+        writer.WriteInt32("row-count", rows.Count);
+        writer.WriteInt64("operation-count", operationCount);
+        WriteRows(writer, rows);
+        WriteAppendConfirmations(writer, accounts);
+        return writer.GetHashHex();
+    }
+
+    private static void WriteRows(CanonicalHashWriter writer, IReadOnlyList<ValidatedStagedRow> rows)
+    {
+        writer.BeginCollection("rows", rows.Count);
         foreach (var item in rows)
         {
-            Append(hash, item.Row.Id.ToString("N"));
-            Append(hash, item.Row.SourceRowNumber.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, item.Row.ShareUrl);
-            Append(hash, item.Row.NormalizedShareId);
-            Append(hash, item.Row.ExtractionCode);
-            Append(hash, item.Row.TargetPath);
-            Append(hash, item.Row.CreateFolderName);
-            Append(hash, item.Row.MappedAccountId?.ToString("N"));
-            Append(hash, item.ConstraintAccountId?.ToString("N"));
-            Append(hash, item.ConstraintReason.ToString());
-            Append(hash, item.MatchedRuleId?.ToString("N"));
-            Append(hash, item.Row.Note);
-            Append(hash, item.Row.PrecheckStatus);
-            Append(hash, item.Row.PrecheckErrorCode);
+            writer.BeginObject("row", 14);
+            writer.WriteGuid("id", item.Row.Id);
+            writer.WriteInt64("source-row-number", item.Row.SourceRowNumber);
+            writer.WriteString("share-url", item.Row.ShareUrl);
+            writer.WriteString("normalized-share-id", item.Row.NormalizedShareId);
+            writer.WriteString("extraction-code", item.Row.ExtractionCode);
+            writer.WriteString("target-path", item.Row.TargetPath);
+            writer.WriteString("create-folder-name", item.Row.CreateFolderName);
+            writer.WriteNullableGuid("mapped-account-id", item.Row.MappedAccountId);
+            writer.WriteNullableGuid("constraint-account-id", item.ConstraintAccountId);
+            writer.WriteInt32("constraint-reason", (int)item.ConstraintReason);
+            writer.WriteNullableGuid("matched-rule-id", item.MatchedRuleId);
+            writer.WriteString("note", item.Row.Note);
+            writer.WriteString("precheck-status", item.Row.PrecheckStatus);
+            writer.WriteString("precheck-error-code", item.Row.PrecheckErrorCode);
         }
-        return Convert.ToHexString(hash.GetHashAndReset());
     }
 
-    private static string HashRules(IEnumerable<AccountRule> rules)
+    private static void WriteRules(CanonicalHashWriter writer, IEnumerable<AccountRule> rules)
     {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        foreach (var rule in rules.OrderBy(rule => rule.AccountId).ThenBy(rule => rule.Id))
+        var ordered = rules.OrderBy(rule => rule.AccountId).ThenBy(rule => rule.Id).ToArray();
+        writer.BeginCollection("rules", ordered.Length);
+        foreach (var rule in ordered)
         {
-            Append(hash, rule.Id.ToString("N"));
-            Append(hash, rule.AccountId.ToString("N"));
-            Append(hash, rule.DirectoryPrefix);
-            Append(hash, rule.Priority.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, rule.IsEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            writer.BeginObject("rule", 5);
+            writer.WriteGuid("id", rule.Id);
+            writer.WriteGuid("account-id", rule.AccountId);
+            writer.WriteString("directory-prefix", rule.DirectoryPrefix);
+            writer.WriteInt32("priority", rule.Priority);
+            writer.WriteBoolean("enabled", rule.IsEnabled);
         }
-        return Convert.ToHexString(hash.GetHashAndReset());
     }
 
-    private static string HashColumnDefinitions(IEnumerable<ImportColumnDefinitionRecord> definitions)
+    private static void WriteColumnDefinitions(
+        CanonicalHashWriter writer,
+        IEnumerable<ImportColumnDefinitionRecord> definitions)
     {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        foreach (var definition in definitions.OrderBy(value => value.ColumnOrdinal))
+        var ordered = definitions.OrderBy(value => value.ColumnOrdinal).ToArray();
+        writer.BeginCollection("column-definitions", ordered.Length);
+        foreach (var definition in ordered)
         {
-            Append(hash, definition.ColumnOrdinal.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, definition.SourceHeader);
-            Append(hash, definition.MappedRole);
-            Append(hash, definition.IsRequired.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            writer.BeginObject("column-definition", 4);
+            writer.WriteInt32("ordinal", definition.ColumnOrdinal);
+            writer.WriteString("source-header", definition.SourceHeader);
+            writer.WriteString("mapped-role", definition.MappedRole);
+            writer.WriteBoolean("required", definition.IsRequired);
         }
-        return Convert.ToHexString(hash.GetHashAndReset());
     }
 
-    private static string HashAccountSelections(IEnumerable<BatchAccountDraft> accounts)
+    private static void WriteAccountSelections(CanonicalHashWriter writer, IEnumerable<BatchAccountDraft> accounts)
     {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        foreach (var account in accounts.OrderBy(value => value.PriorityOrder))
+        var ordered = accounts.OrderBy(value => value.PriorityOrder).ToArray();
+        writer.BeginCollection("account-selections", ordered.Length);
+        foreach (var account in ordered)
         {
-            Append(hash, account.AccountId.ToString("N"));
-            Append(hash, account.PriorityOrder.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, account.SelectionDecision.ToString());
-            Append(hash, account.TargetItemCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, account.TargetSuccessCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, account.ShareEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            Append(hash, Hash(account.DefaultTargetPath));
+            writer.BeginObject("account-selection", 7);
+            writer.WriteGuid("account-id", account.AccountId);
+            writer.WriteInt32("priority-order", account.PriorityOrder);
+            writer.WriteInt32("selection-decision", (int)account.SelectionDecision);
+            writer.WriteInt32("target-item-count", account.TargetItemCount);
+            writer.WriteInt32("target-success-count", account.TargetSuccessCount);
+            writer.WriteBoolean("share-enabled", account.ShareEnabled);
+            writer.WriteString("default-target-path", account.DefaultTargetPath);
         }
-        return Convert.ToHexString(hash.GetHashAndReset());
     }
 
-    private static void Append(IncrementalHash hash, string? value)
+    private static void WriteCreateConfirmations(
+        CanonicalHashWriter writer,
+        IEnumerable<BatchAccountConfirmation> accounts)
     {
-        hash.AppendData(Encoding.UTF8.GetBytes(value ?? string.Empty));
-        hash.AppendData([0]);
+        var ordered = accounts.ToArray();
+        writer.BeginCollection("account-confirmations", ordered.Length);
+        foreach (var account in ordered)
+        {
+            writer.BeginObject("account-confirmation", 10);
+            writer.WriteGuid("account-id", account.AccountId);
+            writer.WriteInt32("priority-order", account.PriorityOrder);
+            writer.WriteInt32("target-item-count", account.TargetItemCount);
+            writer.WriteInt32("target-success-count", account.TargetSuccessCount);
+            writer.WriteBoolean("share-enabled", account.ShareEnabled);
+            writer.WriteInt64("planned-transfer-count", account.PlannedTransferCount);
+            writer.WriteInt64("planned-share-count", account.PlannedShareCount);
+            writer.WriteInt32("output-ordinal", account.OutputOrdinal);
+            writer.WriteString("output-label", account.OutputLabel);
+            writer.WriteString("normalized-default-target-path", account.NormalizedDefaultTargetPath);
+        }
     }
 
-    private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+    private static void WriteAppendConfirmations(
+        CanonicalHashWriter writer,
+        IReadOnlyList<BatchAccountConfirmation> accounts)
+    {
+        writer.BeginCollection("account-confirmations", accounts.Count);
+        foreach (var account in accounts)
+        {
+            writer.BeginObject("account-confirmation", 13);
+            writer.WriteGuid("account-id", account.AccountId);
+            writer.WriteInt32("priority-order", account.PriorityOrder);
+            writer.WriteInt32("target-item-count", account.TargetItemCount);
+            writer.WriteInt32("target-success-count", account.TargetSuccessCount);
+            writer.WriteInt32("effective-target-success-count", account.EffectiveTargetSuccessCount);
+            writer.WriteInt32("fulfilled-count", account.FulfilledCount);
+            writer.WriteInt32("reserved-slot-count", account.ReservedSlotCount);
+            writer.WriteInt32("locked-item-count", account.LockedItemCount);
+            writer.WriteInt32("exclusive-candidate-count", account.ExclusiveCandidateCount);
+            writer.WriteInt32("unused-candidate-count", account.UnusedCandidateCount);
+            writer.WriteInt32("new-exclusive-candidate-count", account.NewExclusiveCandidateCount);
+            writer.WriteInt32("reachable-target-success-count", account.ReachableTargetSuccessCount);
+            writer.WriteString("normalized-default-target-path", account.NormalizedDefaultTargetPath);
+        }
+    }
+
+    private static void WriteOutputLayout(CanonicalHashWriter writer, ResultColumnLayout layout)
+    {
+        writer.WriteString("output-layout-fingerprint", layout.Fingerprint);
+        writer.BeginCollection("output-source-headers", layout.SourceHeaders.Length);
+        foreach (var header in layout.SourceHeaders) writer.WriteString("source-header", header);
+        writer.WriteString("resolved-title-header", layout.ResolvedTitleHeader);
+        writer.WriteString("original-share-url-header", layout.OriginalShareUrlHeader);
+        writer.BeginCollection("output-accounts", layout.Accounts.Length);
+        foreach (var account in layout.Accounts)
+        {
+            writer.BeginObject("output-account", 6);
+            writer.WriteGuid("account-id", account.AccountId);
+            writer.WriteInt32("output-ordinal", account.OutputOrdinal);
+            writer.WriteString("output-label", account.OutputLabel);
+            writer.WriteString("share-url-header", account.ShareUrlHeader);
+            writer.WriteString("extraction-code-header", account.ExtractionCodeHeader);
+            writer.WriteString("share-status-header", account.ShareStatusHeader);
+        }
+    }
 }

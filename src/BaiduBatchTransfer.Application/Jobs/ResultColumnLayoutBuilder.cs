@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Globalization;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -86,16 +85,23 @@ public sealed partial class ResultColumnLayoutBuilder
                 UniqueSystemHeader($"转存结果_{label}_分享状态", used)));
         }
 
-        var canonical = string.Join('\n', headers.Append(resolved).Append(original)
-            .Concat(output.SelectMany(account => new[]
-            {
-                account.OutputOrdinal.ToString(CultureInfo.InvariantCulture),
-                account.OutputLabel,
-                account.ShareUrlHeader,
-                account.ExtractionCodeHeader,
-                account.ShareStatusHeader,
-            })));
-        var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
+        using var canonical = new CanonicalHashWriter("result-column-layout-v1");
+        canonical.BeginCollection("source-headers", sourceHeaders.Count);
+        foreach (var header in sourceHeaders) canonical.WriteString("source-header", header);
+        canonical.WriteString("resolved-title-header", resolved);
+        canonical.WriteString("original-share-url-header", original);
+        canonical.BeginCollection("accounts", output.Count);
+        foreach (var account in output)
+        {
+            canonical.BeginObject("account", 6);
+            canonical.WriteGuid("account-id", account.AccountId);
+            canonical.WriteInt32("output-ordinal", account.OutputOrdinal);
+            canonical.WriteString("output-label", account.OutputLabel);
+            canonical.WriteString("share-url-header", account.ShareUrlHeader);
+            canonical.WriteString("extraction-code-header", account.ExtractionCodeHeader);
+            canonical.WriteString("share-status-header", account.ShareStatusHeader);
+        }
+        var fingerprint = canonical.GetHashHex();
         return new(headers, resolved, original, output, fingerprint);
     }
 

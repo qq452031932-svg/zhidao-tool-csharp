@@ -12,38 +12,32 @@ public sealed class AccountRuleResolver
         IEnumerable<AccountRule> rules,
         IEnumerable<AccountRuleAccount> confirmedAccounts)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        return Prepare(rules, confirmedAccounts).Resolve(explicitRowAccountId, candidatePath);
+    }
+
+    public PreparedAccountRuleResolver Prepare(
+        IEnumerable<AccountRule> rules,
+        IEnumerable<AccountRuleAccount> confirmedAccounts)
+    {
         ArgumentNullException.ThrowIfNull(rules);
         ArgumentNullException.ThrowIfNull(confirmedAccounts);
-
         var accounts = confirmedAccounts.ToDictionary(account => account.AccountId);
-        if (explicitRowAccountId is { } explicitId && IsEligible(explicitId, accounts))
-        {
-            return new AccountRuleResolution(
-                explicitId,
-                AccountRuleResolutionReason.ExplicitRowAccount,
-                null,
-                null);
-        }
-
-        var normalizedCandidatePath = _pathNormalizer.Normalize(candidatePath).ComparisonValue;
-        var match = rules
+        var eligibleAccountIds = accounts.Values
+            .Where(account => account.IsEnabled && !account.IsDeleted && account.IsHealthy)
+            .Select(account => account.AccountId)
+            .ToHashSet();
+        var ruleSnapshot = rules.ToArray();
+        return new PreparedAccountRuleResolver(eligibleAccountIds, () => ruleSnapshot
             .Where(rule => rule.IsEnabled && IsEligible(rule.AccountId, accounts))
             .Select(rule => new NormalizedRule(rule, _pathNormalizer.Normalize(rule.DirectoryPrefix).ComparisonValue))
-            .Where(rule => IsDirectoryPrefix(rule.NormalizedPrefix, normalizedCandidatePath))
-            .OrderByDescending(rule => rule.NormalizedPrefix.Length)
-            .ThenBy(rule => rule.Rule.Priority)
-            .ThenBy(rule => accounts[rule.Rule.AccountId].ConfirmedOrder)
-            .ThenBy(rule => rule.Rule.Id)
-            .FirstOrDefault();
-
-        return match is null
-            ? new AccountRuleResolution(null, AccountRuleResolutionReason.Public, null, null)
-            : new AccountRuleResolution(
-                match.Rule.AccountId,
-                AccountRuleResolutionReason.DirectoryBinding,
-                match.Rule.Id,
-                match.NormalizedPrefix);
+            .GroupBy(rule => rule.NormalizedPrefix, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderBy(rule => rule.Rule.Priority)
+                    .ThenBy(rule => accounts[rule.Rule.AccountId].ConfirmedOrder)
+                    .ThenBy(rule => rule.Rule.Id)
+                    .First().Rule,
+                StringComparer.Ordinal));
     }
 
     private static bool IsEligible(
@@ -54,12 +48,51 @@ public sealed class AccountRuleResolver
         !account.IsDeleted &&
         account.IsHealthy;
 
-    private static bool IsDirectoryPrefix(string prefix, string path) =>
-        prefix == "/" ||
-        path.Equals(prefix, StringComparison.Ordinal) ||
-        path.StartsWith($"{prefix}/", StringComparison.Ordinal);
-
     private sealed record NormalizedRule(AccountRule Rule, string NormalizedPrefix);
+}
+
+public sealed class PreparedAccountRuleResolver
+{
+    private readonly HashSet<Guid> eligibleAccountIds;
+    private readonly Lazy<IReadOnlyDictionary<string, AccountRule>> rulesByPrefix;
+    private readonly BaiduPathNormalizer pathNormalizer = new();
+
+    internal PreparedAccountRuleResolver(
+        HashSet<Guid> eligibleAccountIds,
+        Func<IReadOnlyDictionary<string, AccountRule>> rulesFactory)
+    {
+        this.eligibleAccountIds = eligibleAccountIds;
+        rulesByPrefix = new Lazy<IReadOnlyDictionary<string, AccountRule>>(
+            rulesFactory ?? throw new ArgumentNullException(nameof(rulesFactory)),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+    }
+
+    public AccountRuleResolution Resolve(Guid? explicitRowAccountId, string candidatePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(candidatePath);
+        if (explicitRowAccountId is { } explicitId && eligibleAccountIds.Contains(explicitId))
+            return new AccountRuleResolution(
+                explicitId,
+                AccountRuleResolutionReason.ExplicitRowAccount,
+                null,
+                null);
+
+        var prefix = pathNormalizer.Normalize(candidatePath).ComparisonValue;
+        while (true)
+        {
+            if (rulesByPrefix.Value.TryGetValue(prefix, out var rule))
+                return new AccountRuleResolution(
+                    rule.AccountId,
+                    AccountRuleResolutionReason.DirectoryBinding,
+                    rule.Id,
+                    prefix);
+            if (prefix == "/") break;
+            var separator = prefix.LastIndexOf('/');
+            prefix = separator <= 0 ? "/" : prefix[..separator];
+        }
+
+        return new AccountRuleResolution(null, AccountRuleResolutionReason.Public, null, null);
+    }
 }
 
 public sealed record AccountRuleAccount

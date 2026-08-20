@@ -105,6 +105,40 @@ public sealed class AccountRuleResolverTests
         Assert.Null(result.CandidateConstraintAccountId);
     }
 
+    [Fact]
+    public void PreparedResolverSnapshotsAccountsAndRulesForRepeatedLookups()
+    {
+        var account = Id(1);
+        var accounts = new List<AccountRuleAccount> { Account(account, 0) };
+        var rules = new List<AccountRule> { Rule(1, "/team", account, 0) };
+        var prepared = new AccountRuleResolver().Prepare(rules, accounts);
+        accounts.Clear();
+        rules.Clear();
+
+        var first = prepared.Resolve(null, "/team/one");
+        var second = prepared.Resolve(null, "/team/two");
+
+        Assert.Equal(account, first.CandidateConstraintAccountId);
+        Assert.Equal(account, second.CandidateConstraintAccountId);
+        Assert.Equal(Id(1), first.MatchedRuleId);
+        Assert.Equal("/team", first.MatchedNormalizedPrefix);
+    }
+
+    [Fact]
+    public void PreparedResolverKeepsExplicitAccountPrecedenceOverUnrelatedMalformedRule()
+    {
+        var account = Id(1);
+        var prepared = new AccountRuleResolver().Prepare(
+            [Rule(1, "/invalid/../rule", account, 0)],
+            [Account(account, 0)]);
+
+        var explicitResult = prepared.Resolve(account, "/team/item");
+
+        Assert.Equal(account, explicitResult.CandidateConstraintAccountId);
+        Assert.Equal(AccountRuleResolutionReason.ExplicitRowAccount, explicitResult.Reason);
+        Assert.Throws<ArgumentException>(() => prepared.Resolve(null, "/team/item"));
+    }
+
     private static AccountRule Rule(int id, string prefix, Guid accountId, int priority, bool enabled = true) =>
         new(Id(id), prefix, accountId, priority, enabled);
 

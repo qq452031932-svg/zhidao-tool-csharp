@@ -2,10 +2,12 @@ using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
+using System.Diagnostics;
+using Xunit.Abstractions;
 
 namespace BaiduBatchTransfer.Application.Tests.Jobs;
 
-public sealed class CreateBatchServiceTests
+public sealed class CreateBatchServiceTests(ITestOutputHelper output)
 {
     [Fact]
     public async Task MissingSelectionRejectsBeforeOpeningUnitOfWork()
@@ -116,6 +118,48 @@ public sealed class CreateBatchServiceTests
     }
 
     [Fact]
+    public async Task PreviewCountsMixedMappingsLinearlyForTwoHundredThousandRowsAndOneThousandAccounts()
+    {
+        const int rowCount = 200_000;
+        const int accountCount = 1_000;
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountIds = Enumerable.Range(0, accountCount).Select(_ => Guid.NewGuid()).ToArray();
+        var rows = Enumerable.Range(1, rowCount).Select(row => BatchTestData.ReadyRow(
+            sessionId,
+            row,
+            mappedAccountId: row <= rowCount / 2 ? accountIds[(row - 1) % accountCount] : null));
+        await database.SeedAsync(
+            accountIds.Select((id, index) => BatchTestData.Account(id, index.ToString())),
+            BatchTestData.ReadySession(sessionId, rowCount, rowCount),
+            rows);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            accountIds.Select((id, index) => new BatchAccountDraft(
+                id, index, $"/账号{index}", rowCount / accountCount, 0,
+                BatchAccountSelectionDecision.Selected, shareEnabled: index % 2 == 0)).ToArray());
+        var observer = new BatchDraftValidationComplexityObserver();
+        var service = new CreateBatchService(
+            database.UnitOfWorkFactory,
+            new BatchDraftValidator(observer),
+            new ReplicationPreflightEstimator(
+                new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue),
+                database.DatabasePath));
+        var stopwatch = Stopwatch.StartNew();
+
+        var preview = await service.PreviewAsync(draft);
+
+        stopwatch.Stop();
+        output.WriteLine($"200k/1000 preview diagnostic: {stopwatch.Elapsed}.");
+        Assert.Equal(rowCount, preview.TransferCount);
+        Assert.Equal(rowCount / 2, preview.ShareCount);
+        Assert.Equal(rowCount, observer.ConstraintRowVisits);
+        Assert.InRange(observer.ConstraintAccountLookups, accountCount, accountCount * 2L);
+        Assert.Equal(1, observer.RuleResolverPreparationCount);
+        Assert.Equal(accountCount, observer.RuleResolverAccountPreparations);
+        Assert.Equal(rowCount, observer.RuleResolutionCalls);
+    }
+
+    [Fact]
     public void WorkloadPlannerDistributesAndReplicatesWithoutUsingLoggedAccountCount()
     {
         var accounts = new[]
@@ -195,6 +239,24 @@ public sealed class CreateBatchServiceTests
         Assert.Equal("转存结果_解析后标题（系统2）", collision.ResolvedTitleHeader);
         Assert.Equal("转存结果_原分享链接（系统2）", collision.OriginalShareUrlHeader);
         Assert.Equal(["同名（1）", "同名（2）"], collision.Accounts.Select(x => x.OutputLabel));
+    }
+
+    [Fact]
+    public void ResultLayoutFingerprintPreservesHeaderCollectionBoundariesAndUnusualUnicode()
+    {
+        var builder = new ResultColumnLayoutBuilder();
+        var account = new[] { WorkloadAccount(0, 1) };
+
+        var single = builder.Build(["a\nb", "😀\0𠀀"], account);
+        var split = builder.Build(["a", "b", "😀\0𠀀"], account);
+        var replay = builder.Build(["a\nb", "😀\0𠀀"], account);
+        var nullHeader = builder.Build([null], account);
+        var emptyHeader = builder.Build([string.Empty], account);
+
+        Assert.NotEqual(single.Fingerprint, split.Fingerprint);
+        Assert.Equal(single.Fingerprint, replay.Fingerprint);
+        Assert.NotEqual(nullHeader.Fingerprint, emptyHeader.Fingerprint);
+        Assert.Throws<ArgumentException>(() => builder.Build(["broken\uD800"], account));
     }
 
     [Fact]
@@ -326,6 +388,37 @@ public sealed class CreateBatchServiceTests
 
         await using var read = await database.UnitOfWorkFactory.BeginAsync();
         Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task ConfirmationTokenSeparatesDelimiterShapedDraftsAndReplaysExactly()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(accountId, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1, note: "换行\nNUL\0😀")]);
+        var account = new BatchAccountDraft(
+            accountId, 0, "/目标", 1, 0, BatchAccountSelectionDecision.Selected);
+        var left = new BatchDraft(
+            batchId, sessionId, "任务😀\0", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction, [account], "/", "x|Skip",
+            DuplicatePolicy.Skip, "y\n", 1, true);
+        var right = new BatchDraft(
+            batchId, sessionId, "任务😀\0", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction, [account], "/", "x",
+            DuplicatePolicy.Skip, "Skip|y\n", 1, true);
+        var service = Service(database, long.MaxValue);
+
+        var leftPreview = await service.PreviewAsync(left);
+        var rightPreview = await service.PreviewAsync(right);
+        var replay = await service.PreviewAsync(left);
+
+        Assert.NotEqual(leftPreview.ConfirmationToken, rightPreview.ConfirmationToken);
+        Assert.Equal(leftPreview.ConfirmationToken, replay.ConfirmationToken);
     }
 
     [Theory]

@@ -351,8 +351,12 @@ public sealed class CreateJobWizardViewModelTests
         {
             Summary = new WizardConfirmationSummary(
                 8, 9, "server-token", true,
-                [new WizardAccountConfirmation(account.AccountId, 10, 8, 7, 3, 2, 1, 4, 5, 6)],
-                12_345, 67_890),
+                [new WizardAccountConfirmation(
+                    account.AccountId, 10, 8, 7, 3, 2, 1, 4, 5, 6,
+                    PlannedTransferCount: 9, PlannedShareCount: 7,
+                    ConfirmedTransferCount: 9, ConfirmedShareCount: 7)],
+                12_345, 67_890, TransferCount: 9, ShareCount: 7,
+                TotalActionCount: 16, ResultColumnCount: 8),
         };
         var vm = Create([account], ready: 10, gateway: gateway);
 
@@ -360,11 +364,140 @@ public sealed class CreateJobWizardViewModelTests
 
         Assert.Equal(8, vm.ConfirmedResourceCount);
         Assert.Equal(9, vm.ConfirmedOperationCount);
+        Assert.Equal(9, vm.TransferCount);
+        Assert.Equal(7, vm.ShareCount);
+        Assert.Equal(16, vm.TotalActionCount);
+        Assert.Equal(8, vm.ResultColumnCount);
         Assert.Equal(12_345, vm.RequiredFreeBytes);
         Assert.Equal(67_890, vm.AvailableFreeBytes);
         Assert.Equal(8, vm.Accounts[0].EffectiveTargetSuccessCount);
         Assert.Equal(7, vm.Accounts[0].ReachableTargetSuccessCount);
         Assert.Equal(2, vm.Accounts[0].ReservedSlotCount);
+        Assert.Equal(9, vm.Accounts[0].ConfirmedTransferCount);
+        Assert.Equal(7, vm.Accounts[0].ConfirmedShareCount);
+    }
+
+    [Fact]
+    public async Task BindableShareSettingsBuildTheDraftAndEveryEditInvalidatesPreview()
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(1), ready: 2, gateway: gateway);
+
+        Assert.True(vm.IsSharePermanent);
+        Assert.True(vm.IsShareAccessUnlimited);
+        Assert.Equal("永久", vm.ShareValidityText);
+        Assert.Equal("不限次数", vm.ShareAccessText);
+        Assert.Equal("随机提取码", vm.ExtractionCodeBehaviorText);
+        Assert.Equal("Ask", vm.ExistingSharePolicy);
+        Assert.Equal("每次询问", vm.ExistingSharePolicyText);
+
+        await vm.PrepareConfirmationAsync();
+        Assert.NotNull(vm.ConfirmationToken);
+
+        vm.ExtractionCodeBehavior = ShareExtractionCodeBehavior.Fixed;
+        Assert.Null(vm.ConfirmationToken);
+        Assert.Contains("固定提取码", vm.ValidationMessage);
+        vm.FixedExtractionCode = "a1b2";
+        vm.ExistingSharePolicy = "Reuse";
+        Assert.Equal("固定提取码", vm.ExtractionCodeBehaviorText);
+        Assert.Equal("复用已有分享", vm.ExistingSharePolicyText);
+        await vm.PrepareConfirmationAsync();
+
+        var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        Assert.True(draft.IsSharePermanent);
+        Assert.True(draft.IsShareAccessUnlimited);
+        Assert.Equal(ShareExtractionCodeBehavior.Fixed, draft.ExtractionCodeBehavior);
+        Assert.Equal("a1b2", draft.FixedExtractionCode);
+        Assert.Equal("Reuse", draft.ExistingSharePolicy);
+        Assert.NotNull(vm.ConfirmationToken);
+
+        vm.FixedExtractionCode = "b2c3";
+        Assert.Null(vm.ConfirmationToken);
+        Assert.Equal(0, vm.TransferCount);
+        Assert.Equal(0, vm.ShareCount);
+        Assert.Equal(0, vm.TotalActionCount);
+        Assert.Equal(0, vm.ResultColumnCount);
+        Assert.All(vm.Accounts, row =>
+        {
+            Assert.Equal(0, row.PlannedTransferCount);
+            Assert.Equal(0, row.PlannedShareCount);
+            Assert.Equal(0, row.ConfirmedTransferCount);
+            Assert.Equal(0, row.ConfirmedShareCount);
+        });
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("duplicate")]
+    [InlineData("unknown")]
+    [InlineData("counts")]
+    [InlineData("share-setting")]
+    public async Task PreviewRejectsIncompleteOrAmbiguousAccountConfirmationSnapshot(string shape)
+    {
+        var options = Accounts(2).Select(option => option with
+        {
+            PlannedTransferCount = 12,
+            PlannedShareCount = 11,
+        }).ToArray();
+        var confirmations = shape switch
+        {
+            "missing" => new[]
+            {
+                Confirmation(options[0].AccountId),
+            },
+            "duplicate" => new[]
+            {
+                Confirmation(options[0].AccountId),
+                Confirmation(options[0].AccountId),
+            },
+            "counts" => new[]
+            {
+                Confirmation(options[0].AccountId),
+                Confirmation(options[1].AccountId),
+            },
+            "share-setting" => new[]
+            {
+                Confirmation(options[0].AccountId) with
+                {
+                    PlannedShareCount = 0,
+                    ConfirmedShareCount = 0,
+                    ShareEnabled = false,
+                },
+                Confirmation(options[1].AccountId),
+            },
+            _ => new[]
+            {
+                Confirmation(options[0].AccountId),
+                Confirmation(Guid.NewGuid()),
+            },
+        };
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                2, shape == "counts" ? 5 : 4, "must-not-survive", true, confirmations,
+                TransferCount: shape == "counts" ? 5 : 4,
+                ShareCount: shape == "share-setting" ? 2 : 4,
+                TotalActionCount: shape == "counts" ? 9 : shape == "share-setting" ? 6 : 8,
+                ResultColumnCount: 10),
+        };
+        var vm = Create(options, ready: 2, gateway: gateway);
+        vm.SelectMode(TransferMode.Replication);
+        foreach (var account in vm.Accounts) account.IsSelected = true;
+
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Null(vm.ConfirmationToken);
+        Assert.Contains("重新预览", vm.ValidationMessage);
+        Assert.Equal(0, vm.TransferCount);
+        Assert.Equal(0, vm.ShareCount);
+        Assert.All(vm.Accounts, account =>
+        {
+            Assert.True(account.ShareEnabled);
+            Assert.Equal(0, account.PlannedTransferCount);
+            Assert.Equal(0, account.PlannedShareCount);
+            Assert.Equal(0, account.ConfirmedTransferCount);
+            Assert.Equal(0, account.ConfirmedShareCount);
+        });
     }
 
     [Fact]
@@ -595,6 +728,11 @@ public sealed class CreateJobWizardViewModelTests
         new(Guid.NewGuid(), name, "Active", true, false, remaining, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, BatchAccountSelectionDecision.NotSelected);
 
+    private static WizardAccountConfirmation Confirmation(Guid accountId) =>
+        new(accountId, 1, 1, 1, 0, 0, 0, 0, 2, 0,
+            PlannedTransferCount: 2, PlannedShareCount: 2,
+            ConfirmedTransferCount: 2, ConfirmedShareCount: 2);
+
     private static ImportPreviewRow Row(int number) =>
         new(Guid.NewGuid(), number, $"https://pan.baidu.com/s/{number}", null, null, "就绪", null);
 
@@ -636,14 +774,29 @@ public sealed class CreateJobWizardViewModelTests
             LastPreviewDraft = draft;
             if (ThrowDiskShortage) throw new StorageCapacityException(10, 1);
             if (Summary is not null) return Task.FromResult(Summary);
+            var selected = draft.Accounts.Where(account => account.IsSelected).ToArray();
+            var transferCounts = selected.Select((account, index) =>
+                draft.TransferMode == TransferMode.Replication
+                    ? (long)draft.ReadyResourceCount
+                    : index == 0 ? (long)draft.ReadyResourceCount : 0L).ToArray();
+            var accountConfirmations = selected.Select((account, index) => new WizardAccountConfirmation(
+                account.AccountId, account.TargetSuccessCount, account.TargetSuccessCount,
+                account.TargetSuccessCount, 0, 0, 0, 0, draft.ReadyResourceCount, 0,
+                transferCounts[index], account.ShareEnabled ? transferCounts[index] : 0,
+                transferCounts[index], account.ShareEnabled ? transferCounts[index] : 0,
+                account.ShareEnabled)).ToArray();
+            var transferCount = transferCounts.Sum();
+            var shareCount = accountConfirmations.Sum(account => account.ConfirmedShareCount ?? 0);
             return Task.FromResult(new WizardConfirmationSummary(
                 draft.ReadyResourceCount,
-                draft.TransferMode == TransferMode.Replication
-                    ? draft.ReadyResourceCount * draft.Accounts.Count(account =>
-                        account.SelectionDecision == BatchAccountSelectionDecision.Selected)
-                    : draft.ReadyResourceCount,
+                transferCount,
                 "preview-token",
-                true));
+                true,
+                accountConfirmations,
+                TransferCount: transferCount,
+                ShareCount: shareCount,
+                TotalActionCount: checked(transferCount + shareCount),
+                ResultColumnCount: checked(2 + selected.Length * 3)));
         }
 
         public Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
