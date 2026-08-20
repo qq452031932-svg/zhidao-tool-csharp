@@ -8,6 +8,336 @@ namespace BaiduBatchTransfer.Application.Tests.Jobs;
 public sealed class CreateBatchServiceTests
 {
     [Fact]
+    public void WorkloadPlannerUsesOnlySelectedAccountForTwoHundredThousandRows()
+    {
+        var accounts = Enumerable.Range(0, 10)
+            .Select(index => new BatchWorkloadAccountInput(
+                Guid.NewGuid(), index, $"账号{index + 1}", index == 0, true, index == 0 ? 200_000 : 0))
+            .ToArray();
+
+        var plan = new BatchWorkloadPlanner().Plan(200_000, TransferMode.Distribution, accounts);
+
+        var output = Assert.Single(plan.Accounts);
+        Assert.Equal(200_000, plan.TransferCount);
+        Assert.Equal(200_000, plan.ShareCount);
+        Assert.Equal(200_000, output.PlannedTransferCount);
+        Assert.Equal(200_000, output.PlannedShareCount);
+    }
+
+    [Fact]
+    public void WorkloadPlannerDistributesAndReplicatesWithoutUsingLoggedAccountCount()
+    {
+        var accounts = new[]
+        {
+            WorkloadAccount(0, 50_000),
+            WorkloadAccount(1, 100_000),
+            WorkloadAccount(2, 50_000),
+        };
+        var planner = new BatchWorkloadPlanner();
+
+        var distribution = planner.Plan(200_000, TransferMode.Distribution, accounts);
+        var replication = planner.Plan(200_000, TransferMode.Replication, accounts);
+
+        Assert.Equal(200_000, distribution.TransferCount);
+        Assert.Equal(200_000, distribution.ShareCount);
+        Assert.Equal([50_000L, 100_000L, 50_000L], distribution.Accounts.Select(x => x.PlannedTransferCount));
+        Assert.Equal(600_000, replication.TransferCount);
+        Assert.Equal(600_000, replication.ShareCount);
+        Assert.All(replication.Accounts, account => Assert.Equal(200_000, account.PlannedTransferCount));
+    }
+
+    [Fact]
+    public void WorkloadPlannerKeepsTransfersWhenSharingIsDisabledAndHonorsMappedAccount()
+    {
+        var first = WorkloadAccount(0, 0, shareEnabled: false);
+        var second = WorkloadAccount(1, 0);
+        var disabled = new BatchWorkloadPlanner().Plan(
+            200_000,
+            TransferMode.Distribution,
+            [WorkloadAccount(0, 200_000, shareEnabled: false)]);
+        var plan = new BatchWorkloadPlanner().Plan(
+            1,
+            TransferMode.Distribution,
+            [first, second],
+            new Dictionary<Guid, long> { [second.AccountId] = 1 });
+
+        Assert.Equal(200_000, disabled.TransferCount);
+        Assert.Equal(0, disabled.ShareCount);
+        Assert.Equal(1, plan.TransferCount);
+        Assert.Equal(1, plan.ShareCount);
+        Assert.Equal(0, plan.Accounts.Single(x => x.AccountId == first.AccountId).PlannedShareCount);
+        Assert.Equal(1, plan.Accounts.Single(x => x.AccountId == second.AccountId).PlannedTransferCount);
+    }
+
+    [Fact]
+    public void WorkloadPlannerRejectsNoSelectionAndDuplicateOrUnavailableSelection()
+    {
+        var id = Guid.NewGuid();
+        var planner = new BatchWorkloadPlanner();
+
+        Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Distribution,
+            [new(id, 0, "A", false, true, 1)]));
+        Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Replication,
+            [new(id, 0, "A", true, true, 1), new(id, 1, "B", true, true, 1)]));
+        Assert.Throws<BatchDraftValidationException>(() => planner.Plan(1, TransferMode.Replication,
+            [new(id, 0, "A", true, true, 1, IsAvailable: false)]));
+    }
+
+    [Fact]
+    public void ResultLayoutEnforcesExcelCapacityAndCollisionSuffixesDoNotChangeCount()
+    {
+        var builder = new ResultColumnLayoutBuilder();
+        var accounts = new[] { WorkloadAccount(0, 1), WorkloadAccount(1, 1) };
+        var source = Enumerable.Range(0, 16_376).Select(index => $"原始列{index}").ToArray();
+
+        var layout = builder.Build(source, accounts);
+
+        Assert.Equal(16_384, layout.ColumnCount);
+        Assert.Throws<BatchDraftValidationException>(() =>
+            builder.Build(source.Append("额外原始列").ToArray(), accounts));
+        var collision = builder.Build(
+            ["转存结果_解析后标题", "转存结果_原分享链接"],
+            [new(Guid.NewGuid(), 0, "同名", true, true, 1), new(Guid.NewGuid(), 1, "同名", true, true, 1)]);
+        Assert.Equal(10, collision.ColumnCount);
+        Assert.Equal("转存结果_解析后标题（系统2）", collision.ResolvedTitleHeader);
+        Assert.Equal("转存结果_原分享链接（系统2）", collision.OriginalShareUrlHeader);
+        Assert.Equal(["同名（1）", "同名（2）"], collision.Accounts.Select(x => x.OutputLabel));
+    }
+
+    [Fact]
+    public void ResultLayoutNeverUsesIdsPathsUrlsControlsOrSecretShapedAccountLabels()
+    {
+        var sensitive = new[]
+        {
+            Guid.NewGuid().ToString("N"),
+            @"C:\Users\person\profile",
+            "https://pan.baidu.com/private",
+            "token=private-value",
+            "双向\u202E文本",
+            "to\u200Bken=obfuscated-value",
+        };
+        var accounts = sensitive.Select((name, index) =>
+            new BatchWorkloadAccountInput(Guid.NewGuid(), index, name, true, true, 1)).ToArray();
+
+        var layout = new ResultColumnLayoutBuilder().Build([], accounts);
+        var allHeaders = layout.Accounts.SelectMany(account => new[]
+        {
+            account.OutputLabel, account.ShareUrlHeader, account.ExtractionCodeHeader, account.ShareStatusHeader,
+        }).ToArray();
+
+        Assert.Equal(["账号1", "账号2", "账号3", "账号4", "双向文本", "账号6"], layout.Accounts.Select(x => x.OutputLabel));
+        Assert.All(sensitive, value => Assert.DoesNotContain(allHeaders, header => header.Contains(value, StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void ResultLayoutAccountLabelsAreGloballyCollisionFreeAcrossOrdinalShapedNames()
+    {
+        var accounts = new[] { "同名", "同名（1）", "同名" }
+            .Select((name, index) => new BatchWorkloadAccountInput(
+                Guid.NewGuid(), index, name, true, true, 1))
+            .ToArray();
+
+        var labels = new ResultColumnLayoutBuilder().Build([], accounts).Accounts.Select(x => x.OutputLabel).ToArray();
+
+        Assert.Equal(3, labels.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(["同名（1）", "同名(1)", "同名（2）"], labels);
+    }
+
+    [Theory]
+    [InlineData("用户原标题", "用户原标题")]
+    [InlineData("  用户原标题  ", "  用户原标题  ")]
+    public void ResolvedTitleKeepsNonblankUserTitleExactly(string sourceTitle, string expected)
+    {
+        Assert.Equal(expected, ResolvedOutputTitleBuilder.Resolve(sourceTitle, ["网盘显示名称"]));
+    }
+
+    [Fact]
+    public void ResolvedTitleUsesStableSafeDisplayedNameFallbackWithoutMutatingInput()
+    {
+        string? sourceTitle = "   ";
+        var names = new[] { "第一个资源名称", "第二个资源名称", "第三个资源名称" };
+
+        var resolved = ResolvedOutputTitleBuilder.Resolve(sourceTitle, names);
+        var unsafeResolved = ResolvedOutputTitleBuilder.Resolve(null, ["https://pan.baidu.com/s/secret"]);
+
+        Assert.Equal("第一个资源名称 等 3 项", resolved);
+        Assert.Equal("未命名资源", unsafeResolved);
+        Assert.Equal("   ", sourceTitle);
+        Assert.Equal("第一个资源名称", names[0]);
+    }
+
+    [Fact]
+    public async Task ConfirmationTokenBindsShareSettingsAndShareEnabledWithZeroWrites()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        var original = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Batch", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, isSelected: true, shareEnabled: true)],
+            "/", "None", DuplicatePolicy.Skip, "Immediate", 1, true);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(original);
+        var changed = new BatchDraft(
+            original.BatchJobId, sessionId, original.Name, original.TransferMode, original.QuotaBasis,
+            original.ShortagePolicy,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0, isSelected: true, shareEnabled: false)],
+            original.DefaultTargetPath, original.FolderCreationMode, original.DuplicatePolicy,
+            original.ValidationMode, original.QueueOrder, original.IgnoreMappedAccountsForReplication,
+            extractionCodeBehavior: ShareExtractionCodeBehavior.Fixed,
+            fixedExtractionCode: "a1b2",
+            existingSharePolicy: "Regenerate");
+
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ConfirmAsync(changed, preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(original.BatchJobId));
+    }
+
+    [Fact]
+    public async Task ConfirmationTokenBindsMappingRawColumnsAndSafeAccountLabels()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a") with { DisplayName = "原账号" }],
+            BatchTestData.ReadySession(sessionId, 1, 1) with { ColumnMappingFingerprint = "mapping-a" },
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.SetColumnDefinitionsAsync(sessionId,
+                [new(sessionId, 0, "原链接", "ShareUrl", true)]);
+            await seed.CommitAsync();
+        }
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+        await using (var update = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await update.Accounts.UpsertAsync(BatchTestData.Account(account, "a") with { DisplayName = "新账号" });
+            await update.Imports.SetColumnDefinitionsAsync(sessionId,
+                [new(sessionId, 0, "改名后的原链接", "ShareUrl", true)]);
+            await update.CommitAsync();
+        }
+
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ConfirmAsync(draft, preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Theory]
+    [InlineData("selection")]
+    [InlineData("order")]
+    [InlineData("allocation")]
+    [InlineData("share-enabled")]
+    [InlineData("code-mode")]
+    [InlineData("fixed-code")]
+    [InlineData("existing-policy")]
+    [InlineData("mapping-fingerprint")]
+    [InlineData("raw-column-layout")]
+    [InlineData("generated-label")]
+    public async Task ConfirmationTokenVNextRejectsEachChangedAuthorityFieldWithZeroWrites(string mutation)
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accounts = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        var session = BatchTestData.ReadySession(sessionId, 1, 1) with { ColumnMappingFingerprint = "mapping-a" };
+        await database.SeedAsync(
+            [
+                BatchTestData.Account(accounts[0], "a") with { DisplayName = "账号A" },
+                BatchTestData.Account(accounts[1], "b") with { DisplayName = "账号B" },
+            ],
+            session,
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.SetColumnDefinitionsAsync(sessionId,
+                [new(sessionId, 0, "原链接", "ShareUrl", true)]);
+            await seed.CommitAsync();
+        }
+        var fixedBaseline = mutation == "fixed-code";
+        var original = TokenDraft(
+            Guid.NewGuid(), sessionId, accounts,
+            extractionCodeBehavior: fixedBaseline ? ShareExtractionCodeBehavior.Fixed : ShareExtractionCodeBehavior.Random,
+            fixedExtractionCode: fixedBaseline ? "a1b2" : null);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(original);
+        var changed = mutation switch
+        {
+            "selection" => TokenDraft(original.BatchJobId, sessionId, accounts, selectSecond: false),
+            "order" => TokenDraft(original.BatchJobId, sessionId, accounts, reverseOrder: true),
+            "allocation" => TokenDraft(original.BatchJobId, sessionId, accounts, allocateToSecond: true),
+            "share-enabled" => TokenDraft(original.BatchJobId, sessionId, accounts, firstShareEnabled: false),
+            "code-mode" => TokenDraft(original.BatchJobId, sessionId, accounts,
+                extractionCodeBehavior: ShareExtractionCodeBehavior.Fixed, fixedExtractionCode: "a1b2"),
+            "fixed-code" => TokenDraft(original.BatchJobId, sessionId, accounts,
+                extractionCodeBehavior: ShareExtractionCodeBehavior.Fixed, fixedExtractionCode: "b2c3"),
+            "existing-policy" => TokenDraft(original.BatchJobId, sessionId, accounts, existingSharePolicy: "Regenerate"),
+            _ => original,
+        };
+        if (mutation is "mapping-fingerprint" or "raw-column-layout" or "generated-label")
+        {
+            await using var update = await database.UnitOfWorkFactory.BeginAsync();
+            if (mutation == "mapping-fingerprint")
+                await update.Imports.UpdateSessionAsync(session with { ColumnMappingFingerprint = "mapping-b" });
+            else if (mutation == "raw-column-layout")
+                await update.Imports.SetColumnDefinitionsAsync(sessionId,
+                    [new(sessionId, 0, "原链接改名", "ShareUrl", true)]);
+            else
+                await update.Accounts.UpsertAsync(BatchTestData.Account(accounts[0], "a") with { DisplayName = "账号A改名" });
+            await update.CommitAsync();
+        }
+
+        await Assert.ThrowsAsync<BatchConfirmationException>(() =>
+            service.ConfirmAsync(changed, preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(original.BatchJobId));
+    }
+
+    [Fact]
+    public async Task ResultColumnOverflowRejectsBeforeDiskProbeOrBatchWrite()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await using (var seed = await database.UnitOfWorkFactory.BeginAsync())
+        {
+            await seed.Imports.SetColumnDefinitionsAsync(sessionId,
+                Enumerable.Range(0, 16_380).Select(index =>
+                    new ImportColumnDefinitionRecord(sessionId, index, $"列{index}", index == 0 ? "ShareUrl" : "Preserve", index == 0)));
+            await seed.CommitAsync();
+        }
+        var probe = new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(long.MaxValue);
+        var service = new CreateBatchService(
+            database.UnitOfWorkFactory,
+            new BatchDraftValidator(),
+            new ReplicationPreflightEstimator(probe, database.DatabasePath));
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.TaskCount,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0)]);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() => service.PreviewAsync(draft));
+
+        Assert.Null(probe.LastPath);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
     public async Task ImmediateValidationCanFinalizeDraftWhenOptionalPrecheckWasSkipped()
     {
         await using var database = await BatchTestDatabase.CreateAsync();
@@ -485,6 +815,48 @@ public sealed class CreateBatchServiceTests
         IReadOnlyList<BatchAccountDraft> accounts) =>
         new(Guid.NewGuid(), importSessionId, "Batch", mode, quota, ShortagePolicy.ProportionalReduction,
             accounts, "/", "None", DuplicatePolicy.Skip, "Immediate", 1, true);
+
+    private static BatchWorkloadAccountInput WorkloadAccount(
+        int priority,
+        long distributionCount,
+        bool shareEnabled = true) =>
+        new(Guid.NewGuid(), priority, $"账号{priority + 1}", true, shareEnabled, distributionCount);
+
+    private static BatchDraft TokenDraft(
+        Guid batchJobId,
+        Guid sessionId,
+        IReadOnlyList<Guid> accounts,
+        bool selectSecond = true,
+        bool reverseOrder = false,
+        bool allocateToSecond = false,
+        bool firstShareEnabled = true,
+        ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
+        string? fixedExtractionCode = null,
+        string existingSharePolicy = "Ask") =>
+        new(
+            batchJobId,
+            sessionId,
+            "Batch",
+            TransferMode.Distribution,
+            QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [
+                new BatchAccountDraft(
+                    accounts[0], reverseOrder ? 1 : 0, "/a", allocateToSecond ? 0 : 1, 0,
+                    isSelected: true, shareEnabled: firstShareEnabled),
+                new BatchAccountDraft(
+                    accounts[1], reverseOrder ? 0 : 1, "/b", allocateToSecond ? 1 : 0, 0,
+                    isSelected: selectSecond, shareEnabled: true),
+            ],
+            "/",
+            "None",
+            DuplicatePolicy.Skip,
+            "Immediate",
+            1,
+            true,
+            extractionCodeBehavior: extractionCodeBehavior,
+            fixedExtractionCode: fixedExtractionCode,
+            existingSharePolicy: existingSharePolicy);
 
     internal static async Task<IReadOnlyList<ResourceItemRecord>> AllResourcesAsync(IJobRepository jobs, Guid batchJobId)
     {

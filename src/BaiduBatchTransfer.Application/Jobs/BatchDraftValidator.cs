@@ -32,6 +32,24 @@ public sealed class BatchDraftValidator
         var accountIds = accounts.Select(account => account.Draft.AccountId).ToHashSet();
         var rules = await ReadDirectoryRulesAsync(accounts, unit.Accounts, cancellationToken).ConfigureAwait(false);
         var rows = await ReadEligibleRowsAsync(session, draft, accounts, accountIds, rules, cancellationToken, unit.Imports).ConfigureAwait(false);
+        var columnDefinitions = await unit.Imports.GetColumnDefinitionsAsync(session.Id, cancellationToken).ConfigureAwait(false);
+        var workloadInputs = accounts.Select(account => new BatchWorkloadAccountInput(
+            account.Draft.AccountId,
+            account.Draft.PriorityOrder,
+            account.Record.DisplayName,
+            true,
+            account.Draft.ShareEnabled,
+            draft.TransferMode == TransferMode.Distribution && draft.QuotaBasis == QuotaBasis.TaskCount
+                ? account.Draft.TargetItemCount
+                : account.Draft.TargetSuccessCount)).ToArray();
+        var mappedCounts = rows.Where(row => row.ConstraintAccountId.HasValue)
+            .GroupBy(row => row.ConstraintAccountId!.Value)
+            .ToDictionary(group => group.Key, group => (long)group.Count());
+        var workload = new BatchWorkloadPlanner().Plan(rows.Length, draft.TransferMode, workloadInputs, mappedCounts);
+        var outputLayout = new ResultColumnLayoutBuilder().Build(
+            columnDefinitions.OrderBy(column => column.ColumnOrdinal)
+                .Select(column => column.SourceHeader).ToArray(),
+            workloadInputs);
 
         if (draft.TransferMode == TransferMode.Distribution && draft.QuotaBasis == QuotaBasis.TaskCount)
         {
@@ -77,10 +95,12 @@ public sealed class BatchDraftValidator
             reachableTargets = simulator.Simulate(reachablePolicy, targetAccounts, candidates).EffectiveTargets;
         }
 
+        var confirmationWorkloads = workload.Accounts.ToDictionary(account => account.AccountId);
         var confirmations = accounts.Select(account =>
         {
             var constraintCount = rows.Count(row => row.ConstraintAccountId == account.Draft.AccountId);
             var replicationTarget = draft.TransferMode == TransferMode.Replication ? rows.Length : (int?)null;
+            var planned = confirmationWorkloads[account.Draft.AccountId];
             return new BatchAccountConfirmation(
                 account.Draft.AccountId,
                 account.Draft.PriorityOrder,
@@ -93,12 +113,15 @@ public sealed class BatchDraftValidator
                 effectiveTargetSuccessCount: replicationTarget ??
                     effectiveTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount,
                 reachableTargetSuccessCount: replicationTarget ??
-                    reachableTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount);
+                    reachableTargets?[account.Draft.AccountId] ?? account.Draft.TargetSuccessCount,
+                plannedTransferCount: planned.PlannedTransferCount,
+                plannedShareCount: planned.PlannedShareCount,
+                shareEnabled: planned.ShareEnabled,
+                outputOrdinal: planned.OutputOrdinal,
+                outputLabel: planned.OutputLabel);
         }).ToImmutableArray();
 
-        var operationCount = draft.TransferMode == TransferMode.Replication
-            ? ReplicationExpander.EstimateIntentCount(rows.Length, accounts.Length)
-            : rows.Length;
+        var operationCount = workload.TransferCount;
         var immediateOperationCount = draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.TaskCount
             ? operationCount
             : 0;
@@ -108,7 +131,10 @@ public sealed class BatchDraftValidator
             confirmations,
             operationCount,
             immediateOperationCount,
-            BatchConfirmationTokens.ForCreate(draft, session, rows, operationCount, confirmations, rules));
+            workload.ShareCount,
+            outputLayout,
+            BatchConfirmationTokens.ForCreate(
+                draft, session, rows, operationCount, confirmations, rules, columnDefinitions, outputLayout));
     }
 
     internal static async Task ValidateSessionCountersAsync(
@@ -140,11 +166,14 @@ public sealed class BatchDraftValidator
 
     private static ImmutableArray<BatchAccountDraft> SelectAccounts(BatchDraft draft)
     {
-        var selected = draft.TransferMode == TransferMode.Replication
-            ? draft.Accounts
-            : draft.Accounts.Where(account => draft.QuotaBasis == QuotaBasis.TaskCount
-                ? account.TargetItemCount > 0
-                : account.TargetSuccessCount > 0).ToImmutableArray();
+        var hasExplicitSelection = draft.Accounts.Any(account => account.HasExplicitSelection);
+        var selected = hasExplicitSelection
+            ? draft.Accounts.Where(account => account.IsSelected).ToImmutableArray()
+            : draft.TransferMode == TransferMode.Replication
+                ? draft.Accounts
+                : draft.Accounts.Where(account => draft.QuotaBasis == QuotaBasis.TaskCount
+                    ? account.TargetItemCount > 0
+                    : account.TargetSuccessCount > 0).ToImmutableArray();
         if (selected.IsDefaultOrEmpty)
             throw new BatchDraftValidationException("At least one participating account is required.");
         if (selected.Select(account => account.AccountId).Distinct().Count() != selected.Length ||
@@ -286,6 +315,8 @@ internal sealed record ValidatedBatchDraft(
     ImmutableArray<BatchAccountConfirmation> Accounts,
     long OperationCount,
     long ImmediateOperationCount,
+    long ShareOperationCount,
+    ResultColumnLayout ResultColumnLayout,
     string ConfirmationToken);
 
 internal static class BatchConfirmationTokens
@@ -296,20 +327,31 @@ internal static class BatchConfirmationTokens
         IReadOnlyList<ValidatedStagedRow> rows,
         long operationCount,
         IEnumerable<BatchAccountConfirmation> accounts,
-        IEnumerable<AccountRule> rules) =>
+        IEnumerable<AccountRule> rules,
+        IEnumerable<ImportColumnDefinitionRecord> columnDefinitions,
+        ResultColumnLayout outputLayout) =>
         Hash(string.Join('|', new[]
         {
-            "create-v1", draft.BatchJobId.ToString("N"), session.Id.ToString("N"), session.UpdatedAt.ToString("O"),
+            "create-vNext", draft.BatchJobId.ToString("N"), session.Id.ToString("N"), session.UpdatedAt.ToString("O"),
             draft.TransferMode.ToString(), draft.QuotaBasis.ToString(), draft.ShortagePolicy.ToString(),
             Hash(draft.Name), Hash(draft.DefaultTargetPath), draft.FolderCreationMode,
             draft.DuplicatePolicy.ToString(), draft.ValidationMode,
             draft.QueueOrder.ToString(System.Globalization.CultureInfo.InvariantCulture),
             draft.IgnoreMappedAccountsForReplication.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            draft.IsSharePermanent.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            draft.IsShareAccessUnlimited.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            draft.ExtractionCodeBehavior.ToString(),
+            Hash(draft.FixedExtractionCode ?? string.Empty),
+            draft.ExistingSharePolicy,
+            draft.ShareSettingsFingerprint,
+            session.ColumnMappingFingerprint ?? string.Empty,
             rows.Count.ToString(System.Globalization.CultureInfo.InvariantCulture),
             operationCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
             HashRows(rows),
-            string.Join(';', accounts.Select(account => $"{account.AccountId:N}:{account.PriorityOrder}:{account.TargetItemCount}:{account.TargetSuccessCount}:{Hash(account.NormalizedDefaultTargetPath)}")),
+            string.Join(';', accounts.Select(account => $"{account.AccountId:N}:{account.PriorityOrder}:{account.TargetItemCount}:{account.TargetSuccessCount}:{account.ShareEnabled}:{account.PlannedTransferCount}:{account.PlannedShareCount}:{account.OutputOrdinal}:{Hash(account.OutputLabel ?? string.Empty)}:{Hash(account.NormalizedDefaultTargetPath)}")),
             HashRules(rules),
+            HashColumnDefinitions(columnDefinitions),
+            outputLayout.Fingerprint,
         }));
 
     public static string ForAppend(
@@ -366,6 +408,19 @@ internal static class BatchConfirmationTokens
             Append(hash, rule.DirectoryPrefix);
             Append(hash, rule.Priority.ToString(System.Globalization.CultureInfo.InvariantCulture));
             Append(hash, rule.IsEnabled.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static string HashColumnDefinitions(IEnumerable<ImportColumnDefinitionRecord> definitions)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var definition in definitions.OrderBy(value => value.ColumnOrdinal))
+        {
+            Append(hash, definition.ColumnOrdinal.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Append(hash, definition.SourceHeader);
+            Append(hash, definition.MappedRole);
+            Append(hash, definition.IsRequired.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
         return Convert.ToHexString(hash.GetHashAndReset());
     }

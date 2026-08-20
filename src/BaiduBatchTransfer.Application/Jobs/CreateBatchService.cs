@@ -32,6 +32,10 @@ public sealed class CreateBatchService
             validated.Rows.Length,
             validated.OperationCount,
             validated.Accounts.Length,
+            validated.ShareOperationCount,
+            validated.ShareOperationCount,
+            validated.Accounts.Length,
+            validated.ResultColumnLayout.ColumnCount,
             cancellationToken).ConfigureAwait(false);
         return ToSummary(validated, estimate);
     }
@@ -110,7 +114,8 @@ public sealed class CreateBatchService
         ValidatedBatchDraft validated,
         StorageGrowthEstimate estimate) =>
         new(validated.Session.Id, validated.Session.UpdatedAt, validated.Rows.Length,
-            validated.OperationCount, validated.Accounts, estimate, validated.ConfirmationToken);
+            validated.OperationCount, validated.Accounts, estimate, validated.ConfirmationToken,
+            validated.ResultColumnLayout);
 
     private static List<ResourceItemRecord> CreateResources(
         BatchDraft draft,

@@ -42,6 +42,70 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public void AccountRowExposesSelectedShareAndServerConfirmedWorkloadState()
+    {
+        var option = Account("A") with
+        {
+            IsSelected = true,
+            ShareEnabled = false,
+            PlannedTransferCount = 200_000,
+            PlannedShareCount = 0,
+        };
+        var row = new AccountAllocationRowViewModel(option, "/目标");
+
+        row.ApplyConfirmation(new WizardAccountConfirmation(
+            option.AccountId, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+            ConfirmedTransferCount: 200_000, ConfirmedShareCount: 0, ShareEnabled: false));
+
+        Assert.True(row.IsSelected);
+        Assert.False(row.ShareEnabled);
+        Assert.Equal(200_000, row.PlannedTransferCount);
+        Assert.Equal(0, row.PlannedShareCount);
+        Assert.Equal(200_000, row.ConfirmedTransferCount);
+        Assert.Equal(0, row.ConfirmedShareCount);
+    }
+
+    [Fact]
+    public async Task PreviewDraftCarriesAuthoritativeSelectionAndPerAccountShareChoice()
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(2), ready: 2, gateway: gateway);
+        vm.SelectMode(TransferMode.Distribution);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].IsSelected = true;
+        vm.Accounts[0].ShareEnabled = false;
+        vm.Accounts[0].TargetItemCount = 2;
+
+        await vm.PrepareConfirmationAsync();
+
+        var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        var selected = Assert.Single(draft.Accounts);
+        Assert.True(selected.IsSelected);
+        Assert.False(selected.ShareEnabled);
+    }
+
+    [Fact]
+    public void WorkloadContractsRedactIdsPathsCodesNamesAndConfirmationTokens()
+    {
+        var accountId = Guid.NewGuid();
+        var account = new WizardAccountDraft(accountId, 0, "/敏感目录", 1, 1, true, true);
+        var draft = new WizardBatchDraft(
+            Guid.NewGuid(), Guid.NewGuid(), "敏感任务", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction, [account], "/敏感目录", "None", DuplicatePolicy.Skip,
+            "Immediate", true, 1, FixedExtractionCode: "s3cr", ExtractionCodeBehavior: ShareExtractionCodeBehavior.Fixed);
+        var summary = new WizardConfirmationSummary(1, 1, "secret-token", true);
+
+        var text = $"{account} {draft} {summary}";
+
+        Assert.DoesNotContain(accountId.ToString(), text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("敏感目录", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("敏感任务", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("s3cr", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret-token", text, StringComparison.Ordinal);
+        Assert.Contains("[REDACTED]", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void MultipleAccountsRequireExplicitModeAndSwitchingRecalculatesOperationCount()
     {
         var vm = Create(Accounts(3), ready: 1_000);
@@ -498,10 +562,12 @@ public sealed class CreateJobWizardViewModelTests
         public string? ConfirmedToken { get; private set; }
         public bool ThrowDiskShortage { get; init; }
         public WizardConfirmationSummary? Summary { get; init; }
+        public WizardBatchDraft? LastPreviewDraft { get; private set; }
 
         public Task<WizardConfirmationSummary> PreviewAsync(WizardBatchDraft draft, CancellationToken cancellationToken)
         {
             PreviewCalls++;
+            LastPreviewDraft = draft;
             if (ThrowDiskShortage) throw new StorageCapacityException(10, 1);
             if (Summary is not null) return Task.FromResult(Summary);
             return Task.FromResult(new WizardConfirmationSummary(

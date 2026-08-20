@@ -8,6 +8,10 @@ public sealed class ReplicationPreflightEstimator
     public const long ResourceRowBytes = 2_048;
     public const long OperationRowBytes = 3_072;
     public const long AllocationRowBytes = 1_024;
+    public const long ShareOperationRowBytes = 3_072;
+    public const long ShareResultRowBytes = 2_048;
+    public const long OutputSnapshotRowBytes = 2_048;
+    public const long ResultColumnSnapshotBytes = 256;
     public const long FixedBatchAndAuditBytes = 8_192;
     public const long MinimumSafetyReserveBytes = 64L * 1024 * 1024;
 
@@ -26,11 +30,27 @@ public sealed class ReplicationPreflightEstimator
         long resourceCount,
         long operationCount,
         int allocationCount,
+        CancellationToken cancellationToken = default) =>
+        await EstimateAsync(resourceCount, operationCount, allocationCount, 0, 0, 0, 0, cancellationToken)
+            .ConfigureAwait(false);
+
+    public async Task<StorageGrowthEstimate> EstimateAsync(
+        long resourceCount,
+        long operationCount,
+        int allocationCount,
+        long shareOperationCount,
+        long shareResultCount,
+        int outputSnapshotCount,
+        int resultColumnCount,
         CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(resourceCount);
         ArgumentOutOfRangeException.ThrowIfNegative(operationCount);
         ArgumentOutOfRangeException.ThrowIfNegative(allocationCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(shareOperationCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(shareResultCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(outputSnapshotCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(resultColumnCount);
 
         long databaseBytes;
         long indexBytes;
@@ -43,6 +63,10 @@ public sealed class ReplicationPreflightEstimator
                 resourceCount * ResourceRowBytes +
                 operationCount * OperationRowBytes +
                 (long)allocationCount * AllocationRowBytes +
+                shareOperationCount * ShareOperationRowBytes +
+                shareResultCount * ShareResultRowBytes +
+                (long)outputSnapshotCount * OutputSnapshotRowBytes +
+                (long)resultColumnCount * ResultColumnSnapshotBytes +
                 FixedBatchAndAuditBytes;
             indexBytes = databaseBytes / 2 + databaseBytes % 2;
             walBytes = databaseBytes + indexBytes;
@@ -61,6 +85,10 @@ public sealed class ReplicationPreflightEstimator
             safetyReserveBytes,
             requiredFreeBytes,
             available,
-            available >= requiredFreeBytes);
+            available >= requiredFreeBytes,
+            shareOperationCount,
+            shareResultCount,
+            outputSnapshotCount,
+            resultColumnCount);
     }
 }

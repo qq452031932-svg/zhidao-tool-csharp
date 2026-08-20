@@ -688,7 +688,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             index,
             account.DefaultTargetPath,
             account.TargetItemCount,
-            account.TargetSuccessCount)).ToArray();
+            account.TargetSuccessCount,
+            account.IsSelected,
+            account.ShareEnabled)).ToArray();
         return new(
             batchJobId,
             importSessionId,

@@ -5,6 +5,7 @@ namespace BaiduBatchTransfer.App.Features.Jobs;
 public sealed class AccountAllocationRowViewModel : ObservableObject
 {
     private bool isSelected;
+    private bool shareEnabled;
     private int targetItemCount;
     private int targetSuccessCount;
     private string defaultTargetPath;
@@ -26,6 +27,10 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         FulfilledCount = option.FulfilledCount;
         ReservedSlotCount = option.ReservedSlotCount;
         targetSuccessCount = option.OriginalTargetSuccessCount;
+        isSelected = option.IsSelected;
+        shareEnabled = option.ShareEnabled;
+        PlannedTransferCount = option.PlannedTransferCount;
+        PlannedShareCount = option.PlannedShareCount;
         defaultTargetPath = initialTargetPath;
     }
 
@@ -46,8 +51,13 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     public int ReservedSlotCount { get; private set; }
     public int ShortfallCount => Math.Max(0, TargetSuccessCount - ReachableTargetSuccessCount);
     public double AllocationPercentage { get; internal set; }
+    public long PlannedTransferCount { get; private set; }
+    public long PlannedShareCount { get; private set; }
+    public long ConfirmedTransferCount { get; private set; }
+    public long ConfirmedShareCount { get; private set; }
 
     public bool IsSelected { get => isSelected; set => SetProperty(ref isSelected, value); }
+    public bool ShareEnabled { get => shareEnabled; set => SetProperty(ref shareEnabled, value); }
     public int TargetItemCount { get => targetItemCount; set => SetProperty(ref targetItemCount, Math.Max(0, value)); }
     public int TargetSuccessCount
     {
@@ -60,7 +70,7 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     }
     public string DefaultTargetPath { get => defaultTargetPath; set => SetProperty(ref defaultTargetPath, value ?? string.Empty); }
 
-    internal void ApplyConfirmation(WizardAccountConfirmation value)
+    public void ApplyConfirmation(WizardAccountConfirmation value)
     {
         OriginalTargetSuccessCount = value.OriginalTarget;
         EffectiveTargetSuccessCount = value.EffectiveTarget;
@@ -71,6 +81,11 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         ExclusiveCandidateCount = value.Exclusive;
         PublicCandidateCount = value.Public;
         UnusedExclusiveCandidateCount = value.Unused;
+        if (value.PlannedTransferCount >= 0) PlannedTransferCount = value.PlannedTransferCount;
+        if (value.PlannedShareCount >= 0) PlannedShareCount = value.PlannedShareCount;
+        if (value.ConfirmedTransferCount >= 0) ConfirmedTransferCount = value.ConfirmedTransferCount;
+        if (value.ConfirmedShareCount >= 0) ConfirmedShareCount = value.ConfirmedShareCount;
+        ShareEnabled = value.ShareEnabled;
         OnPropertyChanged(string.Empty);
     }
 }

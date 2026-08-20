@@ -41,7 +41,15 @@ public sealed record WizardAccountOption(
     int EffectiveTargetSuccessCount,
     int ReachableTargetSuccessCount,
     int FulfilledCount,
-    int ReservedSlotCount);
+    int ReservedSlotCount,
+    bool IsSelected = false,
+    bool ShareEnabled = true,
+    long PlannedTransferCount = 0,
+    long PlannedShareCount = 0)
+{
+    public override string ToString() =>
+        $"WizardAccountOption {{ Identity = [REDACTED], DisplayName = [REDACTED], Status = {Status}, IsEnabled = {IsEnabled}, IsDeleted = {IsDeleted}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount} }}";
+}
 
 public sealed record ImportWizardContext(
     Guid ImportSessionId,
@@ -111,7 +119,13 @@ public sealed record WizardAccountDraft(
     int PriorityOrder,
     string DefaultTargetPath,
     int TargetItemCount,
-    int TargetSuccessCount);
+    int TargetSuccessCount,
+    bool IsSelected = true,
+    bool ShareEnabled = true)
+{
+    public override string ToString() =>
+        $"WizardAccountDraft {{ Identity = [REDACTED], PriorityOrder = {PriorityOrder}, TargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, IsSelected = {IsSelected}, ShareEnabled = {ShareEnabled} }}";
+}
 
 public sealed record WizardBatchDraft(
     Guid BatchJobId,
@@ -126,7 +140,16 @@ public sealed record WizardBatchDraft(
     DuplicatePolicy DuplicatePolicy,
     string ValidationMode,
     bool IgnoreMappedAccountsForReplication,
-    int ReadyResourceCount);
+    int ReadyResourceCount,
+    bool IsSharePermanent = true,
+    bool IsShareAccessUnlimited = true,
+    ShareExtractionCodeBehavior ExtractionCodeBehavior = ShareExtractionCodeBehavior.Random,
+    string? FixedExtractionCode = null,
+    string ExistingSharePolicy = "Ask")
+{
+    public override string ToString() =>
+        $"WizardBatchDraft {{ Identity = [REDACTED], JobName = [REDACTED], TransferMode = {TransferMode}, QuotaBasis = {QuotaBasis}, Accounts = {Accounts?.Count ?? 0}, PathsAndCodes = [REDACTED], IsSharePermanent = {IsSharePermanent}, IsShareAccessUnlimited = {IsShareAccessUnlimited}, ExtractionCodeBehavior = {ExtractionCodeBehavior}, ExistingSharePolicy = {ExistingSharePolicy} }}";
+}
 
 public sealed record WizardConfirmationSummary(
     long ResourceCount,
@@ -135,7 +158,15 @@ public sealed record WizardConfirmationSummary(
     bool HasSufficientDiskSpace,
     IReadOnlyList<WizardAccountConfirmation>? Accounts = null,
     long RequiredFreeBytes = 0,
-    long AvailableFreeBytes = 0);
+    long AvailableFreeBytes = 0,
+    long TransferCount = 0,
+    long ShareCount = 0,
+    long TotalActionCount = 0,
+    int ResultColumnCount = 0)
+{
+    public override string ToString() =>
+        $"WizardConfirmationSummary {{ ResourceCount = {ResourceCount}, OperationCount = {OperationCount}, TransferCount = {TransferCount}, ShareCount = {ShareCount}, TotalActionCount = {TotalActionCount}, ResultColumnCount = {ResultColumnCount}, Accounts = {Accounts?.Count ?? 0}, ConfirmationToken = [REDACTED] }}";
+}
 
 public sealed record WizardAccountConfirmation(
     Guid AccountId,
@@ -147,7 +178,16 @@ public sealed record WizardAccountConfirmation(
     int Locked,
     int Exclusive,
     int Public,
-    int Unused);
+    int Unused,
+    long PlannedTransferCount = -1,
+    long PlannedShareCount = -1,
+    long ConfirmedTransferCount = -1,
+    long ConfirmedShareCount = -1,
+    bool ShareEnabled = true)
+{
+    public override string ToString() =>
+        $"WizardAccountConfirmation {{ Identity = [REDACTED], PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount}, ConfirmedTransferCount = {ConfirmedTransferCount}, ConfirmedShareCount = {ConfirmedShareCount}, ShareEnabled = {ShareEnabled} }}";
+}
 
 public interface IWizardBatchService
 {
@@ -271,9 +311,18 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
                 account.LockedItemCount,
                 account.ExclusiveCandidateCount,
                 publicCandidates,
-                account.UnusedCandidateCount)).ToArray(),
+                account.UnusedCandidateCount,
+                account.PlannedTransferCount,
+                account.PlannedShareCount,
+                account.PlannedTransferCount,
+                account.PlannedShareCount,
+                account.ShareEnabled)).ToArray(),
             summary.StorageEstimate.RequiredFreeBytes,
-            summary.StorageEstimate.AvailableFreeBytes);
+            summary.StorageEstimate.AvailableFreeBytes,
+            summary.TransferCount,
+            summary.ShareCount,
+            summary.TotalActionCount,
+            summary.ResultColumnCount);
     }
 
     public async Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
@@ -293,13 +342,20 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
             account.PriorityOrder,
             account.DefaultTargetPath,
             account.TargetItemCount,
-            account.TargetSuccessCount)).ToArray(),
+            account.TargetSuccessCount,
+            account.IsSelected,
+            account.ShareEnabled)).ToArray(),
         draft.DefaultTargetPath,
         draft.FolderCreationMode,
         draft.DuplicatePolicy,
         draft.ValidationMode,
         0,
-        draft.IgnoreMappedAccountsForReplication);
+        draft.IgnoreMappedAccountsForReplication,
+        draft.IsSharePermanent,
+        draft.IsShareAccessUnlimited,
+        draft.ExtractionCodeBehavior,
+        draft.FixedExtractionCode,
+        draft.ExistingSharePolicy);
 }
 
 internal static class ImportUiText

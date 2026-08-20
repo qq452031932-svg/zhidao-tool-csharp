@@ -46,8 +46,30 @@ public sealed class ReplicationPreflightEstimatorTests
 
         await Assert.ThrowsAsync<OverflowException>(() =>
             estimator.EstimateAsync(long.MaxValue, long.MaxValue, int.MaxValue));
+        await Assert.ThrowsAsync<OverflowException>(() =>
+            estimator.EstimateAsync(1, 1, 1, long.MaxValue, long.MaxValue, int.MaxValue, int.MaxValue));
 
         Assert.Null(probe.LastPath);
+    }
+
+    [Fact]
+    public async Task EstimateIncludesShareOperationsResultsOutputSnapshotsIndexesWalAndReserve()
+    {
+        var estimator = new ReplicationPreflightEstimator(
+            new StubDiskSpaceProbe(long.MaxValue), "jobs.db");
+
+        var withoutSharing = await estimator.EstimateAsync(200_000, 600_000, 3);
+        var withSharing = await estimator.EstimateAsync(
+            200_000, 600_000, 3, shareOperationCount: 600_000,
+            shareResultCount: 600_000, outputSnapshotCount: 3, resultColumnCount: 14);
+
+        Assert.Equal(600_000, withSharing.ShareOperationCount);
+        Assert.Equal(600_000, withSharing.ShareResultCount);
+        Assert.Equal(3, withSharing.OutputSnapshotCount);
+        Assert.True(withSharing.DatabaseBytes > withoutSharing.DatabaseBytes);
+        Assert.True(withSharing.IndexBytes > withoutSharing.IndexBytes);
+        Assert.True(withSharing.WalBytes > withoutSharing.WalBytes);
+        Assert.True(withSharing.SafetyReserveBytes >= withoutSharing.SafetyReserveBytes);
     }
 
     internal sealed class StubDiskSpaceProbe(long availableBytes) : IDiskSpaceProbe
