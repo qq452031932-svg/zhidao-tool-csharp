@@ -322,6 +322,82 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Contains("继续", vm.PrecheckStatusMessage);
     }
 
+    [Fact]
+    public async Task ReloadAccountsPreservesSurvivingSettingsAndInvalidatesConfirmation()
+    {
+        var original = Accounts(3);
+        var vm = Create(original, ready: 3);
+        vm.SelectMode(TransferMode.Distribution);
+        foreach (var account in vm.Accounts)
+        {
+            account.IsSelected = true;
+            account.TargetSuccessCount = 1;
+        }
+        vm.Accounts[0].DefaultTargetPath = "/A";
+        vm.Accounts[2].DefaultTargetPath = "/C";
+        await vm.PrepareConfirmationAsync();
+        vm.IsFinalConfirmationChecked = true;
+        Assert.Equal("preview-token", vm.ConfirmationToken);
+
+        vm.ReloadAccounts([original[0], original[2]]);
+
+        Assert.Equal([original[0].AccountId, original[2].AccountId], vm.Accounts.Select(x => x.AccountId));
+        Assert.All(vm.Accounts, account => Assert.True(account.IsSelected));
+        Assert.Equal(["/A", "/C"], vm.Accounts.Select(x => x.DefaultTargetPath));
+        Assert.All(vm.Accounts, account => Assert.Equal(1, account.TargetSuccessCount));
+        Assert.Null(vm.ConfirmationToken);
+        Assert.False(vm.IsFinalConfirmationChecked);
+    }
+
+    [Fact]
+    public void ReloadToOneAccountDefaultsSelectionButStillRequiresFreshConfirmation()
+    {
+        var original = Accounts(2);
+        var source = new FakePageSource([], 4, null);
+        var vm = Create(original, ready: 4, pageSource: source);
+
+        vm.ReloadAccounts([original[0]]);
+
+        var remaining = Assert.Single(vm.Accounts);
+        Assert.True(remaining.IsSelected);
+        Assert.Equal(TransferMode.Distribution, vm.TransferMode);
+        Assert.Equal(4, remaining.TargetItemCount);
+        Assert.Contains("已自动选择唯一可用账号", vm.AccountSelectionNotice);
+        Assert.False(vm.CanCreateJob);
+        Assert.Empty(source.Requests);
+    }
+
+    [Fact]
+    public async Task AccountReloadMakesAnInflightConfirmationStale()
+    {
+        var accounts = Accounts(2);
+        var gateway = new DelayedBatchGateway();
+        var vm = Create(accounts, ready: 2, gateway: gateway);
+        vm.SelectMode(TransferMode.Distribution);
+        foreach (var account in vm.Accounts)
+        {
+            account.IsSelected = true;
+            account.TargetSuccessCount = 1;
+        }
+
+        var preparing = vm.PrepareConfirmationAsync();
+        await gateway.Started.Task;
+        vm.ReloadAccounts([accounts[0]]);
+        gateway.Complete();
+        await preparing;
+
+        Assert.Null(vm.ConfirmationToken);
+        Assert.False(vm.IsFinalConfirmationChecked);
+    }
+
+    [Fact]
+    public void ReloadAccountsRejectsUnboundedInput()
+    {
+        var vm = Create([], ready: 1);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => vm.ReloadAccounts(Accounts(1_001)));
+    }
+
     private static CreateJobWizardViewModel Create(
         IReadOnlyList<WizardAccountOption> accounts,
         int ready,
@@ -419,6 +495,28 @@ public sealed class CreateJobWizardViewModelTests
             ConfirmedToken = confirmationToken;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class DelayedBatchGateway : IWizardBatchService
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<WizardConfirmationSummary> PreviewAsync(
+            WizardBatchDraft draft,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return new(draft.ReadyResourceCount, draft.ReadyResourceCount, "stale-token", true);
+        }
+
+        public Task ConfirmAsync(
+            WizardBatchDraft draft,
+            string confirmationToken,
+            CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public void Complete() => release.TrySetResult();
     }
 
     private sealed class FakeDialogService : IDialogService

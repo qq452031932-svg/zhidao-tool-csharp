@@ -5,7 +5,7 @@
         WindowStartupLocation="CenterScreen">
     <Grid Background="{StaticResource PageBrush}">
         <Grid.RowDefinitions>
-            <RowDefinition Height="64" />
+            <RowDefinition Height="76" />
             <RowDefinition Height="*" />
             <RowDefinition Height="36" />
         </Grid.RowDefinitions>
@@ -19,7 +19,19 @@
                     <TextBlock Text="{Binding ApplicationTitle}" FontSize="22" FontWeight="SemiBold" />
                     <TextBlock Text="仅支持百度网盘 · 批量任务由本机安全调度" Foreground="{StaticResource MutedBrush}" FontSize="12" />
                 </StackPanel>
-                <Button Grid.Column="1" Content="添加百度账号" Command="{Binding OpenAccountLoginCommand}" VerticalAlignment="Center" />
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" KeyboardNavigation.TabNavigation="Local">
+                        <Button Content="添加百度账号" Command="{Binding OpenAccountLoginCommand}"
+                                TabIndex="0" MinWidth="118" />
+                        <Button Content="账号管理" Command="{Binding OpenAccountManagementCommand}"
+                                TabIndex="1" MinWidth="96" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
+                        <TextBlock Text="{Binding AccountStatusMessage}" Foreground="#52677B" FontSize="12" />
+                        <TextBlock Text=" · " Foreground="#8A9BAB" FontSize="12" />
+                        <TextBlock Text="{Binding AccountManagementStatusMessage}" Foreground="#52677B" FontSize="12" />
+                    </StackPanel>
+                </StackPanel>
             </Grid>
         </Border>
         <Grid Grid.Row="1">

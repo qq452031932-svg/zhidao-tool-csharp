@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Accounts;
 
 namespace BaiduBatchTransfer.App.Tests;
 
@@ -15,6 +16,8 @@ public sealed class MainWindowViewModelTests
         Assert.Equal("百度批量转存", vm.ApplicationTitle);
         Assert.False(vm.OpenAccountLoginCommand.CanExecute(null));
         Assert.Contains("尚不可用", vm.AdapterStatusMessage);
+        Assert.False(vm.OpenAccountManagementCommand.CanExecute(null));
+        Assert.Contains("尚不可用", vm.AccountManagementStatusMessage);
 
         vm.ShowCreateJobCommand.Execute(null);
 
@@ -33,6 +36,79 @@ public sealed class MainWindowViewModelTests
         Assert.DoesNotContain("InvalidOperationException", vm.StatusMessage);
     }
 
+    [Fact]
+    public async Task SuccessfulLoginRefreshesVisibleAccountCount()
+    {
+        var login = new FakeLoginLauncher { IsAvailableValue = true };
+        var refreshCalls = 0;
+        var vm = new MainWindowViewModel(
+            new object(), new object(), login,
+            refreshAccounts: _ =>
+            {
+                refreshCalls++;
+                return Task.FromResult(1);
+            },
+            initialActiveAccountCount: 0);
+
+        Assert.Equal("尚未登录百度账号", vm.AccountStatusMessage);
+
+        await vm.OpenAccountLoginAsync();
+
+        Assert.Equal("已登录 1 个百度账号", vm.AccountStatusMessage);
+        Assert.Equal(1, refreshCalls);
+    }
+
+    [Theory]
+    [InlineData(AccountExitStatus.Removed)]
+    [InlineData(AccountExitStatus.CleanupPending)]
+    public async Task CommittedManagementCloseRefreshesCountAndDisablesCommandsWhileBusy(
+        AccountExitStatus status)
+    {
+        var management = new FakeManagementLauncher
+        {
+            Result = new AccountManagementRefreshResult(true, status),
+            Delay = true,
+        };
+        var refreshCalls = 0;
+        var vm = new MainWindowViewModel(
+            new object(), new object(), new FakeLoginLauncher { IsAvailableValue = true },
+            management,
+            _ =>
+            {
+                refreshCalls++;
+                return Task.FromResult(2);
+            },
+            initialActiveAccountCount: 3);
+
+        var opening = vm.OpenAccountManagementAsync();
+        await management.Started.Task;
+
+        Assert.False(vm.OpenAccountManagementCommand.CanExecute(null));
+        Assert.False(vm.OpenAccountLoginCommand.CanExecute(null));
+        Assert.Contains("正在", vm.AccountManagementStatusMessage);
+
+        management.Complete();
+        await opening;
+
+        Assert.Equal(1, refreshCalls);
+        Assert.Equal("已登录 2 个百度账号", vm.AccountStatusMessage);
+        Assert.True(vm.OpenAccountManagementCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ManagementFailureUsesSafeChineseText()
+    {
+        var management = new FakeManagementLauncher { Throw = true };
+        var vm = new MainWindowViewModel(
+            new object(), new object(), new FakeLoginLauncher { IsAvailableValue = true }, management);
+
+        await vm.OpenAccountManagementAsync();
+
+        Assert.Equal("无法打开账号管理，请稍后重试。", vm.StatusMessage);
+        Assert.DoesNotContain("secret-account-id", vm.StatusMessage);
+        Assert.DoesNotContain("InvalidOperationException", vm.StatusMessage);
+    }
+
     private sealed class FakeLoginLauncher : IAccountLoginLauncher
     {
         public bool IsAvailableValue { get; init; }
@@ -41,5 +117,29 @@ public sealed class MainWindowViewModelTests
         public string StatusMessage => IsAvailable ? string.Empty : "百度登录适配器尚不可用。";
         public Task OpenAsync(CancellationToken cancellationToken = default) =>
             Throw ? throw new InvalidOperationException("secret") : Task.CompletedTask;
+    }
+
+    private sealed class FakeManagementLauncher : IAccountManagementLauncher
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public event EventHandler<AccountManagementRefreshEventArgs>? RefreshRequested
+        {
+            add { }
+            remove { }
+        }
+        public AccountManagementRefreshResult Result { get; init; } = AccountManagementRefreshResult.None;
+        public bool Delay { get; init; }
+        public bool Throw { get; init; }
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<AccountManagementRefreshResult> OpenAsync(CancellationToken cancellationToken = default)
+        {
+            Started.TrySetResult();
+            if (Throw) throw new InvalidOperationException("secret-account-id C:\\private\\profile token");
+            if (Delay) await release.Task.WaitAsync(cancellationToken);
+            return Result;
+        }
+
+        public void Complete() => release.TrySetResult();
     }
 }

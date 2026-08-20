@@ -293,6 +293,86 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         OnPropertyChanged(nameof(CurrentImportSessionId));
     }
 
+    public void ReloadAccounts(IReadOnlyList<WizardAccountOption> accounts)
+    {
+        ArgumentNullException.ThrowIfNull(accounts);
+        if (accounts.Count > 1_000)
+            throw new ArgumentOutOfRangeException(nameof(accounts), "账号列表一次最多可刷新 1,000 项。");
+
+        var previousCount = Accounts.Count;
+        var previous = Accounts.ToDictionary(account => account.AccountId);
+        var eligible = accounts
+            .Where(IsEligible)
+            .GroupBy(account => account.AccountId)
+            .Select(group => group.First())
+            .OrderBy(account => account.DisplayName, StringComparer.CurrentCulture)
+            .ToArray();
+
+        suppressInvalidation = true;
+        try
+        {
+            foreach (var account in Accounts) account.PropertyChanged -= AccountChanged;
+            Accounts.Clear();
+            options.Clear();
+            options.AddRange(eligible);
+
+            foreach (var option in eligible)
+            {
+                var replacement = new AccountAllocationRowViewModel(option, defaultTargetPath);
+                if (previous.TryGetValue(option.AccountId, out var existing))
+                {
+                    replacement.IsSelected = existing.IsSelected;
+                    replacement.TargetItemCount = existing.TargetItemCount;
+                    replacement.TargetSuccessCount = existing.TargetSuccessCount;
+                    replacement.DefaultTargetPath = existing.DefaultTargetPath;
+                    replacement.AllocationPercentage = existing.AllocationPercentage;
+                }
+                replacement.PropertyChanged += AccountChanged;
+                Accounts.Add(replacement);
+            }
+
+            if (Accounts.Count == 0)
+            {
+                transferMode = null;
+                precheckAccountId = null;
+                AccountSelectionNotice = "没有可用账号，请先完成账号登录。";
+            }
+            else if (Accounts.Count == 1)
+            {
+                var account = Accounts[0];
+                transferMode = Core.Domain.TransferMode.Distribution;
+                account.IsSelected = true;
+                account.TargetItemCount = readyResourceCount;
+                if (account.TargetSuccessCount <= 0)
+                    account.TargetSuccessCount = account.OriginalTargetSuccessCount > 0
+                        ? account.OriginalTargetSuccessCount
+                        : readyResourceCount;
+                if (UseBulkPrecheck) precheckAccountId = account.AccountId;
+                AccountSelectionNotice = $"已自动选择唯一可用账号：{account.DisplayName}，请在确认页核对。";
+            }
+            else
+            {
+                if (previousCount <= 1) transferMode = null;
+                if (precheckAccountId is { } selectedPrecheck &&
+                    Accounts.All(account => account.AccountId != selectedPrecheck))
+                    precheckAccountId = null;
+                AccountSelectionNotice = transferMode is null
+                    ? "请选择多账号复制或多账号分流。"
+                    : "账号列表已刷新，请重新核对分配。";
+            }
+        }
+        finally
+        {
+            suppressInvalidation = false;
+        }
+
+        PrecheckStatusMessage = string.Empty;
+        OnPropertyChanged(nameof(PrecheckAccountId));
+        OnPropertyChanged(nameof(AccountSelectionNotice));
+        InvalidateConfirmation();
+        RaiseAll();
+    }
+
     public void SelectMode(TransferMode mode)
     {
         if (transferMode == mode) return;

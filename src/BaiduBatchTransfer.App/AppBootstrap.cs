@@ -2,12 +2,18 @@ using System.Reflection;
 using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.BaiduAdapter.Authentication;
+using BaiduBatchTransfer.BaiduAdapter.Http;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
+using BaiduBatchTransfer.Infrastructure.Excel;
+using BaiduBatchTransfer.Infrastructure.Security;
 using BaiduBatchTransfer.Infrastructure.SystemIntegration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -22,11 +28,13 @@ public sealed record AppDataPaths
         RootDirectory = Path.GetFullPath(rootDirectory);
         DatabasePath = EnsureChild(Path.Combine(RootDirectory, "data", "baidu-batch-transfer.db"));
         BackupDirectory = EnsureChild(Path.Combine(RootDirectory, "backups"));
+        ProfileDirectory = EnsureChild(Path.Combine(RootDirectory, "profiles"));
     }
 
     public string RootDirectory { get; }
     public string DatabasePath { get; }
     public string BackupDirectory { get; }
+    public string ProfileDirectory { get; }
 
     private string EnsureChild(string path)
     {
@@ -71,6 +79,13 @@ public static class AppBootstrap
 
         services.AddSingleton<ImportPageQuery>();
         services.AddSingleton<IImportPreviewPageSource, ImportPreviewPageSource>();
+        services.AddSingleton<TextImportParser>();
+        services.AddSingleton<OpenXmlImportReader>();
+        services.AddSingleton<IShareLinkResolver, DeferredShareLinkResolver>();
+        services.AddSingleton(sp => new ImportStagingService(
+            cancellationToken => sp.GetRequiredService<IUnitOfWorkFactory>().BeginAsync(cancellationToken),
+            sp.GetRequiredService<IShareLinkResolver>()));
+        services.AddSingleton<IImportWorkflow, LocalImportWorkflow>();
         services.AddSingleton<TransferModeReclassificationService>();
         services.AddSingleton<RequestedAccountMappingService>();
         services.AddSingleton<DraftRowEditingService>();
@@ -83,15 +98,51 @@ public static class AppBootstrap
         services.AddSingleton<CreateBatchService>();
         services.AddSingleton<IWizardBatchService, WizardBatchService>();
 
-        // Task4 尚未通过真人扫码验证，因此这里明确保持不可用，也不注册 IBaiduNetdiskAdapter。
+        services.AddSingleton<BaiduSessionIdentityClient>();
+        services.AddSingleton<IBaiduNetdiskAdapter, LiveBaiduNetdiskAdapter>();
+        services.AddSingleton<WebViewCookieSessionBridge>();
+        services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
+        services.AddSingleton(_ => new FileSystemAccountProfilePathPolicy(paths.ProfileDirectory));
+        services.AddSingleton<IAccountProfilePathPolicy>(sp =>
+            sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
+        services.AddSingleton<WebView2ProfileCloser>();
+        services.AddSingleton<IWebViewProfileCloser>(sp => sp.GetRequiredService<WebView2ProfileCloser>());
+        services.AddSingleton<FileSystemWebViewProfileStore>();
+        services.AddSingleton<IWebViewProfileStore>(sp => sp.GetRequiredService<FileSystemWebViewProfileStore>());
+        services.AddSingleton<LoginProfileBootstrapper>();
+        services.AddSingleton<AddAccountService>();
+        services.AddSingleton<IBaiduLoginWindowPresenter, BaiduLoginWindowPresenter>();
+        services.AddSingleton<IAccountLoginLauncher, BaiduAccountLoginLauncher>();
+
+        services.AddSingleton<SqliteAccountRemovalStore>();
+        services.AddSingleton<IAccountRemovalStore>(sp =>
+            sp.GetRequiredService<SqliteAccountRemovalStore>());
+        services.AddSingleton(sp => new RemoveAccountService(
+            sp.GetRequiredService<IUnitOfWorkFactory>(),
+            sp.GetRequiredService<IWebViewProfileStore>(),
+            sp.GetRequiredService<IAccountProfilePathPolicy>()));
+        // 管理窗口只走已在 SQLite 事务中完成凭据清除后的收尾路径。
+        services.AddSingleton(sp => new AccountRemovalCoordinator(
+            sp.GetRequiredService<IAccountRemovalStore>(),
+            sp.GetRequiredService<IWebViewProfileStore>(),
+            sp.GetRequiredService<IAccountProfilePathPolicy>()));
+        services.AddSingleton<IAccountRemovalOperations, AccountRemovalOperations>();
+        services.AddSingleton<IAccountManagementOwnedPrompt, WpfAccountManagementOwnedPrompt>();
+        services.AddTransient<Func<IAccountManagementConfirmation, AccountManagementWindow>>(sp =>
+            confirmation => new AccountManagementWindow(new AccountManagementViewModel(
+                sp.GetRequiredService<IAccountRemovalOperations>(),
+                confirmation)));
+        services.AddSingleton<IAccountManagementWindowPresenter, AccountManagementWindowPresenter>();
+        services.AddSingleton<IAccountManagementLauncher, AccountManagementLauncher>();
+
+        // 真人扫码仅开放账号登录；实际转存方法尚未逐项通过现场门禁，继续禁止开始任务。
         services.AddSingleton<IAdapterAvailability, UnavailableAdapterAvailability>();
-        services.AddSingleton<IAccountLoginLauncher, UnavailableAccountLoginLauncher>();
-        services.AddSingleton<IImportWorkflow, UnavailableImportWorkflow>();
         services.AddSingleton<AppRuntimeState>();
         services.AddSingleton<IAppRecoveryRunner, StartupRecoveryRunner>();
         services.AddSingleton<AppStartupController>();
         services.AddSingleton<IDialogService, DialogService>();
         services.AddSingleton<IWizardAccountProvider, WizardAccountProvider>();
+        services.AddSingleton<IAccountSummaryProvider, WizardAccountSummaryProvider>();
         services.AddSingleton<IAppShellFactory, AppShellFactory>();
     }
 }
@@ -99,6 +150,12 @@ public static class AppBootstrap
 public interface IWizardAccountProvider
 {
     Task<IReadOnlyList<WizardAccountOption>> LoadEligibleAsync(CancellationToken cancellationToken = default);
+}
+
+public sealed class WizardAccountSummaryProvider(IWizardAccountProvider accountProvider) : IAccountSummaryProvider
+{
+    public async Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default) =>
+        (await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(false)).Count;
 }
 
 public sealed class WizardAccountProvider(IUnitOfWorkFactory unitOfWorkFactory) : IWizardAccountProvider
@@ -144,6 +201,7 @@ public sealed class AppShellFactory(
     IDialogService dialogService,
     IAdapterAvailability adapterAvailability,
     IAccountLoginLauncher loginLauncher,
+    IAccountManagementLauncher accountManagementLauncher,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -154,6 +212,20 @@ public sealed class AppShellFactory(
         var importViewModel = new ImportViewModel(importWorkflow, pageSource, dialogService, adapterAvailability);
         var wizardViewModel = new CreateJobWizardViewModel(
             accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow);
+        long refreshGeneration = 0;
+        async Task<int> RefreshAccountsAsync(CancellationToken token)
+        {
+            var generation = Interlocked.Increment(ref refreshGeneration);
+            var refreshed = await accountProvider.LoadEligibleAsync(token).ConfigureAwait(true);
+            if (generation != Volatile.Read(ref refreshGeneration))
+                return wizardViewModel.Accounts.Count;
+
+            void Apply() => wizardViewModel.ReloadAccounts(refreshed);
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess()) Apply();
+            else await dispatcher.InvokeAsync(Apply);
+            return refreshed.Count;
+        }
         importViewModel.DraftReady += (_, draft) => wizardViewModel.Initialize(new ImportWizardContext(
             draft.SessionId,
             $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
@@ -165,7 +237,13 @@ public sealed class AppShellFactory(
             "/我的资源"));
         var importView = new ImportView(importViewModel);
         var wizardView = new CreateJobWizardView(wizardViewModel);
-        var mainViewModel = new MainWindowViewModel(importView, wizardView, loginLauncher);
+        var mainViewModel = new MainWindowViewModel(
+            importView,
+            wizardView,
+            loginLauncher,
+            accountManagementLauncher,
+            RefreshAccountsAsync,
+            accounts.Count);
         return new MainWindow(mainViewModel);
     }
 }

@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Accounts;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -9,19 +10,37 @@ public sealed class MainWindowViewModel : ObservableObject
     private readonly object importPage;
     private readonly object createJobPage;
     private readonly IAccountLoginLauncher loginLauncher;
+    private readonly IAccountManagementLauncher? accountManagementLauncher;
+    private readonly Func<CancellationToken, Task<int>>? refreshAccounts;
     private object currentContent;
     private string currentPageTitle = "导入与草稿";
     private string statusMessage = "就绪";
+    private string accountStatusMessage;
+    private bool isAccountOperationBusy;
 
-    public MainWindowViewModel(object importPage, object createJobPage, IAccountLoginLauncher loginLauncher)
+    public MainWindowViewModel(
+        object importPage,
+        object createJobPage,
+        IAccountLoginLauncher loginLauncher,
+        IAccountManagementLauncher? accountManagementLauncher = null,
+        Func<CancellationToken, Task<int>>? refreshAccounts = null,
+        int initialActiveAccountCount = 0)
     {
         this.importPage = importPage ?? throw new ArgumentNullException(nameof(importPage));
         this.createJobPage = createJobPage ?? throw new ArgumentNullException(nameof(createJobPage));
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
+        this.accountManagementLauncher = accountManagementLauncher;
+        this.refreshAccounts = refreshAccounts;
+        accountStatusMessage = FormatAccountStatus(initialActiveAccountCount);
         currentContent = importPage;
         ShowImportCommand = new RelayCommand(ShowImport);
         ShowCreateJobCommand = new RelayCommand(ShowCreateJob);
-        OpenAccountLoginCommand = new AsyncRelayCommand(OpenAccountLoginAsync, () => loginLauncher.IsAvailable);
+        OpenAccountLoginCommand = new AsyncRelayCommand(
+            OpenAccountLoginAsync,
+            () => loginLauncher.IsAvailable && !IsAccountOperationBusy);
+        OpenAccountManagementCommand = new AsyncRelayCommand(
+            OpenAccountManagementAsync,
+            () => accountManagementLauncher is not null && !IsAccountOperationBusy);
     }
 
     public string ApplicationTitle => "百度批量转存";
@@ -29,9 +48,27 @@ public sealed class MainWindowViewModel : ObservableObject
     public string CurrentPageTitle { get => currentPageTitle; private set => SetProperty(ref currentPageTitle, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string AdapterStatusMessage => loginLauncher.StatusMessage;
+    public string AccountStatusMessage { get => accountStatusMessage; private set => SetProperty(ref accountStatusMessage, value); }
+    public string AccountManagementStatusMessage => accountManagementLauncher is null
+        ? "账号管理尚不可用。"
+        : IsAccountOperationBusy
+            ? "正在处理账号操作，请稍候。"
+            : "可管理已添加的百度账号。";
+    public bool IsAccountOperationBusy
+    {
+        get => isAccountOperationBusy;
+        private set
+        {
+            if (!SetProperty(ref isAccountOperationBusy, value)) return;
+            OnPropertyChanged(nameof(AccountManagementStatusMessage));
+            OpenAccountLoginCommand.NotifyCanExecuteChanged();
+            OpenAccountManagementCommand.NotifyCanExecuteChanged();
+        }
+    }
     public IRelayCommand ShowImportCommand { get; }
     public IRelayCommand ShowCreateJobCommand { get; }
     public IAsyncRelayCommand OpenAccountLoginCommand { get; }
+    public IAsyncRelayCommand OpenAccountManagementCommand { get; }
 
     public async Task OpenAccountLoginAsync(CancellationToken cancellationToken = default)
     {
@@ -40,10 +77,13 @@ public sealed class MainWindowViewModel : ObservableObject
             StatusMessage = loginLauncher.StatusMessage;
             return;
         }
+        if (IsAccountOperationBusy) return;
+        IsAccountOperationBusy = true;
         try
         {
-            await loginLauncher.OpenAsync(cancellationToken).ConfigureAwait(false);
-            StatusMessage = "账号登录窗口已打开，请按提示扫码。";
+            await loginLauncher.OpenAsync(cancellationToken).ConfigureAwait(true);
+            await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
+            StatusMessage = "账号登录窗口已关闭，账号状态已刷新。";
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -53,7 +93,60 @@ public sealed class MainWindowViewModel : ObservableObject
         {
             StatusMessage = "无法打开账号登录，请稍后重试。";
         }
+        finally
+        {
+            IsAccountOperationBusy = false;
+        }
     }
+
+    public async Task OpenAccountManagementAsync(CancellationToken cancellationToken = default)
+    {
+        if (accountManagementLauncher is null)
+        {
+            StatusMessage = "账号管理尚不可用。";
+            return;
+        }
+        if (IsAccountOperationBusy) return;
+        IsAccountOperationBusy = true;
+        try
+        {
+            var result = await accountManagementLauncher.OpenAsync(cancellationToken).ConfigureAwait(true);
+            if (result.RefreshRequired &&
+                result.Status is AccountExitStatus.Removed or AccountExitStatus.CleanupPending)
+            {
+                await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
+                StatusMessage = result.Status == AccountExitStatus.Removed
+                    ? "账号已退出，账号列表已刷新。"
+                    : "账号已退出，本机登录数据待继续清理；账号列表已刷新。";
+            }
+            else
+            {
+                StatusMessage = "账号管理窗口已关闭。";
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            StatusMessage = "已取消打开账号管理。";
+        }
+        catch (Exception)
+        {
+            StatusMessage = "无法打开账号管理，请稍后重试。";
+        }
+        finally
+        {
+            IsAccountOperationBusy = false;
+        }
+    }
+
+    private async Task RefreshAccountsAsync(CancellationToken cancellationToken)
+    {
+        if (refreshAccounts is null) return;
+        var count = await refreshAccounts(cancellationToken).ConfigureAwait(true);
+        AccountStatusMessage = FormatAccountStatus(count);
+    }
+
+    private static string FormatAccountStatus(int count) =>
+        count > 0 ? $"已登录 {count:N0} 个百度账号" : "尚未登录百度账号";
 
     private void ShowImport()
     {
