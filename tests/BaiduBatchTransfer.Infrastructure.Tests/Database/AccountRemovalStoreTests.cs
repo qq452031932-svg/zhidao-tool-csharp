@@ -319,6 +319,35 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CancellationAfterCredentialClearRollsBackAccountBytesAndEveryTable()
+    {
+        var (factory, normal, _) = await CreateAsync(seedGraph: true);
+        var preview = await normal.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        var beforeAccount = await ReadAccountAsync(factory, B);
+        var beforeDatabase = await ReadAllPersistentDataAsync(factory);
+        using var cancellation = new CancellationTokenSource();
+        var cancelling = new SqliteAccountRemovalStore(factory, null, null, async (connection, transaction, ct) =>
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT Status,EncryptedSession FROM Accounts WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", Id(B));
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            Assert.True(await reader.ReadAsync(ct));
+            Assert.Equal("Disabled", reader.GetString(0));
+            Assert.True(reader.IsDBNull(1));
+            cancellation.Cancel();
+            await Task.FromCanceled(cancellation.Token);
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelling.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), cancellation.Token));
+
+        Assert.Equal(beforeAccount, await ReadAccountAsync(factory, B));
+        Assert.Equal(beforeDatabase, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
     public async Task ImmediateTransactionPreventsRealSchedulerAssigningBInValidationGap()
     {
         var (factory, normal, g) = await CreateAsync(seedGraph: true, busyTimeout: 5000);
@@ -433,6 +462,31 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var accountCount = await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;");
         await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(Guid.NewGuid(), RemovedAt, default));
         Assert.Equal(accountCount, await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;"));
+    }
+
+    public static IEnumerable<object[]> UnsafeDeletedCorruptions()
+    {
+        yield return ["UPDATE Accounts SET IsEnabled=1 WHERE Id=$id;"];
+        yield return ["UPDATE Accounts SET EncryptedSession=X'010203' WHERE Id=$id;"];
+        yield return ["UPDATE Accounts SET WebView2ProfileDirectory='retained-profile' WHERE Id=$id;"];
+        yield return ["UPDATE Accounts SET LastValidatedAt='2026-08-20T09:00:00Z' WHERE Id=$id;"];
+        yield return ["UPDATE Accounts SET DeletedAt=NULL WHERE Id=$id;"];
+    }
+
+    [Theory]
+    [MemberData(nameof(UnsafeDeletedCorruptions))]
+    public async Task FinalizeRefusesUnsafeRowsThatOnlyClaimToBeDeleted(string corruption)
+    {
+        var (factory, store, _) = await CreateAsync();
+        await ExecuteAsync(factory,
+            "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;", ("$id", Id(B)));
+        await store.FinalizeTombstoneAsync(B, RemovedAt, default);
+        await ExecuteAsync(factory, corruption, ("$id", Id(B)));
+        var before = await ReadAccountAsync(factory, B);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(B, RemovedAt.AddHours(1), default));
+
+        Assert.Equal(before, await ReadAccountAsync(factory, B));
     }
 
     [Fact]
@@ -565,6 +619,37 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.True(await r.ReadAsync());
         return new(r.GetString(0), r.GetInt64(1) != 0, r.IsDBNull(2) ? null : Convert.ToHexString((byte[])r.GetValue(2)), r.IsDBNull(3) ? null : r.GetString(3),
             r.GetInt64(4) != 0, r.IsDBNull(5) ? null : r.GetString(5), r.IsDBNull(6) ? null : r.GetString(6));
+    }
+
+    private static async Task<string> ReadAllPersistentDataAsync(SqliteConnectionFactory factory)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        var tables = new List<string>();
+        await using (var names = connection.CreateCommand())
+        {
+            names.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;";
+            await using var reader = await names.ExecuteReaderAsync();
+            while (await reader.ReadAsync()) tables.Add(reader.GetString(0));
+        }
+        var snapshot = new StringBuilder();
+        foreach (var table in tables)
+        {
+            snapshot.Append("T:").Append(table).AppendLine();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"SELECT * FROM \"{table.Replace("\"", "\"\"")}\" ORDER BY rowid;";
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+                {
+                    if (reader.IsDBNull(ordinal)) snapshot.Append("N;");
+                    else if (reader.GetValue(ordinal) is byte[] bytes) snapshot.Append("B:").Append(Convert.ToHexString(bytes)).Append(';');
+                    else snapshot.Append("V:").Append(Convert.ToString(reader.GetValue(ordinal), System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+                }
+                snapshot.AppendLine();
+            }
+        }
+        return snapshot.ToString();
     }
 
     private static async Task AssertUnchangedAsync(SqliteConnectionFactory f)

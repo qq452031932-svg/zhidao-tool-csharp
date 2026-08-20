@@ -18,22 +18,31 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     private readonly SqliteConnectionFactory factory;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot;
+    private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterCredentialClearBeforeCommit;
 
-    public SqliteAccountRemovalStore(SqliteConnectionFactory factory) : this(factory, null, null) { }
+    public SqliteAccountRemovalStore(SqliteConnectionFactory factory) : this(factory, null, null, null) { }
 
     internal SqliteAccountRemovalStore(
         SqliteConnectionFactory factory,
         Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation) :
-        this(factory, afterFinalValidation, null) { }
+        this(factory, afterFinalValidation, null, null) { }
 
     internal SqliteAccountRemovalStore(
         SqliteConnectionFactory factory,
         Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation,
-        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot)
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot) :
+        this(factory, afterFinalValidation, afterPreviewSnapshot, null) { }
+
+    internal SqliteAccountRemovalStore(
+        SqliteConnectionFactory factory,
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation,
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot,
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterCredentialClearBeforeCommit)
     {
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
         this.afterFinalValidation = afterFinalValidation;
         this.afterPreviewSnapshot = afterPreviewSnapshot;
+        this.afterCredentialClearBeforeCommit = afterCredentialClearBeforeCommit;
     }
 
     public async Task<AccountPage> GetAccountsPageAsync(int pageNumber, int pageSize, CancellationToken token)
@@ -115,6 +124,9 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                 return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.StaleConfirmation, request.AccountId, StaleMessage).ConfigureAwait(false);
         }
 
+        if (afterCredentialClearBeforeCommit is not null)
+            await afterCredentialClearBeforeCommit(connection, transaction, token).ConfigureAwait(false);
+
         await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
         await transaction.CommitAsync(token).ConfigureAwait(false);
         return new AccountRemovalPreparation(AccountRemovalPreparationStatus.Prepared, request.AccountId,
@@ -136,7 +148,17 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         if (changed != 1)
         {
             var alreadyDeleted = await ScalarLongAsync(connection, transaction,
-                "SELECT COUNT(*) FROM Accounts WHERE Id=$id AND Status='Deleted' AND IsDeleted=1;",
+                """
+                SELECT COUNT(*) FROM Accounts
+                WHERE Id=$id
+                  AND Status='Deleted'
+                  AND IsDeleted=1
+                  AND IsEnabled=0
+                  AND EncryptedSession IS NULL
+                  AND WebView2ProfileDirectory IS NULL
+                  AND LastValidatedAt IS NULL
+                  AND DeletedAt IS NOT NULL;
+                """,
                 token, ("$id", Id(accountId))).ConfigureAwait(false) == 1;
             if (!alreadyDeleted)
             {
