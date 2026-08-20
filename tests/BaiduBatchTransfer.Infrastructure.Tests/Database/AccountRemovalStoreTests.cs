@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
+using System.Diagnostics;
 using System.Text;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
@@ -275,6 +276,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var (factory, store, _) = await CreateAsync(seedGraph: true);
         var beforeA = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A)));
         var beforeC = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
+        var beforeADaily = await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(A)));
+        var beforeCDaily = await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
         var beforeOtherOperations = await ReadRowsAsync(factory,
             "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C)));
         var beforeHistory = await ReadHistoryDataAsync(factory);
@@ -285,6 +290,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(Path.Combine(root, "profiles", "bravo"), result.ProfilePath);
         Assert.Equal(beforeA, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A))));
         Assert.Equal(beforeC, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
+        Assert.Equal(beforeADaily, await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(A))));
+        Assert.Equal(beforeCDaily, await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
         Assert.Equal(beforeOtherOperations, await ReadRowsAsync(factory,
             "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C))));
         Assert.Equal(beforeHistory, await ReadHistoryDataAsync(factory));
@@ -295,6 +304,29 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Null(b.ValidatedAt);
         Assert.Equal(2, await ScalarAsync(factory, "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$id;", ("$id", Id(B))));
         Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Fact]
+    public async Task KeepHistoryDoesNotTreatOtherAccountSharedWorkAsTargetAccountWork()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, """
+            UPDATE TransferOperations
+            SET Status='ResultPending',SubmitState='PendingConfirmation',TargetSlotState='Reserved'
+            WHERE AssignedAccountId=$account AND BatchJobId=$batch;
+            UPDATE ResourceItems
+            SET CandidateStatus='Reserved',ReservedAccountId=$account,ReservationExpiresAt='2026-08-21T00:00:00Z'
+            WHERE Id=$resource;
+            """, ("$account", Id(A)), ("$batch", Id(graph.SharedBatch)), ("$resource", Id(graph.SharedPublic)));
+        var beforeHistory = await ReadHistoryDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal(beforeHistory, await ReadHistoryDataAsync(factory));
     }
 
     [Fact]
@@ -352,6 +384,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var beforeC = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
         var beforeOtherOperations = await ReadRowsAsync(factory,
             "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C)));
+        var beforeADailyCounters = await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(A)));
+        var beforeCDailyCounters = await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
         var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
         Assert.Equal(4, preview.TerminalOperationCount);
         Assert.Equal(4, preview.TerminalBatchCount);
@@ -366,6 +402,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(beforeC, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
         Assert.Equal(beforeOtherOperations, await ReadRowsAsync(factory,
             "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C))));
+        Assert.Equal(beforeADailyCounters, await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(A))));
+        Assert.Equal(beforeCDailyCounters, await ScalarTextAsync(factory,
+            "SELECT DailyExecutedCount||','||DailyCountDateKey FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
         var b = await ReadAccountAsync(factory, B);
         Assert.Equal("Disabled", b.Status);
         Assert.False(b.Enabled);
@@ -542,6 +582,200 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
         Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
         Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Theory]
+    [InlineData("insert")]
+    [InlineData("move")]
+    [InlineData("field")]
+    [InlineData("duplicate")]
+    [InlineData("resource-reference")]
+    public async Task AnyReachableStagedRowClosureMutationMakesCleanupTokenStale(string mutation)
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var row = Guid.NewGuid();
+        var duplicate = Guid.NewGuid();
+        var externalImport = Guid.NewGuid();
+        await InsertImportAsync(factory, externalImport, "BatchCreated", A);
+        await InsertStagedRowAsync(factory, row, graph.Import, 1, null, "ready note");
+        await InsertStagedRowAsync(factory, duplicate, graph.Import, 2, row, "duplicate note");
+        await ExecuteAsync(factory, "UPDATE ResourceItems SET StagedImportRowId=$row WHERE Id=$resource;",
+            ("$row", Id(row)), ("$resource", Id(graph.BOnlyResource)));
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+
+        switch (mutation)
+        {
+            case "insert":
+                await InsertStagedRowAsync(factory, Guid.NewGuid(), graph.Import, 3, null, "inserted later");
+                break;
+            case "move":
+                await ExecuteAsync(factory, "UPDATE StagedImportRows SET ImportSessionId=$import WHERE Id=$row;",
+                    ("$import", Id(externalImport)), ("$row", Id(row)));
+                break;
+            case "field":
+                await ExecuteAsync(factory, "UPDATE StagedImportRows SET ValidationMessage='changed decision',UpdatedAt='2026-08-20T09:00:00Z' WHERE Id=$row;", ("$row", Id(row)));
+                break;
+            case "duplicate":
+                await ExecuteAsync(factory, "UPDATE StagedImportRows SET DuplicateOfStagedRowId=NULL WHERE Id=$row;", ("$row", Id(duplicate)));
+                break;
+            case "resource-reference":
+                await ExecuteAsync(factory, "UPDATE ResourceItems SET StagedImportRowId=$row WHERE Id=$resource;",
+                    ("$row", Id(duplicate)), ("$resource", Id(graph.SharedPublic)));
+                break;
+        }
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    public static IEnumerable<object[]> UnsafeCancelledEvidence()
+    {
+        yield return ["daily count", "DailyCountedAt='2026-08-20T05:00:00Z'"];
+        yield return ["descriptor", "ConfirmationDescriptorJson='{}'"];
+        yield return ["submit started", "SubmitStartedAt='2026-08-20T05:00:00Z'"];
+        yield return ["adapter request", "AdapterRequestId='request'"];
+        yield return ["remote ids", "RemoteItemIdsJson='[]'"];
+        yield return ["result received", "SubmitState='ResultReceived',ConfirmationDescriptorJson='{}'"];
+        yield return ["reserved slot", "TargetSlotState='Reserved'"];
+        yield return ["slot timestamp", "TargetSlotReservedAt='2026-08-20T05:00:00Z'"];
+        yield return ["lease", "LeaseExpiresAt='2026-08-20T05:10:00Z'"];
+    }
+
+    [Theory]
+    [MemberData(nameof(UnsafeCancelledEvidence))]
+    public async Task CancelledOperationWithSubmissionOrReservationEvidenceBlocksWithoutWrites(string _, string mutation)
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, """
+            UPDATE TransferOperations
+            SET Status='Cancelled',OutcomeKind='Cancelled',SubmitState='NotPrepared',TargetSlotState='Released',
+                DailyCountedAt=NULL,ConfirmationDescriptorJson=NULL,SubmitStartedAt=NULL,AdapterRequestId=NULL,
+                RemoteItemIdsJson=NULL,TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL
+            WHERE Id=$id;
+            """, ("$id", Id(graph.BOnlyOperation)));
+        var ready = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, ready.Status);
+        await ExecuteAsync(factory, $"UPDATE TransferOperations SET {mutation} WHERE Id=$id;", ("$id", Id(graph.BOnlyOperation)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, ready.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task UnsafeOtherAccountOperationInAffectedTerminalBatchBlocksWithoutWrites()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, """
+            UPDATE TransferOperations
+            SET Status='ResultPending',OutcomeKind=NULL,SubmitState='PendingConfirmation',TargetSlotState='Reserved',
+                ConfirmationDescriptorJson='{}'
+            WHERE BatchJobId=$batch AND AssignedAccountId=$account;
+            """, ("$batch", Id(graph.SharedBatch)), ("$account", Id(A)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task ReservedAffectedResourceBlocksWithoutOrphaningReservation()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, """
+            UPDATE ResourceItems SET CandidateStatus='Reserved',ReservedAccountId=$account,
+              ReservationExpiresAt='2026-08-20T10:00:00Z' WHERE Id=$resource;
+            """, ("$account", Id(B)), ("$resource", Id(graph.SharedPublic)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task NonterminalImportLinkedThroughAffectedGraphBlocksEvenWhenPrecheckedByA()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        await ExecuteAsync(factory, "UPDATE ImportSessions SET Status='Draft',PrecheckAccountId=$account WHERE Id=$id;",
+            ("$account", Id(A)), ("$id", Id(graph.Import)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task OtherAccountBoundLogPreventsWholeBatchDeletionAndIsNeverDeleted()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var import = Guid.NewGuid();
+        var batch = Guid.NewGuid();
+        var resource = Guid.NewGuid();
+        var operation = Guid.NewGuid();
+        var log = Guid.NewGuid();
+        await InsertImportAsync(factory, import, "BatchCreated", B);
+        await InsertBatchAsync(factory, batch, "Completed", import, 1, 1);
+        await ExecuteAsync(factory, "UPDATE ImportSessions SET CreatedBatchJobId=$batch WHERE Id=$id;", ("$batch", Id(batch)), ("$id", Id(import)));
+        await InsertAllocationAsync(factory, Guid.NewGuid(), batch, B, "/bravo");
+        await InsertResourceAsync(factory, resource, batch, 1, B, "Expanded", "https://bravo.invalid");
+        await InsertOperationAsync(factory, operation, resource, batch, B, 1, "Succeeded");
+        await InsertLogAsync(factory, log, batch, resource, operation, A);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(batch))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id;", ("$id", Id(import))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id=$id;", ("$id", Id(log))));
+        Assert.Equal("0,0", await ScalarTextAsync(factory, "SELECT ResourceCount||','||OperationCount FROM BatchJobs WHERE Id='" + Id(batch) + "';"));
+    }
+
+    [Fact]
+    public async Task RepresentativeSharedCleanupRepairsGroupedCountersWithinStableBudget()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        const int itemsPerAccount = 300;
+        await SeedRepresentativeSharedHistoryAsync(factory, graph.SharedBatch, itemsPerAccount);
+
+        var stopwatch = Stopwatch.StartNew();
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+        stopwatch.Stop();
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(20), $"Representative cleanup took {stopwatch.Elapsed}.");
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND AssignedAccountId=$account;",
+            ("$batch", Id(graph.SharedBatch)), ("$account", Id(B))));
+        Assert.Equal(await ScalarAsync(factory,
+                "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND AssignedAccountId=$account;",
+                ("$batch", Id(graph.SharedBatch)), ("$account", Id(A))),
+            await ScalarAsync(factory,
+                "SELECT AssignedItemCount FROM AccountAllocations WHERE BatchJobId=$batch AND AccountId=$account;",
+                ("$batch", Id(graph.SharedBatch)), ("$account", Id(A))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
     }
 
     [Fact]
@@ -842,6 +1076,22 @@ public sealed class AccountRemovalStoreTests : IDisposable
         VALUES($id,'Excel','safe.xlsx',$status,0,0,0,0,0,$account,NULL,NULL,$at,$at);
         """, ("$id", Id(id)), ("$status", status), ("$account", Id(account)), ("$at", "2026-08-20T04:00:00Z"));
 
+    private static Task InsertStagedRowAsync(
+        SqliteConnectionFactory factory,
+        Guid id,
+        Guid import,
+        int rowNumber,
+        Guid? duplicateOf,
+        string note) => ExecuteAsync(factory, """
+            INSERT INTO StagedImportRows(Id,ImportSessionId,SourceRowNumber,ShareUrl,NormalizedShareId,ExtractionCode,TargetPath,
+              CreateFolderName,RequestedAccountName,MappedAccountId,Note,Disposition,DuplicateOfStagedRowId,ValidationMessage,
+              PrecheckStatus,PrecheckErrorCode,PrecheckedAt,UpdatedAt)
+            VALUES($id,$import,$row,'https://staged.invalid',$share,'code','/target','folder','Bravo',$account,$note,
+              $disposition,$duplicate,'safe validation','Succeeded',NULL,$at,$at);
+            """, ("$id", Id(id)), ("$import", Id(import)), ("$row", rowNumber), ("$share", $"staged-{id:N}"),
+            ("$account", Id(B)), ("$note", note), ("$disposition", duplicateOf is null ? "Ready" : "Duplicate"),
+            ("$duplicate", duplicateOf is null ? null : Id(duplicateOf.Value)), ("$at", "2026-08-20T04:15:00Z"));
+
     private static async Task SeedGraphAsync(SqliteConnectionFactory factory, Graph g)
     {
         await ExecuteAsync(factory, """
@@ -892,6 +1142,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     private static Task InsertOperationAsync(SqliteConnectionFactory f, Guid id, Guid resource, Guid batch, Guid account, int sequence, string status)
     {
         var terminal = status is "Succeeded" or "Failed" or "Cancelled";
+        var completedSubmission = status is "Succeeded" or "Failed";
         return ExecuteAsync(f, """
             INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,
               AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,
@@ -901,7 +1152,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
               NULL,NULL,$submit,$slot,NULL,$daily,NULL,NULL,NULL,NULL,$at,$at);
             """, ("$id", Id(id)), ("$resource", Id(resource)), ("$batch", Id(batch)), ("$sequence", sequence), ("$account", Id(account)),
             ("$status", status), ("$outcome", status == "Succeeded" ? "NewTransfer" : terminal ? status : null), ("$fingerprint", $"fp-{id:N}"),
-            ("$descriptor", terminal ? "{}" : null), ("$submit", terminal ? "ResultReceived" : "NotPrepared"),
+            ("$descriptor", completedSubmission ? "{}" : null), ("$submit", completedSubmission ? "ResultReceived" : "NotPrepared"),
             ("$slot", status == "Succeeded" ? "Fulfilled" : terminal ? "Released" : "Reserved"),
             ("$daily", status is "Succeeded" or "Failed" ? "2026-08-20T05:15:00Z" : null), ("$at", "2026-08-20T05:30:00Z"));
     }
@@ -918,6 +1169,85 @@ public sealed class AccountRemovalStoreTests : IDisposable
             """, ("$id", Id(id)), ("$batch", batch is null ? null : Id(batch.Value)),
             ("$resource", resource is null ? null : Id(resource.Value)), ("$operation", operation is null ? null : Id(operation.Value)),
             ("$account", account is null ? null : Id(account.Value)), ("$at", "2026-08-20T05:45:00Z"));
+
+    private static async Task SeedRepresentativeSharedHistoryAsync(
+        SqliteConnectionFactory factory,
+        Guid batch,
+        int itemsPerAccount)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        for (var i = 0; i < itemsPerAccount; i++)
+        {
+            foreach (var account in new[] { A, B })
+            {
+                var resource = Guid.NewGuid();
+                var operation = Guid.NewGuid();
+                var log = Guid.NewGuid();
+                var sequence = 10_000 + (i * 2) + (account == A ? 0 : 1);
+
+                await using (var insertResource = connection.CreateCommand())
+                {
+                    insertResource.Transaction = transaction;
+                    insertResource.CommandText = """
+                        INSERT INTO ResourceItems(Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,
+                          ExtractionCode,Note,TargetPathOverride,NormalizedTargetPathOverride,CreateFolderName,
+                          FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,CandidateStatus,
+                          ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt)
+                        VALUES($id,$batch,NULL,$sequence,$url,$normalized,'code','benchmark',NULL,NULL,NULL,
+                          'Inherit','Valid',$account,'Expanded',NULL,NULL,$at,$at);
+                        """;
+                    insertResource.Parameters.AddWithValue("$id", Id(resource));
+                    insertResource.Parameters.AddWithValue("$batch", Id(batch));
+                    insertResource.Parameters.AddWithValue("$sequence", sequence);
+                    insertResource.Parameters.AddWithValue("$url", $"https://benchmark.invalid/{resource:N}");
+                    insertResource.Parameters.AddWithValue("$normalized", $"benchmark-{resource:N}");
+                    insertResource.Parameters.AddWithValue("$account", Id(account));
+                    insertResource.Parameters.AddWithValue("$at", "2026-08-20T05:00:00Z");
+                    await insertResource.ExecuteNonQueryAsync();
+                }
+
+                await using (var insertOperation = connection.CreateCommand())
+                {
+                    insertOperation.Transaction = transaction;
+                    insertOperation.CommandText = """
+                        INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,
+                          TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,
+                          OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,
+                          RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,
+                          LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt)
+                        VALUES($id,$resource,$batch,$sequence,$sequence,'/target','/target','',$account,'Fixed','Succeeded',
+                          'NewTransfer',1,$fingerprint,'{}',NULL,NULL,'ResultReceived','Fulfilled',NULL,$at,NULL,
+                          NULL,NULL,NULL,$at,$at);
+                        """;
+                    insertOperation.Parameters.AddWithValue("$id", Id(operation));
+                    insertOperation.Parameters.AddWithValue("$resource", Id(resource));
+                    insertOperation.Parameters.AddWithValue("$batch", Id(batch));
+                    insertOperation.Parameters.AddWithValue("$sequence", sequence);
+                    insertOperation.Parameters.AddWithValue("$account", Id(account));
+                    insertOperation.Parameters.AddWithValue("$fingerprint", $"benchmark-{operation:N}");
+                    insertOperation.Parameters.AddWithValue("$at", "2026-08-20T05:15:00Z");
+                    await insertOperation.ExecuteNonQueryAsync();
+                }
+
+                await using var insertLog = connection.CreateCommand();
+                insertLog.Transaction = transaction;
+                insertLog.CommandText = """
+                    INSERT INTO ExecutionLogs(Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,
+                      Stage,Level,EventCode,SanitizedMessage,CreatedAt)
+                    VALUES($id,$batch,$resource,$operation,$account,'Transfer','Information','BENCHMARK','safe audit',$at);
+                    """;
+                insertLog.Parameters.AddWithValue("$id", Id(log));
+                insertLog.Parameters.AddWithValue("$batch", Id(batch));
+                insertLog.Parameters.AddWithValue("$resource", Id(resource));
+                insertLog.Parameters.AddWithValue("$operation", Id(operation));
+                insertLog.Parameters.AddWithValue("$account", Id(account));
+                insertLog.Parameters.AddWithValue("$at", "2026-08-20T05:30:00Z");
+                await insertLog.ExecuteNonQueryAsync();
+            }
+        }
+        await transaction.CommitAsync();
+    }
 
     private static async Task ExecuteAsync(SqliteConnectionFactory f, string sql, params (string Name, object? Value)[] values)
     {
@@ -1025,11 +1355,16 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.False(state.Deleted);
     }
 
-    private static async Task<string> ScalarTextAsync(SqliteConnectionFactory f, string sql)
+    private static async Task<string> ScalarTextAsync(
+        SqliteConnectionFactory f,
+        string sql,
+        params (string Name, object? Value)[] values)
     {
         await using var c = await f.OpenConnectionAsync();
         await using var command = c.CreateCommand();
         command.CommandText = sql;
+        foreach (var value in values)
+            command.Parameters.AddWithValue(value.Name, value.Value ?? DBNull.Value);
         return Convert.ToString(await command.ExecuteScalarAsync()) ?? string.Empty;
     }
 

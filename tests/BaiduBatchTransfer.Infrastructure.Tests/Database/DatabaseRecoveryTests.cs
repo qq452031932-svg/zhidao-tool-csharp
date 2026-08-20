@@ -12,7 +12,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task ListingReturnsOnlyValidatedCanonicalBackups()
     {
         var (factory, backup, _) = await CreateDatabaseAsync();
-        var valid = await backup.CreateBackupAsync(5);
+        var valid = await backup.CreateBackupAsync(6);
         await File.WriteAllTextAsync(Path.Combine(root, "backups", "database-v2-20000101T000000000Z.db.bak"), "broken");
 
         var listed = await backup.ListValidatedBackupsAsync();
@@ -53,7 +53,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     [Fact]
     public async Task ListingSkipsOverflowVersionAndImpossibleTimestampWithoutAborting()
     {
-        var (_, backup, _) = await CreateDatabaseAsync(); var valid = await backup.CreateBackupAsync(5);
+        var (_, backup, _) = await CreateDatabaseAsync(); var valid = await backup.CreateBackupAsync(6);
         File.Copy(valid.Path, Path.Combine(root, "backups", "database-v999999999999999999999-20260101T000000000Z.db.bak"));
         File.Copy(valid.Path, Path.Combine(root, "backups", "database-v2-20261399T999999999Z.db.bak"));
         var listed = await backup.ListValidatedBackupsAsync();
@@ -63,7 +63,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     [Fact]
     public async Task ListingSkipsOversizedStoredSchemaVersionAndRetainsValidBackup()
     {
-        var (_, backup, _) = await CreateDatabaseAsync(); var valid = await backup.CreateBackupAsync(5);
+        var (_, backup, _) = await CreateDatabaseAsync(); var valid = await backup.CreateBackupAsync(6);
         var malformed = Path.Combine(root, "backups", "database-v2-20260101T000000000Z.db.bak"); File.Copy(valid.Path, malformed);
         await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={malformed};Pooling=False"))
         {
@@ -80,7 +80,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         var (factory, backup, migrator) = await CreateDatabaseAsync();
         var accountId = Guid.NewGuid().ToString("D");
         await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'marker','backup','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "UPDATE Accounts SET DisplayName='damaged-newer' WHERE Id=$id;", ("$id", accountId));
         var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"));
 
@@ -93,14 +93,14 @@ public sealed class DatabaseRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task RestoreAcceptsValidatedVersionFourBackupAndMigratesItToVersionFive()
+    public async Task RestoreAcceptsValidatedVersionFiveBackupAndMigratesItToVersionSix()
     {
         Directory.CreateDirectory(root);
-        var path = Path.Combine(root, "v4-restore.db");
+        var path = Path.Combine(root, "v5-restore.db");
         await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
-            for (var version = 1; version <= 4; version++)
+            for (var version = 1; version <= 5; version++)
             {
                 await MigrationTests.ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
                 await MigrationTests.ExecuteAsync(connection,
@@ -109,20 +109,20 @@ public sealed class DatabaseRecoveryTests : IDisposable
             }
         }
         var factory = new SqliteConnectionFactory(path);
-        var backup = new DatabaseBackupService(factory, Path.Combine(root, "v4-backups"));
+        var backup = new DatabaseBackupService(factory, Path.Combine(root, "v5-backups"));
         var migrator = new DatabaseMigrator(factory, backup, "test");
-        var candidate = await backup.CreateBackupAsync(4);
+        var candidate = await backup.CreateBackupAsync(5);
         await migrator.MigrateAsync();
-        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "v4-quarantine"));
+        var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "v5-quarantine"));
 
         await recovery.RestoreAsync(candidate.Path);
 
         await using var verify = await factory.OpenConnectionAsync();
         await using var versionCommand = verify.CreateCommand();
         versionCommand.CommandText = "SELECT MAX(Version) FROM SchemaVersions;";
-        Assert.Equal(5L, Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
+        Assert.Equal(6L, Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
         await using var indexCommand = verify.CreateCommand();
-        indexCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='IX_AccountAllocations_Account_Batch';";
+        indexCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='IX_ExecutionLogs_Account_Id';";
         Assert.Equal(1L, Convert.ToInt64(await indexCommand.ExecuteScalarAsync()));
     }
 
@@ -132,7 +132,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         var (factory, backup, migrator) = await CreateDatabaseAsync();
         var accountId = Guid.NewGuid().ToString("D");
         await using (var connection = await factory.OpenConnectionAsync()) await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'marker','original','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
-        var valid = await backup.CreateBackupAsync(5);
+        var valid = await backup.CreateBackupAsync(6);
         var tooNew = Path.Combine(root, "backups", "database-v99-20260101T000000000Z.db.bak");
         File.Copy(valid.Path, tooNew);
         await using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={tooNew};Pooling=False"))
@@ -153,7 +153,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task AtomicReplaceFailureNeverDeletesOrChangesLiveDatabase()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        var candidate = await backup.CreateBackupAsync(5); var before = await File.ReadAllBytesAsync(factory.DatabasePath);
+        var candidate = await backup.CreateBackupAsync(6); var before = await File.ReadAllBytesAsync(factory.DatabasePath);
         var quarantineRoot = Path.Combine(root, "quarantine"); Directory.CreateDirectory(quarantineRoot);
         var fixedNow = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var files = new FaultInjectingFileOperations { FailReplaceCall = 1 };
@@ -169,7 +169,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         var accountId = Guid.NewGuid().ToString("D");
         await using (var connection = await factory.OpenConnectionAsync())
             await MigrationTests.ExecuteAsync(connection, "INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,DailyCountDateKey,IsDeleted) VALUES($id,'u','backup','WebView2','Active',0,0,0,1,'2026-01-01',0);", ("$id", accountId));
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         await using (var connection = await factory.OpenConnectionAsync())
             await MigrationTests.ExecuteAsync(connection, "UPDATE Accounts SET DisplayName='original-live' WHERE Id=$id;", ("$id", accountId));
         var files = new FaultInjectingFileOperations { CorruptInstalledDatabase = true, CreateInstalledSidecars = true };
@@ -193,7 +193,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task RollbackFailurePreservesOriginalQuarantineAndFailedRestoreAndAggregatesErrors()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         var files = new FaultInjectingFileOperations { CorruptInstalledDatabase = true, FailReplaceCall = 2 };
         var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"), fileOperations: files);
 
@@ -208,7 +208,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task SuccessfulMainRollbackRestoresOriginalSidecarsDespiteFailedDiagnosticCopy()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         var originalWal = new byte[] { 1, 2, 3 }; var originalShm = new byte[] { 4, 5, 6 };
         await File.WriteAllBytesAsync(factory.DatabasePath + "-wal", originalWal);
         await File.WriteAllBytesAsync(factory.DatabasePath + "-shm", originalShm);
@@ -230,7 +230,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     public async Task SidecarSwapFailureIsIndependentAndPreservesEveryTrackedCopy()
     {
         var (factory, backup, migrator) = await CreateDatabaseAsync();
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         var originalMain = await File.ReadAllBytesAsync(factory.DatabasePath);
         var originalWal = new byte[] { 1, 2, 3 }; var originalShm = new byte[] { 4, 5, 6 };
         await File.WriteAllBytesAsync(factory.DatabasePath + "-wal", originalWal);
@@ -259,7 +259,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
         var (factory, backup, migrator) = await CreateDatabaseAsync();
         var recovery = new DatabaseRecoveryService(factory, backup, migrator, new DatabaseIntegrityService(factory), Path.Combine(root, "quarantine"));
         await Assert.ThrowsAsync<ArgumentException>(() => recovery.RestoreAsync(Path.Combine(root, "outside.db")));
-        var candidate = await backup.CreateBackupAsync(5);
+        var candidate = await backup.CreateBackupAsync(6);
         await using var open = await factory.OpenConnectionAsync();
         await Assert.ThrowsAsync<InvalidOperationException>(() => recovery.RestoreAsync(candidate.Path));
     }
