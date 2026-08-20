@@ -70,9 +70,13 @@ public sealed class ImportStagingService
         ArgumentException.ThrowIfNullOrWhiteSpace(request.SourceType);
         ArgumentException.ThrowIfNullOrWhiteSpace(request.SourceName);
         var sourceType = NormalizeSourceType(request.SourceType);
-        var columnDefinitions = sourceType == "Excel"
-            ? ValidateExcelMapping(request)
-            : null;
+        var columnDefinitions = sourceType switch
+        {
+            "Excel" => ValidateExcelMapping(request),
+            "Text" when request.ColumnMapping is not null =>
+                throw new ArgumentException("Text imports do not accept Excel column mappings.", nameof(request)),
+            _ => null,
+        };
 
         var now = DateTimeOffset.UtcNow;
         var progress = new ProgressState(new ImportSessionRecord(

@@ -130,6 +130,43 @@ public sealed class ImportStagingServiceTests
         Assert.Equal("Text", store.Session!.SourceType);
     }
 
+    [Theory]
+    [InlineData("Text")]
+    [InlineData(" text ")]
+    [InlineData("TEXT")]
+    [InlineData("TeXt")]
+    public async Task TextSourceVariantsRejectColumnMappingBeforeOpeningUnitOfWork(string sourceType)
+    {
+        var store = new ImportStore();
+        var unitOfWorkCalls = 0;
+        var service = new ImportStagingService(
+            cancellationToken =>
+            {
+                unitOfWorkCalls++;
+                return store.CreateUnitOfWorkAsync(cancellationToken);
+            },
+            new SequenceResolver());
+        var sourceColumns = new[] { new TabularInspectionColumn(0, "链接") };
+        var mapping = new ConfirmedImportColumnMapping(
+            null,
+            [new(0, TabularImportColumnRole.ShareUrl)],
+            sourceColumns);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.StageAsync(
+            new ImportRequest(
+                Guid.NewGuid(),
+                sourceType,
+                "paste",
+                ColumnMapping: mapping,
+                SourceColumns: sourceColumns),
+            ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/s/id"))));
+
+        Assert.Equal(0, unitOfWorkCalls);
+        Assert.Null(store.Session);
+        Assert.Empty(store.Rows);
+        Assert.Empty(store.Events);
+    }
+
     [Fact]
     public async Task CanonicalRowsAreNormalizedAndNotesDoNotChangeDuplicateIdentity()
     {
