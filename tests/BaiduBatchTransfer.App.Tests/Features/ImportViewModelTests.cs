@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Imports;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -86,12 +87,47 @@ public sealed class ImportViewModelTests
     }
 
     [Fact]
-    public void StatisticsExposeReadyDuplicateInvalidExcludedAndTotalCounts()
+    public void StatisticsExposeEveryDraftDispositionAndTotalCount()
     {
         var vm = Create(new FakeImportWorkflow());
-        vm.ApplyStatistics(new ImportDraftStatistics(100, 80, 10, 5, 5));
+        vm.ApplyStatistics(new ImportDraftStatistics(100, 65, 10, 5, 5, 8, 7));
 
-        Assert.Equal("总计 100 · 就绪 80 · 重复 10 · 异常 5 · 已排除 5", vm.StatisticsText);
+        Assert.Equal("总计 100 · 就绪 65 · 重复 10 · 异常 5 · 已排除 5 · 冲突 8 · 待解析 7", vm.StatisticsText);
+    }
+
+    [Fact]
+    public async Task CommittedProgressUsesExactSafeChineseMessagesAndFailedChunkDoesNotInflateRows()
+    {
+        var workflow = new ControlledProgressWorkflow();
+        var vm = Create(workflow);
+        var statuses = new List<string>();
+        vm.TextContent = "https://pan.baidu.com/s/abc1";
+        vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(ImportViewModel.StatusMessage))
+                statuses.Add(vm.StatusMessage);
+        };
+
+        var import = vm.ImportTextAsync();
+        await workflow.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotEqual("正在解析并写入草稿", vm.StatusMessage);
+
+        await Task.Run(() => workflow.Report(
+            new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0)));
+        Assert.Equal("正在解析并写入草稿", vm.StatusMessage);
+
+        await Task.Run(() => workflow.Report(
+            new ImportCommittedProgress(ImportProgressKind.ChunkCommitted, 3)));
+        Assert.Equal("正在解析并写入草稿，已保存 3 行", vm.StatusMessage);
+
+        workflow.Fail();
+        await import;
+
+        Assert.Contains("正在解析并写入草稿", statuses);
+        Assert.Contains("正在解析并写入草稿，已保存 3 行", statuses);
+        Assert.DoesNotContain(statuses, status => status.Contains("6 行", StringComparison.Ordinal));
+        Assert.All(statuses, status => Assert.DoesNotContain("abc1", status, StringComparison.Ordinal));
+        Assert.Equal("导入失败，请检查文件后重试。", vm.StatusMessage);
     }
 
     [Fact]
@@ -253,6 +289,53 @@ public sealed class ImportViewModelTests
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
         public string? PickExcelFile() => excelFile;
+    }
+
+    private sealed class ControlledProgressWorkflow : IImportWorkflow
+    {
+        private readonly TaskCompletionSource<ImportWorkflowResult> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private IProgress<ImportCommittedProgress>? progress;
+
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            return completion.Task;
+        }
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            IProgress<ImportCommittedProgress> committedProgress,
+            CancellationToken cancellationToken)
+        {
+            progress = committedProgress;
+            Started.TrySetResult();
+            return completion.Task;
+        }
+
+        public void Report(ImportCommittedProgress value) =>
+            Assert.IsAssignableFrom<IProgress<ImportCommittedProgress>>(progress).Report(value);
+
+        public void Fail() => completion.TrySetException(new ImportWorkflowException(ImportUiError.Unknown));
+
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private sealed class TransferUnavailable : IAdapterAvailability

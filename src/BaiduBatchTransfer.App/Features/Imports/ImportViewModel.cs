@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Imports;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -40,8 +41,25 @@ public interface IImportWorkflow
     bool IsAvailable => true;
     string StatusMessage => string.Empty;
     Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> ImportTextAsync(
+        Guid sessionId,
+        string text,
+        IProgress<ImportCommittedProgress> committedProgress,
+        CancellationToken cancellationToken) =>
+        ImportTextAsync(sessionId, text, cancellationToken);
     Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> ImportExcelAsync(
+        Guid sessionId,
+        string filePath,
+        IProgress<ImportCommittedProgress> committedProgress,
+        CancellationToken cancellationToken) =>
+        ImportExcelAsync(sessionId, filePath, cancellationToken);
     Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> ResumeAsync(
+        Guid sessionId,
+        IProgress<ImportCommittedProgress> committedProgress,
+        CancellationToken cancellationToken) =>
+        ResumeAsync(sessionId, cancellationToken);
     Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
     Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
 }
@@ -155,14 +173,16 @@ public sealed class ImportViewModel : ObservableObject
 
     public void ApplyStatistics(ImportDraftStatistics statistics)
     {
-        StatisticsText = $"总计 {statistics.Total:N0} · 就绪 {statistics.Ready:N0} · 重复 {statistics.Duplicate:N0} · 异常 {statistics.Invalid:N0} · 已排除 {statistics.Excluded:N0}";
+        StatisticsText = $"总计 {statistics.Total:N0} · 就绪 {statistics.Ready:N0} · 重复 {statistics.Duplicate:N0} · 异常 {statistics.Invalid:N0} · 已排除 {statistics.Excluded:N0} · 冲突 {statistics.Conflict:N0} · 待解析 {statistics.NeedsResolution:N0}";
     }
 
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
         var newSessionId = Guid.NewGuid();
         AttachSession(newSessionId);
-        await RunImportAsync(token => workflow.ImportTextAsync(newSessionId, TextContent, token), cancellationToken);
+        await RunImportAsync(
+            (progress, token) => workflow.ImportTextAsync(newSessionId, TextContent, progress, token),
+            cancellationToken);
     }
 
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
@@ -170,7 +190,9 @@ public sealed class ImportViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(filePath)) return;
         var newSessionId = Guid.NewGuid();
         AttachSession(newSessionId);
-        await RunImportAsync(token => workflow.ImportExcelAsync(newSessionId, filePath, token), cancellationToken);
+        await RunImportAsync(
+            (progress, token) => workflow.ImportExcelAsync(newSessionId, filePath, progress, token),
+            cancellationToken);
     }
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
@@ -190,7 +212,9 @@ public sealed class ImportViewModel : ObservableObject
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
         if (sessionId is null) return;
-        await RunImportAsync(token => workflow.ResumeAsync(sessionId.Value, token), cancellationToken);
+        await RunImportAsync(
+            (progress, token) => workflow.ResumeAsync(sessionId.Value, progress, token),
+            cancellationToken);
     }
 
     public async Task LoadFirstPageAsync(CancellationToken cancellationToken = default)
@@ -246,7 +270,7 @@ public sealed class ImportViewModel : ObservableObject
     }
 
     private async Task RunImportAsync(
-        Func<CancellationToken, Task<ImportWorkflowResult>> action,
+        Func<IProgress<ImportCommittedProgress>, CancellationToken, Task<ImportWorkflowResult>> action,
         CancellationToken externalCancellation)
     {
         if (IsBusy) return;
@@ -255,7 +279,8 @@ public sealed class ImportViewModel : ObservableObject
         StatusMessage = "正在流式导入，已保存的批次会持续写入本机数据库…";
         try
         {
-            var result = await action(operationCancellation.Token);
+            var progress = new UiProgress<ImportCommittedProgress>(ApplyCommittedProgress);
+            var result = await action(progress, operationCancellation.Token);
             AttachSession(result.SessionId);
             ApplyStatistics(result.Statistics);
             CanResumeImport = false;
@@ -315,6 +340,16 @@ public sealed class ImportViewModel : ObservableObject
 
     private void Cancel() => operationCancellation?.Cancel();
 
+    private void ApplyCommittedProgress(ImportCommittedProgress progress)
+    {
+        StatusMessage = progress.Kind switch
+        {
+            ImportProgressKind.SessionCreated => "正在解析并写入草稿",
+            ImportProgressKind.ChunkCommitted => $"正在解析并写入草稿，已保存 {progress.PersistedRows:N0} 行",
+            _ => StatusMessage,
+        };
+    }
+
     private void RaiseCommands()
     {
         OnPropertyChanged(nameof(CanImport));
@@ -344,5 +379,30 @@ public sealed class ImportViewModel : ObservableObject
         public static AvailableAdapterAvailability Instance { get; } = new();
         public bool CanStartTransfers => true;
         public string StatusMessage => string.Empty;
+    }
+
+    private sealed class UiProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        private readonly System.Windows.Threading.Dispatcher? dispatcher =
+            System.Windows.Application.Current?.Dispatcher;
+        private readonly SynchronizationContext? synchronizationContext = SynchronizationContext.Current;
+
+        public void Report(T value)
+        {
+            if (dispatcher is not null && !dispatcher.CheckAccess())
+            {
+                dispatcher.Invoke(() => handler(value));
+                return;
+            }
+
+            if (synchronizationContext is not null &&
+                !ReferenceEquals(SynchronizationContext.Current, synchronizationContext))
+            {
+                synchronizationContext.Send(_ => handler(value), null);
+                return;
+            }
+
+            handler(value);
+        }
     }
 }

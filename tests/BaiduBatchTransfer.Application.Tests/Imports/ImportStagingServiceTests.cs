@@ -314,6 +314,50 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task ProgressReportsOnlyTheSessionAndChunksWhoseTransactionsCommitted()
+    {
+        var store = new ImportStore { FailCommitAttempt = 3 };
+        var service = CreateService(store, new SequenceResolver(), chunkSize: 3);
+        var progress = new List<(ImportCommittedProgress Progress, int CommitCount)>();
+        var rows = ToAsync(Enumerable.Range(1, 7)
+            .Select(i => new ImportSourceRow(i, $"https://pan.baidu.com/s/id-{i}"))
+            .ToArray());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.StageAsync(
+            new ImportRequest(Guid.NewGuid(), "Excel", "rows.xlsx"),
+            rows,
+            new InlineProgress<ImportCommittedProgress>(value => progress.Add((value, store.CommitCount))),
+            CancellationToken.None));
+
+        Assert.Equal(
+            [
+                (new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0), 1),
+                (new ImportCommittedProgress(ImportProgressKind.ChunkCommitted, 3), 2),
+            ],
+            progress);
+    }
+
+    [Fact]
+    public async Task LegacyPositionalDefaultCancellationCallsRemainUnambiguous()
+    {
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver());
+        var sessionId = Guid.NewGuid();
+
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/s/id-1")),
+            default);
+        await service.ResumeAsync(
+            sessionId,
+            ToAsync(),
+            TransferMode.Distribution,
+            default);
+
+        Assert.Equal("Draft", store.Session!.Status);
+    }
+
+    [Fact]
     public async Task SourceOverridesAndAccountFieldsAreCopiedAndDifferencesBecomeConflict()
     {
         var store = new ImportStore();
@@ -483,6 +527,11 @@ public sealed class ImportStagingServiceTests
         }
     }
 
+    private sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
+    }
+
     private sealed class ImportStore
     {
         public ImportSessionRecord? Session { get; set; }
@@ -490,6 +539,9 @@ public sealed class ImportStagingServiceTests
         public List<string> Events { get; } = [];
         public List<int> AddBatchSizes { get; } = [];
         public int ActiveUnits { get; private set; }
+        public int? FailCommitAttempt { get; init; }
+        public int CommitAttempts { get; private set; }
+        public int CommitCount { get; private set; }
 
         public Task<IUnitOfWork> CreateUnitOfWorkAsync(CancellationToken cancellationToken)
         {
@@ -511,7 +563,14 @@ public sealed class ImportStagingServiceTests
             public IImportRepository Imports { get; }
             public IJobRepository Jobs => throw new NotSupportedException();
             public IAccountRepository Accounts => throw new NotSupportedException();
-            public Task CommitAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+            public Task CommitAsync(CancellationToken cancellationToken = default)
+            {
+                store.CommitAttempts++;
+                if (store.CommitAttempts == store.FailCommitAttempt)
+                    throw new InvalidOperationException("Injected commit failure.");
+                store.CommitCount++;
+                return Task.CompletedTask;
+            }
             public Task RollbackAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
             public ValueTask DisposeAsync()
             {

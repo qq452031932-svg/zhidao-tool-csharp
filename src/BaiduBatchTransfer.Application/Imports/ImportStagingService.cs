@@ -6,6 +6,14 @@ namespace BaiduBatchTransfer.Application.Imports;
 
 public delegate Task<IUnitOfWork> ImportUnitOfWorkFactory(CancellationToken cancellationToken);
 
+public enum ImportProgressKind
+{
+    SessionCreated,
+    ChunkCommitted,
+}
+
+public sealed record ImportCommittedProgress(ImportProgressKind Kind, int PersistedRows);
+
 public sealed record ImportRequest(
     Guid SessionId,
     string SourceType,
@@ -41,9 +49,16 @@ public sealed class ImportStagingService
         resolutionGate = new SemaphoreSlim(maxResolutionConcurrency, maxResolutionConcurrency);
     }
 
+    public Task StageAsync(
+        ImportRequest request,
+        IAsyncEnumerable<ImportSourceRow> rows,
+        CancellationToken cancellationToken = default) =>
+        StageAsync(request, rows, committedProgress: null, cancellationToken);
+
     public async Task StageAsync(
         ImportRequest request,
         IAsyncEnumerable<ImportSourceRow> rows,
+        IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -68,14 +83,30 @@ public sealed class ImportStagingService
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await ProcessWithDraftRecoveryAsync(progress, request.TransferMode, rows, skipThroughSourceRow: 0, cancellationToken)
+        committedProgress?.Report(new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0));
+
+        await ProcessWithDraftRecoveryAsync(
+                progress,
+                request.TransferMode,
+                rows,
+                skipThroughSourceRow: 0,
+                committedProgress,
+                cancellationToken)
             .ConfigureAwait(false);
     }
+
+    public Task ResumeAsync(
+        Guid sessionId,
+        IAsyncEnumerable<ImportSourceRow> rows,
+        TransferMode transferMode = TransferMode.Distribution,
+        CancellationToken cancellationToken = default) =>
+        ResumeAsync(sessionId, rows, transferMode, committedProgress: null, cancellationToken);
 
     public async Task ResumeAsync(
         Guid sessionId,
         IAsyncEnumerable<ImportSourceRow> rows,
-        TransferMode transferMode = TransferMode.Distribution,
+        TransferMode transferMode,
+        IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(rows);
@@ -96,7 +127,13 @@ public sealed class ImportStagingService
             await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        await ProcessWithDraftRecoveryAsync(new ProgressState(session), transferMode, rows, lastSourceRow, cancellationToken)
+        await ProcessWithDraftRecoveryAsync(
+                new ProgressState(session),
+                transferMode,
+                rows,
+                lastSourceRow,
+                committedProgress,
+                cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -267,6 +304,7 @@ public sealed class ImportStagingService
         TransferMode transferMode,
         IAsyncEnumerable<ImportSourceRow> rows,
         int skipThroughSourceRow,
+        IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken)
     {
         try
@@ -284,6 +322,9 @@ public sealed class ImportStagingService
                 {
                     progress.Session = await PersistChunkAsync(progress.Session, transferMode, chunk, cancellationToken)
                         .ConfigureAwait(false);
+                    committedProgress?.Report(new ImportCommittedProgress(
+                        ImportProgressKind.ChunkCommitted,
+                        progress.Session.TotalRows));
                     chunk.Clear();
                 }
             }
@@ -292,6 +333,9 @@ public sealed class ImportStagingService
             {
                 progress.Session = await PersistChunkAsync(progress.Session, transferMode, chunk, cancellationToken)
                     .ConfigureAwait(false);
+                committedProgress?.Report(new ImportCommittedProgress(
+                    ImportProgressKind.ChunkCommitted,
+                    progress.Session.TotalRows));
             }
 
             await PersistDraftAsync(progress.Session, CancellationToken.None).ConfigureAwait(false);
