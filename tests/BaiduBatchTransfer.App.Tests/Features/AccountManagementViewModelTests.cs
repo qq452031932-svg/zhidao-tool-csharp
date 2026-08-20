@@ -57,6 +57,41 @@ public sealed class AccountManagementViewModelTests
     }
 
     [Fact]
+    public async Task PagedRowsSanitizeAdversarialDisplayNamesEverywhereTheyArePresented()
+    {
+        var operations = new FakeOperations
+        {
+            Pages =
+            {
+                [1] = new AccountPage(
+                [
+                    new(Guid.NewGuid(), "\u202E账号甲", "Active", true),
+                    new(Guid.NewGuid(), "C:\\private\\profile", "Active", true),
+                    new(Guid.NewGuid(), "https://evil.invalid/account", "Active", true),
+                    new(Guid.NewGuid(), "cookie-token-exception", "Active", true),
+                    new(Guid.NewGuid(), "账号 11111111-1111-1111-1111-111111111111", "Active", true),
+                    new(Guid.NewGuid(), new string('长', 200), "Active", true),
+                ], 1, 100, 6),
+            },
+        };
+        var vm = Create(operations);
+
+        await vm.LoadFirstPageAsync();
+
+        Assert.Equal("账号甲", vm.Accounts[0].DisplayName);
+        Assert.All(vm.Accounts.Skip(1).Take(4), row => Assert.Equal("已选择的账号", row.DisplayName));
+        Assert.Equal(80, vm.Accounts[5].DisplayName.Length);
+        foreach (var row in vm.Accounts)
+        {
+            AssertSafeVisibleText(row.DisplayName);
+            AssertSafeVisibleText(row.ToString());
+            AssertSafeVisibleText(row.ActionAutomationName);
+            Assert.DoesNotContain("\u202E", row.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain("http", row.ActionAutomationName, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
     public async Task PreviewUsesSelectedAccountAndModeAndBuildsAccountScopedChineseConfirmation()
     {
         var accountId = Guid.NewGuid();
@@ -89,6 +124,32 @@ public sealed class AccountManagementViewModelTests
         Assert.DoesNotContain("preview-token-secret", vm.ConfirmationMessage, StringComparison.Ordinal);
         Assert.DoesNotContain("private", vm.ConfirmationMessage, StringComparison.OrdinalIgnoreCase);
         AssertSafeVisibleText(vm.ConfirmationMessage);
+    }
+
+    [Fact]
+    public async Task PreviewRaceToCleanupPendingUsesStableMessageAndRequestsRefresh()
+    {
+        var operations = SingleAccount(Guid.NewGuid(), "账号乙");
+        operations.Preview = new(
+            AccountExitStatus.CleanupPending,
+            "账号乙",
+            0,
+            0,
+            0,
+            "must-not-be-visible",
+            "raw exception profile C:\\private cookie");
+        var vm = Create(operations);
+        AccountManagementRefreshEventArgs? refresh = null;
+        vm.RefreshRequested += (_, args) => refresh = args;
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Equal(AccountManagementUiText.CleanupPending, vm.StatusMessage);
+        Assert.Equal(AccountExitStatus.CleanupPending, Assert.IsType<AccountManagementRefreshEventArgs>(refresh).Status);
+        Assert.False(vm.IsConfirmationVisible);
+        Assert.False(vm.ConfirmRemovalCommand.CanExecute(null));
+        AssertSafeVisibleText(vm.StatusMessage);
     }
 
     [Fact]

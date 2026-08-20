@@ -37,6 +37,43 @@ public static class AccountManagementUiText
     public const string Confirm = "确认退出";
 }
 
+internal static class AccountManagementPresentation
+{
+    internal static string SanitizeDisplayName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "未命名账号";
+        var builder = new StringBuilder(Math.Min(value.Length, 80));
+        foreach (var rune in value.EnumerateRunes())
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is UnicodeCategory.Control or UnicodeCategory.Format or
+                UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                continue;
+            builder.Append(rune.ToString());
+            if (builder.Length >= 80) break;
+        }
+        var sanitized = builder.ToString().Trim();
+        if (sanitized.Length == 0 || LooksSensitiveOrPathLike(sanitized))
+            return "已选择的账号";
+        return sanitized;
+    }
+
+    private static bool LooksSensitiveOrPathLike(string value)
+    {
+        if (value.Contains('/') || value.Contains('\\') ||
+            value.Contains("cookie", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("token", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("profile", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("exception", StringComparison.OrdinalIgnoreCase))
+            return true;
+        for (var index = 0; index + 36 <= value.Length; index++)
+        {
+            if (Guid.TryParse(value.AsSpan(index, 36), out _)) return true;
+        }
+        return false;
+    }
+}
+
 public interface IAccountRemovalOperations
 {
     Task<AccountPage> GetAccountsPageAsync(int pageNumber, int pageSize, CancellationToken cancellationToken);
@@ -99,7 +136,7 @@ public sealed class AccountManagementRowViewModel
         this.action = action ?? throw new ArgumentNullException(nameof(action));
         this.canExecute = canExecute ?? throw new ArgumentNullException(nameof(canExecute));
         AccountId = account.AccountId;
-        DisplayName = string.IsNullOrWhiteSpace(account.DisplayName) ? "未命名账号" : account.DisplayName.Trim();
+        DisplayName = AccountManagementPresentation.SanitizeDisplayName(account.DisplayName);
         LoginStatusText = MapLoginStatus(account.Status);
         EnabledStateText = account.IsEnabled ? "已启用" : "已禁用";
         IsCleanupPending = account.IsCleanupPending;
@@ -355,6 +392,9 @@ public sealed class AccountManagementViewModel : ObservableObject
             {
                 StatusMessage = MapPreviewStatus(result.Status);
                 IsConfirmationVisible = false;
+                NeedsPreviewRefresh = false;
+                if (result.Status == AccountExitStatus.CleanupPending)
+                    RaiseRefresh(result.Status);
                 return;
             }
 
@@ -364,7 +404,9 @@ public sealed class AccountManagementViewModel : ObservableObject
             TerminalOperationCount = Math.Max(0, result.TerminalOperationCount);
             TerminalBatchCount = Math.Max(0, result.TerminalBatchCount);
             SharedBatchCount = Math.Max(0, result.SharedBatchCount);
-            ConfirmationMessage = BuildConfirmationMessage(SanitizeDisplayName(result.DisplayName), mode);
+            ConfirmationMessage = BuildConfirmationMessage(
+                AccountManagementPresentation.SanitizeDisplayName(result.DisplayName),
+                mode);
             NeedsPreviewRefresh = false;
             StatusMessage = AccountManagementUiText.Ready;
         }
@@ -576,6 +618,7 @@ public sealed class AccountManagementViewModel : ObservableObject
         AccountExitStatus.StaleConfirmation => AccountManagementUiText.StaleConfirmation,
         AccountExitStatus.AlreadyRemoved => AccountManagementUiText.AlreadyRemoved,
         AccountExitStatus.NotFound => AccountManagementUiText.NotFound,
+        AccountExitStatus.CleanupPending => AccountManagementUiText.CleanupPending,
         _ => AccountManagementUiText.OperationFailed,
     };
 
@@ -596,37 +639,4 @@ public sealed class AccountManagementViewModel : ObservableObject
     private CancellationTokenSource CreateOperationTokenSource(CancellationToken commandToken) =>
         CancellationTokenSource.CreateLinkedTokenSource(commandToken, lifetimeToken);
 
-    private static string SanitizeDisplayName(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return "未命名账号";
-        var builder = new StringBuilder(Math.Min(value.Length, 80));
-        foreach (var rune in value.EnumerateRunes())
-        {
-            var category = Rune.GetUnicodeCategory(rune);
-            if (category is UnicodeCategory.Control or UnicodeCategory.Format or
-                UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
-                continue;
-            builder.Append(rune.ToString());
-            if (builder.Length >= 80) break;
-        }
-        var sanitized = builder.ToString().Trim();
-        if (sanitized.Length == 0 || LooksSensitiveOrPathLike(sanitized))
-            return "已选择的账号";
-        return sanitized;
-    }
-
-    private static bool LooksSensitiveOrPathLike(string value)
-    {
-        if (value.Contains('/') || value.Contains('\\') ||
-            value.Contains("cookie", StringComparison.OrdinalIgnoreCase) ||
-            value.Contains("token", StringComparison.OrdinalIgnoreCase) ||
-            value.Contains("profile", StringComparison.OrdinalIgnoreCase) ||
-            value.Contains("exception", StringComparison.OrdinalIgnoreCase))
-            return true;
-        for (var index = 0; index + 36 <= value.Length; index++)
-        {
-            if (Guid.TryParse(value.AsSpan(index, 36), out _)) return true;
-        }
-        return false;
-    }
 }
