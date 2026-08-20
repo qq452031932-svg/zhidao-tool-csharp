@@ -41,6 +41,9 @@ public sealed class MainWindowViewModel : ObservableObject
         OpenAccountManagementCommand = new AsyncRelayCommand(
             OpenAccountManagementAsync,
             () => accountManagementLauncher is not null && !IsAccountOperationBusy);
+        RefreshAccountsCommand = new AsyncRelayCommand(
+            RefreshAccountsManuallyAsync,
+            () => refreshAccounts is not null && !IsAccountOperationBusy);
     }
 
     public string ApplicationTitle => "百度批量转存";
@@ -63,12 +66,14 @@ public sealed class MainWindowViewModel : ObservableObject
             OnPropertyChanged(nameof(AccountManagementStatusMessage));
             OpenAccountLoginCommand.NotifyCanExecuteChanged();
             OpenAccountManagementCommand.NotifyCanExecuteChanged();
+            RefreshAccountsCommand.NotifyCanExecuteChanged();
         }
     }
     public IRelayCommand ShowImportCommand { get; }
     public IRelayCommand ShowCreateJobCommand { get; }
     public IAsyncRelayCommand OpenAccountLoginCommand { get; }
     public IAsyncRelayCommand OpenAccountManagementCommand { get; }
+    public IAsyncRelayCommand RefreshAccountsCommand { get; }
 
     public async Task OpenAccountLoginAsync(CancellationToken cancellationToken = default)
     {
@@ -82,8 +87,15 @@ public sealed class MainWindowViewModel : ObservableObject
         try
         {
             await loginLauncher.OpenAsync(cancellationToken).ConfigureAwait(true);
-            await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
-            StatusMessage = "账号登录窗口已关闭，账号状态已刷新。";
+            try
+            {
+                await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
+                StatusMessage = "账号登录窗口已关闭，账号状态已刷新。";
+            }
+            catch (Exception)
+            {
+                StatusMessage = "账号登录已完成，但列表刷新失败，请重试刷新。";
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -114,10 +126,17 @@ public sealed class MainWindowViewModel : ObservableObject
             if (result.RefreshRequired &&
                 result.Status is AccountExitStatus.Removed or AccountExitStatus.CleanupPending)
             {
-                await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
-                StatusMessage = result.Status == AccountExitStatus.Removed
-                    ? "账号已退出，账号列表已刷新。"
-                    : "账号已退出，本机登录数据待继续清理；账号列表已刷新。";
+                try
+                {
+                    await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
+                    StatusMessage = result.Status == AccountExitStatus.Removed
+                        ? "账号已退出，账号列表已刷新。"
+                        : "账号已退出，本机登录数据待继续清理；账号列表已刷新。";
+                }
+                catch (Exception)
+                {
+                    StatusMessage = "账号操作已完成，但列表刷新失败，请重试刷新。";
+                }
             }
             else
             {
@@ -131,6 +150,30 @@ public sealed class MainWindowViewModel : ObservableObject
         catch (Exception)
         {
             StatusMessage = "无法打开账号管理，请稍后重试。";
+        }
+        finally
+        {
+            IsAccountOperationBusy = false;
+        }
+    }
+
+    public async Task RefreshAccountsManuallyAsync(CancellationToken cancellationToken = default)
+    {
+        if (refreshAccounts is null || IsAccountOperationBusy) return;
+
+        IsAccountOperationBusy = true;
+        try
+        {
+            await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
+            StatusMessage = "账号列表已刷新。";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            StatusMessage = "账号列表刷新已取消。";
+        }
+        catch (Exception)
+        {
+            StatusMessage = "账号列表刷新失败，请稍后重试。";
         }
         finally
         {

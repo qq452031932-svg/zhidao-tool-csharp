@@ -25,11 +25,18 @@
                                 TabIndex="0" MinWidth="118" />
                         <Button Content="账号管理" Command="{Binding OpenAccountManagementCommand}"
                                 TabIndex="1" MinWidth="96" Margin="8,0,0,0" />
+                        <Button Content="刷新账号" Command="{Binding RefreshAccountsCommand}"
+                                AutomationProperties.Name="刷新百度账号列表"
+                                TabIndex="2" MinWidth="96" Margin="8,0,0,0" />
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,5,0,0">
-                        <TextBlock Text="{Binding AccountStatusMessage}" Foreground="#52677B" FontSize="12" />
+                        <TextBlock Text="{Binding AccountStatusMessage}" Foreground="#52677B" FontSize="12"
+                                   AutomationProperties.Name="当前百度账号数量"
+                                   AutomationProperties.LiveSetting="Polite" />
                         <TextBlock Text=" · " Foreground="#8A9BAB" FontSize="12" />
-                        <TextBlock Text="{Binding AccountManagementStatusMessage}" Foreground="#52677B" FontSize="12" />
+                        <TextBlock Text="{Binding AccountManagementStatusMessage}" Foreground="#52677B" FontSize="12"
+                                   AutomationProperties.Name="账号管理状态"
+                                   AutomationProperties.LiveSetting="Polite" />
                     </StackPanel>
                 </StackPanel>
             </Grid>

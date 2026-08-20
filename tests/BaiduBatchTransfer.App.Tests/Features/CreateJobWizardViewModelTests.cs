@@ -368,6 +368,29 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public async Task ReloadClearsHiddenStalePrecheckBeforeBulkPrecheckIsEnabledAgain()
+    {
+        var original = Accounts(2);
+        var vm = Create(original, ready: 2);
+        vm.SelectMode(TransferMode.Distribution);
+        foreach (var account in vm.Accounts)
+        {
+            account.IsSelected = true;
+            account.TargetSuccessCount = 1;
+        }
+        vm.PrecheckAccountId = original[1].AccountId;
+        await vm.PrepareConfirmationAsync();
+        Assert.Equal("preview-token", vm.ConfirmationToken);
+
+        vm.ReloadAccounts([original[0]]);
+
+        Assert.Null(vm.PrecheckAccountId);
+        Assert.Null(vm.ConfirmationToken);
+        vm.UseBulkPrecheck = true;
+        Assert.Equal(original[0].AccountId, vm.PrecheckAccountId);
+    }
+
+    [Fact]
     public async Task AccountReloadMakesAnInflightConfirmationStale()
     {
         var accounts = Accounts(2);

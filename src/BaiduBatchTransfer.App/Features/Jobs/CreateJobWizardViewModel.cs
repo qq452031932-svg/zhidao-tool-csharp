@@ -331,6 +331,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 Accounts.Add(replacement);
             }
 
+            if (precheckAccountId is { } selectedPrecheck &&
+                Accounts.All(account => account.AccountId != selectedPrecheck))
+                precheckAccountId = null;
+
             if (Accounts.Count == 0)
             {
                 transferMode = null;
@@ -353,9 +357,6 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             else
             {
                 if (previousCount <= 1) transferMode = null;
-                if (precheckAccountId is { } selectedPrecheck &&
-                    Accounts.All(account => account.AccountId != selectedPrecheck))
-                    precheckAccountId = null;
                 AccountSelectionNotice = transferMode is null
                     ? "请选择多账号复制或多账号分流。"
                     : "账号列表已刷新，请重新核对分配。";

@@ -66,6 +66,16 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             await unit.RollbackAsync();
         }
 
+        await using (var connection = await host.Services
+            .GetRequiredService<SqliteConnectionFactory>()
+            .OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT COUNT(*) FROM ImportSessions;";
+            var sessionCount = Convert.ToInt64(await command.ExecuteScalarAsync());
+            Assert.Equal(1L, sessionCount);
+        }
+
         var query = host.Services.GetRequiredService<ImportPageQuery>();
         const int pageSize = 1;
         Assert.InRange(pageSize, 1, 1_000);

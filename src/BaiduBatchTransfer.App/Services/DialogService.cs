@@ -46,6 +46,11 @@ public interface IAccountLoginLauncher
     Task OpenAsync(CancellationToken cancellationToken = default);
 }
 
+public interface IAccountSummaryProvider
+{
+    Task<int> GetActiveAccountCountAsync(CancellationToken cancellationToken = default);
+}
+
 public sealed class UnavailableAccountLoginLauncher : IAccountLoginLauncher
 {
     public bool IsAvailable => false;

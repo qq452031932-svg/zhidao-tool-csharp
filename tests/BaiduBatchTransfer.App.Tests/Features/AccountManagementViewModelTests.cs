@@ -658,9 +658,10 @@ public sealed class AccountManagementViewModelTests
         Assert.DoesNotMatch(new Regex("[A-Za-z]:\\\\", RegexOptions.CultureInvariant), value);
     }
 
-    private static string FindRepositoryRoot()
+    private static string FindRepositoryRoot(
+        [System.Runtime.CompilerServices.CallerFilePath] string sourceFilePath = "")
     {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        var current = new DirectoryInfo(Path.GetDirectoryName(sourceFilePath)!);
         while (current is not null)
         {
             if (File.Exists(Path.Combine(current.FullName, "BaiduBatchTransfer.sln")))

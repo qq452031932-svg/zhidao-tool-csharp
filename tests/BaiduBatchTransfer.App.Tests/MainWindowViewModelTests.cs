@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
 
@@ -111,14 +112,117 @@ public sealed class MainWindowViewModelTests
         Assert.DoesNotContain("InvalidOperationException", vm.StatusMessage);
     }
 
+    [Theory]
+    [InlineData(AccountExitStatus.Removed)]
+    [InlineData(AccountExitStatus.CleanupPending)]
+    public async Task CommittedManagementActionReportsRefreshFailureAndRetriesOnlyTheRefresh(
+        AccountExitStatus status)
+    {
+        var management = new FakeManagementLauncher
+        {
+            Result = new AccountManagementRefreshResult(true, status),
+        };
+        var refreshCalls = 0;
+        var vm = new MainWindowViewModel(
+            new object(),
+            new object(),
+            new FakeLoginLauncher { IsAvailableValue = true },
+            management,
+            (applyCount, _) =>
+            {
+                refreshCalls++;
+                if (refreshCalls == 1)
+                    throw new InvalidOperationException("secret-account-id C:\\private\\profile token");
+                applyCount(4);
+                return Task.CompletedTask;
+            },
+            initialActiveAccountCount: 3);
+
+        await vm.OpenAccountManagementAsync();
+
+        Assert.Equal("账号操作已完成，但列表刷新失败，请重试刷新。", vm.StatusMessage);
+        Assert.Equal(1, management.OpenCalls);
+        Assert.True(vm.OpenAccountManagementCommand.CanExecute(null));
+        Assert.True(vm.RefreshAccountsCommand.CanExecute(null));
+
+        await vm.RefreshAccountsCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, management.OpenCalls);
+        Assert.Equal(2, refreshCalls);
+        Assert.Equal("已登录 4 个百度账号", vm.AccountStatusMessage);
+        Assert.Equal("账号列表已刷新。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task CompletedLoginReportsRefreshFailureWithoutOpeningLoginAgainOnRetry()
+    {
+        var login = new FakeLoginLauncher { IsAvailableValue = true };
+        var refreshCalls = 0;
+        var vm = new MainWindowViewModel(
+            new object(),
+            new object(),
+            login,
+            refreshAccounts: (applyCount, _) =>
+            {
+                refreshCalls++;
+                if (refreshCalls == 1)
+                    throw new InvalidOperationException("private-profile token");
+                applyCount(2);
+                return Task.CompletedTask;
+            });
+
+        await vm.OpenAccountLoginAsync();
+
+        Assert.Equal("账号登录已完成，但列表刷新失败，请重试刷新。", vm.StatusMessage);
+        Assert.Equal(1, login.OpenCalls);
+        Assert.True(vm.RefreshAccountsCommand.CanExecute(null));
+
+        await vm.RefreshAccountsCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, login.OpenCalls);
+        Assert.Equal(2, refreshCalls);
+        Assert.Equal("已登录 2 个百度账号", vm.AccountStatusMessage);
+    }
+
+    [Fact]
+    public void HeaderExposesAccountRefreshAndPolitelyAnnouncesAccountState()
+    {
+        var xaml = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "MainWindow.xaml"));
+
+        Assert.Contains("Content=\"刷新账号\" Command=\"{Binding RefreshAccountsCommand}\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"当前百度账号数量\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"账号管理状态\"", xaml);
+        Assert.Equal(2, xaml.Split("AutomationProperties.LiveSetting=\"Polite\"").Length - 1);
+    }
+
+    private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
+    {
+        var current = new DirectoryInfo(Path.GetDirectoryName(sourceFilePath)!);
+        while (current is not null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "BaiduBatchTransfer.sln")))
+                return current.FullName;
+            current = current.Parent;
+        }
+        throw new DirectoryNotFoundException("未找到测试仓库目录。");
+    }
+
     private sealed class FakeLoginLauncher : IAccountLoginLauncher
     {
         public bool IsAvailableValue { get; init; }
         public bool Throw { get; init; }
+        public int OpenCalls { get; private set; }
         public bool IsAvailable => IsAvailableValue;
         public string StatusMessage => IsAvailable ? string.Empty : "百度登录适配器尚不可用。";
-        public Task OpenAsync(CancellationToken cancellationToken = default) =>
-            Throw ? throw new InvalidOperationException("secret") : Task.CompletedTask;
+        public Task OpenAsync(CancellationToken cancellationToken = default)
+        {
+            OpenCalls++;
+            return Throw ? throw new InvalidOperationException("secret") : Task.CompletedTask;
+        }
     }
 
     private sealed class FakeManagementLauncher : IAccountManagementLauncher
@@ -132,10 +236,12 @@ public sealed class MainWindowViewModelTests
         public AccountManagementRefreshResult Result { get; init; } = AccountManagementRefreshResult.None;
         public bool Delay { get; init; }
         public bool Throw { get; init; }
+        public int OpenCalls { get; private set; }
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task<AccountManagementRefreshResult> OpenAsync(CancellationToken cancellationToken = default)
         {
+            OpenCalls++;
             Started.TrySetResult();
             if (Throw) throw new InvalidOperationException("secret-account-id C:\\private\\profile token");
             if (Delay) await release.Task.WaitAsync(cancellationToken);
