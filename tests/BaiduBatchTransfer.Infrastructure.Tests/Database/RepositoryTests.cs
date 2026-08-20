@@ -364,6 +364,45 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task ShareOperationFingerprintUsesCanonicalExactIdsInsteadOfCallerOrdinalsOrSqliteTextOrder()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, shareEnabled: true, plannedShareCount: 1);
+        var operation = Assert.Single(graph.Operations);
+        var supplementary = "\U00010000";
+        var privateUseBmp = "\uE000";
+        var canonical = new RemoteItemIdentitySet([
+            new(privateUseBmp, "BMP"),
+            new(supplementary, "Supplementary"),
+        ]);
+        operation = operation with { ExactItemSetFingerprint = canonical.Fingerprint };
+
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddShareOperationsAsync([operation], [
+                new(operation.Id, 0, privateUseBmp, "BMP"),
+                new(operation.Id, 1, supplementary, "Supplementary"),
+            ]);
+            await unit.CommitAsync();
+        }
+
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT RemoteItemId FROM ShareOperationRemoteItems WHERE ShareOperationId=$id ORDER BY CanonicalSortKey;";
+        command.Parameters.AddWithValue("$id", operation.Id.ToString("D"));
+        var persisted = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) persisted.Add(reader.GetString(0));
+        Assert.Equal([supplementary, privateUseBmp], persisted);
+
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var first = await store.GetRemoteItemsKeysetPageAsync(operation.Id, null, 1);
+        var second = await store.GetRemoteItemsKeysetPageAsync(operation.Id, first.NextCursor, 1);
+        Assert.Equal(supplementary, Assert.Single(first.Items).RemoteItemId);
+        Assert.Equal(privateUseBmp, Assert.Single(second.Items).RemoteItemId);
+        Assert.Null(second.NextCursor);
+    }
+
+    [Fact]
     public async Task InvalidStreamingExactItemsRollbackInsertedOperationsBeforeCallerCommits()
     {
         var graph = await CreateShareInsertGraphAsync(1, shareEnabled: true, plannedShareCount: 1);

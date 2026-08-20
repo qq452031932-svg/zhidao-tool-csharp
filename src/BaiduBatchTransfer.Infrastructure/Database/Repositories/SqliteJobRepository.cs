@@ -473,7 +473,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 }
             }
 
-            await using (var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName) VALUES($operation,$ordinal,$remote,$name);"))
+            await using (var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($operation,$ordinal,$remote,$sortKey,$name);"))
             {
                 var itemPrepared = false;
                 foreach (var value in remoteItems)
@@ -484,6 +484,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                     Bind(item,"$operation",Id(value.ShareOperationId),!itemPrepared);
                     Bind(item,"$ordinal",value.ItemOrdinal,!itemPrepared);
                     Bind(item,"$remote",value.RemoteItemId,!itemPrepared);
+                    Bind(item,"$sortKey",RemoteItemIdentitySet.GetCanonicalSortKey(value.RemoteItemId),!itemPrepared);
                     Bind(item,"$name",value.DisplayName,!itemPrepared);
                     if (!itemPrepared)
                     {
@@ -538,7 +539,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         Guid operationId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var command = Command("SELECT RemoteItemId FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation ORDER BY ItemOrdinal;");
+        await using var command = Command("SELECT RemoteItemId FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation ORDER BY CanonicalSortKey;");
         Add(command,"$operation",Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))

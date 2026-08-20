@@ -16,7 +16,9 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
         ArgumentNullException.ThrowIfNull(items);
         var snapshot = items
             .Select(item => item ?? throw new ArgumentException("Remote items cannot contain null values.", nameof(items)))
-            .OrderBy(item => item.ExactId, StringComparer.Ordinal)
+            .Select(item => (Item: item, SortKey: GetCanonicalSortKey(item.ExactId)))
+            .OrderBy(value => value.SortKey, CanonicalSortKeyComparer.Instance)
+            .Select(value => value.Item)
             .ToImmutableArray();
         if (snapshot.IsEmpty)
             throw new ArgumentException("At least one exact remote item identity is required.", nameof(items));
@@ -60,24 +62,34 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
     public override string ToString() =>
         $"RemoteItemIdentitySet {{ Count = {Count}, Fingerprint = [REDACTED], Items = [REDACTED] }}";
 
+    public static byte[] GetCanonicalSortKey(string exactId)
+    {
+        ArgumentNullException.ThrowIfNull(exactId);
+        ValidateExactId(exactId, nameof(exactId));
+        var key = new byte[checked(exactId.Length * sizeof(char))];
+        for (var index = 0; index < exactId.Length; index++)
+            BinaryPrimitives.WriteUInt16BigEndian(key.AsSpan(index * sizeof(char), sizeof(char)), exactId[index]);
+        return key;
+    }
+
     public static string ComputeFingerprintFromCanonicalOrder(IEnumerable<string> exactIds)
     {
         ArgumentNullException.ThrowIfNull(exactIds);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         Span<byte> length = stackalloc byte[sizeof(int)];
-        string? previous = null;
+        byte[]? previous = null;
         var count = 0;
         foreach (var exactId in exactIds)
         {
             ArgumentNullException.ThrowIfNull(exactId);
-            ValidateExactId(exactId, nameof(exactIds));
-            if (previous is not null && string.CompareOrdinal(previous, exactId) >= 0)
+            var sortKey = GetCanonicalSortKey(exactId);
+            if (previous is not null && CanonicalSortKeyComparer.Instance.Compare(previous, sortKey) >= 0)
                 throw new ArgumentException("Exact remote item identities must be in strict canonical order.", nameof(exactIds));
             var encoded = StrictUtf8.GetBytes(exactId);
             BinaryPrimitives.WriteInt32BigEndian(length, encoded.Length);
             hash.AppendData(length);
             hash.AppendData(encoded);
-            previous = exactId;
+            previous = sortKey;
             count++;
         }
         if (count == 0)
@@ -93,19 +105,19 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
         ArgumentNullException.ThrowIfNull(exactIds);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var length = new byte[sizeof(int)];
-        string? previous = null;
+        byte[]? previous = null;
         var count = 0;
         await foreach (var exactId in exactIds.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             ArgumentNullException.ThrowIfNull(exactId);
-            ValidateExactId(exactId, nameof(exactIds));
-            if (previous is not null && string.CompareOrdinal(previous, exactId) >= 0)
+            var sortKey = GetCanonicalSortKey(exactId);
+            if (previous is not null && CanonicalSortKeyComparer.Instance.Compare(previous, sortKey) >= 0)
                 throw new ArgumentException("Exact remote item identities must be in strict canonical order.", nameof(exactIds));
             var encoded = StrictUtf8.GetBytes(exactId);
             BinaryPrimitives.WriteInt32BigEndian(length, encoded.Length);
             hash.AppendData(length);
             hash.AppendData(encoded);
-            previous = exactId;
+            previous = sortKey;
             count++;
         }
         if (count == 0)
@@ -124,6 +136,19 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
             throw new ArgumentException(
                 "Exact remote item identities must contain valid UTF-16 text.",
                 parameterName);
+        }
+    }
+
+    private sealed class CanonicalSortKeyComparer : IComparer<byte[]>
+    {
+        public static CanonicalSortKeyComparer Instance { get; } = new();
+
+        public int Compare(byte[]? left, byte[]? right)
+        {
+            if (ReferenceEquals(left, right)) return 0;
+            if (left is null) return -1;
+            if (right is null) return 1;
+            return left.AsSpan().SequenceCompareTo(right);
         }
     }
 }

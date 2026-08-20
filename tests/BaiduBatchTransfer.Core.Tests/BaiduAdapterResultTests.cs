@@ -57,6 +57,23 @@ public sealed class RemoteItemIdentitySetTests
     }
 
     [Fact]
+    public void CanonicalSortKeysPreserveDotNetOrdinalOrderAcrossUnicodePlanes()
+    {
+        var supplementary = "\U00010000";
+        var privateUseBmp = "\uE000";
+
+        Assert.True(string.CompareOrdinal(supplementary, privateUseBmp) < 0);
+        Assert.True(RemoteItemIdentitySet.GetCanonicalSortKey(supplementary)
+            .AsSpan().SequenceCompareTo(RemoteItemIdentitySet.GetCanonicalSortKey(privateUseBmp)) < 0);
+
+        var set = new RemoteItemIdentitySet([
+            new(privateUseBmp, "BMP"),
+            new(supplementary, "Supplementary"),
+        ]);
+        Assert.Equal([supplementary, privateUseBmp], set.Items.Select(item => item.ExactId));
+    }
+
+    [Fact]
     public void IdentityEqualityUsesExactIdAndDisplayNameIsSanitizedForFallback()
     {
         var first = new RemoteItemIdentity("opaque-1", " \u0001\u202e  顶层文件夹  \r\n");

@@ -6,6 +6,14 @@ namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
 {
+    internal const string ResultKeysetSelectSql = ResultColumns +
+        ",BaiduShareResults.CandidateSequence,BaiduShareResults.OutputOrdinal FROM BaiduShareResults " +
+        "WHERE BaiduShareResults.BatchJobId=$batch AND BaiduShareResults.IsAccepted=1 AND BaiduShareResults.IsCurrent=1 " +
+        "AND (BaiduShareResults.CandidateSequence>$afterSequence OR " +
+        "(BaiduShareResults.CandidateSequence=$afterSequence AND (BaiduShareResults.OutputOrdinal>$afterOutput OR " +
+        "(BaiduShareResults.OutputOrdinal=$afterOutput AND BaiduShareResults.Id>$afterResult)))) " +
+        "ORDER BY BaiduShareResults.CandidateSequence,BaiduShareResults.OutputOrdinal,BaiduShareResults.Id LIMIT $limit;";
+
     internal const string ExpiredBatchSelectSql = """
         SELECT batch.Id FROM BatchJobs batch
         WHERE batch.Status='Active' AND EXISTS(
@@ -153,10 +161,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         await using var command = Command(connection, transaction, """
             SELECT ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName
             FROM ShareOperationRemoteItems
-            WHERE ShareOperationId=$operation AND ($after IS NULL OR RemoteItemId>$after)
-            ORDER BY RemoteItemId LIMIT $limit;
+            WHERE ShareOperationId=$operation AND ($afterKey IS NULL OR CanonicalSortKey>$afterKey)
+            ORDER BY CanonicalSortKey LIMIT $limit;
             """);
-        Add(command,"$operation",Id(shareOperationId)); Add(command,"$after",afterRemoteItemId); Add(command,"$limit",checked(pageSize+1));
+        Add(command,"$operation",Id(shareOperationId));
+        Add(command,"$afterKey",afterRemoteItemId is null ? null : RemoteItemIdentitySet.GetCanonicalSortKey(afterRemoteItemId));
+        Add(command,"$limit",checked(pageSize+1));
         var values = new List<ShareOperationRemoteItemRecord>(pageSize+1);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -539,9 +549,13 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 await demote.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
             await using var insert = Command(connection,transaction,"""
-                INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,ExactItemSetFingerprint,
-                  SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,IsAccepted,IsCurrent,SharedAt,UpdatedAt)
-                VALUES($id,$operation,$batch,$resource,$account,$items,$settings,$generation,$share,$url,$code,$accepted,$current,$shared,$updated);
+                INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,IsAccepted,IsCurrent,SharedAt,UpdatedAt)
+                SELECT $id,$operation,$batch,$resource,$account,resource.CandidateSequence,output.OutputOrdinal,
+                  $items,$settings,$generation,$share,$url,$code,$accepted,$current,$shared,$updated
+                FROM ResourceItems resource
+                JOIN BatchOutputAccounts output ON output.BatchJobId=$batch AND output.AccountId=$account
+                WHERE resource.Id=$resource AND resource.BatchJobId=$batch;
                 """);
             Add(insert,"$id",Id(result.Id)); Add(insert,"$operation",Id(result.ShareOperationId)); Add(insert,"$batch",Id(result.BatchJobId));
             Add(insert,"$resource",Id(result.ResourceItemId)); Add(insert,"$account",Id(result.AccountId));
@@ -549,7 +563,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             Add(insert,"$generation",result.Generation); Add(insert,"$share",result.ShareId); Add(insert,"$url",result.ShareUrl);
             Add(insert,"$code",result.ExtractionCode); Add(insert,"$accepted",result.IsAccepted?1:0); Add(insert,"$current",result.IsCurrent?1:0);
             Add(insert,"$shared",Time(result.SharedAt)); Add(insert,"$updated",Time(result.UpdatedAt));
-            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -573,7 +591,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         ArgumentNullException.ThrowIfNull(query); query.Validate();
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred:true);
-        await using var command = Command(connection,transaction,ResultColumns+",resource.CandidateSequence,output.OutputOrdinal FROM BaiduShareResults JOIN ResourceItems resource ON resource.Id=BaiduShareResults.ResourceItemId JOIN BatchOutputAccounts output ON output.BatchJobId=BaiduShareResults.BatchJobId AND output.AccountId=BaiduShareResults.AccountId WHERE BaiduShareResults.BatchJobId=$batch AND BaiduShareResults.IsAccepted=1 AND BaiduShareResults.IsCurrent=1 AND (resource.CandidateSequence>$afterSequence OR (resource.CandidateSequence=$afterSequence AND (output.OutputOrdinal>$afterOutput OR (output.OutputOrdinal=$afterOutput AND BaiduShareResults.Id>$afterResult)))) ORDER BY resource.CandidateSequence,output.OutputOrdinal,BaiduShareResults.Id LIMIT $limit;");
+        await using var command = Command(connection,transaction,ResultKeysetSelectSql);
         Add(command,"$batch",Id(query.BatchJobId)); Add(command,"$afterSequence",query.After?.CandidateSequence??0L);
         Add(command,"$afterOutput",query.After?.OutputOrdinal??0);
         Add(command,"$afterResult",query.After is null?string.Empty:Id(query.After.ResultId)); Add(command,"$limit",checked(query.PageSize+1));

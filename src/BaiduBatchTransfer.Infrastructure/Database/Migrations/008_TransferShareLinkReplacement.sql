@@ -5,6 +5,9 @@ ALTER TABLE BatchJobs ADD COLUMN ShareOperationCount INTEGER NOT NULL DEFAULT 0
 
 ALTER TABLE ResourceItems ADD COLUMN ResolvedOutputTitle TEXT NULL;
 
+CREATE UNIQUE INDEX UX_ResourceItems_Id_Batch_CandidateSequence
+ON ResourceItems(Id, BatchJobId, CandidateSequence);
+
 CREATE TABLE ImportColumnDefinitions (
     ImportSessionId TEXT NOT NULL,
     ColumnOrdinal INTEGER NOT NULL CHECK(typeof(ColumnOrdinal)='integer' AND ColumnOrdinal >= 0),
@@ -285,6 +288,7 @@ CREATE TABLE ShareOperationRemoteItems (
     ShareOperationId TEXT NOT NULL,
     ItemOrdinal INTEGER NOT NULL CHECK(typeof(ItemOrdinal)='integer' AND ItemOrdinal >= 0),
     RemoteItemId TEXT NOT NULL CHECK(length(trim(RemoteItemId))>0),
+    CanonicalSortKey BLOB NOT NULL CHECK(typeof(CanonicalSortKey)='blob' AND length(CanonicalSortKey)>0),
     DisplayName TEXT NOT NULL,
     PRIMARY KEY(ShareOperationId, RemoteItemId),
     UNIQUE(ShareOperationId, ItemOrdinal),
@@ -293,6 +297,8 @@ CREATE TABLE ShareOperationRemoteItems (
 
 CREATE INDEX IX_ShareOperationRemoteItems_Operation_Ordinal_Id
 ON ShareOperationRemoteItems(ShareOperationId, ItemOrdinal, RemoteItemId);
+CREATE INDEX IX_ShareOperationRemoteItems_Operation_CanonicalSortKey
+ON ShareOperationRemoteItems(ShareOperationId, CanonicalSortKey);
 
 CREATE TABLE ShareDiscoveryBaselines (
     ShareOperationId TEXT NOT NULL,
@@ -311,6 +317,8 @@ CREATE TABLE BaiduShareResults (
     BatchJobId TEXT NOT NULL,
     ResourceItemId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
+    CandidateSequence INTEGER NOT NULL CHECK(typeof(CandidateSequence)='integer' AND CandidateSequence > 0),
+    OutputOrdinal INTEGER NOT NULL CHECK(typeof(OutputOrdinal)='integer' AND OutputOrdinal > 0),
     ExactItemSetFingerprint TEXT NOT NULL,
     SettingsFingerprint TEXT NOT NULL,
     Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
@@ -324,7 +332,11 @@ CREATE TABLE BaiduShareResults (
     FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE,
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE,
     FOREIGN KEY(ResourceItemId) REFERENCES ResourceItems(Id) ON DELETE CASCADE,
-    FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
+    FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
+    FOREIGN KEY(ResourceItemId,BatchJobId,CandidateSequence)
+      REFERENCES ResourceItems(Id,BatchJobId,CandidateSequence),
+    FOREIGN KEY(BatchJobId,AccountId,OutputOrdinal)
+      REFERENCES BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal)
     ,FOREIGN KEY(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
       ExactItemSetFingerprint,SettingsFingerprint)
       REFERENCES ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
@@ -341,6 +353,14 @@ CREATE INDEX IX_BaiduShareResults_Operation_Generation
 ON BaiduShareResults(ShareOperationId, Generation, Id);
 CREATE INDEX IX_BaiduShareResults_Batch_Resource_Account_Id
 ON BaiduShareResults(BatchJobId, ResourceItemId, AccountId, Id);
+CREATE INDEX IX_BaiduShareResults_Batch_Accepted_Current_Cursor
+ON BaiduShareResults(BatchJobId, IsAccepted, IsCurrent, CandidateSequence, OutputOrdinal, Id);
+
+CREATE TRIGGER TR_BaiduShareResults_CursorImmutable
+BEFORE UPDATE OF CandidateSequence,OutputOrdinal ON BaiduShareResults
+BEGIN
+    SELECT RAISE(ABORT, 'share result cursor lineage is immutable');
+END;
 
 CREATE TABLE BatchShareDiscoverySnapshots (
     BatchJobId TEXT NOT NULL,

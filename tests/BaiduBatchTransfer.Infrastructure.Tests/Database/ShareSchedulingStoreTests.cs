@@ -82,6 +82,27 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task AcceptedResultKeysetPlanUsesPersistedCursorIndexWithoutScanOrTemporarySort()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN " + SqliteShareSchedulingStore.ResultKeysetSelectSql;
+        command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+        command.Parameters.AddWithValue("$afterSequence", 0);
+        command.Parameters.AddWithValue("$afterOutput", 0);
+        command.Parameters.AddWithValue("$afterResult", string.Empty);
+        command.Parameters.AddWithValue("$limit", 10);
+        var details = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) details.Add(reader.GetString(3));
+        var plan = string.Join(Environment.NewLine, details);
+        Assert.DoesNotContain("SCAN ", plan, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("TEMP B-TREE", plan, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("IX_BaiduShareResults_Batch_Accepted_Current_Cursor", plan, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task OrphanShareOperationCannotCrossAnyShareWriteBoundary()
     {
         var graph = await CreateGraphAsync(includeShareSettings: false);
@@ -443,6 +464,43 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.True(await store.AcceptResultAsync(
             thirdShareId, ShareOperationStatus.Submitting, thirdReserved.LeaseGeneration, thirdResult, graph.Now));
 
+        var fourthResource = new ResourceItemRecord(Guid.NewGuid(), graph.BatchId, null, 2, "source-url-2", "source-id-2",
+            null, null, null, null, null, "None", "Valid", null, "Expanded", null, null, graph.Now, graph.Now,
+            "Resolved title 2");
+        var fourthTransfer = secondTransfer with
+        {
+            Id = Guid.NewGuid(), ResourceItemId = fourthResource.Id, SequenceNumber = 4, AllocationOrdinal = 4,
+            OperationFingerprint = "transfer-four"
+        };
+        var fourthShareId = Guid.NewGuid();
+        var fourthItems = new RemoteItemIdentitySet([new("remote-e", "E")]).Fingerprint;
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddResourcesAsync([fourthResource]);
+            await unit.Jobs.AddOperationsAsync([fourthTransfer]);
+            await unit.Jobs.AddShareOperationsAsync([
+                new(fourthShareId, fourthTransfer.Id, fourthResource.Id, graph.BatchId, graph.AccountId, 1,
+                    "WaitingShare", fourthItems, graph.SettingsFingerprint, 1, null, null, "Unknown", 0,
+                    null, null, null, null, null, graph.Now, graph.Now)],
+                [new(fourthShareId, 0, "remote-e", "E")]);
+            await unit.CommitAsync();
+        }
+        var fourthReserved = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            fourthShareId, 1, fourthReserved.LeaseGeneration, "fourth-baseline", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            fourthShareId, 1, fourthReserved.LeaseGeneration, "{}", graph.Now));
+        Assert.True(await store.TryRecordAdapterRequestAsync(
+            fourthShareId, 1, fourthReserved.LeaseGeneration, "fourth-request", graph.Now));
+        var fourthResult = result with
+        {
+            Id = Guid.Parse("00000000-0000-0000-0000-000000000004"), ShareOperationId = fourthShareId,
+            ResourceItemId = fourthResource.Id, ExactItemSetFingerprint = fourthItems, ShareId = "share-four"
+        };
+        Assert.True(await store.AcceptResultAsync(
+            fourthShareId, ShareOperationStatus.Submitting, fourthReserved.LeaseGeneration, fourthResult, graph.Now));
+
         var export = await store.GetResultsKeysetPageAsync(new ShareResultKeysetQuery(graph.BatchId, 1));
         Assert.NotNull(export.NextCursor);
         var exported = new List<BaiduShareResultRecord>(export.Items);
@@ -453,8 +511,20 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             exported.AddRange(page.Items);
             cursor = page.NextCursor;
         }
-        Assert.Equal(new[] { result.Id, secondResult.Id, thirdResult.Id }, exported.Select(item => item.Id));
+        Assert.Equal(new[] { result.Id, secondResult.Id, thirdResult.Id, fourthResult.Id }, exported.Select(item => item.Id));
         Assert.Equal(2, exported.Select(item => item.AccountId).Distinct().Count());
+
+        Assert.Equal(2L, await ScalarAsync<long>(graph.Factory,
+            "SELECT CandidateSequence FROM BaiduShareResults WHERE Id=$id;", fourthResult.Id));
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT OutputOrdinal FROM BaiduShareResults WHERE Id=$id;", fourthResult.Id));
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var drift = connection.CreateCommand())
+        {
+            drift.CommandText = "UPDATE BaiduShareResults SET CandidateSequence=99 WHERE Id=$id;";
+            drift.Parameters.AddWithValue("$id", fourthResult.Id.ToString("D"));
+            await Assert.ThrowsAsync<SqliteException>(() => drift.ExecuteNonQueryAsync());
+        }
 
         Assert.True(await store.TryStartNextGenerationAsync(
             graph.ShareOperationId, ShareOperationStatus.Succeeded, 1, reserved.LeaseGeneration, graph.Now.AddMinutes(2), graph.Now.AddSeconds(1)));
@@ -502,16 +572,75 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ResultKeysetReadsDeepPagesFromTwoHundredThousandPersistedResultsWithoutLinearGrowth()
+    {
+        const int resultCount = 200_000;
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = graph.Factory.DatabasePath,
+            Pooling = false,
+            ForeignKeys = false,
+        };
+        await using (var connection = new SqliteConnection(builder.ToString()))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                WITH RECURSIVE sequence(value) AS (
+                  VALUES(1) UNION ALL SELECT value+1 FROM sequence WHERE value<$count
+                )
+                INSERT INTO BaiduShareResults(
+                  Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,
+                  IsAccepted,IsCurrent,SharedAt,UpdatedAt)
+                SELECT lower(printf('%08x-0000-0000-0000-%012x',value,value)),$operation,$batch,$resource,
+                  CASE WHEN value%2=1 THEN $firstAccount ELSE $secondAccount END,
+                  ((value-1)/2)+1,CASE WHEN value%2=1 THEN 1 ELSE 2 END,
+                  printf('items-%012d',value),$settings,1,printf('share-%012d',value),
+                  'https://pan.baidu.com/s/redacted','abcd',1,1,$now,$now
+                FROM sequence;
+                """;
+            command.Parameters.AddWithValue("$count", resultCount);
+            command.Parameters.AddWithValue("$operation", graph.ShareOperationId.ToString("D"));
+            command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+            command.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
+            command.Parameters.AddWithValue("$firstAccount", graph.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$secondAccount", graph.SecondAccountId.ToString("D"));
+            command.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
+            command.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+            Assert.Equal(resultCount, await command.ExecuteNonQueryAsync());
+        }
+
+        static Guid ResultId(int value) => Guid.Parse($"{value:x8}-0000-0000-0000-{value:x12}");
+        var cursor = new ShareResultCursor(99_999, 2, ResultId(199_998));
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var before = GC.GetTotalMemory(forceFullCollection: true);
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        CursorKeysetPage<BaiduShareResultRecord, ShareResultCursor>? page = null;
+        for (var iteration = 0; iteration < 100; iteration++)
+            page = await store.GetResultsKeysetPageAsync(new(graph.BatchId, 2, cursor));
+        timer.Stop();
+        var growth = Math.Max(0, GC.GetTotalMemory(forceFullCollection: true) - before);
+
+        Assert.NotNull(page);
+        Assert.Equal([ResultId(199_999), ResultId(200_000)], page.Items.Select(result => result.Id));
+        Assert.Null(page.NextCursor);
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(5), $"100 deep keyset reads took {timer.Elapsed}.");
+        Assert.True(growth < 32L * 1024 * 1024, $"Managed growth was {growth:N0} bytes.");
+    }
+
+    [Fact]
     public async Task ResultLineageCannotDriftFromOwningOperationGeneration()
     {
         var graph = await CreateGraphAsync(includeShareSettings: true);
         await using var connection = await graph.Factory.OpenConnectionAsync();
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,
+            INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,
               IsAccepted,IsCurrent,SharedAt,UpdatedAt)
-            VALUES($id,$operation,$batch,$resource,$account,$items,$settings,999,'share-drift',
+            VALUES($id,$operation,$batch,$resource,$account,1,1,$items,$settings,999,'share-drift',
               'https://pan.baidu.com/s/redacted','abcd',1,1,$now,$now);
             """;
         command.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));

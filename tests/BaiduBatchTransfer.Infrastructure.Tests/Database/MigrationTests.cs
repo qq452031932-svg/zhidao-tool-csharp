@@ -428,6 +428,12 @@ public sealed class MigrationTests : IDisposable
         Assert.Equal(0L, await ScalarAsync<long>(upgraded, "SELECT COUNT(*) FROM BatchShareSettings;"));
         Assert.Equal(0L, await ScalarAsync<long>(upgraded, "SELECT COUNT(*) FROM ShareOperations;"));
         Assert.Contains("SettingsFingerprint", await ColumnsAsync(upgraded, "ShareOperations"));
+        Assert.Contains("CanonicalSortKey", await ColumnsAsync(upgraded, "ShareOperationRemoteItems"));
+        Assert.Contains("CandidateSequence", await ColumnsAsync(upgraded, "BaiduShareResults"));
+        Assert.Contains("OutputOrdinal", await ColumnsAsync(upgraded, "BaiduShareResults"));
+        Assert.Contains("BatchJobId, IsAccepted, IsCurrent, CandidateSequence, OutputOrdinal, Id",
+            await ScalarAsync<string>(upgraded,
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='IX_BaiduShareResults_Batch_Accepted_Current_Cursor';"));
         Assert.Contains("SettingsFingerprint", await ScalarAsync<string>(upgraded,
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='UX_ShareOperations_ActiveCreateKey';"));
         Assert.Equal(0L, await ScalarAsync<long>(upgraded, "SELECT ShareOperationCount FROM BatchJobs LIMIT 1;"));
