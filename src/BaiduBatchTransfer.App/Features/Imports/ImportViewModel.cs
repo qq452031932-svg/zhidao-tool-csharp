@@ -37,6 +37,8 @@ public sealed record ImportDraftReady(Guid SessionId, ImportDraftStatistics Stat
 
 public interface IImportWorkflow
 {
+    bool IsAvailable => true;
+    string StatusMessage => string.Empty;
     Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken);
     Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken);
     Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken);
@@ -46,6 +48,8 @@ public interface IImportWorkflow
 
 public sealed class UnavailableImportWorkflow : IImportWorkflow
 {
+    public bool IsAvailable => false;
+    public string StatusMessage => "本地导入流程尚不可用。";
     private static ImportWorkflowException Error() => new(ImportUiError.AdapterUnavailable);
     public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
     public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
@@ -113,9 +117,13 @@ public sealed class ImportViewModel : ObservableObject
     public string StatisticsText { get => statisticsText; private set => SetProperty(ref statisticsText, value); }
     public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) RaiseCommands(); } }
     public bool CanResumeImport { get => canResumeImport; private set { if (SetProperty(ref canResumeImport, value)) RaiseCommands(); } }
-    public bool CanImport => adapterAvailability.CanStartTransfers && !IsBusy;
+    public bool CanImport => workflow.IsAvailable && !IsBusy;
     public bool CanImportText => CanImport && !string.IsNullOrWhiteSpace(TextContent);
-    public string AdapterStatusMessage => adapterAvailability.StatusMessage;
+    public string AdapterStatusMessage => !workflow.IsAvailable
+        ? workflow.StatusMessage
+        : adapterAvailability.CanStartTransfers
+            ? string.Empty
+            : "可以先导入并整理草稿；实际转存功能仍在验证中。";
     public long TotalRows { get => totalRows; private set => SetProperty(ref totalRows, value); }
     public Guid? SessionId => sessionId;
     public ImportPreviewRow? SelectedRow
@@ -167,8 +175,16 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
+        StatusMessage = "请选择 Excel 文件";
         var path = dialogService.PickExcelFile();
-        if (path is not null) await ImportExcelAsync(path, cancellationToken);
+        if (path is null)
+        {
+            StatusMessage = "未选择文件";
+            return;
+        }
+
+        StatusMessage = "已选择 Excel 文件，正在检查";
+        await ImportExcelAsync(path, cancellationToken);
     }
 
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
@@ -234,11 +250,6 @@ public sealed class ImportViewModel : ObservableObject
         CancellationToken externalCancellation)
     {
         if (IsBusy) return;
-        if (!adapterAvailability.CanStartTransfers)
-        {
-            StatusMessage = adapterAvailability.StatusMessage;
-            return;
-        }
         operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(externalCancellation);
         IsBusy = true;
         StatusMessage = "正在流式导入，已保存的批次会持续写入本机数据库…";

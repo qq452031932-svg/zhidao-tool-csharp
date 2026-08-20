@@ -95,6 +95,37 @@ public sealed class ImportViewModelTests
     }
 
     [Fact]
+    public void LocalImportRemainsEnabledWhileLiveTransferExecutionIsUnavailable()
+    {
+        var vm = new ImportViewModel(
+            new FakeImportWorkflow(),
+            new FakePageSource([], 0, null),
+            new FakeDialogService(),
+            new TransferUnavailable());
+        vm.TextContent = "https://pan.baidu.com/s/abc123";
+
+        Assert.True(vm.ImportTextCommand.CanExecute(null));
+        Assert.Contains("可以先导入", vm.AdapterStatusMessage);
+    }
+
+    [Fact]
+    public async Task ExcelSelectionStartsLocalWorkflowWhenTransfersAreUnavailable()
+    {
+        var workflow = new FakeImportWorkflow();
+        var vm = new ImportViewModel(
+            workflow,
+            new FakePageSource([], 0, null),
+            new FakeDialogService("D:\\imports\\selected.xlsx"),
+            new TransferUnavailable());
+
+        await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, workflow.ExcelCalls);
+        Assert.NotNull(vm.SessionId);
+        Assert.Equal("导入完成，请分页检查异常、重复和账号映射。", vm.StatusMessage);
+    }
+
+    [Fact]
     public async Task CompletedImportHandsThePersistedSessionAndStatisticsToWizard()
     {
         var import = Create(new FakeImportWorkflow());
@@ -168,12 +199,18 @@ public sealed class ImportViewModelTests
         }
     }
 
-    private sealed class FakeDialogService : IDialogService
+    private sealed class FakeDialogService(string? excelFile = null) : IDialogService
     {
         public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.FromResult(true);
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
-        public string? PickExcelFile() => null;
+        public string? PickExcelFile() => excelFile;
+    }
+
+    private sealed class TransferUnavailable : IAdapterAvailability
+    {
+        public bool CanStartTransfers => false;
+        public string StatusMessage => "实际转存尚未开放。";
     }
 }
