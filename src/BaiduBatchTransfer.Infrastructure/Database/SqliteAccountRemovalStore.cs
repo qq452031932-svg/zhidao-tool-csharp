@@ -265,11 +265,11 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled');",
             token, ("$account", Id(account.Id))).ConfigureAwait(false);
         var terminalBatches = await ScalarLongAsync(connection, transaction, """
-            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestTargetBatches target ON target.Id=batch.Id
             WHERE batch.Status IN ('Completed','CompletedWithShortfall','Cancelled');
             """, token).ConfigureAwait(false);
         var sharedBatches = await ScalarLongAsync(connection, transaction, """
-            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestTargetBatches target ON target.Id=batch.Id
             WHERE batch.Status IN ('Completed','CompletedWithShortfall','Cancelled')
               AND (EXISTS(SELECT 1 FROM AccountAllocations a WHERE a.BatchJobId=batch.Id AND a.AccountId<>$account)
                    OR EXISTS(SELECT 1 FROM TransferOperations o WHERE o.BatchJobId=batch.Id AND o.AssignedAccountId<>$account));
@@ -281,18 +281,23 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         SqliteConnection connection, SqliteTransaction transaction, Guid accountId, CancellationToken token)
     {
         await ExecuteChangeAsync(connection, transaction, """
+            CREATE TEMP TABLE AccountRemovalManifestTargetBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestImports(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestResources(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             """, token).ConfigureAwait(false);
         await ExecuteChangeAsync(connection, transaction, """
-            INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetBatches(Id)
             SELECT BatchJobId FROM TransferOperations
              WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled')
             UNION SELECT BatchJobId FROM AccountAllocations WHERE AccountId=$account
             UNION SELECT BatchJobId FROM ResourceItems
              WHERE CandidateConstraintAccountId=$account OR ReservedAccountId=$account;
             """, token, ("$account", Id(accountId))).ConfigureAwait(false);
+        await ExecuteChangeAsync(connection, transaction, """
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+            SELECT Id FROM temp.AccountRemovalManifestTargetBatches;
+            """, token).ConfigureAwait(false);
         await ExecuteChangeAsync(connection, transaction, """
             INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
             SELECT Id FROM ImportSessions WHERE PrecheckAccountId=$account;
@@ -310,6 +315,11 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                 INSERT OR IGNORE INTO temp.AccountRemovalManifestResources(Id)
                 SELECT operation.ResourceItemId FROM TransferOperations operation
                 JOIN temp.AccountRemovalManifestBatches batch ON batch.Id=operation.BatchJobId;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+                SELECT operation.BatchJobId FROM TransferOperations operation
+                JOIN temp.AccountRemovalManifestResources resource ON resource.Id=operation.ResourceItemId;
                 """, token).ConfigureAwait(false);
             changed += await ExecuteChangeAsync(connection, transaction, """
                 INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)

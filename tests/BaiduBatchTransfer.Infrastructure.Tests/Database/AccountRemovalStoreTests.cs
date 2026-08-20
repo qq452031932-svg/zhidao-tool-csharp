@@ -167,6 +167,45 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task OperationChangingToReferenceManifestedResourceMakesTokenStale()
+    {
+        var (factory, store, g) = await CreateAsync(seedGraph: true);
+        var contextBatch = Guid.NewGuid();
+        var originalResource = Guid.NewGuid();
+        var contextOperation = Guid.NewGuid();
+        await InsertBatchAsync(factory, contextBatch, "Completed", null, 1, 1);
+        await InsertResourceAsync(factory, originalResource, contextBatch, 1, null, "Expanded", "https://context.invalid");
+        await InsertOperationAsync(factory, contextOperation, originalResource, contextBatch, A, 1, "Succeeded");
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await ExecuteAsync(factory, "UPDATE TransferOperations SET ResourceItemId=$resource WHERE Id=$operation;",
+            ("$resource", Id(g.BResource)), ("$operation", Id(contextOperation)));
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        await AssertUnchangedAsync(factory);
+    }
+
+    [Fact]
+    public async Task SurvivingOperationReferencingManifestedResourceHasAllFieldsBound()
+    {
+        var (factory, store, g) = await CreateAsync(seedGraph: true);
+        var contextBatch = Guid.NewGuid();
+        var contextOperation = Guid.NewGuid();
+        await InsertBatchAsync(factory, contextBatch, "Completed", null, 0, 1);
+        await InsertOperationAsync(factory, contextOperation, g.BResource, contextBatch, A, 1, "Succeeded");
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        Assert.Equal(3, preview.TerminalBatchCount);
+        await ExecuteAsync(factory, "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',AttemptCount=AttemptCount+1 WHERE Id=$operation;",
+            ("$operation", Id(contextOperation)));
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        await AssertUnchangedAsync(factory);
+    }
+
+    [Fact]
     public async Task PreviewCountsFullTerminalGraphAndRedactsManifestSecrets()
     {
         var (_, store, _) = await CreateAsync(seedGraph: true);
