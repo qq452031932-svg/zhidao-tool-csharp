@@ -9,5 +9,6 @@ public enum BaiduErrorKind
     InsufficientCapacity,
     InvalidTargetPath,
     TransientService,
-    UnknownResponse
+    UnknownResponse,
+    NotValidated,
 }

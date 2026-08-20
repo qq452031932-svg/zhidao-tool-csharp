@@ -6,6 +6,11 @@ namespace BaiduBatchTransfer.BaiduAdapter.Http;
 
 public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityClient) : IBaiduNetdiskAdapter
 {
+    public static AdapterCapability Capability { get; } = new(
+        transferValidated: false,
+        shareValidated: false,
+        "百度转存和分享能力尚未通过现场验收。");
+
     private readonly BaiduSessionIdentityClient identityClient =
         identityClient ?? throw new ArgumentNullException(nameof(identityClient));
 
@@ -66,6 +71,15 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
         return NotValidated<TransferConfirmation>(session, cancellationToken);
     }
 
+    public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferAsync(
+        AccountSession session,
+        TransferConfirmationQuery query,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        return NotValidated<TransferConfirmationResult>(session, cancellationToken);
+    }
+
     private static Task<BaiduAdapterResult<T>> NotValidated<T>(
         AccountSession session,
         CancellationToken cancellationToken)
@@ -73,7 +87,8 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
         ArgumentNullException.ThrowIfNull(session);
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(BaiduAdapterResult<T>.Failure(
-            BaiduErrorKind.UnknownResponse,
-            "The live transfer operation has not passed the user-assisted gate."));
+            BaiduErrorKind.NotValidated,
+            "The live operation has not passed the user-assisted gate.",
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted));
     }
 }

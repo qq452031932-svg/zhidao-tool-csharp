@@ -19,6 +19,7 @@ public static class BaiduAdapterResult
 
         BaiduErrorKind.InsufficientCapacity or
         BaiduErrorKind.InvalidTargetPath or
+        BaiduErrorKind.NotValidated or
         BaiduErrorKind.TransientService => BaiduErrorScope.Operation,
 
         BaiduErrorKind.UnknownResponse => BaiduErrorScope.Unknown,
@@ -35,6 +36,7 @@ public static class BaiduAdapterResult
         BaiduErrorKind.InvalidTargetPath => "The target path is invalid.",
         BaiduErrorKind.TransientService => "The service is temporarily unavailable.",
         BaiduErrorKind.UnknownResponse => "The service returned an unrecognized response.",
+        BaiduErrorKind.NotValidated => "百度转存或分享能力尚未通过现场验收。",
         _ => throw new ArgumentOutOfRangeException(nameof(errorKind), errorKind, "Unknown adapter error kind.")
     };
 }

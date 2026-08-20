@@ -39,4 +39,23 @@ public interface IBaiduNetdiskAdapter
         AccountSession session,
         TransferConfirmationQuery query,
         CancellationToken cancellationToken);
+
+    async Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferAsync(
+        AccountSession session,
+        TransferConfirmationQuery query,
+        CancellationToken cancellationToken)
+    {
+        var legacy = await ConfirmTransferAsync(session, query, cancellationToken).ConfigureAwait(false);
+        if (!legacy.IsSuccess)
+        {
+            return BaiduAdapterResult<TransferConfirmationResult>.Failure(
+                legacy.ErrorKind!.Value,
+                adapterDiagnostic: null,
+                legacy.RetryAfter,
+                legacy.SubmissionAcceptance);
+        }
+
+        return BaiduAdapterResult<TransferConfirmationResult>.Success(
+            legacy.Value.ToExactResult());
+    }
 }

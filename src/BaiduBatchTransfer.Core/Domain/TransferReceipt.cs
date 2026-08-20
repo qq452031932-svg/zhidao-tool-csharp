@@ -11,7 +11,21 @@ public sealed class TransferReceipt : IEquatable<TransferReceipt>
     {
         SubmittedAtUtc = submittedAt.ToUniversalTime();
         AdapterRequestId = NormalizeOptional(adapterRequestId);
-        RemoteItemIds = SnapshotIdentifiers(remoteItemIds);
+        RemoteItemIds = SnapshotLegacyIdentifiers(remoteItemIds);
+        ExactRemoteItems = null;
+    }
+
+    private TransferReceipt(
+        DateTimeOffset submittedAt,
+        string? adapterRequestId,
+        RemoteItemIdentitySet exactRemoteItems)
+    {
+        ArgumentNullException.ThrowIfNull(exactRemoteItems);
+        SubmittedAtUtc = submittedAt.ToUniversalTime();
+        AdapterRequestId = NormalizeOptional(adapterRequestId);
+        ExactRemoteItems = exactRemoteItems;
+        RemoteItemIds = new ReadOnlyCollection<string>(
+            exactRemoteItems.Items.Select(item => item.ExactId).ToArray());
     }
 
     public DateTimeOffset SubmittedAtUtc { get; }
@@ -20,10 +34,19 @@ public sealed class TransferReceipt : IEquatable<TransferReceipt>
 
     public IReadOnlyList<string> RemoteItemIds { get; }
 
+    public RemoteItemIdentitySet? ExactRemoteItems { get; }
+
+    public static TransferReceipt WithExactEvidence(
+        DateTimeOffset submittedAt,
+        string? adapterRequestId,
+        RemoteItemIdentitySet exactRemoteItems) =>
+        new(submittedAt, adapterRequestId, exactRemoteItems);
+
     public bool Equals(TransferReceipt? other) =>
         other is not null &&
         SubmittedAtUtc == other.SubmittedAtUtc &&
         string.Equals(AdapterRequestId, other.AdapterRequestId, StringComparison.Ordinal) &&
+        (ExactRemoteItems is not null) == (other.ExactRemoteItems is not null) &&
         RemoteItemIds.SequenceEqual(other.RemoteItemIds, StringComparer.Ordinal);
 
     public override bool Equals(object? obj) => Equals(obj as TransferReceipt);
@@ -33,6 +56,7 @@ public sealed class TransferReceipt : IEquatable<TransferReceipt>
         var hash = new HashCode();
         hash.Add(SubmittedAtUtc);
         hash.Add(AdapterRequestId, StringComparer.Ordinal);
+        hash.Add(ExactRemoteItems is not null);
         foreach (var remoteItemId in RemoteItemIds)
         {
             hash.Add(remoteItemId, StringComparer.Ordinal);
@@ -50,12 +74,12 @@ public sealed class TransferReceipt : IEquatable<TransferReceipt>
     private static string? NormalizeOptional(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
-    private static IReadOnlyList<string> SnapshotIdentifiers(IEnumerable<string>? values)
+    public override string ToString() =>
+        $"TransferReceipt {{ SubmittedAtUtc = {SubmittedAtUtc:O}, AdapterRequestId = [REDACTED], RemoteItemIds = [REDACTED] }}";
+
+    private static IReadOnlyList<string> SnapshotLegacyIdentifiers(IEnumerable<string>? values)
     {
-        if (values is null)
-        {
-            return Array.Empty<string>();
-        }
+        if (values is null) return Array.Empty<string>();
 
         var snapshot = values
             .Select(value =>

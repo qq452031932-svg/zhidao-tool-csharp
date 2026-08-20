@@ -100,6 +100,8 @@ public static class AppBootstrap
 
         services.AddSingleton<BaiduSessionIdentityClient>();
         services.AddSingleton<IBaiduNetdiskAdapter, LiveBaiduNetdiskAdapter>();
+        services.AddSingleton<IBaiduShareAdapter, LiveBaiduShareAdapter>();
+        services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
         services.AddSingleton(_ => new FileSystemAccountProfilePathPolicy(paths.ProfileDirectory));

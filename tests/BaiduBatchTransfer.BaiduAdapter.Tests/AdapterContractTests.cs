@@ -170,6 +170,118 @@ public sealed class AdapterContractTests
     }
 
     [Fact]
+    public void LegacyTransferReceiptConstructorKeepsItsTrimAndDeduplicateCompatibility()
+    {
+        var receipt = new TransferReceipt(
+            DateTimeOffset.UtcNow,
+            "request-42",
+            [" remote-2 ", "remote-1", "remote-1"]);
+
+        Assert.Equal(["remote-1", "remote-2"], receipt.RemoteItemIds);
+        Assert.Null(receipt.ExactRemoteItems);
+
+        var exactItems = new RemoteItemIdentitySet(
+        [
+            new RemoteItemIdentity("remote-1", "顶层文件夹"),
+        ]);
+        var exactReceipt = TransferReceipt.WithExactEvidence(
+            DateTimeOffset.UtcNow,
+            "request-42",
+            exactItems);
+        Assert.Equal(exactItems, exactReceipt.ExactRemoteItems);
+    }
+
+    [Fact]
+    public void TransferReceiptEqualityPreservesTheExactEvidenceBoundary()
+    {
+        var submittedAt = new DateTimeOffset(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
+        var legacy = new TransferReceipt(submittedAt, "request-42", ["remote-1"]);
+        var exact = TransferReceipt.WithExactEvidence(
+            submittedAt,
+            "request-42",
+            new RemoteItemIdentitySet(
+            [
+                new RemoteItemIdentity("remote-1", "展示名甲"),
+            ]));
+        var rebuiltExactWithDifferentDisplayName = TransferReceipt.WithExactEvidence(
+            submittedAt,
+            "request-42",
+            new RemoteItemIdentitySet(
+            [
+                new RemoteItemIdentity("remote-1", "重命名甲"),
+            ]));
+
+        Assert.NotEqual(legacy, exact);
+        Assert.Equal(exact, rebuiltExactWithDifferentDisplayName);
+        Assert.Equal(exact.GetHashCode(), rebuiltExactWithDifferentDisplayName.GetHashCode());
+    }
+
+    [Fact]
+    public void TransferConfirmationResult_DistinguishesAbsentExactPresentAndAmbiguous()
+    {
+        var exactItems = new RemoteItemIdentitySet(
+        [
+            new RemoteItemIdentity("remote-1", "顶层文件夹"),
+        ]);
+
+        Assert.Equal(TransferConfirmationState.Absent, TransferConfirmationResult.Absent.State);
+        Assert.Null(TransferConfirmationResult.Absent.RemoteItems);
+        Assert.Equal(TransferConfirmationState.Ambiguous, TransferConfirmationResult.Ambiguous.State);
+        Assert.Null(TransferConfirmationResult.Ambiguous.RemoteItems);
+
+        var present = TransferConfirmationResult.ExactPresent(exactItems);
+        Assert.Equal(TransferConfirmationState.ExactPresent, present.State);
+        Assert.Equal(exactItems, present.RemoteItems);
+        Assert.DoesNotContain("remote-1", present.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ShareAdapterIsSeparateAndRequiresExactRemoteEvidence()
+    {
+        IBaiduShareAdapter adapter = new ContractShareAdapter();
+        var session = CreateSession();
+        var exactItems = new RemoteItemIdentitySet(
+        [
+            new RemoteItemIdentity("remote-1", "顶层文件夹"),
+        ]);
+        var request = new PermanentShareRequest(exactItems);
+
+        var created = await adapter.CreatePermanentShareAsync(
+            session,
+            request,
+            CancellationToken.None);
+        var listed = await adapter.ListSharesAsync(session, cursor: null, CancellationToken.None);
+
+        Assert.Equal("request-42", created.Value!.AdapterRequestId);
+        Assert.Equal(exactItems, created.Value.Request.RemoteItems);
+        Assert.Equal(exactItems, listed.Value!.Items.Single().RemoteItems);
+    }
+
+    [Fact]
+    public async Task LegacyConfirmationCannotPromotePersistedIdsIntoExactEvidence()
+    {
+        IBaiduNetdiskAdapter adapter = new ContractAdapter();
+        var query = new TransferConfirmationQuery(
+            "share-identity",
+            new RemotePath("/batch/2026"),
+            "outer-name-fingerprint",
+            "operation-fingerprint",
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            "request-42",
+            ["remote-1"]);
+
+        var result = await adapter.ConfirmExactTransferAsync(
+            CreateSession(),
+            query,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Null(result.Value.RemoteItems);
+    }
+
+    [Fact]
     public void ConfirmationDescriptor_ReconstructsWithStructuralValueEquality()
     {
         var start = new DateTimeOffset(2026, 8, 19, 10, 0, 0, TimeSpan.Zero);
@@ -332,6 +444,45 @@ public sealed class AdapterContractTests
             CancellationToken cancellationToken) =>
             Task.FromResult(BaiduAdapterResult<ResolvedShareLink>.Success(
                 new ResolvedShareLink(rawUrl, "share-identity")));
+    }
+
+    private sealed class ContractShareAdapter : IBaiduShareAdapter
+    {
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(
+                new ShareCreationReceipt(
+                    DateTimeOffset.UtcNow,
+                    "request-42",
+                    request,
+                    "share-42",
+                    "https://pan.baidu.com/s/share-42",
+                    "a1b2")));
+
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
+            AccountSession session,
+            string? cursor,
+            CancellationToken cancellationToken)
+        {
+            var exactItems = new RemoteItemIdentitySet(
+            [
+                new RemoteItemIdentity("remote-1", "顶层文件夹"),
+            ]);
+            return Task.FromResult(BaiduAdapterResult<BaiduSharePage>.Success(
+                new BaiduSharePage(
+                [
+                    new BaiduShareRecord(
+                        "share-42",
+                        exactItems,
+                        "https://pan.baidu.com/s/share-42",
+                        "a1b2",
+                        isPermanent: true,
+                        isAccessUnlimited: true),
+                ],
+                nextCursor: null)));
+        }
     }
 
     private sealed class ContractSessionStore : IBaiduSessionStore
