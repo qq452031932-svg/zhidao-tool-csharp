@@ -17,15 +17,23 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     private const string HistoryUnavailableMessage = "当前版本暂不支持清理历史记录。";
     private readonly SqliteConnectionFactory factory;
     private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation;
+    private readonly Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot;
 
-    public SqliteAccountRemovalStore(SqliteConnectionFactory factory) : this(factory, null) { }
+    public SqliteAccountRemovalStore(SqliteConnectionFactory factory) : this(factory, null, null) { }
 
     internal SqliteAccountRemovalStore(
         SqliteConnectionFactory factory,
-        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation)
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation) :
+        this(factory, afterFinalValidation, null) { }
+
+    internal SqliteAccountRemovalStore(
+        SqliteConnectionFactory factory,
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterFinalValidation,
+        Func<SqliteConnection, SqliteTransaction, CancellationToken, Task>? afterPreviewSnapshot)
     {
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
         this.afterFinalValidation = afterFinalValidation;
+        this.afterPreviewSnapshot = afterPreviewSnapshot;
     }
 
     public async Task<AccountPage> GetAccountsPageAsync(int pageNumber, int pageSize, CancellationToken token)
@@ -50,8 +58,10 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     public async Task<AccountExitPreview> PreviewAsync(Guid accountId, AccountExitHistoryMode mode, CancellationToken token)
     {
         await using var connection = await factory.OpenConnectionAsync(token).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction();
+        await using var transaction = connection.BeginTransaction(deferred: true);
         var account = await ReadAccountAsync(connection, transaction, accountId, token).ConfigureAwait(false);
+        if (afterPreviewSnapshot is not null)
+            await afterPreviewSnapshot(connection, transaction, token).ConfigureAwait(false);
         if (account is null)
         {
             await transaction.CommitAsync(token).ConfigureAwait(false);
@@ -122,7 +132,18 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             """);
         Add(command, "$removed", Time(removedAt));
         Add(command, "$id", Id(accountId));
-        await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+        var changed = await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+        if (changed != 1)
+        {
+            var alreadyDeleted = await ScalarLongAsync(connection, transaction,
+                "SELECT COUNT(*) FROM Accounts WHERE Id=$id AND Status='Deleted' AND IsDeleted=1;",
+                token, ("$id", Id(accountId))).ConfigureAwait(false) == 1;
+            if (!alreadyDeleted)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                throw new InvalidOperationException("Account tombstone preconditions were not satisfied.");
+            }
+        }
         await EnsureForeignKeysAsync(connection, transaction, token).ConfigureAwait(false);
         await transaction.CommitAsync(token).ConfigureAwait(false);
     }
@@ -144,7 +165,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
     {
         var supplied = new byte[expected.Length];
         var valid = false;
-        if (!string.IsNullOrEmpty(suppliedToken))
+        if (suppliedToken?.Length == expected.Length * 2)
         {
             try
             {
@@ -192,7 +213,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         Add(command, "$id", Id(accountId));
         await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         if (!await reader.ReadAsync(token).ConfigureAwait(false)) return null;
-        return new AccountSnapshot(accountId, reader.GetString(1), reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3),
+        return new AccountSnapshot(accountId, reader.GetString(1), reader.GetString(2), ReadBlob(reader, 3),
             reader.IsDBNull(4) ? null : reader.GetString(4), reader.GetString(6), reader.GetInt64(12) != 0, reader.GetInt64(15) != 0);
     }
 
@@ -334,10 +355,13 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                 """, token).ConfigureAwait(false);
             changed += await ExecuteChangeAsync(connection, transaction, """
                 INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
-                SELECT import.Id FROM ImportSessions import
-                WHERE EXISTS(
-                    SELECT 1 FROM temp.AccountRemovalManifestBatches batch
-                    WHERE batch.Id=import.CreatedBatchJobId OR batch.Id=import.AppendToBatchJobId);
+                SELECT import.Id FROM temp.AccountRemovalManifestBatches batch
+                JOIN ImportSessions import ON import.CreatedBatchJobId=batch.Id;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
+                SELECT import.Id FROM temp.AccountRemovalManifestBatches batch
+                JOIN ImportSessions import ON import.AppendToBatchJobId=batch.Id;
                 """, token).ConfigureAwait(false);
             changed += await ExecuteChangeAsync(connection, transaction, """
                 INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
@@ -382,9 +406,12 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             for (var i = 0; i < reader.FieldCount; i++)
             {
                 var name = reader.GetName(i);
-                string? value;
-                if (reader.IsDBNull(i)) value = null;
-                else value = Convert.ToString(reader.GetValue(i), CultureInfo.InvariantCulture);
+                if (!reader.IsDBNull(i) && reader.GetValue(i) is byte[] bytes)
+                {
+                    writer.Bytes(name, bytes);
+                    continue;
+                }
+                string? value = reader.IsDBNull(i) ? null : Convert.ToString(reader.GetValue(i), CultureInfo.InvariantCulture);
                 if (value is not null && timestamps.Contains(name)) value = CanonicalTime(value);
                 if (value is not null && secrets.Contains(name)) value = Fingerprint(value);
                 writer.Value(name, value);
@@ -435,10 +462,18 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         return Convert.ToInt64(await command.ExecuteScalarAsync(token).ConfigureAwait(false), CultureInfo.InvariantCulture);
     }
 
-    private static string Id(Guid id) => id.ToString("N");
+    private static byte[]? ReadBlob(SqliteDataReader reader, int ordinal)
+    {
+        if (reader.IsDBNull(ordinal)) return null;
+        return reader.GetValue(ordinal) is byte[] bytes
+            ? (byte[])bytes.Clone()
+            : throw new InvalidDataException("Encrypted account session has an invalid storage type.");
+    }
+
+    private static string Id(Guid id) => id.ToString("D");
     private static string Time(DateTimeOffset value) => value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
-    private sealed record AccountSnapshot(Guid Id, string BaiduUserId, string DisplayName, string? EncryptedSession,
+    private sealed record AccountSnapshot(Guid Id, string BaiduUserId, string DisplayName, byte[]? EncryptedSession,
         string? ProfilePath, string Status, bool IsEnabled, bool IsDeleted);
     private sealed record Manifest(byte[] Digest, int TerminalOperations, int TerminalBatches, int SharedBatches);
 
@@ -456,6 +491,16 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                 hash.AppendData([1]);
                 Append(value);
             }
+        }
+
+        public void Bytes(string name, ReadOnlySpan<byte> value)
+        {
+            Append(name);
+            hash.AppendData([2]);
+            Span<byte> length = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(length, value.Length);
+            hash.AppendData(length);
+            hash.AppendData(value);
         }
 
         private void Append(string value)

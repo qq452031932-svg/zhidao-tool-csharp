@@ -1,5 +1,7 @@
 using BaiduBatchTransfer.Application.Accounts;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
+using System.Text;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
 
@@ -34,6 +36,50 @@ public sealed class AccountRemovalStoreTests : IDisposable
             Assert.DoesNotContain("cookie", x.ToString(), StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain(root, x.ToString(), StringComparison.OrdinalIgnoreCase);
         });
+    }
+
+    [Fact]
+    public async Task RepositorySeededDashedIdAndBlobSessionSupportsPagePreviewAndPrepare()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var accountId = Guid.NewGuid();
+        var account = AccountRecord.Create(accountId, "repository-user", "Repository Account") with
+        {
+            EncryptedSession = [0, 1, 2, 127, 128, 255],
+            WebView2ProfileDirectory = Path.Combine(root, "profiles", "repository"),
+            LastValidatedAt = RemovedAt
+        };
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(account);
+            await unit.CommitAsync();
+        }
+
+        var page = await store.GetAccountsPageAsync(1, 10, default);
+        Assert.Contains(page.Items, item => item.AccountId == accountId);
+        Assert.Equal(accountId.ToString("D"), await ScalarTextAsync(factory, "SELECT Id FROM Accounts WHERE BaiduUserId='repository-user';"));
+        var preview = await store.PreviewAsync(accountId, AccountExitHistoryMode.KeepHistory, default);
+        var result = await store.PrepareRemovalAsync(new(accountId, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        var state = await ReadAccountAsync(factory, accountId);
+        Assert.Equal("Disabled", state.Status);
+        Assert.Null(state.SessionHex);
+    }
+
+    [Fact]
+    public async Task SessionBlobByteChangeMakesTokenStaleWithoutDisclosure()
+    {
+        var (factory, store, _) = await CreateAsync(seedGraph: true);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await ExecuteAsync(factory, "UPDATE Accounts SET EncryptedSession=$session WHERE Id=$id;",
+            ("$session", new byte[] { 0, 255, 1, 254, 2 }), ("$id", Id(B)));
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.DoesNotContain("00FF01FE02", result.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -235,7 +281,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var b = await ReadAccountAsync(factory, B);
         Assert.Equal("Disabled", b.Status);
         Assert.False(b.Enabled);
-        Assert.Null(b.Session);
+        Assert.Null(b.SessionHex);
         Assert.Null(b.ValidatedAt);
         Assert.Equal(2, await ScalarAsync(factory, "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$id;", ("$id", Id(B))));
         Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
@@ -305,13 +351,62 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(AccountRemovalPreparationStatus.Prepared, (await prepareTask).Status);
         Assert.Null(await writer);
         Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$id AND Status='Reserved';", ("$id", Id(B))));
+        Assert.Equal("Active", await ScalarTextAsync(factory, $"SELECT Status FROM BatchJobs WHERE Id='{Id(g.BBatch)}';"));
+        Assert.Equal(1, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=$batch AND CandidateStatus='Unallocated';", ("$batch", Id(g.BBatch))));
+        await ExecuteAsync(factory, "UPDATE Accounts SET Status='Active',IsEnabled=1,EncryptedSession=$session WHERE Id=$id;",
+            ("$session", new byte[] { 4, 5, 6 }), ("$id", Id(B)));
+        var eligible = await scheduler.TryReserveNextAsync(g.BBatch, RemovedAt.AddMinutes(1), RemovedAt.AddMinutes(6), default);
+        Assert.NotNull(eligible);
+        Assert.Equal(B, eligible.AccountId);
+        Assert.Equal(g.BBatch, eligible.BatchJobId);
+    }
+
+    [Fact]
+    public async Task DeferredPreviewKeepsWalSnapshotWithoutBlockingWriter()
+    {
+        var (factory, normal, g) = await CreateAsync(seedGraph: true, busyTimeout: 2000);
+        var snapshotReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePreview = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var previewStore = new SqliteAccountRemovalStore(factory, null, async (_, _, ct) =>
+        {
+            snapshotReached.SetResult();
+            await releasePreview.Task.WaitAsync(ct);
+        });
+        var previewTask = previewStore.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await snapshotReached.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        try
+        {
+            var writer = Task.Run(async () =>
+            {
+                await using var connection = await factory.OpenConnectionAsync();
+                await using var transaction = connection.BeginTransaction(deferred: false);
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = "UPDATE ResourceItems SET Note='writer committed' WHERE Id=$id;";
+                command.Parameters.AddWithValue("$id", Id(g.SharedPublic));
+                await command.ExecuteNonQueryAsync();
+                await transaction.CommitAsync();
+            });
+            await writer.WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            releasePreview.TrySetResult();
+        }
+
+        var snapshotPreview = await previewTask;
+        var currentPreview = await normal.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        Assert.NotEqual(snapshotPreview.ConfirmationToken, currentPreview.ConfirmationToken);
+        var stale = await normal.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, snapshotPreview.ConfirmationToken, RemovedAt), default);
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, stale.Status);
     }
 
     [Fact]
     public async Task FinalizeTombstoneIsConditionalAndIdempotent()
     {
         var (factory, store, _) = await CreateAsync();
-        await store.FinalizeTombstoneAsync(B, RemovedAt, default);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(B, RemovedAt, default));
         await AssertUnchangedAsync(factory);
         await ExecuteAsync(factory, "UPDATE Accounts SET Status='Disabled',IsEnabled=0,EncryptedSession=NULL,LastValidatedAt=NULL WHERE Id=$id;", ("$id", Id(B)));
         await store.FinalizeTombstoneAsync(B, RemovedAt, default);
@@ -328,11 +423,31 @@ public sealed class AccountRemovalStoreTests : IDisposable
     {
         var (factory, store, _) = await CreateAsync();
         await ExecuteAsync(factory, "UPDATE Accounts SET Status='Disabled',IsEnabled=1 WHERE Id=$id;", ("$id", Id(B)));
-        await store.FinalizeTombstoneAsync(B, RemovedAt, default);
-        Assert.False((await ReadAccountAsync(factory, B)).Deleted);
-        await ExecuteAsync(factory, "UPDATE Accounts SET IsEnabled=0,EncryptedSession='credential' WHERE Id=$id;", ("$id", Id(B)));
-        await store.FinalizeTombstoneAsync(B, RemovedAt, default);
-        Assert.False((await ReadAccountAsync(factory, B)).Deleted);
+        var reenabled = await ReadAccountAsync(factory, B);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(B, RemovedAt, default));
+        Assert.Equal(reenabled, await ReadAccountAsync(factory, B));
+        await ExecuteAsync(factory, "UPDATE Accounts SET IsEnabled=0,EncryptedSession=$session WHERE Id=$id;", ("$session", new byte[] { 9, 8, 7 }), ("$id", Id(B)));
+        var credentialBearing = await ReadAccountAsync(factory, B);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(B, RemovedAt, default));
+        Assert.Equal(credentialBearing, await ReadAccountAsync(factory, B));
+        var accountCount = await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.FinalizeTombstoneAsync(Guid.NewGuid(), RemovedAt, default));
+        Assert.Equal(accountCount, await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;"));
+    }
+
+    [Fact]
+    public async Task MalformedOrOversizedConfirmationTokensAreRejectedWithoutWrites()
+    {
+        var (factory, store, _) = await CreateAsync(seedGraph: true);
+        var before = await ReadAccountAsync(factory, B);
+        var tokens = new string?[] { null, string.Empty, "xyz", new string('A', 63), new string('A', 65), new string('A', 1_000_000) };
+        foreach (var confirmationToken in tokens)
+        {
+            var request = new AccountExitRequest(B, AccountExitHistoryMode.KeepHistory, confirmationToken!, RemovedAt);
+            var result = await store.PrepareRemovalAsync(request, default).WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+            Assert.Equal(before, await ReadAccountAsync(factory, B));
+        }
     }
 
     private async Task<(SqliteConnectionFactory Factory, SqliteAccountRemovalStore Store, Graph Graph)> CreateAsync(bool seedGraph = false, int busyTimeout = 1000)
@@ -353,9 +468,9 @@ public sealed class AccountRemovalStoreTests : IDisposable
               CapacityTotal,CapacityUsed,DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,IsDeleted,DeletedAt)
             VALUES($id,$baidu,$name,$session,$profile,'Cookie','Active',1000,100,10,1,$sort,1,$at,'2026-08-20',0,NULL);
             """;
-        await ExecuteAsync(factory, sql, ("$id", Id(A)), ("$baidu", "baidu-alpha"), ("$name", "Alpha"), ("$session", "cookie-alpha"), ("$profile", Path.Combine(root, "profiles", "alpha")), ("$sort", 1), ("$at", "2026-08-20T01:00:00Z"));
-        await ExecuteAsync(factory, sql, ("$id", Id(B)), ("$baidu", "baidu-bravo"), ("$name", "Bravo"), ("$session", "cookie-bravo"), ("$profile", Path.Combine(root, "profiles", "bravo")), ("$sort", 2), ("$at", "2026-08-20T02:00:00Z"));
-        await ExecuteAsync(factory, sql, ("$id", Id(C)), ("$baidu", "baidu-charlie"), ("$name", "Charlie"), ("$session", "cookie-charlie"), ("$profile", Path.Combine(root, "profiles", "charlie")), ("$sort", 3), ("$at", "2026-08-20T03:00:00Z"));
+        await ExecuteAsync(factory, sql, ("$id", Id(A)), ("$baidu", "baidu-alpha"), ("$name", "Alpha"), ("$session", Encoding.UTF8.GetBytes("cookie-alpha")), ("$profile", Path.Combine(root, "profiles", "alpha")), ("$sort", 1), ("$at", "2026-08-20T01:00:00Z"));
+        await ExecuteAsync(factory, sql, ("$id", Id(B)), ("$baidu", "baidu-bravo"), ("$name", "Bravo"), ("$session", Encoding.UTF8.GetBytes("cookie-bravo")), ("$profile", Path.Combine(root, "profiles", "bravo")), ("$sort", 2), ("$at", "2026-08-20T02:00:00Z"));
+        await ExecuteAsync(factory, sql, ("$id", Id(C)), ("$baidu", "baidu-charlie"), ("$name", "Charlie"), ("$session", Encoding.UTF8.GetBytes("cookie-charlie")), ("$profile", Path.Combine(root, "profiles", "charlie")), ("$sort", 3), ("$at", "2026-08-20T03:00:00Z"));
         await ExecuteAsync(factory, "UPDATE Accounts SET Status='Deleted',IsEnabled=0,IsDeleted=1,EncryptedSession=NULL,DeletedAt='2026-08-19T00:00:00Z' WHERE Id=$id;", ("$id", Id(C)));
     }
 
@@ -448,7 +563,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
         command.Parameters.AddWithValue("$id", Id(id));
         await using var r = await command.ExecuteReaderAsync();
         Assert.True(await r.ReadAsync());
-        return new(r.GetString(0), r.GetInt64(1) != 0, r.IsDBNull(2) ? null : r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3),
+        return new(r.GetString(0), r.GetInt64(1) != 0, r.IsDBNull(2) ? null : Convert.ToHexString((byte[])r.GetValue(2)), r.IsDBNull(3) ? null : r.GetString(3),
             r.GetInt64(4) != 0, r.IsDBNull(5) ? null : r.GetString(5), r.IsDBNull(6) ? null : r.GetString(6));
     }
 
@@ -457,14 +572,22 @@ public sealed class AccountRemovalStoreTests : IDisposable
         var state = await ReadAccountAsync(f, B);
         Assert.Equal("Active", state.Status);
         Assert.True(state.Enabled);
-        Assert.Equal("cookie-bravo", state.Session);
+        Assert.Equal(Convert.ToHexString(Encoding.UTF8.GetBytes("cookie-bravo")), state.SessionHex);
         Assert.NotNull(state.ValidatedAt);
         Assert.False(state.Deleted);
     }
 
-    private static string Id(Guid id) => id.ToString("N");
+    private static async Task<string> ScalarTextAsync(SqliteConnectionFactory f, string sql)
+    {
+        await using var c = await f.OpenConnectionAsync();
+        await using var command = c.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToString(await command.ExecuteScalarAsync()) ?? string.Empty;
+    }
+
+    private static string Id(Guid id) => id.ToString("D");
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
-    private sealed record AccountState(string Status, bool Enabled, string? Session, string? ValidatedAt, bool Deleted, string? DeletedAt, string? Profile);
+    private sealed record AccountState(string Status, bool Enabled, string? SessionHex, string? ValidatedAt, bool Deleted, string? DeletedAt, string? Profile);
     private sealed record Graph(Guid Import, Guid SharedBatch, Guid BBatch, Guid ConstraintBatch, Guid BAllocation, Guid BResource, Guid AResource,
         Guid SharedPublic, Guid BOnlyResource, Guid BOnlyPublic, Guid Constrained, Guid BOperation, Guid BOnlyOperation)
     {
