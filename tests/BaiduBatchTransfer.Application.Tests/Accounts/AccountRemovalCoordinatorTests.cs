@@ -215,21 +215,95 @@ public sealed class AccountRemovalCoordinatorTests
     public async Task PreparedRemovalClosesDeletesAndFinalizesInOrder()
     {
         var events = new List<string>();
+        var unitOfWorkFactory = new RejectingUnitOfWorkFactory();
         var store = new FakeRemovalStore(events)
         {
             PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
         };
         var profiles = new FakeProfileStore(events);
         var paths = new FakePathPolicy(events);
-        var coordinator = new AccountRemovalCoordinator(store, profiles, paths);
+        var removalService = new RemoveAccountService(unitOfWorkFactory, profiles, paths);
+        var coordinator = new AccountRemovalCoordinator(store, removalService);
 
         var result = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
 
         Assert.Equal(AccountExitStatus.Removed, result.Status);
         Assert.Equal("账号已退出。", result.SafeMessage);
         Assert.Equal(new[] { "prepare", "close", "validate-path", "delete", "finalize" }, events);
+        Assert.Equal(0, unitOfWorkFactory.BeginCount);
         Assert.Equal((AccountB, RemovedAt), store.LastFinalizeRequest);
         Assert.Equal((AccountB, ProfilePath), paths.LastValidation);
+    }
+
+    [Fact]
+    public async Task PreparedRemovalWithoutProfileSnapshotClosesThenFinalizesWithoutDelete()
+    {
+        var events = new List<string>();
+        var store = new FakeRemovalStore(events)
+        {
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, null, true)
+        };
+        var profiles = new FakeProfileStore(events);
+        var coordinator = new AccountRemovalCoordinator(store, profiles, new FakePathPolicy(events));
+
+        var result = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+
+        Assert.Equal(AccountExitStatus.Removed, result.Status);
+        Assert.Equal(new[] { "prepare", "close", "finalize" }, events);
+        Assert.Equal(1, store.FinalizeCount);
+    }
+
+    [Fact]
+    public async Task UnsafePreparedProfileSnapshotNeverReachesDeleteOrFinalization()
+    {
+        var events = new List<string>();
+        var store = new FakeRemovalStore(events)
+        {
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+        };
+        var profiles = new FakeProfileStore(events);
+        var paths = new FakePathPolicy(events) { ValidationFailure = new UnauthorizedAccessException("secret-path") };
+        var coordinator = new AccountRemovalCoordinator(store, profiles, paths);
+
+        var result = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+
+        Assert.Equal(AccountExitStatus.CleanupPending, result.Status);
+        Assert.Equal(new[] { "prepare", "close", "validate-path" }, events);
+        Assert.Equal(0, store.FinalizeCount);
+        Assert.DoesNotContain("secret-path", result.SafeMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PreparedCleanupRetryClosesDeletesAndConditionallyFinalizesWithoutLegacyDisable()
+    {
+        var events = new List<string>();
+        var unitOfWorkFactory = new RejectingUnitOfWorkFactory();
+        var store = new FakeRemovalStore(events)
+        {
+            PreparationResult = Preparation(AccountRemovalPreparationStatus.Prepared, AccountB, ProfilePath, true)
+        };
+        var profiles = new FakeProfileStore(events) { DeleteFailure = new IOException("locked-profile") };
+        var removalService = new RemoveAccountService(
+            unitOfWorkFactory,
+            profiles,
+            new FakePathPolicy(events));
+        var coordinator = new AccountRemovalCoordinator(store, removalService);
+
+        var first = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+        profiles.DeleteFailure = null;
+        var retry = await coordinator.ApplyAsync(Request(AccountB, "token"), CancellationToken.None);
+
+        Assert.Equal(AccountExitStatus.CleanupPending, first.Status);
+        Assert.Equal(AccountExitStatus.Removed, retry.Status);
+        Assert.Equal(
+            new[]
+            {
+                "prepare", "close", "validate-path", "delete",
+                "prepare", "close", "validate-path", "delete", "finalize"
+            },
+            events);
+        Assert.Equal(1, store.FinalizeCount);
+        Assert.Equal(0, unitOfWorkFactory.BeginCount);
     }
 
     [Fact]
@@ -401,6 +475,7 @@ public sealed class AccountRemovalCoordinatorTests
     private sealed class FakePathPolicy(List<string>? events = null) : IAccountProfilePathPolicy
     {
         public (Guid AccountId, string Path)? LastValidation { get; private set; }
+        public Exception? ValidationFailure { get; set; }
 
         public string GetAccountProfilePath(Guid accountId) => throw new NotSupportedException();
 
@@ -408,6 +483,18 @@ public sealed class AccountRemovalCoordinatorTests
         {
             events?.Add("validate-path");
             LastValidation = (accountId, candidatePath);
+            if (ValidationFailure is not null) throw ValidationFailure;
+        }
+    }
+
+    private sealed class RejectingUnitOfWorkFactory : IUnitOfWorkFactory
+    {
+        public int BeginCount { get; private set; }
+
+        public Task<IUnitOfWork> BeginAsync(CancellationToken cancellationToken = default)
+        {
+            BeginCount++;
+            throw new InvalidOperationException("The prepared cleanup path must not begin a unit of work.");
         }
     }
 }

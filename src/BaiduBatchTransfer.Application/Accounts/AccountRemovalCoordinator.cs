@@ -10,17 +10,22 @@ public sealed class AccountRemovalCoordinator
     private const string RemovedMessage = "账号已退出。";
 
     private readonly IAccountRemovalStore store;
-    private readonly IWebViewProfileStore profileStore;
-    private readonly IAccountProfilePathPolicy profilePaths;
+    private readonly RemoveAccountService removalService;
 
     public AccountRemovalCoordinator(
         IAccountRemovalStore store,
         IWebViewProfileStore profileStore,
-        IAccountProfilePathPolicy profilePaths)
+        IAccountProfilePathPolicy profilePaths) :
+        this(store, new RemoveAccountService(profileStore, profilePaths))
+    {
+    }
+
+    public AccountRemovalCoordinator(
+        IAccountRemovalStore store,
+        RemoveAccountService removalService)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
-        this.profileStore = profileStore ?? throw new ArgumentNullException(nameof(profileStore));
-        this.profilePaths = profilePaths ?? throw new ArgumentNullException(nameof(profilePaths));
+        this.removalService = removalService ?? throw new ArgumentNullException(nameof(removalService));
     }
 
     public Task<AccountPage> GetAccountsPageAsync(
@@ -61,28 +66,14 @@ public sealed class AccountRemovalCoordinator
             return Result(AccountExitStatus.Failed, FailedMessage);
         }
 
-        try
-        {
-            await profileStore.CloseAsync(request.AccountId, cancellationToken).ConfigureAwait(false);
-            if (preparation.ProfilePath is not null)
-            {
-                profilePaths.EnsureSafeAccountPath(request.AccountId, preparation.ProfilePath);
-                await profileStore.DeleteAsync(
-                    request.AccountId,
-                    preparation.ProfilePath,
-                    cancellationToken).ConfigureAwait(false);
-            }
-
-            await store.FinalizeTombstoneAsync(
-                request.AccountId,
-                request.RemovedAt,
-                cancellationToken).ConfigureAwait(false);
-            return Result(AccountExitStatus.Removed, RemovedMessage);
-        }
-        catch (Exception)
-        {
-            return Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
-        }
+        var cleanup = await removalService.FinalizePreparedAsync(
+            preparation,
+            request.RemovedAt,
+            store,
+            cancellationToken).ConfigureAwait(false);
+        return cleanup.Status == RemoveAccountStatus.Removed
+            ? Result(AccountExitStatus.Removed, RemovedMessage)
+            : Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
     }
 
     private static AccountExitStatus Map(AccountRemovalPreparationStatus status) => status switch
