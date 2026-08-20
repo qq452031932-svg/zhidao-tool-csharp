@@ -51,17 +51,26 @@ public sealed class RemoveAccountService
         if (account is null) return new(RemoveAccountStatus.NotFound, "The account was not found.");
         if (account.IsDeleted) return new(RemoveAccountStatus.AlreadyRemoved, "The account was already removed.");
 
+        var profilePath = account.WebView2ProfileDirectory;
+        if (profilePath is not null)
+        {
+            try
+            {
+                profilePaths.EnsureSafeAccountPath(account.Id, profilePath);
+            }
+            catch (Exception exception) when (IsUnsafePathException(exception))
+            {
+                return new(RemoveAccountStatus.CleanupPending, "Profile cleanup is pending because its path is not safe.");
+            }
+        }
+
         try
         {
-            await CleanupProfileAsync(
+            await CloseAndDeleteProfileAsync(
                 account.Id,
-                account.WebView2ProfileDirectory,
-                validateBeforeClose: true,
+                profilePath,
+                validateAfterClose: false,
                 cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception) when (IsUnsafePathException(exception))
-        {
-            return new(RemoveAccountStatus.CleanupPending, "Profile cleanup is pending because its path is not safe.");
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -96,10 +105,10 @@ public sealed class RemoveAccountService
             await removalStore.CompletePreparedRemovalAsync(
                 accountId,
                 removedAt,
-                (leasedAccountId, leasedProfilePath, token) => CleanupProfileAsync(
+                (leasedAccountId, leasedProfilePath, token) => CloseAndDeleteProfileAsync(
                     leasedAccountId,
                     leasedProfilePath,
-                    validateBeforeClose: false,
+                    validateAfterClose: true,
                     token),
                 cancellationToken).ConfigureAwait(false);
             return new(RemoveAccountStatus.Removed, "The account was removed.");
@@ -110,19 +119,16 @@ public sealed class RemoveAccountService
         }
     }
 
-    private async Task CleanupProfileAsync(
+    private async Task CloseAndDeleteProfileAsync(
         Guid accountId,
         string? profilePath,
-        bool validateBeforeClose,
+        bool validateAfterClose,
         CancellationToken cancellationToken)
     {
-        if (validateBeforeClose && profilePath is not null)
-            profilePaths.EnsureSafeAccountPath(accountId, profilePath);
-
         await profileStore.CloseAsync(accountId, cancellationToken).ConfigureAwait(false);
         if (profilePath is null) return;
 
-        if (!validateBeforeClose)
+        if (validateAfterClose)
             profilePaths.EnsureSafeAccountPath(accountId, profilePath);
         await profileStore.DeleteAsync(accountId, profilePath, cancellationToken).ConfigureAwait(false);
     }

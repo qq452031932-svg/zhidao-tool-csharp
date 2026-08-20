@@ -287,6 +287,45 @@ public sealed class AccountLifecycleTests : IDisposable
         Assert.Null(disabled.EncryptedSession);
     }
 
+    [Fact]
+    public async Task LegacyCloseIoFailureUsesCredentialFreeCleanupPendingMessage()
+    {
+        var repository = new FakeAccountRepository();
+        var account = ActiveAccount();
+        repository.Seed(account);
+        var profiles = new FakeProfileStore([]) { CloseFailure = new IOException("profile-close-failed") };
+        var service = CreateRemoveService(repository, profiles);
+
+        var result = await service.RemoveAsync(account.Id, Now, CancellationToken.None);
+
+        Assert.Equal(RemoveAccountStatus.CleanupPending, result.Status);
+        Assert.Equal(
+            "The account is disabled and credential-free; profile cleanup is pending.",
+            result.SafeMessage);
+        Assert.DoesNotContain("profile-close-failed", result.SafeMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task LegacyDeleteAccessFailureUsesCredentialFreeCleanupPendingMessage()
+    {
+        var repository = new FakeAccountRepository();
+        var account = ActiveAccount();
+        repository.Seed(account);
+        var profiles = new FakeProfileStore([])
+        {
+            DeleteFailure = new UnauthorizedAccessException("profile-delete-denied")
+        };
+        var service = CreateRemoveService(repository, profiles);
+
+        var result = await service.RemoveAsync(account.Id, Now, CancellationToken.None);
+
+        Assert.Equal(RemoveAccountStatus.CleanupPending, result.Status);
+        Assert.Equal(
+            "The account is disabled and credential-free; profile cleanup is pending.",
+            result.SafeMessage);
+        Assert.DoesNotContain("profile-delete-denied", result.SafeMessage, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(LegacyCancellationBoundary.Close)]
     [InlineData(LegacyCancellationBoundary.Delete)]
