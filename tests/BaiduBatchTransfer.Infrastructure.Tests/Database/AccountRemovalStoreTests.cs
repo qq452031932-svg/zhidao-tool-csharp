@@ -117,6 +117,56 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CrossBatchResourceReferencedByTargetOperationIsInManifestClosure()
+    {
+        var (factory, store, g) = await CreateAsync(seedGraph: true);
+        var ownerBatch = Guid.NewGuid();
+        var crossBatchResource = Guid.NewGuid();
+        await InsertBatchAsync(factory, ownerBatch, "Completed", null, 1, 0);
+        await InsertResourceAsync(factory, crossBatchResource, ownerBatch, 1, null, "Expanded", "https://cross-batch.invalid");
+        await ExecuteAsync(factory, "UPDATE TransferOperations SET ResourceItemId=$resource WHERE Id=$operation;",
+            ("$resource", Id(crossBatchResource)), ("$operation", Id(g.BOperation)));
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await ExecuteAsync(factory, "UPDATE ResourceItems SET Note='changed after preview' WHERE Id=$resource;", ("$resource", Id(crossBatchResource)));
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        await AssertUnchangedAsync(factory);
+    }
+
+    [Theory]
+    [InlineData("UPDATE BatchJobs SET Name='changed sibling' WHERE Id=$sibling;")]
+    [InlineData("UPDATE BatchJobs SET ImportSessionId=NULL WHERE Id=$sibling;")]
+    public async Task ImportReverseLinkClosureIncludesSiblingBatchesRegardlessOfPrecheckAccount(string mutation)
+    {
+        var (factory, store, g) = await CreateAsync(seedGraph: true);
+        var bridgeImport = Guid.NewGuid();
+        var bridgeBatch = Guid.NewGuid();
+        var linkedImport = Guid.NewGuid();
+        var sibling = Guid.NewGuid();
+        await ExecuteAsync(factory, """
+            INSERT INTO ImportSessions(Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,
+              PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt)
+            VALUES($id,'Text','sibling source','BatchCreated',0,0,0,0,0,$other,$relevant,NULL,$at,$at);
+            """, ("$id", Id(bridgeImport)), ("$other", Id(A)), ("$relevant", Id(g.BBatch)), ("$at", "2026-08-20T08:00:00Z"));
+        await InsertBatchAsync(factory, bridgeBatch, "Completed", bridgeImport, 0, 0);
+        await ExecuteAsync(factory, """
+            INSERT INTO ImportSessions(Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,
+              PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt)
+            VALUES($id,'Text','nested sibling source','BatchCreated',0,0,0,0,0,$other,$relevant,NULL,$at,$at);
+            """, ("$id", Id(linkedImport)), ("$other", Id(A)), ("$relevant", Id(bridgeBatch)), ("$at", "2026-08-20T08:30:00Z"));
+        await InsertBatchAsync(factory, sibling, "Completed", linkedImport, 0, 0);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
+        await ExecuteAsync(factory, mutation, ("$sibling", Id(sibling)));
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        await AssertUnchangedAsync(factory);
+    }
+
+    [Fact]
     public async Task PreviewCountsFullTerminalGraphAndRedactsManifestSecrets()
     {
         var (_, store, _) = await CreateAsync(seedGraph: true);

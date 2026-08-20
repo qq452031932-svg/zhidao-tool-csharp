@@ -203,7 +203,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         AccountExitHistoryMode mode,
         CancellationToken token)
     {
-        var batchIds = await ReadRelevantBatchIdsAsync(connection, transaction, account.Id, token).ConfigureAwait(false);
+        await MaterializeManifestClosureAsync(connection, transaction, account.Id, token).ConfigureAwait(false);
         using var writer = new CanonicalWriter();
         writer.Value("manifest-version", "1");
         writer.Value("history-mode", mode.ToString());
@@ -216,102 +216,138 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             FROM Accounts WHERE Id=$account ORDER BY Id;
             """, token, ["LastValidatedAt", "DeletedAt"], ["EncryptedSession", "WebView2ProfileDirectory"], ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
 
-        var inClause = InClause(batchIds.Count);
-        if (batchIds.Count != 0)
-        {
-            await AppendQueryAsync(connection, transaction, writer, "BatchJobs", $"""
-                SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,
-                  FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,NextAllocationOrdinal
-                FROM BatchJobs WHERE Id IN ({inClause}) ORDER BY Id;
-                """, token, ["CreatedAt", "StartedAt", "CompletedAt"], [], BatchParameters(batchIds)).ConfigureAwait(false);
-            await AppendQueryAsync(connection, transaction, writer, "TransferOperations", $"""
-                SELECT Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,
-                  AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,
-                  AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,
-                  LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt
-                FROM TransferOperations WHERE BatchJobId IN ({inClause}) ORDER BY BatchJobId,AllocationOrdinal,SequenceNumber,Id;
-                """, token, ["TargetSlotReservedAt", "DailyCountedAt", "SubmitStartedAt", "LeaseExpiresAt", "CreatedAt", "UpdatedAt"], [], BatchParameters(batchIds)).ConfigureAwait(false);
-            await AppendQueryAsync(connection, transaction, writer, "ResourceItems", $"""
-                SELECT Id,BatchJobId,StagedImportRowId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,Note,TargetPathOverride,
-                  NormalizedTargetPathOverride,CreateFolderName,FolderCreationModeOverride,GlobalValidityStatus,CandidateConstraintAccountId,
-                  CandidateStatus,ReservedAccountId,ReservationExpiresAt,CreatedAt,UpdatedAt
-                FROM ResourceItems WHERE BatchJobId IN ({inClause}) ORDER BY BatchJobId,CandidateSequence,Id;
-                """, token, ["ReservationExpiresAt", "CreatedAt", "UpdatedAt"], [], BatchParameters(batchIds)).ConfigureAwait(false);
-            await AppendQueryAsync(connection, transaction, writer, "AccountAllocations", $"""
-                SELECT Id,BatchJobId,AccountId,PriorityOrder,DefaultTargetPath,NormalizedDefaultTargetPath,TargetItemCount,TargetSuccessCount,
-                  EffectiveTargetSuccessCount,AssignedItemCount,AttemptedItemCount,NewSuccessItemCount,AlreadySatisfiedItemCount,SuccessItemCount,
-                  FailedItemCount,LockedItemCount,ExclusiveCandidateCount,UnusedCandidateCount,ReservedSlotCount,FulfilledCount
-                FROM AccountAllocations WHERE BatchJobId IN ({inClause}) ORDER BY BatchJobId,PriorityOrder,AccountId,Id;
-                """, token, [], [], BatchParameters(batchIds)).ConfigureAwait(false);
-        }
-        else
-        {
-            writer.Value("BatchJobs", "empty");
-            writer.Value("TransferOperations", "empty");
-            writer.Value("ResourceItems", "empty");
-            writer.Value("AccountAllocations", "empty");
-        }
-
-        var importIds = await ReadRelevantImportIdsAsync(connection, transaction, account.Id, batchIds, token).ConfigureAwait(false);
-        if (importIds.Count != 0)
-        {
-            var importIn = InClause(importIds.Count);
-            await AppendQueryAsync(connection, transaction, writer, "ImportSessions", $"""
-                SELECT Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,PrecheckAccountId,
-                  CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt
-                FROM ImportSessions WHERE Id IN ({importIn}) ORDER BY Id;
-                """, token, ["CreatedAt", "UpdatedAt"], [], BatchParameters(importIds)).ConfigureAwait(false);
-        }
-        else writer.Value("ImportSessions", "empty");
+        await AppendQueryAsync(connection, transaction, writer, "BatchJobs", """
+            SELECT batch.Id,batch.Name,batch.SourceType,batch.TransferMode,batch.QuotaBasis,batch.ShortagePolicy,batch.ResourceCount,
+              batch.OperationCount,batch.DefaultTargetPath,batch.FolderCreationMode,batch.DuplicatePolicy,batch.ValidationMode,batch.Status,
+              batch.CreatedAt,batch.StartedAt,batch.CompletedAt,batch.ImportSessionId,batch.QueueOrder,batch.NextAllocationOrdinal
+            FROM BatchJobs batch JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+            ORDER BY batch.Id;
+            """, token, ["CreatedAt", "StartedAt", "CompletedAt"], []).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "TransferOperations", """
+            SELECT operation.Id,operation.ResourceItemId,operation.BatchJobId,operation.SequenceNumber,operation.AllocationOrdinal,
+              operation.TargetPath,operation.NormalizedTargetPath,operation.CreateFolderName,operation.AssignedAccountId,
+              operation.AllocationSource,operation.Status,operation.OutcomeKind,operation.AttemptCount,operation.OperationFingerprint,
+              operation.ConfirmationDescriptorJson,operation.AdapterRequestId,operation.RemoteItemIdsJson,operation.SubmitState,
+              operation.TargetSlotState,operation.TargetSlotReservedAt,operation.DailyCountedAt,operation.SubmitStartedAt,
+              operation.LastErrorCode,operation.LastErrorMessage,operation.LeaseExpiresAt,operation.CreatedAt,operation.UpdatedAt
+            FROM TransferOperations operation
+            JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=operation.BatchJobId
+            ORDER BY operation.BatchJobId,operation.AllocationOrdinal,operation.SequenceNumber,operation.Id;
+            """, token, ["TargetSlotReservedAt", "DailyCountedAt", "SubmitStartedAt", "LeaseExpiresAt", "CreatedAt", "UpdatedAt"], []).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "ResourceItems", """
+            SELECT resource.Id,resource.BatchJobId,resource.StagedImportRowId,resource.CandidateSequence,resource.ShareUrl,
+              resource.NormalizedShareId,resource.ExtractionCode,resource.Note,resource.TargetPathOverride,
+              resource.NormalizedTargetPathOverride,resource.CreateFolderName,resource.FolderCreationModeOverride,
+              resource.GlobalValidityStatus,resource.CandidateConstraintAccountId,resource.CandidateStatus,resource.ReservedAccountId,
+              resource.ReservationExpiresAt,resource.CreatedAt,resource.UpdatedAt
+            FROM ResourceItems resource JOIN temp.AccountRemovalManifestResources closure ON closure.Id=resource.Id
+            ORDER BY resource.BatchJobId,resource.CandidateSequence,resource.Id;
+            """, token, ["ReservationExpiresAt", "CreatedAt", "UpdatedAt"], []).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "AccountAllocations", """
+            SELECT allocation.Id,allocation.BatchJobId,allocation.AccountId,allocation.PriorityOrder,allocation.DefaultTargetPath,
+              allocation.NormalizedDefaultTargetPath,allocation.TargetItemCount,allocation.TargetSuccessCount,
+              allocation.EffectiveTargetSuccessCount,allocation.AssignedItemCount,allocation.AttemptedItemCount,
+              allocation.NewSuccessItemCount,allocation.AlreadySatisfiedItemCount,allocation.SuccessItemCount,
+              allocation.FailedItemCount,allocation.LockedItemCount,allocation.ExclusiveCandidateCount,
+              allocation.UnusedCandidateCount,allocation.ReservedSlotCount,allocation.FulfilledCount
+            FROM AccountAllocations allocation JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=allocation.BatchJobId
+            ORDER BY allocation.BatchJobId,allocation.PriorityOrder,allocation.AccountId,allocation.Id;
+            """, token, [], []).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "ImportSessions", """
+            SELECT import.Id,import.SourceType,import.SourceName,import.Status,import.TotalRows,import.ReadyRows,import.InvalidRows,
+              import.DuplicateRows,import.ExcludedRows,import.PrecheckAccountId,import.CreatedBatchJobId,import.AppendToBatchJobId,
+              import.CreatedAt,import.UpdatedAt
+            FROM ImportSessions import JOIN temp.AccountRemovalManifestImports closure ON closure.Id=import.Id
+            ORDER BY import.Id;
+            """, token, ["CreatedAt", "UpdatedAt"], []).ConfigureAwait(false);
 
         var terminalOperations = await ScalarLongAsync(connection, transaction,
             "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled');",
             token, ("$account", Id(account.Id))).ConfigureAwait(false);
-        var terminalBatches = batchIds.Count == 0 ? 0 : await ScalarLongAsync(connection, transaction,
-            $"SELECT COUNT(*) FROM BatchJobs WHERE Id IN ({inClause}) AND Status IN ('Completed','CompletedWithShortfall','Cancelled');",
-            token, BatchParameters(batchIds)).ConfigureAwait(false);
-        var sharedBatches = batchIds.Count == 0 ? 0 : await ScalarLongAsync(connection, transaction, $"""
-            SELECT COUNT(*) FROM BatchJobs batch
-            WHERE batch.Id IN ({inClause}) AND batch.Status IN ('Completed','CompletedWithShortfall','Cancelled')
+        var terminalBatches = await ScalarLongAsync(connection, transaction, """
+            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+            WHERE batch.Status IN ('Completed','CompletedWithShortfall','Cancelled');
+            """, token).ConfigureAwait(false);
+        var sharedBatches = await ScalarLongAsync(connection, transaction, """
+            SELECT COUNT(*) FROM BatchJobs batch JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+            WHERE batch.Status IN ('Completed','CompletedWithShortfall','Cancelled')
               AND (EXISTS(SELECT 1 FROM AccountAllocations a WHERE a.BatchJobId=batch.Id AND a.AccountId<>$account)
                    OR EXISTS(SELECT 1 FROM TransferOperations o WHERE o.BatchJobId=batch.Id AND o.AssignedAccountId<>$account));
-            """, token, [.. BatchParameters(batchIds), ("$account", Id(account.Id))]).ConfigureAwait(false);
+            """, token, ("$account", Id(account.Id))).ConfigureAwait(false);
         return new Manifest(writer.Finish(), checked((int)terminalOperations), checked((int)terminalBatches), checked((int)sharedBatches));
     }
 
-    private static async Task<List<Guid>> ReadRelevantBatchIdsAsync(
+    private static async Task MaterializeManifestClosureAsync(
         SqliteConnection connection, SqliteTransaction transaction, Guid accountId, CancellationToken token)
     {
-        await using var command = Command(connection, transaction, """
-            SELECT BatchJobId FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled')
+        await ExecuteChangeAsync(connection, transaction, """
+            CREATE TEMP TABLE AccountRemovalManifestBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestImports(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestResources(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            """, token).ConfigureAwait(false);
+        await ExecuteChangeAsync(connection, transaction, """
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+            SELECT BatchJobId FROM TransferOperations
+             WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled')
             UNION SELECT BatchJobId FROM AccountAllocations WHERE AccountId=$account
-            UNION SELECT BatchJobId FROM ResourceItems WHERE CandidateConstraintAccountId=$account OR ReservedAccountId=$account
-            UNION SELECT CreatedBatchJobId FROM ImportSessions WHERE PrecheckAccountId=$account AND CreatedBatchJobId IS NOT NULL
-            UNION SELECT AppendToBatchJobId FROM ImportSessions WHERE PrecheckAccountId=$account AND AppendToBatchJobId IS NOT NULL
-            UNION SELECT batch.Id FROM BatchJobs batch JOIN ImportSessions import ON import.Id=batch.ImportSessionId WHERE import.PrecheckAccountId=$account
-            ORDER BY 1;
-            """);
-        Add(command, "$account", Id(accountId));
-        var result = new List<Guid>();
-        await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
-        while (await reader.ReadAsync(token).ConfigureAwait(false)) result.Add(Guid.Parse(reader.GetString(0)));
-        return result;
-    }
+            UNION SELECT BatchJobId FROM ResourceItems
+             WHERE CandidateConstraintAccountId=$account OR ReservedAccountId=$account;
+            """, token, ("$account", Id(accountId))).ConfigureAwait(false);
+        await ExecuteChangeAsync(connection, transaction, """
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
+            SELECT Id FROM ImportSessions WHERE PrecheckAccountId=$account;
+            """, token, ("$account", Id(accountId))).ConfigureAwait(false);
 
-    private static async Task<List<Guid>> ReadRelevantImportIdsAsync(
-        SqliteConnection connection, SqliteTransaction transaction, Guid accountId, IReadOnlyList<Guid> batchIds, CancellationToken token)
-    {
-        var parameters = BatchParameters(batchIds);
-        var predicates = batchIds.Count == 0
-            ? "PrecheckAccountId=$account"
-            : $"PrecheckAccountId=$account OR CreatedBatchJobId IN ({InClause(batchIds.Count)}) OR AppendToBatchJobId IN ({InClause(batchIds.Count)}) OR Id IN (SELECT ImportSessionId FROM BatchJobs WHERE Id IN ({InClause(batchIds.Count)}) AND ImportSessionId IS NOT NULL)";
-        await using var command = Command(connection, transaction, $"SELECT Id FROM ImportSessions WHERE {predicates} ORDER BY Id;");
-        foreach (var value in parameters) Add(command, value.Name, value.Value);
-        Add(command, "$account", Id(accountId));
-        var result = new List<Guid>();
-        await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
-        while (await reader.ReadAsync(token).ConfigureAwait(false)) result.Add(Guid.Parse(reader.GetString(0)));
-        return result;
+        while (true)
+        {
+            var changed = 0;
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestResources(Id)
+                SELECT resource.Id FROM ResourceItems resource
+                JOIN temp.AccountRemovalManifestBatches batch ON batch.Id=resource.BatchJobId;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestResources(Id)
+                SELECT operation.ResourceItemId FROM TransferOperations operation
+                JOIN temp.AccountRemovalManifestBatches batch ON batch.Id=operation.BatchJobId;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+                SELECT resource.BatchJobId FROM ResourceItems resource
+                JOIN temp.AccountRemovalManifestResources closure ON closure.Id=resource.Id;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
+                SELECT batch.ImportSessionId FROM BatchJobs batch
+                JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=batch.Id
+                WHERE batch.ImportSessionId IS NOT NULL;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestImports(Id)
+                SELECT import.Id FROM ImportSessions import
+                WHERE EXISTS(
+                    SELECT 1 FROM temp.AccountRemovalManifestBatches batch
+                    WHERE batch.Id=import.CreatedBatchJobId OR batch.Id=import.AppendToBatchJobId);
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+                SELECT batch.Id FROM BatchJobs batch
+                JOIN temp.AccountRemovalManifestImports import ON import.Id=batch.ImportSessionId;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+                SELECT import.CreatedBatchJobId FROM ImportSessions import
+                JOIN temp.AccountRemovalManifestImports closure ON closure.Id=import.Id
+                WHERE import.CreatedBatchJobId IS NOT NULL;
+                """, token).ConfigureAwait(false);
+            changed += await ExecuteChangeAsync(connection, transaction, """
+                INSERT OR IGNORE INTO temp.AccountRemovalManifestBatches(Id)
+                SELECT import.AppendToBatchJobId FROM ImportSessions import
+                JOIN temp.AccountRemovalManifestImports closure ON closure.Id=import.Id
+                WHERE import.AppendToBatchJobId IS NOT NULL;
+                """, token).ConfigureAwait(false);
+            if (changed == 0) break;
+        }
     }
 
     private static async Task AppendQueryAsync(
@@ -353,9 +389,15 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             : "invalid:" + value;
 
     private static string Fingerprint(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
-    private static string InClause(int count) => string.Join(',', Enumerable.Range(0, count).Select(i => "$b" + i.ToString(CultureInfo.InvariantCulture)));
-    private static (string Name, object? Value)[] BatchParameters(IReadOnlyList<Guid> ids) =>
-        ids.Select((id, index) => ("$b" + index.ToString(CultureInfo.InvariantCulture), (object?)Id(id))).ToArray();
+
+    private static async Task<int> ExecuteChangeAsync(
+        SqliteConnection connection, SqliteTransaction transaction, string sql, CancellationToken token,
+        params (string Name, object? Value)[] parameters)
+    {
+        await using var command = Command(connection, transaction, sql);
+        foreach (var parameter in parameters) Add(command, parameter.Name, parameter.Value);
+        return await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+    }
 
     private static async Task EnsureForeignKeysAsync(SqliteConnection connection, SqliteTransaction transaction, CancellationToken token)
     {
