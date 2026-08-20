@@ -10,6 +10,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     private static readonly Guid A = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     private static readonly Guid B = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
     private static readonly Guid C = Guid.Parse("cccccccc-cccc-cccc-cccc-cccccccccccc");
+    private static readonly Guid Tombstone = Guid.Parse("dddddddd-dddd-dddd-dddd-dddddddddddd");
     private static readonly DateTimeOffset RemovedAt = new(2026, 8, 20, 12, 34, 56, TimeSpan.Zero);
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-account-removal-{Guid.NewGuid():N}");
 
@@ -20,7 +21,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     {
         var (factory, store, _) = await CreateAsync();
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => store.GetAccountsPageAsync(1, pageSize, default));
-        Assert.Equal(3, await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;"));
+        Assert.Equal(4, await ScalarAsync(factory, "SELECT COUNT(*) FROM Accounts;"));
     }
 
     [Fact]
@@ -28,7 +29,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     {
         var (_, store, _) = await CreateAsync();
         var page = await store.GetAccountsPageAsync(1, 2, default);
-        Assert.Equal(2, page.TotalCount);
+        Assert.Equal(3, page.TotalCount);
         Assert.Equal(new[] { "Alpha", "Bravo" }, page.Items.Select(x => x.DisplayName));
         Assert.All(page.Items, x =>
         {
@@ -122,14 +123,17 @@ public sealed class AccountRemovalStoreTests : IDisposable
         await AssertUnchangedAsync(factory);
     }
 
-    [Fact]
-    public async Task TokenCannotApplyToAnotherLocalAccount()
+    [Theory]
+    [InlineData(AccountExitHistoryMode.KeepHistory)]
+    [InlineData(AccountExitHistoryMode.RemoveTerminalHistory)]
+    public async Task TokenCannotApplyToAnotherLocalAccount(AccountExitHistoryMode mode)
     {
         var (factory, store, _) = await CreateAsync(seedGraph: true);
-        var token = (await store.PreviewAsync(A, AccountExitHistoryMode.KeepHistory, default)).ConfirmationToken;
-        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, token, RemovedAt), default);
+        var token = (await store.PreviewAsync(A, mode, default)).ConfirmationToken;
+        var before = await ReadAllPersistentDataAsync(factory);
+        var result = await store.PrepareRemovalAsync(new(B, mode, token, RemovedAt), default);
         Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
-        await AssertUnchangedAsync(factory);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
     }
 
     public static IEnumerable<object[]> ManifestMutations()
@@ -269,15 +273,21 @@ public sealed class AccountRemovalStoreTests : IDisposable
     public async Task KeepHistoryAtomicallyDisablesOnlyBAndClearsCredentials()
     {
         var (factory, store, _) = await CreateAsync(seedGraph: true);
-        var beforeA = await ReadAccountAsync(factory, A);
-        var beforeC = await ReadAccountAsync(factory, C);
+        var beforeA = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A)));
+        var beforeC = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
+        var beforeOtherOperations = await ReadRowsAsync(factory,
+            "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C)));
+        var beforeHistory = await ReadHistoryDataAsync(factory);
         var preview = await store.PreviewAsync(B, AccountExitHistoryMode.KeepHistory, default);
         var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.KeepHistory, preview.ConfirmationToken, RemovedAt), default);
         Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
         Assert.True(result.DatabasePrepared);
         Assert.Equal(Path.Combine(root, "profiles", "bravo"), result.ProfilePath);
-        Assert.Equal(beforeA, await ReadAccountAsync(factory, A));
-        Assert.Equal(beforeC, await ReadAccountAsync(factory, C));
+        Assert.Equal(beforeA, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A))));
+        Assert.Equal(beforeC, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
+        Assert.Equal(beforeOtherOperations, await ReadRowsAsync(factory,
+            "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C))));
+        Assert.Equal(beforeHistory, await ReadHistoryDataAsync(factory));
         var b = await ReadAccountAsync(factory, B);
         Assert.Equal("Disabled", b.Status);
         Assert.False(b.Enabled);
@@ -288,15 +298,234 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task RemoveTerminalHistoryFailsClosedWithoutDisabling()
+    public async Task RemoveTerminalHistoryDeletesOnlyBTerminalGraphAndRebuildsSharedCounters()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var sharedDeletedResource = Guid.NewGuid();
+        var sharedDeletedOperation = Guid.NewGuid();
+        var sharedExclusiveNoOp = Guid.NewGuid();
+        var cResource = Guid.NewGuid();
+        var cOperation = Guid.NewGuid();
+        var sharedAOperation = Guid.NewGuid();
+        var shortfallImport = Guid.NewGuid();
+        var shortfallBatch = Guid.NewGuid();
+        var shortfallResource = Guid.NewGuid();
+        var shortfallPublic = Guid.NewGuid();
+        var shortfallOperation = Guid.NewGuid();
+        var publicAudit = Guid.NewGuid();
+        var aLog = Guid.NewGuid();
+        var cLog = Guid.NewGuid();
+        var bAccountLog = Guid.NewGuid();
+        var bOperationLog = Guid.NewGuid();
+        var bResourceLog = Guid.NewGuid();
+        var bOnlyPublicLog = Guid.NewGuid();
+
+        await InsertAllocationAsync(factory, Guid.NewGuid(), graph.SharedBatch, C, "/charlie");
+        await InsertResourceAsync(factory, cResource, graph.SharedBatch, 4, C, "Expanded", "https://shared-c.invalid");
+        await InsertResourceAsync(factory, sharedDeletedResource, graph.SharedBatch, 5, null, "Expanded", "https://shared-delete.invalid");
+        await InsertResourceAsync(factory, sharedExclusiveNoOp, graph.SharedBatch, 6, B, "Unused", "https://shared-exclusive.invalid");
+        await InsertOperationAsync(factory, cOperation, cResource, graph.SharedBatch, C, 3, "Succeeded");
+        await InsertOperationAsync(factory, sharedDeletedOperation, sharedDeletedResource, graph.SharedBatch, B, 4, "Failed");
+        await InsertOperationAsync(factory, sharedAOperation, graph.BResource, graph.SharedBatch, A, 5, "Succeeded");
+        await ExecuteAsync(factory, "UPDATE BatchJobs SET ResourceCount=6,OperationCount=5 WHERE Id=$id;", ("$id", Id(graph.SharedBatch)));
+        await ExecuteAsync(factory, "UPDATE AccountAllocations SET AssignedItemCount=99,AttemptedItemCount=99,NewSuccessItemCount=99,AlreadySatisfiedItemCount=99,SuccessItemCount=99,FailedItemCount=99,LockedItemCount=99,ExclusiveCandidateCount=99,UnusedCandidateCount=99,ReservedSlotCount=99,FulfilledCount=99 WHERE BatchJobId=$batch AND AccountId<>$account;", ("$batch", Id(graph.SharedBatch)), ("$account", Id(B)));
+
+        await InsertImportAsync(factory, shortfallImport, "BatchCreated", B);
+        await InsertBatchAsync(factory, shortfallBatch, "CompletedWithShortfall", shortfallImport, 2, 1);
+        await ExecuteAsync(factory, "UPDATE ImportSessions SET CreatedBatchJobId=$batch,AppendToBatchJobId=$batch WHERE Id=$id;", ("$batch", Id(shortfallBatch)), ("$id", Id(shortfallImport)));
+        await InsertAllocationAsync(factory, Guid.NewGuid(), shortfallBatch, B, "/shortfall");
+        await InsertResourceAsync(factory, shortfallResource, shortfallBatch, 1, B, "Expanded", "https://shortfall.invalid");
+        await InsertResourceAsync(factory, shortfallPublic, shortfallBatch, 2, null, "Unallocated", "https://shortfall-public.invalid");
+        await InsertOperationAsync(factory, shortfallOperation, shortfallResource, shortfallBatch, B, 1, "Cancelled");
+
+        await InsertLogAsync(factory, publicAudit, graph.SharedBatch, null, null, null);
+        await InsertLogAsync(factory, aLog, graph.SharedBatch, graph.AResource, null, A);
+        await InsertLogAsync(factory, cLog, graph.SharedBatch, cResource, cOperation, C);
+        await InsertLogAsync(factory, bAccountLog, graph.SharedBatch, null, null, B);
+        await InsertLogAsync(factory, bOperationLog, graph.SharedBatch, graph.BResource, graph.BOperation, null);
+        await InsertLogAsync(factory, bResourceLog, graph.SharedBatch, sharedDeletedResource, null, null);
+        await InsertLogAsync(factory, bOnlyPublicLog, shortfallBatch, shortfallPublic, null, null);
+
+        var beforeA = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A)));
+        var beforeC = await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C)));
+        var beforeOtherOperations = await ReadRowsAsync(factory,
+            "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C)));
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(4, preview.TerminalOperationCount);
+        Assert.Equal(4, preview.TerminalBatchCount);
+        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(64, preview.ConfirmationToken.Length);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.True(result.DatabasePrepared);
+        Assert.Equal(beforeA, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(A))));
+        Assert.Equal(beforeC, await ReadRowsAsync(factory, "SELECT * FROM Accounts WHERE Id=$id;", ("$id", Id(C))));
+        Assert.Equal(beforeOtherOperations, await ReadRowsAsync(factory,
+            "SELECT * FROM TransferOperations WHERE AssignedAccountId IN ($a,$c) ORDER BY Id;", ("$a", Id(A)), ("$c", Id(C))));
+        var b = await ReadAccountAsync(factory, B);
+        Assert.Equal("Disabled", b.Status);
+        Assert.False(b.Enabled);
+        Assert.Null(b.SessionHex);
+        Assert.Null(b.ValidatedAt);
+
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled');", ("$account", Id(B))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM AccountAllocations WHERE AccountId=$account AND BatchJobId IN ($shared,$only,$cancelled,$shortfall);", ("$account", Id(B)), ("$shared", Id(graph.SharedBatch)), ("$only", Id(graph.BBatch)), ("$cancelled", Id(graph.ConstraintBatch)), ("$shortfall", Id(shortfallBatch))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(graph.SharedBatch))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id IN ($only,$cancelled,$shortfall);", ("$only", Id(graph.BBatch)), ("$cancelled", Id(graph.ConstraintBatch)), ("$shortfall", Id(shortfallBatch))));
+        Assert.Equal(4, await ScalarAsync(factory, "SELECT ResourceCount FROM BatchJobs WHERE Id=$id;", ("$id", Id(graph.SharedBatch))));
+        Assert.Equal(3, await ScalarAsync(factory, "SELECT OperationCount FROM BatchJobs WHERE Id=$id;", ("$id", Id(graph.SharedBatch))));
+
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(graph.SharedPublic))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(graph.BResource))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id IN ($deleted,$exclusive);", ("$deleted", Id(sharedDeletedResource)), ("$exclusive", Id(sharedExclusiveNoOp))));
+        Assert.Equal("2,2,2,0,2,0,0,1,0,0,2", await ScalarTextAsync(factory, "SELECT AssignedItemCount||','||AttemptedItemCount||','||NewSuccessItemCount||','||AlreadySatisfiedItemCount||','||SuccessItemCount||','||FailedItemCount||','||LockedItemCount||','||ExclusiveCandidateCount||','||UnusedCandidateCount||','||ReservedSlotCount||','||FulfilledCount FROM AccountAllocations WHERE BatchJobId='" + Id(graph.SharedBatch) + "' AND AccountId='" + Id(A) + "';"));
+        Assert.Equal("1,1,1,0,1,0,0,1,0,0,1", await ScalarTextAsync(factory, "SELECT AssignedItemCount||','||AttemptedItemCount||','||NewSuccessItemCount||','||AlreadySatisfiedItemCount||','||SuccessItemCount||','||FailedItemCount||','||LockedItemCount||','||ExclusiveCandidateCount||','||UnusedCandidateCount||','||ReservedSlotCount||','||FulfilledCount FROM AccountAllocations WHERE BatchJobId='" + Id(graph.SharedBatch) + "' AND AccountId='" + Id(C) + "';"));
+
+        Assert.Equal(3, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id IN ($public,$a,$c);", ("$public", Id(publicAudit)), ("$a", Id(aLog)), ("$c", Id(cLog))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id IN ($account,$operation,$resource,$only);", ("$account", Id(bAccountLog)), ("$operation", Id(bOperationLog)), ("$resource", Id(bResourceLog)), ("$only", Id(bOnlyPublicLog))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id AND CreatedBatchJobId IS NULL AND AppendToBatchJobId=$shared;", ("$id", Id(graph.Import)), ("$shared", Id(graph.SharedBatch))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id;", ("$id", Id(shortfallImport))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Theory]
+    [InlineData("Parsing")]
+    [InlineData("Draft")]
+    [InlineData("Prechecking")]
+    [InlineData("ReadyToConfirm")]
+    public async Task NonterminalImportSessionsBlockRemovalAndAreNeverDeleted(string status)
     {
         var (factory, store, _) = await CreateAsync(seedGraph: true);
+        var import = Guid.NewGuid();
+        await InsertImportAsync(factory, import, status, B);
+        var before = await ReadAllPersistentDataAsync(factory);
+
         var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
-        var before = await ReadAccountAsync(factory, B);
         var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
-        Assert.Equal(AccountRemovalPreparationStatus.Failed, result.Status);
-        Assert.False(result.DatabasePrepared);
-        Assert.Equal(before, await ReadAccountAsync(factory, B));
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task PendingConfirmationOperationBlocksRemovalAndIsNeverDeleted()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var resource = Guid.NewGuid();
+        var operation = Guid.NewGuid();
+        await InsertResourceAsync(factory, resource, graph.BBatch, 9, B, "Reserved", "https://pending.invalid");
+        await InsertOperationAsync(factory, operation, resource, graph.BBatch, B, 9, "ResultPending");
+        await ExecuteAsync(factory, "UPDATE TransferOperations SET SubmitState='PendingConfirmation',TargetSlotState='Reserved',ConfirmationDescriptorJson='{}' WHERE Id=$id;", ("$id", Id(operation)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task RemoveHistoryManifestMutationIsStaleAndWritesNothing()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        await ExecuteAsync(factory, "UPDATE ResourceItems SET CandidateStatus='Unused' WHERE Id=$id;", ("$id", Id(graph.BResource)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task CleanupRelevantExecutionLogMutationMakesTokenStaleAndWritesNothing()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var log = Guid.NewGuid();
+        await InsertLogAsync(factory, log, graph.SharedBatch, graph.BResource, graph.BOperation, B);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        await ExecuteAsync(factory, "UPDATE ExecutionLogs SET SanitizedMessage='changed audit' WHERE Id=$id;", ("$id", Id(log)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task OtherAccountConstrainedNoOpResourceMakesTerminalBatchSharedAndSurvives()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var batch = Guid.NewGuid();
+        var bResource = Guid.NewGuid();
+        var aResource = Guid.NewGuid();
+        await InsertBatchAsync(factory, batch, "Completed", null, 2, 1);
+        await InsertAllocationAsync(factory, Guid.NewGuid(), batch, B, "/bravo");
+        await InsertResourceAsync(factory, bResource, batch, 1, B, "Expanded", "https://bravo.invalid");
+        await InsertResourceAsync(factory, aResource, batch, 2, A, "Unused", "https://alpha.invalid");
+        await InsertOperationAsync(factory, Guid.NewGuid(), bResource, batch, B, 1, "Succeeded");
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+
+        var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(batch))));
+        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(aResource))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ResourceItems WHERE Id=$id;", ("$id", Id(bResource))));
+    }
+
+    [Fact]
+    public async Task FailureAfterTerminalOperationDeletionRollsBackCleanupAndCredentialClear()
+    {
+        var (factory, normal, _) = await CreateAsync(seedGraph: true);
+        var preview = await normal.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var before = await ReadAllPersistentDataAsync(factory);
+        var failing = new SqliteAccountRemovalStore(factory, async (connection, transaction, ct) =>
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled');";
+            command.Parameters.AddWithValue("$account", Id(B));
+            Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(ct)));
+            throw new InvalidOperationException("injected cleanup failure");
+        });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failing.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default));
+
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task CancellationAfterTerminalOperationDeletionRollsBackCleanupAndCredentialClear()
+    {
+        var (factory, normal, _) = await CreateAsync(seedGraph: true);
+        var preview = await normal.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var before = await ReadAllPersistentDataAsync(factory);
+        using var cancellation = new CancellationTokenSource();
+        var cancelling = new SqliteAccountRemovalStore(factory, async (connection, transaction, ct) =>
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT COUNT(*) FROM TransferOperations WHERE AssignedAccountId=$account AND Status IN ('Succeeded','Failed','Cancelled');";
+            command.Parameters.AddWithValue("$account", Id(B));
+            Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(ct)));
+            cancellation.Cancel();
+            await Task.FromCanceled(cancellation.Token);
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelling.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), cancellation.Token));
+
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
     }
 
     [Fact]
@@ -541,8 +770,15 @@ public sealed class AccountRemovalStoreTests : IDisposable
         await ExecuteAsync(factory, sql, ("$id", Id(A)), ("$baidu", "baidu-alpha"), ("$name", "Alpha"), ("$session", Encoding.UTF8.GetBytes("cookie-alpha")), ("$profile", Path.Combine(root, "profiles", "alpha")), ("$sort", 1), ("$at", "2026-08-20T01:00:00Z"));
         await ExecuteAsync(factory, sql, ("$id", Id(B)), ("$baidu", "baidu-bravo"), ("$name", "Bravo"), ("$session", Encoding.UTF8.GetBytes("cookie-bravo")), ("$profile", Path.Combine(root, "profiles", "bravo")), ("$sort", 2), ("$at", "2026-08-20T02:00:00Z"));
         await ExecuteAsync(factory, sql, ("$id", Id(C)), ("$baidu", "baidu-charlie"), ("$name", "Charlie"), ("$session", Encoding.UTF8.GetBytes("cookie-charlie")), ("$profile", Path.Combine(root, "profiles", "charlie")), ("$sort", 3), ("$at", "2026-08-20T03:00:00Z"));
-        await ExecuteAsync(factory, "UPDATE Accounts SET Status='Deleted',IsEnabled=0,IsDeleted=1,EncryptedSession=NULL,DeletedAt='2026-08-19T00:00:00Z' WHERE Id=$id;", ("$id", Id(C)));
+        await ExecuteAsync(factory, sql, ("$id", Id(Tombstone)), ("$baidu", "baidu-deleted"), ("$name", "Deleted"), ("$session", Encoding.UTF8.GetBytes("deleted-cookie")), ("$profile", Path.Combine(root, "profiles", "deleted")), ("$sort", 4), ("$at", "2026-08-19T01:00:00Z"));
+        await ExecuteAsync(factory, "UPDATE Accounts SET Status='Deleted',IsEnabled=0,IsDeleted=1,EncryptedSession=NULL,WebView2ProfileDirectory=NULL,LastValidatedAt=NULL,DeletedAt='2026-08-19T00:00:00Z' WHERE Id=$id;", ("$id", Id(Tombstone)));
     }
+
+    private static Task InsertImportAsync(SqliteConnectionFactory factory, Guid id, string status, Guid account) => ExecuteAsync(factory, """
+        INSERT INTO ImportSessions(Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,
+          PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt)
+        VALUES($id,'Excel','safe.xlsx',$status,0,0,0,0,0,$account,NULL,NULL,$at,$at);
+        """, ("$id", Id(id)), ("$status", status), ("$account", Id(account)), ("$at", "2026-08-20T04:00:00Z"));
 
     private static async Task SeedGraphAsync(SqliteConnectionFactory factory, Graph g)
     {
@@ -600,12 +836,26 @@ public sealed class AccountRemovalStoreTests : IDisposable
               RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,
               LeaseExpiresAt,CreatedAt,UpdatedAt)
             VALUES($id,$resource,$batch,$sequence,$sequence,'/target','/target','',$account,'Fixed',$status,$outcome,1,$fingerprint,$descriptor,
-              NULL,NULL,$submit,$slot,NULL,NULL,NULL,NULL,NULL,NULL,$at,$at);
+              NULL,NULL,$submit,$slot,NULL,$daily,NULL,NULL,NULL,NULL,$at,$at);
             """, ("$id", Id(id)), ("$resource", Id(resource)), ("$batch", Id(batch)), ("$sequence", sequence), ("$account", Id(account)),
             ("$status", status), ("$outcome", status == "Succeeded" ? "NewTransfer" : terminal ? status : null), ("$fingerprint", $"fp-{id:N}"),
             ("$descriptor", terminal ? "{}" : null), ("$submit", terminal ? "ResultReceived" : "NotPrepared"),
-            ("$slot", status == "Succeeded" ? "Fulfilled" : terminal ? "Released" : "Reserved"), ("$at", "2026-08-20T05:30:00Z"));
+            ("$slot", status == "Succeeded" ? "Fulfilled" : terminal ? "Released" : "Reserved"),
+            ("$daily", status is "Succeeded" or "Failed" ? "2026-08-20T05:15:00Z" : null), ("$at", "2026-08-20T05:30:00Z"));
     }
+
+    private static Task InsertLogAsync(
+        SqliteConnectionFactory factory,
+        Guid id,
+        Guid? batch,
+        Guid? resource,
+        Guid? operation,
+        Guid? account) => ExecuteAsync(factory, """
+            INSERT INTO ExecutionLogs(Id,BatchJobId,ResourceItemId,TransferOperationId,AccountId,Stage,Level,EventCode,SanitizedMessage,CreatedAt)
+            VALUES($id,$batch,$resource,$operation,$account,'Transfer','Information','TEST','safe audit',$at);
+            """, ("$id", Id(id)), ("$batch", batch is null ? null : Id(batch.Value)),
+            ("$resource", resource is null ? null : Id(resource.Value)), ("$operation", operation is null ? null : Id(operation.Value)),
+            ("$account", account is null ? null : Id(account.Value)), ("$at", "2026-08-20T05:45:00Z"));
 
     private static async Task ExecuteAsync(SqliteConnectionFactory f, string sql, params (string Name, object? Value)[] values)
     {
@@ -664,6 +914,41 @@ public sealed class AccountRemovalStoreTests : IDisposable
                 }
                 snapshot.AppendLine();
             }
+        }
+        return snapshot.ToString();
+    }
+
+    private static async Task<string> ReadHistoryDataAsync(SqliteConnectionFactory factory)
+    {
+        var snapshot = new StringBuilder();
+        foreach (var table in new[] { "ImportSessions", "StagedImportRows", "BatchJobs", "ResourceItems", "TransferOperations", "AccountAllocations", "ExecutionLogs" })
+        {
+            snapshot.Append("T:").Append(table).AppendLine();
+            snapshot.Append(await ReadRowsAsync(factory, $"SELECT * FROM {table} ORDER BY rowid;"));
+        }
+        return snapshot.ToString();
+    }
+
+    private static async Task<string> ReadRowsAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object? Value)[] values)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var value in values) command.Parameters.AddWithValue(value.Name, value.Value ?? DBNull.Value);
+        await using var reader = await command.ExecuteReaderAsync();
+        var snapshot = new StringBuilder();
+        while (await reader.ReadAsync())
+        {
+            for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+            {
+                if (reader.IsDBNull(ordinal)) snapshot.Append("N;");
+                else if (reader.GetValue(ordinal) is byte[] bytes) snapshot.Append("B:").Append(Convert.ToHexString(bytes)).Append(';');
+                else snapshot.Append("V:").Append(Convert.ToString(reader.GetValue(ordinal), System.Globalization.CultureInfo.InvariantCulture)).Append(';');
+            }
+            snapshot.AppendLine();
         }
         return snapshot.ToString();
     }
