@@ -93,7 +93,9 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         var factory = await CreateFactoryAsync();
         var session = ImportSessionRecord.Create(Guid.NewGuid(), "Excel", "source.xlsx") with
         {
-            ColumnMappingFingerprint = "mapping-fingerprint"
+            ColumnMappingFingerprint = "mapping-fingerprint",
+            SourceContentFingerprint = new string('a', 64),
+            HeaderRowNumber = 1,
         };
         var row = StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 1, "normalized-url", "Ready");
         var definitions = new[]
@@ -116,7 +118,10 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         }
 
         await using var read = await SqliteUnitOfWork.BeginAsync(factory);
-        Assert.Equal(session.ColumnMappingFingerprint, (await read.Imports.GetSessionAsync(session.Id))!.ColumnMappingFingerprint);
+        var persistedSession = (await read.Imports.GetSessionAsync(session.Id))!;
+        Assert.Equal(session.ColumnMappingFingerprint, persistedSession.ColumnMappingFingerprint);
+        Assert.Equal(session.SourceContentFingerprint, persistedSession.SourceContentFingerprint);
+        Assert.Equal(session.HeaderRowNumber, persistedSession.HeaderRowNumber);
         Assert.Equal(definitions, await read.Imports.GetColumnDefinitionsAsync(session.Id));
         Assert.Equal(payload, await read.Imports.GetRowPayloadAsync(row.Id));
         await Assert.ThrowsAsync<ArgumentException>(() => read.Imports.AddRowPayloadsAsync([

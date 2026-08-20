@@ -44,7 +44,7 @@ public sealed class OpenXmlWorkbookInspector
             if (relationshipId is null || workbookPart.GetPartById(relationshipId) is not WorksheetPart worksheetPart)
                 throw new ExcelImportException(ExcelImportErrorCode.MissingWorksheet, "The workbook does not contain a readable worksheet.");
 
-            var sharedStrings = workbookReader.ReadSharedStrings(workbookPart.SharedStringTablePart);
+            var sharedStrings = workbookReader.ReadSharedStrings(workbookPart.SharedStringTablePart, cancellationToken);
             var observed = new List<(int RowNumber, Dictionary<int, string> Values)>(MaximumSampleRows + 1);
             uint lastRowNumber = 0;
             var maximumObservedColumnIndex = -1;
@@ -65,7 +65,7 @@ public sealed class OpenXmlWorkbookInspector
                 if (rowNumber <= lastRowNumber)
                     throw new ExcelImportException(ExcelImportErrorCode.InvalidRowOrder, "Worksheet row indexes must be strictly increasing.");
                 lastRowNumber = rowNumber;
-                var values = workbookReader.ReadCells(reader, sharedStrings);
+                var values = workbookReader.ReadCells(reader, sharedStrings, cancellationToken);
                 if (values.Count != 0)
                     maximumObservedColumnIndex = Math.Max(maximumObservedColumnIndex, values.Keys.Max());
                 if (values.Count == 0 || values.Values.All(string.IsNullOrWhiteSpace)) continue;

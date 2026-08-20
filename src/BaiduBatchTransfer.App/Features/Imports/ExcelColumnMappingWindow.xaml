@@ -25,7 +25,7 @@
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   AutomationProperties.Name="列用途对应表">
             <DataGrid.Columns>
-                <DataGridTextColumn Header="列号" Binding="{Binding SourceColumnIndex}" IsReadOnly="True" Width="80" />
+                <DataGridTextColumn Header="列号" Binding="{Binding ColumnLabel}" IsReadOnly="True" Width="80" />
                 <DataGridTextColumn Header="源表头" Binding="{Binding Header}" IsReadOnly="True" Width="*" />
                 <DataGridTemplateColumn Header="用途" Width="230">
                     <DataGridTemplateColumn.CellTemplate>

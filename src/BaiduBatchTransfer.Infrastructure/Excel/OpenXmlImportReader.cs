@@ -15,7 +15,9 @@ public sealed record OpenXmlImportLimits(
     long MaxPartBytes = 128L * 1024 * 1024,
     int MaxRows = 1_048_575,
     int MaxCellsPerRow = 64,
+    int MaxCharactersPerCell = 1_048_576,
     int MaxSharedStrings = 250_000,
+    int MaxCharactersPerSharedStringItem = 1_048_576,
     long MaxSharedStringCharacters = 64L * 1024 * 1024,
     double MaxCompressionRatio = 1_000,
     int MaxArchiveEntries = 2_048,
@@ -38,6 +40,8 @@ public enum ExcelImportErrorCode
     RowLimitExceeded,
     CellLimitExceeded,
     SharedStringLimitExceeded,
+    SharedStringItemLimitExceeded,
+    CellTextLimitExceeded,
 }
 
 public sealed class ExcelImportException : Exception
@@ -71,7 +75,8 @@ public sealed class OpenXmlImportReader
         if (this.limits.MaxWorkbookBytes <= 0 || this.limits.MaxPartBytes <= 0 ||
             this.limits.MaxRows <= 0 || this.limits.MaxRows > OpenXmlImportLimits.ExcelMaximumDataRows ||
             this.limits.MaxCellsPerRow <= 0 ||
-            this.limits.MaxSharedStrings <= 0 || this.limits.MaxSharedStringCharacters <= 0 ||
+            this.limits.MaxCharactersPerCell <= 0 || this.limits.MaxSharedStrings <= 0 ||
+            this.limits.MaxCharactersPerSharedStringItem <= 0 || this.limits.MaxSharedStringCharacters <= 0 ||
             this.limits.MaxCompressionRatio <= 0 || this.limits.MaxArchiveEntries <= 0 ||
             this.limits.MaxTotalUncompressedBytes <= 0)
         {
@@ -113,12 +118,13 @@ public sealed class OpenXmlImportReader
                 throw new ExcelImportException(ExcelImportErrorCode.MissingWorksheet, "The workbook does not contain a readable worksheet.");
             }
 
-            var sharedStrings = ReadSharedStrings(workbookPart.SharedStringTablePart);
+            var sharedStrings = ReadSharedStrings(workbookPart.SharedStringTablePart, cancellationToken);
             using var reader = OpenXmlReader.Create(worksheetPart);
             var extractor = new BaiduShareUrlExtractor();
             var normalizer = new BaiduShareNormalizer();
             var physicalRowCount = 0;
             var dataRowCount = 0;
+            var headerValidated = mapping.HeaderRowNumber is null;
             uint lastRowNumber = 0;
             while (reader.Read())
             {
@@ -140,7 +146,7 @@ public sealed class OpenXmlImportReader
                 }
                 lastRowNumber = rawRowNumber;
                 var sourceRowNumber = (int)rawRowNumber;
-                var values = ReadCells(reader, sharedStrings);
+                var values = ReadCells(reader, sharedStrings, cancellationToken);
                 if (values.Keys.Any(columnIndex => columnIndex >= mapping.SourceColumnCount))
                 {
                     throw new ExcelImportException(
@@ -149,6 +155,21 @@ public sealed class OpenXmlImportReader
                 }
                 if (rawRowNumber == mapping.HeaderRowNumber)
                 {
+                    if (mapping.SourceColumns.Count == mapping.SourceColumnCount)
+                    {
+                        var actualHeaders = ToOrderedValues(values, mapping.SourceColumnCount);
+                        if (mapping.SourceColumns.Any(column =>
+                            !HeaderMatchesSnapshot(
+                                actualHeaders[column.SourceColumnIndex],
+                                column.Header,
+                                column.SourceColumnIndex)))
+                        {
+                            throw new ExcelImportException(
+                                ExcelImportErrorCode.ColumnMappingMismatch,
+                                "The workbook header no longer matches the confirmed mapping snapshot.");
+                        }
+                    }
+                    headerValidated = true;
                     continue;
                 }
 
@@ -187,7 +208,22 @@ public sealed class OpenXmlImportReader
                     RawValues: rawValues);
                 if ((physicalRowCount & 255) == 0) await Task.Yield();
             }
+            if (!headerValidated)
+                throw new ExcelImportException(
+                    ExcelImportErrorCode.ColumnMappingMismatch,
+                    "The confirmed workbook header row is missing.");
         }
+    }
+
+    private static bool HeaderMatchesSnapshot(string actual, string? expected, int sourceColumnIndex)
+    {
+        if (string.Equals(actual, expected ?? string.Empty, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return actual.Length == 0 &&
+               string.Equals(expected, $"第 {sourceColumnIndex + 1} 列", StringComparison.Ordinal);
     }
 
     private static string Get(IReadOnlyList<string> values, int index) =>
@@ -354,25 +390,45 @@ public sealed class OpenXmlImportReader
         return null;
     }
 
-    internal IReadOnlyList<string> ReadSharedStrings(SharedStringTablePart? part)
+    internal IReadOnlyList<string> ReadSharedStrings(
+        SharedStringTablePart? part,
+        CancellationToken cancellationToken)
     {
         if (part is null) return Array.Empty<string>();
         var values = new List<string>();
         long totalCharacters = 0;
+        StringBuilder? currentItem = null;
         using var reader = OpenXmlReader.Create(part);
         while (reader.Read())
         {
-            if (reader.ElementType != typeof(SharedStringItem) || !reader.IsStartElement) continue;
-            if (values.Count >= limits.MaxSharedStrings)
-                throw new ExcelImportException(ExcelImportErrorCode.SharedStringLimitExceeded, "The shared-string table exceeds the allowed entry count.");
-            var item = reader.LoadCurrentElement() as SharedStringItem
-                ?? throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A shared-string entry could not be read.");
-            var value = item.InnerText;
-            totalCharacters = checked(totalCharacters + value.Length);
-            if (totalCharacters > limits.MaxSharedStringCharacters)
-                throw new ExcelImportException(ExcelImportErrorCode.SharedStringLimitExceeded, "The shared-string table exceeds the allowed text size.");
-            values.Add(value);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (reader.ElementType == typeof(SharedStringItem) && reader.IsStartElement)
+            {
+                if (values.Count >= limits.MaxSharedStrings)
+                    throw new ExcelImportException(ExcelImportErrorCode.SharedStringLimitExceeded, "The shared-string table exceeds the allowed entry count.");
+                currentItem = new StringBuilder();
+                continue;
+            }
+            if (currentItem is not null && reader.ElementType == typeof(Text) && reader.IsStartElement)
+            {
+                var text = reader.GetText();
+                if (currentItem.Length > limits.MaxCharactersPerSharedStringItem - text.Length)
+                    throw new ExcelImportException(ExcelImportErrorCode.SharedStringItemLimitExceeded, "A shared-string item exceeds the allowed text size.");
+                currentItem.Append(text);
+                totalCharacters = checked(totalCharacters + text.Length);
+                if (totalCharacters > limits.MaxSharedStringCharacters)
+                    throw new ExcelImportException(ExcelImportErrorCode.SharedStringLimitExceeded, "The shared-string table exceeds the allowed text size.");
+                continue;
+            }
+            if (currentItem is not null && reader.ElementType == typeof(SharedStringItem) && reader.IsEndElement)
+            {
+                values.Add(currentItem.ToString());
+                currentItem = null;
+            }
         }
+
+        if (currentItem is not null)
+            throw new ExcelImportException(ExcelImportErrorCode.InvalidWorkbook, "A shared-string entry is incomplete.");
 
         return values;
     }
@@ -391,7 +447,8 @@ public sealed class OpenXmlImportReader
 
     internal Dictionary<int, string> ReadCells(
         OpenXmlReader reader,
-        IReadOnlyList<string> sharedStrings)
+        IReadOnlyList<string> sharedStrings,
+        CancellationToken cancellationToken)
     {
         var values = new Dictionary<int, string>();
         var fallbackColumn = 0;
@@ -405,7 +462,10 @@ public sealed class OpenXmlImportReader
         void FinishCell()
         {
             if (!inCell) return;
-            values[currentColumn] = ReadCellValue(currentDataType, currentValue, inlineText, sharedStrings);
+            var value = ReadCellValue(currentDataType, currentValue, inlineText, sharedStrings);
+            if (value.Length > limits.MaxCharactersPerCell)
+                throw new ExcelImportException(ExcelImportErrorCode.CellTextLimitExceeded, "A worksheet cell exceeds the allowed text size.");
+            values[currentColumn] = value;
             inCell = false;
             currentValue = null;
             inlineText = null;
@@ -413,6 +473,7 @@ public sealed class OpenXmlImportReader
 
         while (reader.Read())
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (reader.ElementType == typeof(Row) && reader.IsEndElement)
             {
                 FinishCell();
@@ -444,11 +505,16 @@ public sealed class OpenXmlImportReader
             else if (reader.ElementType == typeof(CellValue) && reader.IsStartElement)
             {
                 currentValue = reader.GetText();
+                if (currentValue.Length > limits.MaxCharactersPerCell)
+                    throw new ExcelImportException(ExcelImportErrorCode.CellTextLimitExceeded, "A worksheet cell exceeds the allowed text size.");
             }
             else if (reader.ElementType == typeof(Text) && reader.IsStartElement)
             {
                 inlineText ??= new StringBuilder();
-                inlineText.Append(reader.GetText());
+                var text = reader.GetText();
+                if (inlineText.Length > limits.MaxCharactersPerCell - text.Length)
+                    throw new ExcelImportException(ExcelImportErrorCode.CellTextLimitExceeded, "A worksheet cell exceeds the allowed text size.");
+                inlineText.Append(text);
             }
         }
 

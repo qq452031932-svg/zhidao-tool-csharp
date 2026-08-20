@@ -266,6 +266,24 @@ public sealed class ExcelColumnMappingTests : IDisposable
     }
 
     [Fact]
+    public async Task ReaderRejectsChangedConfirmedHeaderSnapshotAtTheSameWidth()
+    {
+        var path = WriteWorkbook(
+            ["已替换链接", "提取码"],
+            [["https://pan.baidu.com/s/changed-header", "a1b2"]]);
+        var mapping = new ConfirmedImportColumnMapping(
+            1,
+            [new(0, TabularImportColumnRole.ShareUrl), new(1, TabularImportColumnRole.ExtractionCode)],
+            [new(0, "原链接"), new(1, "提取码")]);
+
+        await using var stream = File.OpenRead(path);
+        var error = await Assert.ThrowsAsync<ExcelImportException>(async () =>
+            await ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, mapping)));
+
+        Assert.Equal(ExcelImportErrorCode.ColumnMappingMismatch, error.Code);
+    }
+
+    [Fact]
     public async Task ReaderPreservesBlankCellsExactWhitespaceAndFormulaLikeTextInImmutableOrder()
     {
         var path = WriteWorkbook(
@@ -290,6 +308,29 @@ public sealed class ExcelColumnMappingTests : IDisposable
     }
 
     [Fact]
+    public async Task ReaderAcceptsDeterministicGenericSnapshotForBlankHeaderCell()
+    {
+        var path = WriteWorkbook(
+            ["链接", ""],
+            [["https://pan.baidu.com/s/id", "保留"]]);
+        var mapping = new ConfirmedImportColumnMapping(
+            1,
+            [
+                new(0, TabularImportColumnRole.ShareUrl),
+                new(1, TabularImportColumnRole.Preserve),
+            ],
+            [
+                new(0, "链接"),
+                new(1, "第 2 列"),
+            ]);
+
+        await using var stream = File.OpenRead(path);
+        var row = Assert.Single(await ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, mapping)));
+
+        Assert.Equal(new[] { "https://pan.baidu.com/s/id", "保留" }, row.RawValues);
+    }
+
+    [Fact]
     public async Task InspectorEnforcesSharedStringAndOversizedRowLimits()
     {
         var sharedPath = WriteSharedStringWorkbook();
@@ -307,6 +348,26 @@ public sealed class ExcelColumnMappingTests : IDisposable
                 new OpenXmlWorkbookInspector(new OpenXmlImportLimits(MaxCellsPerRow: 2)).InspectAsync(stream));
             Assert.Equal(ExcelImportErrorCode.CellLimitExceeded, error.Code);
             Assert.Equal(3, error.ObservedCount);
+        }
+    }
+
+    [Fact]
+    public async Task InspectorRejectsOversizedIndividualCellAndSharedStringItemsWithTypedErrors()
+    {
+        var inlinePath = WriteWorkbook(["链接"], [["https://pan.baidu.com/s/too-long"]]);
+        await using (var stream = File.OpenRead(inlinePath))
+        {
+            var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+                new OpenXmlWorkbookInspector(new OpenXmlImportLimits(MaxCharactersPerCell: 8)).InspectAsync(stream));
+            Assert.Equal(ExcelImportErrorCode.CellTextLimitExceeded, error.Code);
+        }
+
+        var sharedPath = WriteSharedStringWorkbook();
+        await using (var stream = File.OpenRead(sharedPath))
+        {
+            var error = await Assert.ThrowsAsync<ExcelImportException>(() =>
+                new OpenXmlWorkbookInspector(new OpenXmlImportLimits(MaxCharactersPerSharedStringItem: 8)).InspectAsync(stream));
+            Assert.Equal(ExcelImportErrorCode.SharedStringItemLimitExceeded, error.Code);
         }
     }
 
@@ -352,6 +413,29 @@ public sealed class ExcelColumnMappingTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             new OpenXmlWorkbookInspector().InspectAsync(stream, cancellation.Token));
+    }
+
+    [Fact]
+    public void SharedStringAndCellReadersObserveCancellationBetweenLargeItemNodes()
+    {
+        var path = WriteRichTextWorkbook(100_000);
+        using var document = SpreadsheetDocument.Open(path, false);
+        var workbookPart = document.WorkbookPart!;
+        var importReader = new OpenXmlImportReader();
+
+        using (var sharedCancellation = new CancellationTokenSource())
+        {
+            sharedCancellation.CancelAfter(TimeSpan.FromMilliseconds(1));
+            Assert.ThrowsAny<OperationCanceledException>(() =>
+                importReader.ReadSharedStrings(workbookPart.SharedStringTablePart, sharedCancellation.Token));
+        }
+
+        using var rowReader = OpenXmlReader.Create(workbookPart.WorksheetParts.Single());
+        while (rowReader.Read() && (rowReader.ElementType != typeof(Row) || !rowReader.IsStartElement)) { }
+        using var rowCancellation = new CancellationTokenSource();
+        rowCancellation.CancelAfter(TimeSpan.FromMilliseconds(1));
+        Assert.ThrowsAny<OperationCanceledException>(() =>
+            importReader.ReadCells(rowReader, [], rowCancellation.Token));
     }
 
     [Fact]
@@ -443,6 +527,7 @@ public sealed class ExcelColumnMappingTests : IDisposable
         var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
         var shared = workbookPart.AddNewPart<SharedStringTablePart>();
         shared.SharedStringTable = new SharedStringTable(
+            new SharedStringItem(),
             new SharedStringItem(new Text("链接")),
             new SharedStringItem(new Text("https://pan.baidu.com/s/id")));
         workbookPart.Workbook = new Workbook(new Sheets(new Sheet
@@ -453,10 +538,10 @@ public sealed class ExcelColumnMappingTests : IDisposable
         writer.WriteStartElement(new Worksheet());
         writer.WriteStartElement(new SheetData());
         writer.WriteStartElement(new Row { RowIndex = 1 });
-        writer.WriteElement(new Cell { DataType = CellValues.SharedString, CellValue = new CellValue(0) });
+        writer.WriteElement(new Cell { DataType = CellValues.SharedString, CellValue = new CellValue(1) });
         writer.WriteEndElement();
         writer.WriteStartElement(new Row { RowIndex = 2 });
-        writer.WriteElement(new Cell { DataType = CellValues.SharedString, CellValue = new CellValue(1) });
+        writer.WriteElement(new Cell { DataType = CellValues.SharedString, CellValue = new CellValue(2) });
         writer.WriteEndElement();
         writer.WriteEndElement();
         writer.WriteEndElement();
@@ -507,6 +592,45 @@ public sealed class ExcelColumnMappingTests : IDisposable
         document.WorkbookPart!.WorksheetParts.Single().AddHyperlinkRelationship(
             new Uri("https://evil.example/private"),
             isExternal: true);
+        return path;
+    }
+
+    private string WriteRichTextWorkbook(int fragmentCount)
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "rich-text.xlsx");
+        using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.Workbook);
+        var workbookPart = document.AddWorkbookPart();
+        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+        var sharedPart = workbookPart.AddNewPart<SharedStringTablePart>();
+        workbookPart.Workbook = new Workbook(new Sheets(new Sheet
+        {
+            Id = workbookPart.GetIdOfPart(worksheetPart), SheetId = 1, Name = "导入",
+        }));
+        using (var writer = OpenXmlWriter.Create(sharedPart))
+        {
+            writer.WriteStartElement(new SharedStringTable());
+            writer.WriteStartElement(new SharedStringItem());
+            for (var index = 0; index < fragmentCount; index++)
+                writer.WriteElement(new Run(new Text("x")));
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+        }
+        using (var writer = OpenXmlWriter.Create(worksheetPart))
+        {
+            writer.WriteStartElement(new Worksheet());
+            writer.WriteStartElement(new SheetData());
+            writer.WriteStartElement(new Row { RowIndex = 1 });
+            writer.WriteStartElement(new Cell { DataType = CellValues.InlineString });
+            writer.WriteStartElement(new InlineString());
+            for (var index = 0; index < fragmentCount; index++)
+                writer.WriteElement(new Run(new Text("x")));
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+        }
         return path;
     }
 

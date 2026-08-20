@@ -429,6 +429,8 @@ public sealed class MigrationTests : IDisposable
         Assert.Equal(0L, await ScalarAsync<long>(upgraded, "SELECT COUNT(*) FROM ShareOperations;"));
         Assert.Contains("SettingsFingerprint", await ColumnsAsync(upgraded, "ShareOperations"));
         Assert.Contains("CanonicalSortKey", await ColumnsAsync(upgraded, "ShareOperationRemoteItems"));
+        Assert.Contains("SourceContentFingerprint", await ColumnsAsync(upgraded, "ImportSessions"));
+        Assert.Contains("HeaderRowNumber", await ColumnsAsync(upgraded, "ImportSessions"));
         Assert.Contains("CandidateSequence", await ColumnsAsync(upgraded, "BaiduShareResults"));
         Assert.Contains("OutputOrdinal", await ColumnsAsync(upgraded, "BaiduShareResults"));
         Assert.Contains("BatchJobId, IsAccepted, IsCurrent, CandidateSequence, OutputOrdinal, Id",

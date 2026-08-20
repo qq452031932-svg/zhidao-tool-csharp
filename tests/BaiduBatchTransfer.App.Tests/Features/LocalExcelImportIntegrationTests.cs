@@ -58,6 +58,91 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task WorkbookReplacedDuringMappingDialogIsRejectedBeforeCreatingSession()
+    {
+        Directory.CreateDirectory(root);
+        var workbookPath = Path.Combine(root, "replace-during-dialog.xlsx");
+        WriteWorkbook(workbookPath, [["https://pan.baidu.com/s/original", "a1b2"]]);
+        var presenter = new MutatingMappingPresenter(() =>
+        {
+            File.Delete(workbookPath);
+            WriteWorkbook(workbookPath, [["https://pan.baidu.com/s/replaced", "a1b2"]]);
+        });
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(presenter));
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+
+        await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            host.Services.GetRequiredService<IImportWorkflow>()
+                .ImportExcelAsync(Guid.NewGuid(), workbookPath, CancellationToken.None));
+
+        await using var connection = await host.Services.GetRequiredService<SqliteConnectionFactory>().OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM ImportSessions;";
+        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync()));
+    }
+
+    [Fact]
+    public async Task NewWorkflowInstanceReselectsAndValidatesWorkbookBeforeDurableResume()
+    {
+        Directory.CreateDirectory(root);
+        var workbookPath = Path.Combine(root, "restart-source.xlsx");
+        WriteWorkbook(
+            workbookPath,
+            [
+                ["https://pan.baidu.com/s/restart-one", "a1b2"],
+                ["https://pan.baidu.com/s/restart-two", "c3d4"],
+            ]);
+        var sessionId = Guid.NewGuid();
+        ConfirmedImportColumnMapping mapping;
+        string digest;
+        await using (var stream = File.OpenRead(workbookPath))
+        {
+            var inspection = await new OpenXmlWorkbookInspector().InspectAsync(stream);
+            var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+            mapping = new ConfirmedImportColumnMapping(suggestion.HeaderRowNumber, suggestion.Columns, inspection.Columns);
+        }
+        await using (var stream = File.OpenRead(workbookPath))
+            digest = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream)).ToLowerInvariant();
+
+        using (var firstHost = AppBootstrap.CreateHost(root))
+        {
+            await firstHost.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+            var firstRow = new ImportSourceRow(
+                2,
+                "https://pan.baidu.com/s/restart-one",
+                "a1b2",
+                OriginalExtractedUrl: "https://pan.baidu.com/s/restart-one",
+                RawValues: ["https://pan.baidu.com/s/restart-one", "a1b2"]);
+            await firstHost.Services.GetRequiredService<ImportStagingService>().StageAsync(
+                new ImportRequest(
+                    sessionId,
+                    "Excel",
+                    Path.GetFileName(workbookPath),
+                    ColumnMapping: mapping,
+                    SourceColumns: mapping.SourceColumns,
+                    SourceContentFingerprint: digest),
+                OneRow(firstRow));
+        }
+
+        var wrongPath = Path.Combine(root, "wrong-reselection.xlsx");
+        WriteWorkbook(wrongPath, [["https://pan.baidu.com/s/wrong", "zzzz"]]);
+        using var resumedHost = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IDialogService>(new SequenceDialogService(wrongPath, workbookPath)));
+        var workflow = resumedHost.Services.GetRequiredService<IImportWorkflow>();
+        await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+            workflow.ResumeAsync(sessionId, CancellationToken.None));
+
+        var result = await workflow
+            .ResumeAsync(sessionId, CancellationToken.None);
+
+        Assert.Equal(2, result.Statistics.Total);
+        await using var unit = await resumedHost.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync();
+        Assert.Equal("Draft", (await unit.Imports.GetSessionAsync(sessionId))!.Status);
+        Assert.Equal(2, (await unit.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10))).TotalCount);
+    }
+
+    [Fact]
     public async Task RealWorkbookImportsThroughTheMigratedHostWhileTransfersStayUnavailable()
     {
         Directory.CreateDirectory(root);
@@ -244,6 +329,8 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         var definitions = await unit.Imports.GetColumnDefinitionsAsync(sessionId);
         Assert.Equal(expectedRows, session!.TotalRows);
         Assert.Equal(presenter.LastMapping!.Fingerprint, session.ColumnMappingFingerprint);
+        Assert.Matches("^[0-9a-f]{64}$", session.SourceContentFingerprint!);
+        Assert.Equal(firstRowIsHeader ? 1 : null, session.HeaderRowNumber);
         Assert.Equal(expectedFirstHeader, definitions[0].SourceHeader);
         Assert.Equal(presenter.LastMapping.SourceColumns.Select(column => column.Header), definitions.Select(column => column.SourceHeader));
         Assert.NotEqual(presenter.InitialFingerprint, presenter.LastMapping.Fingerprint);
@@ -309,6 +396,23 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         public string? PickExcelFile() => selectedPath;
     }
 
+    private sealed class SequenceDialogService(params string?[] selectedPaths) : IDialogService
+    {
+        private readonly Queue<string?> selections = new(selectedPaths);
+
+        public Task<bool> ConfirmAsync(
+            string title,
+            string message,
+            CancellationToken cancellationToken = default) => Task.FromResult(true);
+
+        public Task ShowMessageAsync(
+            string title,
+            string message,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public string? PickExcelFile() => selections.Dequeue();
+    }
+
     private static void AppendTemplateRow(string path, IReadOnlyList<string> values)
     {
         using var document = SpreadsheetDocument.Open(path, true);
@@ -322,6 +426,12 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         sheetData.Append(row);
         worksheet.Save();
         workbookPart.Workbook!.Save();
+    }
+
+    private static async IAsyncEnumerable<ImportSourceRow> OneRow(ImportSourceRow row)
+    {
+        yield return row;
+        await Task.Yield();
     }
 
     private sealed class ConfirmingMappingPresenter : IExcelColumnMappingPresenter
@@ -350,6 +460,23 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             TabularWorkbookInspection inspection,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<ConfirmedImportColumnMapping?>(null);
+    }
+
+    private sealed class MutatingMappingPresenter(Action mutate) : IExcelColumnMappingPresenter
+    {
+        public Task<ConfirmedImportColumnMapping?> ConfirmAsync(
+            TabularWorkbookInspection inspection,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
+            var mapping = new ConfirmedImportColumnMapping(
+                suggestion.HeaderRowNumber,
+                suggestion.Columns,
+                inspection.Columns);
+            mutate();
+            return Task.FromResult<ConfirmedImportColumnMapping?>(mapping);
+        }
     }
 
     private sealed class HeaderOverrideMappingPresenter(bool firstRowIsHeader) : IExcelColumnMappingPresenter

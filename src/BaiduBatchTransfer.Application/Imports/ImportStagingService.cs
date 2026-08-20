@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Core.Services;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace BaiduBatchTransfer.Application.Imports;
@@ -22,10 +23,21 @@ public sealed record ImportRequest(
     TransferMode TransferMode = TransferMode.Distribution,
     Guid? AppendToBatchJobId = null,
     ConfirmedImportColumnMapping? ColumnMapping = null,
-    IReadOnlyList<TabularInspectionColumn>? SourceColumns = null)
+    IReadOnlyList<TabularInspectionColumn>? SourceColumns = null,
+    string? SourceContentFingerprint = null)
 {
     public override string ToString() =>
         $"ImportRequest {{ SessionId = {SessionId}, SourceType = {SourceType}, SourceName = [REDACTED], TransferMode = {TransferMode}, AppendToBatchJobId = {AppendToBatchJobId} }}";
+}
+
+public sealed record ImportResumeRequest(
+    Guid SessionId,
+    string SourceType,
+    ConfirmedImportColumnMapping? ColumnMapping = null,
+    string? SourceContentFingerprint = null)
+{
+    public override string ToString() =>
+        $"ImportResumeRequest {{ SessionId = {SessionId}, SourceType = {SourceType}, MappingConfigured = {ColumnMapping is not null}, UserContent = [REDACTED] }}";
 }
 
 public sealed class ImportStagingService
@@ -37,6 +49,7 @@ public sealed class ImportStagingService
     private readonly BaiduShareNormalizer normalizer = new();
     private readonly BaiduPathNormalizer pathNormalizer = new();
     private readonly ImportConflictService conflicts = new();
+    private static readonly ConcurrentDictionary<Guid, byte> ActiveResumes = new();
 
     public ImportStagingService(
         ImportUnitOfWorkFactory unitOfWorkFactory,
@@ -87,7 +100,9 @@ public sealed class ImportStagingService
             0, 0, 0, 0, 0,
             null, null, request.AppendToBatchJobId,
             now, now,
-            request.ColumnMapping?.Fingerprint));
+            request.ColumnMapping?.Fingerprint,
+            request.SourceContentFingerprint,
+            request.ColumnMapping?.HeaderRowNumber));
 
         await using (var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
         {
@@ -115,45 +130,65 @@ public sealed class ImportStagingService
     }
 
     public Task ResumeAsync(
-        Guid sessionId,
+        ImportResumeRequest request,
         IAsyncEnumerable<ImportSourceRow> rows,
         TransferMode transferMode = TransferMode.Distribution,
         CancellationToken cancellationToken = default) =>
-        ResumeAsync(sessionId, rows, transferMode, committedProgress: null, cancellationToken);
+        ResumeAsync(request, rows, transferMode, committedProgress: null, cancellationToken);
 
     public async Task ResumeAsync(
-        Guid sessionId,
+        ImportResumeRequest request,
         IAsyncEnumerable<ImportSourceRow> rows,
         TransferMode transferMode,
         IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(rows);
-        ImportSessionRecord session;
-        int lastSourceRow;
-        await using (var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
+        if (request.SessionId == Guid.Empty) throw new ArgumentException("A session id is required.", nameof(request));
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.SourceType);
+        if (!ActiveResumes.TryAdd(request.SessionId, 0))
+            throw new InvalidOperationException("This import draft is already being resumed.");
+        try
         {
-            session = await unit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The import session does not exist.");
-            if (session.Status is not ("Draft" or "Parsing"))
+            var sourceType = NormalizeSourceType(request.SourceType);
+            ImportSessionRecord session;
+            int lastSourceRow;
+            await using (var unit = await unitOfWorkFactory(cancellationToken).ConfigureAwait(false))
             {
-                throw new InvalidOperationException("Only an unfinished import draft can be resumed.");
+                session = await unit.Imports.GetSessionAsync(request.SessionId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The import session does not exist.");
+                if (session.Status is not ("Draft" or "Parsing"))
+                {
+                    throw new InvalidOperationException("Only an unfinished import draft can be resumed.");
+                }
+                if (!string.Equals(sourceType, session.SourceType, StringComparison.Ordinal))
+                    throw new ArgumentException("The resume source type does not match the persisted import.", nameof(request));
+
+                var definitions = sourceType == "Excel"
+                    ? await unit.Imports.GetColumnDefinitionsAsync(request.SessionId, cancellationToken).ConfigureAwait(false)
+                    : [];
+                ValidateResumeAuthorization(request, sourceType, session, definitions);
+
+                lastSourceRow = await unit.Imports.GetLastSourceRowNumberAsync(request.SessionId, cancellationToken).ConfigureAwait(false);
+                session = session with { Status = "Parsing", UpdatedAt = DateTimeOffset.UtcNow };
+                await unit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
+                await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            lastSourceRow = await unit.Imports.GetLastSourceRowNumberAsync(sessionId, cancellationToken).ConfigureAwait(false);
-            session = session with { Status = "Parsing", UpdatedAt = DateTimeOffset.UtcNow };
-            await unit.Imports.UpdateSessionAsync(session, cancellationToken).ConfigureAwait(false);
-            await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await ProcessWithDraftRecoveryAsync(
+                    new ProgressState(session),
+                    transferMode,
+                    rows,
+                    lastSourceRow,
+                    committedProgress,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
-
-        await ProcessWithDraftRecoveryAsync(
-                new ProgressState(session),
-                transferMode,
-                rows,
-                lastSourceRow,
-                committedProgress,
-                cancellationToken)
-            .ConfigureAwait(false);
+        finally
+        {
+            ActiveResumes.TryRemove(request.SessionId, out _);
+        }
     }
 
     public async Task RetryNeedsResolutionAsync(
@@ -682,7 +717,8 @@ public sealed class ImportStagingService
     {
         var mapping = request.ColumnMapping
             ?? throw new ArgumentException("Excel imports require a confirmed column mapping.", nameof(request));
-        if (string.IsNullOrWhiteSpace(mapping.Fingerprint) ||
+        if (!IsSha256Fingerprint(request.SourceContentFingerprint) ||
+            string.IsNullOrWhiteSpace(mapping.Fingerprint) ||
             mapping.SourceColumns.Count != mapping.SourceColumnCount ||
             mapping.Columns.Any(column => !Enum.IsDefined(column.Role)) ||
             mapping.Columns.Count(column => column.Role == TabularImportColumnRole.ShareUrl) != 1 ||
@@ -729,5 +765,47 @@ public sealed class ImportStagingService
             headers[column.SourceColumnIndex].Header,
             PersistedRole(column.Role),
             column.Role == TabularImportColumnRole.ShareUrl)).ToArray();
+    }
+
+    private static bool IsSha256Fingerprint(string? value) =>
+        value is { Length: 64 } && value.All(character =>
+            character is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    private static void ValidateResumeAuthorization(
+        ImportResumeRequest request,
+        string sourceType,
+        ImportSessionRecord session,
+        IReadOnlyList<ImportColumnDefinitionRecord> definitions)
+    {
+        if (!string.Equals(sourceType, session.SourceType, StringComparison.Ordinal))
+            throw new ArgumentException("The resume source type does not match the persisted import.", nameof(request));
+        if (sourceType == "Text")
+        {
+            if (request.ColumnMapping is not null || session.ColumnMappingFingerprint is not null ||
+                session.HeaderRowNumber is not null ||
+                !string.Equals(request.SourceContentFingerprint, session.SourceContentFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException("The text resume authorization is invalid.", nameof(request));
+            return;
+        }
+
+        var mapping = request.ColumnMapping
+            ?? throw new ArgumentException("Excel resume requires the persisted confirmed mapping.", nameof(request));
+        if (!IsSha256Fingerprint(request.SourceContentFingerprint) ||
+            !string.Equals(request.SourceContentFingerprint, session.SourceContentFingerprint, StringComparison.Ordinal) ||
+            !string.Equals(mapping.Fingerprint, session.ColumnMappingFingerprint, StringComparison.Ordinal) ||
+            mapping.HeaderRowNumber != session.HeaderRowNumber ||
+            mapping.SourceColumns.Count != mapping.SourceColumnCount ||
+            definitions.Count != mapping.SourceColumnCount)
+            throw new ArgumentException("The Excel resume authorization is invalid.", nameof(request));
+
+        var byOrdinal = definitions.ToDictionary(definition => definition.ColumnOrdinal);
+        if (mapping.Columns.Any(column =>
+                !byOrdinal.TryGetValue(column.SourceColumnIndex, out var definition) ||
+                !string.Equals(definition.MappedRole, PersistedRole(column.Role), StringComparison.Ordinal) ||
+                definition.IsRequired != (column.Role == TabularImportColumnRole.ShareUrl)) ||
+            mapping.SourceColumns.Any(column =>
+                !byOrdinal.TryGetValue(column.SourceColumnIndex, out var definition) ||
+                !string.Equals(definition.SourceHeader, column.Header, StringComparison.Ordinal)))
+            throw new ArgumentException("The persisted Excel mapping definitions no longer match.", nameof(request));
     }
 }

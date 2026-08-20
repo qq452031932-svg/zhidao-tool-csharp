@@ -118,6 +118,31 @@ public sealed class ImportStagingServiceTests
     }
 
     [Fact]
+    public async Task ExcelMappingRequiresSourceContentFingerprintBeforeCreatingSession()
+    {
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver());
+        var sourceColumns = new[] { new TabularInspectionColumn(0, "链接") };
+        var mapping = new ConfirmedImportColumnMapping(
+            1,
+            [new(0, TabularImportColumnRole.ShareUrl)],
+            sourceColumns);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.StageAsync(
+            new ImportRequest(
+                Guid.NewGuid(),
+                "Excel",
+                "rows.xlsx",
+                ColumnMapping: mapping,
+                SourceColumns: sourceColumns),
+            ToAsync(new ImportSourceRow(2, "https://pan.baidu.com/s/id"))));
+
+        Assert.Null(store.Session);
+        Assert.Empty(store.Rows);
+        Assert.Empty(store.Events);
+    }
+
+    [Fact]
     public async Task TextSourceStillAllowsNoColumnMapping()
     {
         var store = new ImportStore();
@@ -493,7 +518,8 @@ public sealed class ImportStagingServiceTests
                 "Excel",
                 "rows.xlsx",
                 ColumnMapping: mapping,
-                SourceColumns: sourceColumns),
+                SourceColumns: sourceColumns,
+                SourceContentFingerprint: new string('a', 64)),
             ToAsync(new ImportSourceRow(
                 2,
                 "https://pan.baidu.com/s/id",
@@ -509,6 +535,8 @@ public sealed class ImportStagingServiceTests
         var payload = await read.Imports.GetRowPayloadAsync(staged.Id);
 
         Assert.Equal(mapping.Fingerprint, session!.ColumnMappingFingerprint);
+        Assert.Equal(new string('a', 64), session.SourceContentFingerprint);
+        Assert.Equal(1, session.HeaderRowNumber);
         Assert.Equal(new[] { "Title", "ShareUrl", "ExtractionCode", "Preserve", "Preserve" }, definitions.Select(x => x.MappedRole));
         Assert.NotNull(payload);
         Assert.Equal(staged.Id, payload!.StagedImportRowId);
@@ -554,7 +582,7 @@ public sealed class ImportStagingServiceTests
             ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/s/id-1")),
             default);
         await service.ResumeAsync(
-            sessionId,
+            new ImportResumeRequest(sessionId, "Text"),
             ToAsync(),
             TransferMode.Distribution,
             default);
@@ -707,7 +735,7 @@ public sealed class ImportStagingServiceTests
             cancellation.Token));
 
         await service.ResumeAsync(
-            sessionId,
+            new ImportResumeRequest(sessionId, "Text"),
             ToAsync(Enumerable.Range(1, 5)
                 .Select(i => new ImportSourceRow(i, $"https://pan.baidu.com/s/id-{i}"))
                 .ToArray()));
@@ -715,6 +743,98 @@ public sealed class ImportStagingServiceTests
         Assert.Equal(5, store.Rows.Count);
         Assert.Equal(5, store.Session!.TotalRows);
         Assert.Equal("Draft", store.Session.Status);
+    }
+
+    [Fact]
+    public async Task ResumeRejectsChangedSourceTypeBeforeChangingDraftStatus()
+    {
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver());
+        var sessionId = Guid.NewGuid();
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/s/id")));
+        var commitCount = store.CommitCount;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.ResumeAsync(
+            new ImportResumeRequest(sessionId, " excel "),
+            ToAsync()));
+
+        Assert.Equal("Draft", store.Session!.Status);
+        Assert.Equal(commitCount, store.CommitCount);
+        Assert.Single(store.Rows);
+    }
+
+    [Fact]
+    public async Task ResumeRejectsChangedExcelMappingBeforeChangingDraftStatus()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var service = new ImportStagingService(database.UnitOfWorkFactory.BeginAsync, new SequenceResolver());
+        var sessionId = Guid.NewGuid();
+        var digest = new string('b', 64);
+        TabularInspectionColumn[] sourceColumns = [new(0, "链接"), new(1, "附加字段")];
+        var mapping = new ConfirmedImportColumnMapping(
+            1,
+            [new(0, TabularImportColumnRole.ShareUrl), new(1, TabularImportColumnRole.Preserve)],
+            sourceColumns);
+        await service.StageAsync(
+            new ImportRequest(
+                sessionId,
+                "Excel",
+                "rows.xlsx",
+                ColumnMapping: mapping,
+                SourceColumns: sourceColumns,
+                SourceContentFingerprint: digest),
+            ToAsync(new ImportSourceRow(2, "https://pan.baidu.com/s/id", RawValues: ["https://pan.baidu.com/s/id", "raw"])));
+        var changedMapping = new ConfirmedImportColumnMapping(
+            1,
+            [new(0, TabularImportColumnRole.ShareUrl), new(1, TabularImportColumnRole.Note)],
+            sourceColumns);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => service.ResumeAsync(
+            new ImportResumeRequest(sessionId, "Excel", changedMapping, digest),
+            ToAsync()));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Equal("Draft", (await read.Imports.GetSessionAsync(sessionId))!.Status);
+        Assert.Equal(1, (await read.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10))).TotalCount);
+    }
+
+    [Fact]
+    public async Task ConcurrentResumeIsRejectedWithoutWritingRows()
+    {
+        var store = new ImportStore();
+        var service = CreateService(store, new SequenceResolver(), chunkSize: 1);
+        var competingService = CreateService(store, new SequenceResolver(), chunkSize: 1);
+        var sessionId = Guid.NewGuid();
+        await service.StageAsync(
+            new ImportRequest(sessionId, "Text", "paste"),
+            ToAsync(new ImportSourceRow(1, "https://pan.baidu.com/s/id-1")));
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async IAsyncEnumerable<ImportSourceRow> BlockingRows()
+        {
+            entered.TrySetResult();
+            await release.Task;
+            yield return new ImportSourceRow(2, "https://pan.baidu.com/s/id-2");
+        }
+
+        var firstResume = service.ResumeAsync(
+            new ImportResumeRequest(sessionId, "Text"),
+            BlockingRows());
+        await entered.Task;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => competingService.ResumeAsync(
+            new ImportResumeRequest(sessionId, "Text"),
+            ToAsync(new ImportSourceRow(2, "https://pan.baidu.com/s/arbitrary"))));
+        Assert.Equal("Parsing", store.Session!.Status);
+        Assert.Single(store.Rows);
+
+        release.TrySetResult();
+        await firstResume;
+        Assert.Equal("Draft", store.Session.Status);
+        Assert.Equal(2, store.Rows.Count);
     }
 
     private static ImportStagingService CreateService(

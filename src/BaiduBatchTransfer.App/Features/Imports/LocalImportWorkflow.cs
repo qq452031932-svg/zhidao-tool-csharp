@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security.Cryptography;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Core.Abstractions;
@@ -27,6 +28,7 @@ public sealed class LocalImportWorkflow(
     OpenXmlImportReader excelReader,
     OpenXmlWorkbookInspector excelInspector,
     IExcelColumnMappingPresenter mappingPresenter,
+    IDialogService dialogService,
     DraftRowEditingService editingService,
     IUnitOfWorkFactory unitOfWorkFactory) : IImportWorkflow
 {
@@ -96,12 +98,19 @@ public sealed class LocalImportWorkflow(
         var stagingCompleted = false;
         try
         {
+            var contentFingerprint = await ComputeFileFingerprintAsync(fullPath, cancellationToken).ConfigureAwait(false);
             var inspection = await InspectExcelAsync(fullPath, cancellationToken).ConfigureAwait(false);
             var mapping = await mappingPresenter.ConfirmAsync(inspection, cancellationToken).ConfigureAwait(false);
             if (mapping is null) throw new OperationCanceledException("Excel column mapping was cancelled.");
             if (mapping.SourceColumns.Count != mapping.SourceColumnCount)
                 throw new ImportWorkflowException(ImportUiError.InvalidData);
-            var source = ReplaySource.ForExcel(fullPath, mapping, mapping.SourceColumns);
+            await using var confirmedStream = OpenExcelStream(fullPath);
+            var confirmedContentFingerprint = await ComputeStreamFingerprintAsync(confirmedStream, cancellationToken)
+                .ConfigureAwait(false);
+            if (!string.Equals(contentFingerprint, confirmedContentFingerprint, StringComparison.Ordinal))
+                throw new ImportWorkflowException(ImportUiError.InvalidData);
+            confirmedStream.Position = 0;
+            var source = ReplaySource.ForExcel(fullPath, mapping, mapping.SourceColumns, contentFingerprint);
             RememberReplaySource(sessionId, source);
             await stagingService.StageAsync(
                 new ImportRequest(
@@ -109,8 +118,9 @@ public sealed class LocalImportWorkflow(
                     "Excel",
                     Path.GetFileName(fullPath),
                     ColumnMapping: mapping,
-                    SourceColumns: mapping.SourceColumns),
-                ReadExcelAsync(fullPath, mapping, cancellationToken),
+                    SourceColumns: mapping.SourceColumns,
+                    SourceContentFingerprint: contentFingerprint),
+                excelReader.ReadAsync(confirmedStream, mapping, cancellationToken),
                 replayProgress,
                 cancellationToken).ConfigureAwait(false);
             stagingCompleted = true;
@@ -143,19 +153,43 @@ public sealed class LocalImportWorkflow(
         IProgress<ImportCommittedProgress>? committedProgress,
         CancellationToken cancellationToken)
     {
-        if (!TryGetReplaySource(sessionId, out var source))
-            throw new ImportWorkflowException(ImportUiError.InvalidData);
-        var rows = source.Kind == ReplaySourceKind.Text
-            ? ReadTextAsync(source.Text!, cancellationToken)
-            : ReadExcelAsync(source.FilePath!, source.Mapping!, cancellationToken);
+        var source = TryGetReplaySource(sessionId, out var retained)
+            ? retained
+            : await RestoreReplaySourceAsync(sessionId, cancellationToken).ConfigureAwait(false);
         try
         {
-            await stagingService.ResumeAsync(
+            var authorization = new ImportResumeRequest(
                 sessionId,
-                rows,
-                TransferMode.Distribution,
-                committedProgress,
-                cancellationToken).ConfigureAwait(false);
+                source.Kind == ReplaySourceKind.Excel ? "Excel" : "Text",
+                source.Mapping,
+                source.ContentFingerprint);
+            if (source.Kind == ReplaySourceKind.Excel)
+            {
+                await using var stream = OpenExcelStream(source.FilePath!);
+                var actualFingerprint = await ComputeStreamFingerprintAsync(stream, cancellationToken).ConfigureAwait(false);
+                if (!string.Equals(actualFingerprint, source.ContentFingerprint, StringComparison.Ordinal))
+                {
+                    RemoveReplaySource(sessionId);
+                    throw new ImportWorkflowException(ImportUiError.InvalidData);
+                }
+                RememberReplaySource(sessionId, source);
+                stream.Position = 0;
+                await stagingService.ResumeAsync(
+                    authorization,
+                    excelReader.ReadAsync(stream, source.Mapping!, cancellationToken),
+                    TransferMode.Distribution,
+                    committedProgress,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await stagingService.ResumeAsync(
+                    authorization,
+                    ReadTextAsync(source.Text!, cancellationToken),
+                    TransferMode.Distribution,
+                    committedProgress,
+                    cancellationToken).ConfigureAwait(false);
+            }
             RemoveReplaySource(sessionId);
             return await LoadResultAsync(sessionId, cancellationToken).ConfigureAwait(false);
         }
@@ -163,6 +197,10 @@ public sealed class LocalImportWorkflow(
         catch (ExcelImportException error)
         {
             throw new ImportWorkflowException(MapExcelError(error.Code), error);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            throw new ImportWorkflowException(ImportUiError.InvalidWorkbook, error);
         }
     }
 
@@ -245,6 +283,28 @@ public sealed class LocalImportWorkflow(
         return await excelInspector.InspectAsync(stream, cancellationToken).ConfigureAwait(false);
     }
 
+    private static async Task<string> ComputeFileFingerprintAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = OpenExcelStream(filePath);
+        return await ComputeStreamFingerprintAsync(stream, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<string> ComputeStreamFingerprintAsync(
+        Stream stream,
+        CancellationToken cancellationToken) =>
+        Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false))
+            .ToLowerInvariant();
+
+    private static FileStream OpenExcelStream(string filePath) => new(
+        filePath,
+        FileMode.Open,
+        FileAccess.Read,
+        FileShare.Read,
+        bufferSize: 64 * 1024,
+        FileOptions.Asynchronous | FileOptions.SequentialScan);
+
     private async Task<ImportWorkflowResult> LoadResultAsync(
         Guid sessionId,
         CancellationToken cancellationToken)
@@ -265,6 +325,67 @@ public sealed class LocalImportWorkflow(
             accountGroups.TotalCount > 0,
             (int)Math.Min(int.MaxValue, accountGroups.TotalCount)));
     }
+
+    private async Task<ReplaySource> RestoreReplaySourceAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken)
+    {
+        ImportSessionRecord session;
+        IReadOnlyList<ImportColumnDefinitionRecord> definitions;
+        await using (var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false))
+        {
+            session = await unit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
+                ?? throw new ImportWorkflowException(ImportUiError.InvalidData);
+            definitions = await unit.Imports.GetColumnDefinitionsAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        }
+        if (!string.Equals(session.SourceType, "Excel", StringComparison.Ordinal) ||
+            session.ColumnMappingFingerprint is null ||
+            session.SourceContentFingerprint is null ||
+            definitions.Count == 0)
+            throw new ImportWorkflowException(ImportUiError.InvalidData);
+
+        ConfirmedImportColumnMapping mapping;
+        try
+        {
+            mapping = new ConfirmedImportColumnMapping(
+                session.HeaderRowNumber,
+                definitions.Select(definition => new TabularImportColumnMapping(
+                    definition.ColumnOrdinal,
+                    ParsePersistedRole(definition.MappedRole))),
+                definitions.Select(definition => new TabularInspectionColumn(
+                    definition.ColumnOrdinal,
+                    definition.SourceHeader)));
+        }
+        catch (ArgumentException error)
+        {
+            throw new ImportWorkflowException(ImportUiError.InvalidData, error);
+        }
+        if (!string.Equals(mapping.Fingerprint, session.ColumnMappingFingerprint, StringComparison.Ordinal))
+            throw new ImportWorkflowException(ImportUiError.InvalidData);
+
+        var selectedPath = dialogService.PickExcelFile();
+        if (selectedPath is null) throw new OperationCanceledException("Excel resume source selection was cancelled.");
+        var source = ReplaySource.ForExcel(
+            Path.GetFullPath(selectedPath),
+            mapping,
+            mapping.SourceColumns,
+            session.SourceContentFingerprint);
+        return source;
+    }
+
+    private static TabularImportColumnRole ParsePersistedRole(string role) => role switch
+    {
+        "Preserve" => TabularImportColumnRole.Preserve,
+        "Title" => TabularImportColumnRole.SourceTitle,
+        "ShareUrl" => TabularImportColumnRole.ShareUrl,
+        "ExtractionCode" => TabularImportColumnRole.ExtractionCode,
+        "TargetPath" => TabularImportColumnRole.TargetPath,
+        "OuterFolderName" => TabularImportColumnRole.OuterFolderName,
+        "RequestedAccountName" => TabularImportColumnRole.RequestedAccountName,
+        "Note" => TabularImportColumnRole.Note,
+        _ => throw new ArgumentException("The persisted mapping role is invalid.", nameof(role)),
+    };
 
     private void RememberReplaySource(Guid sessionId, ReplaySource source)
     {
@@ -316,14 +437,16 @@ public sealed class LocalImportWorkflow(
         string? Text,
         string? FilePath,
         ConfirmedImportColumnMapping? Mapping,
-        IReadOnlyList<TabularInspectionColumn>? SourceColumns)
+        IReadOnlyList<TabularInspectionColumn>? SourceColumns,
+        string? ContentFingerprint)
     {
-        public static ReplaySource ForText(string text) => new(ReplaySourceKind.Text, text, null, null, null);
+        public static ReplaySource ForText(string text) => new(ReplaySourceKind.Text, text, null, null, null, null);
         public static ReplaySource ForExcel(
             string path,
             ConfirmedImportColumnMapping mapping,
-            IReadOnlyList<TabularInspectionColumn> sourceColumns) =>
-            new(ReplaySourceKind.Excel, null, path, mapping, sourceColumns.ToArray());
+            IReadOnlyList<TabularInspectionColumn> sourceColumns,
+            string contentFingerprint) =>
+            new(ReplaySourceKind.Excel, null, path, mapping, sourceColumns.ToArray(), contentFingerprint);
         public override string ToString() => "ReplaySource { Content = [REDACTED] }";
     }
 

@@ -114,6 +114,22 @@ public sealed class ExcelColumnMappingChoice : ObservableObject
 
     public int SourceColumnIndex { get; }
 
+    public string ColumnLabel
+    {
+        get
+        {
+            var value = SourceColumnIndex + 1;
+            var label = string.Empty;
+            while (value > 0)
+            {
+                value--;
+                label = (char)('A' + value % 26) + label;
+                value /= 26;
+            }
+            return label;
+        }
+    }
+
     public string Header
     {
         get => header;

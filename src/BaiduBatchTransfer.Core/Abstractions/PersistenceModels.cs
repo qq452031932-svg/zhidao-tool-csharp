@@ -141,7 +141,9 @@ public sealed record ImportSessionRecord(
     Guid Id, string SourceType, string SourceName, string Status, int TotalRows, int ReadyRows,
     int InvalidRows, int DuplicateRows, int ExcludedRows, Guid? PrecheckAccountId,
     Guid? CreatedBatchJobId, Guid? AppendToBatchJobId, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
-    string? ColumnMappingFingerprint = null)
+    string? ColumnMappingFingerprint = null,
+    string? SourceContentFingerprint = null,
+    int? HeaderRowNumber = null)
 {
     public static ImportSessionRecord Create(Guid id, string sourceType, string sourceName)
     {

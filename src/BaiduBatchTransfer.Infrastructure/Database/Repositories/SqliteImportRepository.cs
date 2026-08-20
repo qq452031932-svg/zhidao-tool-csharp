@@ -10,26 +10,28 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
 
     public async Task AddSessionAsync(ImportSessionRecord s, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("INSERT INTO ImportSessions(Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt,ColumnMappingFingerprint) VALUES($id,$type,$name,$status,$total,$ready,$invalid,$duplicate,$excluded,$precheck,$createdJob,$appendJob,$created,$updated,$mapping);");
+        await using var c = Command("INSERT INTO ImportSessions(Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt,ColumnMappingFingerprint,SourceContentFingerprint,HeaderRowNumber) VALUES($id,$type,$name,$status,$total,$ready,$invalid,$duplicate,$excluded,$precheck,$createdJob,$appendJob,$created,$updated,$mapping,$content,$headerRow);");
         Add(c,"$id",Id(s.Id)); Add(c,"$type",s.SourceType); Add(c,"$name",s.SourceName); Add(c,"$status",s.Status); Add(c,"$total",s.TotalRows);
         Add(c,"$ready",s.ReadyRows); Add(c,"$invalid",s.InvalidRows); Add(c,"$duplicate",s.DuplicateRows); Add(c,"$excluded",s.ExcludedRows);
         Add(c,"$precheck",NullableId(s.PrecheckAccountId)); Add(c,"$createdJob",NullableId(s.CreatedBatchJobId)); Add(c,"$appendJob",NullableId(s.AppendToBatchJobId));
-        Add(c,"$created",Time(s.CreatedAt)); Add(c,"$updated",Time(s.UpdatedAt)); Add(c,"$mapping",s.ColumnMappingFingerprint); await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        Add(c,"$created",Time(s.CreatedAt)); Add(c,"$updated",Time(s.UpdatedAt)); Add(c,"$mapping",s.ColumnMappingFingerprint);
+        Add(c,"$content",s.SourceContentFingerprint); Add(c,"$headerRow",s.HeaderRowNumber); await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<ImportSessionRecord?> GetSessionAsync(Guid id, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("SELECT Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt,ColumnMappingFingerprint FROM ImportSessions WHERE Id=$id;"); Add(c,"$id",Id(id));
+        await using var c = Command("SELECT Id,SourceType,SourceName,Status,TotalRows,ReadyRows,InvalidRows,DuplicateRows,ExcludedRows,PrecheckAccountId,CreatedBatchJobId,AppendToBatchJobId,CreatedAt,UpdatedAt,ColumnMappingFingerprint,SourceContentFingerprint,HeaderRowNumber FROM ImportSessions WHERE Id=$id;"); Add(c,"$id",Id(id));
         await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetInt32(4),r.GetInt32(5),r.GetInt32(6),r.GetInt32(7),r.GetInt32(8),ReadNullableId(r,9),ReadNullableId(r,10),ReadNullableId(r,11),ReadTime(r,12),ReadTime(r,13),r.IsDBNull(14)?null:r.GetString(14)) : null;
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetInt32(4),r.GetInt32(5),r.GetInt32(6),r.GetInt32(7),r.GetInt32(8),ReadNullableId(r,9),ReadNullableId(r,10),ReadNullableId(r,11),ReadTime(r,12),ReadTime(r,13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetInt32(16)) : null;
     }
 
     public async Task UpdateSessionAsync(ImportSessionRecord s, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("UPDATE ImportSessions SET Status=$status,TotalRows=$total,ReadyRows=$ready,InvalidRows=$invalid,DuplicateRows=$duplicate,ExcludedRows=$excluded,PrecheckAccountId=$precheck,CreatedBatchJobId=$createdJob,ColumnMappingFingerprint=$mapping,UpdatedAt=$updated WHERE Id=$id;");
+        await using var c = Command("UPDATE ImportSessions SET Status=$status,TotalRows=$total,ReadyRows=$ready,InvalidRows=$invalid,DuplicateRows=$duplicate,ExcludedRows=$excluded,PrecheckAccountId=$precheck,CreatedBatchJobId=$createdJob,ColumnMappingFingerprint=$mapping,SourceContentFingerprint=$content,HeaderRowNumber=$headerRow,UpdatedAt=$updated WHERE Id=$id;");
         Add(c,"$id",Id(s.Id)); Add(c,"$status",s.Status); Add(c,"$total",s.TotalRows); Add(c,"$ready",s.ReadyRows);
         Add(c,"$invalid",s.InvalidRows); Add(c,"$duplicate",s.DuplicateRows); Add(c,"$excluded",s.ExcludedRows);
-        Add(c,"$precheck",NullableId(s.PrecheckAccountId)); Add(c,"$createdJob",NullableId(s.CreatedBatchJobId)); Add(c,"$mapping",s.ColumnMappingFingerprint); Add(c,"$updated",Time(s.UpdatedAt));
+        Add(c,"$precheck",NullableId(s.PrecheckAccountId)); Add(c,"$createdJob",NullableId(s.CreatedBatchJobId)); Add(c,"$mapping",s.ColumnMappingFingerprint);
+        Add(c,"$content",s.SourceContentFingerprint); Add(c,"$headerRow",s.HeaderRowNumber); Add(c,"$updated",Time(s.UpdatedAt));
         if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1) throw new InvalidOperationException("The import session does not exist.");
     }
 

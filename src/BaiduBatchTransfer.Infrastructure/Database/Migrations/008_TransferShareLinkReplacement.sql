@@ -1,4 +1,9 @@
 ALTER TABLE ImportSessions ADD COLUMN ColumnMappingFingerprint TEXT NULL;
+ALTER TABLE ImportSessions ADD COLUMN SourceContentFingerprint TEXT NULL
+    CHECK(SourceContentFingerprint IS NULL OR (
+      length(SourceContentFingerprint)=64 AND SourceContentFingerprint NOT GLOB '*[^0-9a-f]*'));
+ALTER TABLE ImportSessions ADD COLUMN HeaderRowNumber INTEGER NULL
+    CHECK(HeaderRowNumber IS NULL OR (typeof(HeaderRowNumber)='integer' AND HeaderRowNumber > 0));
 
 ALTER TABLE BatchJobs ADD COLUMN ShareOperationCount INTEGER NOT NULL DEFAULT 0
     CHECK(typeof(ShareOperationCount)='integer' AND ShareOperationCount >= 0);

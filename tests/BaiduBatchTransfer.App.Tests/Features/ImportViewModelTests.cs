@@ -82,6 +82,30 @@ public sealed class ImportViewModelTests
         Assert.Equal("  原表头  ", vm.ConfirmedMapping!.SourceColumns[0].Header);
         Assert.Equal(headerMapping.Fingerprint, vm.ConfirmedMapping.Fingerprint);
     }
+
+    [Fact]
+    public void ExcelMappingDisplaysExcelLettersInsteadOfZeroBasedSourceIndexes()
+    {
+        var columns = Enumerable.Range(0, 27).Select(index => new TabularInspectionColumn(index, null)).ToArray();
+        var suggestion = new ImportColumnMappingSuggestion(
+            null,
+            columns.Select(column => new TabularImportColumnMapping(
+                column.SourceColumnIndex,
+                column.SourceColumnIndex == 0 ? TabularImportColumnRole.ShareUrl : TabularImportColumnRole.Preserve)));
+        var vm = new ExcelColumnMappingViewModel(new TabularWorkbookInspection(null, columns, []), suggestion);
+
+        Assert.Equal("A", vm.Columns[0].ColumnLabel);
+        Assert.Equal("Z", vm.Columns[25].ColumnLabel);
+        Assert.Equal("AA", vm.Columns[26].ColumnLabel);
+        var xamlPath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..",
+            "src", "BaiduBatchTransfer.App", "Features", "Imports", "ExcelColumnMappingWindow.xaml"));
+        var xaml = File.ReadAllText(xamlPath);
+        Assert.Contains("Binding=\"{Binding ColumnLabel}\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Binding=\"{Binding SourceColumnIndex}\"", xaml, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task CancellationBeforeSessionCommitDoesNotClaimAResumableDraft()
     {
@@ -376,9 +400,8 @@ public sealed class ImportViewModelTests
         await context.Workflow.ImportExcelAsync(sessionId, workbookPath, CancellationToken.None);
 
         Assert.False(context.Workflow.HasResumableReplaySource(sessionId));
-        var error = await Assert.ThrowsAsync<ImportWorkflowException>(() =>
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             context.Workflow.ResumeAsync(sessionId, CancellationToken.None));
-        Assert.Equal(ImportUiError.InvalidData, error.Error);
     }
 
     [Fact]
@@ -706,6 +729,7 @@ public sealed class ImportViewModelTests
                 new OpenXmlImportReader(),
                 new OpenXmlWorkbookInspector(),
                 new ConfirmingMappingPresenter(),
+                new FakeDialogService(),
                 new DraftRowEditingService(unitOfWorkFactory),
                 unitOfWorkFactory);
             return new(root, workflow);
