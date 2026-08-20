@@ -232,10 +232,25 @@ public sealed class CreateJobWizardViewModelTests
         vm.Accounts[0].IsSelected = vm.Accounts[1].IsSelected = true;
         vm.Accounts[0].TargetItemCount = 20;
         vm.Accounts[1].TargetItemCount = 80;
+        vm.NextStepCommand.Execute(null);
+        vm.NextStepCommand.Execute(null);
+        Assert.Equal(WizardStepKind.Allocation, vm.Steps[vm.CurrentStepIndex].Kind);
+        Assert.True(vm.NextStepCommand.CanExecute(null));
+        var notifications = new List<string?>();
+        var canExecuteChanged = 0;
+        vm.PropertyChanged += (_, args) => notifications.Add(args.PropertyName);
+        vm.NextStepCommand.CanExecuteChanged += (_, _) => canExecuteChanged++;
 
         await vm.PrepareConfirmationAsync();
 
         Assert.False(vm.CanContinue);
+        Assert.False(vm.CanMoveNext);
+        Assert.False(vm.NextStepCommand.CanExecute(null));
+        Assert.Contains("锁定任务 30 条", vm.ValidationMessage);
+        Assert.Contains(nameof(CreateJobWizardViewModel.WarningMessage), notifications);
+        Assert.Contains(nameof(CreateJobWizardViewModel.CanContinue), notifications);
+        Assert.Contains(nameof(CreateJobWizardViewModel.CanMoveNext), notifications);
+        Assert.True(canExecuteChanged > 0);
         Assert.Equal(30, vm.Accounts[0].LockedItemCount);
 
         vm.Accounts[0].TargetItemCount = 30;
@@ -283,6 +298,8 @@ public sealed class CreateJobWizardViewModelTests
         foreach (var account in vm.Accounts) account.IsSelected = true;
         vm.Accounts[0].TargetSuccessCount = 10;
         vm.Accounts[1].TargetSuccessCount = 10;
+        var notifications = new List<string?>();
+        vm.PropertyChanged += (_, args) => notifications.Add(args.PropertyName);
 
         await vm.PrepareConfirmationAsync();
 
@@ -293,6 +310,7 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Equal(1, vm.Accounts[0].ReservedSlotCount);
         Assert.Equal(3, vm.Accounts[0].UnusedExclusiveCandidateCount);
         Assert.Equal(2, vm.Accounts[0].ShortfallCount);
+        Assert.Contains(nameof(CreateJobWizardViewModel.WarningMessage), notifications);
     }
 
     [Fact]

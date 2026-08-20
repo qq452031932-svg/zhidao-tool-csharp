@@ -957,6 +957,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         {
             suppressInvalidation = false;
         }
+        ValidationMessage = EvaluateValidation();
+        RaiseAll();
     }
 
     private void RaiseAll()
