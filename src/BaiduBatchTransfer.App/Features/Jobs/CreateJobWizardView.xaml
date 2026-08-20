@@ -22,35 +22,58 @@
                 </ItemsControl>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsImportStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
                 <StackPanel>
-                    <TextBlock Text="1. 转存模式与检测方式" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="1. 导入结果与转存模式" FontSize="18" FontWeight="SemiBold" />
                     <TextBlock Text="只有一个可用账号时会自动选中，但仍需在最后确认；多个账号必须明确选择模式。"
                                Foreground="{StaticResource MutedBrush}" Margin="0,5,0,12" />
                     <WrapPanel>
                         <Button Content="多账号复制" Command="{Binding SelectReplicationCommand}" />
                         <Button Content="多账号分流" Command="{Binding SelectDistributionCommand}" />
-                        <CheckBox Content="执行批量预检" IsChecked="{Binding UseBulkPrecheck}" VerticalAlignment="Center" Margin="12,0" />
+                        <CheckBox Content="需要批量预检" IsChecked="{Binding UseBulkPrecheck}" VerticalAlignment="Center" Margin="12,0" />
                     </WrapPanel>
                     <TextBlock Text="{Binding AccountSelectionNotice}" Margin="0,10,0,0" Foreground="{StaticResource MutedBrush}" />
                 </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsPrecheckStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
+                <StackPanel>
+                    <TextBlock Text="2. 批量预检" FontSize="18" FontWeight="SemiBold" />
+                    <CheckBox Content="创建任务前批量检查链接有效性" IsChecked="{Binding UseBulkPrecheck}" Margin="0,12,0,8" />
+                    <TextBlock Text="预检固定使用一个明确选择的账号；登录或安全验证暂停后仍使用该账号继续。" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
+                    <ComboBox ItemsSource="{Binding Accounts}" DisplayMemberPath="DisplayName" SelectedValuePath="AccountId"
+                              SelectedValue="{Binding PrecheckAccountId}" Margin="0,10,0,8" Width="280" HorizontalAlignment="Left" />
+                    <Button Content="开始或继续预检" Command="{Binding RunPrecheckCommand}" HorizontalAlignment="Left" />
+                    <TextBlock Text="{Binding PrecheckStatusMessage}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsDestinationStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
                 <Grid>
                     <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
                     <StackPanel Margin="0,0,12,0">
-                        <TextBlock Text="2. 任务与目录" FontSize="18" FontWeight="SemiBold" />
+                        <TextBlock Text="3. 任务与目录" FontSize="18" FontWeight="SemiBold" />
                         <TextBlock Text="任务名称" Margin="0,10,0,5" />
                         <TextBox Text="{Binding JobName, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBlock Text="默认目标目录" Margin="0,10,0,5" />
                         <TextBox Text="{Binding DefaultTargetPath, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Text="建目录方式" Margin="0,10,0,5" />
+                        <WrapPanel>
+                            <Button Content="保持原结构" Command="{Binding PreserveStructureCommand}" />
+                            <Button Content="创建外层文件夹" Command="{Binding CreateOuterFolderCommand}" />
+                        </WrapPanel>
+                        <TextBlock Text="同名处理" Margin="0,10,0,5" />
+                        <WrapPanel>
+                            <Button Content="跳过同名项" Command="{Binding SkipDuplicateCommand}" />
+                            <Button Content="自动重命名" Command="{Binding RenameDuplicateCommand}" />
+                        </WrapPanel>
                     </StackPanel>
                     <StackPanel Grid.Column="1">
                         <TextBlock Text="Excel 逐行账号处理" FontWeight="SemiBold" />
                         <TextBlock Text="复制模式只能忽略账号列；分流模式可保留映射或统一覆盖。" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,5,0,10" />
                         <WrapPanel>
                             <Button Content="保留已匹配账号" Command="{Binding KeepExcelMappingsCommand}" />
+                            <Button Content="自动匹配唯一名称" Command="{Binding AutoMapUniqueExcelAccountsCommand}" />
                             <Button Content="统一覆盖全部记录" Command="{Binding OverrideExcelMappingsCommand}" />
                             <Button Content="复制时忽略账号列" Command="{Binding IgnoreExcelAccountColumnCommand}" />
                         </WrapPanel>
@@ -58,12 +81,14 @@
                 </Grid>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsAllocationStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
                 <StackPanel>
-                    <TextBlock Text="3. 账号与配额" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="4. 账号与配额" FontSize="18" FontWeight="SemiBold" />
                     <WrapPanel Margin="0,10,0,10">
                         <Button Content="按任务数量" Command="{Binding UseTaskQuotaCommand}" />
                         <Button Content="按成功数量补足" Command="{Binding UseSuccessTargetCommand}" />
+                        <Button Content="平均分配" Command="{Binding ApplyEqualAllocationCommand}" />
+                        <Button Content="按剩余容量分配" Command="{Binding ApplyCapacityAllocationCommand}" />
                         <Button Content="快捷分配 1:2:1" Command="{Binding ApplyOneTwoOneCommand}" />
                     </WrapPanel>
                     <DataGrid ItemsSource="{Binding Accounts}" AutoGenerateColumns="False" CanUserAddRows="False"
@@ -99,11 +124,11 @@
                 </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsConfirmationStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
                 <Grid>
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="280" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                     <StackPanel Orientation="Horizontal">
-                        <TextBlock Text="4. 分页预览" FontSize="18" FontWeight="SemiBold" />
+                        <TextBlock Text="5. 分页核对" FontSize="18" FontWeight="SemiBold" />
                         <TextBlock Text="（只加载当前页，不会把全部资源放入内存）" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" Margin="8,0,0,0" />
                     </StackPanel>
                     <DataGrid Grid.Row="1" ItemsSource="{Binding PreviewRows}" AutoGenerateColumns="False" IsReadOnly="True" Margin="0,10"
@@ -127,15 +152,26 @@
                 </Grid>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" Visibility="{Binding IsConfirmationStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
                 <StackPanel>
                     <TextBlock Text="5. 最终确认" FontSize="18" FontWeight="SemiBold" />
+                    <UniformGrid Columns="3" Margin="0,12,0,8">
+                        <TextBlock Text="{Binding TransferModeText, StringFormat=转存模式：{0}}" />
+                        <TextBlock Text="{Binding QuotaBasisText, StringFormat=分配依据：{0}}" />
+                        <TextBlock Text="{Binding ShortagePolicyText, StringFormat=不足策略：{0}}" />
+                        <TextBlock Text="{Binding ValidationModeText, StringFormat=检测方式：{0}}" />
+                        <TextBlock Text="{Binding FolderCreationModeText, StringFormat=目录方式：{0}}" />
+                        <TextBlock Text="{Binding DuplicatePolicyText, StringFormat=同名处理：{0}}" />
+                    </UniformGrid>
+                    <TextBlock Text="{Binding DefaultTargetPath, StringFormat=默认目标目录：{0}}" TextWrapping="Wrap" />
                     <UniformGrid Columns="4" Margin="0,12,0,8">
-                        <TextBlock Text="{Binding ResourceCount, StringFormat=原始资源：{0:N0}}" />
-                        <TextBlock Text="{Binding OperationCount, StringFormat=转存操作：{0:N0}}" />
+                        <TextBlock Text="{Binding ConfirmedResourceCount, StringFormat=确认资源：{0:N0}}" />
+                        <TextBlock Text="{Binding ConfirmedOperationCount, StringFormat=确认操作：{0:N0}}" />
                         <TextBlock Text="{Binding AssignedCount, StringFormat=已分配：{0:N0}}" />
                         <TextBlock Text="{Binding ReserveCandidateCount, StringFormat=候补资源：{0:N0}}" />
                     </UniformGrid>
+                    <TextBlock Text="{Binding RequiredFreeBytes, StringFormat=预计需要本机空间：{0:N0} 字节}" />
+                    <TextBlock Text="{Binding AvailableFreeBytes, StringFormat=当前可用本机空间：{0:N0} 字节}" Margin="0,3,0,8" />
                     <TextBlock Text="{Binding ValidationMessage}" Foreground="#B42318" TextWrapping="Wrap" />
                     <TextBlock Text="{Binding AdapterStatusMessage}" Foreground="#B54708" TextWrapping="Wrap" Margin="0,4,0,0" />
                     <TextBlock Text="{Binding StatusMessage}" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,4,0,0" />
@@ -146,6 +182,12 @@
                         <Button Content="确认创建任务" Command="{Binding CreateJobCommand}" Style="{StaticResource PrimaryButton}" />
                     </WrapPanel>
                 </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <Button Content="上一步" Command="{Binding PreviousStepCommand}" DockPanel.Dock="Left" />
+                    <Button Content="下一步" Command="{Binding NextStepCommand}" Style="{StaticResource PrimaryButton}" DockPanel.Dock="Right" HorizontalAlignment="Right" />
+                </DockPanel>
             </Border>
         </StackPanel>
     </ScrollViewer>

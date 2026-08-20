@@ -66,12 +66,47 @@ public sealed class ImportViewModelTests
     }
 
     [Fact]
+    public async Task SelectedRowCanBeEditedExcludedAndRestoredFromCommands()
+    {
+        var row = new ImportPreviewRow(Guid.NewGuid(), 1, "https://pan.baidu.com/s/old", "a1b2", null, "就绪", "有效");
+        var workflow = new FakeImportWorkflow();
+        var vm = Create(workflow, new FakePageSource([row], 1, null));
+        vm.AttachSession(Guid.NewGuid());
+        await vm.LoadFirstPageAsync();
+        vm.SelectedRow = vm.Rows[0];
+        vm.SelectedShareUrl = "https://pan.baidu.com/s/new";
+        vm.SelectedExtractionCode = "c3d4";
+
+        await vm.SaveSelectedRowCommand.ExecuteAsync(null);
+        await vm.ToggleSelectedExclusionCommand.ExecuteAsync(null);
+        await vm.ToggleSelectedExclusionCommand.ExecuteAsync(null);
+
+        Assert.Equal((row.RowId, "https://pan.baidu.com/s/new", "c3d4"), workflow.LastEdit);
+        Assert.Equal([(row.RowId, true), (row.RowId, false)], workflow.Exclusions);
+    }
+
+    [Fact]
     public void StatisticsExposeReadyDuplicateInvalidExcludedAndTotalCounts()
     {
         var vm = Create(new FakeImportWorkflow());
         vm.ApplyStatistics(new ImportDraftStatistics(100, 80, 10, 5, 5));
 
         Assert.Equal("总计 100 · 就绪 80 · 重复 10 · 异常 5 · 已排除 5", vm.StatisticsText);
+    }
+
+    [Fact]
+    public async Task CompletedImportHandsThePersistedSessionAndStatisticsToWizard()
+    {
+        var import = Create(new FakeImportWorkflow());
+        ImportDraftReady? handoff = null;
+        import.DraftReady += (_, value) => handoff = value;
+        import.TextContent = "https://pan.baidu.com/s/abc1";
+
+        await import.ImportTextAsync();
+
+        Assert.NotNull(handoff);
+        Assert.Equal(import.SessionId, handoff.SessionId);
+        Assert.Equal(1, handoff.Statistics.Ready);
     }
 
     private static ImportViewModel Create(
@@ -86,11 +121,12 @@ public sealed class ImportViewModelTests
         public int ExcelCalls { get; private set; }
         public (Guid, string, string?) LastEdit { get; private set; }
         public (Guid, bool) LastExclusion { get; private set; }
+        public List<(Guid, bool)> Exclusions { get; } = [];
 
-        public Task<ImportWorkflowResult> ImportTextAsync(string text, CancellationToken cancellationToken)
+        public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken)
             => Result();
 
-        public Task<ImportWorkflowResult> ImportExcelAsync(string filePath, CancellationToken cancellationToken)
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken)
         {
             ExcelCalls++;
             return Result();
@@ -107,6 +143,7 @@ public sealed class ImportViewModelTests
         public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
         {
             LastExclusion = (rowId, excluded);
+            Exclusions.Add((rowId, excluded));
             return Task.CompletedTask;
         }
 

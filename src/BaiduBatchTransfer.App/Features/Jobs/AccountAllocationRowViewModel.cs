@@ -35,15 +35,15 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     public long? CapacityTotal { get; }
     public long? CapacityUsed { get; }
     public long? RemainingCapacity => CapacityTotal is null || CapacityUsed is null ? null : Math.Max(0, CapacityTotal.Value - CapacityUsed.Value);
-    public int LockedItemCount { get; }
-    public int ExclusiveCandidateCount { get; }
-    public int PublicCandidateCount { get; }
-    public int UnusedExclusiveCandidateCount { get; }
-    public int OriginalTargetSuccessCount { get; }
-    public int EffectiveTargetSuccessCount { get; }
-    public int ReachableTargetSuccessCount { get; }
-    public int FulfilledCount { get; }
-    public int ReservedSlotCount { get; }
+    public int LockedItemCount { get; private set; }
+    public int ExclusiveCandidateCount { get; private set; }
+    public int PublicCandidateCount { get; private set; }
+    public int UnusedExclusiveCandidateCount { get; private set; }
+    public int OriginalTargetSuccessCount { get; private set; }
+    public int EffectiveTargetSuccessCount { get; private set; }
+    public int ReachableTargetSuccessCount { get; private set; }
+    public int FulfilledCount { get; private set; }
+    public int ReservedSlotCount { get; private set; }
     public int ShortfallCount => Math.Max(0, TargetSuccessCount - ReachableTargetSuccessCount);
     public double AllocationPercentage { get; internal set; }
 
@@ -59,4 +59,18 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         }
     }
     public string DefaultTargetPath { get => defaultTargetPath; set => SetProperty(ref defaultTargetPath, value ?? string.Empty); }
+
+    internal void ApplyConfirmation(WizardAccountConfirmation value)
+    {
+        OriginalTargetSuccessCount = value.OriginalTarget;
+        EffectiveTargetSuccessCount = value.EffectiveTarget;
+        ReachableTargetSuccessCount = value.ReachableTarget;
+        FulfilledCount = value.Fulfilled;
+        ReservedSlotCount = value.Reserved;
+        LockedItemCount = value.Locked;
+        ExclusiveCandidateCount = value.Exclusive;
+        PublicCandidateCount = value.Public;
+        UnusedExclusiveCandidateCount = value.Unused;
+        OnPropertyChanged(string.Empty);
+    }
 }

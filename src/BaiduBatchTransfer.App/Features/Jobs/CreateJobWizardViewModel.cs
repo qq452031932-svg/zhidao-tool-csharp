@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Numerics;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Domain;
@@ -16,6 +17,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private readonly IWizardBatchService batchService;
     private readonly IDialogService dialogService;
     private readonly IAdapterAvailability adapterAvailability;
+    private readonly IWizardDraftWorkflow draftWorkflow;
+    private readonly IWizardPrecheckWorkflow precheckWorkflow;
     private readonly List<WizardAccountOption> options;
     private Guid importSessionId;
     private Guid batchJobId;
@@ -41,19 +44,31 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private int currentStepIndex;
     private bool isBusy;
     private bool suppressInvalidation;
+    private long draftGeneration;
+    private string folderCreationMode = "None";
+    private DuplicatePolicy duplicatePolicy = DuplicatePolicy.Skip;
+    private long requiredFreeBytes;
+    private long availableFreeBytes;
+    private long confirmedResourceCount;
+    private long confirmedOperationCount;
+    private string precheckStatusMessage = string.Empty;
 
     public CreateJobWizardViewModel(
         IReadOnlyList<WizardAccountOption> accounts,
         IImportPreviewPageSource pageSource,
         IWizardBatchService batchService,
         IDialogService dialogService,
-        IAdapterAvailability? adapterAvailability = null)
+        IAdapterAvailability? adapterAvailability = null,
+        IWizardDraftWorkflow? draftWorkflow = null,
+        IWizardPrecheckWorkflow? precheckWorkflow = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
         this.pageSource = pageSource ?? throw new ArgumentNullException(nameof(pageSource));
         this.batchService = batchService ?? throw new ArgumentNullException(nameof(batchService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
         this.adapterAvailability = adapterAvailability ?? AvailableAdapterAvailability.Instance;
+        this.draftWorkflow = draftWorkflow ?? new PassiveWizardDraftWorkflow();
+        this.precheckWorkflow = precheckWorkflow ?? new UnavailableWizardPrecheckWorkflow();
         options = accounts.Where(IsEligible).OrderBy(x => x.DisplayName, StringComparer.CurrentCulture).ToList();
         Accounts = new(options.Select(option => new AccountAllocationRowViewModel(option, defaultTargetPath)));
         foreach (var account in Accounts) account.PropertyChanged += AccountChanged;
@@ -69,19 +84,27 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         CreateJobCommand = new AsyncRelayCommand(CreateJobAsync, () => CanCreateJob && !IsBusy);
         LoadFirstPreviewPageCommand = new AsyncRelayCommand(LoadFirstPreviewPageAsync, () => !IsBusy);
         LoadNextPreviewPageCommand = new AsyncRelayCommand(LoadNextPreviewPageAsync, () => nextPreviewCursor is not null && !IsBusy);
-        NextStepCommand = new RelayCommand(MoveNext, () => CanContinue);
+        NextStepCommand = new RelayCommand(MoveNext, () => CanMoveNext);
         PreviousStepCommand = new RelayCommand(MovePrevious, () => currentStepIndex > 0);
-        SelectReplicationCommand = new RelayCommand(() => SelectMode(Core.Domain.TransferMode.Replication));
-        SelectDistributionCommand = new RelayCommand(() => SelectMode(Core.Domain.TransferMode.Distribution));
+        SelectReplicationCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Replication));
+        SelectDistributionCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Distribution));
         UseTaskQuotaCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.TaskCount);
         UseSuccessTargetCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.SuccessTarget);
         UseProportionalReductionCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.ProportionalReduction);
         UseAccountPriorityCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.AccountPriority);
         UseWaitForCandidatesCommand = new RelayCommand(() => ShortagePolicy = Core.Domain.ShortagePolicy.WaitForCandidates);
         KeepExcelMappingsCommand = new RelayCommand(() => ExcelAccountHandling = ExcelAccountHandling.KeepMappings);
-        OverrideExcelMappingsCommand = new RelayCommand(() => ExcelAccountHandling = ExcelAccountHandling.OverrideAll);
-        IgnoreExcelAccountColumnCommand = new RelayCommand(() => ExcelAccountHandling = ExcelAccountHandling.IgnoreColumn);
+        AutoMapUniqueExcelAccountsCommand = new AsyncRelayCommand(AutoMapUniqueExcelAccountsAsync);
+        OverrideExcelMappingsCommand = new AsyncRelayCommand(OverrideAllExcelAccountsAsync);
+        IgnoreExcelAccountColumnCommand = new AsyncRelayCommand(IgnoreExcelAccountsAsync);
         ApplyOneTwoOneCommand = new RelayCommand(() => TryApplyOneTwoOne());
+        ApplyEqualAllocationCommand = new RelayCommand(() => TryApplyEqualAllocation());
+        ApplyCapacityAllocationCommand = new RelayCommand(() => TryApplyCapacityAllocation());
+        PreserveStructureCommand = new RelayCommand(() => FolderCreationMode = "None");
+        CreateOuterFolderCommand = new RelayCommand(() => FolderCreationMode = "OuterFolder");
+        SkipDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Skip);
+        RenameDuplicateCommand = new RelayCommand(() => DuplicatePolicy = Core.Domain.DuplicatePolicy.Rename);
+        RunPrecheckCommand = new AsyncRelayCommand(RunPrecheckAsync, () => UseBulkPrecheck && PrecheckAccountId is not null && !IsBusy);
     }
 
     public ObservableCollection<AccountAllocationRowViewModel> Accounts { get; }
@@ -93,17 +116,25 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public IAsyncRelayCommand LoadNextPreviewPageCommand { get; }
     public IRelayCommand NextStepCommand { get; }
     public IRelayCommand PreviousStepCommand { get; }
-    public IRelayCommand SelectReplicationCommand { get; }
-    public IRelayCommand SelectDistributionCommand { get; }
+    public IAsyncRelayCommand SelectReplicationCommand { get; }
+    public IAsyncRelayCommand SelectDistributionCommand { get; }
     public IRelayCommand UseTaskQuotaCommand { get; }
     public IRelayCommand UseSuccessTargetCommand { get; }
     public IRelayCommand UseProportionalReductionCommand { get; }
     public IRelayCommand UseAccountPriorityCommand { get; }
     public IRelayCommand UseWaitForCandidatesCommand { get; }
     public IRelayCommand KeepExcelMappingsCommand { get; }
-    public IRelayCommand OverrideExcelMappingsCommand { get; }
-    public IRelayCommand IgnoreExcelAccountColumnCommand { get; }
+    public IAsyncRelayCommand AutoMapUniqueExcelAccountsCommand { get; }
+    public IAsyncRelayCommand OverrideExcelMappingsCommand { get; }
+    public IAsyncRelayCommand IgnoreExcelAccountColumnCommand { get; }
     public IRelayCommand ApplyOneTwoOneCommand { get; }
+    public IRelayCommand ApplyEqualAllocationCommand { get; }
+    public IRelayCommand ApplyCapacityAllocationCommand { get; }
+    public IRelayCommand PreserveStructureCommand { get; }
+    public IRelayCommand CreateOuterFolderCommand { get; }
+    public IRelayCommand SkipDuplicateCommand { get; }
+    public IRelayCommand RenameDuplicateCommand { get; }
+    public IAsyncRelayCommand RunPrecheckCommand { get; }
 
     public string JobName { get => jobName; set => SetAndInvalidate(ref jobName, value ?? string.Empty); }
     public string DefaultTargetPath
@@ -132,7 +163,16 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             OnPropertyChanged(nameof(ValidationModeText));
         }
     }
-    public Guid? PrecheckAccountId { get => precheckAccountId; set => SetAndInvalidate(ref precheckAccountId, value); }
+    public Guid? PrecheckAccountId
+    {
+        get => precheckAccountId;
+        set
+        {
+            if (!SetAndInvalidate(ref precheckAccountId, value)) return;
+            PrecheckStatusMessage = string.Empty;
+            RunPrecheckCommand.NotifyCanExecuteChanged();
+        }
+    }
     public bool IsFinalConfirmationChecked
     {
         get => isFinalConfirmationChecked;
@@ -145,8 +185,19 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public string? ConfirmationToken { get => confirmationToken; private set => SetProperty(ref confirmationToken, value); }
     public string ValidationMessage { get => validationMessage; private set => SetProperty(ref validationMessage, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
-    public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) RaiseDerived(); } }
+    public bool IsBusy
+    {
+        get => isBusy;
+        private set
+        {
+            if (!SetProperty(ref isBusy, value)) return;
+            OnPropertyChanged(nameof(CanEdit));
+            RaiseDerived();
+        }
+    }
+    public bool CanEdit => !IsBusy;
     public int ReadyResourceCount => readyResourceCount;
+    public Guid? CurrentImportSessionId => importSessionId == Guid.Empty ? null : importSessionId;
     public long ResourceCount => readyResourceCount;
     public long OperationCount => transferMode == Core.Domain.TransferMode.Replication
         ? checked((long)readyResourceCount * Accounts.Count(x => x.IsSelected))
@@ -157,9 +208,44 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public long ReserveCandidateCount => Math.Max(0, readyResourceCount - SuccessTargetCount);
     public long PreviewTotalCount { get => previewTotalCount; private set => SetProperty(ref previewTotalCount, value); }
     public int CurrentStepIndex { get => currentStepIndex; private set => SetProperty(ref currentStepIndex, value); }
+    public bool IsImportStepVisible => currentStepIndex == 0;
+    public bool IsPrecheckStepVisible => currentStepIndex == 1;
+    public bool IsDestinationStepVisible => currentStepIndex == 2;
+    public bool IsAllocationStepVisible => currentStepIndex == 3;
+    public bool IsConfirmationStepVisible => currentStepIndex == 4;
+    public bool CanMoveNext => currentStepIndex switch
+    {
+        0 => importSessionId != Guid.Empty && readyResourceCount > 0 && conflictRowCount + needsResolutionRowCount == 0,
+        1 => !UseBulkPrecheck || PrecheckAccountId is not null,
+        2 => !string.IsNullOrWhiteSpace(DefaultTargetPath),
+        3 => CanContinue,
+        _ => false,
+    };
     public string AccountSelectionNotice { get; private set; } = string.Empty;
     public string ValidationModeText => UseBulkPrecheck ? "批量预检" : "执行前即时检测";
+    public string TransferModeText => transferMode switch
+    {
+        Core.Domain.TransferMode.Replication => "多账号复制",
+        Core.Domain.TransferMode.Distribution => "多账号分流",
+        _ => "尚未选择",
+    };
+    public string QuotaBasisText => quotaBasis == Core.Domain.QuotaBasis.TaskCount ? "按任务数量" : "按成功数量补足";
+    public string ShortagePolicyText => shortagePolicy switch
+    {
+        Core.Domain.ShortagePolicy.ProportionalReduction => "按比例缩减",
+        Core.Domain.ShortagePolicy.AccountPriority => "账号优先级",
+        _ => "暂停等待补充",
+    };
+    public string FolderCreationModeText => FolderCreationMode == "OuterFolder" ? "创建外层文件夹" : "保持原结构";
+    public string DuplicatePolicyText => DuplicatePolicy == Core.Domain.DuplicatePolicy.Rename ? "自动重命名" : "跳过同名项";
     public string AdapterStatusMessage => adapterAvailability.StatusMessage;
+    public string FolderCreationMode { get => folderCreationMode; set => SetAndInvalidate(ref folderCreationMode, value); }
+    public DuplicatePolicy DuplicatePolicy { get => duplicatePolicy; set => SetAndInvalidate(ref duplicatePolicy, value); }
+    public long RequiredFreeBytes { get => requiredFreeBytes; private set => SetProperty(ref requiredFreeBytes, value); }
+    public long AvailableFreeBytes { get => availableFreeBytes; private set => SetProperty(ref availableFreeBytes, value); }
+    public long ConfirmedResourceCount { get => confirmedResourceCount; private set => SetProperty(ref confirmedResourceCount, value); }
+    public long ConfirmedOperationCount { get => confirmedOperationCount; private set => SetProperty(ref confirmedOperationCount, value); }
+    public string PrecheckStatusMessage { get => precheckStatusMessage; private set => SetProperty(ref precheckStatusMessage, value); }
     public string WarningMessage => BuildWarning();
     public bool CanContinue => string.IsNullOrEmpty(EvaluateValidation());
     public bool CanCreateJob => adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
@@ -204,6 +290,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         suppressInvalidation = false;
         InvalidateConfirmation();
         RaiseAll();
+        OnPropertyChanged(nameof(CurrentImportSessionId));
     }
 
     public void SelectMode(TransferMode mode)
@@ -214,6 +301,104 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         InvalidateConfirmation();
         OnPropertyChanged(nameof(TransferMode));
         RaiseAll();
+    }
+
+    public async Task SelectModeAsync(TransferMode mode, CancellationToken cancellationToken = default)
+    {
+        if (importSessionId == Guid.Empty) { SelectMode(mode); return; }
+        IsBusy = true;
+        try
+        {
+            var mutation = await draftWorkflow.SwitchModeAsync(importSessionId, mode, cancellationToken);
+            ApplyMutation(mutation);
+            SelectMode(mode);
+            StatusMessage = mode == Core.Domain.TransferMode.Replication ? "已切换为多账号复制。" : "已切换为多账号分流。";
+        }
+        catch (Exception) { ValidationMessage = "无法切换模式，请先处理草稿冲突。"; }
+        finally { IsBusy = false; }
+    }
+
+    public async Task IgnoreExcelAccountsAsync(CancellationToken cancellationToken = default)
+    {
+        if (importSessionId == Guid.Empty || transferMode is null) return;
+        IsBusy = true;
+        try
+        {
+            var mutation = await draftWorkflow.IgnoreAllAccountNamesAsync(importSessionId, transferMode.Value, cancellationToken);
+            ApplyMutation(mutation);
+            ExcelAccountHandling = ExcelAccountHandling.IgnoreColumn;
+            unresolvedAccountMappingCount = 0;
+        }
+        catch (Exception) { ValidationMessage = "无法忽略 Excel 账号列，请刷新草稿后重试。"; }
+        finally { IsBusy = false; }
+    }
+
+    public async Task AutoMapUniqueExcelAccountsAsync(CancellationToken cancellationToken = default)
+    {
+        if (importSessionId == Guid.Empty || transferMode != Core.Domain.TransferMode.Distribution) return;
+        IsBusy = true;
+        try
+        {
+            var mutation = await draftWorkflow.AutoMapUniqueAccountNamesAsync(
+                importSessionId, transferMode.Value, cancellationToken);
+            ApplyMutation(mutation);
+            unresolvedAccountMappingCount = mutation.UnresolvedAccountMappings;
+            ExcelAccountHandling = ExcelAccountHandling.MapNames;
+            StatusMessage = unresolvedAccountMappingCount == 0
+                ? "Excel 账号名称已全部唯一匹配。"
+                : $"已匹配唯一名称，仍有 {unresolvedAccountMappingCount:N0} 个名称需要统一覆盖或人工处理。";
+        }
+        catch (Exception) { ValidationMessage = "无法匹配 Excel 账号名称，请刷新草稿后重试。"; }
+        finally { IsBusy = false; }
+    }
+
+    public async Task OverrideAllExcelAccountsAsync(CancellationToken cancellationToken = default)
+    {
+        if (importSessionId == Guid.Empty || transferMode is null) return;
+        var account = Accounts.FirstOrDefault(x => x.IsSelected);
+        if (account is null) { ValidationMessage = "请先选择用于覆盖的账号。"; return; }
+        IsBusy = true;
+        try
+        {
+            var mutation = await draftWorkflow.OverrideAllAccountsAsync(importSessionId, account.AccountId, transferMode.Value, cancellationToken);
+            ApplyMutation(mutation);
+            ExcelAccountHandling = ExcelAccountHandling.OverrideAll;
+            unresolvedAccountMappingCount = 0;
+        }
+        catch (Exception) { ValidationMessage = "无法覆盖逐行账号，请刷新草稿后重试。"; }
+        finally { IsBusy = false; }
+    }
+
+    public async Task RunPrecheckAsync(CancellationToken cancellationToken = default)
+    {
+        if (!UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId) return;
+        if (Accounts.All(x => x.AccountId != accountId))
+        {
+            ValidationMessage = "请选择一个可用账号执行预检。";
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            var result = await precheckWorkflow.RunAsync(importSessionId, accountId, cancellationToken);
+            PrecheckStatusMessage = result.Status switch
+            {
+                WizardPrecheckStatus.Completed => $"预检已继续并完成，已处理 {result.ProcessedRows:N0} 条记录。",
+                WizardPrecheckStatus.PausedForLogin => "预检已暂停，请完成账号登录后点击继续预检。",
+                WizardPrecheckStatus.PausedForVerification => "预检已暂停，请完成安全验证后点击继续预检。",
+                _ => "百度网盘适配器尚不可用，暂时无法执行预检。",
+            };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            PrecheckStatusMessage = "预检已取消，可使用同一账号继续。";
+        }
+        catch (Exception)
+        {
+            PrecheckStatusMessage = "预检失败，可使用同一账号继续重试。";
+        }
+        finally { IsBusy = false; }
     }
 
     public void SetImportResolutionCounts(int conflictRows, int needsResolutionRows)
@@ -244,16 +429,62 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         return true;
     }
 
+    public bool TryApplyEqualAllocation()
+    {
+        var selected = Accounts.Where(x => x.IsSelected).ToArray();
+        if (selected.Length == 0 || transferMode != Core.Domain.TransferMode.Distribution) return false;
+        var perAccount = readyResourceCount / selected.Length;
+        var remainder = readyResourceCount % selected.Length;
+        ApplyTargets(selected, selected.Select((_, index) => perAccount + (index < remainder ? 1 : 0)).ToArray());
+        return true;
+    }
+
+    public bool TryApplyCapacityAllocation()
+    {
+        var selected = Accounts.Where(x => x.IsSelected).ToArray();
+        if (selected.Length == 0 || transferMode != Core.Domain.TransferMode.Distribution) return false;
+        var weights = selected.Select(x => new BigInteger(Math.Max(0, x.RemainingCapacity ?? 0))).ToArray();
+        var totalWeight = weights.Aggregate(BigInteger.Zero, (sum, value) => sum + value);
+        if (totalWeight == BigInteger.Zero) return TryApplyEqualAllocation();
+
+        var targets = new int[selected.Length];
+        var remainders = new (int Index, BigInteger Remainder)[selected.Length];
+        var assigned = 0;
+        for (var index = 0; index < selected.Length; index++)
+        {
+            var quotient = BigInteger.DivRem(weights[index] * readyResourceCount, totalWeight, out var remainder);
+            targets[index] = checked((int)quotient);
+            assigned += targets[index];
+            remainders[index] = (index, remainder);
+        }
+        foreach (var item in remainders.OrderByDescending(x => x.Remainder).ThenBy(x => x.Index).Take(readyResourceCount - assigned))
+            targets[item.Index]++;
+        ApplyTargets(selected, targets);
+        return true;
+    }
+
+    private void ApplyTargets(IReadOnlyList<AccountAllocationRowViewModel> accounts, IReadOnlyList<int> targets)
+    {
+        suppressInvalidation = true;
+        try
+        {
+            for (var index = 0; index < accounts.Count; index++) SetTarget(accounts[index], targets[index]);
+        }
+        finally { suppressInvalidation = false; }
+        InvalidateConfirmation();
+        RaiseAll();
+    }
+
     public async Task LoadFirstPreviewPageAsync(CancellationToken cancellationToken = default)
     {
         nextPreviewCursor = null;
-        await LoadPreviewPageAsync(null, replace: true, cancellationToken).ConfigureAwait(false);
+        await LoadPreviewPageAsync(null, replace: true, cancellationToken);
     }
 
     public async Task LoadNextPreviewPageAsync(CancellationToken cancellationToken = default)
     {
         if (nextPreviewCursor is null) return;
-        await LoadPreviewPageAsync(nextPreviewCursor, replace: true, cancellationToken).ConfigureAwait(false);
+        await LoadPreviewPageAsync(nextPreviewCursor, replace: true, cancellationToken);
     }
 
     public async Task PrepareConfirmationAsync(CancellationToken cancellationToken = default)
@@ -262,12 +493,22 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         ValidationMessage = validation;
         if (validation.Length != 0) return;
         IsBusy = true;
+        var generation = draftGeneration;
+        var session = importSessionId;
         try
         {
             var draft = BuildDraft();
-            var summary = await batchService.PreviewAsync(draft, cancellationToken).ConfigureAwait(false);
+            var summary = await batchService.PreviewAsync(draft, cancellationToken);
+            if (generation != draftGeneration || session != importSessionId) return;
             if (!summary.HasSufficientDiskSpace)
                 throw new StorageCapacityException(0, 0);
+            if (summary.Accounts is not null)
+                foreach (var confirmation in summary.Accounts)
+                    Accounts.FirstOrDefault(x => x.AccountId == confirmation.AccountId)?.ApplyConfirmation(confirmation);
+            RequiredFreeBytes = summary.RequiredFreeBytes;
+            AvailableFreeBytes = summary.AvailableFreeBytes;
+            ConfirmedResourceCount = summary.ResourceCount;
+            ConfirmedOperationCount = summary.OperationCount;
             ConfirmationToken = summary.ConfirmationToken;
             StatusMessage = $"预览完成：{summary.ResourceCount:N0} 个资源，{summary.OperationCount:N0} 次转存操作。";
             IsFinalConfirmationChecked = false;
@@ -301,13 +542,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         var draft = BuildDraft();
         var confirmed = await dialogService.ConfirmAsync(
             "最终确认",
-            $"将创建任务“{JobName}”，包含 {ResourceCount:N0} 个资源、{OperationCount:N0} 次转存操作。确认继续吗？",
-            cancellationToken).ConfigureAwait(false);
+            $"将创建任务“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
+            cancellationToken);
         if (!confirmed) return;
         IsBusy = true;
         try
         {
-            await batchService.ConfirmAsync(draft, token, cancellationToken).ConfigureAwait(false);
+            await batchService.ConfirmAsync(draft, token, cancellationToken);
             ConfirmationToken = null;
             IsFinalConfirmationChecked = false;
             StatusMessage = "任务已创建，正在等待调度。";
@@ -333,11 +574,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private async Task LoadPreviewPageAsync(long? cursor, bool replace, CancellationToken cancellationToken)
     {
         if (importSessionId == Guid.Empty) return;
+        var expectedSession = importSessionId;
+        var generation = draftGeneration;
         IsBusy = true;
         try
         {
-            var page = await pageSource.LoadAsync(new(importSessionId, PreviewPageSize, cursor), cancellationToken)
-                .ConfigureAwait(false);
+            var page = await pageSource.LoadAsync(new(expectedSession, PreviewPageSize, cursor), cancellationToken);
+            if (expectedSession != importSessionId || generation != draftGeneration) return;
             void ApplyPage()
             {
                 if (replace) PreviewRows.Clear();
@@ -374,8 +617,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             shortagePolicy,
             accountDrafts,
             DefaultTargetPath,
-            "None",
-            DuplicatePolicy.Skip,
+            FolderCreationMode,
+            DuplicatePolicy,
             UseBulkPrecheck ? "BatchPrecheck" : "Immediate",
             mode == Core.Domain.TransferMode.Replication && ExcelAccountHandling == ExcelAccountHandling.IgnoreColumn,
             readyResourceCount);
@@ -393,8 +636,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (selected.Length == 0) return "请至少选择一个参与账号。";
         if (string.IsNullOrWhiteSpace(JobName)) return "请输入任务名称。";
         if (string.IsNullOrWhiteSpace(DefaultTargetPath)) return "请选择默认目标目录。";
-        if (UseBulkPrecheck && (PrecheckAccountId is null || selected.All(x => x.AccountId != PrecheckAccountId)))
-            return "请选择一个本批次参与的可用账号作为预检账号。";
+        if (UseBulkPrecheck && (PrecheckAccountId is null || Accounts.All(x => x.AccountId != PrecheckAccountId)))
+            return "请选择一个可用账号作为预检账号。";
         if (hasExcelAccountColumn)
         {
             if (transferMode == Core.Domain.TransferMode.Replication && ExcelAccountHandling != ExcelAccountHandling.IgnoreColumn)
@@ -444,6 +687,15 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         RaiseAll();
     }
 
+    private void ApplyMutation(WizardDraftMutation mutation)
+    {
+        readyResourceCount = mutation.ReadyRows;
+        conflictRowCount = mutation.ConflictRows;
+        needsResolutionRowCount = mutation.NeedsResolutionRows;
+        InvalidateConfirmation();
+        RaiseAll();
+    }
+
     private bool SetAndInvalidate<T>(ref T field, T value)
     {
         if (!SetProperty(ref field, value)) return false;
@@ -462,6 +714,11 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     {
         if (suppressInvalidation) return;
         ConfirmationToken = null;
+        ConfirmedResourceCount = 0;
+        ConfirmedOperationCount = 0;
+        RequiredFreeBytes = 0;
+        AvailableFreeBytes = 0;
+        draftGeneration++;
         isFinalConfirmationChecked = false;
         OnPropertyChanged(nameof(IsFinalConfirmationChecked));
         ValidationMessage = EvaluateValidation();
@@ -476,6 +733,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         OnPropertyChanged(nameof(QuotaBasis));
         OnPropertyChanged(nameof(ShortagePolicy));
         OnPropertyChanged(nameof(ExcelAccountHandling));
+        OnPropertyChanged(nameof(TransferModeText));
+        OnPropertyChanged(nameof(QuotaBasisText));
+        OnPropertyChanged(nameof(ShortagePolicyText));
+        OnPropertyChanged(nameof(FolderCreationModeText));
+        OnPropertyChanged(nameof(DuplicatePolicyText));
+        OnPropertyChanged(nameof(ValidationModeText));
         OnPropertyChanged(nameof(ReadyResourceCount));
         OnPropertyChanged(nameof(ResourceCount));
         OnPropertyChanged(nameof(OperationCount));
@@ -484,6 +747,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         OnPropertyChanged(nameof(SuccessTargetCount));
         OnPropertyChanged(nameof(ReserveCandidateCount));
         OnPropertyChanged(nameof(WarningMessage));
+        OnPropertyChanged(nameof(CanMoveNext));
         RaiseDerived();
     }
 
@@ -496,6 +760,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         PrepareConfirmationCommand?.NotifyCanExecuteChanged();
         LoadFirstPreviewPageCommand?.NotifyCanExecuteChanged();
         LoadNextPreviewPageCommand?.NotifyCanExecuteChanged();
+        RunPrecheckCommand?.NotifyCanExecuteChanged();
     }
 
     private void MoveNext()
@@ -519,6 +784,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         Steps[currentStepIndex].IsCurrent = false;
         CurrentStepIndex = index;
         Steps[currentStepIndex].IsCurrent = true;
+        OnPropertyChanged(nameof(IsImportStepVisible));
+        OnPropertyChanged(nameof(IsPrecheckStepVisible));
+        OnPropertyChanged(nameof(IsDestinationStepVisible));
+        OnPropertyChanged(nameof(IsAllocationStepVisible));
+        OnPropertyChanged(nameof(IsConfirmationStepVisible));
+        OnPropertyChanged(nameof(CanMoveNext));
         PreviousStepCommand.NotifyCanExecuteChanged();
     }
 

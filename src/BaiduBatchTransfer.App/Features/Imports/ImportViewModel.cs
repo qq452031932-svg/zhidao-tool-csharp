@@ -22,13 +22,23 @@ public sealed class ImportWorkflowException(ImportUiError error, Exception? inne
     public ImportUiError Error { get; } = error;
 }
 
-public sealed record ImportDraftStatistics(int Total, int Ready, int Duplicate, int Invalid, int Excluded);
+public sealed record ImportDraftStatistics(
+    int Total,
+    int Ready,
+    int Duplicate,
+    int Invalid,
+    int Excluded,
+    int Conflict = 0,
+    int NeedsResolution = 0,
+    bool HasExcelAccountColumn = false,
+    int UnresolvedAccountMappings = 0);
 public sealed record ImportWorkflowResult(Guid SessionId, ImportDraftStatistics Statistics);
+public sealed record ImportDraftReady(Guid SessionId, ImportDraftStatistics Statistics);
 
 public interface IImportWorkflow
 {
-    Task<ImportWorkflowResult> ImportTextAsync(string text, CancellationToken cancellationToken);
-    Task<ImportWorkflowResult> ImportExcelAsync(string filePath, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken);
     Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken);
     Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
     Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
@@ -37,8 +47,8 @@ public interface IImportWorkflow
 public sealed class UnavailableImportWorkflow : IImportWorkflow
 {
     private static ImportWorkflowException Error() => new(ImportUiError.AdapterUnavailable);
-    public Task<ImportWorkflowResult> ImportTextAsync(string text, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
-    public Task<ImportWorkflowResult> ImportExcelAsync(string filePath, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
+    public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
+    public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
     public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
     public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) => Task.FromException(Error());
     public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => Task.FromException(Error());
@@ -60,6 +70,11 @@ public sealed class ImportViewModel : ObservableObject
     private bool canResumeImport;
     private long totalRows;
     private long? nextCursor;
+    private ImportPreviewRow? selectedRow;
+    private string selectedShareUrl = string.Empty;
+    private string selectedExtractionCode = string.Empty;
+    private bool selectedRowIsExcluded;
+    private long pageGeneration;
 
     public ImportViewModel(
         IImportWorkflow workflow,
@@ -78,15 +93,20 @@ public sealed class ImportViewModel : ObservableObject
         CancelCommand = new RelayCommand(Cancel, () => IsBusy);
         LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => sessionId is not null && !IsBusy);
         LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => nextCursor is not null && !IsBusy);
+        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => SelectedRow is not null && !IsBusy);
+        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => SelectedRow is not null && !IsBusy);
     }
 
     public ObservableCollection<ImportPreviewRow> Rows { get; }
+    public event EventHandler<ImportDraftReady>? DraftReady;
     public IAsyncRelayCommand ImportTextCommand { get; }
     public IAsyncRelayCommand SelectAndImportExcelCommand { get; }
     public IAsyncRelayCommand ResumeImportCommand { get; }
     public IRelayCommand CancelCommand { get; }
     public IAsyncRelayCommand LoadFirstPageCommand { get; }
     public IAsyncRelayCommand LoadNextPageCommand { get; }
+    public IAsyncRelayCommand SaveSelectedRowCommand { get; }
+    public IAsyncRelayCommand ToggleSelectedExclusionCommand { get; }
 
     public string TextContent { get => textContent; set { if (SetProperty(ref textContent, value ?? string.Empty)) RaiseCommands(); } }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
@@ -98,11 +118,29 @@ public sealed class ImportViewModel : ObservableObject
     public string AdapterStatusMessage => adapterAvailability.StatusMessage;
     public long TotalRows { get => totalRows; private set => SetProperty(ref totalRows, value); }
     public Guid? SessionId => sessionId;
+    public ImportPreviewRow? SelectedRow
+    {
+        get => selectedRow;
+        set
+        {
+            if (!SetProperty(ref selectedRow, value)) return;
+            SelectedShareUrl = value?.ShareUrl ?? string.Empty;
+            SelectedExtractionCode = value?.ExtractionCode ?? string.Empty;
+            selectedRowIsExcluded = string.Equals(value?.DispositionText, "已排除", StringComparison.Ordinal);
+            OnPropertyChanged(nameof(SelectedExclusionActionText));
+            SaveSelectedRowCommand.NotifyCanExecuteChanged();
+            ToggleSelectedExclusionCommand.NotifyCanExecuteChanged();
+        }
+    }
+    public string SelectedShareUrl { get => selectedShareUrl; set => SetProperty(ref selectedShareUrl, value ?? string.Empty); }
+    public string SelectedExtractionCode { get => selectedExtractionCode; set => SetProperty(ref selectedExtractionCode, value ?? string.Empty); }
+    public string SelectedExclusionActionText => selectedRowIsExcluded ? "恢复所选记录" : "排除所选记录";
 
     public void AttachSession(Guid value)
     {
         if (value == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(value));
         sessionId = value;
+        pageGeneration++;
         OnPropertyChanged(nameof(SessionId));
         RaiseCommands();
     }
@@ -112,46 +150,52 @@ public sealed class ImportViewModel : ObservableObject
         StatisticsText = $"总计 {statistics.Total:N0} · 就绪 {statistics.Ready:N0} · 重复 {statistics.Duplicate:N0} · 异常 {statistics.Invalid:N0} · 已排除 {statistics.Excluded:N0}";
     }
 
-    public async Task ImportTextAsync(CancellationToken cancellationToken = default) =>
-        await RunImportAsync(token => workflow.ImportTextAsync(TextContent, token), cancellationToken).ConfigureAwait(false);
+    public async Task ImportTextAsync(CancellationToken cancellationToken = default)
+    {
+        var newSessionId = Guid.NewGuid();
+        AttachSession(newSessionId);
+        await RunImportAsync(token => workflow.ImportTextAsync(newSessionId, TextContent, token), cancellationToken);
+    }
 
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(filePath)) return;
-        await RunImportAsync(token => workflow.ImportExcelAsync(filePath, token), cancellationToken).ConfigureAwait(false);
+        var newSessionId = Guid.NewGuid();
+        AttachSession(newSessionId);
+        await RunImportAsync(token => workflow.ImportExcelAsync(newSessionId, filePath, token), cancellationToken);
     }
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
         var path = dialogService.PickExcelFile();
-        if (path is not null) await ImportExcelAsync(path, cancellationToken).ConfigureAwait(false);
+        if (path is not null) await ImportExcelAsync(path, cancellationToken);
     }
 
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
         if (sessionId is null) return;
-        await RunImportAsync(token => workflow.ResumeAsync(sessionId.Value, token), cancellationToken).ConfigureAwait(false);
+        await RunImportAsync(token => workflow.ResumeAsync(sessionId.Value, token), cancellationToken);
     }
 
     public async Task LoadFirstPageAsync(CancellationToken cancellationToken = default)
     {
         nextCursor = null;
-        await LoadPageAsync(null, cancellationToken).ConfigureAwait(false);
+        await LoadPageAsync(null, cancellationToken);
     }
 
     public async Task LoadNextPageAsync(CancellationToken cancellationToken = default)
     {
         if (nextCursor is null) return;
-        await LoadPageAsync(nextCursor, cancellationToken).ConfigureAwait(false);
+        await LoadPageAsync(nextCursor, cancellationToken);
     }
 
     public async Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken = default)
     {
         try
         {
-            await workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, cancellationToken).ConfigureAwait(false);
+            await workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, cancellationToken);
             StatusMessage = "预检结果已失效，需要重新预检或按未预检状态继续。";
-            await LoadFirstPageAsync(cancellationToken).ConfigureAwait(false);
+            await LoadFirstPageAsync(cancellationToken);
         }
         catch (Exception) { StatusMessage = "修改失败，请检查链接与提取码。"; }
     }
@@ -160,10 +204,29 @@ public sealed class ImportViewModel : ObservableObject
     {
         try
         {
-            await workflow.SetExcludedAsync(rowId, excluded, cancellationToken).ConfigureAwait(false);
+            await workflow.SetExcludedAsync(rowId, excluded, cancellationToken);
             StatusMessage = excluded ? "已排除该记录。" : "已恢复该记录。";
         }
         catch (Exception) { StatusMessage = "无法更新记录，请刷新后重试。"; }
+    }
+
+    private async Task SaveSelectedRowAsync(CancellationToken cancellationToken)
+    {
+        if (SelectedRow is null) return;
+        await UpdateLinkAsync(
+            SelectedRow.RowId,
+            SelectedShareUrl,
+            string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
+            cancellationToken);
+    }
+
+    private async Task ToggleSelectedExclusionAsync(CancellationToken cancellationToken)
+    {
+        if (SelectedRow is null) return;
+        var exclude = !selectedRowIsExcluded;
+        await SetExcludedAsync(SelectedRow.RowId, exclude, cancellationToken);
+        selectedRowIsExcluded = exclude;
+        OnPropertyChanged(nameof(SelectedExclusionActionText));
     }
 
     private async Task RunImportAsync(
@@ -181,16 +244,17 @@ public sealed class ImportViewModel : ObservableObject
         StatusMessage = "正在流式导入，已保存的批次会持续写入本机数据库…";
         try
         {
-            var result = await action(operationCancellation.Token).ConfigureAwait(false);
+            var result = await action(operationCancellation.Token);
             AttachSession(result.SessionId);
             ApplyStatistics(result.Statistics);
             CanResumeImport = false;
             StatusMessage = "导入完成，请分页检查异常、重复和账号映射。";
-            await LoadFirstPageAsync(externalCancellation).ConfigureAwait(false);
+            DraftReady?.Invoke(this, new(result.SessionId, result.Statistics));
+            await LoadFirstPageAsync(externalCancellation);
         }
         catch (OperationCanceledException)
         {
-            CanResumeImport = sessionId is not null || true;
+            CanResumeImport = sessionId is not null;
             StatusMessage = "导入已取消，已保存的进度可以继续。";
         }
         catch (ImportWorkflowException error)
@@ -212,13 +276,20 @@ public sealed class ImportViewModel : ObservableObject
     private async Task LoadPageAsync(long? cursor, CancellationToken cancellationToken)
     {
         if (sessionId is null) return;
+        var expectedSession = sessionId.Value;
+        var generation = pageGeneration;
         try
         {
-            var page = await pageSource.LoadAsync(new(sessionId.Value, PageSize, cursor), cancellationToken).ConfigureAwait(false);
+            var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), cancellationToken);
+            if (sessionId != expectedSession || generation != pageGeneration) return;
+            var selectedRowId = SelectedRow?.RowId;
             void Apply()
             {
                 Rows.Clear();
                 foreach (var item in page.Items) Rows.Add(item);
+                SelectedRow = selectedRowId is { } rowId
+                    ? Rows.FirstOrDefault(x => x.RowId == rowId)
+                    : null;
                 TotalRows = page.TotalCount;
                 nextCursor = page.NextSourceRowNumber;
                 LoadNextPageCommand.NotifyCanExecuteChanged();
@@ -243,6 +314,8 @@ public sealed class ImportViewModel : ObservableObject
         CancelCommand.NotifyCanExecuteChanged();
         LoadFirstPageCommand.NotifyCanExecuteChanged();
         LoadNextPageCommand.NotifyCanExecuteChanged();
+        SaveSelectedRowCommand.NotifyCanExecuteChanged();
+        ToggleSelectedExclusionCommand.NotifyCanExecuteChanged();
     }
 
     private static string SafeError(ImportUiError error) => error switch

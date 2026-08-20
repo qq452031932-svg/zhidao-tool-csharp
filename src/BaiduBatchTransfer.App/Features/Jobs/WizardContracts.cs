@@ -132,7 +132,22 @@ public sealed record WizardConfirmationSummary(
     long ResourceCount,
     long OperationCount,
     string ConfirmationToken,
-    bool HasSufficientDiskSpace);
+    bool HasSufficientDiskSpace,
+    IReadOnlyList<WizardAccountConfirmation>? Accounts = null,
+    long RequiredFreeBytes = 0,
+    long AvailableFreeBytes = 0);
+
+public sealed record WizardAccountConfirmation(
+    Guid AccountId,
+    int OriginalTarget,
+    int EffectiveTarget,
+    int ReachableTarget,
+    int Fulfilled,
+    int Reserved,
+    int Locked,
+    int Exclusive,
+    int Public,
+    int Unused);
 
 public interface IWizardBatchService
 {
@@ -140,13 +155,125 @@ public interface IWizardBatchService
     Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken);
 }
 
+public sealed record WizardDraftMutation(
+    int TotalRows,
+    int ReadyRows,
+    int InvalidRows,
+    int DuplicateRows,
+    int ConflictRows,
+    int NeedsResolutionRows,
+    int ExcludedRows,
+    int UnresolvedAccountMappings = 0);
+
+public interface IWizardDraftWorkflow
+{
+    Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken);
+    Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken);
+    Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken);
+    Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken);
+}
+
+public enum WizardPrecheckStatus
+{
+    Completed,
+    PausedForLogin,
+    PausedForVerification,
+    Unavailable,
+}
+
+public sealed record WizardPrecheckResult(WizardPrecheckStatus Status, int ProcessedRows);
+
+public interface IWizardPrecheckWorkflow
+{
+    Task<WizardPrecheckResult> RunAsync(
+        Guid sessionId,
+        Guid accountId,
+        CancellationToken cancellationToken);
+}
+
+internal sealed class UnavailableWizardPrecheckWorkflow : IWizardPrecheckWorkflow
+{
+    public Task<WizardPrecheckResult> RunAsync(
+        Guid sessionId,
+        Guid accountId,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(new WizardPrecheckResult(WizardPrecheckStatus.Unavailable, 0));
+}
+
+public sealed class WizardDraftWorkflow(
+    TransferModeReclassificationService reclassification,
+    RequestedAccountMappingService mappings) : IWizardDraftWorkflow
+{
+    public async Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
+        Map(await reclassification.SwitchAsync(sessionId, mode, cancellationToken).ConfigureAwait(false));
+
+    public async Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(
+        Guid sessionId,
+        TransferMode mode,
+        CancellationToken cancellationToken)
+    {
+        var unique = new List<AccountMappingDecision>();
+        var unresolved = 0;
+        for (var pageNumber = 1; ; pageNumber++)
+        {
+            var page = await mappings.GetGroupsPageAsync(sessionId, pageNumber, 1_000, cancellationToken).ConfigureAwait(false);
+            unique.AddRange(page.Items
+                .Where(x => x.Status == AccountNameMatchStatus.Unique)
+                .Select(x => AccountMappingDecision.PreserveUnique(x.RequestedAccountName)));
+            unresolved += page.Items.Count(x => x.Status != AccountNameMatchStatus.Unique);
+            if ((long)pageNumber * page.PageSize >= page.TotalCount) break;
+        }
+
+        var result = unique.Count == 0
+            ? await reclassification.SwitchAsync(sessionId, mode, cancellationToken).ConfigureAwait(false)
+            : await mappings.ApplyAsync(sessionId, unique, mode, cancellationToken).ConfigureAwait(false);
+        return Map(result) with { UnresolvedAccountMappings = unresolved };
+    }
+
+    public async Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
+        Map(await mappings.IgnoreAllAsync(sessionId, mode, cancellationToken).ConfigureAwait(false));
+
+    public async Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) =>
+        Map(await mappings.OverrideAllAsync(sessionId, accountId, mode, cancellationToken).ConfigureAwait(false));
+
+    private static WizardDraftMutation Map(DraftMutationResult value) => new(
+        value.TotalRows, value.ReadyRows, value.InvalidRows, value.DuplicateRows,
+        value.ConflictRows, value.NeedsResolutionRows, value.ExcludedRows);
+}
+
+internal sealed class PassiveWizardDraftWorkflow : IWizardDraftWorkflow
+{
+    public Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
+        throw new InvalidOperationException("草稿服务尚未连接。");
+    public Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
+        throw new InvalidOperationException("草稿服务尚未连接。");
+    public Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
+        throw new InvalidOperationException("草稿服务尚未连接。");
+    public Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) =>
+        throw new InvalidOperationException("草稿服务尚未连接。");
+}
+
 public sealed class WizardBatchService(CreateBatchService service) : IWizardBatchService
 {
     public async Task<WizardConfirmationSummary> PreviewAsync(WizardBatchDraft draft, CancellationToken cancellationToken)
     {
         var summary = await service.PreviewAsync(ToApplicationDraft(draft), cancellationToken).ConfigureAwait(false);
+        var publicCandidates = Math.Max(0, checked((int)summary.ResourceCount) - summary.Accounts.Sum(x => x.ExclusiveCandidateCount));
         return new(summary.ResourceCount, summary.OperationCount, summary.ConfirmationToken,
-            summary.StorageEstimate.HasSufficientSpace);
+            summary.StorageEstimate.HasSufficientSpace,
+            summary.Accounts.Select(account => new WizardAccountConfirmation(
+                account.AccountId,
+                account.TargetSuccessCount,
+                account.EffectiveTargetSuccessCount,
+                account.ReachableTargetSuccessCount,
+                account.FulfilledCount,
+                account.ReservedSlotCount,
+                account.LockedItemCount,
+                account.ExclusiveCandidateCount,
+                publicCandidates,
+                account.UnusedCandidateCount)).ToArray(),
+            summary.StorageEstimate.RequiredFreeBytes,
+            summary.StorageEstimate.AvailableFreeBytes);
     }
 
     public async Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)

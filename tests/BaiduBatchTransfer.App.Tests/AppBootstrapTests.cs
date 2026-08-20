@@ -23,6 +23,8 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<IImportPreviewPageSource>());
         Assert.NotNull(host.Services.GetRequiredService<IWizardBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
+        Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
+        Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
     }
 
     [Fact]

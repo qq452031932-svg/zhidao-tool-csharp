@@ -58,6 +58,23 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public void ConfirmationPolicyLabelsAreAlwaysChinese()
+    {
+        var vm = Create(Accounts(2), ready: 10);
+        vm.SelectMode(TransferMode.Distribution);
+        vm.QuotaBasis = QuotaBasis.SuccessTarget;
+        vm.ShortagePolicy = ShortagePolicy.AccountPriority;
+        vm.FolderCreationMode = "OuterFolder";
+        vm.DuplicatePolicy = DuplicatePolicy.Rename;
+
+        Assert.Equal("多账号分流", vm.TransferModeText);
+        Assert.Equal("按成功数量补足", vm.QuotaBasisText);
+        Assert.Equal("账号优先级", vm.ShortagePolicyText);
+        Assert.Equal("创建外层文件夹", vm.FolderCreationModeText);
+        Assert.Equal("自动重命名", vm.DuplicatePolicyText);
+    }
+
+    [Fact]
     public void ExcelAccountColumnIsAHardGateForReplicationUntilIgnoredOrModeChanged()
     {
         var vm = Create(Accounts(2), ready: 10, hasExcelAccounts: true);
@@ -152,6 +169,28 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public void EqualAndCapacityShortcutsAllocateEveryResourceDeterministically()
+    {
+        var accounts = new[]
+        {
+            AccountWithCapacity("A", 100),
+            AccountWithCapacity("B", 300),
+            AccountWithCapacity("C", 600),
+        };
+        var vm = Create(accounts, ready: 10);
+        vm.SelectMode(TransferMode.Distribution);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        foreach (var account in vm.Accounts) account.IsSelected = true;
+
+        Assert.True(vm.TryApplyEqualAllocation());
+        Assert.Equal([4, 3, 3], vm.Accounts.Select(x => x.TargetItemCount));
+
+        Assert.True(vm.TryApplyCapacityAllocation());
+        Assert.Equal([1, 3, 6], vm.Accounts.Select(x => x.TargetItemCount));
+        Assert.Equal(10, vm.Accounts.Sum(x => x.TargetItemCount));
+    }
+
+    [Fact]
     public async Task PreviewUsesOnlyDatabasePageAndNeverCreatesCollectionForEntireImport()
     {
         var source = new FakePageSource(Enumerable.Range(1, 25).Select(Row).ToArray(), total: 200_000, next: 25);
@@ -164,6 +203,22 @@ public sealed class CreateJobWizardViewModelTests
         var request = Assert.Single(source.Requests);
         Assert.InRange(request.PageSize, 1, 1_000);
         Assert.Null(request.AfterSourceRowNumber);
+    }
+
+    [Fact]
+    public async Task PageFromAnOlderImportCannotReplaceTheCurrentDraftPage()
+    {
+        var source = new DelayedPageSource();
+        var vm = new CreateJobWizardViewModel(
+            Accounts(1), source, new FakeBatchGateway(), new FakeDialogService());
+        vm.Initialize(new(Guid.NewGuid(), "旧任务", 1, false, 0, 0, 0, "/旧"));
+
+        var oldLoad = vm.LoadFirstPreviewPageAsync();
+        vm.Initialize(new(Guid.NewGuid(), "新任务", 1, false, 0, 0, 0, "/新"));
+        source.Complete(new ImportPreviewPage([Row(1)], 1, null));
+        await oldLoad;
+
+        Assert.Empty(vm.PreviewRows);
     }
 
     [Fact]
@@ -203,6 +258,68 @@ public sealed class CreateJobWizardViewModelTests
 
         Assert.Contains("本机磁盘空间不足", vm.ValidationMessage);
         Assert.DoesNotContain("StorageCapacityException", vm.ValidationMessage);
+    }
+
+    [Fact]
+    public async Task FinalConfirmationUsesServerCountsDiskEstimateAndAccountSnapshot()
+    {
+        var account = Account("A");
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                8, 9, "server-token", true,
+                [new WizardAccountConfirmation(account.AccountId, 10, 8, 7, 3, 2, 1, 4, 5, 6)],
+                12_345, 67_890),
+        };
+        var vm = Create([account], ready: 10, gateway: gateway);
+
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Equal(8, vm.ConfirmedResourceCount);
+        Assert.Equal(9, vm.ConfirmedOperationCount);
+        Assert.Equal(12_345, vm.RequiredFreeBytes);
+        Assert.Equal(67_890, vm.AvailableFreeBytes);
+        Assert.Equal(8, vm.Accounts[0].EffectiveTargetSuccessCount);
+        Assert.Equal(7, vm.Accounts[0].ReachableTargetSuccessCount);
+        Assert.Equal(2, vm.Accounts[0].ReservedSlotCount);
+    }
+
+    [Fact]
+    public async Task ModeAndExcelActionsPersistThroughDraftWorkflowBeforeChangingUiState()
+    {
+        var draftWorkflow = new FakeDraftWorkflow();
+        var vm = new CreateJobWizardViewModel(
+            Accounts(2), new FakePageSource([], 10, null), new FakeBatchGateway(),
+            new FakeDialogService(), draftWorkflow: draftWorkflow);
+        vm.Initialize(new(Guid.NewGuid(), "任务", 10, true, 0, 0, 0, "/资源"));
+
+        await vm.SelectModeAsync(TransferMode.Distribution);
+        await vm.AutoMapUniqueExcelAccountsAsync();
+        await vm.IgnoreExcelAccountsAsync();
+
+        Assert.Equal(TransferMode.Distribution, draftWorkflow.LastMode);
+        Assert.True(draftWorkflow.AutoMapCalled);
+        Assert.True(draftWorkflow.IgnoreCalled);
+        Assert.Equal(ExcelAccountHandling.IgnoreColumn, vm.ExcelAccountHandling);
+    }
+
+    [Fact]
+    public async Task PrecheckPausesAndResumesWithTheSameExplicitAccount()
+    {
+        var precheck = new FakePrecheckWorkflow();
+        var vm = new CreateJobWizardViewModel(
+            Accounts(2), new FakePageSource([], 10, null), new FakeBatchGateway(), new FakeDialogService(),
+            precheckWorkflow: precheck);
+        vm.Initialize(new(Guid.NewGuid(), "任务", 10, false, 0, 0, 0, "/资源"));
+        vm.SelectMode(TransferMode.Distribution);
+        vm.UseBulkPrecheck = true;
+        vm.PrecheckAccountId = vm.Accounts[1].AccountId;
+
+        await vm.RunPrecheckAsync();
+        await vm.RunPrecheckAsync();
+
+        Assert.Equal([vm.Accounts[1].AccountId, vm.Accounts[1].AccountId], precheck.Accounts);
+        Assert.Contains("继续", vm.PrecheckStatusMessage);
     }
 
     private static CreateJobWizardViewModel Create(
@@ -245,6 +362,10 @@ public sealed class CreateJobWizardViewModelTests
         new(Guid.NewGuid(), name, status, enabled, deleted, 2_000_000_000, 500_000_000,
             locked, exclusive, publicCandidates, unused, original, effective, reachable, fulfilled, reserved);
 
+    private static WizardAccountOption AccountWithCapacity(string name, long remaining) =>
+        new(Guid.NewGuid(), name, "Active", true, false, remaining, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0);
+
     private static ImportPreviewRow Row(int number) =>
         new(Guid.NewGuid(), number, $"https://pan.baidu.com/s/{number}", null, null, "就绪", null);
 
@@ -261,16 +382,29 @@ public sealed class CreateJobWizardViewModelTests
         }
     }
 
+    private sealed class DelayedPageSource : IImportPreviewPageSource
+    {
+        private readonly TaskCompletionSource<ImportPreviewPage> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<ImportPreviewPage> LoadAsync(ImportPreviewPageRequest request, CancellationToken cancellationToken) =>
+            completion.Task.WaitAsync(cancellationToken);
+
+        public void Complete(ImportPreviewPage page) => completion.TrySetResult(page);
+    }
+
     private sealed class FakeBatchGateway : IWizardBatchService
     {
         public int PreviewCalls { get; private set; }
         public string? ConfirmedToken { get; private set; }
         public bool ThrowDiskShortage { get; init; }
+        public WizardConfirmationSummary? Summary { get; init; }
 
         public Task<WizardConfirmationSummary> PreviewAsync(WizardBatchDraft draft, CancellationToken cancellationToken)
         {
             PreviewCalls++;
             if (ThrowDiskShortage) throw new StorageCapacityException(10, 1);
+            if (Summary is not null) return Task.FromResult(Summary);
             return Task.FromResult(new WizardConfirmationSummary(
                 draft.ReadyResourceCount,
                 draft.TransferMode == TransferMode.Replication
@@ -296,5 +430,41 @@ public sealed class CreateJobWizardViewModelTests
             Task.CompletedTask;
 
         public string? PickExcelFile() => null;
+    }
+
+    private sealed class FakeDraftWorkflow : IWizardDraftWorkflow
+    {
+        public TransferMode? LastMode { get; private set; }
+        public bool IgnoreCalled { get; private set; }
+        public bool AutoMapCalled { get; private set; }
+        public Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken)
+        {
+            LastMode = mode;
+            return Task.FromResult(new WizardDraftMutation(10, 10, 0, 0, 0, 0, 0));
+        }
+        public Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken)
+        {
+            IgnoreCalled = true;
+            return Task.FromResult(new WizardDraftMutation(10, 10, 0, 0, 0, 0, 0));
+        }
+        public Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken)
+        {
+            AutoMapCalled = true;
+            return Task.FromResult(new WizardDraftMutation(10, 10, 0, 0, 0, 0, 0, 0));
+        }
+        public Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) =>
+            Task.FromResult(new WizardDraftMutation(10, 10, 0, 0, 0, 0, 0));
+    }
+
+    private sealed class FakePrecheckWorkflow : IWizardPrecheckWorkflow
+    {
+        public List<Guid> Accounts { get; } = [];
+        public Task<WizardPrecheckResult> RunAsync(Guid sessionId, Guid accountId, CancellationToken cancellationToken)
+        {
+            Accounts.Add(accountId);
+            return Task.FromResult(new WizardPrecheckResult(
+                Accounts.Count == 1 ? WizardPrecheckStatus.PausedForVerification : WizardPrecheckStatus.Completed,
+                5));
+        }
     }
 }

@@ -1,6 +1,5 @@
 using System.Windows;
 using System.IO;
-using BaiduBatchTransfer.Infrastructure.Database;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
@@ -18,8 +17,14 @@ public partial class App : System.Windows.Application
         host = AppBootstrap.CreateHost(dataRoot);
         try
         {
-            await host.StartAsync().ConfigureAwait(true);
-            _ = await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync().ConfigureAwait(true);
+            var startup = await host.Services.GetRequiredService<AppStartupController>()
+                .StartAsync(token => host.StartAsync(token)).ConfigureAwait(true);
+            if (!startup.CoordinatorMayStart)
+            {
+                MessageBox.Show(startup.StatusMessage, "百度批量转存", MessageBoxButton.OK, MessageBoxImage.Information);
+                Shutdown();
+                return;
+            }
             MainWindow = await host.Services.GetRequiredService<IAppShellFactory>().CreateAsync().ConfigureAwait(true);
             MainWindow.Show();
         }

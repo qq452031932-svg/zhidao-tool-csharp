@@ -45,7 +45,7 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <TextBlock Text="草稿记录（仅加载当前页）" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10" />
-                <DataGrid Grid.Row="1" ItemsSource="{Binding Rows}" AutoGenerateColumns="False" IsReadOnly="True"
+                <DataGrid Grid.Row="1" ItemsSource="{Binding Rows}" SelectedItem="{Binding SelectedRow}" AutoGenerateColumns="False" IsReadOnly="True"
                           EnableRowVirtualization="True" EnableColumnVirtualization="True"
                           VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                           ScrollViewer.CanContentScroll="True">
@@ -58,10 +58,19 @@
                         <DataGridTextColumn Header="预检结果" Binding="{Binding PrecheckText}" Width="110" />
                     </DataGrid.Columns>
                 </DataGrid>
-                <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
-                    <Button Content="刷新第一页" Command="{Binding LoadFirstPageCommand}" />
-                    <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
-                    <TextBlock Text="{Binding TotalRows, StringFormat=共 {0:N0} 条}" VerticalAlignment="Center" Foreground="{StaticResource MutedBrush}" />
+                <StackPanel Grid.Row="2" Margin="0,10,0,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="110" /></Grid.ColumnDefinitions>
+                        <TextBox Text="{Binding SelectedShareUrl, UpdateSourceTrigger=PropertyChanged}" ToolTip="编辑所选记录的分享链接" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedExtractionCode, UpdateSourceTrigger=PropertyChanged}" ToolTip="编辑提取码" Margin="8,0,0,0" />
+                    </Grid>
+                    <WrapPanel Margin="0,8,0,0">
+                        <Button Content="保存所选修改" Command="{Binding SaveSelectedRowCommand}" />
+                        <Button Content="{Binding SelectedExclusionActionText}" Command="{Binding ToggleSelectedExclusionCommand}" />
+                        <Button Content="刷新第一页" Command="{Binding LoadFirstPageCommand}" />
+                        <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
+                        <TextBlock Text="{Binding TotalRows, StringFormat=共 {0:N0} 条}" VerticalAlignment="Center" Foreground="{StaticResource MutedBrush}" />
+                    </WrapPanel>
                 </StackPanel>
             </Grid>
         </Border>

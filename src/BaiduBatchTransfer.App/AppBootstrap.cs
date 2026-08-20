@@ -5,6 +5,7 @@ using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.SystemIntegration;
@@ -58,9 +59,23 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteConnectionFactory>(),
             sp.GetRequiredService<DatabaseBackupService>(),
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"));
+        services.AddSingleton<DatabaseIntegrityService>();
+        services.AddSingleton<IStartupDatabaseMaintenance, SqliteStartupDatabaseMaintenance>();
+        services.AddSingleton<SqliteTransferSchedulingStore>();
+        services.AddSingleton<IInterruptedOperationRecoveryStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IAllocationCounterStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<AllocationCounterRebuilder>();
+        services.AddSingleton<ISingleInstanceGuard>(_ =>
+            new WindowsMutexSingleInstanceGuard(@"Local\BaiduBatchTransfer.Singleton.v1"));
+        services.AddSingleton<StartupRecoveryService>();
 
         services.AddSingleton<ImportPageQuery>();
         services.AddSingleton<IImportPreviewPageSource, ImportPreviewPageSource>();
+        services.AddSingleton<TransferModeReclassificationService>();
+        services.AddSingleton<RequestedAccountMappingService>();
+        services.AddSingleton<DraftRowEditingService>();
+        services.AddSingleton<IWizardDraftWorkflow, WizardDraftWorkflow>();
+        services.AddSingleton<IWizardPrecheckWorkflow, UnavailableWizardPrecheckWorkflow>();
         services.AddSingleton<BatchDraftValidator>();
         services.AddSingleton<IDiskSpaceProbe, WindowsDiskSpaceProbe>();
         services.AddSingleton(sp => new ReplicationPreflightEstimator(
@@ -72,6 +87,9 @@ public static class AppBootstrap
         services.AddSingleton<IAdapterAvailability, UnavailableAdapterAvailability>();
         services.AddSingleton<IAccountLoginLauncher, UnavailableAccountLoginLauncher>();
         services.AddSingleton<IImportWorkflow, UnavailableImportWorkflow>();
+        services.AddSingleton<AppRuntimeState>();
+        services.AddSingleton<IAppRecoveryRunner, StartupRecoveryRunner>();
+        services.AddSingleton<AppStartupController>();
         services.AddSingleton<IDialogService, DialogService>();
         services.AddSingleton<IWizardAccountProvider, WizardAccountProvider>();
         services.AddSingleton<IAppShellFactory, AppShellFactory>();
@@ -121,15 +139,30 @@ public sealed class AppShellFactory(
     IImportWorkflow importWorkflow,
     IImportPreviewPageSource pageSource,
     IWizardBatchService batchService,
+    IWizardDraftWorkflow draftWorkflow,
+    IWizardPrecheckWorkflow precheckWorkflow,
     IDialogService dialogService,
     IAdapterAvailability adapterAvailability,
-    IAccountLoginLauncher loginLauncher) : IAppShellFactory
+    IAccountLoginLauncher loginLauncher,
+    AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
-        var accounts = await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(true);
+        var accounts = runtimeState.CoordinatorMayStart
+            ? await accountProvider.LoadEligibleAsync(cancellationToken).ConfigureAwait(true)
+            : [];
         var importViewModel = new ImportViewModel(importWorkflow, pageSource, dialogService, adapterAvailability);
-        var wizardViewModel = new CreateJobWizardViewModel(accounts, pageSource, batchService, dialogService, adapterAvailability);
+        var wizardViewModel = new CreateJobWizardViewModel(
+            accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow);
+        importViewModel.DraftReady += (_, draft) => wizardViewModel.Initialize(new ImportWizardContext(
+            draft.SessionId,
+            $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
+            draft.Statistics.Ready,
+            draft.Statistics.HasExcelAccountColumn,
+            draft.Statistics.UnresolvedAccountMappings,
+            draft.Statistics.Conflict,
+            draft.Statistics.NeedsResolution,
+            "/我的资源"));
         var importView = new ImportView(importViewModel);
         var wizardView = new CreateJobWizardView(wizardViewModel);
         var mainViewModel = new MainWindowViewModel(importView, wizardView, loginLauncher);
