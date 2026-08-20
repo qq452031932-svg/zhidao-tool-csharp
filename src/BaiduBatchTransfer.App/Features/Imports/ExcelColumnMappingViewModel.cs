@@ -149,6 +149,10 @@ public sealed record ExcelColumnRoleOption(TabularImportColumnRole Role, string 
         new(TabularImportColumnRole.SourceTitle, "源标题"),
         new(TabularImportColumnRole.ShareUrl, "分享链接（必选）"),
         new(TabularImportColumnRole.ExtractionCode, "提取码"),
+        new(TabularImportColumnRole.TargetPath, "目标目录"),
+        new(TabularImportColumnRole.OuterFolderName, "外层目录"),
+        new(TabularImportColumnRole.RequestedAccountName, "指定账号"),
+        new(TabularImportColumnRole.Note, "备注"),
     ];
 }
 

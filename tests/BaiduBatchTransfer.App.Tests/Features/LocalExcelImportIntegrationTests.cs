@@ -20,6 +20,44 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
         Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public async Task GeneratedTemplatePreservesOperationalFieldsAndRawCellsThroughConfirmedStaging()
+    {
+        Directory.CreateDirectory(root);
+        var workbookPath = Path.Combine(root, "generated-template.xlsx");
+        await using (var output = File.Create(workbookPath))
+            await new OpenXmlTemplateWriter().WriteAsync(output);
+        AppendTemplateRow(
+            workbookPath,
+            ["  源标题  ", "https://pan.baidu.com/s/template", " a1B2 ", " /课程 ", " 外层 ", " 账号甲 ", " 备注文本 "]);
+        var presenter = new ConfirmingMappingPresenter();
+        using var host = AppBootstrap.CreateHost(root, services =>
+            services.AddSingleton<IExcelColumnMappingPresenter>(presenter));
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sessionId = Guid.NewGuid();
+
+        await host.Services.GetRequiredService<IImportWorkflow>()
+            .ImportExcelAsync(sessionId, workbookPath, CancellationToken.None);
+
+        await using var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync();
+        var definitions = await unit.Imports.GetColumnDefinitionsAsync(sessionId);
+        Assert.Equal(
+            new[] { "Title", "ShareUrl", "ExtractionCode", "TargetPath", "OuterFolderName", "RequestedAccountName", "Note" },
+            definitions.Select(definition => definition.MappedRole));
+        var row = Assert.Single((await unit.Imports.GetRowsPageAsync(new(sessionId, null, 1, 10))).Items);
+        Assert.Equal("a1B2", row.ExtractionCode);
+        Assert.Equal("/课程", row.TargetPath);
+        Assert.Equal("外层", row.CreateFolderName);
+        Assert.Equal("账号甲", row.RequestedAccountName);
+        Assert.Equal("备注文本", row.Note);
+        var payload = await unit.Imports.GetRowPayloadAsync(row.Id);
+        Assert.NotNull(payload);
+        Assert.Equal("源标题", payload.SourceTitle);
+        Assert.Equal(
+            new[] { "  源标题  ", "https://pan.baidu.com/s/template", " a1B2 ", " /课程 ", " 外层 ", " 账号甲 ", " 备注文本 " },
+            System.Text.Json.JsonSerializer.Deserialize<string[]>(payload.RawValuesJson));
+    }
+
+    [Fact]
     public async Task RealWorkbookImportsThroughTheMigratedHostWhileTransfersStayUnavailable()
     {
         Directory.CreateDirectory(root);
@@ -269,6 +307,21 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
             CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public string? PickExcelFile() => selectedPath;
+    }
+
+    private static void AppendTemplateRow(string path, IReadOnlyList<string> values)
+    {
+        using var document = SpreadsheetDocument.Open(path, true);
+        var workbookPart = document.WorkbookPart!;
+        var worksheet = workbookPart.WorksheetParts.Single().Worksheet!;
+        var sheetData = worksheet.GetFirstChild<SheetData>()!;
+        var row = new Row { RowIndex = 2 };
+        foreach (var value in values)
+            row.Append(new Cell(new InlineString(new Text(value) { Space = SpaceProcessingModeValues.Preserve }))
+                { DataType = CellValues.InlineString });
+        sheetData.Append(row);
+        worksheet.Save();
+        workbookPart.Workbook!.Save();
     }
 
     private sealed class ConfirmingMappingPresenter : IExcelColumnMappingPresenter

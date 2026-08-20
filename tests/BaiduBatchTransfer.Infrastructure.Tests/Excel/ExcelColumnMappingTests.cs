@@ -15,20 +15,26 @@ public sealed class ExcelColumnMappingTests : IDisposable
     public async Task InspectorAndSuggestionsRecognizeKnownHeaders()
     {
         var path = WriteWorkbook(
-            ["源标题", "分享链接", "提取码", "自定义字段"],
-            [["课程一", "https://pan.baidu.com/s/known", " a1B2 ", "保留"]]);
+            ["源标题", "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注", "自定义字段"],
+            [["课程一", "https://pan.baidu.com/s/known", " a1B2 ", " /课程 ", " 外层 ", " 账号甲 ", " 备注文本 ", "保留"]]);
 
         await using var stream = File.OpenRead(path);
         var inspection = await new OpenXmlWorkbookInspector().InspectAsync(stream);
         var suggestion = new ExcelColumnSuggestionEngine().Suggest(inspection);
 
         Assert.Equal(1, inspection.HeaderRowNumber);
-        Assert.Equal(new[] { "源标题", "分享链接", "提取码", "自定义字段" }, inspection.Columns.Select(x => x.Header));
+        Assert.Equal(
+            new[] { "源标题", "分享链接", "提取码", "目标目录", "外层目录", "指定账号", "备注", "自定义字段" },
+            inspection.Columns.Select(x => x.Header));
         Assert.Equal(2, Assert.Single(inspection.SampleRows).SourceRowNumber);
         Assert.Equal(TabularImportColumnRole.SourceTitle, Role(suggestion, 0));
         Assert.Equal(TabularImportColumnRole.ShareUrl, Role(suggestion, 1));
         Assert.Equal(TabularImportColumnRole.ExtractionCode, Role(suggestion, 2));
-        Assert.Equal(TabularImportColumnRole.Preserve, Role(suggestion, 3));
+        Assert.Equal(TabularImportColumnRole.TargetPath, Role(suggestion, 3));
+        Assert.Equal(TabularImportColumnRole.OuterFolderName, Role(suggestion, 4));
+        Assert.Equal(TabularImportColumnRole.RequestedAccountName, Role(suggestion, 5));
+        Assert.Equal(TabularImportColumnRole.Note, Role(suggestion, 6));
+        Assert.Equal(TabularImportColumnRole.Preserve, Role(suggestion, 7));
     }
 
     [Fact]
@@ -227,6 +233,36 @@ public sealed class ExcelColumnMappingTests : IDisposable
         Assert.Null(row.SourceTitle);
         Assert.Null(row.ExtractionCode);
         Assert.Equal(new[] { "https://evil.example", " 说明 https://pan.baidu.com/s/remapped。 ", "=RAW()" }, row.RawValues);
+    }
+
+    [Fact]
+    public async Task ReaderHydratesLegacyOperationalFieldsOnlyFromConfirmedRoles()
+    {
+        var path = WriteWorkbook(
+            ["链接", "提取码", "目标目录", "外层目录", "指定账号", "备注", "保留"],
+            [["https://pan.baidu.com/s/legacy", " a1B2 ", " /课程 ", " 外层 ", " 账号甲 ", " 备注文本 ", "  原样  "]]);
+        var mapping = new ConfirmedImportColumnMapping(1,
+        [
+            new(0, TabularImportColumnRole.ShareUrl),
+            new(1, TabularImportColumnRole.ExtractionCode),
+            new(2, TabularImportColumnRole.TargetPath),
+            new(3, TabularImportColumnRole.OuterFolderName),
+            new(4, TabularImportColumnRole.RequestedAccountName),
+            new(5, TabularImportColumnRole.Note),
+            new(6, TabularImportColumnRole.Preserve),
+        ]);
+
+        await using var stream = File.OpenRead(path);
+        var row = Assert.Single(await ReadAllAsync(new OpenXmlImportReader().ReadAsync(stream, mapping)));
+
+        Assert.Equal("a1B2", row.ExtractionCode);
+        Assert.Equal("/课程", row.TargetPath);
+        Assert.Equal("外层", row.CreateFolderName);
+        Assert.Equal("账号甲", row.RequestedAccountName);
+        Assert.Equal("备注文本", row.Note);
+        Assert.Equal(
+            new[] { "https://pan.baidu.com/s/legacy", " a1B2 ", " /课程 ", " 外层 ", " 账号甲 ", " 备注文本 ", "  原样  " },
+            row.RawValues);
     }
 
     [Fact]

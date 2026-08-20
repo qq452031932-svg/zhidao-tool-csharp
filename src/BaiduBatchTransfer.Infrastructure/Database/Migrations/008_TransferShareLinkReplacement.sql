@@ -12,7 +12,8 @@ CREATE TABLE ImportColumnDefinitions (
     ImportSessionId TEXT NOT NULL,
     ColumnOrdinal INTEGER NOT NULL CHECK(typeof(ColumnOrdinal)='integer' AND ColumnOrdinal >= 0),
     SourceHeader TEXT NULL,
-    MappedRole TEXT NOT NULL CHECK(MappedRole IN ('ShareUrl','Title','ExtractionCode','Preserve')),
+    MappedRole TEXT NOT NULL CHECK(MappedRole IN (
+      'ShareUrl','Title','ExtractionCode','TargetPath','OuterFolderName','RequestedAccountName','Note','Preserve')),
     IsRequired INTEGER NOT NULL CHECK(IsRequired IN (0,1)),
     PRIMARY KEY(ImportSessionId, ColumnOrdinal),
     FOREIGN KEY(ImportSessionId) REFERENCES ImportSessions(Id) ON DELETE CASCADE,

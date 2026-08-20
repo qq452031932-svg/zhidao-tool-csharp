@@ -10,6 +10,10 @@ public enum TabularImportColumnRole
     SourceTitle,
     ShareUrl,
     ExtractionCode,
+    TargetPath,
+    OuterFolderName,
+    RequestedAccountName,
+    Note,
 }
 
 public sealed record TabularImportColumnMapping
@@ -141,9 +145,17 @@ public sealed record ConfirmedImportColumnMapping
         }
         if (ordered.Count(column => column.Role == TabularImportColumnRole.ShareUrl) != 1)
             throw new ArgumentException("Exactly one share-link column must be confirmed.", nameof(columns));
-        if (ordered.Count(column => column.Role == TabularImportColumnRole.SourceTitle) > 1 ||
-            ordered.Count(column => column.Role == TabularImportColumnRole.ExtractionCode) > 1)
-            throw new ArgumentException("Title and extraction-code mappings are optional but cannot be repeated.", nameof(columns));
+        var optionalRoles = new[]
+        {
+            TabularImportColumnRole.SourceTitle,
+            TabularImportColumnRole.ExtractionCode,
+            TabularImportColumnRole.TargetPath,
+            TabularImportColumnRole.OuterFolderName,
+            TabularImportColumnRole.RequestedAccountName,
+            TabularImportColumnRole.Note,
+        };
+        if (optionalRoles.Any(role => ordered.Count(column => column.Role == role) > 1))
+            throw new ArgumentException("Optional operational mappings cannot be repeated.", nameof(columns));
 
         HeaderRowNumber = headerRowNumber;
         Columns = ordered;
@@ -174,6 +186,14 @@ public sealed record ConfirmedImportColumnMapping
     public int? SourceTitleColumnIndex => FindOptional(TabularImportColumnRole.SourceTitle);
 
     public int? ExtractionCodeColumnIndex => FindOptional(TabularImportColumnRole.ExtractionCode);
+
+    public int? TargetPathColumnIndex => FindOptional(TabularImportColumnRole.TargetPath);
+
+    public int? OuterFolderNameColumnIndex => FindOptional(TabularImportColumnRole.OuterFolderName);
+
+    public int? RequestedAccountNameColumnIndex => FindOptional(TabularImportColumnRole.RequestedAccountName);
+
+    public int? NoteColumnIndex => FindOptional(TabularImportColumnRole.Note);
 
     public override string ToString() =>
         $"ConfirmedImportColumnMapping {{ HasHeader = {HeaderRowNumber is not null}, ColumnCount = {Columns.Count}, Fingerprint = {Fingerprint} }}";

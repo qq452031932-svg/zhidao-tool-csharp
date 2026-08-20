@@ -177,6 +177,10 @@ public sealed class OpenXmlImportReader
                     sourceRowNumber,
                     shareUrl ?? string.Empty,
                     extractionCode,
+                    NormalizeOptional(mapping.TargetPathColumnIndex is int targetColumn ? Get(rawValues, targetColumn) : null),
+                    NormalizeOptional(mapping.OuterFolderNameColumnIndex is int folderColumn ? Get(rawValues, folderColumn) : null),
+                    NormalizeOptional(mapping.RequestedAccountNameColumnIndex is int accountColumn ? Get(rawValues, accountColumn) : null),
+                    Note: NormalizeOptional(mapping.NoteColumnIndex is int noteColumn ? Get(rawValues, noteColumn) : null),
                     ValidationError: shareUrl is null ? "The mapped share-link cell does not contain a supported Baidu URL." : null,
                     SourceTitle: mapping.SourceTitleColumnIndex is int titleColumn ? Get(rawValues, titleColumn) : null,
                     OriginalExtractedUrl: originalExtractedUrl,
@@ -188,6 +192,9 @@ public sealed class OpenXmlImportReader
 
     private static string Get(IReadOnlyList<string> values, int index) =>
         index < values.Count ? values[index] : string.Empty;
+
+    private static string? NormalizeOptional(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     internal static IReadOnlyList<string> ToOrderedValues(IReadOnlyDictionary<int, string> values, int width)
     {

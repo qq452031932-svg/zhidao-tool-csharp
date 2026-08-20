@@ -298,7 +298,9 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             throw new ArgumentException("Exactly one ShareUrl column is required.", nameof(definitions));
         if (values.Any(value => value.ImportSessionId != sessionId || value.ColumnOrdinal < 0))
             throw new ArgumentException("Every column definition must belong to the import session and use a nonnegative ordinal.", nameof(definitions));
-        var allowed = new HashSet<string>(["ShareUrl", "Title", "ExtractionCode", "Preserve"], StringComparer.Ordinal);
+        var allowed = new HashSet<string>(
+            ["ShareUrl", "Title", "ExtractionCode", "TargetPath", "OuterFolderName", "RequestedAccountName", "Note", "Preserve"],
+            StringComparer.Ordinal);
         if (values.Any(value => !allowed.Contains(value.MappedRole) || value.IsRequired != (value.MappedRole == "ShareUrl")) ||
             values.Select(value => value.ColumnOrdinal).Distinct().Count() != values.Length ||
             values.Where(value => value.MappedRole != "Preserve").GroupBy(value => value.MappedRole).Any(group => group.Count() > 1))

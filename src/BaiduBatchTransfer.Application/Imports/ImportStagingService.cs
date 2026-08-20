@@ -663,6 +663,10 @@ public sealed class ImportStagingService
         TabularImportColumnRole.SourceTitle => "Title",
         TabularImportColumnRole.ShareUrl => "ShareUrl",
         TabularImportColumnRole.ExtractionCode => "ExtractionCode",
+        TabularImportColumnRole.TargetPath => "TargetPath",
+        TabularImportColumnRole.OuterFolderName => "OuterFolderName",
+        TabularImportColumnRole.RequestedAccountName => "RequestedAccountName",
+        TabularImportColumnRole.Note => "Note",
         _ => throw new ArgumentOutOfRangeException(nameof(role)),
     };
 
@@ -682,8 +686,15 @@ public sealed class ImportStagingService
             mapping.SourceColumns.Count != mapping.SourceColumnCount ||
             mapping.Columns.Any(column => !Enum.IsDefined(column.Role)) ||
             mapping.Columns.Count(column => column.Role == TabularImportColumnRole.ShareUrl) != 1 ||
-            mapping.Columns.Count(column => column.Role == TabularImportColumnRole.SourceTitle) > 1 ||
-            mapping.Columns.Count(column => column.Role == TabularImportColumnRole.ExtractionCode) > 1)
+            new[]
+            {
+                TabularImportColumnRole.SourceTitle,
+                TabularImportColumnRole.ExtractionCode,
+                TabularImportColumnRole.TargetPath,
+                TabularImportColumnRole.OuterFolderName,
+                TabularImportColumnRole.RequestedAccountName,
+                TabularImportColumnRole.Note,
+            }.Any(role => mapping.Columns.Count(column => column.Role == role) > 1))
         {
             throw new ArgumentException("The confirmed Excel mapping is invalid.", nameof(request));
         }

@@ -10,6 +10,10 @@ public sealed class ExcelColumnSuggestionEngine
         "源标题", "标题", "名称", "资源名称", "source title", "title", "name",
         "分享链接", "原分享链接", "链接", "share url", "share link", "url", "link",
         "提取码", "访问码", "extraction code", "code",
+        "目标目录", "目标路径", "target path",
+        "外层目录", "创建目录名称", "outer folder",
+        "指定账号", "账号", "account",
+        "备注", "note",
     };
 
     private static readonly HashSet<string> LinkHeaders = new(StringComparer.OrdinalIgnoreCase)
@@ -27,6 +31,26 @@ public sealed class ExcelColumnSuggestionEngine
         "提取码", "访问码", "extraction code", "code",
     };
 
+    private static readonly HashSet<string> TargetPathHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "目标目录", "目标路径", "target path",
+    };
+
+    private static readonly HashSet<string> OuterFolderHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "外层目录", "创建目录名称", "outer folder",
+    };
+
+    private static readonly HashSet<string> AccountHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "指定账号", "账号", "account",
+    };
+
+    private static readonly HashSet<string> NoteHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "备注", "note",
+    };
+
     private readonly BaiduShareUrlExtractor extractor = new();
 
     public ImportColumnMappingSuggestion Suggest(TabularWorkbookInspection inspection)
@@ -35,11 +59,19 @@ public sealed class ExcelColumnSuggestionEngine
         var linkColumn = FindLinkColumn(inspection);
         var titleColumn = linkColumn is null ? null : FindTitleColumn(inspection, linkColumn.Value);
         var codeColumn = FindHeaderColumn(inspection, CodeHeaders, excluded: linkColumn);
+        var targetPathColumn = FindHeaderColumn(inspection, TargetPathHeaders, excluded: linkColumn);
+        var outerFolderColumn = FindHeaderColumn(inspection, OuterFolderHeaders, excluded: linkColumn);
+        var accountColumn = FindHeaderColumn(inspection, AccountHeaders, excluded: linkColumn);
+        var noteColumn = FindHeaderColumn(inspection, NoteHeaders, excluded: linkColumn);
         var columns = inspection.Columns.Select(column => new TabularImportColumnMapping(
             column.SourceColumnIndex,
             column.SourceColumnIndex == linkColumn ? TabularImportColumnRole.ShareUrl :
             column.SourceColumnIndex == titleColumn ? TabularImportColumnRole.SourceTitle :
             column.SourceColumnIndex == codeColumn ? TabularImportColumnRole.ExtractionCode :
+            column.SourceColumnIndex == targetPathColumn ? TabularImportColumnRole.TargetPath :
+            column.SourceColumnIndex == outerFolderColumn ? TabularImportColumnRole.OuterFolderName :
+            column.SourceColumnIndex == accountColumn ? TabularImportColumnRole.RequestedAccountName :
+            column.SourceColumnIndex == noteColumn ? TabularImportColumnRole.Note :
             TabularImportColumnRole.Preserve));
         return new ImportColumnMappingSuggestion(inspection.HeaderRowNumber, columns);
     }
