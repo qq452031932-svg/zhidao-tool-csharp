@@ -6,6 +6,34 @@ namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
 {
+    internal const string ExpiredBatchSelectSql = """
+        SELECT batch.Id FROM BatchJobs batch
+        WHERE batch.Status='Active' AND EXISTS(
+          SELECT 1 FROM ShareOperations candidate
+          WHERE candidate.BatchJobId=batch.Id AND candidate.Status='Reserved'
+            AND candidate.LeaseExpiresAt IS NOT NULL AND candidate.LeaseExpiresAt<=$now
+            AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+              WHERE settings.BatchJobId=candidate.BatchJobId
+                AND settings.SettingsFingerprint=candidate.SettingsFingerprint)
+            AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
+              WHERE output.BatchJobId=candidate.BatchJobId AND output.AccountId=candidate.AccountId
+                AND output.OutputOrdinal=candidate.OutputOrdinal AND output.ShareEnabled=1))
+        ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
+        """;
+
+    internal const string ExpiredOperationSelectSql = """
+        SELECT operation.Id FROM ShareOperations operation
+        WHERE operation.BatchJobId=$batch AND operation.Status='Reserved'
+          AND operation.LeaseExpiresAt IS NOT NULL AND operation.LeaseExpiresAt<=$now
+          AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+            WHERE settings.BatchJobId=operation.BatchJobId
+              AND settings.SettingsFingerprint=operation.SettingsFingerprint)
+          AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
+            WHERE output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId
+              AND output.OutputOrdinal=operation.OutputOrdinal AND output.ShareEnabled=1)
+        ORDER BY operation.LeaseExpiresAt,operation.OutputOrdinal,operation.Id LIMIT 1;
+        """;
+
     private readonly SqliteConnectionFactory factory;
 
     public SqliteShareSchedulingStore(SqliteConnectionFactory factory) =>
@@ -23,16 +51,28 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         {
             async Task<string?> SelectAsync(string status, bool expired)
             {
-                var candidateLeasePredicate = expired
-                    ? "candidate.LeaseExpiresAt IS NOT NULL AND julianday(candidate.LeaseExpiresAt)<=julianday($now)"
-                    : "candidate.LeaseExpiresAt IS NULL";
+                if (expired)
+                {
+                    string? expiredBatchId;
+                    await using (var selectBatch = Command(connection, transaction, ExpiredBatchSelectSql))
+                    {
+                        Add(selectBatch,"$now",Time(now));
+                        expiredBatchId = Convert.ToString(await selectBatch.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+                    }
+                    if (string.IsNullOrEmpty(expiredBatchId)) return null;
+                    await using var selectOperation = Command(connection, transaction, ExpiredOperationSelectSql);
+                    Add(selectOperation,"$batch",expiredBatchId); Add(selectOperation,"$now",Time(now));
+                    var expiredId = Convert.ToString(await selectOperation.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+                    return string.IsNullOrEmpty(expiredId) ? null : expiredId;
+                }
+
                 string? batchId;
                 await using (var selectBatch = Command(connection, transaction, $"""
                     SELECT batch.Id FROM BatchJobs batch
                     WHERE batch.Status='Active' AND EXISTS(
                       SELECT 1 FROM ShareOperations candidate
                       WHERE candidate.BatchJobId=batch.Id AND candidate.Status=$status
-                        AND {candidateLeasePredicate}
+                        AND candidate.LeaseExpiresAt IS NULL
                         AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                           WHERE settings.BatchJobId=candidate.BatchJobId
                             AND settings.SettingsFingerprint=candidate.SettingsFingerprint)
@@ -42,20 +82,14 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                     ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
                     """))
                 {
-                    Add(selectBatch,"$status",status); Add(selectBatch,"$now",Time(now));
+                    Add(selectBatch,"$status",status);
                     batchId = Convert.ToString(await selectBatch.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
                 }
                 if (string.IsNullOrEmpty(batchId)) return null;
 
-                var operationLeasePredicate = expired
-                    ? "operation.LeaseExpiresAt IS NOT NULL AND julianday(operation.LeaseExpiresAt)<=julianday($now)"
-                    : "operation.LeaseExpiresAt IS NULL";
-                var operationIndexHint = expired
-                    ? "INDEXED BY IX_ShareOperations_Batch_Status_Output_Id_Lease"
-                    : string.Empty;
                 await using var select = Command(connection, transaction, $"""
-                    SELECT operation.Id FROM ShareOperations operation {operationIndexHint}
-                    WHERE operation.BatchJobId=$batch AND operation.Status=$status AND {operationLeasePredicate}
+                    SELECT operation.Id FROM ShareOperations operation
+                    WHERE operation.BatchJobId=$batch AND operation.Status=$status AND operation.LeaseExpiresAt IS NULL
                       AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                         WHERE settings.BatchJobId=operation.BatchJobId
                           AND settings.SettingsFingerprint=operation.SettingsFingerprint)
@@ -64,7 +98,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                           AND output.OutputOrdinal=operation.OutputOrdinal AND output.ShareEnabled=1)
                     ORDER BY operation.OutputOrdinal,operation.Id LIMIT 1;
                     """);
-                Add(select,"$batch",batchId); Add(select,"$status",status); Add(select,"$now",Time(now));
+                Add(select,"$batch",batchId); Add(select,"$status",status);
                 var selected = Convert.ToString(await select.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
                 return string.IsNullOrEmpty(selected) ? null : selected;
             }
@@ -80,8 +114,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 UPDATE ShareOperations SET Status='Reserved',LeaseGeneration=LeaseGeneration+1,
                   LeaseExpiresAt=$lease,UpdatedAt=$now
                 WHERE Id=$id AND (
-                  (Status='WaitingShare' AND (LeaseExpiresAt IS NULL OR julianday(LeaseExpiresAt)<=julianday($now)))
-                  OR (Status='Reserved' AND LeaseExpiresAt IS NOT NULL AND julianday(LeaseExpiresAt)<=julianday($now)))
+                  (Status='WaitingShare' AND LeaseExpiresAt IS NULL)
+                  OR (Status='Reserved' AND LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt<=$now))
                   AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                     WHERE settings.BatchJobId=ShareOperations.BatchJobId
                       AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
@@ -379,7 +413,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         return value;
     }
 
-    public async Task SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default)
+    public async Task<bool> SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         if (string.IsNullOrWhiteSpace(snapshot.SettingsFingerprint) ||
@@ -393,7 +427,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         try
         {
             await using var command = Command(connection,transaction,"""
-                INSERT INTO BatchShareDecisionSnapshots(BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,
+                INSERT OR IGNORE INTO BatchShareDecisionSnapshots(BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,
                   CompatibleCount,IncompatibleCount,Generation,ConfirmedAt,DiscoveryVersion)
                 SELECT discovery.BatchJobId,discovery.AccountId,discovery.SettingsFingerprint,$decision,
                   discovery.DiscoveryFingerprint,discovery.DiscoveredCount,discovery.CompatibleCount,
@@ -412,9 +446,13 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             Add(command,"$incompatible",snapshot.IncompatibleCount); Add(command,"$generation",snapshot.Generation);
             Add(command,"$confirmed",Time(snapshot.ConfirmedAt));
             Add(command,"$version",snapshot.DiscoveryVersion);
-            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                throw new InvalidOperationException("Sharing is not enabled for this confirmed batch.");
+            var inserted = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            var persisted = inserted
+                ? snapshot with { ConfirmedAt = snapshot.ConfirmedAt.ToUniversalTime() }
+                : await GetDecisionSnapshotAsync(
+                    connection, transaction, snapshot.BatchJobId, snapshot.AccountId, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return persisted == snapshot with { ConfirmedAt = snapshot.ConfirmedAt.ToUniversalTime() };
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
     }
@@ -424,12 +462,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred:true);
-        await using var command = Command(connection,transaction,"SELECT BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,ConfirmedAt,DiscoveryVersion FROM BatchShareDecisionSnapshots WHERE BatchJobId=$batch AND AccountId=$account;");
-        Add(command,"$batch",Id(batchJobId)); Add(command,"$account",Id(accountId));
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        var value = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new BatchShareDecisionSnapshotRecord(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetInt32(5),reader.GetInt32(6),reader.GetInt32(7),reader.GetString(8),ReadTime(reader,9),reader.GetInt64(10))
-            : null;
+        var value = await GetDecisionSnapshotAsync(
+            connection, transaction, batchJobId, accountId, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return value;
     }
@@ -539,16 +573,16 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         ArgumentNullException.ThrowIfNull(query); query.Validate();
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred:true);
-        await using var command = Command(connection,transaction,ResultColumns+",resource.CandidateSequence FROM BaiduShareResults JOIN ResourceItems resource ON resource.Id=BaiduShareResults.ResourceItemId WHERE BaiduShareResults.BatchJobId=$batch AND BaiduShareResults.IsAccepted=1 AND BaiduShareResults.IsCurrent=1 AND (resource.CandidateSequence>$afterSequence OR (resource.CandidateSequence=$afterSequence AND (BaiduShareResults.AccountId>$afterAccount OR (BaiduShareResults.AccountId=$afterAccount AND BaiduShareResults.Id>$afterResult)))) ORDER BY resource.CandidateSequence,BaiduShareResults.AccountId,BaiduShareResults.Id LIMIT $limit;");
+        await using var command = Command(connection,transaction,ResultColumns+",resource.CandidateSequence,output.OutputOrdinal FROM BaiduShareResults JOIN ResourceItems resource ON resource.Id=BaiduShareResults.ResourceItemId JOIN BatchOutputAccounts output ON output.BatchJobId=BaiduShareResults.BatchJobId AND output.AccountId=BaiduShareResults.AccountId WHERE BaiduShareResults.BatchJobId=$batch AND BaiduShareResults.IsAccepted=1 AND BaiduShareResults.IsCurrent=1 AND (resource.CandidateSequence>$afterSequence OR (resource.CandidateSequence=$afterSequence AND (output.OutputOrdinal>$afterOutput OR (output.OutputOrdinal=$afterOutput AND BaiduShareResults.Id>$afterResult)))) ORDER BY resource.CandidateSequence,output.OutputOrdinal,BaiduShareResults.Id LIMIT $limit;");
         Add(command,"$batch",Id(query.BatchJobId)); Add(command,"$afterSequence",query.After?.CandidateSequence??0L);
-        Add(command,"$afterAccount",query.After is null?string.Empty:Id(query.After.AccountId));
+        Add(command,"$afterOutput",query.After?.OutputOrdinal??0);
         Add(command,"$afterResult",query.After is null?string.Empty:Id(query.After.ResultId)); Add(command,"$limit",checked(query.PageSize+1));
-        var values = new List<(BaiduShareResultRecord Result,long Cursor)>(query.PageSize+1);
+        var values = new List<(BaiduShareResultRecord Result,long Sequence,int OutputOrdinal)>(query.PageSize+1);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add((ReadResult(reader),reader.GetInt64(15)));
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add((ReadResult(reader),reader.GetInt64(15),reader.GetInt32(16)));
         var more=values.Count>query.PageSize; if(more)values.RemoveAt(values.Count-1);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new(values.Select(value=>value.Result).ToArray(),more?new(values[^1].Cursor,values[^1].Result.AccountId,values[^1].Result.Id):null);
+        return new(values.Select(value=>value.Result).ToArray(),more?new(values[^1].Sequence,values[^1].OutputOrdinal,values[^1].Result.Id):null);
     }
 
     private const string ResultColumns = "SELECT BaiduShareResults.Id,BaiduShareResults.ShareOperationId,BaiduShareResults.BatchJobId,BaiduShareResults.ResourceItemId,BaiduShareResults.AccountId,BaiduShareResults.ExactItemSetFingerprint,BaiduShareResults.SettingsFingerprint,BaiduShareResults.Generation,BaiduShareResults.ShareId,BaiduShareResults.ShareUrl,BaiduShareResults.ExtractionCode,BaiduShareResults.IsAccepted,BaiduShareResults.IsCurrent,BaiduShareResults.SharedAt,BaiduShareResults.UpdatedAt";
@@ -637,6 +671,21 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
             ? new(Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), reader.GetString(2),
                 reader.GetString(3), reader.GetInt32(4), reader.GetInt32(5), reader.GetInt32(6),
                 reader.GetString(7), ReadTime(reader, 8), reader.GetInt64(9))
+            : null;
+    }
+
+    private static async Task<BatchShareDecisionSnapshotRecord?> GetDecisionSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        Guid accountId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection,transaction,"SELECT BatchJobId,AccountId,SettingsFingerprint,Decision,DiscoveryFingerprint,DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,ConfirmedAt,DiscoveryVersion FROM BatchShareDecisionSnapshots WHERE BatchJobId=$batch AND AccountId=$account;");
+        Add(command,"$batch",Id(batchJobId)); Add(command,"$account",Id(accountId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new BatchShareDecisionSnapshotRecord(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetString(2),reader.GetString(3),reader.GetString(4),reader.GetInt32(5),reader.GetInt32(6),reader.GetInt32(7),reader.GetString(8),ReadTime(reader,9),reader.GetInt64(10))
             : null;
     }
 

@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
+using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.Infrastructure.Database.Repositories;
 
@@ -445,80 +446,109 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         ArgumentNullException.ThrowIfNull(operations);
         ArgumentNullException.ThrowIfNull(remoteItems);
         var operationSnapshot = TakeBounded(operations, 500, nameof(operations));
-        var itemSnapshot = TakeBounded(remoteItems, 1000, nameof(remoteItems));
-        var itemsByOperation = ValidateExactRemoteItems(operationSnapshot, itemSnapshot);
+        var itemCounts = ValidateShareOperations(operationSnapshot);
         await ValidateShareOutputsAsync(operationSnapshot, cancellationToken).ConfigureAwait(false);
-        await using (var command = Command("""
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
-              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
-              LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
-            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$settings,$generation,$descriptor,$request,
-              $acceptance,$attempts,$leaseGeneration,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
-            """))
+        await ExecuteControlAsync("SAVEPOINT add_share_operations;", cancellationToken).ConfigureAwait(false);
+        try
         {
-            var prepared = false;
-            foreach (var value in operationSnapshot)
+            await using (var command = Command("""
+                INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
+                  LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$settings,$generation,$descriptor,$request,
+                  $acceptance,$attempts,$leaseGeneration,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
+                """))
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                BindShareOperation(command, value, add: !prepared);
-                if (!prepared)
+                var prepared = false;
+                foreach (var value in operationSnapshot)
                 {
-                    command.Prepare();
-                    prepared = true;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    BindShareOperation(command, value, add: !prepared);
+                    if (!prepared)
+                    {
+                        command.Prepare();
+                        prepared = true;
+                    }
+                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
+
+            await using (var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName) VALUES($operation,$ordinal,$remote,$name);"))
+            {
+                var itemPrepared = false;
+                foreach (var value in remoteItems)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!itemCounts.TryGetValue(value.ShareOperationId, out var count))
+                        throw new ArgumentException("Every exact remote item must belong to the supplied share operations.", nameof(remoteItems));
+                    Bind(item,"$operation",Id(value.ShareOperationId),!itemPrepared);
+                    Bind(item,"$ordinal",value.ItemOrdinal,!itemPrepared);
+                    Bind(item,"$remote",value.RemoteItemId,!itemPrepared);
+                    Bind(item,"$name",value.DisplayName,!itemPrepared);
+                    if (!itemPrepared)
+                    {
+                        item.Prepare();
+                        itemPrepared = true;
+                    }
+                    await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    itemCounts[value.ShareOperationId] = checked(count + 1);
+                }
+            }
+
+            foreach (var operation in operationSnapshot)
+            {
+                var count = itemCounts[operation.Id];
+                if (count == 0 || !await HasContiguousItemOrdinalsAsync(operation.Id, count, cancellationToken).ConfigureAwait(false))
+                    throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", nameof(remoteItems));
+                var fingerprint = await RemoteItemIdentitySet.ComputeFingerprintFromCanonicalOrderAsync(
+                    ReadExactRemoteItemIdsAsync(operation.Id, cancellationToken), cancellationToken).ConfigureAwait(false);
+                if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
+                    throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
+            }
+            await ExecuteControlAsync("RELEASE SAVEPOINT add_share_operations;", cancellationToken).ConfigureAwait(false);
         }
-        await using var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,DisplayName) VALUES($operation,$ordinal,$remote,$name);");
-        var itemPrepared = false;
-        foreach (var operation in operationSnapshot)
+        catch
         {
-            foreach (var value in itemsByOperation[operation.Id])
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                Bind(item,"$operation",Id(value.ShareOperationId),!itemPrepared);
-                Bind(item,"$ordinal",value.ItemOrdinal,!itemPrepared);
-                Bind(item,"$remote",value.RemoteItemId,!itemPrepared);
-                Bind(item,"$name",value.DisplayName,!itemPrepared);
-                if (!itemPrepared)
-                {
-                    item.Prepare();
-                    itemPrepared = true;
-                }
-                await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
+            await ExecuteControlAsync("ROLLBACK TO SAVEPOINT add_share_operations;", CancellationToken.None).ConfigureAwait(false);
+            await ExecuteControlAsync("RELEASE SAVEPOINT add_share_operations;", CancellationToken.None).ConfigureAwait(false);
+            throw;
         }
     }
 
-    private static IReadOnlyDictionary<Guid, ShareOperationRemoteItemRecord[]> ValidateExactRemoteItems(
-        IReadOnlyList<ShareOperationRecord> operations,
-        IReadOnlyList<ShareOperationRemoteItemRecord> remoteItems)
+    private static Dictionary<Guid, int> ValidateShareOperations(IReadOnlyList<ShareOperationRecord> operations)
     {
-        var operationIds = operations.Select(value => value.Id).ToHashSet();
-        if (operationIds.Count != operations.Count)
+        var counts = new Dictionary<Guid, int>(operations.Count);
+        if (operations.Any(value => !counts.TryAdd(value.Id, 0)))
             throw new ArgumentException("Share operation identifiers must be unique.", nameof(operations));
-        if (remoteItems.Any(value => !operationIds.Contains(value.ShareOperationId)))
-            throw new ArgumentException("Every exact remote item must belong to the supplied share operations.", nameof(remoteItems));
+        if (operations.Any(operation => string.IsNullOrWhiteSpace(operation.SettingsFingerprint)))
+            throw new ArgumentException("Each share operation requires an immutable settings fingerprint.", nameof(operations));
+        return counts;
+    }
 
-        var grouped = remoteItems
-            .GroupBy(value => value.ShareOperationId)
-            .ToDictionary(group => group.Key, group => group.OrderBy(value => value.ItemOrdinal).ToArray());
+    private async Task<bool> HasContiguousItemOrdinalsAsync(Guid operationId, int count, CancellationToken cancellationToken)
+    {
+        await using var command = Command("SELECT COUNT(*),MIN(ItemOrdinal),MAX(ItemOrdinal) FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation;");
+        Add(command,"$operation",Id(operationId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) && reader.GetInt64(0) == count &&
+            reader.GetInt64(1) == 0 && reader.GetInt64(2) == count - 1;
+    }
 
-        foreach (var operation in operations)
-        {
-            if (string.IsNullOrWhiteSpace(operation.SettingsFingerprint))
-                throw new ArgumentException("Each share operation requires an immutable settings fingerprint.", nameof(operations));
-            if (!grouped.TryGetValue(operation.Id, out var items))
-                items = [];
-            if (items.Length == 0 || items.Where((value, index) => value.ItemOrdinal != index).Any())
-                throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", nameof(remoteItems));
-            var fingerprint = new RemoteItemIdentitySet(items.Select(value =>
-                new RemoteItemIdentity(value.RemoteItemId, value.DisplayName))).Fingerprint;
-            if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
-                throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
-        }
+    private async IAsyncEnumerable<string> ReadExactRemoteItemIdsAsync(
+        Guid operationId,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await using var command = Command("SELECT RemoteItemId FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation ORDER BY ItemOrdinal;");
+        Add(command,"$operation",Id(operationId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            yield return reader.GetString(0);
+    }
 
-        return grouped;
+    private async Task ExecuteControlAsync(string sql, CancellationToken cancellationToken)
+    {
+        await using var command = Command(sql);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ValidateShareOutputsAsync(

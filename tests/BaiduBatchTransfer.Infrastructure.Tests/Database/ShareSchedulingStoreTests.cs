@@ -62,23 +62,8 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                   AND output.OutputOrdinal=operation.OutputOrdinal AND output.ShareEnabled=1)
             ORDER BY operation.OutputOrdinal,operation.Id LIMIT 1;
             """,
-            """
-            EXPLAIN QUERY PLAN SELECT batch.Id FROM BatchJobs batch
-            WHERE batch.Status='Active' AND EXISTS(
-              SELECT 1 FROM ShareOperations candidate
-              WHERE candidate.BatchJobId=batch.Id AND candidate.Status='Reserved'
-                AND candidate.LeaseExpiresAt IS NOT NULL
-                AND julianday(candidate.LeaseExpiresAt)<=julianday($now))
-            ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
-            """,
-            """
-            EXPLAIN QUERY PLAN SELECT operation.Id FROM ShareOperations operation
-              INDEXED BY IX_ShareOperations_Batch_Status_Output_Id_Lease
-            WHERE operation.BatchJobId=$batch AND operation.Status='Reserved'
-              AND operation.LeaseExpiresAt IS NOT NULL
-              AND julianday(operation.LeaseExpiresAt)<=julianday($now)
-            ORDER BY operation.OutputOrdinal,operation.Id LIMIT 1;
-            """,
+            "EXPLAIN QUERY PLAN " + SqliteShareSchedulingStore.ExpiredBatchSelectSql,
+            "EXPLAIN QUERY PLAN " + SqliteShareSchedulingStore.ExpiredOperationSelectSql,
         };
         foreach (var sql in queries)
         {
@@ -92,6 +77,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             var plan = string.Join(Environment.NewLine, details);
             Assert.DoesNotContain("SCAN ", plan, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("TEMP B-TREE", plan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("julianday", sql, StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -107,7 +93,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             graph.ShareOperationId, 0, [new(graph.ShareOperationId, "orphan-share")]));
         Assert.False(await store.TryCompleteDiscoveryBaselineAsync(
             graph.ShareOperationId, 1, 0, "orphan-baseline", 0, graph.Now));
-        await Assert.ThrowsAsync<InvalidOperationException>(() => store.SaveDecisionSnapshotAsync(new(
+        Assert.False(await store.SaveDecisionSnapshotAsync(new(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Cancel", "orphan-discovery", 0, 0, 0, "orphan-generation", graph.Now)));
         Assert.Equal(0, await CountAsync(graph.Factory, "ShareDiscoveryBaselines"));
         Assert.Equal(0, await CountAsync(graph.Factory, "BatchShareDecisionSnapshots"));
@@ -162,10 +148,87 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ExpiredRecoverySkipsManyEarlierUnexpiredRowsAndReturnsEarliestCanonicalLease()
+    {
+        const int unexpiredCount = 250;
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var expiredId = Guid.Parse("ffffffff-ffff-ffff-ffff-fffffffffff0");
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = graph.Factory.DatabasePath,
+            Pooling = false,
+            ForeignKeys = false,
+        };
+        await using (var connection = new SqliteConnection(builder.ToString()))
+        {
+            await connection.OpenAsync();
+            await using var transaction = connection.BeginTransaction();
+            await using (var setup = connection.CreateCommand())
+            {
+                setup.Transaction = transaction;
+                setup.CommandText = """
+                    UPDATE ShareOperations SET Status='Cancelled' WHERE Id=$initial;
+                    UPDATE BatchOutputAccounts SET PlannedTransferCount=$planned,PlannedShareCount=$planned
+                    WHERE BatchJobId=$batch AND AccountId=$account;
+                    """;
+                setup.Parameters.AddWithValue("$initial", graph.ShareOperationId.ToString("D"));
+                setup.Parameters.AddWithValue("$planned", unexpiredCount + 2);
+                setup.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+                setup.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+                await setup.ExecuteNonQueryAsync();
+            }
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+                  Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,
+                  LeaseGeneration,LeaseExpiresAt,CreatedAt,UpdatedAt)
+                VALUES($id,$transfer,$resource,$batch,$account,1,'Reserved',$items,$settings,1,'Unknown',0,1,$lease,$created,$created);
+                """;
+            for (var index = 1; index <= unexpiredCount + 1; index++)
+            {
+                var id = index <= unexpiredCount ? new Guid(index, 0, 0, new byte[8]) : expiredId;
+                insert.Parameters.Clear();
+                insert.Parameters.AddWithValue("$id", id.ToString("D"));
+                insert.Parameters.AddWithValue("$transfer", Guid.NewGuid().ToString("D"));
+                insert.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
+                insert.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+                insert.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+                insert.Parameters.AddWithValue("$items", $"items-{index}");
+                insert.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
+                insert.Parameters.AddWithValue("$lease", (index <= unexpiredCount
+                    ? graph.Now.AddHours(1).AddSeconds(index)
+                    : graph.Now.AddMinutes(-2)).ToString("O"));
+                insert.Parameters.AddWithValue("$created", graph.Now.ToString("O"));
+                await insert.ExecuteNonQueryAsync();
+            }
+            await transaction.CommitAsync();
+        }
+
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var recovered = Assert.IsType<ShareOperationRecord>(await new SqliteShareSchedulingStore(graph.Factory)
+            .TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        timer.Stop();
+        Assert.Equal(expiredId, recovered.Id);
+        Assert.True(timer.Elapsed < TimeSpan.FromSeconds(2), $"Expired recovery took {timer.Elapsed}.");
+        Assert.EndsWith("+00:00", await ScalarAsync<string>(graph.Factory,
+            "SELECT LeaseExpiresAt FROM ShareOperations WHERE Id=$id;", expiredId), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ShareCreationRejectsMissingOrMismatchedExactItemsAndWrongOutputOrdinal()
     {
         var graph = await CreateGraphAsync(includeShareSettings: true);
-        var template = new ShareOperationRecord(Guid.NewGuid(), graph.TransferId, graph.ResourceId, graph.BatchId,
+        var validationTransfer = new TransferOperationRecord(Guid.NewGuid(), graph.ResourceId, graph.BatchId, 2, 2,
+            "/validation", "/validation", "", graph.AccountId, "Rule", "Cancelled", "Cancelled", 0,
+            "transfer-validation", null, null, null, "NotPrepared", "Released", null, null, null, null, null,
+            null, graph.Now, graph.Now);
+        await using (var seed = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await seed.Jobs.AddOperationsAsync([validationTransfer]);
+            await seed.CommitAsync();
+        }
+        var template = new ShareOperationRecord(Guid.NewGuid(), validationTransfer.Id, graph.ResourceId, graph.BatchId,
             graph.AccountId, 1, "WaitingShare", "wrong-fingerprint", graph.SettingsFingerprint, 1, null, null, "Unknown", 0,
             null, null, null, null, null, graph.Now, graph.Now);
 
@@ -183,7 +246,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 [new(template.Id, 0, "remote-a", "A")]));
         }
 
-        var secondTransfer = new TransferOperationRecord(Guid.NewGuid(), graph.ResourceId, graph.BatchId, 2, 2,
+        var secondTransfer = new TransferOperationRecord(Guid.NewGuid(), graph.ResourceId, graph.BatchId, 3, 3,
             "/two", "/two", "", graph.AccountId, "Rule", "Cancelled", "Cancelled", 0, "transfer-two", null,
             null, null, "NotPrepared", "Released", null, null, null, null, null, null, graph.Now, graph.Now);
         var operationId = Guid.NewGuid();
@@ -242,7 +305,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.True(await restarted.TrySaveDiscoverySnapshotAsync(changed));
         Assert.False(await restarted.TrySaveDiscoverySnapshotAsync(first));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => restarted.SaveDecisionSnapshotAsync(new(
+        Assert.False(await restarted.SaveDecisionSnapshotAsync(new(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Regenerate", first.DiscoveryFingerprint,
             first.DiscoveredCount, first.CompatibleCount, first.IncompatibleCount, first.Generation, graph.Now, first.Version)));
         Assert.Equal(0, await CountAsync(graph.Factory, "BatchShareDecisionSnapshots"));
@@ -290,16 +353,19 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.True(await store.TrySaveDiscoverySnapshotAsync(discovery));
         Assert.Equal(discovery, await new SqliteShareSchedulingStore(graph.Factory).GetDiscoverySnapshotAsync(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint));
-        await Assert.ThrowsAsync<InvalidOperationException>(() => store.SaveDecisionSnapshotAsync(
+        Assert.False(await store.SaveDecisionSnapshotAsync(
             decision with { SettingsFingerprint = "wrong-settings" }));
-        await store.SaveDecisionSnapshotAsync(decision);
+        Assert.True(await store.SaveDecisionSnapshotAsync(decision));
         Assert.Equal(decision, await store.GetDecisionSnapshotAsync(graph.BatchId, graph.AccountId));
-        await Assert.ThrowsAsync<InvalidOperationException>(() => store.SaveDecisionSnapshotAsync(
+        var restartedStore = new SqliteShareSchedulingStore(graph.Factory);
+        Assert.True(await restartedStore.SaveDecisionSnapshotAsync(decision));
+        Assert.Equal(1, await CountAsync(graph.Factory, "BatchShareDecisionSnapshots"));
+        Assert.False(await store.SaveDecisionSnapshotAsync(
             decision with { DiscoveryFingerprint = "stale", Generation = "stale-generation" }));
         Assert.Equal(decision, await store.GetDecisionSnapshotAsync(graph.BatchId, graph.AccountId));
 
         var result = new BaiduShareResultRecord(
-            Guid.NewGuid(), graph.ShareOperationId, graph.BatchId, graph.ResourceId, graph.AccountId,
+            Guid.Parse("10000000-0000-0000-0000-000000000001"), graph.ShareOperationId, graph.BatchId, graph.ResourceId, graph.AccountId,
             graph.ItemSetFingerprint, graph.SettingsFingerprint, 1, "share-new", "https://pan.baidu.com/s/private", "abcd",
             true, true, graph.Now, graph.Now);
         Assert.False(await store.AcceptResultAsync(graph.ShareOperationId, ShareOperationStatus.Preparing, reserved.LeaseGeneration,
@@ -339,7 +405,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             secondShareId, 2, secondReserved.LeaseGeneration, "second-baseline", 1, graph.Now));
         var secondResult = result with
         {
-            Id = Guid.NewGuid(), ShareOperationId = secondShareId, ExactItemSetFingerprint = secondItemSetFingerprint,
+            Id = Guid.Parse("20000000-0000-0000-0000-000000000002"), ShareOperationId = secondShareId, ExactItemSetFingerprint = secondItemSetFingerprint,
             SettingsFingerprint = graph.SettingsFingerprint, Generation = 2, ShareId = "share-two"
         };
         Assert.True(await store.ReuseExistingResultAsync(secondShareId, secondReserved.LeaseGeneration, secondResult, graph.Now));
@@ -371,7 +437,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             thirdShareId, 1, thirdReserved.LeaseGeneration, "third-request", graph.Now));
         var thirdResult = result with
         {
-            Id = Guid.NewGuid(), ShareOperationId = thirdShareId, AccountId = graph.SecondAccountId,
+            Id = Guid.Parse("30000000-0000-0000-0000-000000000003"), ShareOperationId = thirdShareId, AccountId = graph.SecondAccountId,
             ExactItemSetFingerprint = thirdItems, ShareId = "share-three"
         };
         Assert.True(await store.AcceptResultAsync(
@@ -387,7 +453,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             exported.AddRange(page.Items);
             cursor = page.NextCursor;
         }
-        Assert.Equal(new[] { result.Id, secondResult.Id, thirdResult.Id }.Order(), exported.Select(item => item.Id).Order());
+        Assert.Equal(new[] { result.Id, secondResult.Id, thirdResult.Id }, exported.Select(item => item.Id));
         Assert.Equal(2, exported.Select(item => item.AccountId).Distinct().Count());
 
         Assert.True(await store.TryStartNextGenerationAsync(
@@ -467,8 +533,8 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         var factory = new SqliteConnectionFactory(Path.Combine(root, $"{Guid.NewGuid():N}.db"));
         await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         var now = new DateTimeOffset(2026, 8, 20, 8, 0, 0, TimeSpan.Zero);
-        var account = AccountRecord.Create(Guid.NewGuid(), $"user-{Guid.NewGuid():N}", "Account");
-        var secondAccount = AccountRecord.Create(Guid.NewGuid(), $"user-{Guid.NewGuid():N}", "Second Account");
+        var account = AccountRecord.Create(Guid.Parse("ffffffff-ffff-ffff-ffff-fffffffffff1"), $"user-{Guid.NewGuid():N}", "Account");
+        var secondAccount = AccountRecord.Create(Guid.Parse("00000000-0000-0000-0000-000000000002"), $"user-{Guid.NewGuid():N}", "Second Account");
         var batch = new BatchJobRecord(Guid.NewGuid(), "Batch", "Excel", "Distribution", "TaskCount", "ProportionalReduction",
             1, 1, "/", "None", "Skip", "Immediate", batchStatus, now,
             batchStatus == "Active" ? now : null, null, null, 1, 4);

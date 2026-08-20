@@ -213,8 +213,6 @@ CREATE INDEX IX_ShareOperations_Resource_Account_Status_Id
 ON ShareOperations(ResourceItemId, AccountId, Status, Id);
 CREATE INDEX IX_ShareOperations_Batch_Status_Lease_Output_Id
 ON ShareOperations(BatchJobId, Status, LeaseExpiresAt, OutputOrdinal, Id);
-CREATE INDEX IX_ShareOperations_Batch_Status_Output_Id_Lease
-ON ShareOperations(BatchJobId, Status, OutputOrdinal, Id, LeaseExpiresAt);
 CREATE INDEX IX_BatchJobs_Status_Queue_Created_Id
 ON BatchJobs(Status, QueueOrder, CreatedAt, Id);
 

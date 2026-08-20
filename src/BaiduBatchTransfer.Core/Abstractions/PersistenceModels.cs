@@ -384,7 +384,7 @@ public sealed record BaiduShareResultRecord(
         $"BaiduShareResultRecord {{ Identity = [REDACTED], Generation = {Generation}, IsAccepted = {IsAccepted}, IsCurrent = {IsCurrent}, UserContent = [REDACTED] }}";
 }
 
-public sealed record ShareResultCursor(long CandidateSequence, Guid AccountId, Guid ResultId)
+public sealed record ShareResultCursor(long CandidateSequence, int OutputOrdinal, Guid ResultId)
 {
     public override string ToString() =>
         $"ShareResultCursor {{ CandidateSequence = {CandidateSequence}, Identity = [REDACTED] }}";
@@ -397,7 +397,7 @@ public sealed record ShareResultKeysetQuery(Guid BatchJobId, int PageSize, Share
         if (BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(BatchJobId));
         if (PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(PageSize));
         if (After is { CandidateSequence: < 0 }) throw new ArgumentOutOfRangeException(nameof(After));
-        if (After is { AccountId: var accountId } && accountId == Guid.Empty) throw new ArgumentException("A result cursor account is required.", nameof(After));
+        if (After is { OutputOrdinal: <= 0 }) throw new ArgumentException("A result cursor output ordinal is required.", nameof(After));
         if (After is { ResultId: var resultId } && resultId == Guid.Empty) throw new ArgumentException("A result cursor identity is required.", nameof(After));
     }
 

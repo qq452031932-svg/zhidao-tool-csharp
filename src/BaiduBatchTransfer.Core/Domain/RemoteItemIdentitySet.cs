@@ -28,7 +28,7 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
         }
 
         Items = snapshot;
-        Fingerprint = ComputeFingerprint(snapshot);
+        Fingerprint = ComputeFingerprintFromCanonicalOrder(snapshot.Select(item => item.ExactId));
     }
 
     public ImmutableArray<RemoteItemIdentity> Items { get; }
@@ -60,18 +60,56 @@ public sealed class RemoteItemIdentitySet : IEquatable<RemoteItemIdentitySet>
     public override string ToString() =>
         $"RemoteItemIdentitySet {{ Count = {Count}, Fingerprint = [REDACTED], Items = [REDACTED] }}";
 
-    private static string ComputeFingerprint(ImmutableArray<RemoteItemIdentity> items)
+    public static string ComputeFingerprintFromCanonicalOrder(IEnumerable<string> exactIds)
     {
+        ArgumentNullException.ThrowIfNull(exactIds);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         Span<byte> length = stackalloc byte[sizeof(int)];
-        foreach (var item in items)
+        string? previous = null;
+        var count = 0;
+        foreach (var exactId in exactIds)
         {
-            var encoded = StrictUtf8.GetBytes(item.ExactId);
+            ArgumentNullException.ThrowIfNull(exactId);
+            ValidateExactId(exactId, nameof(exactIds));
+            if (previous is not null && string.CompareOrdinal(previous, exactId) >= 0)
+                throw new ArgumentException("Exact remote item identities must be in strict canonical order.", nameof(exactIds));
+            var encoded = StrictUtf8.GetBytes(exactId);
             BinaryPrimitives.WriteInt32BigEndian(length, encoded.Length);
             hash.AppendData(length);
             hash.AppendData(encoded);
+            previous = exactId;
+            count++;
         }
+        if (count == 0)
+            throw new ArgumentException("At least one exact remote item identity is required.", nameof(exactIds));
 
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    public static async Task<string> ComputeFingerprintFromCanonicalOrderAsync(
+        IAsyncEnumerable<string> exactIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(exactIds);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var length = new byte[sizeof(int)];
+        string? previous = null;
+        var count = 0;
+        await foreach (var exactId in exactIds.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            ArgumentNullException.ThrowIfNull(exactId);
+            ValidateExactId(exactId, nameof(exactIds));
+            if (previous is not null && string.CompareOrdinal(previous, exactId) >= 0)
+                throw new ArgumentException("Exact remote item identities must be in strict canonical order.", nameof(exactIds));
+            var encoded = StrictUtf8.GetBytes(exactId);
+            BinaryPrimitives.WriteInt32BigEndian(length, encoded.Length);
+            hash.AppendData(length);
+            hash.AppendData(encoded);
+            previous = exactId;
+            count++;
+        }
+        if (count == 0)
+            throw new ArgumentException("At least one exact remote item identity is required.", nameof(exactIds));
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 

@@ -132,7 +132,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         {
             new StringKeysetPage<string>([marker], marker),
             new CursorKeysetPage<string, SecretCursor>([marker], new(marker)),
-            new ShareResultKeysetQuery(markerId, 10, new(4, markerId, markerId)),
+            new ShareResultKeysetQuery(markerId, 10, new(4, 1, markerId)),
             new ImportColumnDefinitionRecord(markerId, 0, marker, "Preserve", false),
             new StagedImportRowPayloadRecord(markerId, marker, marker, marker, marker),
             new BatchShareSettingsRecord(markerId, true, true, "Fixed", marker, "Ask", DateTimeOffset.UnixEpoch, marker),
@@ -149,7 +149,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
                 marker, DateTimeOffset.UnixEpoch, 1),
             new BaiduShareResultRecord(markerId, markerId, markerId, markerId, markerId, marker, marker, 1,
                 marker, marker, marker, true, true, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch),
-            new ShareResultCursor(4, markerId, markerId),
+            new ShareResultCursor(4, 1, markerId),
             new AdapterCapabilityAcceptanceRecord("BaiduShare", "v1", "build", DateTimeOffset.UnixEpoch, marker),
         };
 
@@ -328,6 +328,62 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         direct.Parameters.AddWithValue("$now", operation.CreatedAt.ToString("O"));
         await Assert.ThrowsAsync<SqliteException>(() => direct.ExecuteNonQueryAsync());
         Assert.Equal(0, await CountTableAsync(disabled.Factory, "ShareOperations"));
+    }
+
+    [Fact]
+    public async Task OneShareOperationStreamsMoreThanOneThousandExactItemsAndRoundTrips()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, shareEnabled: true, plannedShareCount: 1);
+        var identities = Enumerable.Range(0, 1_501)
+            .Select(index => new RemoteItemIdentity($"large-remote-{index:D4}", $"Item {index:D4}"))
+            .ToArray();
+        var operation = Assert.Single(graph.Operations) with
+        {
+            ExactItemSetFingerprint = new RemoteItemIdentitySet(identities).Fingerprint
+        };
+        IEnumerable<ShareOperationRemoteItemRecord> StreamItems()
+        {
+            foreach (var (identity, ordinal) in identities.Select((value, index) => (value, index)))
+                yield return new(operation.Id, ordinal, identity.ExactId, $"Item {ordinal:D4}");
+        }
+
+        var before = GC.GetTotalMemory(forceFullCollection: true);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddShareOperationsAsync([operation], StreamItems());
+            await unit.CommitAsync();
+        }
+        var growth = Math.Max(0, GC.GetTotalMemory(forceFullCollection: true) - before);
+        Assert.True(growth < 16L * 1024 * 1024, $"Managed growth was {growth:N0} bytes.");
+
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var first = await store.GetRemoteItemsKeysetPageAsync(operation.Id, null, 1_000);
+        var second = await store.GetRemoteItemsKeysetPageAsync(operation.Id, first.NextCursor, 1_000);
+        Assert.Equal(1_501, first.Items.Count + second.Items.Count);
+        Assert.Null(second.NextCursor);
+    }
+
+    [Fact]
+    public async Task InvalidStreamingExactItemsRollbackInsertedOperationsBeforeCallerCommits()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, shareEnabled: true, plannedShareCount: 1);
+        var operation = Assert.Single(graph.Operations);
+        var valid = Assert.Single(graph.RemoteItems);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await Assert.ThrowsAsync<ArgumentException>(() => unit.Jobs.AddShareOperationsAsync([operation], []));
+            await Assert.ThrowsAsync<SqliteException>(() => unit.Jobs.AddShareOperationsAsync(
+                [operation], [valid, valid with { ItemOrdinal = 1 }]));
+            await Assert.ThrowsAsync<ArgumentException>(() => unit.Jobs.AddShareOperationsAsync(
+                [operation], [valid, valid with { ShareOperationId = Guid.NewGuid() }]));
+            await unit.CommitAsync();
+        }
+
+        Assert.Equal(0, await CountTableAsync(graph.Factory, "ShareOperations"));
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var count = connection.CreateCommand();
+        count.CommandText = "SELECT CreatedShareOperationCount FROM BatchOutputAccounts;";
+        Assert.Equal(0, Convert.ToInt32(await count.ExecuteScalarAsync()));
     }
 
     [Fact]

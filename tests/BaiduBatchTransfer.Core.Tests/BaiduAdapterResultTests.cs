@@ -34,9 +34,26 @@ public sealed class RemoteItemIdentitySetTests
         Assert.Equal(first, rebuiltWithDifferentNames);
         Assert.Equal(first.GetHashCode(), rebuiltWithDifferentNames.GetHashCode());
         Assert.Equal(first.Fingerprint, rebuiltWithDifferentNames.Fingerprint);
+        Assert.Equal(first.Fingerprint, RemoteItemIdentitySet.ComputeFingerprintFromCanonicalOrder(
+            first.Items.Select(item => item.ExactId)));
         Assert.Equal(
             "ccfa9f96bfc52436266badc26337f6da5394d83b7d81ff593e588ee7934c38f5",
             first.Fingerprint);
+    }
+
+    [Fact]
+    public async Task AsyncCanonicalFingerprintConsumesAStreamingSequence()
+    {
+        static async IAsyncEnumerable<string> Stream()
+        {
+            yield return "remote-1";
+            await Task.Yield();
+            yield return "remote-2";
+        }
+
+        var expected = new RemoteItemIdentitySet([new("remote-2", "B"), new("remote-1", "A")]);
+        Assert.Equal(expected.Fingerprint,
+            await RemoteItemIdentitySet.ComputeFingerprintFromCanonicalOrderAsync(Stream()));
     }
 
     [Fact]

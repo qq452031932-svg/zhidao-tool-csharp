@@ -50,7 +50,7 @@ public interface IShareSchedulingStore
         Guid accountId,
         string settingsFingerprint,
         CancellationToken cancellationToken = default);
-    Task SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default);
+    Task<bool> SaveDecisionSnapshotAsync(BatchShareDecisionSnapshotRecord snapshot, CancellationToken cancellationToken = default);
     Task<BatchShareDecisionSnapshotRecord?> GetDecisionSnapshotAsync(
         Guid batchJobId,
         Guid accountId,
