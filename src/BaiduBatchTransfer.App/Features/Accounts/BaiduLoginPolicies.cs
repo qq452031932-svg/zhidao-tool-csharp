@@ -48,8 +48,9 @@ public static class BaiduLoginCookieCapturePolicy
     {
         ArgumentNullException.ThrowIfNull(cookies);
         var valid = new List<CapturedWebCookie>();
-        foreach (var cookie in cookies.Take(MaximumCookieCount))
+        foreach (var cookie in cookies)
         {
+            if (valid.Count >= MaximumCookieCount) break;
             if (cookie is null || string.IsNullOrWhiteSpace(cookie.Value)) continue;
             try
             {

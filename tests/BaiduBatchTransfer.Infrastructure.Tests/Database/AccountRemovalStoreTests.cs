@@ -795,7 +795,7 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task OtherAccountBoundLogPreventsWholeBatchDeletionAndIsNeverDeleted()
+    public async Task OtherAccountBoundLogThatTargetsRemovedOperationIsDeletedWithWholeBatch()
     {
         var (factory, store, _) = await CreateAsync();
         var import = Guid.NewGuid();
@@ -814,12 +814,11 @@ public sealed class AccountRemovalStoreTests : IDisposable
 
         var result = await store.PrepareRemovalAsync(new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
 
-        Assert.Equal(1, preview.SharedBatchCount);
+        Assert.Equal(0, preview.SharedBatchCount);
         Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
-        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(batch))));
-        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id;", ("$id", Id(import))));
-        Assert.Equal(1, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id=$id;", ("$id", Id(log))));
-        Assert.Equal("0,0", await ScalarTextAsync(factory, "SELECT ResourceCount||','||OperationCount FROM BatchJobs WHERE Id='" + Id(batch) + "';"));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM BatchJobs WHERE Id=$id;", ("$id", Id(batch))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ImportSessions WHERE Id=$id;", ("$id", Id(import))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM ExecutionLogs WHERE Id=$id;", ("$id", Id(log))));
     }
 
     [Fact]

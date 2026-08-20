@@ -5,6 +5,22 @@ CHECK(RemovalState IN ('None','CleanupPending'));
 ALTER TABLE Accounts
 ADD COLUMN RemovalGeneration TEXT NULL;
 
+-- v6 account removal first disabled the account and cleared credentials, then
+-- attempted external profile cleanup. A crash or cleanup failure therefore
+-- left this exact durable fingerprint without an explicit pending marker.
+-- Ordinary disabled accounts do not retain a profile after having both
+-- credentials and validation state cleared.
+UPDATE Accounts
+SET RemovalState='CleanupPending', RemovalGeneration=hex(randomblob(32))
+WHERE Status='Disabled'
+  AND IsEnabled=0
+  AND EncryptedSession IS NULL
+  AND LastValidatedAt IS NULL
+  AND IsDeleted=0
+  AND DeletedAt IS NULL
+  AND WebView2ProfileDirectory IS NOT NULL
+  AND length(trim(WebView2ProfileDirectory))>0;
+
 CREATE INDEX IF NOT EXISTS IX_Accounts_RemovalState_Sort
 ON Accounts(RemovalState, SortOrder, DisplayName, Id);
 

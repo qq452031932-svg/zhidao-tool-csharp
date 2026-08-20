@@ -69,6 +69,49 @@ public sealed class BaiduLoginPolicyTests
     }
 
     [Fact]
+    public void CookieSnapshotRejectsForeignProfileCookiesBeforeApplyingTheSafetyLimit()
+    {
+        var cookies = Enumerable.Range(0, 512)
+            .Select(index => new CapturedWebCookie(
+                $"foreign-{index}", "value", ".example.com", "/", null, true, true))
+            .Append(new CapturedWebCookie(
+                "BDUSS", "signed", ".baidu.com", "/", null, true, true));
+
+        var snapshot = BaiduLoginCookieCapturePolicy.CreateValidSnapshot(cookies);
+
+        var captured = Assert.Single(snapshot);
+        Assert.Equal("BDUSS", captured.Name);
+        Assert.Equal(".baidu.com", captured.Domain);
+    }
+
+    [Fact]
+    public void LoginWindowCapturesTheWholeProfileCookieSnapshot()
+    {
+        var codeBehind = ReadLoginWindowCodeBehind();
+
+        Assert.Contains("GetCookiesAsync(string.Empty)", codeBehind, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "GetCookiesAsync(BaiduLoginFlowPolicy.InitialLoginUri.AbsoluteUri)",
+            codeBehind,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LoginWindowDisablesPasswordSavingAndGeneralAutofill()
+    {
+        var codeBehind = ReadLoginWindowCodeBehind();
+
+        Assert.Contains(
+            "Settings.IsPasswordAutosaveEnabled = false",
+            codeBehind,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "Settings.IsGeneralAutofillEnabled = false",
+            codeBehind,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AutoCaptureCanBeginOnlyOnceAndClosesOnlyAfterRegistrationCompletes()
     {
         var state = new BaiduLoginAuthenticationState(true, true);
@@ -127,5 +170,27 @@ public sealed class BaiduLoginPolicyTests
         Assert.False(close);
         Assert.Contains("已经添加", viewModel.Status);
         Assert.DoesNotContain("secret", viewModel.Status, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ReadLoginWindowCodeBehind(
+        [System.Runtime.CompilerServices.CallerFilePath] string sourceFilePath = "")
+    {
+        var current = new DirectoryInfo(Path.GetDirectoryName(sourceFilePath)!);
+        while (current is not null)
+        {
+            var solution = Path.Combine(current.FullName, "BaiduBatchTransfer.sln");
+            if (File.Exists(solution))
+            {
+                return File.ReadAllText(Path.Combine(
+                    current.FullName,
+                    "src",
+                    "BaiduBatchTransfer.App",
+                    "Features",
+                    "Accounts",
+                    "BaiduLoginWindow.xaml.cs"));
+            }
+            current = current.Parent;
+        }
+        throw new DirectoryNotFoundException("未找到测试仓库目录。");
     }
 }

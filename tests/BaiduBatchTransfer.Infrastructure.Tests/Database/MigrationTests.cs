@@ -309,6 +309,9 @@ public sealed class MigrationTests : IDisposable
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v6-upgrade.db");
         var accountId = Guid.NewGuid().ToString("D");
+        var credentialedDisabledId = Guid.NewGuid().ToString("D");
+        var legacyPendingId = Guid.NewGuid().ToString("D");
+        var legacyProfilePath = Path.Combine(root, "profiles", legacyPendingId);
         await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
@@ -325,6 +328,22 @@ public sealed class MigrationTests : IDisposable
                   SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
                 VALUES($id,'disabled-user','普通停用账号','WebView2','Disabled',0,0,0,0,'2026-08-20',0);
                 """, ("$id", accountId));
+            await ExecuteAsync(connection, """
+                INSERT INTO Accounts(
+                  Id,BaiduUserId,DisplayName,EncryptedSession,WebView2ProfileDirectory,LoginMethod,Status,
+                  DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,
+                  IsDeleted,DeletedAt)
+                VALUES($id,'credentialed-disabled-user','保留会话的普通停用账号',X'010203',$profile,'WebView2','Disabled',
+                  0,0,1,0,'2026-08-20T08:00:00Z','2026-08-20',0,NULL);
+                """, ("$id", credentialedDisabledId), ("$profile", Path.Combine(root, "profiles", credentialedDisabledId)));
+            await ExecuteAsync(connection, """
+                INSERT INTO Accounts(
+                  Id,BaiduUserId,DisplayName,EncryptedSession,WebView2ProfileDirectory,LoginMethod,Status,
+                  DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,
+                  IsDeleted,DeletedAt)
+                VALUES($id,'legacy-pending-user','旧版待清理账号',NULL,$profile,'WebView2','Disabled',
+                  0,0,1,0,NULL,'2026-08-20',0,NULL);
+                """, ("$id", legacyPendingId), ("$profile", legacyProfilePath));
             Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 6)).IsValid);
         }
         var factory = new SqliteConnectionFactory(path);
@@ -342,6 +361,13 @@ public sealed class MigrationTests : IDisposable
             "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", accountId)));
         Assert.Equal("missing", await ScalarAsync<string>(upgraded,
             "SELECT COALESCE(RemovalGeneration,'missing') FROM Accounts WHERE Id=$id;", ("$id", accountId)));
+        Assert.Equal("None", await ScalarAsync<string>(upgraded,
+            "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", credentialedDisabledId)));
+        Assert.Equal("CleanupPending", await ScalarAsync<string>(upgraded,
+            "SELECT RemovalState FROM Accounts WHERE Id=$id;", ("$id", legacyPendingId)));
+        var legacyGeneration = await ScalarAsync<string>(upgraded,
+            "SELECT COALESCE(RemovalGeneration,'missing') FROM Accounts WHERE Id=$id;", ("$id", legacyPendingId));
+        Assert.Matches("^[0-9A-F]{64}$", legacyGeneration);
         var triggers = await NamesAsync(upgraded, "trigger");
         Assert.Contains("TR_Accounts_RemovalState_Insert", triggers);
         Assert.Contains("TR_Accounts_RemovalState_Update", triggers);

@@ -171,7 +171,7 @@ public sealed class CrashBoundaryTests
             await using var command = connection.CreateCommand();
             command.CommandText = "SELECT MAX(Version) FROM SchemaVersions;";
             var persistedVersion = Convert.ToInt32(await command.ExecuteScalarAsync());
-            Assert.Equal(await migrator.MigrateAsync(), persistedVersion);
+            Assert.Equal(DatabaseMigrator.LatestVersion, persistedVersion);
         }
         finally
         {

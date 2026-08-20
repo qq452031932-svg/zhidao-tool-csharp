@@ -634,6 +634,14 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
               JOIN TransferOperations operation ON operation.Id=log.TransferOperationId
               JOIN temp.AccountRemovalManifestBatches batch ON batch.Id=operation.BatchJobId;
 
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetLogs(Id)
+            SELECT log.Id FROM ExecutionLogs log
+              JOIN temp.AccountRemovalManifestLogs manifested ON manifested.Id=log.Id
+              JOIN temp.AccountRemovalManifestTargetOperations target ON target.Id=log.TransferOperationId
+            UNION SELECT log.Id FROM ExecutionLogs log
+              JOIN temp.AccountRemovalManifestLogs manifested ON manifested.Id=log.Id
+              JOIN temp.AccountRemovalManifestTargetResources target ON target.Id=log.ResourceItemId;
+
             INSERT OR IGNORE INTO temp.AccountRemovalManifestBOnlyBatches(Id)
             SELECT terminal.Id FROM temp.AccountRemovalManifestTerminalBatches terminal
             WHERE NOT EXISTS(
@@ -653,6 +661,8 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                     LEFT JOIN TransferOperations operation ON operation.Id=log.TransferOperationId
                     LEFT JOIN ResourceItems resource ON resource.Id=log.ResourceItemId
                     WHERE log.AccountId IS NOT NULL AND log.AccountId<>$account
+                      AND NOT EXISTS(SELECT 1 FROM temp.AccountRemovalManifestTargetLogs targetLog
+                                     WHERE targetLog.Id=log.Id)
                       AND (log.BatchJobId=terminal.Id OR operation.BatchJobId=terminal.Id OR resource.BatchJobId=terminal.Id));
 
             INSERT OR IGNORE INTO temp.AccountRemovalManifestCleanupImports(Id)

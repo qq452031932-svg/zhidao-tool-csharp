@@ -80,6 +80,8 @@ public partial class BaiduLoginWindow : Window
             Browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
             Browser.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             Browser.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            Browser.CoreWebView2.Settings.IsPasswordAutosaveEnabled = false;
+            Browser.CoreWebView2.Settings.IsGeneralAutofillEnabled = false;
             viewModel.ReportWaiting();
             pollTimer.Start();
             Browser.CoreWebView2.Navigate(BaiduLoginFlowPolicy.InitialLoginUri.AbsoluteUri);
@@ -129,7 +131,7 @@ public partial class BaiduLoginWindow : Window
     {
         var currentUri = Uri.TryCreate(Browser.Source?.AbsoluteUri, UriKind.Absolute, out var parsed) ? parsed : null;
         var coreCookies = await Browser.CoreWebView2.CookieManager
-            .GetCookiesAsync(BaiduLoginFlowPolicy.InitialLoginUri.AbsoluteUri)
+            .GetCookiesAsync(string.Empty)
             .ConfigureAwait(true);
         cancellationToken.ThrowIfCancellationRequested();
         var capturedAt = DateTimeOffset.UtcNow;

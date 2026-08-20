@@ -13,7 +13,9 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
         var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var dataRoot = Path.Combine(localData, "BaiduBatchTransfer");
+        var dataRoot = StartupDataRootSelector.Resolve(
+            e.Args,
+            Path.Combine(localData, "BaiduBatchTransfer"));
         host = AppBootstrap.CreateHost(dataRoot);
         try
         {
