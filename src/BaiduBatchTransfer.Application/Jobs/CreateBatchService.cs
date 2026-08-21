@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Core.Services;
@@ -8,6 +9,7 @@ namespace BaiduBatchTransfer.Application.Jobs;
 
 public sealed class CreateBatchService
 {
+    private static readonly JsonSerializerOptions SummaryJsonOptions = new() { MaxDepth = 8 };
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly BatchDraftValidator validator;
     private readonly ReplicationPreflightEstimator preflightEstimator;
@@ -101,7 +103,9 @@ public sealed class CreateBatchService
                 null,
                 draft.ImportSessionId,
                 draft.QueueOrder,
-                checked((int)validated.ShareOperationCount));
+                checked((int)(draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.TaskCount
+                    ? validated.ShareOperationCount
+                    : 0)));
 
             await unit.Jobs.AddAsync(job, cancellationToken).ConfigureAwait(false);
             await unit.Jobs.SetShareSettingsAsync(new(
@@ -156,7 +160,10 @@ public sealed class CreateBatchService
                 validated.ConfirmationToken,
                 draft.ImportSessionId,
                 draft.BatchJobId,
-                now), cancellationToken).ConfigureAwait(false);
+                validated.Session.ColumnMappingFingerprint,
+                now,
+                JsonSerializer.Serialize(BatchConfirmationSummarySnapshot.From(preview), SummaryJsonOptions)),
+                cancellationToken).ConfigureAwait(false);
             if (!await unit.Imports.TryFinalizeBatchCreationAsync(
                     validated.Session, draft.BatchJobId, now, cancellationToken).ConfigureAwait(false))
                 throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
@@ -186,42 +193,18 @@ public sealed class CreateBatchService
             !FixedTimeEquals(receipt.SnapshotFingerprint, confirmationToken))
             throw new BatchConfirmationException("The batch preview changed and must be confirmed again.");
 
-        var job = await unit.Jobs.GetAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException("The durable batch creation receipt is incomplete.");
-        var outputs = await unit.Jobs.GetOutputAccountsAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false);
-        var allocations = new List<AccountAllocationRecord>();
-        for (var pageNumber = 1; ; pageNumber++)
+        try
         {
-            var page = await unit.Jobs.GetAllocationsPageAsync(receipt.BatchJobId, new PageQuery(pageNumber, 1_000), cancellationToken).ConfigureAwait(false);
-            allocations.AddRange(page.Items);
-            if (allocations.Count >= page.TotalCount) break;
+            var snapshot = JsonSerializer.Deserialize<BatchConfirmationSummarySnapshot>(
+                receipt.ConfirmationSummaryJson, SummaryJsonOptions);
+            if (snapshot is null || snapshot.Version != 1 || snapshot.ImportSessionId != receipt.ImportSessionId)
+                throw new InvalidOperationException("The durable batch creation receipt is incomplete.");
+            return new CreatedBatchResult(receipt.BatchJobId, snapshot.ToSummary(confirmationToken));
         }
-        var allocationByAccount = allocations.ToDictionary(value => value.AccountId);
-        var accounts = outputs.Select(output =>
+        catch (JsonException)
         {
-            var allocation = allocationByAccount[output.AccountId];
-            return new BatchAccountConfirmation(
-                output.AccountId, allocation.PriorityOrder, allocation.DefaultTargetPath,
-                allocation.NormalizedDefaultTargetPath, allocation.TargetItemCount, allocation.TargetSuccessCount,
-                allocation.LockedItemCount, allocation.ExclusiveCandidateCount,
-                allocation.EffectiveTargetSuccessCount, allocation.FulfilledCount, allocation.ReservedSlotCount,
-                allocation.UnusedCandidateCount, 0, allocation.EffectiveTargetSuccessCount,
-                output.PlannedTransferCount, output.PlannedShareCount, output.ShareEnabled,
-                output.OutputOrdinal, output.OutputLabel);
-        }).ToArray();
-        var sourceColumns = await unit.Jobs.GetSourceColumnsAsync(receipt.BatchJobId, cancellationToken).ConfigureAwait(false);
-        var layoutInputs = outputs.Select(output => new BatchWorkloadAccountInput(
-            output.AccountId, output.OutputOrdinal, output.OutputLabel,
-            BatchAccountSelectionDecision.Selected, output.ShareEnabled, output.PlannedTransferCount)).ToArray();
-        var layout = new ResultColumnLayoutBuilder().Build(
-            sourceColumns.Select(column => column.SourceHeader).ToArray(), layoutInputs);
-        var estimate = await preflightEstimator.EstimateAsync(
-            job.ResourceCount, job.OperationCount, outputs.Count, job.ShareOperationCount,
-            job.ShareOperationCount, outputs.Count, layout.ColumnCount, cancellationToken).ConfigureAwait(false);
-        var summary = new BatchConfirmationSummary(
-            receipt.ImportSessionId, receipt.CreatedAt, job.ResourceCount, job.OperationCount,
-            accounts, estimate, confirmationToken, layout);
-        return new CreatedBatchResult(receipt.BatchJobId, summary);
+            throw new InvalidOperationException("The durable batch creation receipt is incomplete.");
+        }
     }
 
     private static string HashToken(string confirmationToken) =>
@@ -371,6 +354,89 @@ public sealed class CreateBatchService
 }
 
 public sealed record CreatedBatchResult(Guid BatchJobId, BatchConfirmationSummary Confirmation);
+
+internal sealed record BatchConfirmationSummarySnapshot(
+    int Version,
+    Guid ImportSessionId,
+    DateTimeOffset ImportUpdatedAt,
+    long ResourceCount,
+    long OperationCount,
+    BatchAccountConfirmationSnapshot[] Accounts,
+    StorageGrowthEstimate StorageEstimate,
+    ResultColumnLayoutSnapshot? ResultColumnLayout)
+{
+    public static BatchConfirmationSummarySnapshot From(BatchConfirmationSummary value) => new(
+        1,
+        value.ImportSessionId,
+        value.ImportUpdatedAt,
+        value.ResourceCount,
+        value.OperationCount,
+        value.Accounts.Select(BatchAccountConfirmationSnapshot.From).ToArray(),
+        value.StorageEstimate,
+        value.ResultColumnLayout is null ? null : ResultColumnLayoutSnapshot.From(value.ResultColumnLayout));
+
+    public BatchConfirmationSummary ToSummary(string confirmationToken) => new(
+        ImportSessionId,
+        ImportUpdatedAt,
+        ResourceCount,
+        OperationCount,
+        Accounts.Select(account => account.ToConfirmation()).ToArray(),
+        StorageEstimate,
+        confirmationToken,
+        ResultColumnLayout?.ToLayout());
+}
+
+internal sealed record BatchAccountConfirmationSnapshot(
+    Guid AccountId,
+    int PriorityOrder,
+    string DefaultTargetPath,
+    string NormalizedDefaultTargetPath,
+    int TargetItemCount,
+    int TargetSuccessCount,
+    int LockedItemCount,
+    int ExclusiveCandidateCount,
+    int EffectiveTargetSuccessCount,
+    int FulfilledCount,
+    int ReservedSlotCount,
+    int UnusedCandidateCount,
+    int NewExclusiveCandidateCount,
+    int ReachableTargetSuccessCount,
+    long PlannedTransferCount,
+    long PlannedShareCount,
+    bool ShareEnabled,
+    int OutputOrdinal,
+    string? OutputLabel)
+{
+    public static BatchAccountConfirmationSnapshot From(BatchAccountConfirmation value) => new(
+        value.AccountId, value.PriorityOrder, value.DefaultTargetPath, value.NormalizedDefaultTargetPath,
+        value.TargetItemCount, value.TargetSuccessCount, value.LockedItemCount, value.ExclusiveCandidateCount,
+        value.EffectiveTargetSuccessCount, value.FulfilledCount, value.ReservedSlotCount,
+        value.UnusedCandidateCount, value.NewExclusiveCandidateCount, value.ReachableTargetSuccessCount,
+        value.PlannedTransferCount, value.PlannedShareCount, value.ShareEnabled, value.OutputOrdinal,
+        value.OutputLabel);
+
+    public BatchAccountConfirmation ToConfirmation() => new(
+        AccountId, PriorityOrder, DefaultTargetPath, NormalizedDefaultTargetPath,
+        TargetItemCount, TargetSuccessCount, LockedItemCount, ExclusiveCandidateCount,
+        EffectiveTargetSuccessCount, FulfilledCount, ReservedSlotCount, UnusedCandidateCount,
+        NewExclusiveCandidateCount, ReachableTargetSuccessCount, PlannedTransferCount,
+        PlannedShareCount, ShareEnabled, OutputOrdinal, OutputLabel);
+}
+
+internal sealed record ResultColumnLayoutSnapshot(
+    string[] SourceHeaders,
+    string ResolvedTitleHeader,
+    string OriginalShareUrlHeader,
+    ResultAccountColumnLayout[] Accounts,
+    string Fingerprint)
+{
+    public static ResultColumnLayoutSnapshot From(ResultColumnLayout value) => new(
+        value.SourceHeaders.ToArray(), value.ResolvedTitleHeader, value.OriginalShareUrlHeader,
+        value.Accounts.ToArray(), value.Fingerprint);
+
+    public ResultColumnLayout ToLayout() => new(
+        SourceHeaders, ResolvedTitleHeader, OriginalShareUrlHeader, Accounts, Fingerprint);
+}
 
 internal static class BatchFingerprint
 {

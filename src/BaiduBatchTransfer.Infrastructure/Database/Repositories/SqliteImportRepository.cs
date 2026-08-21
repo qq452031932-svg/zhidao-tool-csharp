@@ -327,17 +327,25 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         await using var command = Command("""
             UPDATE ImportSessions
             SET Status='BatchCreated',CreatedBatchJobId=$batch,UpdatedAt=$updated
-            WHERE Id=$id AND Status=$status AND CreatedBatchJobId IS NULL AND AppendToBatchJobId IS NULL
+            WHERE Id=$id AND SourceType=$sourceType AND SourceName=$sourceName
+              AND Status=$status AND CreatedBatchJobId IS NULL AND AppendToBatchJobId IS NULL
+              AND CreatedAt=$createdAt
               AND UpdatedAt=$expectedUpdated AND TotalRows=$total AND ReadyRows=$ready
               AND InvalidRows=$invalid AND DuplicateRows=$duplicate AND ExcludedRows=$excluded
-              AND ColumnMappingFingerprint IS $mapping;
+              AND PrecheckAccountId IS $precheck
+              AND ColumnMappingFingerprint IS $mapping
+              AND SourceContentFingerprint IS $sourceContent
+              AND HeaderRowNumber IS $headerRow;
             """);
         Add(command,"$batch",Id(batchJobId)); Add(command,"$updated",Time(updatedAt));
         Add(command,"$id",Id(expectedSession.Id)); Add(command,"$status",expectedSession.Status);
         Add(command,"$expectedUpdated",Time(expectedSession.UpdatedAt)); Add(command,"$total",expectedSession.TotalRows);
         Add(command,"$ready",expectedSession.ReadyRows); Add(command,"$invalid",expectedSession.InvalidRows);
         Add(command,"$duplicate",expectedSession.DuplicateRows); Add(command,"$excluded",expectedSession.ExcludedRows);
+        Add(command,"$sourceType",expectedSession.SourceType); Add(command,"$sourceName",expectedSession.SourceName);
+        Add(command,"$createdAt",Time(expectedSession.CreatedAt)); Add(command,"$precheck",NullableId(expectedSession.PrecheckAccountId));
         Add(command,"$mapping",expectedSession.ColumnMappingFingerprint);
+        Add(command,"$sourceContent",expectedSession.SourceContentFingerprint); Add(command,"$headerRow",expectedSession.HeaderRowNumber);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
     }
 

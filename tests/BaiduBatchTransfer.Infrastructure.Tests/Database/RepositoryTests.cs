@@ -302,6 +302,55 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("source-content")]
+    [InlineData("header-row")]
+    [InlineData("precheck-account")]
+    [InlineData("source-type")]
+    [InlineData("source-name")]
+    [InlineData("created-at")]
+    public async Task ImportBatchCreationBoundaryRejectsEverySameTimestampAuthorityChange(string mutation)
+    {
+        var factory = await CreateFactoryAsync();
+        var now = new DateTimeOffset(2026, 8, 21, 1, 2, 3, TimeSpan.Zero);
+        var account = AccountRecord.Create(Guid.NewGuid(), "cas-user", "CAS");
+        var session = new ImportSessionRecord(
+            Guid.NewGuid(), "Excel", "source.xlsx", "ReadyToConfirm", 1, 1, 0, 0, 0,
+            null, null, null, now, now, new string('a', 64), new string('b', 64), 1);
+        var batchId = Guid.NewGuid();
+        await using (var seed = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await seed.Accounts.UpsertAsync(account);
+            await seed.Imports.AddSessionAsync(session);
+            await seed.Jobs.AddAsync(new BatchJobRecord(
+                batchId, "Batch", "Excel", "Distribution", "TaskCount", "ProportionalReduction",
+                0, 0, "/", "None", "Skip", "Immediate", "Queued", now, null, null, null, 1));
+            await seed.CommitAsync();
+        }
+        var (column, value) = mutation switch
+        {
+            "source-content" => ("SourceContentFingerprint", (object)new string('c', 64)),
+            "header-row" => ("HeaderRowNumber", 2),
+            "precheck-account" => ("PrecheckAccountId", account.Id.ToString("D")),
+            "source-type" => ("SourceType", "Text"),
+            "source-name" => ("SourceName", "changed.xlsx"),
+            "created-at" => ("CreatedAt", now.AddMinutes(-1).ToString("O")),
+            _ => throw new ArgumentOutOfRangeException(nameof(mutation)),
+        };
+        await using (var connection = await factory.OpenConnectionAsync())
+        await using (var mutate = connection.CreateCommand())
+        {
+            mutate.CommandText = $"UPDATE ImportSessions SET {column}=$value WHERE Id=$id;";
+            mutate.Parameters.AddWithValue("$value", value);
+            mutate.Parameters.AddWithValue("$id", session.Id.ToString("D"));
+            Assert.Equal(1, await mutate.ExecuteNonQueryAsync());
+        }
+        await using var stale = await SqliteUnitOfWork.BeginAsync(factory);
+        Assert.False(await stale.Imports.TryFinalizeBatchCreationAsync(session, batchId, now.AddSeconds(1)));
+        Assert.Equal("ReadyToConfirm", (await stale.Imports.GetSessionAsync(session.Id))!.Status);
+        await stale.RollbackAsync();
+    }
+
     [Fact]
     public async Task ShareConfirmationSnapshotsAndShareProjectionFieldsRoundTripAndAreImmutable()
     {

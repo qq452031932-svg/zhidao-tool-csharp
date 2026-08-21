@@ -21,6 +21,71 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task DirectPendingHandoffWithoutBothExactItemsAndMatchingLineageCannotBeAcquired(
+        bool addRemoteItem,
+        bool addLineage)
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "DELETE FROM ShareOperations WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddPendingShareOperationsAsync([new(
+                graph.ShareOperationId, graph.TransferId, graph.ResourceId, graph.BatchId,
+                graph.AccountId, 1, graph.SettingsFingerprint, graph.Now)]);
+            await unit.CommitAsync();
+        }
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var transaction = connection.BeginTransaction(deferred: false))
+        {
+            await using (var handoff = connection.CreateCommand())
+            {
+                handoff.Transaction = transaction;
+                handoff.CommandText = "UPDATE ShareOperations SET Status='WaitingShare',ExactItemSetFingerprint=$items WHERE Id=$id;";
+                handoff.Parameters.AddWithValue("$items", graph.ItemSetFingerprint);
+                handoff.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+                Assert.Equal(1, await handoff.ExecuteNonQueryAsync());
+            }
+            if (addRemoteItem)
+            {
+                await using var remote = connection.CreateCommand();
+                remote.Transaction = transaction;
+                remote.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($id,0,'remote-bypass',$sort,'Bypass');";
+                remote.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+                remote.Parameters.AddWithValue("$sort", new byte[] { 1 });
+                Assert.Equal(1, await remote.ExecuteNonQueryAsync());
+            }
+            if (addLineage)
+            {
+                await using var lineage = connection.CreateCommand();
+                lineage.Transaction = transaction;
+                lineage.CommandText = "INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,ExactItemSetFingerprint,SettingsFingerprint) VALUES($id,1,$batch,$resource,$account,$items,$settings);";
+                lineage.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+                lineage.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+                lineage.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
+                lineage.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+                lineage.Parameters.AddWithValue("$items", graph.ItemSetFingerprint);
+                lineage.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
+                Assert.Equal(1, await lineage.ExecuteNonQueryAsync());
+            }
+            await transaction.CommitAsync();
+        }
+
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        Assert.Null(await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.Equal("WaitingShare", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Theory]
     [InlineData("Queued")]
     [InlineData("Paused")]
     [InlineData("Cancelled")]
@@ -209,19 +274,33 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             for (var index = 1; index <= unexpiredCount + 1; index++)
             {
                 var id = index <= unexpiredCount ? new Guid(index, 0, 0, new byte[8]) : expiredId;
+                var remoteId = $"remote-{index}";
+                var itemSetFingerprint = index <= unexpiredCount
+                    ? $"items-{index}"
+                    : new RemoteItemIdentitySet([new(remoteId, "Expired")]).Fingerprint;
                 insert.Parameters.Clear();
                 insert.Parameters.AddWithValue("$id", id.ToString("D"));
                 insert.Parameters.AddWithValue("$transfer", Guid.NewGuid().ToString("D"));
                 insert.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
                 insert.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
                 insert.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
-                insert.Parameters.AddWithValue("$items", $"items-{index}");
+                insert.Parameters.AddWithValue("$items", itemSetFingerprint);
                 insert.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
                 insert.Parameters.AddWithValue("$lease", (index <= unexpiredCount
                     ? graph.Now.AddHours(1).AddSeconds(index)
                     : graph.Now.AddMinutes(-2)).ToString("O"));
                 insert.Parameters.AddWithValue("$created", graph.Now.ToString("O"));
                 await insert.ExecuteNonQueryAsync();
+                if (index > unexpiredCount)
+                {
+                    await using var remote = connection.CreateCommand();
+                    remote.Transaction = transaction;
+                    remote.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($id,0,$remote,$sort,'Expired');";
+                    remote.Parameters.AddWithValue("$id", id.ToString("D"));
+                    remote.Parameters.AddWithValue("$remote", remoteId);
+                    remote.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey(remoteId));
+                    Assert.Equal(1, await remote.ExecuteNonQueryAsync());
+                }
             }
             await transaction.CommitAsync();
         }

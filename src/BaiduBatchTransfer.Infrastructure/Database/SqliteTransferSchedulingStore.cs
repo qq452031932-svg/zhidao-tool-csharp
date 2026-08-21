@@ -163,6 +163,8 @@ public sealed class SqliteTransferSchedulingStore :
         var folder = candidate.Value.Folder ?? string.Empty;
         var source = candidate.Value.ConstraintAccountId is null ? "Weighted" : "Exclusive";
         var fingerprint = Fingerprint(candidate.Value.NormalizedShareId, account.Value.AccountId, normalizedTarget, folder);
+        var shareBinding = await ReadPendingShareBindingAsync(
+            connection, transaction, batchId, account.Value.AccountId, cancellationToken).ConfigureAwait(false);
 
         await using (var reserveCandidate = Command(connection, transaction,
             "UPDATE ResourceItems SET CandidateStatus='Reserved',ReservedAccountId=$account,ReservationExpiresAt=$lease,UpdatedAt=$now WHERE Id=$id AND CandidateStatus IN ('Unallocated','Unused') AND (CandidateConstraintAccountId IS NULL OR CandidateConstraintAccountId=$account);"))
@@ -184,6 +186,25 @@ public sealed class SqliteTransferSchedulingStore :
             Add(insert, "$source", source); Add(insert, "$fingerprint", fingerprint); Add(insert, "$now", Time(reservedAt)); Add(insert, "$lease", Time(leaseExpiresAt));
             await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
+        if (shareBinding is not null)
+        {
+            await using var insertShare = Command(connection, transaction, """
+                INSERT INTO ShareOperations(
+                  Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
+                  SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
+                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+                VALUES(
+                  $id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,
+                  'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created);
+                """);
+            Add(insertShare, "$id", Id(Guid.NewGuid())); Add(insertShare, "$transfer", Id(operationId));
+            Add(insertShare, "$resource", Id(candidate.Value.ResourceId)); Add(insertShare, "$batch", Id(batchId));
+            Add(insertShare, "$account", Id(account.Value.AccountId)); Add(insertShare, "$ordinal", shareBinding.Value.OutputOrdinal);
+            Add(insertShare, "$settings", shareBinding.Value.SettingsFingerprint); Add(insertShare, "$created", Time(reservedAt));
+            RequireOne(await insertShare.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The confirmed share output could not accept the dynamic transfer.");
+        }
         await using (var updateAllocation = Command(connection, transaction,
             "UPDATE AccountAllocations SET AssignedItemCount=AssignedItemCount+1,ReservedSlotCount=ReservedSlotCount+1,UnusedCandidateCount=CASE WHEN $unusedExclusive=1 THEN (SELECT COUNT(*) FROM ResourceItems r WHERE r.BatchJobId=$batch AND r.CandidateStatus='Unused' AND r.CandidateConstraintAccountId=$account) ELSE UnusedCandidateCount END WHERE BatchJobId=$batch AND AccountId=$account AND EffectiveTargetSuccessCount-FulfilledCount-ReservedSlotCount>0;"))
         {
@@ -193,9 +214,10 @@ public sealed class SqliteTransferSchedulingStore :
                 throw new InvalidOperationException("The allocation changed during candidate reservation.");
         }
         await using (var updateBatch = Command(connection, transaction,
-            "UPDATE BatchJobs SET OperationCount=OperationCount+1,NextAllocationOrdinal=$next WHERE Id=$batch AND NextAllocationOrdinal=$current;"))
+            "UPDATE BatchJobs SET OperationCount=OperationCount+1,ShareOperationCount=ShareOperationCount+$shares,NextAllocationOrdinal=$next WHERE Id=$batch AND NextAllocationOrdinal=$current;"))
         {
             Add(updateBatch, "$batch", Id(batchId)); Add(updateBatch, "$next", nextOrdinal); Add(updateBatch, "$current", ordinal);
+            Add(updateBatch, "$shares", shareBinding is null ? 0 : 1);
             RequireOne(await updateBatch.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The batch allocation cursor changed during candidate reservation.");
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1123,6 +1145,26 @@ public sealed class SqliteTransferSchedulingStore :
         if (selected is null) return null;
         var binding = eligible.Single(item => item.State.AccountId == selected.AccountId);
         return (selected.AccountId, binding.DefaultTarget, binding.NormalizedDefaultTarget);
+    }
+
+    private static async Task<(int OutputOrdinal,string SettingsFingerprint)?> ReadPendingShareBindingAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchId,
+        Guid accountId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT output.OutputOrdinal,settings.SettingsFingerprint
+            FROM BatchOutputAccounts output
+            JOIN BatchShareSettings settings ON settings.BatchJobId=output.BatchJobId
+            WHERE output.BatchJobId=$batch AND output.AccountId=$account AND output.ShareEnabled=1;
+            """);
+        Add(command, "$batch", Id(batchId)); Add(command, "$account", Id(accountId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? (reader.GetInt32(0), reader.GetString(1))
+            : null;
     }
 
     private static async Task<(Guid ResourceId,long Sequence,string NormalizedShareId,string? TargetOverride,string? NormalizedTargetOverride,string? Folder,Guid? ConstraintAccountId,bool WasUnused)?> SelectCandidateAsync(SqliteConnection connection, SqliteTransaction transaction, Guid batchId, Guid accountId, CancellationToken cancellationToken)

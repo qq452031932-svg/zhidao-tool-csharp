@@ -2,6 +2,7 @@ using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace BaiduBatchTransfer.Infrastructure.Database.Repositories;
 
@@ -507,10 +508,15 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         if (!IsSha256(receipt.CommandFingerprint) || !IsSha256(receipt.ConfirmationTokenHash) ||
             !IsSha256(receipt.SnapshotFingerprint) || receipt.ImportSessionId == Guid.Empty || receipt.BatchJobId == Guid.Empty)
             throw new ArgumentException("The batch creation receipt is invalid.", nameof(receipt));
-        await using var command = Command("INSERT INTO BatchCreationReceipts(CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,CreatedAt) VALUES($command,$token,$snapshot,$session,$batch,$created);");
+        using (var summary = JsonDocument.Parse(receipt.ConfirmationSummaryJson))
+            if (summary.RootElement.ValueKind != JsonValueKind.Object)
+                throw new ArgumentException("The batch confirmation summary snapshot is invalid.", nameof(receipt));
+        await using var command = Command("INSERT INTO BatchCreationReceipts(CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,ColumnMappingFingerprint,CreatedAt,ConfirmationSummaryJson) VALUES($command,$token,$snapshot,$session,$batch,$mapping,$created,$summary);");
         Add(command,"$command",receipt.CommandFingerprint); Add(command,"$token",receipt.ConfirmationTokenHash);
         Add(command,"$snapshot",receipt.SnapshotFingerprint); Add(command,"$session",Id(receipt.ImportSessionId));
-        Add(command,"$batch",Id(receipt.BatchJobId)); Add(command,"$created",Time(receipt.CreatedAt));
+        Add(command,"$batch",Id(receipt.BatchJobId)); Add(command,"$mapping",receipt.ColumnMappingFingerprint);
+        Add(command,"$created",Time(receipt.CreatedAt));
+        Add(command,"$summary",receipt.ConfirmationSummaryJson);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -518,11 +524,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         Guid batchJobId,
         CancellationToken cancellationToken = default)
     {
-        await using var command = Command("SELECT CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,CreatedAt FROM BatchCreationReceipts WHERE BatchJobId=$batch;");
+        await using var command = Command("SELECT CommandFingerprint,ConfirmationTokenHash,SnapshotFingerprint,ImportSessionId,BatchJobId,ColumnMappingFingerprint,CreatedAt,ConfirmationSummaryJson FROM BatchCreationReceipts WHERE BatchJobId=$batch;");
         Add(command,"$batch",Id(batchJobId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new(reader.GetString(0),reader.GetString(1),reader.GetString(2),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),ReadTime(reader,5))
+            ? new(reader.GetString(0),reader.GetString(1),reader.GetString(2),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),reader.IsDBNull(5)?null:reader.GetString(5),ReadTime(reader,6),reader.GetString(7))
             : null;
     }
 

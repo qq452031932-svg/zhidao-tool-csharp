@@ -25,7 +25,15 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 AND settings.SettingsFingerprint=candidate.SettingsFingerprint)
             AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
               WHERE output.BatchJobId=candidate.BatchJobId AND output.AccountId=candidate.AccountId
-                AND output.OutputOrdinal=candidate.OutputOrdinal AND output.ShareEnabled=1))
+                AND output.OutputOrdinal=candidate.OutputOrdinal AND output.ShareEnabled=1)
+            AND EXISTS(SELECT 1 FROM ShareOperationRemoteItems remote
+              WHERE remote.ShareOperationId=candidate.Id)
+            AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+              WHERE lineage.ShareOperationId=candidate.Id AND lineage.Generation=candidate.Generation
+                AND lineage.BatchJobId=candidate.BatchJobId AND lineage.ResourceItemId=candidate.ResourceItemId
+                AND lineage.AccountId=candidate.AccountId
+                AND lineage.ExactItemSetFingerprint=candidate.ExactItemSetFingerprint
+                AND lineage.SettingsFingerprint=candidate.SettingsFingerprint))
         ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
         """;
 
@@ -39,6 +47,14 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
           AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
             WHERE output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId
               AND output.OutputOrdinal=operation.OutputOrdinal AND output.ShareEnabled=1)
+          AND EXISTS(SELECT 1 FROM ShareOperationRemoteItems remote
+            WHERE remote.ShareOperationId=operation.Id)
+          AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+            WHERE lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              AND lineage.BatchJobId=operation.BatchJobId AND lineage.ResourceItemId=operation.ResourceItemId
+              AND lineage.AccountId=operation.AccountId
+              AND lineage.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+              AND lineage.SettingsFingerprint=operation.SettingsFingerprint)
         ORDER BY operation.LeaseExpiresAt,operation.OutputOrdinal,operation.Id LIMIT 1;
         """;
 
@@ -86,7 +102,15 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                             AND settings.SettingsFingerprint=candidate.SettingsFingerprint)
                         AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
                           WHERE output.BatchJobId=candidate.BatchJobId AND output.AccountId=candidate.AccountId
-                            AND output.OutputOrdinal=candidate.OutputOrdinal AND output.ShareEnabled=1))
+                            AND output.OutputOrdinal=candidate.OutputOrdinal AND output.ShareEnabled=1)
+                        AND EXISTS(SELECT 1 FROM ShareOperationRemoteItems remote
+                          WHERE remote.ShareOperationId=candidate.Id)
+                        AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+                          WHERE lineage.ShareOperationId=candidate.Id AND lineage.Generation=candidate.Generation
+                            AND lineage.BatchJobId=candidate.BatchJobId AND lineage.ResourceItemId=candidate.ResourceItemId
+                            AND lineage.AccountId=candidate.AccountId
+                            AND lineage.ExactItemSetFingerprint=candidate.ExactItemSetFingerprint
+                            AND lineage.SettingsFingerprint=candidate.SettingsFingerprint))
                     ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
                     """))
                 {
@@ -104,6 +128,14 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                       AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
                         WHERE output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId
                           AND output.OutputOrdinal=operation.OutputOrdinal AND output.ShareEnabled=1)
+                      AND EXISTS(SELECT 1 FROM ShareOperationRemoteItems remote
+                        WHERE remote.ShareOperationId=operation.Id)
+                      AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+                        WHERE lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+                          AND lineage.BatchJobId=operation.BatchJobId AND lineage.ResourceItemId=operation.ResourceItemId
+                          AND lineage.AccountId=operation.AccountId
+                          AND lineage.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                          AND lineage.SettingsFingerprint=operation.SettingsFingerprint)
                     ORDER BY operation.OutputOrdinal,operation.Id LIMIT 1;
                     """);
                 Add(select,"$batch",batchId); Add(select,"$status",status);
@@ -132,7 +164,17 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                   AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
                     WHERE output.BatchJobId=ShareOperations.BatchJobId
                       AND output.AccountId=ShareOperations.AccountId
-                      AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1);
+                      AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1)
+                  AND EXISTS(SELECT 1 FROM ShareOperationRemoteItems remote
+                    WHERE remote.ShareOperationId=ShareOperations.Id)
+                  AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+                    WHERE lineage.ShareOperationId=ShareOperations.Id
+                      AND lineage.Generation=ShareOperations.Generation
+                      AND lineage.BatchJobId=ShareOperations.BatchJobId
+                      AND lineage.ResourceItemId=ShareOperations.ResourceItemId
+                      AND lineage.AccountId=ShareOperations.AccountId
+                      AND lineage.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint
+                      AND lineage.SettingsFingerprint=ShareOperations.SettingsFingerprint);
                 """))
             {
                 Add(update,"$id",id); Add(update,"$lease",Time(now + leaseDuration)); Add(update,"$now",Time(now));

@@ -448,7 +448,22 @@ internal static class BatchConfirmationTokens
         using var writer = new CanonicalHashWriter("batch-confirmation/create-vNext");
         writer.WriteGuid("batch-job-id", draft.BatchJobId);
         writer.WriteGuid("session-id", session.Id);
+        writer.WriteString("session-source-type", session.SourceType);
+        writer.WriteString("session-source-name", session.SourceName);
+        writer.WriteString("session-status", session.Status);
+        writer.WriteInt32("session-total-rows", session.TotalRows);
+        writer.WriteInt32("session-ready-rows", session.ReadyRows);
+        writer.WriteInt32("session-invalid-rows", session.InvalidRows);
+        writer.WriteInt32("session-duplicate-rows", session.DuplicateRows);
+        writer.WriteInt32("session-excluded-rows", session.ExcludedRows);
+        writer.WriteNullableGuid("session-precheck-account-id", session.PrecheckAccountId);
+        writer.WriteNullableGuid("session-created-batch-job-id", session.CreatedBatchJobId);
+        writer.WriteNullableGuid("session-append-to-batch-job-id", session.AppendToBatchJobId);
+        writer.WriteDateTimeOffset("session-created-at", session.CreatedAt);
         writer.WriteDateTimeOffset("session-updated-at", session.UpdatedAt);
+        writer.WriteString("session-source-content-fingerprint", session.SourceContentFingerprint);
+        writer.WriteString("session-header-row-number", session.HeaderRowNumber?.ToString(
+            System.Globalization.CultureInfo.InvariantCulture));
         writer.WriteInt32("transfer-mode", (int)draft.TransferMode);
         writer.WriteInt32("quota-basis", (int)draft.QuotaBasis);
         writer.WriteInt32("shortage-policy", (int)draft.ShortagePolicy);

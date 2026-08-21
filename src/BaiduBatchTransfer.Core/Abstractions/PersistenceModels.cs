@@ -293,7 +293,9 @@ public sealed record BatchCreationReceiptRecord(
     string SnapshotFingerprint,
     Guid ImportSessionId,
     Guid BatchJobId,
-    DateTimeOffset CreatedAt)
+    string? ColumnMappingFingerprint,
+    DateTimeOffset CreatedAt,
+    string ConfirmationSummaryJson)
 {
     public override string ToString() =>
         "BatchCreationReceiptRecord { Identity = [REDACTED], Fingerprints = [REDACTED] }";

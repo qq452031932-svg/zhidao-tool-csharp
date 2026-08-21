@@ -73,7 +73,10 @@ CREATE TABLE BatchCreationReceipts (
       CHECK(length(SnapshotFingerprint)=64 AND SnapshotFingerprint NOT GLOB '*[^0-9A-Fa-f]*'),
     ImportSessionId TEXT NOT NULL,
     BatchJobId TEXT NOT NULL UNIQUE,
+    ColumnMappingFingerprint TEXT NULL,
     CreatedAt TEXT NOT NULL,
+    ConfirmationSummaryJson TEXT NOT NULL
+      CHECK(json_valid(ConfirmationSummaryJson) AND json_type(ConfirmationSummaryJson)='object'),
     FOREIGN KEY(ImportSessionId) REFERENCES ImportSessions(Id),
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE
 );
