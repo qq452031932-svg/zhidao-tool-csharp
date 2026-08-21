@@ -798,11 +798,39 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         for (var index = 0; index < 200; index++)
             Assert.NotNull(await store.TryReserveNextAsync(now, TimeSpan.FromMinutes(5)));
         claimTimer.Stop();
+        var discoveryTimer = Stopwatch.StartNew();
+        var runId = Guid.NewGuid();
+        var decisionSettings = new BatchShareSettingsRecord(
+            job.Id, true, true, "Random", null, "Ask", now, settingsFingerprint);
+        Assert.Equal(resourceCount, await store.BeginDiscoveryAsync(
+            runId, new(job.Id, accounts[0].Id, decisionSettings)));
+        var keysetTimer = Stopwatch.StartNew();
+        string? afterFingerprint = null;
+        var discoveredExactSets = 0;
+        do
+        {
+            var page = await store.GetDiscoveryRunExactSetFingerprintsKeysetPageAsync(
+                runId, accounts[0].Id, afterFingerprint, 1_000);
+            discoveredExactSets += page.Items.Count;
+            afterFingerprint = page.NextCursor;
+        } while (afterFingerprint is not null);
+        keysetTimer.Stop();
+        Assert.Equal(resourceCount, discoveredExactSets);
+        var casTimer = Stopwatch.StartNew();
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync(runId,
+        [
+            new(job.Id, accounts[0].Id, settingsFingerprint, "empty", 0, 0, 0,
+                $"{resourceCount}:exact-hash", now, 1),
+        ]));
+        casTimer.Stop();
+        discoveryTimer.Stop();
         var peakGrowth = Math.Max(0, Volatile.Read(ref peakBytes) - beforeBytes);
-        output.WriteLine($"share scale resources={resourceCount}, share-operations={resourceCount * accountCount}, elapsed={timer.Elapsed}, repeated-claims={claimTimer.Elapsed}, peak-managed-growth={peakGrowth:N0} bytes");
+        output.WriteLine($"share scale resources={resourceCount}, share-operations={resourceCount * accountCount}, elapsed={timer.Elapsed}, repeated-claims={claimTimer.Elapsed}, discovery-cas={discoveryTimer.Elapsed}, keyset={keysetTimer.Elapsed}, cas={casTimer.Elapsed}, peak-managed-growth={peakGrowth:N0} bytes");
         Assert.True(peakGrowth < 384L * 1024 * 1024, $"Peak managed growth was {peakGrowth:N0} bytes.");
         Assert.True(timer.Elapsed < TimeSpan.FromSeconds(120), $"Share pipeline insert took {timer.Elapsed}.");
         Assert.True(claimTimer.Elapsed < TimeSpan.FromSeconds(10), $"Repeated indexed claims took {claimTimer.Elapsed}.");
+        Assert.True(keysetTimer.Elapsed < TimeSpan.FromSeconds(10), $"Exact-set keyset paging took {keysetTimer.Elapsed}.");
+        Assert.True(discoveryTimer.Elapsed < TimeSpan.FromSeconds(45), $"Exact-set discovery and CAS took {discoveryTimer.Elapsed}.");
     }
 
     [Fact]

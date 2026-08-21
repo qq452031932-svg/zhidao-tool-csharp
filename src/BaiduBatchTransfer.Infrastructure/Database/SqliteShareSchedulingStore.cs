@@ -64,6 +64,75 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         ORDER BY operation.LeaseExpiresAt,operation.OutputOrdinal,operation.Id LIMIT 1;
         """;
 
+    internal const string DecisionExactSetKeysetSelectSql = """
+        SELECT DISTINCT operation.ExactItemSetFingerprint
+        FROM ShareOperations operation
+        JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+          AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+        JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
+          AND lineage.Generation=operation.Generation
+        WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+          AND operation.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')
+          AND operation.Status NOT IN ('Submitting','ResultPending')
+          AND operation.ExactItemSetFingerprint IS NOT NULL
+          AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+            WHERE item.ShareOperationId=operation.Id)
+          AND ($after IS NULL OR operation.ExactItemSetFingerprint>$after)
+        ORDER BY operation.ExactItemSetFingerprint LIMIT $limit;
+        """;
+
+    internal const string CurrentExactSetsMatchRunSql = """
+        SELECT NOT EXISTS(
+          SELECT 1 FROM ShareOperations operation
+          JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+          JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+          WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+            AND operation.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')
+            AND operation.Status NOT IN ('Submitting','ResultPending')
+            AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
+            AND NOT EXISTS(SELECT 1 FROM BatchShareDiscoveryRunExactSets exactSet
+              WHERE exactSet.RunId=$run AND exactSet.AccountId=$account
+                AND exactSet.ExactItemSetFingerprint=operation.ExactItemSetFingerprint))
+        AND NOT EXISTS(
+          SELECT 1 FROM BatchShareDiscoveryRunExactSets exactSet
+          WHERE exactSet.RunId=$run AND exactSet.AccountId=$account
+            AND NOT EXISTS(
+              SELECT 1 FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.ExactItemSetFingerprint=exactSet.ExactItemSetFingerprint
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')
+                AND operation.Status NOT IN ('Submitting','ResultPending')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)));
+        """;
+
+    internal const string CurrentExactSetsMatchDiscoverySql = """
+        SELECT NOT EXISTS(
+          SELECT 1 FROM ShareOperations operation
+          JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+          JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+          WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+            AND operation.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')
+            AND operation.Status NOT IN ('Submitting','ResultPending')
+            AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
+            AND NOT EXISTS(SELECT 1 FROM BatchShareDiscoveryExactSets exactSet
+              WHERE exactSet.BatchJobId=$batch AND exactSet.AccountId=$account AND exactSet.SettingsFingerprint=$settings
+                AND exactSet.ExactItemSetFingerprint=operation.ExactItemSetFingerprint))
+        AND NOT EXISTS(
+          SELECT 1 FROM BatchShareDiscoveryExactSets exactSet
+          WHERE exactSet.BatchJobId=$batch AND exactSet.AccountId=$account AND exactSet.SettingsFingerprint=$settings
+            AND NOT EXISTS(
+              SELECT 1 FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.ExactItemSetFingerprint=exactSet.ExactItemSetFingerprint
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused')
+                AND operation.Status NOT IN ('Submitting','ResultPending')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)));
+        """;
+
     private readonly SqliteConnectionFactory factory;
 
     public SqliteShareSchedulingStore(SqliteConnectionFactory factory) =>
@@ -705,21 +774,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: true);
-        await using var command = Command(connection, transaction, """
-            SELECT DISTINCT operation.ExactItemSetFingerprint
-            FROM ShareOperations operation
-            JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
-              AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-            JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
-              AND lineage.Generation=operation.Generation
-            WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
-              AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-              AND operation.ExactItemSetFingerprint IS NOT NULL
-              AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
-                WHERE item.ShareOperationId=operation.Id)
-              AND ($after IS NULL OR operation.ExactItemSetFingerprint>$after)
-            ORDER BY operation.ExactItemSetFingerprint LIMIT $limit;
-            """);
+        await using var command = Command(connection, transaction, DecisionExactSetKeysetSelectSql);
         Add(command, "$batch", Id(batchJobId)); Add(command, "$account", Id(accountId));
         Add(command, "$after", afterFingerprint); Add(command, "$limit", checked(pageSize + 1));
         var values = new List<string>(pageSize + 1);
@@ -1504,24 +1559,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         SqliteConnection connection,SqliteTransaction transaction,Guid runId,
         BatchShareDiscoverySnapshotRecord snapshot,CancellationToken cancellationToken)
     {
-        await using var command=Command(connection,transaction,"""
-            SELECT NOT EXISTS(
-              SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
-              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
-              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
-                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
-              EXCEPT SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryRunExactSets WHERE RunId=$run AND AccountId=$account)
-            AND NOT EXISTS(
-              SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryRunExactSets WHERE RunId=$run AND AccountId=$account
-              EXCEPT SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
-              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
-              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
-                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id));
-            """);
+        await using var command=Command(connection,transaction,CurrentExactSetsMatchRunSql);
         Add(command,"$run",Id(runId));Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));
         Add(command,"$settings",snapshot.SettingsFingerprint);
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
@@ -1531,26 +1569,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         SqliteConnection connection,SqliteTransaction transaction,
         BatchShareDecisionSnapshotRecord snapshot,CancellationToken cancellationToken)
     {
-        await using var command=Command(connection,transaction,"""
-            SELECT NOT EXISTS(
-              SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
-              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
-              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
-                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
-              EXCEPT SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryExactSets
-                WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings)
-            AND NOT EXISTS(
-              SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryExactSets
-                WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
-              EXCEPT SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
-              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
-              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
-                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id));
-            """);
+        await using var command=Command(connection,transaction,CurrentExactSetsMatchDiscoverySql);
         Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));Add(command,"$settings",snapshot.SettingsFingerprint);
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
     }

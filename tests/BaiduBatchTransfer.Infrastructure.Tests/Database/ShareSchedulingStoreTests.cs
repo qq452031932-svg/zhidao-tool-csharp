@@ -194,6 +194,37 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ExactSetDiscoveryPlansStreamActiveCreateIndexWithoutTemporaryTrees()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        var queries = new[]
+        {
+            SqliteShareSchedulingStore.DecisionExactSetKeysetSelectSql,
+            SqliteShareSchedulingStore.CurrentExactSetsMatchRunSql,
+            SqliteShareSchedulingStore.CurrentExactSetsMatchDiscoverySql,
+        };
+        foreach (var sql in queries)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "EXPLAIN QUERY PLAN " + sql;
+            command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
+            command.Parameters.AddWithValue("$run", Guid.NewGuid().ToString("D"));
+            command.Parameters.AddWithValue("$after", DBNull.Value);
+            command.Parameters.AddWithValue("$limit", 501);
+            var details = new List<string>();
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync()) details.Add(reader.GetString(3));
+            var plan = string.Join(Environment.NewLine, details);
+            Assert.DoesNotContain("SCAN operation", plan, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("TEMP B-TREE", plan, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("UX_ShareOperations_ActiveCreateKey", plan, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public async Task AcceptedResultKeysetPlanUsesPersistedCursorIndexWithoutScanOrTemporarySort()
     {
         var graph = await CreateGraphAsync(includeShareSettings: true);
