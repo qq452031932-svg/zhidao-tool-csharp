@@ -132,6 +132,19 @@ public sealed class RemoteItemIdentitySetTests
 
 public sealed class BaiduAdapterShareResultTests
 {
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("abcde")]
+    [InlineData("a-b1")]
+    [InlineData("中文ab")]
+    public void PermanentShareRequestRejectsInvalidBaiduFixedExtractionCodesWithoutEchoingValue(string code)
+    {
+        var exception = Assert.Throws<ArgumentException>(() => new PermanentShareRequest(
+            new RemoteItemIdentitySet([new("remote", "name")]), code));
+
+        Assert.DoesNotContain(code, exception.ToString(), StringComparison.Ordinal);
+    }
+
     [Fact]
     public void ShareReceiptAndListingCarryExactEvidenceAndRedactSensitiveValues()
     {

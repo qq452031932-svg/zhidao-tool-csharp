@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -670,6 +671,107 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             Assert.Equal(2, reader.GetInt32(0));
             Assert.Equal(1, reader.GetInt32(1));
         }
+    }
+
+    [Fact]
+    public async Task ExecutionContextAndSubmissionTransitionsAreLeaseGenerationFenced()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var reserved = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+
+        var context = Assert.IsType<ShareExecutionContext>(await store.LoadAsync(graph.ShareOperationId));
+        Assert.True(context.Selected);
+        Assert.True(context.ShareEnabled);
+        Assert.Equal(graph.ItemSetFingerprint, context.ExactRemoteItems.Fingerprint);
+        Assert.Equal("Random", context.Settings.ExtractionCodeMode);
+        Assert.Null(context.ExistingShareDecision);
+
+        Assert.False(await store.TryMarkPreparingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration + 1, graph.Now));
+        Assert.True(await store.TryMarkPreparingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, graph.Now));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, "empty", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.False(await store.TryRecordDefinitelyNotAcceptedRetryAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, 2, graph.Now));
+        Assert.True(await store.TryRecordDefinitelyNotAcceptedRetryAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, 1, graph.Now));
+        Assert.True(await store.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, graph.Now.AddMinutes(1), graph.Now));
+        Assert.False(await store.TryFailAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration + 1, "TransientService", "safe", graph.Now));
+
+        Assert.Equal("ResultPending", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(2L, await ScalarAsync<long>(graph.Factory,
+            "SELECT AttemptCount FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("Unknown", await ScalarAsync<string>(graph.Factory,
+            "SELECT SubmissionAcceptance FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task DiscoveryPauseAndDecisionResumeAreAtomicAndStaleSnapshotsWriteNothing()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var accounts = await store.GetDecisionAccountsAsync(graph.BatchId);
+        var account = Assert.Single(accounts);
+        Assert.Equal(graph.AccountId, account.AccountId);
+        var sets = await store.GetDecisionExactSetFingerprintsKeysetPageAsync(
+            graph.BatchId, graph.AccountId, null, 1);
+        Assert.Equal(graph.ItemSetFingerprint, Assert.Single(sets.Items));
+        Assert.True(await store.ContainsDecisionExactSetAsync(
+            graph.BatchId, graph.AccountId, graph.ItemSetFingerprint));
+
+        var first = new BatchShareDiscoverySnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "discovery-one",
+            1, 1, 0, "operation-generation", graph.Now, 1);
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([first]));
+        Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        var decision = new BatchShareDecisionSnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
+            first.DiscoveryFingerprint, first.DiscoveredCount, first.CompatibleCount,
+            first.IncompatibleCount, first.Generation, graph.Now, first.Version);
+        Assert.True(await store.ApplyDecisionSnapshotsAsync([decision]));
+        Assert.Equal("WaitingShare", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+
+        var second = first with
+        {
+            DiscoveryFingerprint = "discovery-two", DiscoveredCount = 2,
+            CompatibleCount = 2, Version = 2, CompletedAt = graph.Now.AddSeconds(1),
+        };
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([second]));
+        Assert.False(await store.ApplyDecisionSnapshotsAsync([decision]));
+        Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(0, await CountAsync(graph.Factory, "BatchShareDecisionSnapshots"));
+    }
+
+    [Fact]
+    public async Task CancelDecisionRemainsPausedAndIncompatibleReuseIsRejectedWithZeroDecisionWrites()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var snapshot = new BatchShareDiscoverySnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "only-incompatible",
+            1, 0, 1, "operation-generation", graph.Now, 1);
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([snapshot]));
+        var reuse = new BatchShareDecisionSnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
+            snapshot.DiscoveryFingerprint, 1, 0, 1, snapshot.Generation, graph.Now, 1);
+        Assert.False(await store.ApplyDecisionSnapshotsAsync([reuse]));
+        Assert.Equal(0, await CountAsync(graph.Factory, "BatchShareDecisionSnapshots"));
+
+        var cancel = reuse with { Decision = "Cancel" };
+        Assert.True(await store.ApplyDecisionSnapshotsAsync([cancel]));
+        Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
     }
 
     [Fact]

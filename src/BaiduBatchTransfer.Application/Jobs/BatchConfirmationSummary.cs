@@ -96,7 +96,11 @@ public sealed class BatchDraft
         FixedExtractionCode = extractionCodeBehavior == ShareExtractionCodeBehavior.Fixed
             ? string.IsNullOrWhiteSpace(fixedExtractionCode)
                 ? throw new ArgumentException("A fixed extraction code is required.", nameof(fixedExtractionCode))
-                : fixedExtractionCode.Trim()
+                : PermanentShareRequest.IsValidFixedExtractionCode(fixedExtractionCode)
+                    ? fixedExtractionCode.Trim()
+                    : throw new ArgumentException(
+                        "A fixed extraction code must contain exactly four ASCII letters or digits.",
+                        nameof(fixedExtractionCode))
             : fixedExtractionCode is null
                 ? null
                 : throw new ArgumentException("Random extraction-code mode cannot contain a fixed code.", nameof(fixedExtractionCode));

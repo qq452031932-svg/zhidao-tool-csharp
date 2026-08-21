@@ -1,10 +1,11 @@
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
+public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareExecutionStore, IExistingShareDecisionStore
 {
     internal const string ResultKeysetSelectSql = ResultColumns +
         ",BaiduShareResults.CandidateSequence,BaiduShareResults.OutputOrdinal FROM BaiduShareResults " +
@@ -66,6 +67,155 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
 
     public SqliteShareSchedulingStore(SqliteConnectionFactory factory) =>
         this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
+
+    public async Task<ShareExecutionContext?> LoadAsync(
+        Guid operationId,
+        CancellationToken cancellationToken = default)
+    {
+        if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await using var command = Command(connection, transaction, """
+            SELECT operation.Id,operation.TransferOperationId,operation.ResourceItemId,operation.BatchJobId,
+              operation.AccountId,operation.OutputOrdinal,operation.Status,operation.ExactItemSetFingerprint,
+              operation.SettingsFingerprint,operation.Generation,operation.RequestDescriptorJson,
+              operation.AdapterRequestId,operation.SubmissionAcceptance,operation.AttemptCount,
+              operation.LeaseExpiresAt,operation.SubmitStartedAt,operation.NextReconcileAt,
+              operation.LastErrorCode,operation.LastErrorMessage,operation.CreatedAt,operation.UpdatedAt,
+              operation.LeaseGeneration,
+              settings.IsPermanent,settings.IsAccessUnlimited,settings.ExtractionCodeMode,
+              settings.FixedExtractionCode,settings.ExistingSharePolicy,settings.CreatedAt,
+              output.ShareEnabled,
+              decision.Decision
+            FROM ShareOperations operation
+            JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
+              AND settings.SettingsFingerprint=operation.SettingsFingerprint
+            JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+              AND output.AccountId=operation.AccountId AND output.OutputOrdinal=operation.OutputOrdinal
+            LEFT JOIN BatchShareDecisionSnapshots decision ON decision.BatchJobId=operation.BatchJobId
+              AND decision.AccountId=operation.AccountId AND decision.SettingsFingerprint=operation.SettingsFingerprint
+              AND EXISTS(SELECT 1 FROM BatchShareDiscoverySnapshots discovery
+                WHERE discovery.BatchJobId=decision.BatchJobId AND discovery.AccountId=decision.AccountId
+                  AND discovery.SettingsFingerprint=decision.SettingsFingerprint
+                  AND discovery.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND discovery.DiscoveredCount=decision.DiscoveredCount
+                  AND discovery.CompatibleCount=decision.CompatibleCount
+                  AND discovery.IncompatibleCount=decision.IncompatibleCount
+                  AND discovery.Generation=decision.Generation
+                  AND discovery.Version=decision.DiscoveryVersion)
+            WHERE operation.Id=$id;
+            """);
+        Add(command, "$id", Id(operationId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        var operation = ReadOperation(reader);
+        var settings = new BatchShareSettingsRecord(
+            operation.BatchJobId, reader.GetInt64(22) != 0, reader.GetInt64(23) != 0,
+            reader.GetString(24), reader.IsDBNull(25) ? null : reader.GetString(25), reader.GetString(26),
+            ReadTime(reader, 27), operation.SettingsFingerprint);
+        var shareEnabled = reader.GetInt64(28) != 0;
+        var decision = reader.IsDBNull(29)
+            ? (ExistingShareDecision?)null
+            : Enum.Parse<ExistingShareDecision>(reader.GetString(29), ignoreCase: false);
+        await reader.DisposeAsync().ConfigureAwait(false);
+
+        await using var itemsCommand = Command(connection, transaction, """
+            SELECT RemoteItemId,DisplayName FROM ShareOperationRemoteItems
+            WHERE ShareOperationId=$id ORDER BY CanonicalSortKey;
+            """);
+        Add(itemsCommand, "$id", Id(operationId));
+        var items = new List<RemoteItemIdentity>();
+        await using (var itemsReader = await itemsCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            while (await itemsReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                items.Add(new(itemsReader.GetString(0), itemsReader.GetString(1)));
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        if (items.Count == 0) return null;
+        return new(operation, settings, Selected: true, shareEnabled, new(items), decision);
+    }
+
+    public Task<bool> TryMarkPreparingAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        TryTransitionAsync("""
+            UPDATE ShareOperations SET Status='Preparing',UpdatedAt=$updated
+            WHERE Id=$id AND Status='Reserved' AND Generation=$generation
+              AND LeaseGeneration=$leaseGeneration AND LeaseExpiresAt IS NOT NULL
+              AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL
+              AND EXISTS(SELECT 1 FROM BatchJobs batch
+                WHERE batch.Id=ShareOperations.BatchJobId AND batch.Status='Active')
+              AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
+                WHERE output.BatchJobId=ShareOperations.BatchJobId
+                  AND output.AccountId=ShareOperations.AccountId
+                  AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1);
+            """, operationId, generation, leaseGeneration, updatedAt, [], cancellationToken);
+
+    public Task<bool> TryRecordDefinitelyNotAcceptedRetryAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        int expectedAttemptCount,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (expectedAttemptCount < 1) throw new ArgumentOutOfRangeException(nameof(expectedAttemptCount));
+        return TryTransitionAsync("""
+            UPDATE ShareOperations SET AttemptCount=AttemptCount+1,
+              SubmissionAcceptance='DefinitelyNotAccepted',UpdatedAt=$updated
+            WHERE Id=$id AND Status='Submitting' AND Generation=$generation
+              AND LeaseGeneration=$leaseGeneration AND AttemptCount=$attempt
+              AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL;
+            """, operationId, generation, leaseGeneration, updatedAt,
+            [("$attempt", expectedAttemptCount)], cancellationToken);
+    }
+
+    public Task<bool> TryPauseAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        SharePauseReason reason,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(reason)) throw new ArgumentOutOfRangeException(nameof(reason));
+        return TryTransitionAsync("""
+            UPDATE ShareOperations SET Status='Paused',LeaseExpiresAt=NULL,
+              LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$updated
+            WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting')
+              AND Generation=$generation AND LeaseGeneration=$leaseGeneration
+              AND (Status<>'Submitting' OR SubmissionAcceptance='DefinitelyNotAccepted');
+            """, operationId, generation, leaseGeneration, updatedAt,
+            [("$code", reason.ToString()), ("$message", SafePauseMessage(reason))], cancellationToken);
+    }
+
+    public Task<bool> TryFailAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        string errorCode,
+        string safeMessage,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(errorCode);
+        ArgumentException.ThrowIfNullOrWhiteSpace(safeMessage);
+        if (errorCode.Length > 128 || safeMessage.Length > 512)
+            throw new ArgumentException("The stable share failure is too large.");
+        return TryTransitionAsync("""
+            UPDATE ShareOperations SET Status='Failed',LeaseExpiresAt=NULL,
+              LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$updated
+            WHERE Id=$id AND Status='Submitting' AND Generation=$generation
+              AND LeaseGeneration=$leaseGeneration
+              AND SubmissionAcceptance='DefinitelyNotAccepted';
+            """, operationId, generation, leaseGeneration, updatedAt,
+            [("$code", errorCode), ("$message", safeMessage)], cancellationToken);
+    }
 
     public async Task<ShareOperationRecord?> TryReserveNextAsync(
         DateTimeOffset now,
@@ -308,7 +458,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 UPDATE ShareOperations
                 SET Status='Preparing',BaselineGeneration=$generation,BaselineFingerprint=$fingerprint,
                   BaselineShareCount=$count,BaselineCompletedAt=$completed,UpdatedAt=$completed
-                WHERE Id=$id AND Status='Reserved' AND Generation=$generation
+                WHERE Id=$id AND Status IN ('Reserved','Preparing') AND Generation=$generation
                   AND LeaseGeneration=$leaseGeneration AND BaselineCompletedAt IS NULL
                   AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                     WHERE settings.BatchJobId=ShareOperations.BatchJobId
@@ -384,7 +534,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
     {
         if (nextReconcileAt < updatedAt) throw new ArgumentOutOfRangeException(nameof(nextReconcileAt));
         return TryTransitionAsync("""
-            UPDATE ShareOperations SET Status='ResultPending',LeaseExpiresAt=NULL,
+            UPDATE ShareOperations SET Status='ResultPending',SubmissionAcceptance='Unknown',LeaseExpiresAt=NULL,
               NextReconcileAt=$reconcile,UpdatedAt=$updated
             WHERE Id=$id AND Status='Submitting' AND Generation=$generation AND LeaseGeneration=$leaseGeneration
               AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL
@@ -413,6 +563,258 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                   AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
             """, shareOperationId, expectedGeneration, expectedLeaseGeneration, updatedAt,
             [("$status", expectedStatus.ToString()), ("$lease", Time(leaseExpiresAt))], cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ShareDecisionAccountContext>> GetDecisionAccountsAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await using var command = Command(connection, transaction, """
+            SELECT output.BatchJobId,output.AccountId,
+              settings.IsPermanent,settings.IsAccessUnlimited,settings.ExtractionCodeMode,
+              settings.FixedExtractionCode,settings.ExistingSharePolicy,settings.CreatedAt,settings.SettingsFingerprint
+            FROM BatchOutputAccounts output
+            JOIN BatchShareSettings settings ON settings.BatchJobId=output.BatchJobId
+            WHERE output.BatchJobId=$batch AND output.ShareEnabled=1
+              AND EXISTS(SELECT 1 FROM ShareOperations operation
+                WHERE operation.BatchJobId=output.BatchJobId AND operation.AccountId=output.AccountId
+                  AND operation.SettingsFingerprint=settings.SettingsFingerprint
+                  AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                  AND operation.ExactItemSetFingerprint IS NOT NULL
+                  AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+                    WHERE lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+                      AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                        WHERE item.ShareOperationId=operation.Id)))
+            ORDER BY output.OutputOrdinal,output.AccountId;
+            """);
+        Add(command, "$batch", Id(batchJobId));
+        var values = new List<ShareDecisionAccountContext>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var batch = Guid.Parse(reader.GetString(0));
+            var account = Guid.Parse(reader.GetString(1));
+            values.Add(new(batch, account, new(
+                batch, reader.GetInt64(2) != 0, reader.GetInt64(3) != 0, reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5), reader.GetString(6),
+                ReadTime(reader, 7), reader.GetString(8))));
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return values;
+    }
+
+    public async Task<StringKeysetPage<string>> GetDecisionExactSetFingerprintsKeysetPageAsync(
+        Guid batchJobId,
+        Guid accountId,
+        string? afterFingerprint,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty || accountId == Guid.Empty)
+            throw new ArgumentException("A batch and account are required.");
+        if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await using var command = Command(connection, transaction, """
+            SELECT DISTINCT operation.ExactItemSetFingerprint
+            FROM ShareOperations operation
+            JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+              AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+            JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
+              AND lineage.Generation=operation.Generation
+            WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+              AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+              AND operation.ExactItemSetFingerprint IS NOT NULL
+              AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                WHERE item.ShareOperationId=operation.Id)
+              AND ($after IS NULL OR operation.ExactItemSetFingerprint>$after)
+            ORDER BY operation.ExactItemSetFingerprint LIMIT $limit;
+            """);
+        Add(command, "$batch", Id(batchJobId)); Add(command, "$account", Id(accountId));
+        Add(command, "$after", afterFingerprint); Add(command, "$limit", checked(pageSize + 1));
+        var values = new List<string>(pageSize + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add(reader.GetString(0));
+        var more = values.Count > pageSize;
+        if (more) values.RemoveAt(values.Count - 1);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(values, more ? values[^1] : null);
+    }
+
+    public async Task<bool> ContainsDecisionExactSetAsync(
+        Guid batchJobId,
+        Guid accountId,
+        string exactItemSetFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(exactItemSetFingerprint);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT EXISTS(SELECT 1 FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+                AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
+                AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+                AND operation.ExactItemSetFingerprint=$fingerprint
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                  WHERE item.ShareOperationId=operation.Id));
+            """;
+        Add(command, "$batch", Id(batchJobId)); Add(command, "$account", Id(accountId));
+        Add(command, "$fingerprint", exactItemSetFingerprint);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    public async Task<bool> TrySaveDiscoveryAndPauseAsync(
+        IReadOnlyList<BatchShareDiscoverySnapshotRecord> snapshots,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshots);
+        if (snapshots.Count == 0 || snapshots.Select(value => (value.BatchJobId, value.AccountId)).Distinct().Count() != snapshots.Count)
+            throw new ArgumentException("Discovery snapshot accounts must be non-empty and unique.", nameof(snapshots));
+        foreach (var snapshot in snapshots) ValidateDiscoverySnapshot(snapshot);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            foreach (var snapshot in snapshots)
+            {
+                if (await HasUnsafeDecisionWorkAsync(connection, transaction, snapshot, cancellationToken).ConfigureAwait(false))
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
+
+                if (snapshot.Version > 1)
+                {
+                    await using var deleteDecision = Command(connection, transaction, """
+                        DELETE FROM BatchShareDecisionSnapshots
+                        WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                          AND DiscoveryVersion=$previous;
+                        """);
+                    Add(deleteDecision, "$batch", Id(snapshot.BatchJobId)); Add(deleteDecision, "$account", Id(snapshot.AccountId));
+                    Add(deleteDecision, "$settings", snapshot.SettingsFingerprint); Add(deleteDecision, "$previous", snapshot.Version - 1);
+                    await deleteDecision.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                var sql = snapshot.Version == 1
+                    ? """
+                      INSERT OR IGNORE INTO BatchShareDiscoverySnapshots(
+                        BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,DiscoveredCount,
+                        CompatibleCount,IncompatibleCount,Generation,CompletedAt,Version)
+                      SELECT $batch,$account,$settings,$fingerprint,$discovered,$compatible,$incompatible,$generation,$completed,$version
+                      WHERE EXISTS(SELECT 1 FROM BatchOutputAccounts output
+                        WHERE output.BatchJobId=$batch AND output.AccountId=$account AND output.ShareEnabled=1);
+                      """
+                    : """
+                      UPDATE BatchShareDiscoverySnapshots
+                      SET DiscoveryFingerprint=$fingerprint,DiscoveredCount=$discovered,CompatibleCount=$compatible,
+                        IncompatibleCount=$incompatible,Generation=$generation,CompletedAt=$completed,Version=$version
+                      WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                        AND Version=$previous;
+                      """;
+                await using var save = Command(connection, transaction, sql);
+                BindDiscovery(save, snapshot); Add(save, "$previous", snapshot.Version - 1);
+                if (await save.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
+            }
+
+            foreach (var snapshot in snapshots)
+            {
+                await using var pause = Command(connection, transaction, """
+                    UPDATE ShareOperations SET Status='Paused',LeaseExpiresAt=NULL,
+                      LastErrorCode='AwaitingExistingShareDecision',
+                      LastErrorMessage='等待确认已有分享',UpdatedAt=$updated
+                    WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                      AND Status IN ('WaitingShare','Reserved','Preparing');
+                    """);
+                Add(pause, "$batch", Id(snapshot.BatchJobId)); Add(pause, "$account", Id(snapshot.AccountId));
+                Add(pause, "$settings", snapshot.SettingsFingerprint); Add(pause, "$updated", Time(snapshot.CompletedAt));
+                await pause.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
+    }
+
+    public async Task<bool> ApplyDecisionSnapshotsAsync(
+        IReadOnlyList<BatchShareDecisionSnapshotRecord> snapshots,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshots);
+        if (snapshots.Count == 0) throw new ArgumentException("At least one decision is required.", nameof(snapshots));
+        if (snapshots.Select(value => (value.BatchJobId, value.AccountId)).Distinct().Count() != snapshots.Count)
+            throw new ArgumentException("Decision accounts must be unique.", nameof(snapshots));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            foreach (var snapshot in snapshots)
+            {
+                if (snapshot.Decision is not ("Reuse" or "Regenerate" or "Cancel") ||
+                    snapshot.CompatibleCount + snapshot.IncompatibleCount > snapshot.DiscoveredCount ||
+                    (snapshot.Decision == "Reuse" && snapshot.DiscoveredCount > 0 && snapshot.CompatibleCount == 0))
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
+                await using var insert = Command(connection, transaction, """
+                    INSERT INTO BatchShareDecisionSnapshots(BatchJobId,AccountId,SettingsFingerprint,Decision,
+                      DiscoveryFingerprint,DiscoveredCount,CompatibleCount,IncompatibleCount,Generation,ConfirmedAt,DiscoveryVersion)
+                    SELECT discovery.BatchJobId,discovery.AccountId,discovery.SettingsFingerprint,$decision,
+                      discovery.DiscoveryFingerprint,discovery.DiscoveredCount,discovery.CompatibleCount,
+                      discovery.IncompatibleCount,discovery.Generation,$confirmed,discovery.Version
+                    FROM BatchShareDiscoverySnapshots discovery
+                    WHERE discovery.BatchJobId=$batch AND discovery.AccountId=$account
+                      AND discovery.SettingsFingerprint=$settings AND discovery.DiscoveryFingerprint=$fingerprint
+                      AND discovery.DiscoveredCount=$discovered AND discovery.CompatibleCount=$compatible
+                      AND discovery.IncompatibleCount=$incompatible AND discovery.Generation=$generation
+                      AND discovery.Version=$version
+                    ON CONFLICT(BatchJobId,AccountId) DO NOTHING;
+                    """);
+                BindDecision(insert, snapshot);
+                if (await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                {
+                    var persisted = await GetDecisionSnapshotAsync(
+                        connection, transaction, snapshot.BatchJobId, snapshot.AccountId, cancellationToken).ConfigureAwait(false);
+                    if (persisted != snapshot with { ConfirmedAt = snapshot.ConfirmedAt.ToUniversalTime() })
+                    {
+                        await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                        return false;
+                    }
+                }
+            }
+
+            foreach (var snapshot in snapshots.Where(value => value.Decision != "Cancel"))
+            {
+                await using var resume = Command(connection, transaction, """
+                    UPDATE ShareOperations SET Status='WaitingShare',LeaseExpiresAt=NULL,
+                      LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$updated
+                    WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                      AND Status='Paused' AND LastErrorCode='AwaitingExistingShareDecision';
+                    """);
+                Add(resume, "$batch", Id(snapshot.BatchJobId)); Add(resume, "$account", Id(snapshot.AccountId));
+                Add(resume, "$settings", snapshot.SettingsFingerprint); Add(resume, "$updated", Time(snapshot.ConfirmedAt));
+                await resume.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (SqliteException)
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            return false;
+        }
+        catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
     }
 
     public async Task<bool> TrySaveDiscoverySnapshotAsync(
@@ -662,13 +1064,57 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
         Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),
         reader.GetString(5),reader.GetString(6),reader.GetInt32(7),reader.GetString(8),reader.GetString(9),reader.GetString(10),reader.GetInt64(11)!=0,reader.GetInt64(12)!=0,ReadTime(reader,13),ReadTime(reader,14));
 
+    private static ShareOperationRecord ReadOperation(SqliteDataReader reader) => new(
+        Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),
+        reader.GetInt32(5),reader.GetString(6),reader.GetString(7),reader.GetString(8),reader.GetInt32(9),
+        reader.IsDBNull(10)?null:reader.GetString(10),reader.IsDBNull(11)?null:reader.GetString(11),reader.GetString(12),reader.GetInt32(13),
+        ReadNullableTime(reader,14),ReadNullableTime(reader,15),ReadNullableTime(reader,16),reader.IsDBNull(17)?null:reader.GetString(17),
+        reader.IsDBNull(18)?null:reader.GetString(18),ReadTime(reader,19),ReadTime(reader,20),reader.GetInt64(21));
+
     private static async Task<ShareOperationRecord> GetOperationAsync(SqliteConnection connection, SqliteTransaction transaction, string id, CancellationToken token)
     {
         await using var command = Command(connection,transaction,"SELECT Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,LeaseGeneration FROM ShareOperations WHERE Id=$id;");
         Add(command,"$id",id); await using var reader=await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         if(!await reader.ReadAsync(token).ConfigureAwait(false))throw new InvalidDataException("Reserved share work disappeared.");
-        return new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),reader.GetInt32(5),reader.GetString(6),reader.GetString(7),reader.GetString(8),reader.GetInt32(9),reader.IsDBNull(10)?null:reader.GetString(10),reader.IsDBNull(11)?null:reader.GetString(11),reader.GetString(12),reader.GetInt32(13),ReadNullableTime(reader,14),ReadNullableTime(reader,15),ReadNullableTime(reader,16),reader.IsDBNull(17)?null:reader.GetString(17),reader.IsDBNull(18)?null:reader.GetString(18),ReadTime(reader,19),ReadTime(reader,20),reader.GetInt64(21));
+        return ReadOperation(reader);
     }
+
+    private static async Task<bool> HasUnsafeDecisionWorkAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BatchShareDiscoverySnapshotRecord snapshot,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT EXISTS(SELECT 1 FROM ShareOperations
+              WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                AND Status IN ('Submitting','ResultPending'));
+            """);
+        Add(command, "$batch", Id(snapshot.BatchJobId)); Add(command, "$account", Id(snapshot.AccountId));
+        Add(command, "$settings", snapshot.SettingsFingerprint);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    private static void BindDecision(SqliteCommand command, BatchShareDecisionSnapshotRecord snapshot)
+    {
+        Add(command, "$batch", Id(snapshot.BatchJobId)); Add(command, "$account", Id(snapshot.AccountId));
+        Add(command, "$settings", snapshot.SettingsFingerprint); Add(command, "$decision", snapshot.Decision);
+        Add(command, "$fingerprint", snapshot.DiscoveryFingerprint); Add(command, "$discovered", snapshot.DiscoveredCount);
+        Add(command, "$compatible", snapshot.CompatibleCount); Add(command, "$incompatible", snapshot.IncompatibleCount);
+        Add(command, "$generation", snapshot.Generation); Add(command, "$confirmed", Time(snapshot.ConfirmedAt));
+        Add(command, "$version", snapshot.DiscoveryVersion);
+    }
+
+    private static string SafePauseMessage(SharePauseReason reason) => reason switch
+    {
+        SharePauseReason.AwaitingExistingShareDecision => "等待确认已有分享",
+        SharePauseReason.IncompatibleExistingShare => "已有分享设置不兼容",
+        SharePauseReason.CancelledByUser => "用户取消分享",
+        SharePauseReason.AccountSessionUnavailable => "账号登录已失效",
+        SharePauseReason.AccountVerificationRequired => "账号需要安全验证",
+        SharePauseReason.ShareSettingsRejected => "分享设置不可用",
+        _ => "分享已暂停",
+    };
 
     private async Task<bool> TryTransitionAsync(
         string sql, Guid shareOperationId, int expectedGeneration, long expectedLeaseGeneration, DateTimeOffset updatedAt,
