@@ -151,8 +151,8 @@ public interface IExistingShareDecisionStore
 {
     Task<IReadOnlyList<ShareDecisionAccountContext>> GetDecisionAccountsAsync(Guid batchJobId, CancellationToken cancellationToken = default);
     Task<StringKeysetPage<string>> GetDecisionExactSetFingerprintsKeysetPageAsync(Guid batchJobId, Guid accountId, string? afterFingerprint, int pageSize, CancellationToken cancellationToken = default);
-    Task<long> GetDecisionWorkVersionAsync(Guid batchJobId, Guid accountId, string settingsFingerprint, CancellationToken cancellationToken = default);
     Task<long> BeginDiscoveryAsync(Guid runId, ShareDecisionAccountContext account, CancellationToken cancellationToken = default);
+    Task<StringKeysetPage<string>> GetDiscoveryRunExactSetFingerprintsKeysetPageAsync(Guid runId, Guid accountId, string? afterFingerprint, int pageSize, CancellationToken cancellationToken = default);
     Task<bool> ContainsDecisionExactSetAsync(Guid batchJobId, Guid accountId, string exactItemSetFingerprint, CancellationToken cancellationToken = default);
     Task StageDiscoveryPageAsync(Guid runId, ShareDecisionAccountContext account, IReadOnlyList<BaiduShareRecord> candidates, CancellationToken cancellationToken = default);
     Task<ExistingShareDiscoveryPage> GetStagedDiscoveryPageAsync(Guid runId, Guid accountId, string? afterCursor, int pageSize, CancellationToken cancellationToken = default);

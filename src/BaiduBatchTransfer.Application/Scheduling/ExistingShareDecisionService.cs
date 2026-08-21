@@ -41,7 +41,7 @@ public sealed class ExistingShareDecisionService
             foreach (var account in accounts)
             {
                 ValidateAccount(account, batchJobId);
-                var expectedWorkVersion=await store.BeginDiscoveryAsync(runId,account,cancellationToken).ConfigureAwait(false);
+                var expectedWorkCount=await store.BeginDiscoveryAsync(runId,account,cancellationToken).ConfigureAwait(false);
                 var session = await sessionStore.LoadAsync(account.AccountId.ToString("D"), cancellationToken)
                     .ConfigureAwait(false)
                     ?? throw new InvalidOperationException("A selected account session is unavailable.");
@@ -50,7 +50,7 @@ public sealed class ExistingShareDecisionService
                     batchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken).ConfigureAwait(false);
                 var version = previous is null ? 1 : checked(previous.Version + 1);
                 snapshots.Add(await ReadStagedSnapshotAsync(
-                    runId, account, expectedWorkVersion, version, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false));
+                    runId, account, expectedWorkCount, version, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false));
             }
 
             if (!await store.TrySaveDiscoveryAndPauseAsync(runId, snapshots, cancellationToken).ConfigureAwait(false))
@@ -91,13 +91,13 @@ public sealed class ExistingShareDecisionService
                     command.BatchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken)
                     .ConfigureAwait(false);
                 if (snapshot is null) return ExistingShareDecisionConfirmation.Stale;
-                var expectedWorkVersion=await store.BeginDiscoveryAsync(verificationRun,account,cancellationToken).ConfigureAwait(false);
+                var expectedWorkCount=await store.BeginDiscoveryAsync(verificationRun,account,cancellationToken).ConfigureAwait(false);
                 var session = await sessionStore.LoadAsync(account.AccountId.ToString("D"), cancellationToken)
                     .ConfigureAwait(false);
                 if (session is null) return ExistingShareDecisionConfirmation.Stale;
                 await StageAllAsync(verificationRun, account, session, cancellationToken).ConfigureAwait(false);
                 var currentEvidence = await ReadStagedSnapshotAsync(
-                    verificationRun, account, expectedWorkVersion, snapshot.Version, snapshot.CompletedAt, cancellationToken).ConfigureAwait(false);
+                    verificationRun, account, expectedWorkCount, snapshot.Version, snapshot.CompletedAt, cancellationToken).ConfigureAwait(false);
                 if (!SameEvidence(snapshot, currentEvidence)) return ExistingShareDecisionConfirmation.Stale;
                 snapshots.Add(snapshot);
             }
@@ -169,7 +169,7 @@ public sealed class ExistingShareDecisionService
     private async Task<BatchShareDiscoverySnapshotRecord> ReadStagedSnapshotAsync(
         Guid runId,
         ShareDecisionAccountContext account,
-        long expectedWorkVersion,
+        long expectedWorkCount,
         long version,
         DateTimeOffset completedAt,
         CancellationToken cancellationToken)
@@ -199,7 +199,7 @@ public sealed class ExistingShareDecisionService
         } while (cursor is not null);
         return new(account.BatchJobId, account.AccountId, account.Settings.SettingsFingerprint,
             Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(), discovered, compatible,
-            discovered-compatible, await ComputeOperationGenerationAsync(account, expectedWorkVersion, cancellationToken).ConfigureAwait(false),
+            discovered-compatible, await ComputeOperationGenerationAsync(runId, account, expectedWorkCount, cancellationToken).ConfigureAwait(false),
             completedAt, version);
     }
 
@@ -250,8 +250,9 @@ public sealed class ExistingShareDecisionService
     }
 
     private async Task<string> ComputeOperationGenerationAsync(
+        Guid runId,
         ShareDecisionAccountContext account,
-        long expectedWorkVersion,
+        long expectedWorkCount,
         CancellationToken cancellationToken)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -260,8 +261,8 @@ public sealed class ExistingShareDecisionService
         var count = 0;
         do
         {
-            var page = await store.GetDecisionExactSetFingerprintsKeysetPageAsync(
-                account.BatchJobId, account.AccountId, cursor, 500, cancellationToken).ConfigureAwait(false);
+            var page = await store.GetDiscoveryRunExactSetFingerprintsKeysetPageAsync(
+                runId, account.AccountId, cursor, 500, cancellationToken).ConfigureAwait(false);
             foreach (var fingerprint in page.Items)
             {
                 ShareReconciliationPolicy.Append(hash, fingerprint);
@@ -270,7 +271,7 @@ public sealed class ExistingShareDecisionService
             cursor = page.NextCursor;
         } while (cursor is not null);
         if (count == 0) throw new InvalidOperationException("The selected account has no exact share work.");
-        return $"{expectedWorkVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)}:{Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()}";
+        return $"{expectedWorkCount.ToString(System.Globalization.CultureInfo.InvariantCulture)}:{Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()}";
     }
 
     private static byte[] ParseToken(string value)

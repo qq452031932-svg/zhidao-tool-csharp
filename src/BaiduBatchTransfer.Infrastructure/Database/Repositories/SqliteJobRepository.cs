@@ -1,7 +1,6 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
-using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace BaiduBatchTransfer.Infrastructure.Database.Repositories;
@@ -623,11 +622,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                     cancellationToken.ThrowIfCancellationRequested();
                     if (!itemCounts.TryGetValue(value.ShareOperationId, out var count))
                         throw new ArgumentException("Every exact remote item must belong to the supplied share operations.", nameof(remoteItems));
-                    Bind(item,"$operation",Id(value.ShareOperationId),!itemPrepared);
-                    Bind(item,"$ordinal",value.ItemOrdinal,!itemPrepared);
-                    Bind(item,"$remote",value.RemoteItemId,!itemPrepared);
-                    Bind(item,"$sortKey",RemoteItemIdentitySet.GetCanonicalSortKey(value.RemoteItemId),!itemPrepared);
-                    Bind(item,"$name",value.DisplayName,!itemPrepared);
+                    Bind(item, "$operation", Id(value.ShareOperationId), !itemPrepared);
+                    Bind(item, "$ordinal", value.ItemOrdinal, !itemPrepared);
+                    Bind(item, "$remote", value.RemoteItemId, !itemPrepared);
+                    Bind(item, "$sortKey", RemoteItemIdentitySet.GetCanonicalSortKey(value.RemoteItemId), !itemPrepared);
+                    Bind(item, "$name", value.DisplayName, !itemPrepared);
                     if (!itemPrepared)
                     {
                         item.Prepare();
@@ -638,16 +637,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 }
             }
 
-            foreach (var operation in operationSnapshot)
-            {
-                var count = itemCounts[operation.Id];
-                if (count == 0 || !await HasContiguousItemOrdinalsAsync(operation.Id, count, cancellationToken).ConfigureAwait(false))
-                    throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", nameof(remoteItems));
-                var fingerprint = await RemoteItemIdentitySet.ComputeFingerprintFromCanonicalOrderAsync(
-                    ReadExactRemoteItemIdsAsync(operation.Id, cancellationToken), cancellationToken).ConfigureAwait(false);
-                if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
-                    throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
-            }
+            await ValidatePersistedExactRemoteItemsAsync(operationSnapshot, itemCounts, nameof(remoteItems), cancellationToken)
+                .ConfigureAwait(false);
             var evidenceIds = operationSnapshot.Select((_, index) => $"$evidence{index}").ToArray();
             await using (var evidence = Command($"""
                 UPDATE ShareOperationGenerations
@@ -657,7 +648,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 """))
             {
                 for (var index = 0; index < operationSnapshot.Length; index++)
-                    Add(evidence,evidenceIds[index],Id(operationSnapshot[index].Id));
+                    Add(evidence, evidenceIds[index], Id(operationSnapshot[index].Id));
                 evidence.Prepare();
                 if (await evidence.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != operationSnapshot.Length)
                     throw new InvalidOperationException("The complete exact-item evidence could not be sealed.");
@@ -684,24 +675,60 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         return counts;
     }
 
-    private async Task<bool> HasContiguousItemOrdinalsAsync(Guid operationId, int count, CancellationToken cancellationToken)
+    private async Task ValidatePersistedExactRemoteItemsAsync(
+        IReadOnlyList<ShareOperationRecord> operations,
+        IReadOnlyDictionary<Guid, int> itemCounts,
+        string parameterName,
+        CancellationToken cancellationToken)
     {
-        await using var command = Command("SELECT COUNT(*),MIN(ItemOrdinal),MAX(ItemOrdinal) FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation;");
-        Add(command,"$operation",Id(operationId));
+        var expected = operations.ToDictionary(value => value.Id);
+        var ids = operations.Select((_, index) => $"$exact{index}").ToArray();
+        await using var command = Command($"""
+            SELECT ShareOperationId,ItemOrdinal,RemoteItemId
+            FROM ShareOperationRemoteItems
+            WHERE ShareOperationId IN ({string.Join(',', ids)})
+            ORDER BY ShareOperationId,CanonicalSortKey;
+            """);
+        for (var index = 0; index < operations.Count; index++)
+            Add(command, ids[index], Id(operations[index].Id));
+        command.Prepare();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) && reader.GetInt64(0) == count &&
-            reader.GetInt64(1) == 0 && reader.GetInt64(2) == count - 1;
-    }
-
-    private async IAsyncEnumerable<string> ReadExactRemoteItemIdsAsync(
-        Guid operationId,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        await using var command = Command("SELECT RemoteItemId FROM ShareOperationRemoteItems WHERE ShareOperationId=$operation ORDER BY CanonicalSortKey;");
-        Add(command,"$operation",Id(operationId));
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        var verified = new HashSet<Guid>();
+        Guid current = Guid.Empty;
+        List<string>? exactIds = null;
+        var minimumOrdinal = int.MaxValue;
+        var maximumOrdinal = int.MinValue;
+        void Complete()
+        {
+            if (current == Guid.Empty) return;
+            var count = exactIds!.Count;
+            if (!itemCounts.TryGetValue(current, out var expectedCount) || count == 0 || count != expectedCount ||
+                minimumOrdinal != 0 || maximumOrdinal != count - 1)
+                throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", parameterName);
+            var fingerprint = RemoteItemIdentitySet.ComputeFingerprintFromCanonicalOrder(exactIds);
+            if (!string.Equals(fingerprint, expected[current].ExactItemSetFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", parameterName);
+            verified.Add(current);
+        }
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            yield return reader.GetString(0);
+        {
+            var operationId = Guid.Parse(reader.GetString(0));
+            if (operationId != current)
+            {
+                Complete();
+                current = operationId;
+                exactIds = [];
+                minimumOrdinal = int.MaxValue;
+                maximumOrdinal = int.MinValue;
+            }
+            var ordinal = reader.GetInt32(1);
+            minimumOrdinal = Math.Min(minimumOrdinal, ordinal);
+            maximumOrdinal = Math.Max(maximumOrdinal, ordinal);
+            exactIds!.Add(reader.GetString(2));
+        }
+        Complete();
+        if (verified.Count != operations.Count)
+            throw new ArgumentException("Each share operation requires one contiguous exact remote-item set.", parameterName);
     }
 
     private async Task ExecuteControlAsync(string sql, CancellationToken cancellationToken)
@@ -714,21 +741,28 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         IReadOnlyList<ShareOperationRecord> operations,
         CancellationToken cancellationToken)
     {
-        foreach (var group in operations.GroupBy(value => (value.BatchJobId, value.AccountId, value.OutputOrdinal)))
+        var groups = operations.GroupBy(value => (value.BatchJobId, value.AccountId, value.OutputOrdinal))
+            .Select(value => (value.Key.BatchJobId, value.Key.AccountId, value.Key.OutputOrdinal, Count: value.Count())).ToArray();
+        var rows = groups.Select((_, index) => $"($batch{index},$account{index},$ordinal{index},$count{index})");
+        await using var command = Command($"""
+            WITH requested(BatchJobId,AccountId,OutputOrdinal,RequestedCount) AS (VALUES {string.Join(',',rows)})
+            SELECT COUNT(*) FROM requested
+            LEFT JOIN BatchOutputAccounts output
+              ON output.BatchJobId=requested.BatchJobId AND output.AccountId=requested.AccountId
+             AND output.OutputOrdinal=requested.OutputOrdinal
+            WHERE output.BatchJobId IS NULL OR output.ShareEnabled<>1
+               OR output.CreatedShareOperationCount+requested.RequestedCount>output.PlannedShareCount;
+            """);
+        for (var index = 0; index < groups.Length; index++)
         {
-            await using var command = Command("""
-                SELECT ShareEnabled,PlannedShareCount,CreatedShareOperationCount
-                FROM BatchOutputAccounts output
-                WHERE BatchJobId=$batch AND AccountId=$account AND OutputOrdinal=$ordinal;
-                """);
-            Add(command, "$batch", Id(group.Key.BatchJobId));
-            Add(command, "$account", Id(group.Key.AccountId));
-            Add(command, "$ordinal", group.Key.OutputOrdinal);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false) || reader.GetInt64(0) != 1 ||
-                reader.GetInt64(2) + group.Count() > reader.GetInt64(1))
-                throw new InvalidOperationException("The confirmed output account cannot accept this share work.");
+            Add(command, $"$batch{index}", Id(groups[index].BatchJobId));
+            Add(command, $"$account{index}", Id(groups[index].AccountId));
+            Add(command, $"$ordinal{index}", groups[index].OutputOrdinal);
+            Add(command, $"$count{index}", groups[index].Count);
         }
+        command.Prepare();
+        if (Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 0)
+            throw new InvalidOperationException("The confirmed output account cannot accept this share work.");
     }
 
     private static T[] TakeBounded<T>(IEnumerable<T> source, int maximum, string parameterName)
@@ -741,17 +775,17 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
 
     private static void BindShareOperation(SqliteCommand command, ShareOperationRecord value, bool add)
     {
-        Bind(command,"$id",Id(value.Id),add); Bind(command,"$transfer",Id(value.TransferOperationId),add);
-        Bind(command,"$resource",Id(value.ResourceItemId),add); Bind(command,"$batch",Id(value.BatchJobId),add);
-        Bind(command,"$account",Id(value.AccountId),add); Bind(command,"$ordinal",value.OutputOrdinal,add);
-        Bind(command,"$status",value.Status,add); Bind(command,"$fingerprint",value.ExactItemSetFingerprint,add);
-        Bind(command,"$settings",value.SettingsFingerprint,add); Bind(command,"$generation",value.Generation,add);
-        Bind(command,"$descriptor",value.RequestDescriptorJson,add); Bind(command,"$request",value.AdapterRequestId,add);
-        Bind(command,"$acceptance",value.SubmissionAcceptance,add); Bind(command,"$attempts",value.AttemptCount,add);
-        Bind(command,"$leaseGeneration",value.LeaseGeneration,add); Bind(command,"$lease",NullableTime(value.LeaseExpiresAt),add);
-        Bind(command,"$submitted",NullableTime(value.SubmitStartedAt),add); Bind(command,"$reconcile",NullableTime(value.NextReconcileAt),add);
-        Bind(command,"$errorCode",value.LastErrorCode,add); Bind(command,"$errorMessage",value.LastErrorMessage,add);
-        Bind(command,"$created",Time(value.CreatedAt),add); Bind(command,"$updated",Time(value.UpdatedAt),add);
+        Bind(command, "$id", Id(value.Id), add); Bind(command, "$transfer", Id(value.TransferOperationId), add);
+        Bind(command, "$resource", Id(value.ResourceItemId), add); Bind(command, "$batch", Id(value.BatchJobId), add);
+        Bind(command, "$account", Id(value.AccountId), add); Bind(command, "$ordinal", value.OutputOrdinal, add);
+        Bind(command, "$status", value.Status, add); Bind(command, "$fingerprint", value.ExactItemSetFingerprint, add);
+        Bind(command, "$settings", value.SettingsFingerprint, add); Bind(command, "$generation", value.Generation, add);
+        Bind(command, "$descriptor", value.RequestDescriptorJson, add); Bind(command, "$request", value.AdapterRequestId, add);
+        Bind(command, "$acceptance", value.SubmissionAcceptance, add); Bind(command, "$attempts", value.AttemptCount, add);
+        Bind(command, "$leaseGeneration", value.LeaseGeneration, add); Bind(command, "$lease", NullableTime(value.LeaseExpiresAt), add);
+        Bind(command, "$submitted", NullableTime(value.SubmitStartedAt), add); Bind(command, "$reconcile", NullableTime(value.NextReconcileAt), add);
+        Bind(command, "$errorCode", value.LastErrorCode, add); Bind(command, "$errorMessage", value.LastErrorMessage, add);
+        Bind(command, "$created", Time(value.CreatedAt), add); Bind(command, "$updated", Time(value.UpdatedAt), add);
     }
 
     private static void Bind(SqliteCommand command, string name, object? value, bool add)

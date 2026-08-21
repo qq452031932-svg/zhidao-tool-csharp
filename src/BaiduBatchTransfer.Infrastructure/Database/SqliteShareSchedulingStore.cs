@@ -757,23 +757,6 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
 
-    public async Task<long> GetDecisionWorkVersionAsync(
-        Guid batchJobId, Guid accountId, string settingsFingerprint,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(settingsFingerprint);
-        await using var connection=await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var command=connection.CreateCommand();
-        command.CommandText="""
-            SELECT Version FROM BatchShareWorkVersions
-            WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
-            """;
-        Add(command,"$batch",Id(batchJobId));Add(command,"$account",Id(accountId));Add(command,"$settings",settingsFingerprint);
-        var value=await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        if(value is null||value is DBNull)throw new InvalidOperationException("The selected account has no exact share work.");
-        return Convert.ToInt64(value,System.Globalization.CultureInfo.InvariantCulture);
-    }
-
     public async Task<long> BeginDiscoveryAsync(
         Guid runId,ShareDecisionAccountContext account,CancellationToken cancellationToken=default)
     {
@@ -795,11 +778,19 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             }
             await using(var acquire=Command(connection,transaction,"""
                 INSERT OR IGNORE INTO BatchShareDiscoveryRuns(
-                  RunId,BatchJobId,AccountId,SettingsFingerprint,ExpectedWorkVersion,CreatedAt,ExpiresAt)
-                SELECT $run,$batch,$account,$settings,version.Version,$now,$expires
-                FROM BatchShareWorkVersions version
-                WHERE version.BatchJobId=$batch AND version.AccountId=$account
-                  AND version.SettingsFingerprint=$settings;
+                  RunId,BatchJobId,AccountId,SettingsFingerprint,ExpectedWorkCount,CreatedAt,ExpiresAt)
+                SELECT $run,$batch,$account,$settings,COUNT(DISTINCT operation.ExactItemSetFingerprint),$now,$expires
+                FROM ShareOperations operation
+                JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+                  AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+                JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
+                  AND lineage.Generation=operation.Generation
+                WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+                  AND operation.SettingsFingerprint=$settings
+                  AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                  AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                    WHERE item.ShareOperationId=operation.Id)
+                HAVING COUNT(DISTINCT operation.ExactItemSetFingerprint)>0;
                 """))
             {
                 Add(acquire,"$run",Id(runId));Add(acquire,"$batch",Id(account.BatchJobId));
@@ -807,17 +798,43 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 Add(acquire,"$now",Time(now));Add(acquire,"$expires",Time(now.AddHours(1)));
                 await acquire.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
-            await using var verify=Command(connection,transaction,"""
-                SELECT ExpectedWorkVersion FROM BatchShareDiscoveryRuns
+            long expectedWorkCount;
+            await using(var verify=Command(connection,transaction,"""
+                SELECT ExpectedWorkCount FROM BatchShareDiscoveryRuns
                 WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
-                """);
-            Add(verify,"$run",Id(runId));Add(verify,"$batch",Id(account.BatchJobId));
-            Add(verify,"$account",Id(account.AccountId));Add(verify,"$settings",account.Settings.SettingsFingerprint);
-            var value=await verify.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            if(value is null||value is DBNull)
-                throw new InvalidOperationException("Another share discovery is already active for this account.");
+                """))
+            {
+                Add(verify,"$run",Id(runId));Add(verify,"$batch",Id(account.BatchJobId));
+                Add(verify,"$account",Id(account.AccountId));Add(verify,"$settings",account.Settings.SettingsFingerprint);
+                var value=await verify.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+                if(value is null||value is DBNull)
+                    throw new InvalidOperationException("Another share discovery is already active for this account.");
+                expectedWorkCount=Convert.ToInt64(value,System.Globalization.CultureInfo.InvariantCulture);
+            }
+            await using(var capture=Command(connection,transaction,"""
+                INSERT INTO BatchShareDiscoveryRunExactSets(RunId,AccountId,ExactItemSetFingerprint)
+                SELECT $run,$account,operation.ExactItemSetFingerprint
+                FROM ShareOperations operation
+                JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+                  AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+                JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id
+                  AND lineage.Generation=operation.Generation
+                WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+                  AND operation.SettingsFingerprint=$settings
+                  AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                  AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                    WHERE item.ShareOperationId=operation.Id)
+                GROUP BY operation.ExactItemSetFingerprint
+                ON CONFLICT(RunId,AccountId,ExactItemSetFingerprint) DO NOTHING;
+                """))
+            {
+                Add(capture,"$run",Id(runId));Add(capture,"$batch",Id(account.BatchJobId));
+                Add(capture,"$account",Id(account.AccountId));Add(capture,"$settings",account.Settings.SettingsFingerprint);
+                if(await capture.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false)!=expectedWorkCount)
+                    throw new InvalidOperationException("The exact share work changed while discovery was starting.");
+            }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return Convert.ToInt64(value,System.Globalization.CultureInfo.InvariantCulture);
+            return expectedWorkCount;
         }
         catch{await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);throw;}
     }
@@ -877,19 +894,36 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     SELECT $run,$batch,$account,$settings,candidate.Fingerprint,candidate.ShareId,
                       candidate.ShareUrl,candidate.ExtractionCode,candidate.IsPermanent,candidate.IsUnlimited,candidate.IsCompatible
                     FROM candidate
-                    WHERE EXISTS(SELECT 1 FROM ShareOperations operation
-                      JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
-                        AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
-                      WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
-                        AND operation.SettingsFingerprint=$settings
-                        AND operation.ExactItemSetFingerprint=candidate.Fingerprint
-                        AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused'));
+                    WHERE EXISTS(SELECT 1 FROM BatchShareDiscoveryRunExactSets exactSet
+                      WHERE exactSet.RunId=$run AND exactSet.AccountId=$account
+                        AND exactSet.ExactItemSetFingerprint=candidate.Fingerprint);
                     """;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
+    }
+
+    public async Task<StringKeysetPage<string>> GetDiscoveryRunExactSetFingerprintsKeysetPageAsync(
+        Guid runId,Guid accountId,string? afterFingerprint,int pageSize,CancellationToken cancellationToken=default)
+    {
+        if(runId==Guid.Empty||accountId==Guid.Empty)throw new ArgumentException("A run and account are required.");
+        if(pageSize is <1 or >1000)throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var connection=await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command=connection.CreateCommand();
+        command.CommandText="""
+            SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryRunExactSets
+            WHERE RunId=$run AND AccountId=$account AND ($after IS NULL OR ExactItemSetFingerprint>$after)
+            ORDER BY ExactItemSetFingerprint LIMIT $limit;
+            """;
+        Add(command,"$run",Id(runId));Add(command,"$account",Id(accountId));Add(command,"$after",afterFingerprint);
+        Add(command,"$limit",checked(pageSize+1));
+        var values=new List<string>(pageSize+1);
+        await using var reader=await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while(await reader.ReadAsync(cancellationToken).ConfigureAwait(false))values.Add(reader.GetString(0));
+        var more=values.Count>pageSize;if(more)values.RemoveAt(values.Count-1);
+        return new(values,more?values[^1]:null);
     }
 
     public async Task<ExistingShareDiscoveryPage> GetStagedDiscoveryPageAsync(
@@ -952,7 +986,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             foreach (var snapshot in snapshots)
             {
                 if (!await HasDiscoveryOwnershipAsync(connection,transaction,runId,snapshot,cancellationToken).ConfigureAwait(false) ||
-                    !await HasExpectedWorkVersionAsync(connection,transaction,snapshot,cancellationToken).ConfigureAwait(false))
+                    !await CurrentExactSetsMatchRunAsync(connection,transaction,runId,snapshot,cancellationToken).ConfigureAwait(false))
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                     return false;
@@ -980,6 +1014,13 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     Add(deleteMembers, "$batch", Id(snapshot.BatchJobId)); Add(deleteMembers, "$account", Id(snapshot.AccountId));
                     Add(deleteMembers, "$settings", snapshot.SettingsFingerprint);
                     await deleteMembers.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await using var deleteExactSets=Command(connection,transaction,"""
+                        DELETE FROM BatchShareDiscoveryExactSets
+                        WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+                        """);
+                    Add(deleteExactSets,"$batch",Id(snapshot.BatchJobId));Add(deleteExactSets,"$account",Id(snapshot.AccountId));
+                    Add(deleteExactSets,"$settings",snapshot.SettingsFingerprint);
+                    await deleteExactSets.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 var sql = snapshot.Version == 1
@@ -1004,6 +1045,18 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                     return false;
+                }
+
+                await using(var copyExactSets=Command(connection,transaction,"""
+                    INSERT INTO BatchShareDiscoveryExactSets(BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint)
+                    SELECT $batch,$account,$settings,ExactItemSetFingerprint
+                    FROM BatchShareDiscoveryRunExactSets WHERE RunId=$run AND AccountId=$account;
+                    """))
+                {
+                    Add(copyExactSets,"$batch",Id(snapshot.BatchJobId));Add(copyExactSets,"$account",Id(snapshot.AccountId));
+                    Add(copyExactSets,"$settings",snapshot.SettingsFingerprint);Add(copyExactSets,"$run",Id(runId));
+                    if(await copyExactSets.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false)!=ParseWorkCount(snapshot.Generation))
+                    {await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);return false;}
                 }
 
                 await using var copyMembers = Command(connection, transaction, """
@@ -1087,7 +1140,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         {
             foreach (var snapshot in snapshots)
             {
-                if(!await HasExpectedWorkVersionAsync(connection,transaction,snapshot,cancellationToken).ConfigureAwait(false))
+                if(!await CurrentExactSetsMatchDiscoveryAsync(connection,transaction,snapshot,cancellationToken).ConfigureAwait(false))
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                     return false;
@@ -1439,47 +1492,76 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         await using var command=Command(connection,transaction,"""
             SELECT EXISTS(SELECT 1 FROM BatchShareDiscoveryRuns
               WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account
-                AND SettingsFingerprint=$settings AND ExpectedWorkVersion=$version AND ExpiresAt>$now);
+                AND SettingsFingerprint=$settings AND ExpectedWorkCount=$count AND ExpiresAt>$now);
             """);
         Add(command,"$run",Id(runId));Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));
-        Add(command,"$settings",snapshot.SettingsFingerprint);Add(command,"$version",ParseWorkVersion(snapshot.Generation));
+        Add(command,"$settings",snapshot.SettingsFingerprint);Add(command,"$count",ParseWorkCount(snapshot.Generation));
         Add(command,"$now",Time(DateTimeOffset.UtcNow));
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
     }
 
-    private static async Task<bool> HasExpectedWorkVersionAsync(
-        SqliteConnection connection,SqliteTransaction transaction,
+    private static async Task<bool> CurrentExactSetsMatchRunAsync(
+        SqliteConnection connection,SqliteTransaction transaction,Guid runId,
         BatchShareDiscoverySnapshotRecord snapshot,CancellationToken cancellationToken)
-        =>await HasExpectedWorkVersionAsync(connection,transaction,snapshot.BatchJobId,snapshot.AccountId,
-            snapshot.SettingsFingerprint,snapshot.Generation,cancellationToken).ConfigureAwait(false);
-
-    private static async Task<bool> HasExpectedWorkVersionAsync(
-        SqliteConnection connection,SqliteTransaction transaction,
-        BatchShareDecisionSnapshotRecord snapshot,CancellationToken cancellationToken)
-        =>await HasExpectedWorkVersionAsync(connection,transaction,snapshot.BatchJobId,snapshot.AccountId,
-            snapshot.SettingsFingerprint,snapshot.Generation,cancellationToken).ConfigureAwait(false);
-
-    private static async Task<bool> HasExpectedWorkVersionAsync(
-        SqliteConnection connection,SqliteTransaction transaction,Guid batchJobId,Guid accountId,
-        string settingsFingerprint,string generation,CancellationToken cancellationToken)
     {
-        var expected=ParseWorkVersion(generation);
         await using var command=Command(connection,transaction,"""
-            SELECT EXISTS(SELECT 1 FROM BatchShareWorkVersions
-              WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings AND Version=$version);
+            SELECT NOT EXISTS(
+              SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
+              EXCEPT SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryRunExactSets WHERE RunId=$run AND AccountId=$account)
+            AND NOT EXISTS(
+              SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryRunExactSets WHERE RunId=$run AND AccountId=$account
+              EXCEPT SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id));
             """);
-        Add(command,"$batch",Id(batchJobId));Add(command,"$account",Id(accountId));
-        Add(command,"$settings",settingsFingerprint);Add(command,"$version",expected);
+        Add(command,"$run",Id(runId));Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));
+        Add(command,"$settings",snapshot.SettingsFingerprint);
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
     }
 
-    private static long ParseWorkVersion(string generation)
+    private static async Task<bool> CurrentExactSetsMatchDiscoveryAsync(
+        SqliteConnection connection,SqliteTransaction transaction,
+        BatchShareDecisionSnapshotRecord snapshot,CancellationToken cancellationToken)
+    {
+        await using var command=Command(connection,transaction,"""
+            SELECT NOT EXISTS(
+              SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id)
+              EXCEPT SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryExactSets
+                WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings)
+            AND NOT EXISTS(
+              SELECT ExactItemSetFingerprint FROM BatchShareDiscoveryExactSets
+                WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+              EXCEPT SELECT DISTINCT operation.ExactItemSetFingerprint FROM ShareOperations operation
+              JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+              JOIN ShareOperationGenerations lineage ON lineage.ShareOperationId=operation.Id AND lineage.Generation=operation.Generation
+              WHERE operation.BatchJobId=$batch AND operation.AccountId=$account AND operation.SettingsFingerprint=$settings
+                AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item WHERE item.ShareOperationId=operation.Id));
+            """);
+        Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));Add(command,"$settings",snapshot.SettingsFingerprint);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
+    }
+
+    private static long ParseWorkCount(string generation)
     {
         var separator=generation.IndexOf(':');
         if(separator<=0||!long.TryParse(generation.AsSpan(0,separator),System.Globalization.NumberStyles.None,
-               System.Globalization.CultureInfo.InvariantCulture,out var version)||version<1)
+               System.Globalization.CultureInfo.InvariantCulture,out var count)||count<1)
             throw new ArgumentException("The discovery work generation is invalid.",nameof(generation));
-        return version;
+        return count;
     }
 
     private static void BindDecision(SqliteCommand command, BatchShareDecisionSnapshotRecord snapshot)

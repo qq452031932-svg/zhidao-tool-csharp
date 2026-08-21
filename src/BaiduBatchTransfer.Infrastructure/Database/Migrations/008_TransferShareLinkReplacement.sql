@@ -269,10 +269,6 @@ CREATE INDEX IX_ShareOperations_Status_Lease_Id
 ON ShareOperations(Status, LeaseExpiresAt, Id);
 CREATE INDEX IX_ShareOperations_Account_Status_Lease_Id
 ON ShareOperations(AccountId, Status, LeaseExpiresAt, Id);
-CREATE INDEX IX_ShareOperations_Batch_Status_Resource_Id
-ON ShareOperations(BatchJobId, Status, ResourceItemId, Id);
-CREATE INDEX IX_ShareOperations_Resource_Account_Status_Id
-ON ShareOperations(ResourceItemId, AccountId, Status, Id);
 CREATE INDEX IX_ShareOperations_Batch_Status_Lease_Output_Id
 ON ShareOperations(BatchJobId, Status, LeaseExpiresAt, OutputOrdinal, Id);
 CREATE INDEX IX_BatchJobs_Status_Queue_Created_Id
@@ -331,49 +327,6 @@ CREATE TABLE ShareOperationGenerations (
     FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE
 );
 
-CREATE TABLE BatchShareWorkVersions (
-    BatchJobId TEXT NOT NULL,
-    AccountId TEXT NOT NULL,
-    SettingsFingerprint TEXT NOT NULL,
-    Version INTEGER NOT NULL CHECK(typeof(Version)='integer' AND Version > 0),
-    PRIMARY KEY(BatchJobId,AccountId,SettingsFingerprint),
-    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint) ON DELETE CASCADE,
-    FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE
-);
-
-CREATE TRIGGER TR_ShareOperations_WorkVersion_Insert
-AFTER INSERT ON ShareOperations
-WHEN NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-BEGIN
-    INSERT INTO BatchShareWorkVersions(BatchJobId,AccountId,SettingsFingerprint,Version)
-    VALUES(NEW.BatchJobId,NEW.AccountId,NEW.SettingsFingerprint,1)
-    ON CONFLICT(BatchJobId,AccountId,SettingsFingerprint) DO UPDATE SET Version=Version+1;
-END;
-
-CREATE TRIGGER TR_ShareOperations_WorkVersion_Delete
-AFTER DELETE ON ShareOperations
-WHEN OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-BEGIN
-    UPDATE BatchShareWorkVersions SET Version=Version+1
-    WHERE BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId AND SettingsFingerprint=OLD.SettingsFingerprint;
-END;
-
-CREATE TRIGGER TR_ShareOperations_WorkVersion_Update
-AFTER UPDATE OF BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,Generation,Status ON ShareOperations
-WHEN OLD.BatchJobId<>NEW.BatchJobId OR OLD.AccountId<>NEW.AccountId
-  OR OLD.SettingsFingerprint<>NEW.SettingsFingerprint
-  OR OLD.ExactItemSetFingerprint<>NEW.ExactItemSetFingerprint OR OLD.Generation<>NEW.Generation
-  OR (OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused'))<>(NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused'))
-BEGIN
-    UPDATE BatchShareWorkVersions SET Version=Version+1
-    WHERE OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-      AND BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId AND SettingsFingerprint=OLD.SettingsFingerprint;
-    INSERT INTO BatchShareWorkVersions(BatchJobId,AccountId,SettingsFingerprint,Version)
-    SELECT NEW.BatchJobId,NEW.AccountId,NEW.SettingsFingerprint,1
-    WHERE NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused')
-    ON CONFLICT(BatchJobId,AccountId,SettingsFingerprint) DO UPDATE SET Version=Version+1;
-END;
-
 CREATE TRIGGER TR_ShareOperations_RecordInitialGeneration
 AFTER INSERT ON ShareOperations
 WHEN NEW.ExactItemSetFingerprint IS NOT NULL
@@ -426,23 +379,13 @@ ON ShareOperationRemoteItems(ShareOperationId, ItemOrdinal, RemoteItemId);
 CREATE INDEX IX_ShareOperationRemoteItems_Operation_CanonicalSortKey
 ON ShareOperationRemoteItems(ShareOperationId, CanonicalSortKey);
 
-CREATE TRIGGER TR_ShareOperationRemoteItems_RequireExactBoundary
+CREATE TRIGGER TR_ShareOperationRemoteItems_RequireMutableExactBoundary
 BEFORE INSERT ON ShareOperationRemoteItems
 BEGIN
     SELECT CASE WHEN NOT EXISTS(
-        SELECT 1 FROM ShareOperations operation
-        WHERE operation.Id=NEW.ShareOperationId
-          AND operation.Status<>'WaitingTransfer'
-          AND operation.ExactItemSetFingerprint IS NOT NULL)
+        SELECT 1 FROM ShareOperationGenerations lineage
+        WHERE lineage.ShareOperationId=NEW.ShareOperationId AND lineage.ExactItemCount IS NULL)
       THEN RAISE(ABORT, 'exact remote items require an exact share boundary') END;
-END;
-
-CREATE TRIGGER TR_ShareOperationRemoteItems_SealInsert
-BEFORE INSERT ON ShareOperationRemoteItems
-WHEN EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
-  WHERE lineage.ShareOperationId=NEW.ShareOperationId AND lineage.ExactItemCount IS NOT NULL)
-BEGIN
-    SELECT RAISE(ABORT, 'validated exact remote items are immutable');
 END;
 
 CREATE TRIGGER TR_ShareOperationRemoteItems_SealUpdate
@@ -601,7 +544,7 @@ CREATE TABLE BatchShareDiscoveryRuns (
     BatchJobId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
     SettingsFingerprint TEXT NOT NULL,
-    ExpectedWorkVersion INTEGER NOT NULL CHECK(typeof(ExpectedWorkVersion)='integer' AND ExpectedWorkVersion > 0),
+    ExpectedWorkCount INTEGER NOT NULL CHECK(typeof(ExpectedWorkCount)='integer' AND ExpectedWorkCount > 0),
     CreatedAt TEXT NOT NULL,
     ExpiresAt TEXT NOT NULL,
     PRIMARY KEY(RunId,AccountId),
@@ -612,6 +555,24 @@ CREATE TABLE BatchShareDiscoveryRuns (
 
 CREATE INDEX IX_BatchShareDiscoveryRuns_Expiry
 ON BatchShareDiscoveryRuns(ExpiresAt,RunId,AccountId);
+
+CREATE TABLE BatchShareDiscoveryRunExactSets (
+    RunId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NOT NULL,
+    PRIMARY KEY(RunId,AccountId,ExactItemSetFingerprint),
+    FOREIGN KEY(RunId,AccountId) REFERENCES BatchShareDiscoveryRuns(RunId,AccountId) ON DELETE CASCADE
+);
+
+CREATE TABLE BatchShareDiscoveryExactSets (
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NOT NULL,
+    PRIMARY KEY(BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint),
+    FOREIGN KEY(BatchJobId,AccountId,SettingsFingerprint)
+      REFERENCES BatchShareDiscoverySnapshots(BatchJobId,AccountId,SettingsFingerprint) ON DELETE CASCADE
+);
 
 CREATE TABLE BatchShareDiscoveryStaging (
     RunId TEXT NOT NULL,

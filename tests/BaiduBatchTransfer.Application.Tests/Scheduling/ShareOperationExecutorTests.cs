@@ -618,11 +618,11 @@ public sealed class ShareOperationExecutorTests
         public Task<bool> ContainsDecisionExactSetAsync(Guid batchJobId, Guid accountId, string exactItemSetFingerprint, CancellationToken cancellationToken = default) =>
             Task.FromResult(exactSets[accountId].Any(value => value.Fingerprint == exactItemSetFingerprint));
 
-        public Task<long> GetDecisionWorkVersionAsync(Guid batchJobId, Guid accountId, string settingsFingerprint, CancellationToken cancellationToken = default) =>
-            Task.FromResult(1L);
-
         public Task<long> BeginDiscoveryAsync(Guid runId, ShareDecisionAccountContext account, CancellationToken cancellationToken = default) =>
-            Task.FromResult(1L);
+            Task.FromResult((long)exactSets[account.AccountId].Select(value => value.Fingerprint).Distinct().Count());
+
+        public Task<StringKeysetPage<string>> GetDiscoveryRunExactSetFingerprintsKeysetPageAsync(Guid runId, Guid accountId, string? afterFingerprint, int pageSize, CancellationToken cancellationToken = default) =>
+            GetDecisionExactSetFingerprintsKeysetPageAsync(accounts[0].BatchJobId, accountId, afterFingerprint, pageSize, cancellationToken);
 
         public Task StageDiscoveryPageAsync(Guid runId, ShareDecisionAccountContext account, IReadOnlyList<BaiduShareRecord> candidates, CancellationToken cancellationToken = default)
         {

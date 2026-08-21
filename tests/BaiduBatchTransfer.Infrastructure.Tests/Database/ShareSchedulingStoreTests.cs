@@ -11,6 +11,18 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-share-store-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task FreshShareSchemaOmitsUnusedResourceOperationIndexes()
+    {
+        var graph=await CreateGraphAsync(includeShareSettings:true);
+        await using var connection=await graph.Factory.OpenConnectionAsync();
+        await using var command=connection.CreateCommand();
+        command.CommandText="SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='IX_ShareOperations_Resource_Account_Status_Id';";
+        Assert.Equal(0L,Convert.ToInt64(await command.ExecuteScalarAsync()));
+        command.CommandText="SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='IX_ShareOperations_Batch_Status_Resource_Id';";
+        Assert.Equal(0L,Convert.ToInt64(await command.ExecuteScalarAsync()));
+    }
+
+    [Fact]
     public async Task ShareDisabledHistoricalBatchCannotAcquireShareWork()
     {
         var graph = await CreateGraphAsync(includeShareSettings: false);
@@ -56,15 +68,6 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 handoff.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
                 Assert.Equal(1, await handoff.ExecuteNonQueryAsync());
             }
-            if (addRemoteItem)
-            {
-                await using var remote = connection.CreateCommand();
-                remote.Transaction = transaction;
-                remote.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($id,0,'remote-bypass',$sort,'Bypass');";
-                remote.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
-                remote.Parameters.AddWithValue("$sort", new byte[] { 1 });
-                Assert.Equal(1, await remote.ExecuteNonQueryAsync());
-            }
             if (addLineage)
             {
                 await using var lineage = connection.CreateCommand();
@@ -77,6 +80,16 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 lineage.Parameters.AddWithValue("$items", graph.ItemSetFingerprint);
                 lineage.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
                 Assert.Equal(1, await lineage.ExecuteNonQueryAsync());
+            }
+            if (addRemoteItem)
+            {
+                await using var remote = connection.CreateCommand();
+                remote.Transaction = transaction;
+                remote.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($id,0,'remote-bypass',$sort,'Bypass');";
+                remote.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+                remote.Parameters.AddWithValue("$sort", new byte[] { 1 });
+                if(addLineage)Assert.Equal(1,await remote.ExecuteNonQueryAsync());
+                else await Assert.ThrowsAsync<SqliteException>(()=>remote.ExecuteNonQueryAsync());
             }
             await transaction.CommitAsync();
         }
@@ -899,7 +912,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ConcurrentDiscoveryOwnerAndWorkVersionCasPreventPartialOrStaleAuthorization()
+    public async Task ConcurrentDiscoveryOwnerAndExactSetCasPreventPartialOrStaleAuthorization()
     {
         var graph=await CreateGraphAsync(includeShareSettings:true);
         var store=new SqliteShareSchedulingStore(graph.Factory);
@@ -915,16 +928,15 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         await using(var connection=await graph.Factory.OpenConnectionAsync())
         await using(var bump=connection.CreateCommand())
         {
-            bump.CommandText="UPDATE BatchShareWorkVersions SET Version=Version+1 WHERE BatchJobId=$batch AND AccountId=$account;";
-            bump.Parameters.AddWithValue("$batch",graph.BatchId.ToString("D"));
-            bump.Parameters.AddWithValue("$account",graph.AccountId.ToString("D"));
+            bump.CommandText="UPDATE ShareOperations SET Status='Failed' WHERE Id=$id;";
+            bump.Parameters.AddWithValue("$id",graph.ShareOperationId.ToString("D"));
             Assert.Equal(1,await bump.ExecuteNonQueryAsync());
         }
         var stale=new BatchShareDiscoverySnapshotRecord(graph.BatchId,graph.AccountId,graph.SettingsFingerprint,
             "stale",1,1,0,"1:exact-hash",graph.Now,1);
         Assert.False(await store.TrySaveDiscoveryAndPauseAsync(firstRun,[stale]));
         Assert.Equal(0,await CountAsync(graph.Factory,"BatchShareDiscoverySnapshots"));
-        Assert.Equal("WaitingShare",await ScalarAsync<string>(graph.Factory,
+        Assert.Equal("Failed",await ScalarAsync<string>(graph.Factory,
             "SELECT Status FROM ShareOperations WHERE Id=$id;",graph.ShareOperationId));
     }
 
