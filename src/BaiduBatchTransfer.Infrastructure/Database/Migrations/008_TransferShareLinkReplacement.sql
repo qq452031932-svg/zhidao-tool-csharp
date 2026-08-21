@@ -305,6 +305,18 @@ BEGIN
     WHERE BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId;
 END;
 
+CREATE TRIGGER TR_TransferOperations_RemoveTerminalPendingShare
+AFTER UPDATE OF Status ON TransferOperations
+WHEN NEW.Status IN ('Failed','Cancelled') AND OLD.Status<>NEW.Status
+BEGIN
+    UPDATE BatchJobs SET ShareOperationCount=ShareOperationCount-1
+    WHERE Id=NEW.BatchJobId AND EXISTS(
+      SELECT 1 FROM ShareOperations share
+      WHERE share.TransferOperationId=NEW.Id AND share.Status='WaitingTransfer');
+    DELETE FROM ShareOperations
+    WHERE TransferOperationId=NEW.Id AND Status='WaitingTransfer';
+END;
+
 CREATE TABLE ShareOperationGenerations (
     ShareOperationId TEXT NOT NULL,
     Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
@@ -313,6 +325,7 @@ CREATE TABLE ShareOperationGenerations (
     AccountId TEXT NOT NULL,
     ExactItemSetFingerprint TEXT NOT NULL,
     SettingsFingerprint TEXT NOT NULL,
+    ExactItemCount INTEGER NULL CHECK(ExactItemCount IS NULL OR (typeof(ExactItemCount)='integer' AND ExactItemCount > 0)),
     PRIMARY KEY(ShareOperationId,Generation),
     UNIQUE(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,ExactItemSetFingerprint,SettingsFingerprint),
     FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE
@@ -339,9 +352,17 @@ BEGIN
 END;
 
 CREATE TRIGGER TR_ShareOperationGenerations_Immutable
-BEFORE UPDATE ON ShareOperationGenerations
+BEFORE UPDATE OF ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+  ExactItemSetFingerprint,SettingsFingerprint ON ShareOperationGenerations
 BEGIN
     SELECT RAISE(ABORT, 'share generation lineage is immutable');
+END;
+
+CREATE TRIGGER TR_ShareOperationGenerations_SealOnce
+BEFORE UPDATE OF ExactItemCount ON ShareOperationGenerations
+WHEN OLD.ExactItemCount IS NOT NULL OR NEW.ExactItemCount IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'exact share evidence is immutable');
 END;
 
 CREATE TABLE ShareOperationRemoteItems (
@@ -369,6 +390,22 @@ BEGIN
           AND operation.Status<>'WaitingTransfer'
           AND operation.ExactItemSetFingerprint IS NOT NULL)
       THEN RAISE(ABORT, 'exact remote items require an exact share boundary') END;
+END;
+
+CREATE TRIGGER TR_ShareOperationRemoteItems_SealInsert
+BEFORE INSERT ON ShareOperationRemoteItems
+WHEN EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+  WHERE lineage.ShareOperationId=NEW.ShareOperationId AND lineage.ExactItemCount IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'validated exact remote items are immutable');
+END;
+
+CREATE TRIGGER TR_ShareOperationRemoteItems_SealUpdate
+BEFORE UPDATE ON ShareOperationRemoteItems
+WHEN EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+  WHERE lineage.ShareOperationId=OLD.ShareOperationId AND lineage.ExactItemCount IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'validated exact remote items are immutable');
 END;
 
 CREATE TABLE ShareDiscoveryBaselines (

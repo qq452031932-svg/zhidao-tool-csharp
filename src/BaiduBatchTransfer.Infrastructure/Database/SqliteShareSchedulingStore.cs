@@ -33,7 +33,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                 AND lineage.BatchJobId=candidate.BatchJobId AND lineage.ResourceItemId=candidate.ResourceItemId
                 AND lineage.AccountId=candidate.AccountId
                 AND lineage.ExactItemSetFingerprint=candidate.ExactItemSetFingerprint
-                AND lineage.SettingsFingerprint=candidate.SettingsFingerprint))
+                AND lineage.SettingsFingerprint=candidate.SettingsFingerprint
+                AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                  WHERE exactItem.ShareOperationId=candidate.Id)))
         ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
         """;
 
@@ -54,7 +56,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
               AND lineage.BatchJobId=operation.BatchJobId AND lineage.ResourceItemId=operation.ResourceItemId
               AND lineage.AccountId=operation.AccountId
               AND lineage.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
-              AND lineage.SettingsFingerprint=operation.SettingsFingerprint)
+              AND lineage.SettingsFingerprint=operation.SettingsFingerprint
+              AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                WHERE exactItem.ShareOperationId=operation.Id))
         ORDER BY operation.LeaseExpiresAt,operation.OutputOrdinal,operation.Id LIMIT 1;
         """;
 
@@ -110,7 +114,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                             AND lineage.BatchJobId=candidate.BatchJobId AND lineage.ResourceItemId=candidate.ResourceItemId
                             AND lineage.AccountId=candidate.AccountId
                             AND lineage.ExactItemSetFingerprint=candidate.ExactItemSetFingerprint
-                            AND lineage.SettingsFingerprint=candidate.SettingsFingerprint))
+                            AND lineage.SettingsFingerprint=candidate.SettingsFingerprint
+                            AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                              WHERE exactItem.ShareOperationId=candidate.Id)))
                     ORDER BY batch.QueueOrder,batch.CreatedAt,batch.Id LIMIT 1;
                     """))
                 {
@@ -135,7 +141,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                           AND lineage.BatchJobId=operation.BatchJobId AND lineage.ResourceItemId=operation.ResourceItemId
                           AND lineage.AccountId=operation.AccountId
                           AND lineage.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
-                          AND lineage.SettingsFingerprint=operation.SettingsFingerprint)
+                          AND lineage.SettingsFingerprint=operation.SettingsFingerprint
+                          AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                            WHERE exactItem.ShareOperationId=operation.Id))
                     ORDER BY operation.OutputOrdinal,operation.Id LIMIT 1;
                     """);
                 Add(select,"$batch",batchId); Add(select,"$status",status);
@@ -174,7 +182,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore
                       AND lineage.ResourceItemId=ShareOperations.ResourceItemId
                       AND lineage.AccountId=ShareOperations.AccountId
                       AND lineage.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint
-                      AND lineage.SettingsFingerprint=ShareOperations.SettingsFingerprint);
+                      AND lineage.SettingsFingerprint=ShareOperations.SettingsFingerprint
+                      AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                        WHERE exactItem.ShareOperationId=ShareOperations.Id));
                 """))
             {
                 Add(update,"$id",id); Add(update,"$lease",Time(now + leaseDuration)); Add(update,"$now",Time(now));

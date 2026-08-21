@@ -1333,6 +1333,58 @@ public sealed class CreateBatchServiceTests
     }
 
     [Fact]
+    public async Task FailedSuccessTargetAttemptReleasesPendingShareCapacityForSameAccountRetry()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accounts = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        await database.SeedAsync(
+            accounts.Select((id, index) => BatchTestData.Account(id, index.ToString())),
+            BatchTestData.ReadySession(sessionId, 2, 2),
+            [BatchTestData.ReadyRow(sessionId, 1), BatchTestData.ReadyRow(sessionId, 2)]);
+        var draft = Draft(sessionId, TransferMode.Distribution, QuotaBasis.SuccessTarget,
+            [new BatchAccountDraft(accounts[0], 0, "/a", 0, 1, BatchAccountSelectionDecision.Selected, shareEnabled: true),
+             new BatchAccountDraft(accounts[1], 1, "/b", 0, 1, BatchAccountSelectionDecision.Selected, shareEnabled: true)]);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+        await service.ConfirmAsync(draft, preview.ConfirmationToken);
+        var scheduler = new SqliteTransferSchedulingStore(database.ConnectionFactory);
+        Assert.Equal(draft.BatchJobId, await scheduler.TryActivateNextBatchAsync(BatchTestData.Now));
+        var first = Assert.IsType<BaiduBatchTransfer.Application.Scheduling.ScheduledOperation>(
+            await scheduler.TryReserveNextAsync(draft.BatchJobId, BatchTestData.Now, BatchTestData.Now.AddMinutes(5)));
+        Assert.Equal(accounts[0], first.AccountId);
+
+        await scheduler.MarkFailedAsync(first.OperationId, "TransientService",
+            "The service is temporarily unavailable.", globallyInvalid: false, BatchTestData.Now.AddSeconds(1));
+
+        var retry = Assert.IsType<BaiduBatchTransfer.Application.Scheduling.ScheduledOperation>(
+            await scheduler.TryReserveNextAsync(draft.BatchJobId, BatchTestData.Now.AddSeconds(2), BatchTestData.Now.AddMinutes(5)));
+        Assert.Equal(accounts[0], retry.AccountId);
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT job.ShareOperationCount,output.CreatedShareOperationCount,
+              (SELECT COUNT(*) FROM ShareOperations share WHERE share.BatchJobId=job.Id),
+              (SELECT COUNT(*) FROM ShareOperations share WHERE share.TransferOperationId=$failed),
+              (SELECT COUNT(*) FROM ShareOperations share WHERE share.TransferOperationId=$retry)
+            FROM BatchJobs job JOIN BatchOutputAccounts output
+              ON output.BatchJobId=job.Id AND output.AccountId=$account
+            WHERE job.Id=$batch;
+            """;
+        command.Parameters.AddWithValue("$failed", first.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$retry", retry.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$account", accounts[0].ToString("D"));
+        command.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        await using var row = await command.ExecuteReaderAsync();
+        Assert.True(await row.ReadAsync());
+        Assert.Equal(1, row.GetInt64(0));
+        Assert.Equal(1, row.GetInt64(1));
+        Assert.Equal(1, row.GetInt64(2));
+        Assert.Equal(0, row.GetInt64(3));
+        Assert.Equal(1, row.GetInt64(4));
+    }
+
+    [Fact]
     public async Task SuccessTargetPreviewShowsDeterministicEffectiveTargetsUnderExclusiveShortage()
     {
         await using var database = await BatchTestDatabase.CreateAsync();

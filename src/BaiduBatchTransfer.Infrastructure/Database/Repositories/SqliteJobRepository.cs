@@ -648,6 +648,20 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 if (!string.Equals(fingerprint, operation.ExactItemSetFingerprint, StringComparison.Ordinal))
                     throw new ArgumentException("The exact remote-item set does not match its persisted fingerprint.", nameof(remoteItems));
             }
+            var evidenceIds = operationSnapshot.Select((_, index) => $"$evidence{index}").ToArray();
+            await using (var evidence = Command($"""
+                UPDATE ShareOperationGenerations
+                SET ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                  WHERE item.ShareOperationId=ShareOperationGenerations.ShareOperationId)
+                WHERE ShareOperationId IN ({string.Join(',', evidenceIds)}) AND ExactItemCount IS NULL;
+                """))
+            {
+                for (var index = 0; index < operationSnapshot.Length; index++)
+                    Add(evidence,evidenceIds[index],Id(operationSnapshot[index].Id));
+                evidence.Prepare();
+                if (await evidence.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != operationSnapshot.Length)
+                    throw new InvalidOperationException("The complete exact-item evidence could not be sealed.");
+            }
             await ExecuteControlAsync("RELEASE SAVEPOINT add_share_operations;", cancellationToken).ConfigureAwait(false);
         }
         catch

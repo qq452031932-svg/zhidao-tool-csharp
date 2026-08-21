@@ -24,6 +24,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(false, true)]
+    [InlineData(true, true)]
     public async Task DirectPendingHandoffWithoutBothExactItemsAndMatchingLineageCannotBeAcquired(
         bool addRemoteItem,
         bool addLineage)
@@ -300,6 +301,11 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                     remote.Parameters.AddWithValue("$remote", remoteId);
                     remote.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey(remoteId));
                     Assert.Equal(1, await remote.ExecuteNonQueryAsync());
+                    await using var evidence = connection.CreateCommand();
+                    evidence.Transaction = transaction;
+                    evidence.CommandText = "UPDATE ShareOperationGenerations SET ExactItemCount=1 WHERE ShareOperationId=$id AND Generation=1;";
+                    evidence.Parameters.AddWithValue("$id", id.ToString("D"));
+                    Assert.Equal(1, await evidence.ExecuteNonQueryAsync());
                 }
             }
             await transaction.CommitAsync();
