@@ -353,7 +353,14 @@ public sealed record ShareOperationRemoteItemRecord(
         $"ShareOperationRemoteItemRecord {{ Identity = [REDACTED], ItemOrdinal = {ItemOrdinal}, RemoteItem = [REDACTED] }}";
 }
 
-public sealed record ShareDiscoveryBaselineRecord(Guid ShareOperationId, string ShareId, int Generation = 1)
+public sealed record ShareDiscoveryBaselineRecord(
+    Guid ShareOperationId,
+    string ShareId,
+    int Generation = 1,
+    string? ShareUrl = null,
+    string? ExtractionCode = null,
+    bool? IsPermanent = null,
+    bool? IsAccessUnlimited = null)
 {
     public override string ToString() =>
         $"ShareDiscoveryBaselineRecord {{ Identity = [REDACTED], Generation = {Generation}, ShareId = [REDACTED] }}";

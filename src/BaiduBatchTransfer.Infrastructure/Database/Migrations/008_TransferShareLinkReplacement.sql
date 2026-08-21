@@ -331,6 +331,49 @@ CREATE TABLE ShareOperationGenerations (
     FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE
 );
 
+CREATE TABLE BatchShareWorkVersions (
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    Version INTEGER NOT NULL CHECK(typeof(Version)='integer' AND Version > 0),
+    PRIMARY KEY(BatchJobId,AccountId,SettingsFingerprint),
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint) ON DELETE CASCADE,
+    FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE
+);
+
+CREATE TRIGGER TR_ShareOperations_WorkVersion_Insert
+AFTER INSERT ON ShareOperations
+WHEN NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+BEGIN
+    INSERT INTO BatchShareWorkVersions(BatchJobId,AccountId,SettingsFingerprint,Version)
+    VALUES(NEW.BatchJobId,NEW.AccountId,NEW.SettingsFingerprint,1)
+    ON CONFLICT(BatchJobId,AccountId,SettingsFingerprint) DO UPDATE SET Version=Version+1;
+END;
+
+CREATE TRIGGER TR_ShareOperations_WorkVersion_Delete
+AFTER DELETE ON ShareOperations
+WHEN OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+BEGIN
+    UPDATE BatchShareWorkVersions SET Version=Version+1
+    WHERE BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId AND SettingsFingerprint=OLD.SettingsFingerprint;
+END;
+
+CREATE TRIGGER TR_ShareOperations_WorkVersion_Update
+AFTER UPDATE OF BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,Generation,Status ON ShareOperations
+WHEN OLD.BatchJobId<>NEW.BatchJobId OR OLD.AccountId<>NEW.AccountId
+  OR OLD.SettingsFingerprint<>NEW.SettingsFingerprint
+  OR OLD.ExactItemSetFingerprint<>NEW.ExactItemSetFingerprint OR OLD.Generation<>NEW.Generation
+  OR (OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused'))<>(NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused'))
+BEGIN
+    UPDATE BatchShareWorkVersions SET Version=Version+1
+    WHERE OLD.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+      AND BatchJobId=OLD.BatchJobId AND AccountId=OLD.AccountId AND SettingsFingerprint=OLD.SettingsFingerprint;
+    INSERT INTO BatchShareWorkVersions(BatchJobId,AccountId,SettingsFingerprint,Version)
+    SELECT NEW.BatchJobId,NEW.AccountId,NEW.SettingsFingerprint,1
+    WHERE NEW.Status IN ('WaitingShare','Reserved','Preparing','Paused')
+    ON CONFLICT(BatchJobId,AccountId,SettingsFingerprint) DO UPDATE SET Version=Version+1;
+END;
+
 CREATE TRIGGER TR_ShareOperations_RecordInitialGeneration
 AFTER INSERT ON ShareOperations
 WHEN NEW.ExactItemSetFingerprint IS NOT NULL
@@ -424,6 +467,10 @@ CREATE TABLE ShareDiscoveryBaselines (
     ShareOperationId TEXT NOT NULL,
     Generation INTEGER NOT NULL CHECK(typeof(Generation)='integer' AND Generation > 0),
     ShareId TEXT NOT NULL CHECK(length(trim(ShareId))>0),
+    ShareUrl TEXT NULL,
+    ExtractionCode TEXT NULL,
+    IsPermanent INTEGER NULL CHECK(IsPermanent IS NULL OR IsPermanent IN (0,1)),
+    IsAccessUnlimited INTEGER NULL CHECK(IsAccessUnlimited IS NULL OR IsAccessUnlimited IN (0,1)),
     PRIMARY KEY(ShareOperationId, Generation, ShareId),
     FOREIGN KEY(ShareOperationId) REFERENCES ShareOperations(Id) ON DELETE CASCADE
 );
@@ -527,6 +574,65 @@ CREATE TABLE BatchShareDecisionSnapshots (
 
 CREATE INDEX IX_BatchShareDecisionSnapshots_Batch_Account
 ON BatchShareDecisionSnapshots(BatchJobId, AccountId);
+
+CREATE TABLE BatchShareDiscoveryMembers (
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    DiscoveryFingerprint TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NOT NULL,
+    ShareId TEXT NOT NULL,
+    ShareUrl TEXT NOT NULL,
+    ExtractionCode TEXT NOT NULL,
+    IsPermanent INTEGER NOT NULL CHECK(IsPermanent IN (0,1)),
+    IsAccessUnlimited INTEGER NOT NULL CHECK(IsAccessUnlimited IN (0,1)),
+    IsCompatible INTEGER NOT NULL CHECK(IsCompatible IN (0,1)),
+    PRIMARY KEY(BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,ExactItemSetFingerprint,ShareId),
+    FOREIGN KEY(BatchJobId,AccountId,SettingsFingerprint)
+      REFERENCES BatchShareDiscoverySnapshots(BatchJobId,AccountId,SettingsFingerprint)
+      ON DELETE CASCADE
+);
+
+CREATE INDEX IX_BatchShareDiscoveryMembers_ExactSet
+ON BatchShareDiscoveryMembers(BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,IsCompatible,ShareId);
+
+CREATE TABLE BatchShareDiscoveryRuns (
+    RunId TEXT NOT NULL,
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    ExpectedWorkVersion INTEGER NOT NULL CHECK(typeof(ExpectedWorkVersion)='integer' AND ExpectedWorkVersion > 0),
+    CreatedAt TEXT NOT NULL,
+    ExpiresAt TEXT NOT NULL,
+    PRIMARY KEY(RunId,AccountId),
+    UNIQUE(BatchJobId,AccountId),
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint) ON DELETE CASCADE,
+    FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE
+);
+
+CREATE INDEX IX_BatchShareDiscoveryRuns_Expiry
+ON BatchShareDiscoveryRuns(ExpiresAt,RunId,AccountId);
+
+CREATE TABLE BatchShareDiscoveryStaging (
+    RunId TEXT NOT NULL,
+    BatchJobId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    SettingsFingerprint TEXT NOT NULL,
+    ExactItemSetFingerprint TEXT NOT NULL,
+    ShareId TEXT NOT NULL,
+    ShareUrl TEXT NOT NULL,
+    ExtractionCode TEXT NOT NULL,
+    IsPermanent INTEGER NOT NULL CHECK(IsPermanent IN (0,1)),
+    IsAccessUnlimited INTEGER NOT NULL CHECK(IsAccessUnlimited IN (0,1)),
+    IsCompatible INTEGER NOT NULL CHECK(IsCompatible IN (0,1)),
+    PRIMARY KEY(RunId,AccountId,ExactItemSetFingerprint,ShareId),
+    FOREIGN KEY(RunId,AccountId) REFERENCES BatchShareDiscoveryRuns(RunId,AccountId) ON DELETE CASCADE,
+    FOREIGN KEY(BatchJobId,SettingsFingerprint) REFERENCES BatchShareSettings(BatchJobId,SettingsFingerprint) ON DELETE CASCADE,
+    FOREIGN KEY(BatchJobId,AccountId) REFERENCES BatchOutputAccounts(BatchJobId,AccountId) ON DELETE CASCADE
+);
+
+CREATE INDEX IX_BatchShareDiscoveryStaging_Page
+ON BatchShareDiscoveryStaging(RunId,AccountId,ExactItemSetFingerprint,ShareId);
 
 CREATE TABLE AdapterCapabilityAcceptances (
     AdapterKind TEXT NOT NULL,

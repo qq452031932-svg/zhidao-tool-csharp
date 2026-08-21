@@ -700,6 +700,8 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             graph.ShareOperationId, 1, reserved.LeaseGeneration, 2, graph.Now));
         Assert.True(await store.TryRecordDefinitelyNotAcceptedRetryAsync(
             graph.ShareOperationId, 1, reserved.LeaseGeneration, 1, graph.Now));
+        Assert.True(await store.TryBeginSubmissionAttemptAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, 1, graph.Now));
         Assert.True(await store.TryMarkResultPendingAsync(
             graph.ShareOperationId, 1, reserved.LeaseGeneration, graph.Now.AddMinutes(1), graph.Now));
         Assert.False(await store.TryFailAsync(
@@ -729,10 +731,16 @@ public sealed class ShareSchedulingStoreTests : IDisposable
 
         var first = new BatchShareDiscoverySnapshotRecord(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "discovery-one",
-            1, 1, 0, "operation-generation", graph.Now, 1);
-        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([first]));
+            1, 1, 0, "1:operation-generation", graph.Now, 1);
+        var firstRun = await StageDiscoveryAsync(store, graph, permanent: true);
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync(firstRun, [first]));
         Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
             "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT LeaseGeneration FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.AppendDiscoveryBaselinePageAsync(
+            graph.ShareOperationId, 0, [new(graph.ShareOperationId, "stale-worker-share")]));
+        Assert.Equal(0, await CountAsync(graph.Factory, "ShareDiscoveryBaselines"));
         var decision = new BatchShareDecisionSnapshotRecord(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
             first.DiscoveryFingerprint, first.DiscoveredCount, first.CompatibleCount,
@@ -746,7 +754,13 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             DiscoveryFingerprint = "discovery-two", DiscoveredCount = 2,
             CompatibleCount = 2, Version = 2, CompletedAt = graph.Now.AddSeconds(1),
         };
-        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([second]));
+        var secondRun = await StageDiscoveryAsync(store, graph, permanent: true, shareId: "share-two");
+        var secondAccountContext = Assert.Single(await store.GetDecisionAccountsAsync(graph.BatchId),
+            value => value.AccountId == graph.AccountId);
+        await store.StageDiscoveryPageAsync(secondRun, secondAccountContext,
+            [new("share-three", new([new("remote-a", "A"), new("remote-b", "B")]),
+                "https://pan.baidu.com/s/redacted-two", "c3d4", true, true)]);
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync(secondRun, [second]));
         Assert.False(await store.ApplyDecisionSnapshotsAsync([decision]));
         Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
             "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
@@ -760,8 +774,9 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         var store = new SqliteShareSchedulingStore(graph.Factory);
         var snapshot = new BatchShareDiscoverySnapshotRecord(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "only-incompatible",
-            1, 0, 1, "operation-generation", graph.Now, 1);
-        Assert.True(await store.TrySaveDiscoveryAndPauseAsync([snapshot]));
+            1, 0, 1, "1:operation-generation", graph.Now, 1);
+        var run = await StageDiscoveryAsync(store, graph, permanent: false);
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync(run, [snapshot]));
         var reuse = new BatchShareDecisionSnapshotRecord(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
             snapshot.DiscoveryFingerprint, 1, 0, 1, snapshot.Generation, graph.Now, 1);
@@ -772,6 +787,145 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.True(await store.ApplyDecisionSnapshotsAsync([cancel]));
         Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
             "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task ZeroConflictDiscoveryNeverPausesOrAuthorizesCleanExactWork()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var snapshot = new BatchShareDiscoverySnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "empty-discovery",
+            0, 0, 0, "1:operation-generation", graph.Now, 1);
+        var run = Guid.NewGuid();
+        var account=Assert.Single(await store.GetDecisionAccountsAsync(graph.BatchId),value=>value.AccountId==graph.AccountId);
+        Assert.Equal(1,await store.BeginDiscoveryAsync(run,account));
+        await store.StageDiscoveryPageAsync(run,account,[]);
+
+        Assert.True(await store.TrySaveDiscoveryAndPauseAsync(run, [snapshot]));
+        Assert.Equal("WaitingShare", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        var reuse = new BatchShareDecisionSnapshotRecord(
+            graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
+            snapshot.DiscoveryFingerprint, 0, 0, 0, snapshot.Generation, graph.Now, 1);
+        Assert.True(await store.ApplyDecisionSnapshotsAsync([reuse]));
+        var context = Assert.IsType<ShareExecutionContext>(await store.LoadAsync(graph.ShareOperationId));
+        Assert.Null(context.ExistingShareDecision);
+        Assert.Null(context.ConfirmedExistingShare);
+    }
+
+    [Fact]
+    public async Task PreparingFailureAndRetryAttemptBoundariesAreDurableAndFenced()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var reserved = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryMarkPreparingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, graph.Now));
+        Assert.True(await store.TryFailAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, "InvalidCursor", "safe", graph.Now));
+        Assert.Equal("Failed", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task SubmissionAndEveryRetryRecheckActiveBatchAndShareEnabledGate()
+    {
+        var disabled=await CreateGraphAsync(includeShareSettings:true);
+        var disabledStore=new SqliteShareSchedulingStore(disabled.Factory);
+        var disabledLease=Assert.IsType<ShareOperationRecord>(
+            await disabledStore.TryReserveNextAsync(disabled.Now,TimeSpan.FromMinutes(2)));
+        Assert.True(await disabledStore.TryMarkPreparingAsync(
+            disabled.ShareOperationId,1,disabledLease.LeaseGeneration,disabled.Now));
+        Assert.True(await disabledStore.TryCompleteDiscoveryBaselineAsync(
+            disabled.ShareOperationId,1,disabledLease.LeaseGeneration,"empty",0,disabled.Now));
+        await SetShareEnabledAsync(disabled,false);
+        Assert.False(await disabledStore.TryMarkSubmittingAsync(
+            disabled.ShareOperationId,1,disabledLease.LeaseGeneration,"{}",disabled.Now));
+
+        var paused=await CreateGraphAsync(includeShareSettings:true);
+        var pausedStore=new SqliteShareSchedulingStore(paused.Factory);
+        var pausedLease=Assert.IsType<ShareOperationRecord>(
+            await pausedStore.TryReserveNextAsync(paused.Now,TimeSpan.FromMinutes(2)));
+        Assert.True(await pausedStore.TryMarkPreparingAsync(paused.ShareOperationId,1,pausedLease.LeaseGeneration,paused.Now));
+        Assert.True(await pausedStore.TryCompleteDiscoveryBaselineAsync(
+            paused.ShareOperationId,1,pausedLease.LeaseGeneration,"empty",0,paused.Now));
+        Assert.True(await pausedStore.TryMarkSubmittingAsync(
+            paused.ShareOperationId,1,pausedLease.LeaseGeneration,"{}",paused.Now));
+        Assert.True(await pausedStore.TryRecordDefinitelyNotAcceptedRetryAsync(
+            paused.ShareOperationId,1,pausedLease.LeaseGeneration,1,paused.Now));
+        await using(var connection=await paused.Factory.OpenConnectionAsync())
+        await using(var pause=connection.CreateCommand())
+        {
+            pause.CommandText="UPDATE BatchJobs SET Status='Paused' WHERE Id=$id;";
+            pause.Parameters.AddWithValue("$id",paused.BatchId.ToString("D"));
+            Assert.Equal(1,await pause.ExecuteNonQueryAsync());
+        }
+        Assert.False(await pausedStore.TryBeginSubmissionAttemptAsync(
+            paused.ShareOperationId,1,pausedLease.LeaseGeneration,1,paused.Now));
+        Assert.Equal("DefinitelyNotAccepted",await ScalarAsync<string>(paused.Factory,
+            "SELECT SubmissionAcceptance FROM ShareOperations WHERE Id=$id;",paused.ShareOperationId));
+        Assert.Equal(1L,await ScalarAsync<long>(paused.Factory,
+            "SELECT AttemptCount FROM ShareOperations WHERE Id=$id;",paused.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task RestartedDiscoveryRemovesAbandonedSensitiveStagingBeforeContinuing()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var firstStore = new SqliteShareSchedulingStore(graph.Factory);
+        var account = Assert.Single(await firstStore.GetDecisionAccountsAsync(graph.BatchId),
+            value => value.AccountId == graph.AccountId);
+        var exact = new RemoteItemIdentitySet([new("remote-a", "A"), new("remote-b", "B")]);
+        var firstRun=Guid.NewGuid();
+        Assert.Equal(1,await firstStore.BeginDiscoveryAsync(firstRun,account));
+        await firstStore.StageDiscoveryPageAsync(firstRun, account,
+            [new("abandoned", exact, "https://pan.baidu.com/s/private", "a1b2", true, true)]);
+        Assert.Equal(1, await CountAsync(graph.Factory, "BatchShareDiscoveryStaging"));
+        await using (var connection=await graph.Factory.OpenConnectionAsync())
+        await using (var expire=connection.CreateCommand())
+        {
+            expire.CommandText="UPDATE BatchShareDiscoveryRuns SET ExpiresAt='2000-01-01T00:00:00Z';";
+            Assert.Equal(1,await expire.ExecuteNonQueryAsync());
+        }
+
+        var restarted = new SqliteShareSchedulingStore(graph.Factory);
+        var restartedRun=Guid.NewGuid();
+        Assert.Equal(1,await restarted.BeginDiscoveryAsync(restartedRun,account));
+        await restarted.StageDiscoveryPageAsync(restartedRun, account, []);
+
+        Assert.Equal(0, await CountAsync(graph.Factory, "BatchShareDiscoveryStaging"));
+    }
+
+    [Fact]
+    public async Task ConcurrentDiscoveryOwnerAndWorkVersionCasPreventPartialOrStaleAuthorization()
+    {
+        var graph=await CreateGraphAsync(includeShareSettings:true);
+        var store=new SqliteShareSchedulingStore(graph.Factory);
+        var account=Assert.Single(await store.GetDecisionAccountsAsync(graph.BatchId),value=>value.AccountId==graph.AccountId);
+        var exact=new RemoteItemIdentitySet([new("remote-a","A"),new("remote-b","B")]);
+        var firstRun=Guid.NewGuid();
+        Assert.Equal(1,await store.BeginDiscoveryAsync(firstRun,account));
+        await store.StageDiscoveryPageAsync(firstRun,account,
+            [new("one",exact,"https://pan.baidu.com/s/private","a1b2",true,true)]);
+        await Assert.ThrowsAsync<InvalidOperationException>(()=>store.BeginDiscoveryAsync(Guid.NewGuid(),account));
+        Assert.Equal(1,await CountAsync(graph.Factory,"BatchShareDiscoveryStaging"));
+
+        await using(var connection=await graph.Factory.OpenConnectionAsync())
+        await using(var bump=connection.CreateCommand())
+        {
+            bump.CommandText="UPDATE BatchShareWorkVersions SET Version=Version+1 WHERE BatchJobId=$batch AND AccountId=$account;";
+            bump.Parameters.AddWithValue("$batch",graph.BatchId.ToString("D"));
+            bump.Parameters.AddWithValue("$account",graph.AccountId.ToString("D"));
+            Assert.Equal(1,await bump.ExecuteNonQueryAsync());
+        }
+        var stale=new BatchShareDiscoverySnapshotRecord(graph.BatchId,graph.AccountId,graph.SettingsFingerprint,
+            "stale",1,1,0,"1:exact-hash",graph.Now,1);
+        Assert.False(await store.TrySaveDiscoveryAndPauseAsync(firstRun,[stale]));
+        Assert.Equal(0,await CountAsync(graph.Factory,"BatchShareDiscoverySnapshots"));
+        Assert.Equal("WaitingShare",await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;",graph.ShareOperationId));
     }
 
     [Fact]
@@ -930,6 +1084,35 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         return new(factory, now, account.Id, secondAccount.Id, batch.Id, resource.Id, transfer.Id, shareId, itemSetFingerprint, settingsFingerprint);
     }
 
+    private static async Task<Guid> StageDiscoveryAsync(
+        SqliteShareSchedulingStore store,
+        Graph graph,
+        bool permanent,
+        string shareId = "share-one")
+    {
+        var account = Assert.Single(await store.GetDecisionAccountsAsync(graph.BatchId),
+            value => value.AccountId == graph.AccountId);
+        var run = Guid.NewGuid();
+        var exact = new RemoteItemIdentitySet([new("remote-a", "A"), new("remote-b", "B")]);
+        await store.BeginDiscoveryAsync(run,account);
+        await store.StageDiscoveryPageAsync(run, account,
+            [new(shareId, exact, "https://pan.baidu.com/s/redacted", "a1b2", permanent, true)]);
+        return run;
+    }
+
+    private static async Task SetShareEnabledAsync(Graph graph,bool enabled)
+    {
+        await using var connection=await graph.Factory.OpenConnectionAsync();
+        await using var command=connection.CreateCommand();
+        command.CommandText="UPDATE BatchOutputAccounts SET ShareEnabled=$enabled,PlannedShareCount=$planned,CreatedShareOperationCount=$created WHERE BatchJobId=$batch AND AccountId=$account;";
+        command.Parameters.AddWithValue("$enabled",enabled?1:0);
+        command.Parameters.AddWithValue("$planned",enabled?3:0);
+        command.Parameters.AddWithValue("$created",enabled?1:0);
+        command.Parameters.AddWithValue("$batch",graph.BatchId.ToString("D"));
+        command.Parameters.AddWithValue("$account",graph.AccountId.ToString("D"));
+        Assert.Equal(1,await command.ExecuteNonQueryAsync());
+    }
+
     private static async Task SeedOrphanShareOperationAsync(SqliteConnectionFactory factory, ShareOperationRecord share)
     {
         var builder = new SqliteConnectionStringBuilder { DataSource = factory.DatabasePath, Pooling = false, ForeignKeys = false };
@@ -1033,6 +1216,8 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         {
             "ShareDiscoveryBaselines" => "SELECT COUNT(*) FROM ShareDiscoveryBaselines;",
             "BatchShareDecisionSnapshots" => "SELECT COUNT(*) FROM BatchShareDecisionSnapshots;",
+            "BatchShareDiscoverySnapshots" => "SELECT COUNT(*) FROM BatchShareDiscoverySnapshots;",
+            "BatchShareDiscoveryStaging" => "SELECT COUNT(*) FROM BatchShareDiscoveryStaging;",
             "BaiduShareResults" => "SELECT COUNT(*) FROM BaiduShareResults;",
             _ => throw new ArgumentOutOfRangeException(nameof(table)),
         };

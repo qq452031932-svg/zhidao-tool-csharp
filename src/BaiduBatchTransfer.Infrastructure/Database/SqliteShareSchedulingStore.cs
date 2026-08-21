@@ -2,6 +2,7 @@ using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Data.Sqlite;
+using System.Text;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
@@ -86,7 +87,37 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
               settings.IsPermanent,settings.IsAccessUnlimited,settings.ExtractionCodeMode,
               settings.FixedExtractionCode,settings.ExistingSharePolicy,settings.CreatedAt,
               output.ShareEnabled,
-              decision.Decision
+              decision.Decision,
+              (SELECT member.ShareId FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1),
+              (SELECT member.ShareUrl FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1),
+              (SELECT member.ExtractionCode FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1),
+              (SELECT member.IsPermanent FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1),
+              (SELECT member.IsAccessUnlimited FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1)
             FROM ShareOperations operation
             JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
               AND settings.SettingsFingerprint=operation.SettingsFingerprint
@@ -103,6 +134,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                   AND discovery.IncompatibleCount=decision.IncompatibleCount
                   AND discovery.Generation=decision.Generation
                   AND discovery.Version=decision.DiscoveryVersion)
+              AND EXISTS(SELECT 1 FROM BatchShareDiscoveryMembers member
+                WHERE member.BatchJobId=operation.BatchJobId AND member.AccountId=operation.AccountId
+                  AND member.SettingsFingerprint=operation.SettingsFingerprint
+                  AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
+                  AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint)
             WHERE operation.Id=$id;
             """);
         Add(command, "$id", Id(operationId));
@@ -121,6 +157,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         var decision = reader.IsDBNull(29)
             ? (ExistingShareDecision?)null
             : Enum.Parse<ExistingShareDecision>(reader.GetString(29), ignoreCase: false);
+        var existingShareId = reader.IsDBNull(30) ? null : reader.GetString(30);
+        var existingShareUrl = reader.IsDBNull(31) ? null : reader.GetString(31);
+        var existingCode = reader.IsDBNull(32) ? null : reader.GetString(32);
+        var existingPermanent = !reader.IsDBNull(33) && reader.GetInt64(33) != 0;
+        var existingUnlimited = !reader.IsDBNull(34) && reader.GetInt64(34) != 0;
         await reader.DisposeAsync().ConfigureAwait(false);
 
         await using var itemsCommand = Command(connection, transaction, """
@@ -134,7 +175,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 items.Add(new(itemsReader.GetString(0), itemsReader.GetString(1)));
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         if (items.Count == 0) return null;
-        return new(operation, settings, Selected: true, shareEnabled, new(items), decision);
+        var exact = new RemoteItemIdentitySet(items);
+        var existing = existingShareId is null || existingShareUrl is null || existingCode is null
+            ? null
+            : new BaiduShareRecord(existingShareId, exact, existingShareUrl, existingCode, existingPermanent, existingUnlimited);
+        return new(operation, settings, Selected: true, shareEnabled, exact, decision, existing);
     }
 
     public Task<bool> TryMarkPreparingAsync(
@@ -166,11 +211,36 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
     {
         if (expectedAttemptCount < 1) throw new ArgumentOutOfRangeException(nameof(expectedAttemptCount));
         return TryTransitionAsync("""
-            UPDATE ShareOperations SET AttemptCount=AttemptCount+1,
-              SubmissionAcceptance='DefinitelyNotAccepted',UpdatedAt=$updated
+            UPDATE ShareOperations SET SubmissionAcceptance='DefinitelyNotAccepted',UpdatedAt=$updated
             WHERE Id=$id AND Status='Submitting' AND Generation=$generation
               AND LeaseGeneration=$leaseGeneration AND AttemptCount=$attempt
               AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL;
+            """, operationId, generation, leaseGeneration, updatedAt,
+            [("$attempt", expectedAttemptCount)], cancellationToken);
+    }
+
+    public Task<bool> TryBeginSubmissionAttemptAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        int expectedAttemptCount,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (expectedAttemptCount < 1) throw new ArgumentOutOfRangeException(nameof(expectedAttemptCount));
+        return TryTransitionAsync("""
+            UPDATE ShareOperations SET AttemptCount=AttemptCount+1,
+              SubmissionAcceptance='Unknown',AdapterRequestId=NULL,UpdatedAt=$updated
+            WHERE Id=$id AND Status='Submitting' AND Generation=$generation
+              AND LeaseGeneration=$leaseGeneration AND AttemptCount=$attempt
+              AND SubmissionAcceptance='DefinitelyNotAccepted'
+              AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL
+              AND EXISTS(SELECT 1 FROM BatchJobs batch
+                WHERE batch.Id=ShareOperations.BatchJobId AND batch.Status='Active')
+              AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
+                WHERE output.BatchJobId=ShareOperations.BatchJobId
+                  AND output.AccountId=ShareOperations.AccountId
+                  AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1);
             """, operationId, generation, leaseGeneration, updatedAt,
             [("$attempt", expectedAttemptCount)], cancellationToken);
     }
@@ -210,9 +280,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         return TryTransitionAsync("""
             UPDATE ShareOperations SET Status='Failed',LeaseExpiresAt=NULL,
               LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$updated
-            WHERE Id=$id AND Status='Submitting' AND Generation=$generation
+            WHERE Id=$id AND Status IN ('Preparing','Submitting') AND Generation=$generation
               AND LeaseGeneration=$leaseGeneration
-              AND SubmissionAcceptance='DefinitelyNotAccepted';
+              AND (Status='Preparing' OR SubmissionAcceptance='DefinitelyNotAccepted');
             """, operationId, generation, leaseGeneration, updatedAt,
             [("$code", errorCode), ("$message", safeMessage)], cancellationToken);
     }
@@ -391,12 +461,15 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         try
         {
             await using var command = Command(connection, transaction,
-                "INSERT OR IGNORE INTO ShareDiscoveryBaselines(ShareOperationId,Generation,ShareId) SELECT $operation,$generation,$share WHERE EXISTS(SELECT 1 FROM ShareOperations operation JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId AND settings.SettingsFingerprint=operation.SettingsFingerprint WHERE operation.Id=$operation AND operation.Generation=$generation AND operation.LeaseGeneration=$leaseGeneration AND operation.BaselineCompletedAt IS NULL);");
+                "INSERT OR IGNORE INTO ShareDiscoveryBaselines(ShareOperationId,Generation,ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited) SELECT $operation,$generation,$share,$url,$code,$permanent,$unlimited WHERE EXISTS(SELECT 1 FROM ShareOperations operation JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId AND settings.SettingsFingerprint=operation.SettingsFingerprint WHERE operation.Id=$operation AND operation.Generation=$generation AND operation.LeaseGeneration=$leaseGeneration AND operation.BaselineCompletedAt IS NULL);");
             foreach (var entry in entries)
             {
                 if (entry.ShareOperationId != shareOperationId || string.IsNullOrWhiteSpace(entry.ShareId))
                     throw new ArgumentException("The discovery baseline page is invalid.", nameof(entries));
                 command.Parameters.Clear(); Add(command,"$operation",Id(shareOperationId)); Add(command,"$generation",entry.Generation); Add(command,"$leaseGeneration",expectedLeaseGeneration); Add(command,"$share",entry.ShareId);
+                Add(command,"$url",entry.ShareUrl); Add(command,"$code",entry.ExtractionCode);
+                Add(command,"$permanent",entry.IsPermanent is null?null:entry.IsPermanent.Value?1:0);
+                Add(command,"$unlimited",entry.IsAccessUnlimited is null?null:entry.IsAccessUnlimited.Value?1:0);
                 if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1) continue;
                 await using var existing = Command(connection, transaction, """
                     SELECT EXISTS(
@@ -405,10 +478,15 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                       JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
                         AND settings.SettingsFingerprint=operation.SettingsFingerprint
                       WHERE baseline.ShareOperationId=$operation AND baseline.Generation=$generation
-                        AND baseline.ShareId=$share AND operation.Generation=$generation
+                        AND baseline.ShareId=$share AND baseline.ShareUrl IS $url
+                        AND baseline.ExtractionCode IS $code AND baseline.IsPermanent IS $permanent
+                        AND baseline.IsAccessUnlimited IS $unlimited AND operation.Generation=$generation
                         AND operation.LeaseGeneration=$leaseGeneration);
                     """);
                 Add(existing,"$operation",Id(shareOperationId)); Add(existing,"$generation",entry.Generation); Add(existing,"$leaseGeneration",expectedLeaseGeneration); Add(existing,"$share",entry.ShareId);
+                Add(existing,"$url",entry.ShareUrl); Add(existing,"$code",entry.ExtractionCode);
+                Add(existing,"$permanent",entry.IsPermanent is null?null:entry.IsPermanent.Value?1:0);
+                Add(existing,"$unlimited",entry.IsAccessUnlimited is null?null:entry.IsAccessUnlimited.Value?1:0);
                 if (Convert.ToInt64(await existing.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 1)
                     throw new InvalidOperationException("The discovery baseline generation is stale or already complete.");
             }
@@ -427,7 +505,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred:true);
         await using var command = Command(connection,transaction,"""
-            SELECT ShareOperationId,ShareId,Generation FROM ShareDiscoveryBaselines
+            SELECT ShareOperationId,ShareId,Generation,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited FROM ShareDiscoveryBaselines
             WHERE ShareOperationId=$operation
               AND Generation=(SELECT Generation FROM ShareOperations WHERE Id=$operation)
               AND ($after IS NULL OR ShareId>$after)
@@ -436,7 +514,10 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         Add(command,"$operation",Id(shareOperationId)); Add(command,"$after",afterShareId); Add(command,"$limit",checked(pageSize+1));
         var values = new List<ShareDiscoveryBaselineRecord>(pageSize+1);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add(new(Guid.Parse(reader.GetString(0)),reader.GetString(1),reader.GetInt32(2)));
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) values.Add(new(
+            Guid.Parse(reader.GetString(0)),reader.GetString(1),reader.GetInt32(2),
+            reader.IsDBNull(3)?null:reader.GetString(3),reader.IsDBNull(4)?null:reader.GetString(4),
+            reader.IsDBNull(5)?null:reader.GetInt64(5)!=0,reader.IsDBNull(6)?null:reader.GetInt64(6)!=0));
         var more = values.Count>pageSize; if (more) values.RemoveAt(values.Count-1);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new(values,more ? values[^1].ShareId : null);
@@ -505,7 +586,13 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
               AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL
               AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                 WHERE settings.BatchJobId=ShareOperations.BatchJobId
-                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
+                  AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
+              AND EXISTS(SELECT 1 FROM BatchJobs batch
+                WHERE batch.Id=ShareOperations.BatchJobId AND batch.Status='Active')
+              AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
+                WHERE output.BatchJobId=ShareOperations.BatchJobId
+                  AND output.AccountId=ShareOperations.AccountId
+                  AND output.OutputOrdinal=ShareOperations.OutputOrdinal AND output.ShareEnabled=1);
             """, shareOperationId, expectedGeneration, expectedLeaseGeneration, submittedAt,
             [("$descriptor", requestDescriptorJson)], cancellationToken);
     }
@@ -670,10 +757,190 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
 
+    public async Task<long> GetDecisionWorkVersionAsync(
+        Guid batchJobId, Guid accountId, string settingsFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(settingsFingerprint);
+        await using var connection=await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command=connection.CreateCommand();
+        command.CommandText="""
+            SELECT Version FROM BatchShareWorkVersions
+            WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+            """;
+        Add(command,"$batch",Id(batchJobId));Add(command,"$account",Id(accountId));Add(command,"$settings",settingsFingerprint);
+        var value=await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if(value is null||value is DBNull)throw new InvalidOperationException("The selected account has no exact share work.");
+        return Convert.ToInt64(value,System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    public async Task<long> BeginDiscoveryAsync(
+        Guid runId,ShareDecisionAccountContext account,CancellationToken cancellationToken=default)
+    {
+        if(runId==Guid.Empty)throw new ArgumentException("A discovery run is required.",nameof(runId));
+        ArgumentNullException.ThrowIfNull(account);
+        await using var connection=await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction=connection.BeginTransaction(deferred:false);
+        try
+        {
+            var now=DateTimeOffset.UtcNow;
+            await using(var cleanup=Command(connection,transaction,"""
+                DELETE FROM BatchShareDiscoveryRuns
+                WHERE (RunId,AccountId) IN (
+                  SELECT RunId,AccountId FROM BatchShareDiscoveryRuns
+                  WHERE ExpiresAt<=$now ORDER BY ExpiresAt,RunId,AccountId LIMIT 100);
+                """))
+            {
+                Add(cleanup,"$now",Time(now));await cleanup.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await using(var acquire=Command(connection,transaction,"""
+                INSERT OR IGNORE INTO BatchShareDiscoveryRuns(
+                  RunId,BatchJobId,AccountId,SettingsFingerprint,ExpectedWorkVersion,CreatedAt,ExpiresAt)
+                SELECT $run,$batch,$account,$settings,version.Version,$now,$expires
+                FROM BatchShareWorkVersions version
+                WHERE version.BatchJobId=$batch AND version.AccountId=$account
+                  AND version.SettingsFingerprint=$settings;
+                """))
+            {
+                Add(acquire,"$run",Id(runId));Add(acquire,"$batch",Id(account.BatchJobId));
+                Add(acquire,"$account",Id(account.AccountId));Add(acquire,"$settings",account.Settings.SettingsFingerprint);
+                Add(acquire,"$now",Time(now));Add(acquire,"$expires",Time(now.AddHours(1)));
+                await acquire.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await using var verify=Command(connection,transaction,"""
+                SELECT ExpectedWorkVersion FROM BatchShareDiscoveryRuns
+                WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+                """);
+            Add(verify,"$run",Id(runId));Add(verify,"$batch",Id(account.BatchJobId));
+            Add(verify,"$account",Id(account.AccountId));Add(verify,"$settings",account.Settings.SettingsFingerprint);
+            var value=await verify.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if(value is null||value is DBNull)
+                throw new InvalidOperationException("Another share discovery is already active for this account.");
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return Convert.ToInt64(value,System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch{await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);throw;}
+    }
+
+    public async Task StageDiscoveryPageAsync(
+        Guid runId,
+        ShareDecisionAccountContext account,
+        IReadOnlyList<BaiduShareRecord> candidates,
+        CancellationToken cancellationToken = default)
+    {
+        if (runId == Guid.Empty) throw new ArgumentException("A discovery run is required.", nameof(runId));
+        ArgumentNullException.ThrowIfNull(account);
+        ArgumentNullException.ThrowIfNull(candidates);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            var now=DateTimeOffset.UtcNow;
+            await using (var verify = Command(connection,transaction,"""
+                UPDATE BatchShareDiscoveryRuns SET ExpiresAt=$expires
+                WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+                """))
+            {
+                Add(verify,"$run",Id(runId));Add(verify,"$batch",Id(account.BatchJobId));
+                Add(verify,"$account",Id(account.AccountId));Add(verify,"$settings",account.Settings.SettingsFingerprint);
+                Add(verify,"$expires",Time(now.AddHours(1)));
+                if(await verify.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false)!=1)
+                    throw new InvalidOperationException("Another share discovery is already active for this account.");
+            }
+            foreach (var chunk in candidates.Chunk(40))
+            {
+                if (chunk.Length == 0) continue;
+                var rows = new List<string>(chunk.Length);
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                Add(command, "$run", Id(runId)); Add(command, "$batch", Id(account.BatchJobId));
+                Add(command, "$account", Id(account.AccountId)); Add(command, "$settings", account.Settings.SettingsFingerprint);
+                for (var index = 0; index < chunk.Length; index++)
+                {
+                    var share = chunk[index];
+                    rows.Add($"($f{index},$id{index},$url{index},$code{index},$permanent{index},$unlimited{index},$compatible{index})");
+                    Add(command, $"$f{index}", share.RemoteItems.Fingerprint); Add(command, $"$id{index}", share.ShareId);
+                    Add(command, $"$url{index}", share.ShareUrl); Add(command, $"$code{index}", share.ExtractionCode);
+                    Add(command, $"$permanent{index}", share.IsPermanent ? 1 : 0);
+                    Add(command, $"$unlimited{index}", share.IsAccessUnlimited ? 1 : 0);
+                    var compatible = share.IsPermanent && share.IsAccessUnlimited &&
+                        (string.Equals(account.Settings.ExtractionCodeMode, "Random", StringComparison.Ordinal) ||
+                         string.Equals(share.ExtractionCode, account.Settings.FixedExtractionCode, StringComparison.Ordinal));
+                    Add(command, $"$compatible{index}", compatible ? 1 : 0);
+                }
+                command.CommandText = $"""
+                    WITH candidate(Fingerprint,ShareId,ShareUrl,ExtractionCode,IsPermanent,IsUnlimited,IsCompatible) AS
+                      (VALUES {string.Join(',', rows)})
+                    INSERT OR IGNORE INTO BatchShareDiscoveryStaging(
+                      RunId,BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,ShareId,
+                      ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,IsCompatible)
+                    SELECT $run,$batch,$account,$settings,candidate.Fingerprint,candidate.ShareId,
+                      candidate.ShareUrl,candidate.ExtractionCode,candidate.IsPermanent,candidate.IsUnlimited,candidate.IsCompatible
+                    FROM candidate
+                    WHERE EXISTS(SELECT 1 FROM ShareOperations operation
+                      JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
+                        AND output.AccountId=operation.AccountId AND output.ShareEnabled=1
+                      WHERE operation.BatchJobId=$batch AND operation.AccountId=$account
+                        AND operation.SettingsFingerprint=$settings
+                        AND operation.ExactItemSetFingerprint=candidate.Fingerprint
+                        AND operation.Status IN ('WaitingShare','Reserved','Preparing','Paused'));
+                    """;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
+    }
+
+    public async Task<ExistingShareDiscoveryPage> GetStagedDiscoveryPageAsync(
+        Guid runId, Guid accountId, string? afterCursor, int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        if (runId == Guid.Empty || accountId == Guid.Empty) throw new ArgumentException("A run and account are required.");
+        if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        var after = DecodeMemberCursor(afterCursor);
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT BatchJobId,AccountId,SettingsFingerprint,ExactItemSetFingerprint,ShareId,ShareUrl,
+              ExtractionCode,IsPermanent,IsAccessUnlimited,IsCompatible
+            FROM BatchShareDiscoveryStaging
+            WHERE RunId=$run AND AccountId=$account
+              AND ($afterFingerprint IS NULL OR ExactItemSetFingerprint>$afterFingerprint OR
+                (ExactItemSetFingerprint=$afterFingerprint AND ShareId>$afterShare))
+            ORDER BY ExactItemSetFingerprint,ShareId LIMIT $limit;
+            """;
+        Add(command,"$run",Id(runId)); Add(command,"$account",Id(accountId));
+        Add(command,"$afterFingerprint",after?.Fingerprint); Add(command,"$afterShare",after?.ShareId);
+        Add(command,"$limit",checked(pageSize + 1));
+        var values = new List<ExistingShareDiscoveryMember>(pageSize + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            values.Add(new(Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),reader.GetString(2),string.Empty,
+                reader.GetString(3),reader.GetString(4),reader.GetString(5),reader.GetString(6),
+                reader.GetInt64(7)!=0,reader.GetInt64(8)!=0,reader.GetInt64(9)!=0));
+        var more = values.Count > pageSize;
+        if (more) values.RemoveAt(values.Count - 1);
+        var next = more ? EncodeMemberCursor(values[^1].ExactItemSetFingerprint, values[^1].ShareId) : null;
+        return new(values, next);
+    }
+
+    public async Task AbortDiscoveryAsync(Guid runId, CancellationToken cancellationToken = default)
+    {
+        if (runId == Guid.Empty) return;
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM BatchShareDiscoveryRuns WHERE RunId=$run;";
+        Add(command,"$run",Id(runId));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<bool> TrySaveDiscoveryAndPauseAsync(
+        Guid runId,
         IReadOnlyList<BatchShareDiscoverySnapshotRecord> snapshots,
         CancellationToken cancellationToken = default)
     {
+        if (runId == Guid.Empty) throw new ArgumentException("A discovery run is required.", nameof(runId));
         ArgumentNullException.ThrowIfNull(snapshots);
         if (snapshots.Count == 0 || snapshots.Select(value => (value.BatchJobId, value.AccountId)).Distinct().Count() != snapshots.Count)
             throw new ArgumentException("Discovery snapshot accounts must be non-empty and unique.", nameof(snapshots));
@@ -684,6 +951,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         {
             foreach (var snapshot in snapshots)
             {
+                if (!await HasDiscoveryOwnershipAsync(connection,transaction,runId,snapshot,cancellationToken).ConfigureAwait(false) ||
+                    !await HasExpectedWorkVersionAsync(connection,transaction,snapshot,cancellationToken).ConfigureAwait(false))
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
                 if (await HasUnsafeDecisionWorkAsync(connection, transaction, snapshot, cancellationToken).ConfigureAwait(false))
                 {
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
@@ -700,6 +973,13 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     Add(deleteDecision, "$batch", Id(snapshot.BatchJobId)); Add(deleteDecision, "$account", Id(snapshot.AccountId));
                     Add(deleteDecision, "$settings", snapshot.SettingsFingerprint); Add(deleteDecision, "$previous", snapshot.Version - 1);
                     await deleteDecision.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    await using var deleteMembers = Command(connection, transaction, """
+                        DELETE FROM BatchShareDiscoveryMembers
+                        WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+                        """);
+                    Add(deleteMembers, "$batch", Id(snapshot.BatchJobId)); Add(deleteMembers, "$account", Id(snapshot.AccountId));
+                    Add(deleteMembers, "$settings", snapshot.SettingsFingerprint);
+                    await deleteMembers.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
                 var sql = snapshot.Version == 1
@@ -725,20 +1005,67 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                     return false;
                 }
+
+                await using var copyMembers = Command(connection, transaction, """
+                    INSERT INTO BatchShareDiscoveryMembers(
+                      BatchJobId,AccountId,SettingsFingerprint,DiscoveryFingerprint,ExactItemSetFingerprint,
+                      ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,IsCompatible)
+                    SELECT BatchJobId,AccountId,SettingsFingerprint,$fingerprint,ExactItemSetFingerprint,
+                      ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,IsCompatible
+                    FROM BatchShareDiscoveryStaging
+                    WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings;
+                    """);
+                Add(copyMembers,"$run",Id(runId)); Add(copyMembers,"$batch",Id(snapshot.BatchJobId));
+                Add(copyMembers,"$account",Id(snapshot.AccountId)); Add(copyMembers,"$settings",snapshot.SettingsFingerprint);
+                Add(copyMembers,"$fingerprint",snapshot.DiscoveryFingerprint);
+                if (await copyMembers.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != snapshot.DiscoveredCount)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
             }
 
             foreach (var snapshot in snapshots)
             {
+                await using (var clearBaseline = Command(connection, transaction, """
+                    DELETE FROM ShareDiscoveryBaselines
+                    WHERE ShareOperationId IN (
+                      SELECT Id FROM ShareOperations
+                      WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
+                        AND Status IN ('WaitingShare','Reserved','Preparing')
+                        AND EXISTS(SELECT 1 FROM BatchShareDiscoveryMembers member
+                          WHERE member.BatchJobId=ShareOperations.BatchJobId
+                            AND member.AccountId=ShareOperations.AccountId
+                            AND member.SettingsFingerprint=ShareOperations.SettingsFingerprint
+                            AND member.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint));
+                    """))
+                {
+                    Add(clearBaseline, "$batch", Id(snapshot.BatchJobId)); Add(clearBaseline, "$account", Id(snapshot.AccountId));
+                    Add(clearBaseline, "$settings", snapshot.SettingsFingerprint);
+                    await clearBaseline.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
                 await using var pause = Command(connection, transaction, """
-                    UPDATE ShareOperations SET Status='Paused',LeaseExpiresAt=NULL,
+                    UPDATE ShareOperations SET Status='Paused',LeaseGeneration=LeaseGeneration+1,LeaseExpiresAt=NULL,
+                      BaselineGeneration=NULL,BaselineFingerprint=NULL,BaselineShareCount=0,BaselineCompletedAt=NULL,
                       LastErrorCode='AwaitingExistingShareDecision',
                       LastErrorMessage='等待确认已有分享',UpdatedAt=$updated
                     WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
-                      AND Status IN ('WaitingShare','Reserved','Preparing');
+                      AND Status IN ('WaitingShare','Reserved','Preparing')
+                      AND EXISTS(SELECT 1 FROM BatchShareDiscoveryMembers member
+                        WHERE member.BatchJobId=ShareOperations.BatchJobId
+                          AND member.AccountId=ShareOperations.AccountId
+                          AND member.SettingsFingerprint=ShareOperations.SettingsFingerprint
+                          AND member.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint);
                     """);
                 Add(pause, "$batch", Id(snapshot.BatchJobId)); Add(pause, "$account", Id(snapshot.AccountId));
                 Add(pause, "$settings", snapshot.SettingsFingerprint); Add(pause, "$updated", Time(snapshot.CompletedAt));
                 await pause.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await using (var cleanup = Command(connection, transaction,
+                "DELETE FROM BatchShareDiscoveryRuns WHERE RunId=$run;"))
+            {
+                Add(cleanup,"$run",Id(runId));
+                await cleanup.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
@@ -760,6 +1087,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         {
             foreach (var snapshot in snapshots)
             {
+                if(!await HasExpectedWorkVersionAsync(connection,transaction,snapshot,cancellationToken).ConfigureAwait(false))
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return false;
+                }
                 if (snapshot.Decision is not ("Reuse" or "Regenerate" or "Cancel") ||
                     snapshot.CompatibleCount + snapshot.IncompatibleCount > snapshot.DiscoveredCount ||
                     (snapshot.Decision == "Reuse" && snapshot.DiscoveredCount > 0 && snapshot.CompatibleCount == 0))
@@ -800,7 +1132,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     UPDATE ShareOperations SET Status='WaitingShare',LeaseExpiresAt=NULL,
                       LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$updated
                     WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings
-                      AND Status='Paused' AND LastErrorCode='AwaitingExistingShareDecision';
+                      AND Status='Paused' AND LastErrorCode='AwaitingExistingShareDecision'
+                      AND EXISTS(SELECT 1 FROM BatchShareDiscoveryMembers member
+                        WHERE member.BatchJobId=ShareOperations.BatchJobId
+                          AND member.AccountId=ShareOperations.AccountId
+                          AND member.SettingsFingerprint=ShareOperations.SettingsFingerprint
+                          AND member.ExactItemSetFingerprint=ShareOperations.ExactItemSetFingerprint);
                     """);
                 Add(resume, "$batch", Id(snapshot.BatchJobId)); Add(resume, "$account", Id(snapshot.AccountId));
                 Add(resume, "$settings", snapshot.SettingsFingerprint); Add(resume, "$updated", Time(snapshot.ConfirmedAt));
@@ -1095,6 +1432,56 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
 
+    private static async Task<bool> HasDiscoveryOwnershipAsync(
+        SqliteConnection connection,SqliteTransaction transaction,Guid runId,
+        BatchShareDiscoverySnapshotRecord snapshot,CancellationToken cancellationToken)
+    {
+        await using var command=Command(connection,transaction,"""
+            SELECT EXISTS(SELECT 1 FROM BatchShareDiscoveryRuns
+              WHERE RunId=$run AND BatchJobId=$batch AND AccountId=$account
+                AND SettingsFingerprint=$settings AND ExpectedWorkVersion=$version AND ExpiresAt>$now);
+            """);
+        Add(command,"$run",Id(runId));Add(command,"$batch",Id(snapshot.BatchJobId));Add(command,"$account",Id(snapshot.AccountId));
+        Add(command,"$settings",snapshot.SettingsFingerprint);Add(command,"$version",ParseWorkVersion(snapshot.Generation));
+        Add(command,"$now",Time(DateTimeOffset.UtcNow));
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
+    }
+
+    private static async Task<bool> HasExpectedWorkVersionAsync(
+        SqliteConnection connection,SqliteTransaction transaction,
+        BatchShareDiscoverySnapshotRecord snapshot,CancellationToken cancellationToken)
+        =>await HasExpectedWorkVersionAsync(connection,transaction,snapshot.BatchJobId,snapshot.AccountId,
+            snapshot.SettingsFingerprint,snapshot.Generation,cancellationToken).ConfigureAwait(false);
+
+    private static async Task<bool> HasExpectedWorkVersionAsync(
+        SqliteConnection connection,SqliteTransaction transaction,
+        BatchShareDecisionSnapshotRecord snapshot,CancellationToken cancellationToken)
+        =>await HasExpectedWorkVersionAsync(connection,transaction,snapshot.BatchJobId,snapshot.AccountId,
+            snapshot.SettingsFingerprint,snapshot.Generation,cancellationToken).ConfigureAwait(false);
+
+    private static async Task<bool> HasExpectedWorkVersionAsync(
+        SqliteConnection connection,SqliteTransaction transaction,Guid batchJobId,Guid accountId,
+        string settingsFingerprint,string generation,CancellationToken cancellationToken)
+    {
+        var expected=ParseWorkVersion(generation);
+        await using var command=Command(connection,transaction,"""
+            SELECT EXISTS(SELECT 1 FROM BatchShareWorkVersions
+              WHERE BatchJobId=$batch AND AccountId=$account AND SettingsFingerprint=$settings AND Version=$version);
+            """);
+        Add(command,"$batch",Id(batchJobId));Add(command,"$account",Id(accountId));
+        Add(command,"$settings",settingsFingerprint);Add(command,"$version",expected);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))==1;
+    }
+
+    private static long ParseWorkVersion(string generation)
+    {
+        var separator=generation.IndexOf(':');
+        if(separator<=0||!long.TryParse(generation.AsSpan(0,separator),System.Globalization.NumberStyles.None,
+               System.Globalization.CultureInfo.InvariantCulture,out var version)||version<1)
+            throw new ArgumentException("The discovery work generation is invalid.",nameof(generation));
+        return version;
+    }
+
     private static void BindDecision(SqliteCommand command, BatchShareDecisionSnapshotRecord snapshot)
     {
         Add(command, "$batch", Id(snapshot.BatchJobId)); Add(command, "$account", Id(snapshot.AccountId));
@@ -1212,4 +1599,18 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
     private static string Time(DateTimeOffset value)=>value.ToUniversalTime().ToString("O");
     private static DateTimeOffset ReadTime(SqliteDataReader reader,int ordinal)=>DateTimeOffset.Parse(reader.GetString(ordinal),System.Globalization.CultureInfo.InvariantCulture);
     private static DateTimeOffset? ReadNullableTime(SqliteDataReader reader,int ordinal)=>reader.IsDBNull(ordinal)?null:ReadTime(reader,ordinal);
+    private static string EncodeMemberCursor(string fingerprint,string shareId)=>
+        Convert.ToBase64String(Encoding.UTF8.GetBytes(fingerprint+'\n'+shareId));
+    private static (string Fingerprint,string ShareId)? DecodeMemberCursor(string? cursor)
+    {
+        if (cursor is null) return null;
+        try
+        {
+            var value=Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
+            var separator=value.IndexOf('\n');
+            if(separator<=0||separator==value.Length-1)throw new FormatException();
+            return(value[..separator],value[(separator+1)..]);
+        }
+        catch(FormatException){throw new ArgumentException("The discovery cursor is invalid.",nameof(cursor));}
+    }
 }

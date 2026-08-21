@@ -34,38 +34,33 @@ public sealed class ExistingShareDecisionService
         if (accounts.Count == 0)
             throw new InvalidOperationException("The batch has no selected share-enabled accounts.");
 
+        var runId = Guid.NewGuid();
         var snapshots = new List<BatchShareDiscoverySnapshotRecord>(accounts.Count);
-        foreach (var account in accounts)
+        try
         {
-            ValidateAccount(account, batchJobId);
-            var session = await sessionStore.LoadAsync(account.AccountId.ToString("D"), cancellationToken)
-                .ConfigureAwait(false)
-                ?? throw new InvalidOperationException("A selected account session is unavailable.");
-            var listed = await ListAllAsync(session, cancellationToken).ConfigureAwait(false);
-            var matches = new List<BaiduShareRecord>();
-            foreach (var share in listed.OrderBy(value => value.ShareId, StringComparer.Ordinal))
+            foreach (var account in accounts)
             {
-                if (await store.ContainsDecisionExactSetAsync(
-                        batchJobId, account.AccountId, share.RemoteItems.Fingerprint, cancellationToken)
-                    .ConfigureAwait(false))
-                    matches.Add(share);
+                ValidateAccount(account, batchJobId);
+                var expectedWorkVersion=await store.BeginDiscoveryAsync(runId,account,cancellationToken).ConfigureAwait(false);
+                var session = await sessionStore.LoadAsync(account.AccountId.ToString("D"), cancellationToken)
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("A selected account session is unavailable.");
+                await StageAllAsync(runId, account, session, cancellationToken).ConfigureAwait(false);
+                var previous = await store.GetDiscoverySnapshotAsync(
+                    batchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken).ConfigureAwait(false);
+                var version = previous is null ? 1 : checked(previous.Version + 1);
+                snapshots.Add(await ReadStagedSnapshotAsync(
+                    runId, account, expectedWorkVersion, version, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false));
             }
-            var compatible = matches.Count(value => policy.IsCompatible(value, Request(account.Settings, value.RemoteItems)));
-            var incompatible = matches.Count - compatible;
-            var fingerprint = ComputeDiscoveryFingerprint(account, matches);
-            var generation = await ComputeOperationGenerationAsync(account, cancellationToken).ConfigureAwait(false);
-            var previous = await store.GetDiscoverySnapshotAsync(
-                batchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken).ConfigureAwait(false);
-            var version = previous is null ? 1 : checked(previous.Version + 1);
-            var snapshot = new BatchShareDiscoverySnapshotRecord(
-                batchJobId, account.AccountId, account.Settings.SettingsFingerprint,
-                fingerprint, matches.Count, compatible, incompatible, generation,
-                timeProvider.GetUtcNow(), version);
-            snapshots.Add(snapshot);
-        }
 
-        if (!await store.TrySaveDiscoveryAndPauseAsync(snapshots, cancellationToken).ConfigureAwait(false))
-            throw new InvalidOperationException("The share discovery snapshot changed before it could be persisted.");
+            if (!await store.TrySaveDiscoveryAndPauseAsync(runId, snapshots, cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("The share discovery snapshot changed before it could be persisted.");
+        }
+        catch
+        {
+            await store.AbortDiscoveryAsync(runId, CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
 
         return Summary(batchJobId, snapshots);
     }
@@ -87,13 +82,29 @@ public sealed class ExistingShareDecisionService
             throw new ArgumentException("A decision override does not belong to a selected share-enabled account.", nameof(command));
 
         var snapshots = new List<BatchShareDiscoverySnapshotRecord>(accounts.Count);
-        foreach (var account in accounts)
+        var verificationRun = Guid.NewGuid();
+        try
         {
-            var snapshot = await store.GetDiscoverySnapshotAsync(
-                command.BatchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken)
-                .ConfigureAwait(false);
-            if (snapshot is null) return ExistingShareDecisionConfirmation.Stale;
-            snapshots.Add(snapshot);
+            foreach (var account in accounts)
+            {
+                var snapshot = await store.GetDiscoverySnapshotAsync(
+                    command.BatchJobId, account.AccountId, account.Settings.SettingsFingerprint, cancellationToken)
+                    .ConfigureAwait(false);
+                if (snapshot is null) return ExistingShareDecisionConfirmation.Stale;
+                var expectedWorkVersion=await store.BeginDiscoveryAsync(verificationRun,account,cancellationToken).ConfigureAwait(false);
+                var session = await sessionStore.LoadAsync(account.AccountId.ToString("D"), cancellationToken)
+                    .ConfigureAwait(false);
+                if (session is null) return ExistingShareDecisionConfirmation.Stale;
+                await StageAllAsync(verificationRun, account, session, cancellationToken).ConfigureAwait(false);
+                var currentEvidence = await ReadStagedSnapshotAsync(
+                    verificationRun, account, expectedWorkVersion, snapshot.Version, snapshot.CompletedAt, cancellationToken).ConfigureAwait(false);
+                if (!SameEvidence(snapshot, currentEvidence)) return ExistingShareDecisionConfirmation.Stale;
+                snapshots.Add(snapshot);
+            }
+        }
+        finally
+        {
+            await store.AbortDiscoveryAsync(verificationRun, CancellationToken.None).ConfigureAwait(false);
         }
 
         var current = Summary(command.BatchJobId, snapshots);
@@ -122,13 +133,14 @@ public sealed class ExistingShareDecisionService
             : ExistingShareDecisionConfirmation.Stale;
     }
 
-    private async Task<IReadOnlyList<BaiduShareRecord>> ListAllAsync(
+    private async Task StageAllAsync(
+        Guid runId,
+        ShareDecisionAccountContext account,
         AccountSession session,
         CancellationToken cancellationToken)
     {
         var cursor = (string?)null;
         var cursors = new HashSet<string>(StringComparer.Ordinal);
-        var values = new List<BaiduShareRecord>();
         for (var page = 0; page < MaximumDiscoveryPages; page++)
         {
             BaiduAdapterResult<BaiduSharePage> result;
@@ -143,15 +155,61 @@ public sealed class ExistingShareDecisionService
             }
             if (!result.IsSuccess)
                 throw new InvalidOperationException(result.SafeMessage ?? "The existing-share discovery request failed.");
-            values.AddRange(result.Value!.Items);
+            await store.StageDiscoveryPageAsync(runId, account, result.Value!.Items, cancellationToken)
+                .ConfigureAwait(false);
             var next = result.Value.NextCursor;
-            if (next is null) return values;
+            if (next is null) return;
             if (string.IsNullOrWhiteSpace(next) || !cursors.Add(next))
                 throw new InvalidOperationException("The existing-share discovery cursor is invalid.");
             cursor = next;
         }
         throw new InvalidOperationException("The existing-share discovery exceeded its bounded page limit.");
     }
+
+    private async Task<BatchShareDiscoverySnapshotRecord> ReadStagedSnapshotAsync(
+        Guid runId,
+        ShareDecisionAccountContext account,
+        long expectedWorkVersion,
+        long version,
+        DateTimeOffset completedAt,
+        CancellationToken cancellationToken)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        ShareReconciliationPolicy.Append(hash, "account-share-discovery-v1");
+        ShareReconciliationPolicy.Append(hash, account.AccountId.ToString("D"));
+        ShareReconciliationPolicy.Append(hash, account.Settings.SettingsFingerprint);
+        string? cursor = null;
+        var discovered = 0;
+        var compatible = 0;
+        do
+        {
+            var page = await store.GetStagedDiscoveryPageAsync(
+                runId, account.AccountId, cursor, 500, cancellationToken).ConfigureAwait(false);
+            foreach (var member in page.Items)
+            {
+                ShareReconciliationPolicy.Append(hash, member.ShareId);
+                ShareReconciliationPolicy.Append(hash, member.ExactItemSetFingerprint);
+                ShareReconciliationPolicy.Append(hash, member.IsPermanent ? "1" : "0");
+                ShareReconciliationPolicy.Append(hash, member.IsAccessUnlimited ? "1" : "0");
+                ShareReconciliationPolicy.Append(hash, member.ExtractionCode);
+                discovered++;
+                if (member.IsCompatible) compatible++;
+            }
+            cursor = page.NextCursor;
+        } while (cursor is not null);
+        return new(account.BatchJobId, account.AccountId, account.Settings.SettingsFingerprint,
+            Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(), discovered, compatible,
+            discovered-compatible, await ComputeOperationGenerationAsync(account, expectedWorkVersion, cancellationToken).ConfigureAwait(false),
+            completedAt, version);
+    }
+
+    private static bool SameEvidence(BatchShareDiscoverySnapshotRecord left, BatchShareDiscoverySnapshotRecord right) =>
+        left.BatchJobId == right.BatchJobId && left.AccountId == right.AccountId &&
+        string.Equals(left.SettingsFingerprint,right.SettingsFingerprint,StringComparison.Ordinal) &&
+        string.Equals(left.DiscoveryFingerprint,right.DiscoveryFingerprint,StringComparison.Ordinal) &&
+        left.DiscoveredCount == right.DiscoveredCount && left.CompatibleCount == right.CompatibleCount &&
+        left.IncompatibleCount == right.IncompatibleCount &&
+        string.Equals(left.Generation,right.Generation,StringComparison.Ordinal) && left.Version == right.Version;
 
     private static ExistingShareBatchSummary Summary(
         Guid batchJobId,
@@ -178,25 +236,6 @@ public sealed class ExistingShareDecisionService
                 value.AccountId, value.DiscoveredCount, value.CompatibleCount, value.IncompatibleCount)).ToArray());
     }
 
-    private static string ComputeDiscoveryFingerprint(
-        ShareDecisionAccountContext account,
-        IReadOnlyList<BaiduShareRecord> matches)
-    {
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        ShareReconciliationPolicy.Append(hash, "account-share-discovery-v1");
-        ShareReconciliationPolicy.Append(hash, account.AccountId.ToString("D"));
-        ShareReconciliationPolicy.Append(hash, account.Settings.SettingsFingerprint);
-        foreach (var match in matches)
-        {
-            ShareReconciliationPolicy.Append(hash, match.ShareId);
-            ShareReconciliationPolicy.Append(hash, match.RemoteItems.Fingerprint);
-            ShareReconciliationPolicy.Append(hash, match.IsPermanent ? "1" : "0");
-            ShareReconciliationPolicy.Append(hash, match.IsAccessUnlimited ? "1" : "0");
-            ShareReconciliationPolicy.Append(hash, match.ExtractionCode);
-        }
-        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-    }
-
     private static PermanentShareRequest Request(BatchShareSettingsRecord settings, RemoteItemIdentitySet items) =>
         string.Equals(settings.ExtractionCodeMode, "Random", StringComparison.Ordinal)
             ? new(items)
@@ -212,6 +251,7 @@ public sealed class ExistingShareDecisionService
 
     private async Task<string> ComputeOperationGenerationAsync(
         ShareDecisionAccountContext account,
+        long expectedWorkVersion,
         CancellationToken cancellationToken)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -230,7 +270,7 @@ public sealed class ExistingShareDecisionService
             cursor = page.NextCursor;
         } while (cursor is not null);
         if (count == 0) throw new InvalidOperationException("The selected account has no exact share work.");
-        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+        return $"{expectedWorkVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)}:{Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant()}";
     }
 
     private static byte[] ParseToken(string value)
