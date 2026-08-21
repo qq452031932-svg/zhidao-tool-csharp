@@ -27,8 +27,15 @@ public interface IOperationReconciliationStore
         DateTimeOffset confirmedAt,
         CancellationToken cancellationToken = default);
 
+    Task MarkConfirmedPresentWithEvidenceAsync(
+        PendingReconciliationOperation expected,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset confirmedAt,
+        CancellationToken cancellationToken = default);
+
     Task MarkConfirmedAbsentAsync(
         PendingReconciliationOperation expected,
+        SubmissionAcceptance submissionAcceptance,
         DateTimeOffset confirmedAt,
         CancellationToken cancellationToken = default);
 
@@ -77,10 +84,10 @@ public sealed class OperationReconciliationService
             .ConfigureAwait(false);
         if (session is null) return TransferConfirmation.Ambiguous;
 
-        BaiduAdapterResult<TransferConfirmation> result;
+        BaiduAdapterResult<TransferConfirmationResult> result;
         try
         {
-            result = await adapter.ConfirmTransferAsync(session, query, cancellationToken).ConfigureAwait(false);
+            result = await adapter.ConfirmExactTransferAsync(session, query, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -92,35 +99,41 @@ public sealed class OperationReconciliationService
         }
 
         if (!result.IsSuccess) return TransferConfirmation.Ambiguous;
-        switch (result.Value)
+        switch (result.Value!.State)
         {
-            case TransferConfirmation.ConfirmedPresent:
-                await store.MarkConfirmedPresentAsync(pending, timeProvider.GetUtcNow(), cancellationToken)
+            case TransferConfirmationState.ExactPresent:
+                await store.MarkConfirmedPresentWithEvidenceAsync(
+                    pending,
+                    result.Value.RemoteItems!,
+                    timeProvider.GetUtcNow(),
+                    cancellationToken)
                     .ConfigureAwait(false);
                 return TransferConfirmation.ConfirmedPresent;
-            case TransferConfirmation.ConfirmedAbsent:
-                await store.MarkConfirmedAbsentAsync(pending, timeProvider.GetUtcNow(), cancellationToken)
+            case TransferConfirmationState.Absent when
+                result.SubmissionAcceptance == SubmissionAcceptance.DefinitelyNotAccepted:
+                await store.MarkConfirmedAbsentAsync(
+                    pending,
+                    result.SubmissionAcceptance,
+                    timeProvider.GetUtcNow(),
+                    cancellationToken)
                     .ConfigureAwait(false);
                 return TransferConfirmation.ConfirmedAbsent;
-            case TransferConfirmation.Ambiguous:
+            case TransferConfirmationState.Absent:
+            case TransferConfirmationState.Ambiguous:
                 return TransferConfirmation.Ambiguous;
             default:
                 throw new InvalidOperationException("The adapter returned an unsupported confirmation result.");
         }
     }
 
-    public async Task<ManualRetryResult> RetryAsync(
+    public Task<ManualRetryResult> RetryAsync(
         Guid operationId,
         bool duplicateRiskAccepted,
         CancellationToken cancellationToken = default)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation ID is required.", nameof(operationId));
-        if (!duplicateRiskAccepted)
-            return new ManualRetryResult(true, false, DuplicateRiskWarning);
-
-        await store.ResetPendingForUserRetryAsync(operationId, timeProvider.GetUtcNow(), cancellationToken)
-            .ConfigureAwait(false);
-        return new ManualRetryResult(false, true, DuplicateRiskWarning);
+        _ = duplicateRiskAccepted;
+        return Task.FromResult(new ManualRetryResult(true, false, DuplicateRiskWarning));
     }
 
     private static TransferConfirmationQuery BuildQuery(PendingReconciliationOperation pending)

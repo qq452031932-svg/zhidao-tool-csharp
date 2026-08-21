@@ -117,6 +117,53 @@ public sealed class OperationExecutorTests
         Assert.Equal(["remote-1"], store.RemoteItemIds);
     }
 
+    [Fact]
+    public async Task ExactTransferEvidenceUsesOneAtomicCompletionBoundary()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot) { RejectSplitSuccessWrites = true };
+        var adapter = new RecordingAdapter
+        {
+            SaveResult = BaiduAdapterResult<TransferReceipt>.Success(
+                TransferReceipt.WithExactEvidence(
+                    Now,
+                    "request-1",
+                    new RemoteItemIdentitySet([
+                        new RemoteItemIdentity("remote-2", "第二项"),
+                        new RemoteItemIdentity("remote-1", "第一项"),
+                    ]))),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.ExactCompleted);
+        Assert.Equal(["remote-1", "remote-2"], store.ExactRemoteItems!.Items.Select(item => item.ExactId));
+        Assert.DoesNotContain(store.Events, item => item.Name is "Identifiers" or "Succeeded");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ShareEnabledLegacySuccessWithoutExactEvidenceRemainsPending(bool descriptorOnly)
+    {
+        var snapshot = Snapshot(createFolderName: null) with { RequiresExactShareEvidence = true };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new RecordingAdapter
+        {
+            SaveResult = BaiduAdapterResult<TransferReceipt>.Success(new TransferReceipt(
+                Now,
+                descriptorOnly ? "request-only" : null,
+                descriptorOnly ? ["approximate-id"] : [])),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.ResultPending);
+        Assert.False(store.Succeeded);
+        Assert.False(store.ExactCompleted);
+        Assert.Equal(SubmissionAcceptance.Unknown, store.PendingAcceptance);
+    }
+
     [Theory]
     [InlineData(BaiduErrorKind.TransientService)]
     [InlineData(BaiduErrorKind.UnknownResponse)]
@@ -398,6 +445,9 @@ public sealed class OperationExecutorTests
         public int SucceededOrder { get; private set; }
         public bool Succeeded { get; private set; }
         public bool ResultPending { get; private set; }
+        public bool ExactCompleted { get; private set; }
+        public bool RejectSplitSuccessWrites { get; init; }
+        public RemoteItemIdentitySet? ExactRemoteItems { get; private set; }
         public bool AccountPaused { get; private set; }
         public bool PreSubmissionPaused { get; private set; }
         public bool DefiniteAccountFailure { get; private set; }
@@ -427,6 +477,7 @@ public sealed class OperationExecutorTests
 
         public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId, IReadOnlyList<string> remoteItemIds, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
+            if (RejectSplitSuccessWrites) throw new InvalidOperationException("split success write");
             IdentifierOrder = ++order;
             Events.Add((order, "Identifiers"));
             timeline?.Add("Identifiers");
@@ -437,10 +488,25 @@ public sealed class OperationExecutorTests
 
         public Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
         {
+            if (RejectSplitSuccessWrites) throw new InvalidOperationException("split success write");
             Succeeded = true;
             SucceededOrder = ++order;
             Events.Add((order, "Succeeded"));
             timeline?.Add("Succeeded");
+            return Task.CompletedTask;
+        }
+
+        public Task CompleteSucceededWithEvidenceAsync(
+            Guid operationId,
+            string? requestId,
+            RemoteItemIdentitySet exactRemoteItems,
+            DateTimeOffset now,
+            CancellationToken cancellationToken = default)
+        {
+            ExactCompleted = true;
+            ExactRemoteItems = exactRemoteItems;
+            Events.Add((++order, "ExactCompleted"));
+            timeline?.Add("ExactCompleted");
             return Task.CompletedTask;
         }
 

@@ -76,9 +76,14 @@ public sealed class BaiduAdapterResult<T>
     public SubmissionAcceptance SubmissionAcceptance { get; }
 
     public static BaiduAdapterResult<T> Success(T value)
+        => Success(value, SubmissionAcceptance.Unknown);
+
+    public static BaiduAdapterResult<T> Success(
+        T value,
+        SubmissionAcceptance submissionAcceptance)
     {
         ArgumentNullException.ThrowIfNull(value);
-        return new BaiduAdapterResult<T>(true, value, null, null, null, null, SubmissionAcceptance.Unknown);
+        return new BaiduAdapterResult<T>(true, value, null, null, null, null, submissionAcceptance);
     }
 
     public static BaiduAdapterResult<T> Failure(

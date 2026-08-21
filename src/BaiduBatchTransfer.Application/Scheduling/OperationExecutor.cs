@@ -13,7 +13,8 @@ public sealed record OperationExecutionSnapshot(
     RemotePath TargetPath,
     string? CreateFolderName,
     DuplicatePolicy DuplicatePolicy,
-    string OperationFingerprint)
+    string OperationFingerprint,
+    bool RequiresExactShareEvidence = false)
 {
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
@@ -30,6 +31,12 @@ public interface IOperationExecutionStore
         DateTimeOffset now,
         CancellationToken cancellationToken = default);
     Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default);
+    Task CompleteSucceededWithEvidenceAsync(
+        Guid operationId,
+        string? requestId,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default);
     Task MarkFailedAsync(
         Guid operationId,
         string code,
@@ -232,12 +239,34 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
 
         var receipt = saveResult.Value!;
+        if (receipt.ExactRemoteItems is not null)
+        {
+            await store.CompleteSucceededWithEvidenceAsync(
+                snapshot.OperationId,
+                receipt.AdapterRequestId,
+                receipt.ExactRemoteItems,
+                now,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
         await store.RecordSubmissionIdentifiersAsync(
             snapshot.OperationId,
             receipt.AdapterRequestId,
             receipt.RemoteItemIds,
             now,
             cancellationToken).ConfigureAwait(false);
+        if (snapshot.RequiresExactShareEvidence)
+        {
+            var unknown = BaiduAdapterResult.Failure(BaiduErrorKind.UnknownResponse, null);
+            await store.MarkResultPendingAsync(
+                snapshot.OperationId,
+                BaiduErrorKind.UnknownResponse.ToString(),
+                unknown.SafeMessage!,
+                SubmissionAcceptance.Unknown,
+                now,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
         await store.MarkSucceededAsync(snapshot.OperationId, now, cancellationToken).ConfigureAwait(false);
     }
 

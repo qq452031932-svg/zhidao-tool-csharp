@@ -16,7 +16,7 @@ public sealed class ReconciliationTests
     [InlineData(TransferConfirmation.ConfirmedPresent)]
     [InlineData(TransferConfirmation.ConfirmedAbsent)]
     [InlineData(TransferConfirmation.Ambiguous)]
-    public async Task PersistedDescriptorAloneCanDriveAllThreeConfirmationOutcomes(
+    public async Task LegacyDescriptorOnlyConfirmationNeverFinalizesWithoutExactTypedEvidence(
         TransferConfirmation confirmation)
     {
         var operation = PendingOperation();
@@ -33,12 +33,12 @@ public sealed class ReconciliationTests
 
         var outcome = await service.ReconcileAsync(operation.OperationId);
 
-        Assert.Equal(confirmation, outcome);
+        Assert.Equal(TransferConfirmation.Ambiguous, outcome);
         Assert.NotNull(adapter.Query);
         Assert.Null(adapter.Query!.AdapterRequestId);
         Assert.Empty(adapter.Query.RemoteItemIds);
-        Assert.Equal(confirmation == TransferConfirmation.ConfirmedPresent, store.Present);
-        Assert.Equal(confirmation == TransferConfirmation.ConfirmedAbsent, store.Absent);
+        Assert.False(store.Present);
+        Assert.False(store.Absent);
         Assert.False(store.ResetForRetry);
     }
 
@@ -90,7 +90,7 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
-    public async Task UserRetryRequiresDuplicateWarningAndReusesTheSameOperation()
+    public async Task UserCannotBlindRetryAnUnknownSubmissionEvenAfterAcceptingDuplicateRisk()
     {
         var operation = PendingOperation();
         var store = new RecordingReconciliationStore(operation);
@@ -109,14 +109,223 @@ public sealed class ReconciliationTests
 
         var accepted = await service.RetryAsync(operation.OperationId, duplicateRiskAccepted: true);
 
-        Assert.False(accepted.RequiresConfirmation);
-        Assert.True(accepted.ResetForRetry);
-        Assert.Equal(operation.OperationId, store.ResetOperationId);
+        Assert.True(accepted.RequiresConfirmation);
+        Assert.False(accepted.ResetForRetry);
+        Assert.Null(store.ResetOperationId);
+    }
+
+    [Fact]
+    public async Task ExactPresentConfirmationPassesCanonicalEvidenceToAtomicCompletion()
+    {
+        var operation = PendingOperation();
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-2", "第二项"),
+            new RemoteItemIdentity("remote-1", "第一项"),
+        ]);
+        var store = new RecordingReconciliationStore(operation);
+        var adapter = new ConfirmationAdapter
+        {
+            Result = BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.ConfirmedPresent),
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(exact)),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var outcome = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedPresent, outcome);
+        Assert.True(store.Present);
+        Assert.Same(exact, store.ExactRemoteItems);
+    }
+
+    [Fact]
+    public async Task MultipleApproximateMatchesRemainAmbiguousAndNeverUseLegacyPresentSignal()
+    {
+        var operation = PendingOperation();
+        var store = new RecordingReconciliationStore(operation);
+        var adapter = new ConfirmationAdapter
+        {
+            Result = BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.ConfirmedPresent),
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.Ambiguous),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var outcome = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.Ambiguous, outcome);
+        Assert.False(store.Present);
+        Assert.False(store.Absent);
+        Assert.False(store.ResetForRetry);
+    }
+
+    [Theory]
+    [InlineData(SubmissionAcceptance.Unknown, TransferConfirmation.Ambiguous, false)]
+    [InlineData(SubmissionAcceptance.DefinitelyNotAccepted, TransferConfirmation.ConfirmedAbsent, true)]
+    public async Task AbsentOnlyReleasesPendingWorkWithExplicitDefinitelyNotAcceptedEvidence(
+        SubmissionAcceptance acceptance,
+        TransferConfirmation expectedOutcome,
+        bool expectedAbsentWrite)
+    {
+        var operation = PendingOperation();
+        var store = new RecordingReconciliationStore(operation);
+        var adapter = new ConfirmationAdapter
+        {
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.Absent,
+                acceptance),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var outcome = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(expectedOutcome, outcome);
+        Assert.Equal(expectedAbsentWrite, store.Absent);
+        Assert.False(store.Present);
+    }
+
+    [Theory]
+    [InlineData("用户标题", "用户标题")]
+    [InlineData("预检回退标题", "预检回退标题")]
+    [InlineData(null, "第一项 等 2 项")]
+    public async Task SqliteExactCompletionAtomicallySealsShareEvidenceCountersAndTitle(
+        string? persistedTitle,
+        string expectedTitle)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, persistedTitle);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var pending = await store.LoadPendingAsync(data.OperationId);
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-2", "第二项"),
+            new RemoteItemIdentity("remote-1", "第一项"),
+        ]);
+
+        await store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now);
+
+        Assert.Equal("Succeeded", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("WaitingShare", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Equal(exact.Fingerprint, await ScalarAsync(db, "ShareOperations", "ExactItemSetFingerprint"));
+        Assert.Equal(2, await ScalarIntAsync(db, "ShareOperationGenerations", "ExactItemCount"));
+        Assert.Equal(2, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ItemCount FROM ShareOperationRemoteItems)", "ItemCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+        Assert.Equal(expectedTitle, await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+    }
+
+    [Fact]
+    public async Task FailureWhilePersistingExactItemsRollsBackTheEntireTransferShareHandoff()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, "原有回退");
+        await ExecuteAsync(db, """
+            CREATE TRIGGER fail_exact_item BEFORE INSERT ON ShareOperationRemoteItems
+            BEGIN SELECT RAISE(ABORT,'injected exact item failure'); END;
+            """);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var pending = await store.LoadPendingAsync(data.OperationId);
+        var exact = new RemoteItemIdentitySet([new RemoteItemIdentity("remote-1", "远端名称")]);
+
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now));
+
+        Assert.Equal("ResultPending", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Reserved", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal("WaitingTransfer", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Null(await ScalarNullableAsync(db, "ShareOperations", "ExactItemSetFingerprint"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ItemCount FROM ShareOperationRemoteItems)", "ItemCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS GenerationCount FROM ShareOperationGenerations)", "GenerationCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+        Assert.Equal("原有回退", await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+    }
+
+    [Fact]
+    public async Task DefinitelyAbsentResetsTheSameTransferSafelyWithoutReleasingShareWork()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, "预检标题");
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new OperationReconciliationService(
+            new ConfirmationAdapter
+            {
+                ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                    TransferConfirmationResult.Absent,
+                    SubmissionAcceptance.DefinitelyNotAccepted),
+            },
+            new SessionStore(data.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(data.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedAbsent, result);
+        Assert.Equal("Waiting", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Released", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal("WaitingTransfer", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+        Assert.Equal("预检标题", await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+    }
+
+    [Fact]
+    public async Task LegacySuccessStoreApisCannotBypassExactEvidenceForShareEnabledWork()
+    {
+        await using var firstDb = await BatchTestDatabase.CreateAsync();
+        var first = await SeedPendingShareAsync(firstDb, "标题");
+        var firstStore = new SqliteTransferSchedulingStore(firstDb.ConnectionFactory);
+        Assert.True((await firstStore.LoadOperationAsync(first.OperationId))!.RequiresExactShareEvidence);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            firstStore.MarkSucceededAsync(first.OperationId, Now));
+        Assert.Equal("ResultPending", await ScalarAsync(firstDb, "TransferOperations", "Status"));
+        Assert.Equal("WaitingTransfer", await ScalarAsync(firstDb, "ShareOperations", "Status"));
+
+        await using var secondDb = await BatchTestDatabase.CreateAsync();
+        var second = await SeedPendingShareAsync(secondDb, "标题");
+        var secondStore = new SqliteTransferSchedulingStore(secondDb.ConnectionFactory);
+        var pending = await secondStore.LoadPendingAsync(second.OperationId);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            secondStore.MarkConfirmedPresentAsync(pending!, Now));
+        Assert.Equal("ResultPending", await ScalarAsync(secondDb, "TransferOperations", "Status"));
+        Assert.Equal("WaitingTransfer", await ScalarAsync(secondDb, "ShareOperations", "Status"));
+    }
+
+    [Fact]
+    public async Task TransferFailurePreservesThePreResolvedTitle()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, "预转存解析标题");
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.MarkFailedAsync(
+            data.OperationId,
+            "TransientService",
+            "The service is temporarily unavailable.",
+            globallyInvalid: false,
+            Now);
+
+        Assert.Equal("Failed", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("预转存解析标题", await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ShareCount FROM ShareOperations)", "ShareCount"));
     }
 
     [Theory]
     [InlineData(TransferConfirmation.ConfirmedPresent, "Succeeded", "Fulfilled", 0, 1)]
-    [InlineData(TransferConfirmation.ConfirmedAbsent, "Failed", "Released", 0, 0)]
+    [InlineData(TransferConfirmation.ConfirmedAbsent, "Waiting", "Released", 0, 0)]
     [InlineData(TransferConfirmation.Ambiguous, "ResultPending", "Reserved", 1, 0)]
     public async Task SqliteReconciliationChangesOperationAndSlotCountersAtomically(
         TransferConfirmation confirmation,
@@ -130,7 +339,17 @@ public sealed class ReconciliationTests
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var adapter = new ConfirmationAdapter
         {
-            Result = BaiduAdapterResult<TransferConfirmation>.Success(confirmation),
+            ExactResult = confirmation switch
+            {
+                TransferConfirmation.ConfirmedPresent => BaiduAdapterResult<TransferConfirmationResult>.Success(
+                    TransferConfirmationResult.ExactPresent(new RemoteItemIdentitySet([
+                        new RemoteItemIdentity("remote-1", "资源")
+                    ]))),
+                TransferConfirmation.ConfirmedAbsent => BaiduAdapterResult<TransferConfirmationResult>.Success(
+                    TransferConfirmationResult.Absent,
+                    SubmissionAcceptance.DefinitelyNotAccepted),
+                _ => BaiduAdapterResult<TransferConfirmationResult>.Success(TransferConfirmationResult.Ambiguous),
+            },
         };
         var service = new OperationReconciliationService(
             adapter,
@@ -147,7 +366,7 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
-    public async Task AcceptedPendingRetryKeepsDailyCountAndCanCrossBoundaryWithoutCountingAgain()
+    public async Task AcceptedDuplicateRiskStillCannotBlindRetryUnknownPendingWork()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var data = await SeedPendingAsync(db, dailyLimit: 1);
@@ -158,21 +377,14 @@ public sealed class ReconciliationTests
             store,
             new FixedTimeProvider(Now));
 
-        await service.RetryAsync(data.OperationId, duplicateRiskAccepted: true);
+        var retry = await service.RetryAsync(data.OperationId, duplicateRiskAccepted: true);
         var reserved = await store.TryReserveNextAsync(data.BatchId, Now, Now.AddMinutes(5));
-        await store.MarkPreparingAsync(data.OperationId, Now.AddSeconds(1));
-        var boundary = await new AccountDailyLimitService(store, new FixedTimeProvider(Now.AddSeconds(2)))
-            .PersistFirstSubmissionAsync(new SubmissionBoundaryCommand(
-                data.OperationId,
-                data.AccountId,
-                DescriptorJson("retry-operation"),
-                Now.AddMinutes(5)));
 
-        Assert.Equal(data.OperationId, reserved?.OperationId);
-        Assert.True(boundary.Accepted);
-        Assert.False(boundary.WasNewlyCounted);
+        Assert.True(retry.RequiresConfirmation);
+        Assert.False(retry.ResetForRetry);
+        Assert.Null(reserved);
         Assert.Equal(1, await ScalarIntAsync(db, "Accounts", "DailyExecutedCount"));
-        Assert.Equal("Submitting", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("ResultPending", await ScalarAsync(db, "TransferOperations", "Status"));
     }
 
     [Fact]
@@ -267,12 +479,12 @@ public sealed class ReconciliationTests
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             new CancelOperationService(store, new FixedTimeProvider(Now)).CancelAsync(data.OperationId));
 
-        Assert.Equal("Waiting", await ScalarAsync(db, "TransferOperations", "Status"));
-        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal("ResultPending", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
     }
 
     [Fact]
-    public async Task StaleConfirmationCannotFinalizeANewerManualRetryAttempt()
+    public async Task StaleExactConfirmationCannotFinalizeChangedPendingEvidence()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var data = await SeedPendingAsync(db);
@@ -280,7 +492,10 @@ public sealed class ReconciliationTests
         var adapter = new ConfirmationAdapter
         {
             BlockConfirmation = true,
-            Result = BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.ConfirmedPresent),
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(new RemoteItemIdentitySet([
+                    new RemoteItemIdentity("remote-1", "资源")
+                ]))),
         };
         var service = new OperationReconciliationService(
             adapter,
@@ -290,22 +505,9 @@ public sealed class ReconciliationTests
         var reconciliation = service.ReconcileAsync(data.OperationId);
         await adapter.QueryObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        await service.RetryAsync(data.OperationId, duplicateRiskAccepted: true);
-        Assert.Equal(data.OperationId,
-            (await store.TryReserveNextAsync(data.BatchId, Now, Now.AddMinutes(5)))?.OperationId);
-        await store.MarkPreparingAsync(data.OperationId, Now.AddSeconds(1));
-        await new AccountDailyLimitService(store, new FixedTimeProvider(Now.AddSeconds(2)))
-            .PersistFirstSubmissionAsync(new SubmissionBoundaryCommand(
-                data.OperationId,
-                data.AccountId,
-                DescriptorJson("operation"),
-                Now.AddMinutes(5)));
-        await store.MarkResultPendingAsync(
-            data.OperationId,
-            "UnknownResponse",
-            "The service returned an unrecognized response.",
-            SubmissionAcceptance.Unknown,
-            Now.AddSeconds(3));
+        await ExecuteAsync(db,
+            "UPDATE TransferOperations SET AttemptCount=AttemptCount+1,AdapterRequestId='new-request' WHERE Id=$id;",
+            ("$id", data.OperationId.ToString("D")));
 
         adapter.ReleaseConfirmation.TrySetResult();
         await Assert.ThrowsAsync<InvalidOperationException>(() => reconciliation);
@@ -390,6 +592,32 @@ public sealed class ReconciliationTests
             "/base", "/base", 1, 1, 1, 1, dailyCounted ? 1 : 0, 0, 0, 0, 0, 0, 0, 0, 1, 0);
         await db.SeedAsync([account], job: job, resources: [resource], operations: [operation], allocations: [allocation]);
         return (batchId, accountId, operationId);
+    }
+
+    private static async Task<(Guid BatchId, Guid AccountId, Guid OperationId)> SeedPendingShareAsync(
+        BatchTestDatabase db,
+        string? resolvedOutputTitle)
+    {
+        var data = await SeedPendingAsync(db);
+        await ExecuteAsync(db,
+            "UPDATE ResourceItems SET ResolvedOutputTitle=$title; UPDATE BatchJobs SET ShareOperationCount=1 WHERE Id=$batch;",
+            ("$title", resolvedOutputTitle),
+            ("$batch", data.BatchId.ToString("D")));
+        await ExecuteAsync(db, """
+            INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Ask','settings-fingerprint',$now);
+            INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'账号',1,1,1);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            SELECT $share,o.Id,o.ResourceItemId,o.BatchJobId,o.AssignedAccountId,1,'WaitingTransfer',NULL,'settings-fingerprint',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now
+            FROM TransferOperations o WHERE o.Id=$operation;
+            """,
+            ("$batch", data.BatchId.ToString("D")),
+            ("$account", data.AccountId.ToString("D")),
+            ("$share", Guid.NewGuid().ToString("D")),
+            ("$operation", data.OperationId.ToString("D")),
+            ("$now", Now.ToString("O")));
+        return data;
     }
 
     private static async Task<(Guid BatchId, Guid FailedAccountId, Guid ReplacementAccountId, Guid OperationId)>
@@ -487,6 +715,7 @@ public sealed class ReconciliationTests
         public bool Absent { get; private set; }
         public bool ResetForRetry { get; private set; }
         public Guid? ResetOperationId { get; private set; }
+        public RemoteItemIdentitySet? ExactRemoteItems { get; private set; }
 
         public Task<PendingReconciliationOperation?> LoadPendingAsync(
             Guid operationId,
@@ -502,11 +731,24 @@ public sealed class ReconciliationTests
             return Task.CompletedTask;
         }
 
-        public Task MarkConfirmedAbsentAsync(
+        public Task MarkConfirmedPresentWithEvidenceAsync(
             PendingReconciliationOperation expected,
+            RemoteItemIdentitySet exactRemoteItems,
             DateTimeOffset confirmedAt,
             CancellationToken cancellationToken = default)
         {
+            Present = true;
+            ExactRemoteItems = exactRemoteItems;
+            return Task.CompletedTask;
+        }
+
+        public Task MarkConfirmedAbsentAsync(
+            PendingReconciliationOperation expected,
+            SubmissionAcceptance submissionAcceptance,
+            DateTimeOffset confirmedAt,
+            CancellationToken cancellationToken = default)
+        {
+            Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, submissionAcceptance);
             Absent = true;
             return Task.CompletedTask;
         }
@@ -542,6 +784,7 @@ public sealed class ReconciliationTests
     {
         public BaiduAdapterResult<TransferConfirmation> Result { get; set; } =
             BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.Ambiguous);
+        public BaiduAdapterResult<TransferConfirmationResult>? ExactResult { get; init; }
 
         public TransferConfirmationQuery? Query { get; private set; }
         public bool BlockConfirmation { get; init; }
@@ -557,6 +800,24 @@ public sealed class ReconciliationTests
             QueryObserved.TrySetResult();
             if (BlockConfirmation) await ReleaseConfirmation.Task.WaitAsync(cancellationToken);
             return Result;
+        }
+
+        public async Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferAsync(
+            AccountSession session,
+            TransferConfirmationQuery query,
+            CancellationToken cancellationToken)
+        {
+            Query = query;
+            QueryObserved.TrySetResult();
+            if (BlockConfirmation) await ReleaseConfirmation.Task.WaitAsync(cancellationToken);
+            if (ExactResult is not null) return ExactResult;
+            if (!Result.IsSuccess)
+                return BaiduAdapterResult<TransferConfirmationResult>.Failure(
+                    Result.ErrorKind!.Value,
+                    null,
+                    Result.RetryAfter,
+                    Result.SubmissionAcceptance);
+            return BaiduAdapterResult<TransferConfirmationResult>.Success(Result.Value.ToExactResult());
         }
 
         public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();

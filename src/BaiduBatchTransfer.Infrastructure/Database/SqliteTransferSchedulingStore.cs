@@ -535,6 +535,11 @@ public sealed class SqliteTransferSchedulingStore :
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, expected.OperationId, cancellationToken).ConfigureAwait(false);
+        await EnsureLegacySuccessHasNoPendingShareAsync(
+            connection,
+            transaction,
+            expected.OperationId,
+            cancellationToken).ConfigureAwait(false);
         await using (var operation = Command(connection, transaction,
             "UPDATE TransferOperations SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status='ResultPending' AND SubmitState='PendingConfirmation' AND TargetSlotState='Reserved' AND AttemptCount=$attempt AND ConfirmationDescriptorJson=$descriptor AND AdapterRequestId IS $request AND RemoteItemIdsJson IS $remote;"))
         {
@@ -560,15 +565,20 @@ public sealed class SqliteTransferSchedulingStore :
 
     public async Task MarkConfirmedAbsentAsync(
         PendingReconciliationOperation expected,
+        SubmissionAcceptance submissionAcceptance,
         DateTimeOffset confirmedAt,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(expected);
+        if (submissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
+            throw new ArgumentException(
+                "Only explicit definitely-not-accepted evidence can reset a submitted transfer.",
+                nameof(submissionAcceptance));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, expected.OperationId, cancellationToken).ConfigureAwait(false);
         await using (var operation = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState='ResultReceived',TargetSlotState='Released',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode='ConfirmedAbsent',LastErrorMessage='The transfer was confirmed absent.',UpdatedAt=$now WHERE Id=$id AND Status='ResultPending' AND SubmitState='PendingConfirmation' AND TargetSlotState='Reserved' AND AttemptCount=$attempt AND ConfirmationDescriptorJson=$descriptor AND AdapterRequestId IS $request AND RemoteItemIdsJson IS $remote;"))
+            "UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',TargetSlotState='Released',TargetSlotReservedAt=NULL,ConfirmationDescriptorJson=NULL,AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status='ResultPending' AND SubmitState='PendingConfirmation' AND TargetSlotState='Reserved' AND AttemptCount=$attempt AND ConfirmationDescriptorJson=$descriptor AND AdapterRequestId IS $request AND RemoteItemIdsJson IS $remote;"))
         {
             Add(operation, "$now", Time(confirmedAt)); Add(operation, "$id", Id(expected.OperationId));
             Add(operation, "$attempt", expected.AttemptCount);
@@ -576,13 +586,13 @@ public sealed class SqliteTransferSchedulingStore :
             RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The pending confirmation changed before it could be finalized.");
         }
         await using (var allocation = Command(connection, transaction,
-            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1,FailedItemCount=FailedItemCount+1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
+            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
         {
             Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
             RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing.");
         }
         await using (var resource = Command(connection, transaction,
-            "UPDATE ResourceItems SET CandidateStatus='Expanded',ReservedAccountId=NULL,ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved' AND ReservedAccountId=$account;"))
+            "UPDATE ResourceItems SET ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved' AND ReservedAccountId=$account;"))
         {
             Add(resource, "$now", Time(confirmedAt)); Add(resource, "$resource", Id(ids.ResourceId)); Add(resource, "$account", Id(ids.AccountId));
             await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -595,28 +605,12 @@ public sealed class SqliteTransferSchedulingStore :
         DateTimeOffset resetAt,
         CancellationToken cancellationToken = default)
     {
-        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = connection.BeginTransaction(deferred: false);
-        var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
-        await using (var operation = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',TargetSlotState='Released',TargetSlotReservedAt=NULL,ConfirmationDescriptorJson=NULL,AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status='ResultPending' AND SubmitState='PendingConfirmation' AND TargetSlotState='Reserved' AND ConfirmationDescriptorJson IS NOT NULL;"))
-        {
-            Add(operation, "$now", Time(resetAt)); Add(operation, "$id", Id(operationId));
-            RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Only a result-pending operation can be retried.");
-        }
-        await using (var allocation = Command(connection, transaction,
-            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
-        {
-            Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
-            RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing.");
-        }
-        await using (var resource = Command(connection, transaction,
-            "UPDATE ResourceItems SET ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved' AND ReservedAccountId=$account;"))
-        {
-            Add(resource, "$now", Time(resetAt)); Add(resource, "$resource", Id(ids.ResourceId)); Add(resource, "$account", Id(ids.AccountId));
-            await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        _ = operationId;
+        _ = resetAt;
+        _ = cancellationToken;
+        await Task.Yield();
+        throw new InvalidOperationException(
+            "An unknown transfer result cannot be reset for blind retry; reconcile definite absence first.");
     }
 
     public async Task CancelBeforeSubmissionAsync(
@@ -676,7 +670,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
+            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer') FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
@@ -684,7 +678,7 @@ public sealed class SqliteTransferSchedulingStore :
             Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)),
             new ShareReference(reader.GetString(2), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4)),
             new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
-            Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8));
+            Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0);
     }
 
     public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default) =>
@@ -773,11 +767,203 @@ public sealed class SqliteTransferSchedulingStore :
             ("$request", requestId), ("$remote", remoteJson), ("$now", Time(now)), ("$id", Id(operationId)));
     }
 
+    public async Task CompleteSucceededWithEvidenceAsync(
+        Guid operationId,
+        string? requestId,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+        => await CompleteSucceededWithEvidenceCoreAsync(
+            operationId,
+            requestId,
+            exactRemoteItems,
+            now,
+            expected: null,
+            cancellationToken).ConfigureAwait(false);
+
+    public Task MarkConfirmedPresentWithEvidenceAsync(
+        PendingReconciliationOperation expected,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset confirmedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(expected);
+        return CompleteSucceededWithEvidenceCoreAsync(
+            expected.OperationId,
+            expected.AdapterRequestId,
+            exactRemoteItems,
+            confirmedAt,
+            expected,
+            cancellationToken);
+    }
+
+    private async Task CompleteSucceededWithEvidenceCoreAsync(
+        Guid operationId,
+        string? requestId,
+        RemoteItemIdentitySet exactRemoteItems,
+        DateTimeOffset now,
+        PendingReconciliationOperation? expected,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(exactRemoteItems);
+        var remoteJson = System.Text.Json.JsonSerializer.Serialize(
+            exactRemoteItems.Items.Select(item => item.ExactId));
+        var resolvedFallback = ResolvedOutputTitleBuilder.Resolve(
+            null,
+            exactRemoteItems.Items.Select(item => (string?)item.DisplayedTopLevelName).ToArray());
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
+
+        Guid? shareOperationId = null;
+        await using (var readShare = Command(connection, transaction,
+            "SELECT Id,Status FROM ShareOperations WHERE TransferOperationId=$transfer;"))
+        {
+            Add(readShare, "$transfer", Id(operationId));
+            await using var reader = await readShare.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                shareOperationId = Guid.Parse(reader.GetString(0));
+                if (!string.Equals(reader.GetString(1), "WaitingTransfer", StringComparison.Ordinal))
+                    throw new InvalidOperationException("The share handoff is no longer waiting for transfer evidence.");
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    throw new InvalidDataException("A transfer operation has multiple share handoffs.");
+            }
+        }
+
+        var expectedPredicate = expected is null
+            ? string.Empty
+            : " AND AttemptCount=$attempt AND ConfirmationDescriptorJson=$descriptor AND AdapterRequestId IS $expectedRequest AND RemoteItemIdsJson IS $expectedRemote";
+        await using (var operation = Command(connection, transaction, $"""
+            UPDATE TransferOperations
+            SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',
+                AdapterRequestId=COALESCE($request,AdapterRequestId),RemoteItemIdsJson=$remote,LeaseExpiresAt=NULL,
+                LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved'
+              AND ConfirmationDescriptorJson IS NOT NULL{expectedPredicate};
+            """))
+        {
+            Add(operation, "$request", requestId); Add(operation, "$remote", remoteJson);
+            Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
+            if (expected is not null)
+            {
+                Add(operation, "$attempt", expected.AttemptCount);
+                Add(operation, "$descriptor", expected.ConfirmationDescriptorJson);
+                Add(operation, "$expectedRequest", expected.AdapterRequestId);
+                Add(operation, "$expectedRemote", expected.RemoteItemIdsJson);
+            }
+            RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "Operation cannot be completed without an exact submitted transfer boundary.");
+        }
+
+        await using (var allocation = Command(connection, transaction,
+            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1,FulfilledCount=FulfilledCount+1,SuccessItemCount=SuccessItemCount+1,NewSuccessItemCount=NewSuccessItemCount+1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
+        {
+            Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
+            RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "Allocation reservation is missing.");
+        }
+
+        await using (var resource = Command(connection, transaction, """
+            UPDATE ResourceItems
+            SET CandidateStatus='Expanded',ReservedAccountId=NULL,ReservationExpiresAt=NULL,
+                ResolvedOutputTitle=CASE WHEN ResolvedOutputTitle IS NULL OR length(trim(ResolvedOutputTitle))=0
+                    THEN $title ELSE ResolvedOutputTitle END,
+                UpdatedAt=$now
+            WHERE Id=$resource AND CandidateStatus='Reserved';
+            """))
+        {
+            Add(resource, "$title", resolvedFallback); Add(resource, "$now", Time(now));
+            Add(resource, "$resource", Id(ids.ResourceId));
+            RequireOne(await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The transfer resource reservation is inconsistent.");
+        }
+
+        if (shareOperationId is not null)
+        {
+            await using (var share = Command(connection, transaction, """
+                UPDATE ShareOperations
+                SET Status='WaitingShare',ExactItemSetFingerprint=$fingerprint,UpdatedAt=$now
+                WHERE Id=$id AND TransferOperationId=$transfer AND Status='WaitingTransfer'
+                  AND ExactItemSetFingerprint IS NULL AND Generation=1;
+                """))
+            {
+                Add(share, "$fingerprint", exactRemoteItems.Fingerprint); Add(share, "$now", Time(now));
+                Add(share, "$id", Id(shareOperationId.Value)); Add(share, "$transfer", Id(operationId));
+                RequireOne(await share.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                    "The pending share handoff changed before exact transfer evidence was persisted.");
+            }
+
+            await using (var generation = Command(connection, transaction, """
+                INSERT INTO ShareOperationGenerations(
+                  ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+                  ExactItemSetFingerprint,SettingsFingerprint,ExactItemCount)
+                SELECT Id,Generation,BatchJobId,ResourceItemId,AccountId,
+                  ExactItemSetFingerprint,SettingsFingerprint,NULL
+                FROM ShareOperations
+                WHERE Id=$operation AND Status='WaitingShare' AND Generation=1
+                  AND ExactItemSetFingerprint=$fingerprint;
+                """))
+            {
+                Add(generation, "$operation", Id(shareOperationId.Value));
+                Add(generation, "$fingerprint", exactRemoteItems.Fingerprint);
+                RequireOne(await generation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                    "The exact share generation lineage could not be created.");
+            }
+
+            await using (var item = Command(connection, transaction,
+                "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($operation,$ordinal,$remote,$sortKey,$name);"))
+            {
+                item.Parameters.Add("$operation", Microsoft.Data.Sqlite.SqliteType.Text);
+                item.Parameters.Add("$ordinal", Microsoft.Data.Sqlite.SqliteType.Integer);
+                item.Parameters.Add("$remote", Microsoft.Data.Sqlite.SqliteType.Text);
+                item.Parameters.Add("$sortKey", Microsoft.Data.Sqlite.SqliteType.Blob);
+                item.Parameters.Add("$name", Microsoft.Data.Sqlite.SqliteType.Text);
+                item.Prepare();
+                for (var ordinal = 0; ordinal < exactRemoteItems.Items.Length; ordinal++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var remoteItem = exactRemoteItems.Items[ordinal];
+                    item.Parameters["$operation"].Value = Id(shareOperationId.Value);
+                    item.Parameters["$ordinal"].Value = ordinal;
+                    item.Parameters["$remote"].Value = remoteItem.ExactId;
+                    item.Parameters["$sortKey"].Value = RemoteItemIdentitySet.GetCanonicalSortKey(remoteItem.ExactId);
+                    item.Parameters["$name"].Value = remoteItem.DisplayedTopLevelName;
+                    RequireOne(await item.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                        "An exact remote item could not be persisted.");
+                }
+            }
+
+            await using (var seal = Command(connection, transaction, """
+                UPDATE ShareOperationGenerations
+                SET ExactItemCount=$count
+                WHERE ShareOperationId=$operation AND Generation=1 AND ExactItemCount IS NULL
+                  AND ExactItemSetFingerprint=$fingerprint
+                  AND $count=(SELECT COUNT(*) FROM ShareOperationRemoteItems item
+                    WHERE item.ShareOperationId=$operation);
+                """))
+            {
+                Add(seal, "$count", exactRemoteItems.Count); Add(seal, "$operation", Id(shareOperationId.Value));
+                Add(seal, "$fingerprint", exactRemoteItems.Fingerprint);
+                RequireOne(await seal.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                    "The complete exact-item evidence could not be sealed.");
+            }
+        }
+
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
+        await EnsureLegacySuccessHasNoPendingShareAsync(
+            connection,
+            transaction,
+            operationId,
+            cancellationToken).ConfigureAwait(false);
         await using (var operation = Command(connection, transaction,
             "UPDATE TransferOperations SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved';"))
         { Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId)); RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be marked successful."); }
@@ -788,6 +974,24 @@ public sealed class SqliteTransferSchedulingStore :
             "UPDATE ResourceItems SET CandidateStatus='Expanded',ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved';"))
         { Add(resource, "$now", Time(now)); Add(resource, "$resource", Id(ids.ResourceId)); await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false); }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureLegacySuccessHasNoPendingShareAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid operationId,
+        CancellationToken cancellationToken)
+    {
+        if (await ScalarLongAsync(
+                connection,
+                transaction,
+                "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$transfer AND Status='WaitingTransfer';",
+                cancellationToken,
+                ("$transfer", Id(operationId))).ConfigureAwait(false) != 0)
+        {
+            throw new InvalidOperationException(
+                "Share-enabled transfer work requires exact remote-item evidence before success.");
+        }
     }
 
     public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid, DateTimeOffset now, CancellationToken cancellationToken = default) =>
