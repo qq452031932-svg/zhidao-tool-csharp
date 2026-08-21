@@ -86,6 +86,38 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
     }
 
+    [Fact]
+    public async Task SealedExactRemoteItemCannotBeDeleted()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM ShareOperationRemoteItems WHERE ShareOperationId=$id AND ItemOrdinal=0;";
+        command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+
+        await Assert.ThrowsAsync<SqliteException>(() => command.ExecuteNonQueryAsync());
+        Assert.Equal(2L, await ScalarAsync<long>(graph.Factory,
+            "SELECT COUNT(*) FROM ShareOperationRemoteItems WHERE ShareOperationId=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task RemoteItemCannotBeMovedFromUnsealedOperationIntoSealedExactSet()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var unsealedShareId = await SeedUnsealedExactOperationAsync(graph);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE ShareOperationRemoteItems SET ShareOperationId=$sealed,ItemOrdinal=2 WHERE ShareOperationId=$unsealed;";
+        command.Parameters.AddWithValue("$sealed", graph.ShareOperationId.ToString("D"));
+        command.Parameters.AddWithValue("$unsealed", unsealedShareId.ToString("D"));
+
+        await Assert.ThrowsAsync<SqliteException>(() => command.ExecuteNonQueryAsync());
+        Assert.Equal(2L, await ScalarAsync<long>(graph.Factory,
+            "SELECT COUNT(*) FROM ShareOperationRemoteItems WHERE ShareOperationId=$id;", graph.ShareOperationId));
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT COUNT(*) FROM ShareOperationRemoteItems WHERE ShareOperationId=$id;", unsealedShareId));
+    }
+
     [Theory]
     [InlineData("Queued")]
     [InlineData("Paused")]
@@ -613,6 +645,9 @@ public sealed class ShareSchedulingStoreTests : IDisposable
 
         Assert.True(await store.TryStartNextGenerationAsync(
             graph.ShareOperationId, ShareOperationStatus.Succeeded, 1, reserved.LeaseGeneration, graph.Now.AddMinutes(2), graph.Now.AddSeconds(1)));
+        Assert.Equal(2L, await ScalarAsync<long>(graph.Factory,
+            "SELECT ExactItemCount FROM ShareOperationGenerations WHERE ShareOperationId=$id AND Generation=2;",
+            graph.ShareOperationId));
         var regeneratedLease = reserved.LeaseGeneration + 1;
         var regenerated = result with { Id = Guid.NewGuid(), Generation = 2, ShareId = "share-regenerated" };
         Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
@@ -817,6 +852,54 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         command.Parameters.AddWithValue("$created", share.CreatedAt.ToString("O"));
         command.Parameters.AddWithValue("$updated", share.UpdatedAt.ToString("O"));
         Assert.Equal(1, await command.ExecuteNonQueryAsync());
+    }
+
+    private static async Task<Guid> SeedUnsealedExactOperationAsync(Graph graph)
+    {
+        var transferId = Guid.NewGuid();
+        var shareId = Guid.NewGuid();
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddOperationsAsync([new(
+                transferId, graph.ResourceId, graph.BatchId, 2, 2, "/unsealed", "/unsealed", "",
+                graph.AccountId, "Rule", "Succeeded", "NewTransfer", 1, "unsealed-transfer", "{}",
+                "unsealed-request", "[\"remote-unsealed\"]", "ResultReceived", "Fulfilled", graph.Now,
+                graph.Now, graph.Now, null, null, null, graph.Now, graph.Now)]);
+            await unit.CommitAsync();
+        }
+
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await using (var operation = connection.CreateCommand())
+        {
+            operation.Transaction = transaction;
+            operation.CommandText = """
+                INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt)
+                VALUES($id,$transfer,$resource,$batch,$account,1,'WaitingShare','unsealed-items',$settings,1,'Unknown',0,$now,$now);
+                """;
+            operation.Parameters.AddWithValue("$id", shareId.ToString("D"));
+            operation.Parameters.AddWithValue("$transfer", transferId.ToString("D"));
+            operation.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
+            operation.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+            operation.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            operation.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
+            operation.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+            Assert.Equal(1, await operation.ExecuteNonQueryAsync());
+        }
+        await using (var remoteItem = connection.CreateCommand())
+        {
+            remoteItem.Transaction = transaction;
+            remoteItem.CommandText = """
+                INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
+                VALUES($id,0,'remote-unsealed',$sort,'Unsealed');
+                """;
+            remoteItem.Parameters.AddWithValue("$id", shareId.ToString("D"));
+            remoteItem.Parameters.AddWithValue("$sort", new byte[] { 1 });
+            Assert.Equal(1, await remoteItem.ExecuteNonQueryAsync());
+        }
+        await transaction.CommitAsync();
+        return shareId;
     }
 
     private static async Task SetOrphanStateAsync(

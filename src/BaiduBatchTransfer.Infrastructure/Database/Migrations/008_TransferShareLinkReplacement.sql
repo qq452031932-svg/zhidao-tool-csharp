@@ -346,9 +346,11 @@ AFTER UPDATE OF Generation ON ShareOperations
 WHEN NEW.Generation <> OLD.Generation AND NEW.ExactItemSetFingerprint IS NOT NULL
 BEGIN
     INSERT INTO ShareOperationGenerations(ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
-      ExactItemSetFingerprint,SettingsFingerprint)
+      ExactItemSetFingerprint,SettingsFingerprint,ExactItemCount)
     VALUES(NEW.Id,NEW.Generation,NEW.BatchJobId,NEW.ResourceItemId,NEW.AccountId,
-      NEW.ExactItemSetFingerprint,NEW.SettingsFingerprint);
+      NEW.ExactItemSetFingerprint,NEW.SettingsFingerprint,
+      (SELECT ExactItemCount FROM ShareOperationGenerations
+       WHERE ShareOperationId=NEW.Id AND Generation=OLD.Generation));
 END;
 
 CREATE TRIGGER TR_ShareOperationGenerations_Immutable
@@ -403,7 +405,17 @@ END;
 CREATE TRIGGER TR_ShareOperationRemoteItems_SealUpdate
 BEFORE UPDATE ON ShareOperationRemoteItems
 WHEN EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
+  WHERE lineage.ShareOperationId IN (OLD.ShareOperationId,NEW.ShareOperationId)
+    AND lineage.ExactItemCount IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'validated exact remote items are immutable');
+END;
+
+CREATE TRIGGER TR_ShareOperationRemoteItems_SealDelete
+BEFORE DELETE ON ShareOperationRemoteItems
+WHEN EXISTS(SELECT 1 FROM ShareOperationGenerations lineage
   WHERE lineage.ShareOperationId=OLD.ShareOperationId AND lineage.ExactItemCount IS NOT NULL)
+AND EXISTS(SELECT 1 FROM ShareOperations operation WHERE operation.Id=OLD.ShareOperationId)
 BEGIN
     SELECT RAISE(ABORT, 'validated exact remote items are immutable');
 END;
