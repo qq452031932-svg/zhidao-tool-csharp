@@ -95,6 +95,30 @@ public sealed class ShareOperationExecutorTests
     }
 
     [Fact]
+    public async Task PersistedCancelStillPausesWhenPreviouslyDiscoveredShareDisappears()
+    {
+        var harness = Harness(RandomSettings(), ExistingShareDecision.Cancel, []);
+
+        var outcome = await harness.Executor.ExecuteAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareExecutionDisposition.Paused, outcome.Disposition);
+        Assert.Equal(SharePauseReason.CancelledByUser, harness.Store.PauseReason);
+        Assert.Empty(harness.Adapter.CreateRequests);
+    }
+
+    [Fact]
+    public async Task PersistedReuseNeverCreatesWhenPreviouslyDiscoveredShareDisappears()
+    {
+        var harness = Harness(RandomSettings(), ExistingShareDecision.Reuse, []);
+
+        var outcome = await harness.Executor.ExecuteAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareExecutionDisposition.Paused, outcome.Disposition);
+        Assert.Equal(SharePauseReason.AwaitingExistingShareDecision, harness.Store.PauseReason);
+        Assert.Empty(harness.Adapter.CreateRequests);
+    }
+
+    [Fact]
     public async Task DefinitelyNotAcceptedTransientFailureRetriesThreeTimesAndHonorsServerWait()
     {
         var failure = BaiduAdapterResult<ShareCreationReceipt>.Failure(

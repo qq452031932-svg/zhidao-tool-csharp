@@ -82,23 +82,24 @@ public sealed class ShareOperationExecutor
 
         var compatible = exactMatches.Where(share => reconciliation.IsCompatible(share, request))
             .OrderBy(share => share.ShareId, StringComparer.Ordinal).ToArray();
-        if (exactMatches.Count > 0)
+        switch (context.ExistingShareDecision)
         {
-            switch (context.ExistingShareDecision)
-            {
-                case ExistingShareDecision.Cancel:
-                    return await PauseAsync(operation, SharePauseReason.CancelledByUser, cancellationToken).ConfigureAwait(false);
-                case ExistingShareDecision.Reuse when compatible.Length == 0:
-                    return await PauseAsync(operation, SharePauseReason.IncompatibleExistingShare, cancellationToken).ConfigureAwait(false);
-                case ExistingShareDecision.Reuse:
-                    return await ReuseAsync(context, compatible[0], cancellationToken).ConfigureAwait(false);
-                case ExistingShareDecision.Regenerate:
-                    break;
-                case null:
-                    return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
-                default:
-                    throw new InvalidOperationException("The persisted existing-share decision is invalid.");
-            }
+            case ExistingShareDecision.Cancel:
+                return await PauseAsync(operation, SharePauseReason.CancelledByUser, cancellationToken).ConfigureAwait(false);
+            case ExistingShareDecision.Reuse when compatible.Length > 0:
+                return await ReuseAsync(context, compatible[0], cancellationToken).ConfigureAwait(false);
+            case ExistingShareDecision.Reuse when exactMatches.Count > 0:
+                return await PauseAsync(operation, SharePauseReason.IncompatibleExistingShare, cancellationToken).ConfigureAwait(false);
+            case ExistingShareDecision.Reuse:
+                return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
+            case ExistingShareDecision.Regenerate:
+                break;
+            case null when exactMatches.Count > 0:
+                return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
+            case null:
+                break;
+            default:
+                throw new InvalidOperationException("The persisted existing-share decision is invalid.");
         }
 
         var submittedAt = timeProvider.GetUtcNow();
