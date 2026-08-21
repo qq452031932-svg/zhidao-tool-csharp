@@ -512,7 +512,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT Id,AssignedAccountId,AttemptCount,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson FROM TransferOperations WHERE Id=$id AND Status='ResultPending' AND SubmitState='PendingConfirmation' AND TargetSlotState='Reserved' AND ConfirmationDescriptorJson IS NOT NULL;");
+            "SELECT o.Id,o.AssignedAccountId,o.AttemptCount,o.ConfirmationDescriptorJson,o.AdapterRequestId,o.RemoteItemIdsJson,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer') FROM TransferOperations o WHERE o.Id=$id AND o.Status='ResultPending' AND o.SubmitState='PendingConfirmation' AND o.TargetSlotState='Reserved' AND o.ConfirmationDescriptorJson IS NOT NULL;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
@@ -522,7 +522,8 @@ public sealed class SqliteTransferSchedulingStore :
                 reader.GetInt32(2),
                 reader.GetString(3),
                 ReadString(reader, 4),
-                ReadString(reader, 5))
+                ReadString(reader, 5),
+                reader.GetInt64(6) != 0)
             : null;
     }
 

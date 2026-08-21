@@ -56,6 +56,7 @@ public interface IBaiduNetdiskAdapter
         }
 
         return BaiduAdapterResult<TransferConfirmationResult>.Success(
-            legacy.Value.ToExactResult());
+            legacy.Value.ToExactResult(),
+            legacy.SubmissionAcceptance);
     }
 }

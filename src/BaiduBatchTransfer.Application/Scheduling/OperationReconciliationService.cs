@@ -10,7 +10,8 @@ public sealed record PendingReconciliationOperation(
     int AttemptCount,
     string ConfirmationDescriptorJson,
     string? AdapterRequestId,
-    string? RemoteItemIdsJson)
+    string? RemoteItemIdsJson,
+    bool RequiresExactShareEvidence = false)
 {
     public override string ToString() =>
         "PendingReconciliationOperation { EntityIds = [REDACTED], Confirmation = [REDACTED] }";
@@ -83,6 +84,48 @@ public sealed class OperationReconciliationService
         var session = await sessionStore.LoadAsync(pending.AccountId.ToString("D"), cancellationToken)
             .ConfigureAwait(false);
         if (session is null) return TransferConfirmation.Ambiguous;
+
+        if (!pending.RequiresExactShareEvidence)
+        {
+            BaiduAdapterResult<TransferConfirmation> legacyResult;
+            try
+            {
+                legacyResult = await adapter.ConfirmTransferAsync(session, query, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return TransferConfirmation.Ambiguous;
+            }
+
+            if (!legacyResult.IsSuccess) return TransferConfirmation.Ambiguous;
+            switch (legacyResult.Value)
+            {
+                case TransferConfirmation.ConfirmedPresent:
+                    await store.MarkConfirmedPresentAsync(
+                        pending,
+                        timeProvider.GetUtcNow(),
+                        cancellationToken).ConfigureAwait(false);
+                    return TransferConfirmation.ConfirmedPresent;
+                case TransferConfirmation.ConfirmedAbsent when
+                    legacyResult.SubmissionAcceptance == SubmissionAcceptance.DefinitelyNotAccepted:
+                    await store.MarkConfirmedAbsentAsync(
+                        pending,
+                        legacyResult.SubmissionAcceptance,
+                        timeProvider.GetUtcNow(),
+                        cancellationToken).ConfigureAwait(false);
+                    return TransferConfirmation.ConfirmedAbsent;
+                case TransferConfirmation.ConfirmedAbsent:
+                case TransferConfirmation.Ambiguous:
+                    return TransferConfirmation.Ambiguous;
+                default:
+                    throw new InvalidOperationException("The adapter returned an unsupported confirmation result.");
+            }
+        }
 
         BaiduAdapterResult<TransferConfirmationResult> result;
         try

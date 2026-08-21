@@ -19,7 +19,7 @@ public sealed class ReconciliationTests
     public async Task LegacyDescriptorOnlyConfirmationNeverFinalizesWithoutExactTypedEvidence(
         TransferConfirmation confirmation)
     {
-        var operation = PendingOperation();
+        var operation = PendingOperation() with { RequiresExactShareEvidence = true };
         var store = new RecordingReconciliationStore(operation);
         var adapter = new ConfirmationAdapter
         {
@@ -117,7 +117,7 @@ public sealed class ReconciliationTests
     [Fact]
     public async Task ExactPresentConfirmationPassesCanonicalEvidenceToAtomicCompletion()
     {
-        var operation = PendingOperation();
+        var operation = PendingOperation() with { RequiresExactShareEvidence = true };
         var exact = new RemoteItemIdentitySet([
             new RemoteItemIdentity("remote-2", "第二项"),
             new RemoteItemIdentity("remote-1", "第一项"),
@@ -145,7 +145,7 @@ public sealed class ReconciliationTests
     [Fact]
     public async Task MultipleApproximateMatchesRemainAmbiguousAndNeverUseLegacyPresentSignal()
     {
-        var operation = PendingOperation();
+        var operation = PendingOperation() with { RequiresExactShareEvidence = true };
         var store = new RecordingReconciliationStore(operation);
         var adapter = new ConfirmationAdapter
         {
@@ -167,6 +167,49 @@ public sealed class ReconciliationTests
         Assert.False(store.ResetForRetry);
     }
 
+    [Fact]
+    public async Task LegacyTransferOnlyConfirmedPresentRemainsBackwardCompatibleWithoutExactIds()
+    {
+        var operation = PendingOperation() with { RequiresExactShareEvidence = false };
+        var store = new RecordingReconciliationStore(operation);
+        var adapter = new ConfirmationAdapter
+        {
+            Result = BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.ConfirmedPresent),
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(TransferConfirmationResult.Ambiguous),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedPresent, result);
+        Assert.True(store.Present);
+        Assert.Null(store.ExactRemoteItems);
+    }
+
+    [Fact]
+    public async Task DefaultExactConfirmationWrapperPreservesDefinitelyNotAcceptedEvidence()
+    {
+        var operation = PendingOperation() with { RequiresExactShareEvidence = true };
+        var store = new RecordingReconciliationStore(operation);
+        var service = new OperationReconciliationService(
+            new LegacyOnlyConfirmationAdapter(
+                BaiduAdapterResult<TransferConfirmation>.Success(
+                    TransferConfirmation.ConfirmedAbsent,
+                    SubmissionAcceptance.DefinitelyNotAccepted)),
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedAbsent, result);
+        Assert.True(store.Absent);
+    }
+
     [Theory]
     [InlineData(SubmissionAcceptance.Unknown, TransferConfirmation.Ambiguous, false)]
     [InlineData(SubmissionAcceptance.DefinitelyNotAccepted, TransferConfirmation.ConfirmedAbsent, true)]
@@ -175,7 +218,7 @@ public sealed class ReconciliationTests
         TransferConfirmation expectedOutcome,
         bool expectedAbsentWrite)
     {
-        var operation = PendingOperation();
+        var operation = PendingOperation() with { RequiresExactShareEvidence = true };
         var store = new RecordingReconciliationStore(operation);
         var adapter = new ConfirmationAdapter
         {
@@ -339,6 +382,11 @@ public sealed class ReconciliationTests
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var adapter = new ConfirmationAdapter
         {
+            Result = BaiduAdapterResult<TransferConfirmation>.Success(
+                confirmation,
+                confirmation == TransferConfirmation.ConfirmedAbsent
+                    ? SubmissionAcceptance.DefinitelyNotAccepted
+                    : SubmissionAcceptance.Unknown),
             ExactResult = confirmation switch
             {
                 TransferConfirmation.ConfirmedPresent => BaiduAdapterResult<TransferConfirmationResult>.Success(
@@ -487,7 +535,7 @@ public sealed class ReconciliationTests
     public async Task StaleExactConfirmationCannotFinalizeChangedPendingEvidence()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
-        var data = await SeedPendingAsync(db);
+        var data = await SeedPendingShareAsync(db, "标题");
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var adapter = new ConfirmationAdapter
         {
@@ -819,6 +867,22 @@ public sealed class ReconciliationTests
                     Result.SubmissionAcceptance);
             return BaiduAdapterResult<TransferConfirmationResult>.Success(Result.Value.ToExactResult());
         }
+
+        public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private sealed class LegacyOnlyConfirmationAdapter(BaiduAdapterResult<TransferConfirmation> result)
+        : IBaiduNetdiskAdapter
+    {
+        public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(
+            AccountSession session,
+            TransferConfirmationQuery query,
+            CancellationToken cancellationToken) => Task.FromResult(result);
 
         public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
