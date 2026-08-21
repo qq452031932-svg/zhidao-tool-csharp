@@ -809,9 +809,6 @@ public sealed class SqliteTransferSchedulingStore :
         ArgumentNullException.ThrowIfNull(exactRemoteItems);
         var remoteJson = System.Text.Json.JsonSerializer.Serialize(
             exactRemoteItems.Items.Select(item => item.ExactId));
-        var resolvedFallback = ResolvedOutputTitleBuilder.Resolve(
-            null,
-            exactRemoteItems.Items.Select(item => (string?)item.DisplayedTopLevelName).ToArray());
 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
@@ -831,6 +828,28 @@ public sealed class SqliteTransferSchedulingStore :
                 if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     throw new InvalidDataException("A transfer operation has multiple share handoffs.");
             }
+        }
+
+        string? resolvedFallback = null;
+        if (shareOperationId is not null)
+        {
+            var persistedTitle = await ScalarStringOrNullAsync(
+                connection,
+                transaction,
+                "SELECT ResolvedOutputTitle FROM ResourceItems WHERE Id=$resource;",
+                cancellationToken,
+                ("$resource", Id(ids.ResourceId))).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(persistedTitle))
+            {
+                throw new InvalidOperationException(
+                    "Share-enabled transfer work requires a persisted resolved output title before completion.");
+            }
+        }
+        else
+        {
+            resolvedFallback = ResolvedOutputTitleBuilder.Resolve(
+                null,
+                exactRemoteItems.Items.Select(item => (string?)item.DisplayedTopLevelName).ToArray());
         }
 
         var expectedPredicate = expected is null

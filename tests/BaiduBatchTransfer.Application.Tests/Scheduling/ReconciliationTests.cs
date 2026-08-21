@@ -242,7 +242,6 @@ public sealed class ReconciliationTests
     [Theory]
     [InlineData("用户标题", "用户标题")]
     [InlineData("预检回退标题", "预检回退标题")]
-    [InlineData(null, "第一项 等 2 项")]
     public async Task SqliteExactCompletionAtomicallySealsShareEvidenceCountersAndTitle(
         string? persistedTitle,
         string expectedTitle)
@@ -266,6 +265,57 @@ public sealed class ReconciliationTests
         Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
         Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
         Assert.Equal(expectedTitle, await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("   ")]
+    public async Task ShareEnabledExactCompletionRejectsBlankPersistedTitleAndRollsBackEntireHandoff(
+        string? persistedTitle)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, persistedTitle);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var pending = await store.LoadPendingAsync(data.OperationId);
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-2", "第二项"),
+            new RemoteItemIdentity("remote-1", "第一项"),
+        ]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now));
+
+        Assert.Equal("ResultPending", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Reserved", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Null(await ScalarNullableAsync(db, "TransferOperations", "OutcomeKind"));
+        Assert.Null(await ScalarNullableAsync(db, "TransferOperations", "RemoteItemIdsJson"));
+        Assert.Equal("WaitingTransfer", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Null(await ScalarNullableAsync(db, "ShareOperations", "ExactItemSetFingerprint"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ItemCount FROM ShareOperationRemoteItems)", "ItemCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS GenerationCount FROM ShareOperationGenerations)", "GenerationCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+        Assert.Equal(persistedTitle, await ScalarNullableAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+    }
+
+    [Fact]
+    public async Task LegacyTransferOnlyExactCompletionMayBuildFallbackForBlankPersistedTitle()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingAsync(db);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-2", "第二项"),
+            new RemoteItemIdentity("remote-1", "第一项"),
+        ]);
+
+        await store.CompleteSucceededWithEvidenceAsync(data.OperationId, null, exact, Now);
+
+        Assert.Equal("Succeeded", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("第一项 等 2 项", await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ShareCount FROM ShareOperations)", "ShareCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
     }
 
     [Fact]
