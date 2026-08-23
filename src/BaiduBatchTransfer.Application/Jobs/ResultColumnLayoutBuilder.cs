@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using BaiduBatchTransfer.Core.Services;
 
 namespace BaiduBatchTransfer.Application.Jobs;
 
@@ -68,7 +69,8 @@ public sealed partial class ResultColumnLayoutBuilder
             throw new BatchDraftValidationException("结果列数超过 Excel 的 16,384 列限制，请减少原始列或参与账号。");
 
         var headers = sourceHeaders.Select(header => header ?? string.Empty).ToArray();
-        var used = new HashSet<string>(headers, StringComparer.Ordinal);
+        var used = headers.Select(SpreadsheetTextSanitizer.Sanitize)
+            .ToHashSet(StringComparer.Ordinal);
         var resolved = UniqueSystemHeader(ResolvedTitleBase, used);
         var original = UniqueSystemHeader(OriginalShareUrlBase, used);
         var labels = CreateSafeAccountLabels(selected.Select(account => account.DisplayName).ToArray());
@@ -134,11 +136,11 @@ public sealed partial class ResultColumnLayoutBuilder
 
     private static string UniqueSystemHeader(string basis, HashSet<string> used)
     {
-        if (used.Add(basis)) return basis;
+        if (used.Add(SpreadsheetTextSanitizer.Sanitize(basis))) return basis;
         for (var ordinal = 2; ; ordinal++)
         {
             var candidate = $"{basis}（系统{ordinal}）";
-            if (used.Add(candidate)) return candidate;
+            if (used.Add(SpreadsheetTextSanitizer.Sanitize(candidate))) return candidate;
         }
     }
 

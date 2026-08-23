@@ -267,6 +267,26 @@ public sealed class CreateBatchServiceTests
     }
 
     [Fact]
+    public void ResultLayoutUsesSanitizedPhysicalHeadersForCollisionsButPreservesOriginalHeaders()
+    {
+        var builder = new ResultColumnLayoutBuilder();
+        var account = new[] { WorkloadAccount(0, 1) };
+        var controlCollision = "转存结果_解析后标题\u0001";
+
+        var system2 = builder.Build([controlCollision, "", ""], account);
+        var system3 = builder.Build(
+            [controlCollision, "转存结果_解析后标题（系统2）", "重复", "重复", "", ""],
+            account);
+
+        Assert.Equal(new[] { controlCollision, "", "" }, system2.SourceHeaders.ToArray());
+        Assert.Equal("转存结果_解析后标题（系统2）", system2.ResolvedTitleHeader);
+        Assert.Equal(
+            new[] { controlCollision, "转存结果_解析后标题（系统2）", "重复", "重复", "", "" },
+            system3.SourceHeaders.ToArray());
+        Assert.Equal("转存结果_解析后标题（系统3）", system3.ResolvedTitleHeader);
+    }
+
+    [Fact]
     public void ResultLayoutFingerprintPreservesHeaderCollectionBoundariesAndUnusualUnicode()
     {
         var builder = new ResultColumnLayoutBuilder();
@@ -321,6 +341,20 @@ public sealed class CreateBatchServiceTests
 
         Assert.Equal(3, labels.Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(["同名（1）", "同名(1)", "同名（2）"], labels);
+    }
+
+    [Fact]
+    public void ResultLayoutUsesStableFallbackForBlankAccountNameAndBoundsLongName()
+    {
+        var accounts = new[] { string.Empty, new string('长', 100) }
+            .Select((name, index) => new BatchWorkloadAccountInput(
+                Guid.NewGuid(), index, name, BatchAccountSelectionDecision.Selected, true, 1))
+            .ToArray();
+
+        var labels = new ResultColumnLayoutBuilder().Build([], accounts).Accounts.Select(x => x.OutputLabel).ToArray();
+
+        Assert.Equal("账号1", labels[0]);
+        Assert.Equal(new string('长', 40), labels[1]);
     }
 
     [Theory]
