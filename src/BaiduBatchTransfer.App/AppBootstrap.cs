@@ -12,6 +12,7 @@ using BaiduBatchTransfer.BaiduAdapter.Authentication;
 using BaiduBatchTransfer.BaiduAdapter.Http;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
+using BaiduBatchTransfer.Infrastructure.Database.Repositories;
 using BaiduBatchTransfer.Infrastructure.Excel;
 using BaiduBatchTransfer.Infrastructure.Security;
 using BaiduBatchTransfer.Infrastructure.SystemIntegration;
@@ -78,6 +79,11 @@ public static class AppBootstrap
         services.AddSingleton<IInterruptedOperationRecoveryStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
         services.AddSingleton<IInterruptedShareOperationRecoveryStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<IAllocationCounterStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IOperationReconciliationStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IJobResultTransferActionStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IShareReconciliationStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
+        services.AddSingleton<IExistingShareDecisionStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
+        services.AddSingleton<IJobResultShareActionStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<AllocationCounterRebuilder>();
         services.AddSingleton<ISingleInstanceGuard>(_ =>
             new WindowsMutexSingleInstanceGuard(@"Local\BaiduBatchTransfer.Singleton.v1"));
@@ -106,13 +112,31 @@ public static class AppBootstrap
             sp.GetRequiredService<IDiskSpaceProbe>(), paths.DatabasePath));
         services.AddSingleton<CreateBatchService>();
         services.AddSingleton<IWizardBatchService, WizardBatchService>();
+        services.AddSingleton<JobPageQuery>();
+        services.AddSingleton<BatchStatisticsQuery>();
+        services.AddSingleton<SqliteBatchResultProjectionRepository>();
+        services.AddSingleton<IBatchResultProjectionRepository>(sp =>
+            sp.GetRequiredService<SqliteBatchResultProjectionRepository>());
+        services.AddSingleton<ReplacementWorkbookFileNameBuilder>();
+        services.AddSingleton<ReplacementWorkbookExportService>();
+        services.AddSingleton<IReplacementWorkbookWriter, OpenXmlReplacementResultWriter>();
+        services.AddSingleton<IReplacementWorkbookFilePublisher, OpenXmlReplacementWorkbookFilePublisher>();
 
         services.AddSingleton<BaiduSessionIdentityClient>();
-        services.AddSingleton<IBaiduNetdiskAdapter, LiveBaiduNetdiskAdapter>();
-        services.AddSingleton<IBaiduShareAdapter, LiveBaiduShareAdapter>();
+        services.AddSingleton<LiveBaiduNetdiskAdapter>();
+        services.AddSingleton<LiveBaiduShareAdapter>();
+        services.AddSingleton<BaiduAdapterConcurrencyGate>();
+        services.AddSingleton<IBaiduNetdiskAdapter>(sp => new CoordinatedBaiduNetdiskAdapter(
+            sp.GetRequiredService<LiveBaiduNetdiskAdapter>(),
+            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
+        services.AddSingleton<IBaiduShareAdapter>(sp => new CoordinatedBaiduShareAdapter(
+            sp.GetRequiredService<LiveBaiduShareAdapter>(),
+            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
         services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
+        services.AddSingleton<EncryptedBaiduSessionStore>();
+        services.AddSingleton<IBaiduSessionStore>(sp => sp.GetRequiredService<EncryptedBaiduSessionStore>());
         services.AddSingleton(_ => new FileSystemAccountProfilePathPolicy(paths.ProfileDirectory));
         services.AddSingleton<IAccountProfilePathPolicy>(sp =>
             sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
@@ -148,11 +172,26 @@ public static class AppBootstrap
 
         // 真人扫码仅开放账号登录；实际转存方法尚未逐项通过现场门禁，继续禁止开始任务。
         services.AddSingleton<IAdapterAvailability, UnavailableAdapterAvailability>();
+        services.AddSingleton<IJobResultCapabilityAvailability, UnavailableJobResultCapabilityAvailability>();
+        services.AddSingleton<IJobResultActionCapability, UnavailableJobResultActionCapability>();
+        services.AddSingleton<IAsyncDelay>(_ => new TimeProviderDelay(TimeProvider.System));
+        services.AddSingleton<OperationReconciliationService>();
+        services.AddSingleton<ITransferResultReconciler>(sp => sp.GetRequiredService<OperationReconciliationService>());
+        services.AddSingleton<ShareOperationReconciliationService>();
+        services.AddSingleton<IShareResultReconciler>(sp => sp.GetRequiredService<ShareOperationReconciliationService>());
+        services.AddSingleton<IJobResultActions, JobResultActions>();
+        services.AddSingleton<IJobResultsWorkflow, LocalJobResultsWorkflow>();
+        services.AddSingleton<ExistingShareDecisionService>();
+        services.AddSingleton<IExistingShareDecisionPresenter, ExistingShareDecisionPresenter>();
+        services.AddSingleton<IExistingShareDecisionApplication, ExistingShareDecisionApplication>();
+        services.AddSingleton<IExistingShareDecisionInteraction, ExistingShareDecisionInteraction>();
         services.AddSingleton<AppRuntimeState>();
         services.AddSingleton<IAppRecoveryRunner, StartupRecoveryRunner>();
         services.AddSingleton<AppStartupController>();
         services.AddSingleton<IUiDispatcher, WpfUiDispatcher>();
         services.AddSingleton<IExcelFileDialog, WpfExcelFileDialog>();
+        services.AddSingleton<IFolderDialog, WpfFolderDialog>();
+        services.AddSingleton<IResultSaveDialog, ResultSaveDialog>();
         services.AddSingleton<IDialogService, DialogService>();
         services.AddSingleton<IWizardAccountProvider, WizardAccountProvider>();
         services.AddSingleton<IAccountSummaryProvider, WizardAccountSummaryProvider>();
@@ -299,6 +338,10 @@ public sealed class AppShellFactory(
     IAccountLoginLauncher loginLauncher,
     IAccountManagementLauncher accountManagementLauncher,
     IAccountSummaryProvider accountSummaryProvider,
+    IJobResultsWorkflow jobResultsWorkflow,
+    IResultSaveDialog resultSaveDialog,
+    IJobResultCapabilityAvailability resultCapabilities,
+    IExistingShareDecisionInteraction existingShareInteraction,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -311,7 +354,8 @@ public sealed class AppShellFactory(
             : 0;
         var importViewModel = await importWorkspaceFactory.CreateAsync(cancellationToken).ConfigureAwait(true);
         var wizardViewModel = new CreateJobWizardViewModel(
-            accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow);
+            accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow,
+            resultCapabilities);
 
         async Task DispatchOnUiAsync(Action action)
         {
@@ -335,13 +379,49 @@ public sealed class AppShellFactory(
             "/我的资源"));
         var importView = new ImportView(importViewModel);
         var wizardView = new CreateJobWizardView(wizardViewModel);
+        var resultsViewModel = new JobResultsViewModel(
+            jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction);
+        var resultsView = new JobResultsView(resultsViewModel);
         var mainViewModel = new MainWindowViewModel(
             importView,
             wizardView,
             loginLauncher,
             accountManagementLauncher,
             accountRefresh.RefreshAsync,
-            initialActiveAccountCount);
-        return new MainWindow(mainViewModel);
+            initialActiveAccountCount,
+            resultsView);
+        wizardViewModel.JobCreated += async (_, batchId) =>
+        {
+            await resultsViewModel.InitializeAsync(batchId).ConfigureAwait(true);
+            mainViewModel.ShowResults();
+        };
+        var mainWindow = new MainWindow(mainViewModel);
+        var decisionPoll = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(2),
+        };
+        var decisionCheckRunning = false;
+        decisionPoll.Tick += async (_, _) =>
+        {
+            if (decisionCheckRunning) return;
+            decisionCheckRunning = true;
+            try
+            {
+                var pendingBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
+                if (pendingBatch is not null) mainViewModel.ShowResults();
+            }
+            finally
+            {
+                decisionCheckRunning = false;
+            }
+        };
+        mainWindow.Loaded += async (_, _) =>
+        {
+            var restoredBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
+            if (restoredBatch is not null) mainViewModel.ShowResults();
+            if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
+        };
+        mainWindow.Closed += (_, _) => decisionPoll.Stop();
+        return mainWindow;
     }
 }

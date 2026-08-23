@@ -66,7 +66,14 @@ public interface IShareReconciliationStore
         DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
 }
 
-public sealed class ShareOperationReconciliationService
+public interface IShareResultReconciler
+{
+    Task<ShareReconciliationResult> ReconcileAsync(
+        Guid operationId,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class ShareOperationReconciliationService : IShareResultReconciler
 {
     private const int BaselinePageSize = 500;
     private readonly IBaiduShareAdapter adapter;

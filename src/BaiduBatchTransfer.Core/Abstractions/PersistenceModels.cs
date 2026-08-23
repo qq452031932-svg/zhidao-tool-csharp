@@ -94,7 +94,20 @@ public sealed record OperationResultRecord(
     string? OutcomeKind,
     string? LastErrorCode,
     string? LastErrorMessage,
-    DateTimeOffset UpdatedAt)
+    DateTimeOffset UpdatedAt,
+    string? ResolvedTitle = null,
+    Guid? ShareOperationId = null,
+    string? ShareStatus = null,
+    string? ShareLastErrorCode = null,
+    string? ShareLastErrorMessage = null,
+    bool HasCompleteShareEvidence = false,
+    bool IsBatchShareActionAllowed = false,
+    bool IsAccountActive = false,
+    bool ShareEnabled = false,
+      bool ShareCanRestartSafely = false,
+      int? ShareGeneration = null,
+      DateTimeOffset? ShareUpdatedAt = null,
+      int TransferAttemptCount = 0)
 {
     public override string ToString() =>
         $"OperationResultRecord {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, UserContent = [REDACTED] }}";

@@ -16,3 +16,20 @@ public static class OperationStatusChineseMapper
         _ => throw new ArgumentOutOfRangeException(nameof(status)),
     };
 }
+
+public static class ShareOperationStatusChineseMapper
+{
+    public static string Map(ShareOperationStatus status) => status switch
+    {
+        ShareOperationStatus.WaitingTransfer => "等待转存",
+        ShareOperationStatus.WaitingShare => "等待",
+        ShareOperationStatus.Reserved or ShareOperationStatus.Preparing or ShareOperationStatus.Submitting => "处理中",
+        ShareOperationStatus.ResultPending => "结果待确认",
+        ShareOperationStatus.Succeeded => "成功",
+        ShareOperationStatus.Failed => "失败",
+        ShareOperationStatus.Paused => "暂停",
+        ShareOperationStatus.ReusedExisting => "复用已有分享",
+        ShareOperationStatus.Cancelled => "已取消",
+        _ => throw new ArgumentOutOfRangeException(nameof(status)),
+    };
+}

@@ -17,7 +17,8 @@ public sealed class SqliteTransferSchedulingStore :
     IInterruptedOperationRecoveryStore,
     IAllocationCounterStore,
     IOperationReconciliationStore,
-    ICancelOperationStore
+    ICancelOperationStore,
+    IJobResultTransferActionStore
 {
     private readonly SqliteConnectionFactory factory;
     private readonly TimeProvider timeProvider;
@@ -1156,6 +1157,8 @@ public sealed class SqliteTransferSchedulingStore :
 
     public async Task<bool> ResumePausedAsync(
         Guid operationId,
+        int expectedAttemptCount,
+        DateTimeOffset expectedUpdatedAt,
         DateTimeOffset now,
         CancellationToken cancellationToken = default)
     {
@@ -1163,14 +1166,16 @@ public sealed class SqliteTransferSchedulingStore :
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
         await using (var pending = Command(connection, transaction, """
-            UPDATE TransferOperations SET Status='ResultPending',LeaseExpiresAt=NULL,UpdatedAt=$now
-            WHERE Id=$id AND Status='Paused' AND SubmitState='PendingConfirmation'
+            UPDATE TransferOperations SET Status='ResultPending',AttemptCount=AttemptCount+1,LeaseExpiresAt=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Paused' AND AttemptCount=$expectedAttempt AND UpdatedAt=$expectedUpdated AND SubmitState='PendingConfirmation'
               AND TargetSlotState='Reserved' AND ConfirmationDescriptorJson IS NOT NULL
               AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
                 AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
             """))
         {
             Add(pending, "$now", Time(now)); Add(pending, "$id", Id(operationId));
+            Add(pending, "$expectedAttempt", expectedAttemptCount);
+            Add(pending, "$expectedUpdated", Time(expectedUpdatedAt));
             if (await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1)
             {
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1178,17 +1183,19 @@ public sealed class SqliteTransferSchedulingStore :
             }
         }
         await using (var retryable = Command(connection, transaction, """
-            UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',
+            UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',AttemptCount=AttemptCount+1,
               TargetSlotState='Released',TargetSlotReservedAt=NULL,ConfirmationDescriptorJson=NULL,
               AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,LeaseExpiresAt=NULL,
               LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
-            WHERE Id=$id AND Status='Paused' AND SubmitState IN ('NotPrepared','ResultReceived')
+            WHERE Id=$id AND Status='Paused' AND AttemptCount=$expectedAttempt AND UpdatedAt=$expectedUpdated AND SubmitState IN ('NotPrepared','ResultReceived')
               AND TargetSlotState='Reserved'
               AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
                 AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
             """))
         {
             Add(retryable, "$now", Time(now)); Add(retryable, "$id", Id(operationId));
+            Add(retryable, "$expectedAttempt", expectedAttemptCount);
+            Add(retryable, "$expectedUpdated", Time(expectedUpdatedAt));
             if (await retryable.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             {
                 await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);

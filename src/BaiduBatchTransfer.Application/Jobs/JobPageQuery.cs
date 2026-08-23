@@ -38,21 +38,48 @@ public sealed record OperationPageItem(
     long AllocationOrdinal,
     string ShareUrl,
     string? Note,
+    string ResolvedTitle,
     Guid AccountId,
     string AccountDisplayName,
     string TargetPath,
     string Status,
-    string StatusText,
+    string TransferStatusText,
     string? OutcomeKind,
     string? LastErrorCode,
     string? LastErrorMessage,
-    DateTimeOffset UpdatedAt)
+    DateTimeOffset UpdatedAt,
+    Guid? ShareOperationId,
+    string? ShareStatus,
+    string ShareStatusText,
+    string? ShareLastErrorCode,
+    string? ShareLastErrorMessage,
+    int? ShareGeneration,
+    DateTimeOffset? ShareUpdatedAt,
+    bool CanRetryShare,
+    bool CanReconcileTransfer,
+    bool CanReconcileShare,
+    bool CanResumeTransfer,
+    bool CanResumeShare,
+    int TransferAttemptCount)
 {
+    public string StatusText => TransferStatusText;
+
     internal static OperationPageItem FromPersistence(OperationResultRecord record)
     {
-        var statusText = Enum.TryParse<OperationStatus>(record.Status, ignoreCase: false, out var status)
+        var transferStatusText = Enum.TryParse<OperationStatus>(record.Status, ignoreCase: false, out var status) &&
+            Enum.IsDefined(status)
             ? OperationStatusChineseMapper.Map(status)
-            : record.Status;
+            : "状态未知";
+        var shareStatusText = record.ShareStatus is null
+            ? record.ShareEnabled
+                ? record.Status is "Failed" or "Cancelled" ? "转存未成功，未生成分享" : "等待生成分享"
+                : "未启用分享"
+            : Enum.TryParse<ShareOperationStatus>(record.ShareStatus, ignoreCase: false, out var shareStatus) &&
+              Enum.IsDefined(shareStatus)
+                ? ShareOperationStatusChineseMapper.Map(shareStatus)
+                : "状态未知";
+        var shareActionGate = record.HasCompleteShareEvidence && record.IsBatchShareActionAllowed &&
+            record.IsAccountActive && record.ShareEnabled && record.ShareCanRestartSafely;
         return new(
             record.OperationId,
             record.ResourceItemId,
@@ -61,19 +88,35 @@ public sealed record OperationPageItem(
             record.AllocationOrdinal,
             record.ShareUrl,
             record.Note,
+            string.IsNullOrWhiteSpace(record.ResolvedTitle) ? "未命名资源" : record.ResolvedTitle,
             record.AccountId,
             record.AccountDisplayName,
             record.TargetPath,
             record.Status,
-            statusText,
+            transferStatusText,
             record.OutcomeKind,
             record.LastErrorCode,
             record.LastErrorMessage,
-            record.UpdatedAt);
+            record.UpdatedAt,
+            record.ShareOperationId,
+            record.ShareStatus,
+            shareStatusText,
+            record.ShareLastErrorCode,
+            record.ShareLastErrorMessage,
+            record.ShareGeneration,
+            record.ShareUpdatedAt,
+            record.Status == OperationStatus.Succeeded.ToString() &&
+                record.ShareStatus == ShareOperationStatus.Failed.ToString() && shareActionGate,
+            record.Status == OperationStatus.ResultPending.ToString(),
+            record.ShareStatus == ShareOperationStatus.ResultPending.ToString(),
+            record.Status == OperationStatus.Paused.ToString(),
+            record.ShareStatus == ShareOperationStatus.Paused.ToString() && shareActionGate &&
+                record.ShareLastErrorCode is not ("AwaitingExistingShareDecision" or "CancelledByUser" or "IncompatibleExistingShare"),
+            record.TransferAttemptCount);
     }
 
     public override string ToString() =>
-        $"OperationPageItem {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, StatusText = {StatusText}, UserContent = [REDACTED] }}";
+        $"OperationPageItem {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, TransferStatus = {Status}, TransferStatusText = {TransferStatusText}, ShareStatus = {ShareStatus}, UserContent = [REDACTED] }}";
 }
 
 public sealed class JobPageQuery(IUnitOfWorkFactory unitOfWorkFactory)

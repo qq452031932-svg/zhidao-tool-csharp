@@ -62,7 +62,8 @@ public sealed record ExistingShareAccountSummary(
     Guid AccountId,
     int DiscoveredCount,
     int CompatibleCount,
-    int IncompatibleCount)
+    int IncompatibleCount,
+    string AccountDisplayName = "")
 {
     public bool RequiresDecision => DiscoveredCount > 0;
 
@@ -98,7 +99,8 @@ public sealed record ExistingShareDecisionConfirmation(bool Accepted, bool IsSta
 public sealed record ShareDecisionAccountContext(
     Guid BatchJobId,
     Guid AccountId,
-    BatchShareSettingsRecord Settings)
+    BatchShareSettingsRecord Settings,
+    string AccountDisplayName = "")
 {
     public override string ToString() =>
         "ShareDecisionAccountContext { Identity = [REDACTED], Settings = [REDACTED] }";
@@ -149,6 +151,10 @@ public interface IShareExecutionStore
 
 public interface IExistingShareDecisionStore
 {
+    Task<IReadOnlyList<Guid>> GetPendingDecisionBatchIdsAsync(
+        int maximumCount,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Pending existing-share decision queries are not supported by this store.");
     Task<IReadOnlyList<ShareDecisionAccountContext>> GetDecisionAccountsAsync(Guid batchJobId, CancellationToken cancellationToken = default);
     Task<StringKeysetPage<string>> GetDecisionExactSetFingerprintsKeysetPageAsync(Guid batchJobId, Guid accountId, string? afterFingerprint, int pageSize, CancellationToken cancellationToken = default);
     Task<long> BeginDiscoveryAsync(Guid runId, ShareDecisionAccountContext account, CancellationToken cancellationToken = default);

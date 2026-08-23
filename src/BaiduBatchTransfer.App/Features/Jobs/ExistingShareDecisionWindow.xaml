@@ -1,0 +1,103 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.Jobs.ExistingShareDecisionWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:automation="clr-namespace:System.Windows.Automation;assembly=PresentationCore"
+        Title="确认已有分享决定"
+        Width="860"
+        Height="620"
+        MinWidth="680"
+        MinHeight="480"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,16">
+            <TextBlock FontSize="22" FontWeight="SemiBold" Text="确认已有分享处理方式" />
+            <TextBlock x:Name="SummaryText"
+                       Margin="0,8,0,0"
+                       Text="{Binding DecisionSummaryText}"
+                       TextWrapping="Wrap" />
+        </StackPanel>
+
+        <DockPanel Grid.Row="1" Margin="0,0,0,12">
+            <TextBlock Margin="0,0,12,0"
+                       VerticalAlignment="Center"
+                       Text="批次默认决定" />
+            <ComboBox Width="220"
+                      ItemsSource="{Binding BatchDecisionOptions}"
+                      SelectedItem="{Binding SelectedBatchDefaultOption, Mode=TwoWay}"
+                      DisplayMemberPath="DisplayName"
+                      IsTextSearchEnabled="False"
+                      automation:AutomationProperties.Name="批次默认已有分享决定" />
+        </DockPanel>
+
+        <DataGrid x:Name="AccountGrid"
+                  Grid.Row="2"
+                  ItemsSource="{Binding Accounts}"
+                  AutoGenerateColumns="False"
+                  CanUserAddRows="False"
+                  CanUserDeleteRows="False"
+                  CanUserReorderColumns="False"
+                  EnableRowVirtualization="True"
+                  EnableColumnVirtualization="True"
+                  VirtualizingPanel.IsVirtualizing="True"
+                  VirtualizingPanel.VirtualizationMode="Recycling"
+                  ScrollViewer.CanContentScroll="True"
+                  HeadersVisibility="Column"
+                  automation:AutomationProperties.Name="按账号设置已有分享决定">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="账号" Binding="{Binding AccountLabel}" IsReadOnly="True" />
+                <DataGridTextColumn Header="发现数量" Binding="{Binding DiscoveredCount}" IsReadOnly="True" />
+                <DataGridTextColumn Header="兼容数量" Binding="{Binding CompatibleCount}" IsReadOnly="True" />
+                <DataGridTextColumn Header="不兼容数量" Binding="{Binding IncompatibleCount}" IsReadOnly="True" />
+                <DataGridTemplateColumn Header="账号决定" Width="220">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <ComboBox ItemsSource="{Binding DataContext.AccountOverrideOptions, RelativeSource={RelativeSource AncestorType=Window}}"
+                                      SelectedItem="{Binding SelectedOverrideOption, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                      DisplayMemberPath="DisplayName"
+                                      IsTextSearchEnabled="False"
+                                      automation:AutomationProperties.Name="账号已有分享决定" />
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <TextBlock Grid.Row="3"
+                   Margin="0,12,0,0"
+                   Foreground="DarkRed"
+                   Text="{Binding ValidationMessage}"
+                   TextWrapping="Wrap"
+                   automation:AutomationProperties.LiveSetting="Assertive" />
+
+        <StackPanel Grid.Row="4"
+                    Margin="0,16,0,0"
+                    HorizontalAlignment="Right"
+                    Orientation="Horizontal">
+            <Button x:Name="CloseButton"
+                    MinWidth="100"
+                    Margin="0,0,10,0"
+                    Padding="12,6"
+                    IsCancel="True"
+                    Click="Close_Click"
+                    Content="_关闭"
+                    automation:AutomationProperties.Name="关闭已有分享决定窗口" />
+            <Button x:Name="ConfirmButton"
+                    MinWidth="120"
+                    Padding="12,6"
+                    IsDefault="True"
+                    IsEnabled="{Binding CanConfirm}"
+                    Click="Confirm_Click"
+                    Content="_确认决定"
+                    automation:AutomationProperties.Name="确认已有分享决定" />
+        </StackPanel>
+    </Grid>
+</Window>

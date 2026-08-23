@@ -1546,7 +1546,7 @@ public sealed class SqliteSchedulingStoreTests
             Now.AddSeconds(1));
         await ExecuteAsync(db, "UPDATE Accounts SET Status='Active' WHERE Id=$id;", ("$id", account.ToString("D")));
 
-        Assert.True(await store.ResumePausedAsync(operation.Id, Now.AddSeconds(2)));
+        Assert.True(await store.ResumePausedAsync(operation.Id, operation.AttemptCount, Now.AddSeconds(1), Now.AddSeconds(2)));
 
         Assert.Equal(expectedStatus, await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
         Assert.Equal(expectedSlotState, await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
@@ -1600,7 +1600,7 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM Accounts WHERE LastValidatedAt IS NULL"));
         Assert.Equal(1L, await ScalarLongAsync(db,
             "SELECT COUNT(*) FROM TransferOperations WHERE LastErrorCode IS NULL AND LastErrorMessage IS NULL"));
-        Assert.False(await store.ResumePausedAsync(operation.Id, Now.AddSeconds(2)));
+        Assert.False(await store.ResumePausedAsync(operation.Id, operation.AttemptCount, operation.UpdatedAt, Now.AddSeconds(2)));
         Assert.NotNull(await ((IOperationReconciliationStore)store).LoadPendingAsync(operation.Id));
     }
 

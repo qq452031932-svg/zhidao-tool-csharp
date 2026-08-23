@@ -25,6 +25,14 @@ public sealed class ExistingShareDecisionService
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
+    public Task<IReadOnlyList<Guid>> GetPendingBatchIdsAsync(
+        int maximumCount = 1,
+        CancellationToken cancellationToken = default)
+    {
+        if (maximumCount is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(maximumCount));
+        return store.GetPendingDecisionBatchIdsAsync(maximumCount, cancellationToken);
+    }
+
     public async Task<ExistingShareBatchSummary> DiscoverAsync(
         Guid batchJobId,
         CancellationToken cancellationToken = default)
@@ -62,7 +70,7 @@ public sealed class ExistingShareDecisionService
             throw;
         }
 
-        return Summary(batchJobId, snapshots);
+        return Summary(batchJobId, snapshots, accounts);
     }
 
     public async Task<ExistingShareDecisionConfirmation> ConfirmAsync(
@@ -107,7 +115,7 @@ public sealed class ExistingShareDecisionService
             await store.AbortDiscoveryAsync(verificationRun, CancellationToken.None).ConfigureAwait(false);
         }
 
-        var current = Summary(command.BatchJobId, snapshots);
+        var current = Summary(command.BatchJobId, snapshots, accounts);
         if (!CryptographicOperations.FixedTimeEquals(
                 Convert.FromHexString(current.ConfirmationToken),
                 ParseToken(command.ConfirmationToken)))
@@ -213,7 +221,8 @@ public sealed class ExistingShareDecisionService
 
     private static ExistingShareBatchSummary Summary(
         Guid batchJobId,
-        IReadOnlyList<BatchShareDiscoverySnapshotRecord> snapshots)
+        IReadOnlyList<BatchShareDiscoverySnapshotRecord> snapshots,
+        IReadOnlyList<ShareDecisionAccountContext> accounts)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         ShareReconciliationPolicy.Append(hash, "batch-share-decision-v1");
@@ -233,7 +242,8 @@ public sealed class ExistingShareDecisionService
             batchJobId,
             Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(),
             snapshots.Select(value => new ExistingShareAccountSummary(
-                value.AccountId, value.DiscoveredCount, value.CompatibleCount, value.IncompatibleCount)).ToArray());
+                value.AccountId, value.DiscoveredCount, value.CompatibleCount, value.IncompatibleCount,
+                accounts.Single(account => account.AccountId == value.AccountId).AccountDisplayName)).ToArray());
     }
 
     private static PermanentShareRequest Request(BatchShareSettingsRecord settings, RemoteItemIdentitySet items) =>

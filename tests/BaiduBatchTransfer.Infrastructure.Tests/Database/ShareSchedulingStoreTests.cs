@@ -1491,6 +1491,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             1, 0, 1, "1:operation-generation", graph.Now, 1);
         var run = await StageDiscoveryAsync(store, graph, permanent: false);
         Assert.True(await store.TrySaveDiscoveryAndPauseAsync(run, [snapshot]));
+        Assert.Equal([graph.BatchId], await store.GetPendingDecisionBatchIdsAsync(10));
         var reuse = new BatchShareDecisionSnapshotRecord(
             graph.BatchId, graph.AccountId, graph.SettingsFingerprint, "Reuse",
             snapshot.DiscoveryFingerprint, 1, 0, 1, snapshot.Generation, graph.Now, 1);
@@ -1501,6 +1502,37 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.True(await store.ApplyDecisionSnapshotsAsync([cancel]));
         Assert.Equal("Paused", await ScalarAsync<string>(graph.Factory,
             "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Empty(await store.GetPendingDecisionBatchIdsAsync(10));
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE ShareOperations
+                SET ExactItemSetFingerprint='new-exact-set',LastErrorCode='AwaitingExistingShareDecision',UpdatedAt=$time
+                WHERE Id=$id;
+                """;
+            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+            command.Parameters.AddWithValue("$time", graph.Now.AddMinutes(1).ToUniversalTime().ToString("O"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        Assert.Equal([graph.BatchId], await store.GetPendingDecisionBatchIdsAsync(10));
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE BatchShareDecisionSnapshots SET Decision='Reuse' WHERE BatchJobId=$batch;
+                UPDATE ShareOperations SET ExactItemSetFingerprint=$items WHERE Id=$id;
+                """;
+            command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+            command.Parameters.AddWithValue("$items", graph.ItemSetFingerprint);
+            Assert.Equal(2, await command.ExecuteNonQueryAsync());
+        }
+
+        Assert.Equal([graph.BatchId], await store.GetPendingDecisionBatchIdsAsync(10));
     }
 
     [Fact]

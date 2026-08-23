@@ -57,6 +57,17 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public void ZeroEligibleAccountsCannotContinue()
+    {
+        var vm = Create([], ready: 20);
+
+        Assert.Empty(vm.Accounts);
+        Assert.Null(vm.TransferMode);
+        Assert.False(vm.CanContinue);
+        Assert.False(vm.CanMoveNext);
+    }
+
+    [Fact]
     public void AccountRowExposesSelectedShareAndServerConfirmedWorkloadState()
     {
         var option = Account("A") with
@@ -157,6 +168,23 @@ public sealed class CreateJobWizardViewModelTests
         vm.SelectMode(TransferMode.Distribution);
 
         Assert.Equal(1_000, vm.OperationCount);
+    }
+
+    [Fact]
+    public void MultipleAccountsRequireAtLeastOneExplicitParticipantAfterModeSelection()
+    {
+        var vm = Create(Accounts(2), ready: 10);
+
+        vm.SelectMode(TransferMode.Distribution);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+
+        Assert.DoesNotContain(vm.Accounts, account => account.IsSelected);
+        Assert.False(vm.CanContinue);
+
+        vm.Accounts[0].IsSelected = true;
+        vm.Accounts[0].TargetItemCount = 10;
+
+        Assert.True(vm.CanContinue);
     }
 
     [Fact]
@@ -380,10 +408,13 @@ public sealed class CreateJobWizardViewModelTests
         vm.SetImportResolutionCounts(0, 0);
         vm.Accounts[0].TargetSuccessCount = 8;
         await vm.PrepareConfirmationAsync();
+        Guid? createdBatchId = null;
+        vm.JobCreated += (_, batchId) => createdBatchId = batchId;
         vm.IsFinalConfirmationChecked = true;
         await vm.CreateJobAsync();
 
         Assert.Equal("preview-token", gateway.ConfirmedToken);
+        Assert.Equal(gateway.LastPreviewDraft!.BatchJobId, createdBatchId);
     }
 
     [Fact]
@@ -438,6 +469,152 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Equal(9, vm.Accounts[0].ConfirmedTransferCount);
         Assert.Equal(7, vm.Accounts[0].ConfirmedShareCount);
         Assert.True(vm.Accounts[0].HasCurrentConfirmation);
+    }
+
+    [Fact]
+    public async Task OneOfTenTwoHundredThousandConfirmationUsesOnlyAuthoritativeSelectedAccountWorkload()
+    {
+        var accounts = Accounts(10);
+        var selected = accounts[0];
+        var gateway = new FakeBatchGateway
+        {
+            Summary = new WizardConfirmationSummary(
+                200_000, 200_000, "server-token", true,
+                [new WizardAccountConfirmation(
+                    selected.AccountId, 200_000, 200_000, 200_000, 0, 0, 0, 0, 200_000, 0,
+                    PlannedTransferCount: 200_000, PlannedShareCount: 200_000,
+                    ConfirmedTransferCount: 200_000, ConfirmedShareCount: 200_000,
+                    ShareEnabled: true)],
+                TransferCount: 200_000, ShareCount: 200_000,
+                TotalActionCount: 400_000, ResultColumnCount: 8),
+        };
+        var vm = Create(accounts, ready: 200_000, gateway: gateway);
+        vm.SelectMode(TransferMode.Distribution);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].IsSelected = true;
+        vm.Accounts[0].TargetItemCount = 200_000;
+
+        await vm.PrepareConfirmationAsync();
+
+        var confirmationAccount = Assert.Single(vm.ConfirmationAccounts);
+        Assert.Equal(selected.AccountId, confirmationAccount.AccountId);
+        Assert.Equal(200_000, confirmationAccount.ConfirmedTransferCount);
+        Assert.Equal(200_000, confirmationAccount.ConfirmedShareCount);
+        Assert.Equal(200_000, vm.TransferCount);
+        Assert.Equal(200_000, vm.ShareCount);
+        Assert.Equal(400_000, vm.TotalActionCount);
+        Assert.Equal(8, vm.ResultColumnCount);
+    }
+
+    [Fact]
+    public async Task BusyConfirmationDisablesBothNavigationDirections()
+    {
+        var gateway = new DelayedBatchGateway();
+        var vm = Create(Accounts(1), ready: 2, gateway: gateway);
+        vm.NextStepCommand.Execute(null);
+        vm.NextStepCommand.Execute(null);
+        Assert.Equal(WizardStepKind.Allocation, vm.Steps.Single(step => step.IsCurrent).Kind);
+
+        var preparing = vm.PrepareConfirmationAsync();
+        await gateway.Started.Task;
+
+        Assert.True(vm.IsBusy);
+        Assert.False(vm.CanEdit);
+        Assert.False(vm.NextStepCommand.CanExecute(null));
+        Assert.False(vm.PreviousStepCommand.CanExecute(null));
+
+        gateway.Complete();
+        await preparing;
+    }
+
+    [Fact]
+    public async Task NavigatingInvalidatesConfirmationTokenAndSummary()
+    {
+        var vm = Create(Accounts(1), ready: 2);
+        await vm.PrepareConfirmationAsync();
+        Assert.NotNull(vm.ConfirmationToken);
+        Assert.True(vm.TotalActionCount > 0);
+
+        vm.NextStepCommand.Execute(null);
+
+        Assert.Null(vm.ConfirmationToken);
+        Assert.Equal(0, vm.TransferCount);
+        Assert.Equal(0, vm.ShareCount);
+        Assert.Equal(0, vm.TotalActionCount);
+        Assert.Equal(0, vm.ResultColumnCount);
+        Assert.Empty(vm.ConfirmationAccounts);
+    }
+
+    [Theory]
+    [InlineData("switch")]
+    [InlineData("ignore")]
+    [InlineData("auto-map")]
+    [InlineData("override")]
+    public async Task DraftWorkflowCompletionCannotOverwriteANewerImportSession(string operation)
+    {
+        var workflow = new DelayedDraftWorkflow();
+        var vm = new CreateJobWizardViewModel(
+            Accounts(2), new FakePageSource([], 10, null), new FakeBatchGateway(),
+            new FakeDialogService(), draftWorkflow: workflow);
+        vm.Initialize(new(Guid.NewGuid(), "旧任务", 10, true, 1, 0, 0, "/旧目录"));
+
+        Task pending;
+        switch (operation)
+        {
+            case "switch":
+                pending = vm.SelectModeAsync(TransferMode.Replication);
+                break;
+            case "ignore":
+                vm.SelectMode(TransferMode.Replication);
+                pending = vm.IgnoreExcelAccountsAsync();
+                break;
+            case "auto-map":
+                vm.SelectMode(TransferMode.Distribution);
+                pending = vm.AutoMapUniqueExcelAccountsAsync();
+                break;
+            case "override":
+                vm.SelectMode(TransferMode.Distribution);
+                vm.Accounts[0].IsSelected = true;
+                pending = vm.OverrideAllExcelAccountsAsync();
+                break;
+            default:
+                throw new InvalidOperationException(operation);
+        }
+
+        await workflow.Started.Task;
+        var newSessionId = Guid.NewGuid();
+        vm.Initialize(new(newSessionId, "新任务", 7, true, 3, 0, 0, "/新目录"));
+        workflow.Complete();
+        await pending;
+
+        Assert.Equal(newSessionId, vm.CurrentImportSessionId);
+        Assert.Equal(7, vm.ReadyResourceCount);
+        Assert.Null(vm.TransferMode);
+        Assert.Equal(ExcelAccountHandling.Unresolved, vm.ExcelAccountHandling);
+    }
+
+    [Fact]
+    public void WizardXamlWiresShareControlsAndAuthoritativeConfirmationSummary()
+    {
+        var xaml = File.ReadAllText(FindRepositoryFile(
+            "src", "BaiduBatchTransfer.App", "Features", "Jobs", "CreateJobWizardView.xaml"));
+
+        Assert.Contains("{Binding ShareEnabled", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ShareValidityText", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ShareAccessText", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ExtractionCodeBehavior", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding FixedExtractionCode", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ExistingSharePolicyText", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tag=\"Reuse\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tag=\"Regenerate\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tag=\"Cancel\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ConfirmationAccounts", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ConfirmedTransferCount", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ConfirmedShareCount", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding TransferCount", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ShareCount", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding TotalActionCount", xaml, StringComparison.Ordinal);
+        Assert.Contains("{Binding ResultColumnCount", xaml, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -522,7 +699,7 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Equal("不限次数", vm.ShareAccessText);
         Assert.Equal("随机提取码", vm.ExtractionCodeBehaviorText);
         Assert.Equal("Ask", vm.ExistingSharePolicy);
-        Assert.Equal("每次询问", vm.ExistingSharePolicyText);
+        Assert.Equal("询问，默认复用", vm.ExistingSharePolicyText);
 
         await vm.PrepareConfirmationAsync();
         Assert.NotNull(vm.ConfirmationToken);
@@ -531,9 +708,8 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Null(vm.ConfirmationToken);
         Assert.Contains("固定提取码", vm.ValidationMessage);
         vm.FixedExtractionCode = "a1b2";
-        vm.ExistingSharePolicy = "Reuse";
         Assert.Equal("固定提取码", vm.ExtractionCodeBehaviorText);
-        Assert.Equal("复用已有分享", vm.ExistingSharePolicyText);
+        Assert.Equal("询问，默认复用", vm.ExistingSharePolicyText);
         await vm.PrepareConfirmationAsync();
 
         var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
@@ -541,7 +717,7 @@ public sealed class CreateJobWizardViewModelTests
         Assert.True(draft.IsShareAccessUnlimited);
         Assert.Equal(ShareExtractionCodeBehavior.Fixed, draft.ExtractionCodeBehavior);
         Assert.Equal("a1b2", draft.FixedExtractionCode);
-        Assert.Equal("Reuse", draft.ExistingSharePolicy);
+        Assert.Equal("Ask", draft.ExistingSharePolicy);
         Assert.NotNull(vm.ConfirmationToken);
 
         vm.FixedExtractionCode = "b2c3";
@@ -643,13 +819,19 @@ public sealed class CreateJobWizardViewModelTests
         vm.Initialize(new(Guid.NewGuid(), "任务", 10, true, 0, 0, 0, "/资源"));
 
         await vm.SelectModeAsync(TransferMode.Distribution);
+        Assert.False(vm.IsBusy);
         await vm.AutoMapUniqueExcelAccountsAsync();
+        Assert.False(vm.IsBusy);
         await vm.IgnoreExcelAccountsAsync();
+        Assert.False(vm.IsBusy);
+        vm.Accounts[0].IsSelected = true;
+        await vm.OverrideAllExcelAccountsAsync();
+        Assert.False(vm.IsBusy);
 
         Assert.Equal(TransferMode.Distribution, draftWorkflow.LastMode);
         Assert.True(draftWorkflow.AutoMapCalled);
         Assert.True(draftWorkflow.IgnoreCalled);
-        Assert.Equal(ExcelAccountHandling.IgnoreColumn, vm.ExcelAccountHandling);
+        Assert.Equal(ExcelAccountHandling.OverrideAll, vm.ExcelAccountHandling);
     }
 
     [Fact]
@@ -669,6 +851,33 @@ public sealed class CreateJobWizardViewModelTests
 
         Assert.Equal([vm.Accounts[1].AccountId, vm.Accounts[1].AccountId], precheck.Accounts);
         Assert.Contains("继续", vm.PrecheckStatusMessage);
+    }
+
+    [Fact]
+    public async Task InflightPrecheckCannotWriteIntoANewerImportSessionOrKeepItBusy()
+    {
+        var precheck = new DelayedPrecheckWorkflow();
+        var vm = new CreateJobWizardViewModel(
+            Accounts(2), new FakePageSource([], 10, null), new FakeBatchGateway(), new FakeDialogService(),
+            precheckWorkflow: precheck);
+        vm.Initialize(new(Guid.NewGuid(), "旧任务", 10, false, 0, 0, 0, "/资源"));
+        vm.SelectMode(TransferMode.Distribution);
+        vm.UseBulkPrecheck = true;
+        vm.PrecheckAccountId = vm.Accounts[0].AccountId;
+
+        var running = vm.RunPrecheckAsync();
+        await precheck.Started.Task;
+        Assert.True(vm.IsBusy);
+
+        var currentSession = Guid.NewGuid();
+        vm.Initialize(new(currentSession, "新任务", 3, false, 0, 0, 0, "/新资源"));
+        Assert.False(vm.IsBusy);
+        precheck.Complete();
+        await running;
+
+        Assert.Equal(currentSession, vm.CurrentImportSessionId);
+        Assert.Empty(vm.PrecheckStatusMessage);
+        Assert.False(vm.IsBusy);
     }
 
     [Fact]
@@ -746,6 +955,24 @@ public sealed class CreateJobWizardViewModelTests
         Assert.Contains("已自动选择唯一可用账号", vm.AccountSelectionNotice);
         Assert.False(vm.CanCreateJob);
         Assert.Empty(source.Requests);
+    }
+
+    [Fact]
+    public async Task ShareEnabledDraftIsBlockedIndependentlyUntilShareCapabilityIsAccepted()
+    {
+        var vm = new CreateJobWizardViewModel(
+            Accounts(1), new FakePageSource([], 4, null), new FakeBatchGateway(), new FakeDialogService(),
+            resultCapabilities: new TransferOnlyCapabilities());
+        vm.Initialize(new(Guid.NewGuid(), "任务", 4, false, 0, 0, 0, "/资源"));
+
+        Assert.False(vm.CanContinue);
+        Assert.Contains("分享功能尚未验证", vm.ValidationMessage);
+        Assert.Equal("分享功能尚未验证", vm.ShareCapabilityStatusMessage);
+
+        vm.Accounts[0].ShareEnabled = false;
+        await vm.PrepareConfirmationAsync();
+
+        Assert.NotNull(vm.ConfirmationToken);
     }
 
     [Fact]
@@ -865,6 +1092,19 @@ public sealed class CreateJobWizardViewModelTests
         new(accountId, 1, 1, 1, 0, 0, 0, 0, 2, 0,
             PlannedTransferCount: 2, PlannedShareCount: 2,
             ConfirmedTransferCount: 2, ConfirmedShareCount: 2);
+
+    private static string FindRepositoryFile(params string[] segments)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            if (!File.Exists(Path.Combine(directory.FullName, "BaiduBatchTransfer.sln"))) continue;
+            return Path.Combine([directory.FullName, .. segments]);
+        }
+
+        throw new DirectoryNotFoundException("无法定位仓库根目录。");
+    }
 
     private static void AssertNoPreviewDerivedState(
         CreateJobWizardViewModel vm,
@@ -1020,6 +1260,33 @@ public sealed class CreateJobWizardViewModelTests
             Task.FromResult(new WizardDraftMutation(10, 10, 0, 0, 0, 0, 0));
     }
 
+    private sealed class DelayedDraftWorkflow : IWizardDraftWorkflow
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<WizardDraftMutation> SwitchModeAsync(
+            Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => WaitAsync(cancellationToken);
+
+        public Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(
+            Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => WaitAsync(cancellationToken);
+
+        public Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(
+            Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => WaitAsync(cancellationToken);
+
+        public Task<WizardDraftMutation> OverrideAllAccountsAsync(
+            Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) => WaitAsync(cancellationToken);
+
+        public void Complete() => release.TrySetResult();
+
+        private async Task<WizardDraftMutation> WaitAsync(CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return new WizardDraftMutation(99, 99, 0, 0, 0, 0, 0);
+        }
+    }
+
     private sealed class FakePrecheckWorkflow : IWizardPrecheckWorkflow
     {
         public List<Guid> Accounts { get; } = [];
@@ -1030,5 +1297,31 @@ public sealed class CreateJobWizardViewModelTests
                 Accounts.Count == 1 ? WizardPrecheckStatus.PausedForVerification : WizardPrecheckStatus.Completed,
                 5));
         }
+    }
+
+    private sealed class DelayedPrecheckWorkflow : IWizardPrecheckWorkflow
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<WizardPrecheckResult> RunAsync(
+            Guid sessionId,
+            Guid accountId,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return new(WizardPrecheckStatus.Completed, 10);
+        }
+
+        public void Complete() => release.TrySetResult();
+    }
+
+    private sealed class TransferOnlyCapabilities : IJobResultCapabilityAvailability
+    {
+        public bool CanUseTransferActions => true;
+        public bool CanUseShareActions => false;
+        public string TransferStatusMessage => string.Empty;
+        public string ShareStatusMessage => "分享功能尚未验证";
     }
 }

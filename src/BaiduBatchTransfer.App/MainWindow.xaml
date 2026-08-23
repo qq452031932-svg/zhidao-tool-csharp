@@ -51,6 +51,7 @@
                     <TextBlock Text="工作区" Foreground="#AFC6DB" Margin="8,0,0,10" />
                     <Button Content="导入与草稿" Command="{Binding ShowImportCommand}" HorizontalContentAlignment="Left" />
                     <Button Content="创建任务" Command="{Binding ShowCreateJobCommand}" HorizontalContentAlignment="Left" Margin="0,8,8,0" />
+                    <Button Content="任务结果" Command="{Binding ShowResultsCommand}" HorizontalContentAlignment="Left" Margin="0,8,8,0" />
                     <Border Background="#183B56" CornerRadius="8" Padding="10" Margin="0,24,0,0">
                         <TextBlock Text="{Binding AdapterStatusMessage}" TextWrapping="Wrap" Foreground="#D7E8F7" FontSize="12" />
                     </Border>

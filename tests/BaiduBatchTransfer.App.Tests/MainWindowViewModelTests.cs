@@ -27,6 +27,26 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void ResultNavigationUsesDedicatedPageAndIsUnavailableWhenPageWasNotProvided()
+    {
+        var results = new object();
+        var vm = new MainWindowViewModel(
+            new object(),
+            new object(),
+            new FakeLoginLauncher(),
+            resultsPage: results);
+
+        Assert.True(vm.ShowResultsCommand.CanExecute(null));
+        vm.ShowResultsCommand.Execute(null);
+
+        Assert.Same(results, vm.CurrentContent);
+        Assert.Equal("任务结果", vm.CurrentPageTitle);
+
+        var withoutResults = new MainWindowViewModel(new object(), new object(), new FakeLoginLauncher());
+        Assert.False(withoutResults.ShowResultsCommand.CanExecute(null));
+    }
+
+    [Fact]
     public async Task LoginLauncherFailureIsMappedToChineseWithoutLeakingException()
     {
         var login = new FakeLoginLauncher { IsAvailableValue = true, Throw = true };
@@ -195,6 +215,7 @@ public sealed class MainWindowViewModelTests
             "MainWindow.xaml"));
 
         Assert.Contains("Content=\"刷新账号\" Command=\"{Binding RefreshAccountsCommand}\"", xaml);
+        Assert.Contains("Content=\"任务结果\" Command=\"{Binding ShowResultsCommand}\"", xaml);
         Assert.Contains("x:Name=\"AccountStatusLiveRegion\"", xaml);
         Assert.Contains("AutomationProperties.Name=\"{Binding AccountStatusMessage}\"", xaml);
         Assert.Contains("x:Name=\"OperationStatusLiveRegion\"", xaml);

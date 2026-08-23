@@ -289,6 +289,29 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     {
         ArgumentNullException.ThrowIfNull(query);
         query.Validate();
+        if (query.AfterAllocationOrdinal == 0)
+        {
+            await using var duplicate = Command("""
+                SELECT EXISTS(
+                  SELECT 1 FROM TransferOperations
+                  WHERE BatchJobId=$job
+                  GROUP BY AllocationOrdinal HAVING COUNT(*)>1 LIMIT 1);
+                """);
+            Add(duplicate, "$job", Id(query.BatchJobId));
+            if (Convert.ToInt64(await duplicate.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 0)
+                throw new InvalidDataException("The operation result keyset contains duplicate allocation ordinals.");
+        }
+        else
+        {
+            await using var boundary = Command("""
+                SELECT COUNT(*) FROM TransferOperations
+                WHERE BatchJobId=$job AND AllocationOrdinal=$after;
+                """);
+            Add(boundary, "$job", Id(query.BatchJobId));
+            Add(boundary, "$after", query.AfterAllocationOrdinal);
+            if (Convert.ToInt64(await boundary.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) > 1)
+                throw new InvalidDataException("The operation result keyset cursor is ambiguous.");
+        }
         var accountFilter = query.AccountId is null ? string.Empty : " AND o.AssignedAccountId=$account";
         var statusFilter = query.Status is null ? string.Empty : " AND o.Status=$status";
         var fromFilter = query.UpdatedFrom is null ? string.Empty : " AND julianday(o.UpdatedAt)>=julianday($from)";
@@ -309,8 +332,20 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
 
         await using var command = Command(
             "SELECT o.Id,o.ResourceItemId,o.BatchJobId,r.CandidateSequence,o.AllocationOrdinal,r.ShareUrl,r.Note," +
-            "o.AssignedAccountId,a.DisplayName,o.TargetPath,o.Status,o.OutcomeKind,o.LastErrorCode,o.LastErrorMessage,o.UpdatedAt " +
-            $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN Accounts a ON a.Id=o.AssignedAccountId " +
+            "o.AssignedAccountId,a.DisplayName,o.TargetPath,o.Status,o.OutcomeKind,o.LastErrorCode,o.LastErrorMessage,o.UpdatedAt,r.ResolvedOutputTitle," +
+            "s.Id,s.Status,s.LastErrorCode,s.LastErrorMessage," +
+            "CASE WHEN s.Id IS NOT NULL AND EXISTS(SELECT 1 FROM ShareOperationGenerations lineage " +
+            "WHERE lineage.ShareOperationId=s.Id AND lineage.Generation=s.Generation AND lineage.ExactItemCount>0 " +
+            "AND lineage.ExactItemCount=(SELECT COUNT(*) FROM ShareOperationRemoteItems remote WHERE remote.ShareOperationId=s.Id)) THEN 1 ELSE 0 END," +
+            "CASE WHEN b.Status IN ('Active','CompletedWithShortfall') THEN 1 ELSE 0 END," +
+            "CASE WHEN a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 THEN 1 ELSE 0 END," +
+            "COALESCE(output.ShareEnabled,0)," +
+            "CASE WHEN s.Id IS NOT NULL AND (s.SubmitStartedAt IS NULL OR s.SubmissionAcceptance='DefinitelyNotAccepted') THEN 1 ELSE 0 END," +
+            "s.Generation,s.UpdatedAt,o.AttemptCount " +
+            $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId " +
+            "JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId " +
+            "LEFT JOIN ShareOperations s ON s.TransferOperationId=o.Id " +
+            "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
             "WHERE o.BatchJobId=$job" + filter +
             " AND o.AllocationOrdinal>$after ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT $limit;");
         BindOperationFilters(command, query);
@@ -327,8 +362,18 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.GetString(8), reader.GetString(9), reader.GetString(10),
                 reader.IsDBNull(11) ? null : reader.GetString(11),
                 reader.IsDBNull(12) ? null : reader.GetString(12),
-                reader.IsDBNull(13) ? null : reader.GetString(13), ReadTime(reader, 14)));
+                reader.IsDBNull(13) ? null : reader.GetString(13), ReadTime(reader, 14),
+                reader.IsDBNull(15) ? null : reader.GetString(15), ReadNullableId(reader, 16),
+                reader.IsDBNull(17) ? null : reader.GetString(17),
+                reader.IsDBNull(18) ? null : reader.GetString(18), reader.IsDBNull(19) ? null : reader.GetString(19),
+                reader.GetInt64(20) != 0, reader.GetInt64(21) != 0, reader.GetInt64(22) != 0,
+                reader.GetInt64(23) != 0, reader.GetInt64(24) != 0,
+                reader.IsDBNull(25) ? null : reader.GetInt32(25),
+                reader.IsDBNull(26) ? null : ReadTime(reader, 26),
+                reader.GetInt32(27)));
         }
+        if (items.Zip(items.Skip(1), static (left, right) => left.AllocationOrdinal == right.AllocationOrdinal).Any(equal => equal))
+            throw new InvalidDataException("The operation result keyset contains duplicate allocation ordinals.");
         var hasMore = items.Count > query.PageSize;
         if (hasMore) items.RemoveAt(items.Count - 1);
         return new(items, total, hasMore ? items[^1].AllocationOrdinal : null);

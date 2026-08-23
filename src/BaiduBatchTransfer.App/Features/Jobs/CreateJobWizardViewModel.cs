@@ -18,6 +18,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private readonly IWizardBatchService batchService;
     private readonly IDialogService dialogService;
     private readonly IAdapterAvailability adapterAvailability;
+    private readonly IJobResultCapabilityAvailability resultCapabilities;
     private readonly IWizardDraftWorkflow draftWorkflow;
     private readonly IWizardPrecheckWorkflow precheckWorkflow;
     private readonly List<WizardAccountOption> options;
@@ -46,6 +47,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private bool isBusy;
     private bool suppressInvalidation;
     private long draftGeneration;
+    private long busyGeneration;
     private string folderCreationMode = "None";
     private DuplicatePolicy duplicatePolicy = DuplicatePolicy.Skip;
     private long requiredFreeBytes;
@@ -58,8 +60,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private int resultColumnCount;
     private ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random;
     private string fixedExtractionCode = string.Empty;
-    private string existingSharePolicy = "Ask";
     private string precheckStatusMessage = string.Empty;
+
+    public event EventHandler<Guid>? JobCreated;
 
     public CreateJobWizardViewModel(
         IReadOnlyList<WizardAccountOption> accounts,
@@ -68,7 +71,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         IDialogService dialogService,
         IAdapterAvailability? adapterAvailability = null,
         IWizardDraftWorkflow? draftWorkflow = null,
-        IWizardPrecheckWorkflow? precheckWorkflow = null)
+        IWizardPrecheckWorkflow? precheckWorkflow = null,
+        IJobResultCapabilityAvailability? resultCapabilities = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
         ValidateSelectionDecisions(accounts, nameof(accounts));
@@ -76,6 +80,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         this.batchService = batchService ?? throw new ArgumentNullException(nameof(batchService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
         this.adapterAvailability = adapterAvailability ?? AvailableAdapterAvailability.Instance;
+        this.resultCapabilities = resultCapabilities ?? AvailableResultCapabilities.Instance;
         this.draftWorkflow = draftWorkflow ?? new PassiveWizardDraftWorkflow();
         this.precheckWorkflow = precheckWorkflow ?? new UnavailableWizardPrecheckWorkflow();
         options = accounts.Where(IsEligible).OrderBy(x => x.DisplayName, StringComparer.CurrentCulture).ToList();
@@ -94,7 +99,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         LoadFirstPreviewPageCommand = new AsyncRelayCommand(LoadFirstPreviewPageAsync, () => !IsBusy);
         LoadNextPreviewPageCommand = new AsyncRelayCommand(LoadNextPreviewPageAsync, () => nextPreviewCursor is not null && !IsBusy);
         NextStepCommand = new RelayCommand(MoveNext, () => CanMoveNext);
-        PreviousStepCommand = new RelayCommand(MovePrevious, () => currentStepIndex > 0);
+        PreviousStepCommand = new RelayCommand(MovePrevious, () => !IsBusy && currentStepIndex > 0);
         SelectReplicationCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Replication));
         SelectDistributionCommand = new AsyncRelayCommand(() => SelectModeAsync(Core.Domain.TransferMode.Distribution));
         UseTaskQuotaCommand = new RelayCommand(() => QuotaBasis = Core.Domain.QuotaBasis.TaskCount);
@@ -222,14 +227,14 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public bool IsDestinationStepVisible => currentStepIndex == 2;
     public bool IsAllocationStepVisible => currentStepIndex == 3;
     public bool IsConfirmationStepVisible => currentStepIndex == 4;
-    public bool CanMoveNext => currentStepIndex switch
+    public bool CanMoveNext => !IsBusy && Accounts.Count > 0 && (currentStepIndex switch
     {
         0 => importSessionId != Guid.Empty && readyResourceCount > 0 && conflictRowCount + needsResolutionRowCount == 0,
         1 => !UseBulkPrecheck || PrecheckAccountId is not null,
         2 => !string.IsNullOrWhiteSpace(DefaultTargetPath),
         3 => CanContinue,
         _ => false,
-    };
+    });
     public string AccountSelectionNotice { get; private set; } = string.Empty;
     public string ValidationModeText => UseBulkPrecheck ? "批量预检" : "执行前即时检测";
     public string TransferModeText => transferMode switch
@@ -258,6 +263,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public long ShareCount { get => shareCount; private set => SetProperty(ref shareCount, value); }
     public long TotalActionCount { get => totalActionCount; private set => SetProperty(ref totalActionCount, value); }
     public int ResultColumnCount { get => resultColumnCount; private set => SetProperty(ref resultColumnCount, value); }
+    public IReadOnlyList<AccountAllocationRowViewModel> ConfirmationAccounts =>
+        Accounts.Where(account => account.IsSelected && account.HasCurrentConfirmation).ToArray();
     public bool IsSharePermanent => true;
     public bool IsShareAccessUnlimited => true;
     public string ShareValidityText => "永久";
@@ -281,24 +288,11 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         get => fixedExtractionCode;
         set => SetAndInvalidate(ref fixedExtractionCode, value ?? string.Empty);
     }
-    public string ExistingSharePolicy
-    {
-        get => existingSharePolicy;
-        set
-        {
-            if (value is not ("Ask" or "Reuse" or "Regenerate" or "Cancel"))
-                throw new ArgumentOutOfRangeException(nameof(value));
-            if (SetAndInvalidate(ref existingSharePolicy, value))
-                OnPropertyChanged(nameof(ExistingSharePolicyText));
-        }
-    }
-    public string ExistingSharePolicyText => existingSharePolicy switch
-    {
-        "Reuse" => "复用已有分享",
-        "Regenerate" => "重新生成分享",
-        "Cancel" => "取消任务",
-        _ => "每次询问",
-    };
+    public string ExistingSharePolicy => "Ask";
+    public string ExistingSharePolicyText => "询问，默认复用";
+    public string ShareCapabilityStatusMessage => resultCapabilities.CanUseShareActions
+        ? string.Empty
+        : resultCapabilities.ShareStatusMessage;
     public string PrecheckStatusMessage { get => precheckStatusMessage; private set => SetProperty(ref precheckStatusMessage, value); }
     public string WarningMessage => BuildWarning();
     public bool CanContinue => string.IsNullOrEmpty(EvaluateValidation());
@@ -308,6 +302,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public void Initialize(ImportWizardContext context)
     {
         if (context.ImportSessionId == Guid.Empty) throw new ArgumentException("导入会话不能为空。", nameof(context));
+        ResetBusy();
         suppressInvalidation = true;
         importSessionId = context.ImportSessionId;
         batchJobId = Guid.NewGuid();
@@ -353,6 +348,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         ValidateSelectionDecisions(accounts, nameof(accounts));
         if (accounts.Count > 1_000)
             throw new ArgumentOutOfRangeException(nameof(accounts), "账号列表一次最多可刷新 1,000 项。");
+        ResetBusy();
 
         var previousCount = Accounts.Count;
         var previous = Accounts.ToDictionary(account => account.AccountId);
@@ -443,41 +439,60 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task SelectModeAsync(TransferMode mode, CancellationToken cancellationToken = default)
     {
         if (importSessionId == Guid.Empty) { SelectMode(mode); return; }
-        IsBusy = true;
+        var session = importSessionId;
+        var generation = draftGeneration;
+        var busyToken = BeginBusy();
         try
         {
-            var mutation = await draftWorkflow.SwitchModeAsync(importSessionId, mode, cancellationToken);
+            var mutation = await draftWorkflow.SwitchModeAsync(session, mode, cancellationToken);
+            if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
             SelectMode(mode);
             StatusMessage = mode == Core.Domain.TransferMode.Replication ? "已切换为多账号复制。" : "已切换为多账号分流。";
         }
-        catch (Exception) { ValidationMessage = "无法切换模式，请先处理草稿冲突。"; }
-        finally { IsBusy = false; }
+        catch (Exception)
+        {
+            if (IsCurrentDraft(session, generation))
+                ValidationMessage = "无法切换模式，请先处理草稿冲突。";
+        }
+        finally { EndBusy(busyToken); }
     }
 
     public async Task IgnoreExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (importSessionId == Guid.Empty || transferMode is null) return;
-        IsBusy = true;
+        var session = importSessionId;
+        var generation = draftGeneration;
+        var mode = transferMode.Value;
+        var busyToken = BeginBusy();
         try
         {
-            var mutation = await draftWorkflow.IgnoreAllAccountNamesAsync(importSessionId, transferMode.Value, cancellationToken);
+            var mutation = await draftWorkflow.IgnoreAllAccountNamesAsync(session, mode, cancellationToken);
+            if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
             ExcelAccountHandling = ExcelAccountHandling.IgnoreColumn;
             unresolvedAccountMappingCount = 0;
         }
-        catch (Exception) { ValidationMessage = "无法忽略 Excel 账号列，请刷新草稿后重试。"; }
-        finally { IsBusy = false; }
+        catch (Exception)
+        {
+            if (IsCurrentDraft(session, generation))
+                ValidationMessage = "无法忽略 Excel 账号列，请刷新草稿后重试。";
+        }
+        finally { EndBusy(busyToken); }
     }
 
     public async Task AutoMapUniqueExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (importSessionId == Guid.Empty || transferMode != Core.Domain.TransferMode.Distribution) return;
-        IsBusy = true;
+        var session = importSessionId;
+        var generation = draftGeneration;
+        var mode = transferMode.Value;
+        var busyToken = BeginBusy();
         try
         {
             var mutation = await draftWorkflow.AutoMapUniqueAccountNamesAsync(
-                importSessionId, transferMode.Value, cancellationToken);
+                session, mode, cancellationToken);
+            if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
             unresolvedAccountMappingCount = mutation.UnresolvedAccountMappings;
             ExcelAccountHandling = ExcelAccountHandling.MapNames;
@@ -485,8 +500,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 ? "Excel 账号名称已全部唯一匹配。"
                 : $"已匹配唯一名称，仍有 {unresolvedAccountMappingCount:N0} 个名称需要统一覆盖或人工处理。";
         }
-        catch (Exception) { ValidationMessage = "无法匹配 Excel 账号名称，请刷新草稿后重试。"; }
-        finally { IsBusy = false; }
+        catch (Exception)
+        {
+            if (IsCurrentDraft(session, generation))
+                ValidationMessage = "无法匹配 Excel 账号名称，请刷新草稿后重试。";
+        }
+        finally { EndBusy(busyToken); }
     }
 
     public async Task OverrideAllExcelAccountsAsync(CancellationToken cancellationToken = default)
@@ -494,16 +513,24 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (importSessionId == Guid.Empty || transferMode is null) return;
         var account = Accounts.FirstOrDefault(x => x.IsSelected);
         if (account is null) { ValidationMessage = "请先选择用于覆盖的账号。"; return; }
-        IsBusy = true;
+        var session = importSessionId;
+        var generation = draftGeneration;
+        var mode = transferMode.Value;
+        var busyToken = BeginBusy();
         try
         {
-            var mutation = await draftWorkflow.OverrideAllAccountsAsync(importSessionId, account.AccountId, transferMode.Value, cancellationToken);
+            var mutation = await draftWorkflow.OverrideAllAccountsAsync(session, account.AccountId, mode, cancellationToken);
+            if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
             ExcelAccountHandling = ExcelAccountHandling.OverrideAll;
             unresolvedAccountMappingCount = 0;
         }
-        catch (Exception) { ValidationMessage = "无法覆盖逐行账号，请刷新草稿后重试。"; }
-        finally { IsBusy = false; }
+        catch (Exception)
+        {
+            if (IsCurrentDraft(session, generation))
+                ValidationMessage = "无法覆盖逐行账号，请刷新草稿后重试。";
+        }
+        finally { EndBusy(busyToken); }
     }
 
     public async Task RunPrecheckAsync(CancellationToken cancellationToken = default)
@@ -515,10 +542,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             return;
         }
 
-        IsBusy = true;
+        var session = importSessionId;
+        var generation = draftGeneration;
+        var busyToken = BeginBusy();
         try
         {
-            var result = await precheckWorkflow.RunAsync(importSessionId, accountId, cancellationToken);
+            var result = await precheckWorkflow.RunAsync(session, accountId, cancellationToken);
+            if (!IsCurrentDraft(session, generation)) return;
             PrecheckStatusMessage = result.Status switch
             {
                 WizardPrecheckStatus.Completed => $"预检已继续并完成，已处理 {result.ProcessedRows:N0} 条记录。",
@@ -529,13 +559,15 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            PrecheckStatusMessage = "预检已取消，可使用同一账号继续。";
+            if (IsCurrentDraft(session, generation))
+                PrecheckStatusMessage = "预检已取消，可使用同一账号继续。";
         }
         catch (Exception)
         {
-            PrecheckStatusMessage = "预检失败，可使用同一账号继续重试。";
+            if (IsCurrentDraft(session, generation))
+                PrecheckStatusMessage = "预检失败，可使用同一账号继续重试。";
         }
-        finally { IsBusy = false; }
+        finally { EndBusy(busyToken); }
     }
 
     public void SetImportResolutionCounts(int conflictRows, int needsResolutionRows)
@@ -629,7 +661,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         var validation = EvaluateValidation();
         ValidationMessage = validation;
         if (validation.Length != 0) return;
-        IsBusy = true;
+        var busyToken = BeginBusy();
         var generation = draftGeneration;
         var session = importSessionId;
         try
@@ -646,24 +678,33 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            StatusMessage = "预览已取消。";
+            if (IsCurrentDraft(session, generation)) StatusMessage = "预览已取消。";
         }
         catch (StorageCapacityException)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "本机磁盘空间不足，无法安全创建任务。请释放空间后重新预览。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "本机磁盘空间不足，无法安全创建任务。请释放空间后重新预览。";
+            }
         }
         catch (BatchDraftValidationException)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "任务配置或导入草稿已变化，请返回检查并重新预览。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "任务配置或导入草稿已变化，请返回检查并重新预览。";
+            }
         }
         catch (Exception)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "任务预览失败，请检查配置后重试。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "任务预览失败，请检查配置后重试。";
+            }
         }
-        finally { IsBusy = false; }
+        finally { EndBusy(busyToken); }
     }
 
     public async Task CreateJobAsync(CancellationToken cancellationToken = default)
@@ -671,35 +712,52 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (!CanCreateJob || ConfirmationToken is null) return;
         var token = ConfirmationToken;
         var draft = BuildDraft();
+        var session = importSessionId;
+        var generation = draftGeneration;
         var confirmed = await dialogService.ConfirmAsync(
             "最终确认",
             $"将创建任务“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
             cancellationToken);
-        if (!confirmed) return;
-        IsBusy = true;
+        if (!confirmed || !IsCurrentDraft(session, generation)) return;
+        var busyToken = BeginBusy();
+        var created = false;
         try
         {
             await batchService.ConfirmAsync(draft, token, cancellationToken);
-            ConfirmationToken = null;
-            IsFinalConfirmationChecked = false;
-            StatusMessage = "任务已创建，正在等待调度。";
+            created = true;
+            if (IsCurrentDraft(session, generation))
+            {
+                ConfirmationToken = null;
+                IsFinalConfirmationChecked = false;
+                StatusMessage = "任务已创建，正在等待调度。";
+            }
         }
         catch (BatchConfirmationException)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "导入草稿或任务设置已变化，请重新预览并确认。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "导入草稿或任务设置已变化，请重新预览并确认。";
+            }
         }
         catch (StorageCapacityException)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "本机磁盘空间不足，任务没有创建。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "本机磁盘空间不足，任务没有创建。";
+            }
         }
         catch (Exception)
         {
-            InvalidateConfirmation();
-            ValidationMessage = "任务创建失败，未写入执行队列，请重试。";
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = "任务创建失败，未写入执行队列，请重试。";
+            }
         }
-        finally { IsBusy = false; }
+        finally { EndBusy(busyToken); }
+        if (created) JobCreated?.Invoke(this, draft.BatchJobId);
     }
 
     private async Task LoadPreviewPageAsync(long? cursor, bool replace, CancellationToken cancellationToken)
@@ -707,7 +765,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (importSessionId == Guid.Empty) return;
         var expectedSession = importSessionId;
         var generation = draftGeneration;
-        IsBusy = true;
+        var busyToken = BeginBusy();
         try
         {
             var page = await pageSource.LoadAsync(new(expectedSession, PreviewPageSize, cursor), cancellationToken);
@@ -725,8 +783,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             else await dispatcher.InvokeAsync(ApplyPage);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception) { StatusMessage = "无法加载预览页，请稍后重试。"; }
-        finally { IsBusy = false; }
+        catch (Exception)
+        {
+            if (IsCurrentDraft(expectedSession, generation))
+                StatusMessage = "无法加载预览页，请稍后重试。";
+        }
+        finally { EndBusy(busyToken); }
     }
 
     private WizardBatchDraft BuildDraft()
@@ -781,6 +843,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (transferMode is null) return "多个账号时必须选择多账号复制或多账号分流。";
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length == 0) return "请至少选择一个参与账号。";
+        if (selected.Any(account => account.ShareEnabled) && !resultCapabilities.CanUseShareActions)
+            return string.IsNullOrWhiteSpace(resultCapabilities.ShareStatusMessage)
+                ? "分享功能尚未通过现场验证；请先关闭分享或完成能力验收。"
+                : resultCapabilities.ShareStatusMessage;
         if (ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
             string.IsNullOrWhiteSpace(FixedExtractionCode))
             return "固定提取码模式必须填写固定提取码。";
@@ -991,7 +1057,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     {
         OnPropertyChanged(nameof(CanContinue));
         OnPropertyChanged(nameof(CanCreateJob));
+        OnPropertyChanged(nameof(ConfirmationAccounts));
         NextStepCommand?.NotifyCanExecuteChanged();
+        PreviousStepCommand?.NotifyCanExecuteChanged();
         CreateJobCommand?.NotifyCanExecuteChanged();
         PrepareConfirmationCommand?.NotifyCanExecuteChanged();
         LoadFirstPreviewPageCommand?.NotifyCanExecuteChanged();
@@ -1017,6 +1085,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     private void SetCurrentStep(int index)
     {
+        if (index == currentStepIndex) return;
+        InvalidateConfirmation();
         Steps[currentStepIndex].IsCurrent = false;
         CurrentStepIndex = index;
         Steps[currentStepIndex].IsCurrent = true;
@@ -1029,6 +1099,27 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         PreviousStepCommand.NotifyCanExecuteChanged();
     }
 
+    private bool IsCurrentDraft(Guid session, long generation) =>
+        session == importSessionId && generation == draftGeneration;
+
+    private long BeginBusy()
+    {
+        var token = ++busyGeneration;
+        IsBusy = true;
+        return token;
+    }
+
+    private void EndBusy(long token)
+    {
+        if (token == busyGeneration) IsBusy = false;
+    }
+
+    private void ResetBusy()
+    {
+        busyGeneration++;
+        IsBusy = false;
+    }
+
     private static bool IsEligible(WizardAccountOption account) =>
         account.IsEnabled && !account.IsDeleted && string.Equals(account.Status, "Active", StringComparison.Ordinal);
 
@@ -1037,5 +1128,14 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         public static AvailableAdapterAvailability Instance { get; } = new();
         public bool CanStartTransfers => true;
         public string StatusMessage => string.Empty;
+    }
+
+    private sealed class AvailableResultCapabilities : IJobResultCapabilityAvailability
+    {
+        public static AvailableResultCapabilities Instance { get; } = new();
+        public bool CanUseTransferActions => true;
+        public bool CanUseShareActions => true;
+        public string TransferStatusMessage => string.Empty;
+        public string ShareStatusMessage => string.Empty;
     }
 }

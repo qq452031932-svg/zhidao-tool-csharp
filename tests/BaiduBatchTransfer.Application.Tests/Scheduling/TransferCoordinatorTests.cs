@@ -1,9 +1,48 @@
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Tests.Scheduling;
 
 public sealed class TransferCoordinatorTests
 {
+    [Fact]
+    public async Task SharedAdapterGateLimitsAllCallersToTwoGloballyAndOnePerAccount()
+    {
+        var gate = new BaiduAdapterConcurrencyGate();
+        var accountA = Session(Guid.NewGuid());
+        var accountB = Session(Guid.NewGuid());
+        var accountC = Session(Guid.NewGuid());
+        var sync = new object();
+        var activeGlobal = 0;
+        var maximumGlobal = 0;
+        var activeByAccount = new Dictionary<string, int>(StringComparer.Ordinal);
+        var maximumByAccount = new Dictionary<string, int>(StringComparer.Ordinal);
+
+        async Task RunAsync(AccountSession session)
+        {
+            await using var lease = await gate.AcquireAsync(session);
+            lock (sync)
+            {
+                activeGlobal++;
+                maximumGlobal = Math.Max(maximumGlobal, activeGlobal);
+                activeByAccount[session.AccountId] = activeByAccount.GetValueOrDefault(session.AccountId) + 1;
+                maximumByAccount[session.AccountId] = Math.Max(
+                    maximumByAccount.GetValueOrDefault(session.AccountId), activeByAccount[session.AccountId]);
+            }
+            await Task.Delay(50);
+            lock (sync)
+            {
+                activeGlobal--;
+                activeByAccount[session.AccountId]--;
+            }
+        }
+
+        await Task.WhenAll(RunAsync(accountA), RunAsync(accountA), RunAsync(accountB), RunAsync(accountC));
+
+        Assert.Equal(2, maximumGlobal);
+        Assert.All(maximumByAccount.Values, value => Assert.Equal(1, value));
+    }
+
     [Fact]
     public async Task CoordinatorAllocatesSeriallyAndExecutesAtMostTwoWithOnePerAccount()
     {
@@ -103,6 +142,11 @@ public sealed class TransferCoordinatorTests
         Assert.Equal(0, scheduled);
         Assert.Equal(1, store.ExhaustionChecks);
     }
+
+    private static AccountSession Session(Guid id) => new(
+        id, $"baidu-{id:N}",
+        [new SessionCookie("BDUSS", "secret", ".baidu.com", "/", null, true, true)],
+        DateTimeOffset.UtcNow);
 
     [Fact]
     public async Task TransferAndShareUseOneGlobalTwoWorkerPoolAndOneWorkerPerAccount()

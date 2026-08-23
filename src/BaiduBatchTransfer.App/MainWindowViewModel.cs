@@ -9,6 +9,7 @@ public sealed class MainWindowViewModel : ObservableObject
 {
     private readonly object importPage;
     private readonly object createJobPage;
+    private readonly object? resultsPage;
     private readonly IAccountLoginLauncher loginLauncher;
     private readonly IAccountManagementLauncher? accountManagementLauncher;
     private readonly Func<Action<int>, CancellationToken, Task>? refreshAccounts;
@@ -24,10 +25,12 @@ public sealed class MainWindowViewModel : ObservableObject
         IAccountLoginLauncher loginLauncher,
         IAccountManagementLauncher? accountManagementLauncher = null,
         Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
-        int initialActiveAccountCount = 0)
+        int initialActiveAccountCount = 0,
+        object? resultsPage = null)
     {
         this.importPage = importPage ?? throw new ArgumentNullException(nameof(importPage));
         this.createJobPage = createJobPage ?? throw new ArgumentNullException(nameof(createJobPage));
+        this.resultsPage = resultsPage;
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
         this.accountManagementLauncher = accountManagementLauncher;
         this.refreshAccounts = refreshAccounts;
@@ -35,6 +38,7 @@ public sealed class MainWindowViewModel : ObservableObject
         currentContent = importPage;
         ShowImportCommand = new RelayCommand(ShowImport);
         ShowCreateJobCommand = new RelayCommand(ShowCreateJob);
+        ShowResultsCommand = new RelayCommand(ShowResults, () => this.resultsPage is not null);
         OpenAccountLoginCommand = new AsyncRelayCommand(
             OpenAccountLoginAsync,
             () => loginLauncher.IsAvailable && !IsAccountOperationBusy);
@@ -71,6 +75,7 @@ public sealed class MainWindowViewModel : ObservableObject
     }
     public IRelayCommand ShowImportCommand { get; }
     public IRelayCommand ShowCreateJobCommand { get; }
+    public IRelayCommand ShowResultsCommand { get; }
     public IAsyncRelayCommand OpenAccountLoginCommand { get; }
     public IAsyncRelayCommand OpenAccountManagementCommand { get; }
     public IAsyncRelayCommand RefreshAccountsCommand { get; }
@@ -202,5 +207,12 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         CurrentContent = createJobPage;
         CurrentPageTitle = "创建任务";
+    }
+
+    public void ShowResults()
+    {
+        if (resultsPage is null) return;
+        CurrentContent = resultsPage;
+        CurrentPageTitle = "任务结果";
     }
 }

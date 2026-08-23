@@ -51,7 +51,14 @@ public sealed record ManualRetryResult(
     bool ResetForRetry,
     string Warning);
 
-public sealed class OperationReconciliationService
+public interface ITransferResultReconciler
+{
+    Task<TransferConfirmation> ReconcileAsync(
+        Guid operationId,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class OperationReconciliationService : ITransferResultReconciler
 {
     public const string DuplicateRiskWarning = "此前转存结果无法确认，重试可能产生重复资源。";
     private const int MaximumPersistedJsonLength = 64 * 1024;

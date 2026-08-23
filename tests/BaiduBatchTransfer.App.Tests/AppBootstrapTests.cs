@@ -5,6 +5,7 @@ using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -22,10 +23,13 @@ public sealed class AppBootstrapTests : IDisposable
     {
         using var host = AppBootstrap.CreateHost(root);
 
-        Assert.IsType<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>(
+        Assert.IsType<CoordinatedBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
-        Assert.IsType<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>(
+        Assert.IsType<CoordinatedBaiduShareAdapter>(
             host.Services.GetRequiredService<IBaiduShareAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<BaiduAdapterConcurrencyGate>());
         var capability = host.Services.GetRequiredService<AdapterCapability>();
         Assert.False(capability.TransferValidated);
         Assert.False(capability.ShareValidated);
@@ -37,6 +41,16 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<ExcelColumnSuggestionEngine>());
         Assert.NotNull(host.Services.GetRequiredService<IImportPreviewPageSource>());
         Assert.NotNull(host.Services.GetRequiredService<IWizardBatchService>());
+        Assert.IsType<LocalJobResultsWorkflow>(host.Services.GetRequiredService<IJobResultsWorkflow>());
+        Assert.IsType<ResultSaveDialog>(host.Services.GetRequiredService<IResultSaveDialog>());
+        Assert.IsType<UnavailableJobResultCapabilityAvailability>(
+            host.Services.GetRequiredService<IJobResultCapabilityAvailability>());
+        Assert.IsType<ExistingShareDecisionPresenter>(
+            host.Services.GetRequiredService<IExistingShareDecisionPresenter>());
+        Assert.IsType<ExistingShareDecisionInteraction>(
+            host.Services.GetRequiredService<IExistingShareDecisionInteraction>());
+        Assert.NotNull(host.Services.GetRequiredService<IJobResultActions>());
+        Assert.NotNull(host.Services.GetRequiredService<ReplacementWorkbookExportService>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
