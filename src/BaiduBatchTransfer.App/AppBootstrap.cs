@@ -74,7 +74,9 @@ public static class AppBootstrap
         services.AddSingleton<DatabaseIntegrityService>();
         services.AddSingleton<IStartupDatabaseMaintenance, SqliteStartupDatabaseMaintenance>();
         services.AddSingleton<SqliteTransferSchedulingStore>();
+        services.AddSingleton<SqliteShareSchedulingStore>();
         services.AddSingleton<IInterruptedOperationRecoveryStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IInterruptedShareOperationRecoveryStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<IAllocationCounterStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
         services.AddSingleton<AllocationCounterRebuilder>();
         services.AddSingleton<ISingleInstanceGuard>(_ =>

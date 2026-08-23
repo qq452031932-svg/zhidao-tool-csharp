@@ -42,6 +42,8 @@ public sealed class TransferOperation
 
     public bool SubmissionMayHaveOccurred { get; private set; }
 
+    public SubmissionAcceptance? PausedSubmissionAcceptance { get; private set; }
+
     public DateTimeOffset? TargetSlotReservedAt { get; private set; }
 
     public DateTimeOffset? SubmitStartedAt { get; private set; }
@@ -208,6 +210,54 @@ public sealed class TransferOperation
         LastErrorCode = string.IsNullOrWhiteSpace(errorCode) ? null : errorCode;
         LastErrorMessage = string.IsNullOrWhiteSpace(safeMessage) ? null : safeMessage;
         UpdatedAt = pausedAt;
+    }
+
+    public void PauseAfterSubmission(
+        string errorCode,
+        string safeMessage,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset pausedAt)
+    {
+        if (!SubmissionMayHaveOccurred || Status is not (OperationStatus.Submitting or OperationStatus.ResultPending))
+            throw new InvalidOperationException("Only submitted work can be paused with an acceptance disposition.");
+        if (Status == OperationStatus.ResultPending && submissionAcceptance == SubmissionAcceptance.DefinitelyNotAccepted)
+            throw new InvalidOperationException("Unknown submission acceptance cannot be downgraded after entering result pending.");
+        EnsureReservedSlot();
+        EnsureTimestamp(pausedAt);
+        Status = OperationStatus.Paused;
+        PausedSubmissionAcceptance = submissionAcceptance;
+        LastErrorCode = string.IsNullOrWhiteSpace(errorCode) ? null : errorCode;
+        LastErrorMessage = string.IsNullOrWhiteSpace(safeMessage) ? null : safeMessage;
+        UpdatedAt = pausedAt;
+    }
+
+    public void ResumePaused(DateTimeOffset resumedAt)
+    {
+        EnsureStatus(OperationStatus.Paused);
+        EnsureReservedSlot();
+        EnsureTimestamp(resumedAt);
+        if (PausedSubmissionAcceptance == SubmissionAcceptance.Unknown)
+        {
+            Status = OperationStatus.ResultPending;
+        }
+        else
+        {
+            Status = OperationStatus.Waiting;
+            TargetSlotState = TargetSlotState.Released;
+            SubmissionMayHaveOccurred = false;
+            SubmitStartedAt = null;
+            LastErrorCode = null;
+            LastErrorMessage = null;
+        }
+        PausedSubmissionAcceptance = null;
+        UpdatedAt = resumedAt;
+    }
+
+    public void ResumePausedBeforeSubmission(DateTimeOffset resumedAt)
+    {
+        if (SubmissionMayHaveOccurred || SubmitStartedAt is not null)
+            throw new InvalidOperationException("Uncertain submitted work must be reconciled instead of resumed.");
+        ResumePaused(resumedAt);
     }
 
     public void ResetForRetry(DateTimeOffset updatedAt)

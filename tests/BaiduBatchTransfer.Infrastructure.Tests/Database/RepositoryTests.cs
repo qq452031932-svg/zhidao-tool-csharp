@@ -786,17 +786,35 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             await sampler;
         }
 
-        await using var connection = await factory.OpenConnectionAsync();
-        await using var count = connection.CreateCommand();
-        count.CommandText = "SELECT COUNT(*),(SELECT COUNT(*) FROM ShareOperationRemoteItems) FROM ShareOperations;";
-        await using var reader = await count.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
-        Assert.Equal(resourceCount * accountCount, reader.GetInt32(0));
-        Assert.Equal(resourceCount * accountCount, reader.GetInt32(1));
+        await using (var countConnection = await factory.OpenConnectionAsync())
+        await using (var count = countConnection.CreateCommand())
+        {
+            count.CommandText = "SELECT COUNT(*),(SELECT COUNT(*) FROM ShareOperationRemoteItems) FROM ShareOperations;";
+            await using var reader = await count.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(resourceCount * accountCount, reader.GetInt32(0));
+            Assert.Equal(resourceCount * accountCount, reader.GetInt32(1));
+        }
+        await using var writeConnection = await factory.OpenConnectionAsync();
         var claimTimer = Stopwatch.StartNew();
         var store = new SqliteShareSchedulingStore(factory);
         for (var index = 0; index < 200; index++)
-            Assert.NotNull(await store.TryReserveNextAsync(now, TimeSpan.FromMinutes(5)));
+        {
+            var reserved = Assert.IsType<ShareOperationRecord>(
+                await store.TryReserveNextAsync(now, TimeSpan.FromMinutes(5)));
+            await using var release = writeConnection.CreateCommand();
+            release.CommandText = "UPDATE ShareOperations SET Status='Succeeded',LeaseExpiresAt=NULL,UpdatedAt=$now WHERE Id=$id AND Status='Reserved';";
+            release.Parameters.AddWithValue("$id", reserved.Id.ToString("D"));
+            release.Parameters.AddWithValue("$now", now.ToString("O"));
+            Assert.Equal(1, await release.ExecuteNonQueryAsync());
+        }
+        await using (var reopen = writeConnection.CreateCommand())
+        {
+            reopen.CommandText = "UPDATE ShareOperations SET Status='WaitingShare',UpdatedAt=$now WHERE BatchJobId=$batch AND Status='Succeeded';";
+            reopen.Parameters.AddWithValue("$batch", job.Id.ToString("D"));
+            reopen.Parameters.AddWithValue("$now", now.ToString("O"));
+            Assert.Equal(200, await reopen.ExecuteNonQueryAsync());
+        }
         claimTimer.Stop();
         var discoveryTimer = Stopwatch.StartNew();
         var runId = Guid.NewGuid();

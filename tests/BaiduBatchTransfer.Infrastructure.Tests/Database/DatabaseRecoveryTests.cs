@@ -341,7 +341,8 @@ public sealed class DatabaseRecoveryTests : IDisposable
         var contents = string.Join('\n', zip.Entries.Select(Read));
         Assert.DoesNotContain("secret", contents, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("1234", contents);
-        Assert.DoesNotContain("999", contents);
+        Assert.DoesNotContain("userId", contents, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("999", contents, StringComparison.Ordinal);
         Assert.DoesNotContain("11111111-1111-1111-1111-111111111111", contents);
         Assert.DoesNotContain("abcd", contents, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("response body", contents, StringComparison.OrdinalIgnoreCase);

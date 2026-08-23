@@ -1,4 +1,6 @@
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Jobs;
 
@@ -24,9 +26,55 @@ public sealed record OperationPageRequest(
     long? AfterAllocationOrdinal = null);
 
 public sealed record OperationPageResult(
-    IReadOnlyList<OperationResultRecord> Items,
+    IReadOnlyList<OperationPageItem> Items,
     long TotalCount,
     long? NextCursor);
+
+public sealed record OperationPageItem(
+    Guid OperationId,
+    Guid ResourceItemId,
+    Guid BatchJobId,
+    long CandidateSequence,
+    long AllocationOrdinal,
+    string ShareUrl,
+    string? Note,
+    Guid AccountId,
+    string AccountDisplayName,
+    string TargetPath,
+    string Status,
+    string StatusText,
+    string? OutcomeKind,
+    string? LastErrorCode,
+    string? LastErrorMessage,
+    DateTimeOffset UpdatedAt)
+{
+    internal static OperationPageItem FromPersistence(OperationResultRecord record)
+    {
+        var statusText = Enum.TryParse<OperationStatus>(record.Status, ignoreCase: false, out var status)
+            ? OperationStatusChineseMapper.Map(status)
+            : record.Status;
+        return new(
+            record.OperationId,
+            record.ResourceItemId,
+            record.BatchJobId,
+            record.CandidateSequence,
+            record.AllocationOrdinal,
+            record.ShareUrl,
+            record.Note,
+            record.AccountId,
+            record.AccountDisplayName,
+            record.TargetPath,
+            record.Status,
+            statusText,
+            record.OutcomeKind,
+            record.LastErrorCode,
+            record.LastErrorMessage,
+            record.UpdatedAt);
+    }
+
+    public override string ToString() =>
+        $"OperationPageItem {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, StatusText = {StatusText}, UserContent = [REDACTED] }}";
+}
 
 public sealed class JobPageQuery(IUnitOfWorkFactory unitOfWorkFactory)
 {
@@ -72,7 +120,7 @@ public sealed class JobPageQuery(IUnitOfWorkFactory unitOfWorkFactory)
         var page = await unit.Jobs.GetOperationResultsKeysetPageAsync(persistenceQuery, cancellationToken)
             .ConfigureAwait(false);
         return new(
-            page.Items,
+            page.Items.Select(OperationPageItem.FromPersistence).ToArray(),
             page.TotalCount ?? throw new InvalidOperationException("The operation query did not return its total count."),
             page.NextCursor);
     }

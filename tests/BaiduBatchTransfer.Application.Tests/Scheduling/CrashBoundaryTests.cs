@@ -118,6 +118,25 @@ public sealed class CrashBoundaryTests
     }
 
     [Fact]
+    public async Task StartupRecoversShareLeasesBeforeCounterRebuildAndCoordinatorStart()
+    {
+        var calls = new List<string>();
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            new RecordingMaintenance(calls),
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now),
+            new RecordingShareRecoveryStore(calls));
+
+        var result = await service.RecoverAsync();
+
+        Assert.Equal(["guard", "database", "leases", "share-leases", "counters"], calls);
+        Assert.Equal(new ShareLeaseRecoveryResult(2, 3), result.ShareRecovery);
+        Assert.True(result.CoordinatorMayStart);
+    }
+
+    [Fact]
     public async Task StartupStopsBeforeDatabaseWhenAnotherInstanceOwnsTheGuard()
     {
         var calls = new List<string>();
@@ -218,6 +237,21 @@ public sealed class CrashBoundaryTests
         {
             calls.Add("counters");
             return Task.FromResult(new AllocationCounterRebuildResult(0, 0, 0));
+        }
+    }
+
+    private sealed class RecordingShareRecoveryStore(List<string> calls) : IInterruptedShareOperationRecoveryStore
+    {
+        public Task<ShareLeaseRecoveryResult> RecoverInterruptedShareOperationsAsync(DateTimeOffset recoveredAt, CancellationToken cancellationToken = default)
+        {
+            calls.Add("share-leases");
+            return Task.FromResult(new ShareLeaseRecoveryResult(2, 3));
+        }
+
+        public Task<ShareLeaseRecoveryResult> RecoverExpiredShareOperationsAsync(DateTimeOffset recoveredAt, CancellationToken cancellationToken = default)
+        {
+            calls.Add("expired-share-leases");
+            return Task.FromResult(new ShareLeaseRecoveryResult(0, 0));
         }
     }
 

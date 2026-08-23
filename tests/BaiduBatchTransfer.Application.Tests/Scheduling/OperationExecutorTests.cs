@@ -207,24 +207,35 @@ public sealed class OperationExecutorTests
         Assert.Null(store.FailureCode);
     }
 
-    [Fact]
-    public async Task AccountFailureWithoutDefiniteRejectionAfterSubmitRemainsResultPending()
+    [Theory]
+    [InlineData(BaiduErrorKind.ExpiredLogin, SubmissionAcceptance.DefinitelyNotAccepted)]
+    [InlineData(BaiduErrorKind.ExpiredLogin, SubmissionAcceptance.Unknown)]
+    [InlineData(BaiduErrorKind.VerificationRequired, SubmissionAcceptance.DefinitelyNotAccepted)]
+    [InlineData(BaiduErrorKind.VerificationRequired, SubmissionAcceptance.Unknown)]
+    public async Task PostSubmissionSessionFailurePausesForInterventionBeforeResumeRouting(
+        BaiduErrorKind errorKind,
+        SubmissionAcceptance acceptance)
     {
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot);
         var adapter = new RecordingAdapter
         {
             SaveResult = BaiduAdapterResult<TransferReceipt>.Failure(
-                BaiduErrorKind.ExpiredLogin,
-                "private ambiguous response"),
+                errorKind,
+                "private response",
+                submissionAcceptance: acceptance),
         };
 
         await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
 
-        Assert.True(store.ResultPending);
-        Assert.False(store.AccountPaused);
-        Assert.Equal("ExpiredLogin", store.FailureCode);
-        Assert.Equal(SubmissionAcceptance.Unknown, store.PendingAcceptance);
+        Assert.True(store.AccountPaused);
+        Assert.True(store.PreSubmissionPaused);
+        Assert.False(store.DefiniteAccountFailure);
+        Assert.False(store.ResultPending);
+        Assert.Equal(errorKind.ToString(), store.AccountPauseCode);
+        Assert.Equal(acceptance, store.PausedAcceptance);
+        Assert.Equal(Now, store.ObservedSessionCapturedAtUtc);
+        Assert.Null(store.FailureCode);
         Assert.Equal(1, adapter.SaveCalls);
     }
 
@@ -355,6 +366,7 @@ public sealed class OperationExecutorTests
         Assert.True(store.PreSubmissionPaused);
         Assert.False(store.DefiniteAccountFailure);
         Assert.Equal(errorKind.ToString(), store.AccountPauseCode);
+        Assert.Equal(Now, store.ObservedSessionCapturedAtUtc);
         Assert.Equal(1, adapter.EnsureCalls);
         Assert.Null(store.FailureCode);
         Assert.Equal(0, adapter.SaveCalls);
@@ -380,15 +392,27 @@ public sealed class OperationExecutorTests
         Assert.Equal(0, adapter.SaveCalls);
     }
 
+    [Fact]
+    public async Task MissingSessionPausesWithoutClaimingAnObservedSessionVersion()
+    {
+        var snapshot = Snapshot(createFolderName: null);
+        var store = new RecordingExecutionStore(snapshot);
+
+        await Executor(store, new RecordingAdapter(), new MissingSessionStore()).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.AccountPaused);
+        Assert.Null(store.ObservedSessionCapturedAtUtc);
+    }
+
     private static OperationExecutor Executor(
         RecordingExecutionStore store,
         RecordingAdapter adapter,
+        IBaiduSessionStore? sessions = null,
         IAsyncDelay? delay = null)
     {
-        var sessions = new MemorySessionStore(store.Snapshot.AccountId);
         return new OperationExecutor(
             adapter,
-            sessions,
+            sessions ?? new MemorySessionStore(store.Snapshot.AccountId),
             store,
             new AccountDailyLimitService(store, new FixedTimeProvider(Now)),
             RetryPolicy.Default,
@@ -430,6 +454,13 @@ public sealed class OperationExecutorTests
         public Task SaveAsync(AccountSession value, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
+    private sealed class MissingSessionStore : IBaiduSessionStore
+    {
+        public Task<AccountSession?> LoadAsync(string id, CancellationToken cancellationToken) => Task.FromResult<AccountSession?>(null);
+        public Task RemoveAsync(string id, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SaveAsync(AccountSession value, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
     private sealed class RecordingExecutionStore(OperationExecutionSnapshot snapshot, List<string>? timeline = null)
         : IOperationExecutionStore, ISubmissionBoundaryStore
     {
@@ -452,8 +483,10 @@ public sealed class OperationExecutorTests
         public bool PreSubmissionPaused { get; private set; }
         public bool DefiniteAccountFailure { get; private set; }
         public SubmissionAcceptance? PendingAcceptance { get; private set; }
+        public SubmissionAcceptance? PausedAcceptance { get; private set; }
         public string? AccountPauseCode { get; private set; }
         public string? AccountPauseMessage { get; private set; }
+        public DateTimeOffset? ObservedSessionCapturedAtUtc { get; private set; }
 
         public Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default)
         {
@@ -536,6 +569,26 @@ public sealed class OperationExecutorTests
             AccountPauseMessage = safeMessage;
             Events.Add((++order, "AccountPausedBeforeSubmission"));
             return Task.CompletedTask;
+        }
+
+        public Task PauseForAccountInterventionAsync(
+            Guid operationId,
+            TransferPauseReason reason,
+            SubmissionAcceptance submissionAcceptance,
+            DateTimeOffset? observedSessionCapturedAtUtc,
+            DateTimeOffset now,
+            CancellationToken cancellationToken = default)
+        {
+            var (code, message) = reason switch
+            {
+                TransferPauseReason.AccountSessionUnavailable => ("ExpiredLogin", "The account session has expired."),
+                TransferPauseReason.AccountVerificationRequired => ("VerificationRequired", "Account verification is required."),
+                TransferPauseReason.UserInterventionRequired => ("UserInterventionRequired", "User intervention is required."),
+                _ => throw new ArgumentOutOfRangeException(nameof(reason)),
+            };
+            PausedAcceptance = submissionAcceptance;
+            ObservedSessionCapturedAtUtc = observedSessionCapturedAtUtc;
+            return PauseAccountBeforeSubmissionAsync(operationId, code, message, now, cancellationToken);
         }
 
         public Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)

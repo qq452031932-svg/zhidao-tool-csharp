@@ -107,10 +107,11 @@ public sealed record AccountBatchStatisticsRecord(
     long NewCount,
     long ExistingCount,
     long FailedCount,
-    long PendingCount)
+    long PendingCount,
+    long PausedCount)
 {
     public override string ToString() =>
-        $"AccountBatchStatisticsRecord {{ AccountId = {AccountId}, PriorityOrder = {PriorityOrder}, NewCount = {NewCount}, ExistingCount = {ExistingCount}, FailedCount = {FailedCount}, PendingCount = {PendingCount}, DisplayName = [REDACTED] }}";
+        $"AccountBatchStatisticsRecord {{ AccountId = {AccountId}, PriorityOrder = {PriorityOrder}, NewCount = {NewCount}, ExistingCount = {ExistingCount}, FailedCount = {FailedCount}, PendingCount = {PendingCount}, PausedCount = {PausedCount}, DisplayName = [REDACTED] }}";
 }
 
 public sealed record BatchStatisticsRecord(

@@ -43,8 +43,17 @@ public sealed class SqliteTransferSchedulingStore :
         var slots = 0;
         if (activeBatches.Count > 0)
         {
-            await using var command = Command(connection, null,
-                "SELECT AssignedAccountId,SUM(CASE WHEN Status IN ('Reserved','Preparing','Submitting') THEN 1 ELSE 0 END) FROM TransferOperations WHERE Status IN ('Reserved','Preparing','Submitting','ResultPending') GROUP BY AssignedAccountId;");
+            await using var command = Command(connection, null, """
+                SELECT AccountId,SUM(NetworkSlots) FROM (
+                  SELECT AssignedAccountId AS AccountId,
+                    CASE WHEN Status IN ('Reserved','Preparing','Submitting') THEN 1 ELSE 0 END AS NetworkSlots
+                  FROM TransferOperations WHERE Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')
+                  UNION ALL
+                  SELECT AccountId,
+                    CASE WHEN Status IN ('Reserved','Preparing','Submitting') THEN 1 ELSE 0 END AS NetworkSlots
+                  FROM ShareOperations WHERE Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')
+                ) GROUP BY AccountId;
+                """);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -107,8 +116,8 @@ public sealed class SqliteTransferSchedulingStore :
             return null;
         }
         var activeSlots = await ScalarLongAsync(connection, transaction,
-            "SELECT COUNT(*) FROM TransferOperations WHERE Status IN ('Reserved','Preparing','Submitting');",
-            cancellationToken).ConfigureAwait(false);
+            "SELECT (SELECT COUNT(*) FROM TransferOperations WHERE Status IN ('Reserved','Preparing','Submitting') AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt>$now))+(SELECT COUNT(*) FROM ShareOperations WHERE Status IN ('Reserved','Preparing','Submitting') AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt>$now));",
+            cancellationToken, ("$now", Time(reservedAt))).ConfigureAwait(false);
         if (activeSlots >= TransferCoordinator.MaximumGlobalConcurrency)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -249,7 +258,7 @@ public sealed class SqliteTransferSchedulingStore :
         if (!string.Equals(quotaBasis, "SuccessTarget", StringComparison.Ordinal))
         {
             var nonTerminal = await ScalarLongAsync(connection, transaction,
-                "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending');",
+                "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending','Paused');",
                 cancellationToken, ("$batch", Id(batchId))).ConfigureAwait(false);
             if (nonTerminal > 0)
             {
@@ -261,7 +270,7 @@ public sealed class SqliteTransferSchedulingStore :
         }
 
         var occupied = await ScalarLongAsync(connection, transaction,
-            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending');",
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending','Paused');",
             cancellationToken, ("$batch", Id(batchId))).ConfigureAwait(false);
         var reservedCandidates = await ScalarLongAsync(connection, transaction,
             "SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=$batch AND CandidateStatus='Reserved';",
@@ -294,7 +303,7 @@ public sealed class SqliteTransferSchedulingStore :
         {
             var dateKey = now.ToLocalTime().ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
             var claimableCandidates = await ScalarLongAsync(connection, transaction,
-                $"SELECT COUNT(*) FROM ResourceItems r WHERE {potentialCandidatePredicate} AND EXISTS(SELECT 1 FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId WHERE al.BatchJobId=r.BatchJobId AND al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0 AND (r.CandidateConstraintAccountId IS NULL OR r.CandidateConstraintAccountId=al.AccountId) AND {noExistingKey} AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=al.AccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending')));",
+                $"SELECT COUNT(*) FROM ResourceItems r WHERE {potentialCandidatePredicate} AND EXISTS(SELECT 1 FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId WHERE al.BatchJobId=r.BatchJobId AND al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0 AND (r.CandidateConstraintAccountId IS NULL OR r.CandidateConstraintAccountId=al.AccountId) AND {noExistingKey} AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=al.AccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy WHERE shareBusy.AccountId=al.AccountId AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')));",
                 cancellationToken, ("$batch", Id(batchId)), ("$date", dateKey)).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return claimableCandidates > 0
@@ -341,6 +350,18 @@ public sealed class SqliteTransferSchedulingStore :
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        var unfinishedShares = await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status IN ('WaitingTransfer','WaitingShare','Reserved','Preparing','Submitting','ResultPending','Paused');",
+            cancellationToken, ("$batch", Id(batchId))).ConfigureAwait(false);
+        if (unfinishedShares > 0)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return BatchExhaustionOutcome.TemporarilyBlocked;
+        }
+        var failedShares = await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status IN ('Failed','Cancelled');",
+            cancellationToken, ("$batch", Id(batchId))).ConfigureAwait(false);
+        hasShortfall |= failedShares > 0;
         await using (var candidates = Command(connection, transaction,
             "UPDATE ResourceItems SET CandidateStatus='Unused',ReservedAccountId=NULL,ReservationExpiresAt=NULL,UpdatedAt=$now WHERE BatchJobId=$batch AND CandidateStatus='Unallocated' AND GlobalValidityStatus<>'Invalid';"))
         {
@@ -1025,25 +1046,154 @@ public sealed class SqliteTransferSchedulingStore :
         return CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid: false, resultPending: true, now, cancellationToken);
     }
 
-    public async Task PauseAccountBeforeSubmissionAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public Task PauseAccountBeforeSubmissionAsync(
+        Guid operationId,
+        string code,
+        string safeMessage,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
     {
         ValidateSafeError(code, safeMessage);
-        if (code is not ("ExpiredLogin" or "VerificationRequired"))
-            throw new ArgumentException("Only a pre-submission session failure can pause retryable work.", nameof(code));
+        var reason = code switch
+        {
+            "ExpiredLogin" => TransferPauseReason.AccountSessionUnavailable,
+            "VerificationRequired" => TransferPauseReason.AccountVerificationRequired,
+            "UserInterventionRequired" => TransferPauseReason.UserInterventionRequired,
+            _ => throw new ArgumentException("Only an account intervention can pause retryable work.", nameof(code)),
+        };
+        return PauseForAccountInterventionAsync(
+            operationId,
+            reason,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            observedSessionCapturedAtUtc: null,
+            now,
+            cancellationToken);
+    }
+
+    public async Task PauseForAccountInterventionAsync(
+        Guid operationId,
+        TransferPauseReason reason,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset? observedSessionCapturedAtUtc,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        var (code, safeMessage) = reason switch
+        {
+            TransferPauseReason.AccountSessionUnavailable => ("ExpiredLogin", "The account session has expired."),
+            TransferPauseReason.AccountVerificationRequired => ("VerificationRequired", "Account verification is required."),
+            TransferPauseReason.UserInterventionRequired => ("UserInterventionRequired", "User intervention is required."),
+            _ => throw new ArgumentOutOfRangeException(nameof(reason)),
+        };
+        ValidateSafeError(code, safeMessage);
+        if (submissionAcceptance is not (SubmissionAcceptance.Unknown or SubmissionAcceptance.DefinitelyNotAccepted))
+            throw new ArgumentOutOfRangeException(nameof(submissionAcceptance));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
-        await using (var account = Command(connection, transaction,
-            "UPDATE Accounts SET Status='Invalid',LastValidatedAt=$now WHERE Id=$account AND IsDeleted=0;"))
-        {
-            Add(account, "$now", Time(now)); Add(account, "$account", Id(ids.AccountId));
-            RequireOne(await account.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The unavailable account no longer exists.");
-        }
+        var submitted = "(ConfirmationDescriptorJson IS NOT NULL OR SubmitStartedAt IS NOT NULL OR AdapterRequestId IS NOT NULL OR RemoteItemIdsJson IS NOT NULL OR SubmitState IN ('Submitting','PendingConfirmation') OR Status IN ('Submitting','ResultPending'))";
+        var untouched = "(ConfirmationDescriptorJson IS NULL AND SubmitStartedAt IS NULL AND AdapterRequestId IS NULL AND RemoteItemIdsJson IS NULL AND SubmitState IN ('NotPrepared','PreparingToSubmit') AND DailyCountedAt IS NULL)";
+        var acceptanceGuard = submissionAcceptance == SubmissionAcceptance.Unknown
+            ? $"Status IN ('Submitting','ResultPending') AND {submitted}"
+            : $"((Status IN ('Reserved','Preparing') AND {untouched}) OR (Status='Submitting' AND SubmitState='Submitting'))";
+        var nextSubmitState = submissionAcceptance == SubmissionAcceptance.Unknown
+            ? "'PendingConfirmation'"
+            : "CASE WHEN Status='Submitting' THEN 'ResultReceived' ELSE 'NotPrepared' END";
         await using (var operation = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Waiting',SubmitState='NotPrepared',TargetSlotState='Unoccupied',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing') AND DailyCountedAt IS NULL AND TargetSlotState='Reserved';"))
+            $"UPDATE TransferOperations SET Status='Paused',SubmitState={nextSubmitState},LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND TargetSlotState='Reserved' AND {acceptanceGuard};"))
         {
             Add(operation, "$code", code); Add(operation, "$message", safeMessage); Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
-            RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The pre-submission account pause is no longer retryable.");
+            RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The account intervention pause is no longer current.");
+        }
+        if (observedSessionCapturedAtUtc is not null)
+        {
+            await using var account = Command(connection, transaction, """
+                UPDATE Accounts SET Status='Invalid'
+                WHERE Id=$account AND Status='Active' AND IsDeleted=0
+                  AND (LastValidatedAt IS NULL OR julianday(LastValidatedAt)<=julianday($observedSession));
+                """);
+            Add(account, "$observedSession", Time(observedSessionCapturedAtUtc.Value));
+            Add(account, "$account", Id(ids.AccountId));
+            await account.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> ResumePausedBeforeSubmissionAsync(
+        Guid operationId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
+        await using (var operation = Command(connection, transaction, """
+            UPDATE TransferOperations SET Status='Waiting',TargetSlotState='Released',TargetSlotReservedAt=NULL,
+              LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Paused' AND SubmitState='NotPrepared' AND DailyCountedAt IS NULL
+              AND SubmitStartedAt IS NULL AND ConfirmationDescriptorJson IS NULL
+              AND AdapterRequestId IS NULL AND RemoteItemIdsJson IS NULL AND TargetSlotState='Reserved'
+              AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
+            """))
+        {
+            Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
+            if (await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
+        }
+        await using (var allocation = Command(connection, transaction,
+            "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
+        {
+            Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId));
+            RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing.");
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    public async Task<bool> ResumePausedAsync(
+        Guid operationId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
+        await using (var pending = Command(connection, transaction, """
+            UPDATE TransferOperations SET Status='ResultPending',LeaseExpiresAt=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Paused' AND SubmitState='PendingConfirmation'
+              AND TargetSlotState='Reserved' AND ConfirmationDescriptorJson IS NOT NULL
+              AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
+            """))
+        {
+            Add(pending, "$now", Time(now)); Add(pending, "$id", Id(operationId));
+            if (await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+        }
+        await using (var retryable = Command(connection, transaction, """
+            UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',
+              TargetSlotState='Released',TargetSlotReservedAt=NULL,ConfirmationDescriptorJson=NULL,
+              AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,LeaseExpiresAt=NULL,
+              LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Paused' AND SubmitState IN ('NotPrepared','ResultReceived')
+              AND TargetSlotState='Reserved'
+              AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
+            """))
+        {
+            Add(retryable, "$now", Time(now)); Add(retryable, "$id", Id(operationId));
+            if (await retryable.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return false;
+            }
         }
         await using (var allocation = Command(connection, transaction,
             "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
@@ -1058,13 +1208,14 @@ public sealed class SqliteTransferSchedulingStore :
             await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     public async Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
     {
         ValidateSafeError(code, safeMessage);
-        if (code is not ("ExpiredLogin" or "VerificationRequired" or "InsufficientCapacity" or "InvalidTargetPath"))
-            throw new ArgumentException("Only account-scoped failures can pause an account.", nameof(code));
+        if (code is not ("InsufficientCapacity" or "InvalidTargetPath"))
+            throw new ArgumentException("Only definitive capacity or target-path failures can release an account operation.", nameof(code));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
@@ -1330,7 +1481,7 @@ public sealed class SqliteTransferSchedulingStore :
     private static async Task<ScheduledOperation?> ReadWaitingAsync(SqliteConnection connection, SqliteTransaction transaction, Guid batchId, string dateKey, CancellationToken cancellationToken)
     {
         await using var command = Command(connection, transaction,
-            "SELECT o.Id,o.AssignedAccountId,o.AllocationOrdinal,o.AllocationSource FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId JOIN AccountAllocations al ON al.BatchJobId=o.BatchJobId AND al.AccountId=o.AssignedAccountId JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch AND o.Status='Waiting' AND o.TargetSlotState IN ('Unoccupied','Released') AND r.CandidateStatus<>'GloballyInvalid' AND r.GlobalValidityStatus<>'Invalid' AND (b.QuotaBasis<>'SuccessTarget' OR al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0) AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (o.DailyCountedAt IS NOT NULL OR a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=o.AssignedAccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending')) ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT 1;");
+            "SELECT o.Id,o.AssignedAccountId,o.AllocationOrdinal,o.AllocationSource FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId JOIN AccountAllocations al ON al.BatchJobId=o.BatchJobId AND al.AccountId=o.AssignedAccountId JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch AND o.Status='Waiting' AND o.TargetSlotState IN ('Unoccupied','Released') AND r.CandidateStatus<>'GloballyInvalid' AND r.GlobalValidityStatus<>'Invalid' AND (b.QuotaBasis<>'SuccessTarget' OR al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0) AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (o.DailyCountedAt IS NOT NULL OR a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=o.AssignedAccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy WHERE shareBusy.AccountId=o.AssignedAccountId AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT 1;");
         Add(command, "$batch", Id(batchId)); Add(command, "$date", dateKey);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
@@ -1345,7 +1496,7 @@ public sealed class SqliteTransferSchedulingStore :
         var publicUnallocated = $"EXISTS(SELECT 1 FROM ResourceItems r WHERE r.BatchJobId=al.BatchJobId AND r.CandidateStatus='Unallocated' AND r.CandidateConstraintAccountId IS NULL AND r.GlobalValidityStatus<>'Invalid' AND {noExistingKey})";
         var publicUnused = $"EXISTS(SELECT 1 FROM ResourceItems r WHERE r.BatchJobId=al.BatchJobId AND r.CandidateStatus='Unused' AND r.CandidateConstraintAccountId IS NULL AND r.GlobalValidityStatus<>'Invalid' AND {noExistingKey})";
         await using var command = Command(connection, transaction,
-            $"SELECT al.AccountId,al.DefaultTargetPath,al.NormalizedDefaultTargetPath,al.TargetSuccessCount,al.EffectiveTargetSuccessCount,al.FulfilledCount,al.ReservedSlotCount,al.PriorityOrder,b.ShortagePolicy FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId JOIN BatchJobs b ON b.Id=al.BatchJobId WHERE al.BatchJobId=$batch AND al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0 AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=al.AccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending')) AND ({exclusiveUnallocated} OR {exclusiveUnused} OR {publicUnallocated} OR {publicUnused}) ORDER BY al.PriorityOrder,al.AccountId;");
+            $"SELECT al.AccountId,al.DefaultTargetPath,al.NormalizedDefaultTargetPath,al.TargetSuccessCount,al.EffectiveTargetSuccessCount,al.FulfilledCount,al.ReservedSlotCount,al.PriorityOrder,b.ShortagePolicy FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId JOIN BatchJobs b ON b.Id=al.BatchJobId WHERE al.BatchJobId=$batch AND al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0 AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=al.AccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy WHERE shareBusy.AccountId=al.AccountId AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND ({exclusiveUnallocated} OR {exclusiveUnused} OR {publicUnallocated} OR {publicUnused}) ORDER BY al.PriorityOrder,al.AccountId;");
         Add(command, "$batch", Id(batchId)); Add(command, "$date", dateKey);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         var eligible = new List<(SuccessTargetAccount State, string DefaultTarget, string NormalizedDefaultTarget)>();
@@ -1451,9 +1602,15 @@ public sealed class SqliteTransferSchedulingStore :
 
     private static void ValidateSafeError(string code, string safeMessage)
     {
-        var allowed = Enum.GetNames<BaiduErrorKind>().Append("DailyLimit").ToHashSet(StringComparer.Ordinal);
+        var allowed = Enum.GetNames<BaiduErrorKind>().Append("DailyLimit").Append("UserInterventionRequired").ToHashSet(StringComparer.Ordinal);
         if (!allowed.Contains(code)) throw new ArgumentException("The scheduler error code is not allowlisted.", nameof(code));
-        var expected = Enum.TryParse<BaiduErrorKind>(code, out var kind) ? BaiduAdapterResult.Failure(kind, null).SafeMessage : "The account daily limit has been reached.";
+        var expected = code switch
+        {
+            "DailyLimit" => "The account daily limit has been reached.",
+            "UserInterventionRequired" => "User intervention is required.",
+            _ when Enum.TryParse<BaiduErrorKind>(code, out var kind) => BaiduAdapterResult.Failure(kind, null).SafeMessage,
+            _ => null,
+        };
         if (!string.Equals(expected, safeMessage, StringComparison.Ordinal)) throw new ArgumentException("Only canonical safe scheduler messages may be persisted.", nameof(safeMessage));
     }
 

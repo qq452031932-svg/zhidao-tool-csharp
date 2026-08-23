@@ -106,6 +106,71 @@ public sealed class StateTransitionTests
     }
 
     [Fact]
+    public void PreSubmissionPauseRetainsSlotAndRequiresExplicitSafeResume()
+    {
+        var operation = CreateReservedOperation();
+        operation.MarkPreparing(Later);
+
+        operation.PauseBeforeSubmission("ExpiredLogin", "Login required", Later.AddSeconds(1));
+
+        Assert.Equal(OperationStatus.Paused, operation.Status);
+        Assert.Equal(TargetSlotState.Reserved, operation.TargetSlotState);
+
+        operation.ResumePausedBeforeSubmission(Later.AddSeconds(2));
+
+        Assert.Equal(OperationStatus.Waiting, operation.Status);
+        Assert.Equal(TargetSlotState.Released, operation.TargetSlotState);
+    }
+
+    [Theory]
+    [InlineData(SubmissionAcceptance.DefinitelyNotAccepted, OperationStatus.Waiting, TargetSlotState.Released)]
+    [InlineData(SubmissionAcceptance.Unknown, OperationStatus.ResultPending, TargetSlotState.Reserved)]
+    public void PostSubmissionPauseRetainsSlotUntilExplicitResumeRoutesByAcceptance(
+        SubmissionAcceptance acceptance,
+        OperationStatus resumedStatus,
+        TargetSlotState resumedSlotState)
+    {
+        var operation = CreateReservedOperation();
+        operation.MarkPreparing(Later);
+        operation.MarkSubmitting(Later.AddSeconds(1));
+
+        operation.PauseAfterSubmission(
+            "ExpiredLogin",
+            "The account session has expired.",
+            acceptance,
+            Later.AddSeconds(2));
+
+        Assert.Equal(OperationStatus.Paused, operation.Status);
+        Assert.Equal(TargetSlotState.Reserved, operation.TargetSlotState);
+        Assert.True(operation.SubmissionMayHaveOccurred);
+        Assert.Equal(acceptance, operation.PausedSubmissionAcceptance);
+
+        operation.ResumePaused(Later.AddSeconds(3));
+
+        Assert.Equal(resumedStatus, operation.Status);
+        Assert.Equal(resumedSlotState, operation.TargetSlotState);
+    }
+
+    [Fact]
+    public void ResultPendingCannotDowngradeUnknownAcceptanceToDefinitelyNotAccepted()
+    {
+        var operation = CreateReservedOperation();
+        operation.MarkPreparing(Later);
+        operation.MarkSubmitting(Later.AddSeconds(1));
+        operation.MarkResultPending("response timeout", Later.AddSeconds(2));
+
+        Assert.Throws<InvalidOperationException>(() => operation.PauseAfterSubmission(
+            "ExpiredLogin",
+            "The account session has expired.",
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            Later.AddSeconds(3)));
+
+        Assert.Equal(OperationStatus.ResultPending, operation.Status);
+        Assert.Equal(TargetSlotState.Reserved, operation.TargetSlotState);
+        Assert.True(operation.SubmissionMayHaveOccurred);
+    }
+
+    [Fact]
     public void Operation_CannotBeCancelledOnceSubmissionMayHaveOccurred()
     {
         var operation = CreateReservedOperation();

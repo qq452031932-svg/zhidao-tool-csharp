@@ -4,6 +4,11 @@ namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IShareSchedulingStore
 {
+    Task<ShareOperationRecord?> TryGetDueResultPendingAsync(
+        Guid batchJobId,
+        DateTimeOffset dueAt,
+        IReadOnlyCollection<Guid> excludedAccountIds,
+        CancellationToken cancellationToken = default);
     Task<ShareOperationRecord?> TryReserveNextAsync(
         DateTimeOffset now,
         TimeSpan leaseDuration,

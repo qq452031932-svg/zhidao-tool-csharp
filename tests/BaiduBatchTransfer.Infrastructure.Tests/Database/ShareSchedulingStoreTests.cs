@@ -33,6 +33,35 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.Null(reserved);
     }
 
+    [Fact]
+    public async Task ShareReservationHonorsTransferAccountAndGlobalWorkerOccupancy()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE TransferOperations SET Status='Preparing',TargetSlotState='Reserved',LeaseExpiresAt=$lease
+                WHERE Id=$id;
+                """;
+            command.Parameters.AddWithValue("$lease", graph.Now.AddMinutes(2).ToString("O"));
+            command.Parameters.AddWithValue("$id", graph.TransferId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        Assert.Null(await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE TransferOperations SET Status='Succeeded',TargetSlotState='Fulfilled',LeaseExpiresAt=NULL WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.TransferId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        Assert.NotNull(await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
@@ -312,9 +341,232 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ExpiredRecoverySkipsManyEarlierUnexpiredRowsAndReturnsEarliestCanonicalLease()
+    public async Task StartupRestartRecoversUnexpiredReservedShareLeaseImmediately()
     {
-        const int unexpiredCount = 250;
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var firstProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var reserved = Assert.IsType<ShareOperationRecord>(
+            await firstProcess.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+
+        var restartedProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var recovered = await restartedProcess.RecoverInterruptedShareOperationsAsync(graph.Now.AddSeconds(1));
+
+        Assert.Equal(new ShareLeaseRecoveryResult(1, 0), recovered);
+        Assert.Equal("WaitingShare", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Null(await ScalarNullableAsync(graph.Factory,
+            "SELECT LeaseExpiresAt FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        var retried = Assert.IsType<ShareOperationRecord>(
+            await restartedProcess.TryReserveNextAsync(graph.Now.AddSeconds(2), TimeSpan.FromMinutes(2)));
+        Assert.Equal(reserved.Id, retried.Id);
+        Assert.True(retried.LeaseGeneration > reserved.LeaseGeneration);
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task PeriodicRecoveryDoesNotStealAnUnexpiredShareLease()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2));
+
+        var recovered = await store.RecoverExpiredShareOperationsAsync(graph.Now.AddSeconds(1));
+
+        Assert.Equal(new ShareLeaseRecoveryResult(0, 0), recovered);
+        Assert.Equal("Reserved", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    public static TheoryData<string, string> ShareCrashBoundaries => new()
+    {
+        { "reserve", "WaitingShare" },
+        { "prepare", "WaitingShare" },
+        { "submit", "ResultPending" },
+        { "response-id", "ResultPending" },
+    };
+
+    [Theory]
+    [MemberData(nameof(ShareCrashBoundaries))]
+    public async Task RestartAtShareWriteBoundaryRetriesOnlySafeWorkAndQueuesUnknownForReconciliation(
+        string boundary,
+        string expectedStatus)
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var firstProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await firstProcess.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        if (boundary != "reserve")
+        {
+            Assert.True(await firstProcess.TryMarkPreparingAsync(
+                graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now));
+        }
+        if (boundary is "submit" or "response-id")
+        {
+            Assert.True(await firstProcess.TryCompleteDiscoveryBaselineAsync(
+                graph.ShareOperationId, 1, lease.LeaseGeneration, "baseline", 0, graph.Now));
+            Assert.True(await firstProcess.TryMarkSubmittingAsync(
+                graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        }
+        if (boundary == "response-id")
+        {
+            Assert.True(await firstProcess.TryRecordAdapterRequestAsync(
+                graph.ShareOperationId, 1, lease.LeaseGeneration, "request-1", graph.Now));
+        }
+
+        var restartedProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var recovered = await restartedProcess.RecoverInterruptedShareOperationsAsync(graph.Now.AddSeconds(1));
+
+        Assert.Equal(expectedStatus, await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(0, await CountAsync(graph.Factory, "BaiduShareResults"));
+        Assert.Equal(expectedStatus == "WaitingShare" ? 1 : 0, recovered.RetryableOperationCount);
+        Assert.Equal(expectedStatus == "ResultPending" ? 1 : 0, recovered.ResultPendingOperationCount);
+        if (expectedStatus == "WaitingShare")
+        {
+            var retried = Assert.IsType<ShareOperationRecord>(
+                await restartedProcess.TryReserveNextAsync(graph.Now.AddSeconds(2), TimeSpan.FromMinutes(2)));
+            Assert.Equal(graph.ShareOperationId, retried.Id);
+            Assert.True(retried.LeaseGeneration > lease.LeaseGeneration);
+        }
+        else
+        {
+            Assert.Null(await restartedProcess.TryReserveNextAsync(
+                graph.Now.AddSeconds(2), TimeSpan.FromMinutes(2)));
+            Assert.Equal(graph.ShareOperationId,
+                (await restartedProcess.TryGetDueResultPendingAsync(
+                    graph.BatchId, graph.Now.AddSeconds(2), []))?.Id);
+            var baseline = Assert.IsType<ShareDiscoveryBaselineStateRecord>(
+                await restartedProcess.GetDiscoveryBaselineStateAsync(graph.ShareOperationId));
+            Assert.Equal(1, baseline.Generation);
+            Assert.Equal("baseline", baseline.Fingerprint);
+        }
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task AtomicShareResultSurvivesRestartAndCannotBePersistedTwice()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var firstProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await firstProcess.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await firstProcess.TryMarkPreparingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now));
+        Assert.True(await firstProcess.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "baseline", 0, graph.Now));
+        Assert.True(await firstProcess.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await firstProcess.TryRecordAdapterRequestAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "request-1", graph.Now));
+        var result = AcceptedResult(graph);
+
+        Assert.True(await firstProcess.AcceptResultAsync(
+            graph.ShareOperationId, ShareOperationStatus.Submitting, lease.LeaseGeneration, result, graph.Now));
+
+        var restartedProcess = new SqliteShareSchedulingStore(graph.Factory);
+        Assert.Equal(new ShareLeaseRecoveryResult(0, 0),
+            await restartedProcess.RecoverInterruptedShareOperationsAsync(graph.Now.AddSeconds(1)));
+        Assert.Equal("Succeeded", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(result, await restartedProcess.GetAcceptedResultAsync(graph.ShareOperationId));
+        Assert.False(await restartedProcess.AcceptResultAsync(
+            graph.ShareOperationId, ShareOperationStatus.Submitting, lease.LeaseGeneration,
+            result with { Id = Guid.NewGuid() }, graph.Now.AddSeconds(1)));
+        Assert.Equal(1, await CountAsync(graph.Factory, "BaiduShareResults"));
+    }
+
+    [Fact]
+    public async Task PersistedShareResultCanRebuildAndFinalizeAfterRestartedCompletionCheck()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddAllocationsAsync([new(
+                Guid.NewGuid(), graph.BatchId, graph.AccountId, 1, "/", "/",
+                1, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0)]);
+            await unit.CommitAsync();
+        }
+        var firstProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await firstProcess.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await firstProcess.TryMarkPreparingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now));
+        Assert.True(await firstProcess.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "baseline", 0, graph.Now));
+        Assert.True(await firstProcess.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await firstProcess.TryRecordAdapterRequestAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "request-1", graph.Now));
+        Assert.True(await firstProcess.AcceptResultAsync(
+            graph.ShareOperationId, ShareOperationStatus.Submitting, lease.LeaseGeneration,
+            AcceptedResult(graph), graph.Now));
+
+        var restartedTransferStore = new SqliteTransferSchedulingStore(graph.Factory);
+        var rebuilt = await restartedTransferStore.RebuildAllocationCountersAsync();
+        var finalized = await restartedTransferStore.TryFinalizeExhaustedBatchAsync(
+            graph.BatchId, graph.Now.AddSeconds(1));
+
+        Assert.Equal(new AllocationCounterRebuildResult(1, 0, 1), rebuilt);
+        Assert.Equal(BatchExhaustionOutcome.Completed, finalized);
+        Assert.Equal("Completed", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM BatchJobs WHERE Id=$id;", graph.BatchId));
+        Assert.Equal(1, await CountAsync(graph.Factory, "BaiduShareResults"));
+        Assert.Equal(BatchExhaustionOutcome.NotExhausted,
+            await new SqliteTransferSchedulingStore(graph.Factory).TryFinalizeExhaustedBatchAsync(
+                graph.BatchId, graph.Now.AddSeconds(2)));
+    }
+
+    [Theory]
+    [InlineData("Reserved", "Unknown", false, "WaitingShare")]
+    [InlineData("Preparing", "Unknown", false, "WaitingShare")]
+    [InlineData("Submitting", "DefinitelyNotAccepted", true, "WaitingShare")]
+    [InlineData("Submitting", "Unknown", true, "ResultPending")]
+    public async Task StartupShareRecoveryDistinguishesSafeRetryFromUnknownAcceptance(
+        string status,
+        string acceptance,
+        bool submitted,
+        string expected)
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE ShareOperations SET Status=$status,SubmissionAcceptance=$acceptance,
+                  LeaseExpiresAt=$expired,RequestDescriptorJson=$descriptor,SubmitStartedAt=$submitted,
+                  BaselineGeneration=$baselineGeneration,BaselineFingerprint=$baselineFingerprint,
+                  BaselineCompletedAt=$baselineCompleted
+                WHERE Id=$id;
+                """;
+            command.Parameters.AddWithValue("$status", status);
+            command.Parameters.AddWithValue("$acceptance", acceptance);
+            command.Parameters.AddWithValue("$expired", graph.Now.AddMinutes(-1).ToString("O"));
+            command.Parameters.AddWithValue("$descriptor", submitted ? "{}" : DBNull.Value);
+            command.Parameters.AddWithValue("$submitted", submitted ? graph.Now.AddMinutes(-2).ToString("O") : DBNull.Value);
+            command.Parameters.AddWithValue("$baselineGeneration", submitted ? 1 : DBNull.Value);
+            command.Parameters.AddWithValue("$baselineFingerprint", submitted ? "baseline" : DBNull.Value);
+            command.Parameters.AddWithValue("$baselineCompleted", submitted ? graph.Now.AddMinutes(-3).ToString("O") : DBNull.Value);
+            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var result = await new SqliteShareSchedulingStore(graph.Factory)
+            .RecoverInterruptedShareOperationsAsync(graph.Now);
+
+        Assert.Equal(expected, await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(expected == "WaitingShare" ? 1 : 0, result.RetryableOperationCount);
+        Assert.Equal(expected == "ResultPending" ? 1 : 0, result.ResultPendingOperationCount);
+        Assert.Null(await ScalarNullableAsync(graph.Factory,
+            "SELECT LeaseExpiresAt FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
+    public async Task ExpiredRecoverySkipsEarlierUnexpiredRowAndReturnsEarliestCanonicalLease()
+    {
+        const int unexpiredCount = 1;
         var graph = await CreateGraphAsync(includeShareSettings: true);
         var expiredId = Guid.Parse("ffffffff-ffff-ffff-ffff-fffffffffff0");
         var builder = new SqliteConnectionStringBuilder
@@ -344,14 +596,21 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             await using var insert = connection.CreateCommand();
             insert.Transaction = transaction;
             insert.CommandText = """
+                INSERT OR IGNORE INTO BatchOutputAccounts(
+                  BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+                VALUES($batch,$account,$ordinal,$label,$planned,$planned,1);
                 INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
                   Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,
                   LeaseGeneration,LeaseExpiresAt,CreatedAt,UpdatedAt)
-                VALUES($id,$transfer,$resource,$batch,$account,1,'Reserved',$items,$settings,1,'Unknown',0,1,$lease,$created,$created);
+                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'Reserved',$items,$settings,1,'Unknown',0,1,$lease,$created,$created);
                 """;
             for (var index = 1; index <= unexpiredCount + 1; index++)
             {
                 var id = index <= unexpiredCount ? new Guid(index, 0, 0, new byte[8]) : expiredId;
+                var accountId = index <= unexpiredCount
+                    ? new Guid(100_000 + index, 0, 0, new byte[8])
+                    : graph.AccountId;
+                var outputOrdinal = index <= unexpiredCount ? index + 2 : 1;
                 var remoteId = $"remote-{index}";
                 var itemSetFingerprint = index <= unexpiredCount
                     ? $"items-{index}"
@@ -361,7 +620,10 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 insert.Parameters.AddWithValue("$transfer", Guid.NewGuid().ToString("D"));
                 insert.Parameters.AddWithValue("$resource", graph.ResourceId.ToString("D"));
                 insert.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
-                insert.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+                insert.Parameters.AddWithValue("$account", accountId.ToString("D"));
+                insert.Parameters.AddWithValue("$ordinal", outputOrdinal);
+                insert.Parameters.AddWithValue("$label", $"Performance output {outputOrdinal}");
+                insert.Parameters.AddWithValue("$planned", unexpiredCount + 2);
                 insert.Parameters.AddWithValue("$items", itemSetFingerprint);
                 insert.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
                 insert.Parameters.AddWithValue("$lease", (index <= unexpiredCount
@@ -760,6 +1022,414 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RestartedSqliteStoreReconcilesOnlyTheNewCompatibleShareAgainstPersistedBaseline()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var firstProcess = new SqliteShareSchedulingStore(graph.Factory);
+        var reserved = Assert.IsType<ShareOperationRecord>(
+            await firstProcess.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        var exactItems = new RemoteItemIdentitySet([
+            new("remote-a", "A"),
+            new("remote-b", "B"),
+        ]);
+        var oldShare = new BaiduShareRecord(
+            "baseline-old", exactItems, "https://pan.baidu.com/s/baseline-old", "old1", true, true);
+        var newShare = new BaiduShareRecord(
+            "reconciled-new", exactItems, "https://pan.baidu.com/s/reconciled-new", "new1", true, true);
+
+        await firstProcess.AppendDiscoveryBaselinePageAsync(
+            graph.ShareOperationId,
+            reserved.LeaseGeneration,
+            [new(graph.ShareOperationId, oldShare.ShareId, 1, oldShare.ShareUrl, oldShare.ExtractionCode,
+                oldShare.IsPermanent, oldShare.IsAccessUnlimited)]);
+        Assert.True(await firstProcess.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, "pre-create-baseline", 1, graph.Now));
+        Assert.True(await firstProcess.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await firstProcess.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, reserved.LeaseGeneration, graph.Now.AddMinutes(1), graph.Now));
+
+        var restartedStore = new SqliteShareSchedulingStore(graph.Factory);
+        var restartedPending = Assert.IsType<ShareExecutionContext>(
+            await restartedStore.LoadPendingAsync(graph.ShareOperationId));
+        Assert.Equal("ResultPending", restartedPending.Operation.Status);
+        Assert.Equal("Unknown", restartedPending.Operation.SubmissionAcceptance);
+        var restartedBaseline = await restartedStore.GetBaselinePageAsync(
+            graph.ShareOperationId, null, 10);
+        Assert.Equal(oldShare.ShareId, Assert.Single(restartedBaseline.Items).ShareId);
+        var adapter = new RestartReconciliationAdapter([oldShare, newShare]);
+        var service = new ShareOperationReconciliationService(
+            adapter,
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            restartedStore,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var reconciliation = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.Accepted, reconciliation.Disposition);
+        Assert.Equal(0, adapter.CreateCalls);
+        Assert.Equal("Succeeded", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        var accepted = Assert.IsType<BaiduShareResultRecord>(
+            await restartedStore.GetAcceptedResultAsync(graph.ShareOperationId));
+        Assert.Equal(newShare.ShareId, accepted.ShareId);
+        Assert.NotEqual(oldShare.ShareId, accepted.ShareId);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*),SUM(IsCurrent) FROM BaiduShareResults WHERE ShareOperationId=$id;";
+        command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1, reader.GetInt32(0));
+        Assert.Equal(1, reader.GetInt32(1));
+    }
+
+    [Fact]
+    public async Task DueReconciliationExcludesBusyAccountInsideSqliteAndWorkSourceReturnsSecondAccount()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var firstLease = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, firstLease.LeaseGeneration, "empty", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, firstLease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await store.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, firstLease.LeaseGeneration, graph.Now, graph.Now));
+
+        var secondTransfer = new TransferOperationRecord(
+            Guid.NewGuid(), graph.ResourceId, graph.BatchId, 2, 2, "/two", "/two", "",
+            graph.SecondAccountId, "Rule", "Cancelled", "Cancelled", 0, "transfer-two", null, null, null,
+            "NotPrepared", "Released", null, null, null, null, null, null, graph.Now, graph.Now);
+        var secondShareId = Guid.NewGuid();
+        var secondItems = new RemoteItemIdentitySet([new("remote-c", "C")]);
+        var secondShare = new ShareOperationRecord(
+            secondShareId, secondTransfer.Id, graph.ResourceId, graph.BatchId, graph.SecondAccountId, 2,
+            "ResultPending", secondItems.Fingerprint, graph.SettingsFingerprint, 1, "{\"safe\":true}", null,
+            "Unknown", 1, null, graph.Now, graph.Now, null, null, graph.Now, graph.Now, 1);
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddOperationsAsync([secondTransfer]);
+            await unit.Jobs.AddShareOperationsAsync(
+                [secondShare], [new(secondShareId, 0, "remote-c", "C")]);
+            await unit.CommitAsync();
+        }
+
+        Assert.Equal(graph.ShareOperationId,
+            (await store.TryGetDueResultPendingAsync(graph.BatchId, graph.Now, []))?.Id);
+        Assert.Equal(secondShareId,
+            (await store.TryGetDueResultPendingAsync(graph.BatchId, graph.Now, [graph.AccountId]))?.Id);
+        Assert.Null(await store.TryGetDueResultPendingAsync(
+            graph.BatchId, graph.Now, [graph.AccountId, graph.SecondAccountId]));
+        Assert.Null(await store.TryGetDueResultPendingAsync(
+            graph.BatchId, graph.Now, [graph.AccountId, graph.SecondAccountId, Guid.NewGuid()]));
+
+        var adapter = new RestartReconciliationAdapter([]);
+        var sessions = new RestartReconciliationSessionStore(graph.AccountId, graph.Now);
+        var executor = new ShareOperationExecutor(adapter, sessions, store, RetryPolicy.Default, new NoDelay());
+        var reconciliation = new ShareOperationReconciliationService(
+            adapter, sessions, store, new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)));
+        var source = new ShareCoordinatorWorkSource(store, store, executor, reconciliation);
+
+        var work = await source.TryTakeDueReconciliationAsync(
+            graph.BatchId, graph.Now, [graph.AccountId]);
+
+        Assert.NotNull(work);
+        Assert.Equal(secondShareId, work.OperationId);
+        Assert.Equal(graph.SecondAccountId, work.AccountId);
+    }
+
+    [Theory]
+    [InlineData(BaiduErrorKind.ExpiredLogin, "AccountSessionUnavailable", "等待账号登录后继续确认分享结果")]
+    [InlineData(BaiduErrorKind.VerificationRequired, "AccountVerificationRequired", "账号完成安全验证后继续确认分享结果")]
+    public async Task ListingAccountFailureAtomicallyInvalidatesAccountUntilReactivatedThenReconciles(
+        BaiduErrorKind errorKind,
+        string expectedIssue,
+        string expectedMessage)
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "empty", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await store.TryRecordAdapterRequestAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "request-1", graph.Now));
+        Assert.True(await store.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now, graph.Now));
+        var compatible = new BaiduShareRecord(
+            "new-after-login",
+            new([new("remote-a", "A"), new("remote-b", "B")]),
+            "https://pan.baidu.com/s/new-after-login", "n3w1", true, true);
+        var adapter = new SequencedReconciliationAdapter([
+            BaiduAdapterResult<BaiduSharePage>.Failure(errorKind, "private session diagnostic"),
+            BaiduAdapterResult<BaiduSharePage>.Success(new([compatible], null)),
+        ]);
+        var service = new ShareOperationReconciliationService(
+            adapter,
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            store,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var paused = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.RequiresUser, paused.Disposition);
+        Assert.Equal("Invalid", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+        Assert.Equal("ResultPending", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("Unknown", await ScalarAsync<string>(graph.Factory,
+            "SELECT SubmissionAcceptance FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("{\"safe\":true}", await ScalarAsync<string>(graph.Factory,
+            "SELECT RequestDescriptorJson FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("request-1", await ScalarAsync<string>(graph.Factory,
+            "SELECT AdapterRequestId FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(expectedIssue, await ScalarAsync<string>(graph.Factory,
+            "SELECT LastErrorCode FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(expectedMessage, await ScalarAsync<string>(graph.Factory,
+            "SELECT LastErrorMessage FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Null(await store.TryGetDueResultPendingAsync(
+            graph.BatchId, graph.Now.AddMinutes(3), []));
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE Accounts SET Status='Active' WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        Assert.Equal(graph.ShareOperationId,
+            (await store.TryGetDueResultPendingAsync(graph.BatchId, graph.Now.AddMinutes(3), []))?.Id);
+
+        var accepted = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.Accepted, accepted.Disposition);
+        Assert.Equal("Succeeded", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(compatible.ShareId,
+            (await store.GetAcceptedResultAsync(graph.ShareOperationId))?.ShareId);
+        Assert.Equal(0, adapter.CreateCalls);
+    }
+
+    [Fact]
+    public async Task ConcurrentReconciliationOfSameSqliteOperationPersistsOnlyOneAcceptedResult()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "empty", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await store.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now, graph.Now));
+        var candidate = new BaiduShareRecord(
+            "one-current-result",
+            new([new("remote-a", "A"), new("remote-b", "B")]),
+            "https://pan.baidu.com/s/one-current-result", "same", true, true);
+        var adapter = new ConcurrentSqliteReconciliationAdapter(candidate);
+        var service = new ShareOperationReconciliationService(
+            adapter,
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            store,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var results = await Task.WhenAll(
+            service.ReconcileAsync(graph.ShareOperationId),
+            service.ReconcileAsync(graph.ShareOperationId));
+
+        Assert.Equal(2, adapter.MaximumConcurrentListings);
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Accepted);
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Stale);
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*),SUM(IsCurrent) FROM BaiduShareResults WHERE ShareOperationId=$id;";
+        command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal(1, reader.GetInt32(0));
+        Assert.Equal(1, reader.GetInt32(1));
+    }
+
+    [Fact]
+    public async Task KeepPendingWinningControlledSqliteRaceMakesConcurrentAcceptStale()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var sqlite = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(sqlite, graph);
+        var store = new KeepFirstReconciliationStore(sqlite);
+        var candidate = new BaiduShareRecord(
+            "must-not-win-after-keep",
+            new([new("remote-a", "A"), new("remote-b", "B")]),
+            "https://pan.baidu.com/s/must-not-win-after-keep", "race", true, true);
+        var adapter = new OrderedOutcomeAdapter(candidate, bothFailures: false);
+        var service = new ShareOperationReconciliationService(
+            adapter,
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            store,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var results = await Task.WhenAll(
+            service.ReconcileAsync(graph.ShareOperationId),
+            service.ReconcileAsync(graph.ShareOperationId));
+
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.RequiresUser);
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Stale);
+        Assert.Equal("ResultPending", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("Invalid", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+        Assert.Equal(0, await CountAsync(graph.Factory, "BaiduShareResults"));
+    }
+
+    [Fact]
+    public async Task AcceptWinningControlledSqliteRaceMakesConcurrentKeepStaleWithoutInvalidatingAccount()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var sqlite = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(sqlite, graph);
+        var store = new AcceptFirstReconciliationStore(sqlite);
+        var candidate = new BaiduShareRecord(
+            "accept-wins",
+            new([new("remote-a", "A"), new("remote-b", "B")]),
+            "https://pan.baidu.com/s/accept-wins", "race", true, true);
+        var service = new ShareOperationReconciliationService(
+            new OrderedOutcomeAdapter(candidate, bothFailures: false),
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            store,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var results = await Task.WhenAll(
+            service.ReconcileAsync(graph.ShareOperationId),
+            service.ReconcileAsync(graph.ShareOperationId));
+
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Accepted);
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Stale);
+        Assert.Equal("Succeeded", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("Active", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+        Assert.Equal(1, await CountAsync(graph.Factory, "BaiduShareResults"));
+    }
+
+    [Fact]
+    public async Task FirstKeepPendingWinningControlledSqliteRaceMakesSecondKeepStale()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var sqlite = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(sqlite, graph);
+        var store = new KeepFirstReconciliationStore(sqlite);
+        var adapter = new OrderedOutcomeAdapter(candidate: null, bothFailures: true);
+        var service = new ShareOperationReconciliationService(
+            adapter,
+            new RestartReconciliationSessionStore(graph.AccountId, graph.Now),
+            store,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var results = await Task.WhenAll(
+            service.ReconcileAsync(graph.ShareOperationId),
+            service.ReconcileAsync(graph.ShareOperationId));
+
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.RequiresUser);
+        Assert.Single(results, result => result.Disposition == ShareReconciliationDisposition.Stale);
+        Assert.Equal(0, await CountAsync(graph.Factory, "BaiduShareResults"));
+    }
+
+    [Fact]
+    public async Task NewerActiveLoginIsNotInvalidatedByOlderObservedSessionFailure()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var sqlite = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(sqlite, graph);
+        var refreshedAt = graph.Now.AddMinutes(5);
+        var store = new RefreshAccountBeforeKeepStore(sqlite, graph.Factory, graph.AccountId, refreshedAt);
+        var compatible = new BaiduShareRecord(
+            "new-login-result",
+            new([new("remote-a", "A"), new("remote-b", "B")]),
+            "https://pan.baidu.com/s/new-login-result", "fresh", true, true);
+        var adapter = new SequencedReconciliationAdapter([
+            BaiduAdapterResult<BaiduSharePage>.Failure(BaiduErrorKind.ExpiredLogin, "old session failed"),
+            BaiduAdapterResult<BaiduSharePage>.Success(new([compatible], null)),
+        ]);
+        var sessions = new SequencedCapturedSessionStore(graph.AccountId, [graph.Now, refreshedAt]);
+        var service = new ShareOperationReconciliationService(
+            adapter, sessions, store, new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var oldFailure = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.RequiresUser, oldFailure.Disposition);
+        Assert.Equal("Active", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+        Assert.Equal(refreshedAt, DateTimeOffset.Parse(await ScalarAsync<string>(graph.Factory,
+            "SELECT LastValidatedAt FROM Accounts WHERE Id=$id;", graph.AccountId)));
+        Assert.Equal("ResultPending", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(graph.ShareOperationId,
+            (await sqlite.TryGetDueResultPendingAsync(graph.BatchId, graph.Now.AddMinutes(3), []))?.Id);
+
+        var accepted = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.Accepted, accepted.Disposition);
+        Assert.Equal(compatible.ShareId,
+            (await sqlite.GetAcceptedResultAsync(graph.ShareOperationId))?.ShareId);
+        Assert.Equal("Active", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+    }
+
+    [Fact]
+    public async Task MissingSessionKeepsPendingWithoutInvalidatingPossiblyRefreshedAccount()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var sqlite = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(sqlite, graph);
+        var refreshedAt = graph.Now.AddMinutes(5);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE Accounts SET Status='Active',LastValidatedAt=$validated WHERE Id=$id;";
+            command.Parameters.AddWithValue("$validated", refreshedAt.ToString("O"));
+            command.Parameters.AddWithValue("$id", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        var service = new ShareOperationReconciliationService(
+            new RestartReconciliationAdapter([]),
+            new MissingSessionStore(),
+            sqlite,
+            new NoDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FixedTimeProvider(graph.Now.AddMinutes(1)));
+
+        var result = await service.ReconcileAsync(graph.ShareOperationId);
+
+        Assert.Equal(ShareReconciliationDisposition.RequiresUser, result.Disposition);
+        Assert.Equal("Active", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$id;", graph.AccountId));
+        Assert.Equal(refreshedAt, DateTimeOffset.Parse(await ScalarAsync<string>(graph.Factory,
+            "SELECT LastValidatedAt FROM Accounts WHERE Id=$id;", graph.AccountId)));
+        Assert.Equal("ResultPending", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
+    [Fact]
     public async Task DiscoveryPauseAndDecisionResumeAreAtomicAndStaleSnapshotsWriteNothing()
     {
         var graph = await CreateGraphAsync(includeShareSettings: true);
@@ -1143,6 +1813,318 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         return run;
     }
 
+    private static async Task PrepareResultPendingAsync(SqliteShareSchedulingStore store, Graph graph)
+    {
+        var lease = Assert.IsType<ShareOperationRecord>(
+            await store.TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2)));
+        Assert.True(await store.TryCompleteDiscoveryBaselineAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "empty", 0, graph.Now));
+        Assert.True(await store.TryMarkSubmittingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, "{\"safe\":true}", graph.Now));
+        Assert.True(await store.TryMarkResultPendingAsync(
+            graph.ShareOperationId, 1, lease.LeaseGeneration, graph.Now, graph.Now));
+    }
+
+    private sealed class RestartReconciliationAdapter(IReadOnlyList<BaiduShareRecord> shares) : IBaiduShareAdapter
+    {
+        public int CreateCalls { get; private set; }
+
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
+            AccountSession session,
+            string? cursor,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<BaiduSharePage>.Success(new(shares, null)));
+
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken)
+        {
+            CreateCalls++;
+            throw new InvalidOperationException("Reconciliation must not create a share.");
+        }
+    }
+
+    private sealed class SequencedReconciliationAdapter(
+        IEnumerable<BaiduAdapterResult<BaiduSharePage>> responses) : IBaiduShareAdapter
+    {
+        private readonly Queue<BaiduAdapterResult<BaiduSharePage>> responses = new(responses);
+        public int CreateCalls { get; private set; }
+
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
+            AccountSession session,
+            string? cursor,
+            CancellationToken cancellationToken) => Task.FromResult(responses.Dequeue());
+
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken)
+        {
+            CreateCalls++;
+            throw new InvalidOperationException("Reconciliation must not create a share.");
+        }
+    }
+
+    private sealed class ConcurrentSqliteReconciliationAdapter(BaiduShareRecord candidate) : IBaiduShareAdapter
+    {
+        private readonly TaskCompletionSource bothEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int concurrentListings;
+        public int MaximumConcurrentListings { get; private set; }
+
+        public async Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
+            AccountSession session,
+            string? cursor,
+            CancellationToken cancellationToken)
+        {
+            var concurrent = Interlocked.Increment(ref concurrentListings);
+            MaximumConcurrentListings = Math.Max(MaximumConcurrentListings, concurrent);
+            if (concurrent == 2) bothEntered.TrySetResult();
+            try
+            {
+                await bothEntered.Task.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+                return BaiduAdapterResult<BaiduSharePage>.Success(new([candidate], null));
+            }
+            finally
+            {
+                Interlocked.Decrement(ref concurrentListings);
+            }
+        }
+
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Reconciliation must not create a share.");
+    }
+
+    private sealed class OrderedOutcomeAdapter(BaiduShareRecord? candidate, bool bothFailures) : IBaiduShareAdapter
+    {
+        private int calls;
+
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
+            AccountSession session,
+            string? cursor,
+            CancellationToken cancellationToken)
+        {
+            var call = Interlocked.Increment(ref calls);
+            return Task.FromResult(bothFailures || call == 1
+                ? BaiduAdapterResult<BaiduSharePage>.Failure(BaiduErrorKind.ExpiredLogin, "private")
+                : BaiduAdapterResult<BaiduSharePage>.Success(new([candidate!], null)));
+        }
+
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Reconciliation must not create a share.");
+    }
+
+    private sealed class KeepFirstReconciliationStore(SqliteShareSchedulingStore inner) : IShareReconciliationStore
+    {
+        private readonly TaskCompletionSource bothLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource firstKeepCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int loadCalls;
+        private int keepCalls;
+
+        public async Task<ShareExecutionContext?> LoadPendingAsync(
+            Guid operationId,
+            CancellationToken cancellationToken = default)
+        {
+            var context = await inner.LoadPendingAsync(operationId, cancellationToken);
+            if (Interlocked.Increment(ref loadCalls) == 2) bothLoaded.TrySetResult();
+            await bothLoaded.Task.WaitAsync(cancellationToken);
+            return context;
+        }
+
+        public Task<StringKeysetPage<ShareDiscoveryBaselineRecord>> GetBaselinePageAsync(
+            Guid operationId,
+            string? afterShareId,
+            int pageSize,
+            CancellationToken cancellationToken = default) =>
+            inner.GetBaselinePageAsync(operationId, afterShareId, pageSize, cancellationToken);
+
+        public async Task<bool> TryAcceptAsync(
+            Guid operationId,
+            int generation,
+            long leaseGeneration,
+            ShareReconciliationWriteSnapshot expected,
+            BaiduShareResultRecord result,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            await firstKeepCompleted.Task.WaitAsync(cancellationToken);
+            return await inner.TryAcceptAsync(
+                operationId, generation, leaseGeneration, expected, result, updatedAt, cancellationToken);
+        }
+
+        public async Task<bool> TryKeepPendingAsync(
+            Guid operationId,
+            int generation,
+            long leaseGeneration,
+            ShareReconciliationWriteSnapshot expected,
+            ShareReconciliationIssue issue,
+            DateTimeOffset? observedSessionCapturedAtUtc,
+            DateTimeOffset nextReconcileAt,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            var call = Interlocked.Increment(ref keepCalls);
+            if (call > 1) await firstKeepCompleted.Task.WaitAsync(cancellationToken);
+            var changed = await inner.TryKeepPendingAsync(
+                operationId, generation, leaseGeneration, expected, issue, observedSessionCapturedAtUtc,
+                nextReconcileAt, updatedAt, cancellationToken);
+            if (call == 1) firstKeepCompleted.TrySetResult();
+            return changed;
+        }
+    }
+
+    private sealed class RefreshAccountBeforeKeepStore(
+        SqliteShareSchedulingStore inner,
+        SqliteConnectionFactory factory,
+        Guid accountId,
+        DateTimeOffset refreshedAt) : IShareReconciliationStore
+    {
+        public Task<ShareExecutionContext?> LoadPendingAsync(
+            Guid operationId,
+            CancellationToken cancellationToken = default) => inner.LoadPendingAsync(operationId, cancellationToken);
+
+        public Task<StringKeysetPage<ShareDiscoveryBaselineRecord>> GetBaselinePageAsync(
+            Guid operationId,
+            string? afterShareId,
+            int pageSize,
+            CancellationToken cancellationToken = default) =>
+            inner.GetBaselinePageAsync(operationId, afterShareId, pageSize, cancellationToken);
+
+        public Task<bool> TryAcceptAsync(
+            Guid operationId,
+            int generation,
+            long leaseGeneration,
+            ShareReconciliationWriteSnapshot expected,
+            BaiduShareResultRecord result,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) =>
+            inner.TryAcceptAsync(
+                operationId, generation, leaseGeneration, expected, result, updatedAt, cancellationToken);
+
+        public async Task<bool> TryKeepPendingAsync(
+            Guid operationId,
+            int generation,
+            long leaseGeneration,
+            ShareReconciliationWriteSnapshot expected,
+            ShareReconciliationIssue issue,
+            DateTimeOffset? observedSessionCapturedAtUtc,
+            DateTimeOffset nextReconcileAt,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            await using (var connection = await factory.OpenConnectionAsync(cancellationToken))
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "UPDATE Accounts SET Status='Active',LastValidatedAt=$validated WHERE Id=$id;";
+                command.Parameters.AddWithValue("$validated", refreshedAt.ToString("O"));
+                command.Parameters.AddWithValue("$id", accountId.ToString("D"));
+                Assert.Equal(1, await command.ExecuteNonQueryAsync(cancellationToken));
+            }
+            return await inner.TryKeepPendingAsync(
+                operationId, generation, leaseGeneration, expected, issue, observedSessionCapturedAtUtc,
+                nextReconcileAt, updatedAt, cancellationToken);
+        }
+    }
+
+    private sealed class AcceptFirstReconciliationStore(SqliteShareSchedulingStore inner) : IShareReconciliationStore
+    {
+        private readonly TaskCompletionSource bothLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource acceptCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int loadCalls;
+
+        public async Task<ShareExecutionContext?> LoadPendingAsync(
+            Guid operationId,
+            CancellationToken cancellationToken = default)
+        {
+            var context = await inner.LoadPendingAsync(operationId, cancellationToken);
+            if (Interlocked.Increment(ref loadCalls) == 2) bothLoaded.TrySetResult();
+            await bothLoaded.Task.WaitAsync(cancellationToken);
+            return context;
+        }
+
+        public Task<StringKeysetPage<ShareDiscoveryBaselineRecord>> GetBaselinePageAsync(
+            Guid operationId, string? afterShareId, int pageSize, CancellationToken cancellationToken = default) =>
+            inner.GetBaselinePageAsync(operationId, afterShareId, pageSize, cancellationToken);
+
+        public async Task<bool> TryAcceptAsync(
+            Guid operationId, int generation, long leaseGeneration, ShareReconciliationWriteSnapshot expected,
+            BaiduShareResultRecord result, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            var changed = await inner.TryAcceptAsync(
+                operationId, generation, leaseGeneration, expected, result, updatedAt, cancellationToken);
+            acceptCompleted.TrySetResult();
+            return changed;
+        }
+
+        public async Task<bool> TryKeepPendingAsync(
+            Guid operationId, int generation, long leaseGeneration, ShareReconciliationWriteSnapshot expected,
+            ShareReconciliationIssue issue, DateTimeOffset? observedSessionCapturedAtUtc,
+            DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            await acceptCompleted.Task.WaitAsync(cancellationToken);
+            return await inner.TryKeepPendingAsync(
+                operationId, generation, leaseGeneration, expected, issue, observedSessionCapturedAtUtc,
+                nextReconcileAt, updatedAt, cancellationToken);
+        }
+    }
+
+    private sealed class RestartReconciliationSessionStore(Guid accountId, DateTimeOffset now) : IBaiduSessionStore
+    {
+        private readonly AccountSession session = new(accountId, "baidu-user", [
+            new SessionCookie("BDUSS", "secret", ".baidu.com", "/", null, true, true)], now);
+
+        public Task<AccountSession?> LoadAsync(string accountId, CancellationToken cancellationToken) =>
+            Task.FromResult<AccountSession?>(session);
+
+        public Task SaveAsync(AccountSession session, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RemoveAsync(string accountId, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class SequencedCapturedSessionStore(
+        Guid accountId,
+        IEnumerable<DateTimeOffset> capturedAtValues) : IBaiduSessionStore
+    {
+        private readonly Queue<DateTimeOffset> capturedAtValues = new(capturedAtValues);
+
+        public Task<AccountSession?> LoadAsync(string requestedAccountId, CancellationToken cancellationToken) =>
+            Task.FromResult<AccountSession?>(new(
+                accountId,
+                "baidu-user",
+                [new SessionCookie("BDUSS", "secret", ".baidu.com", "/", null, true, true)],
+                capturedAtValues.Dequeue()));
+
+        public Task SaveAsync(AccountSession session, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RemoveAsync(string accountId, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class MissingSessionStore : IBaiduSessionStore
+    {
+        public Task<AccountSession?> LoadAsync(string accountId, CancellationToken cancellationToken) =>
+            Task.FromResult<AccountSession?>(null);
+
+        public Task SaveAsync(AccountSession session, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RemoveAsync(string accountId, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class NoDelay : IAsyncDelay
+    {
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
     private static async Task SetShareEnabledAsync(Graph graph,bool enabled)
     {
         await using var connection=await graph.Factory.OpenConnectionAsync();
@@ -1279,6 +2261,23 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.Equal(1, await command.ExecuteNonQueryAsync());
     }
 
+    private static BaiduShareResultRecord AcceptedResult(Graph graph) => new(
+        Guid.Parse("40000000-0000-0000-0000-000000000004"),
+        graph.ShareOperationId,
+        graph.BatchId,
+        graph.ResourceId,
+        graph.AccountId,
+        graph.ItemSetFingerprint,
+        graph.SettingsFingerprint,
+        1,
+        "new-share",
+        "https://pan.baidu.com/s/redacted",
+        "a1b2",
+        true,
+        true,
+        graph.Now,
+        graph.Now);
+
     private static async Task<T> ScalarAsync<T>(SqliteConnectionFactory factory, string sql, Guid id)
     {
         await using var connection = await factory.OpenConnectionAsync();
@@ -1286,6 +2285,15 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         command.Parameters.AddWithValue("$id", id.ToString("D"));
         var value = await command.ExecuteScalarAsync() ?? throw new InvalidDataException("The scalar query returned null.");
         return (T)Convert.ChangeType(value, typeof(T));
+    }
+
+    private static async Task<object?> ScalarNullableAsync(SqliteConnectionFactory factory, string sql, Guid id)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand(); command.CommandText = sql;
+        command.Parameters.AddWithValue("$id", id.ToString("D"));
+        var value = await command.ExecuteScalarAsync();
+        return value is DBNull ? null : value;
     }
 
     private static async Task<IReadOnlyList<string>> ColumnsAsync(SqliteConnection connection, string table)

@@ -14,6 +14,41 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
     private readonly ITestOutputHelper output = output;
 
     [Fact]
+    public async Task OperationQueryProjectsStableChineseStatusLabels()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var statuses = new[]
+        {
+            (Raw: "Waiting", Chinese: "等待"),
+            (Raw: "Reserved", Chinese: "处理中"),
+            (Raw: "Preparing", Chinese: "处理中"),
+            (Raw: "Submitting", Chinese: "处理中"),
+            (Raw: "ResultPending", Chinese: "结果待确认"),
+            (Raw: "Succeeded", Chinese: "成功"),
+            (Raw: "Failed", Chinese: "失败"),
+            (Raw: "Paused", Chinese: "暂停"),
+            (Raw: "Cancelled", Chinese: "已取消"),
+        };
+        var resources = statuses.Select((_, index) => Resource(batch, index + 1)).ToArray();
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "projection")],
+            job: Job(batch) with { ResourceCount = statuses.Length, OperationCount = statuses.Length },
+            resources: resources,
+            operations: statuses.Select((status, index) =>
+                Operation(batch, resources[index], account, index + 1, status.Raw, null)),
+            allocations: [Allocation(batch, account, 1)]);
+
+        var page = await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, null, null, null, 100));
+
+        Assert.Equal(
+            statuses.Select(status => (status.Raw, status.Chinese)),
+            page.Items.Select(item => (item.Status, item.StatusText)));
+    }
+
+    [Fact]
     public async Task ImportPagingUsesStableCursorAndBoundsPageSize()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -55,6 +90,11 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
             Operation(batch, resources[1], accountA, 3, "Succeeded", "AlreadySatisfied"),
             Operation(batch, resources[1], accountB, 4, "Succeeded", "NewTransfer"),
             Operation(batch, resources[2], accountA, 5, "Failed", "Failed", "SAFE_FAILURE", "A safe failure."),
+            Operation(batch, resources[2], accountB, 6, "Paused", null) with
+            {
+                TargetSlotState = "Reserved",
+                TargetSlotReservedAt = BatchTestData.Now,
+            },
         };
         await db.SeedAsync(
             [BatchTestData.Account(accountA, "A"), BatchTestData.Account(accountB, "B")],
@@ -89,11 +129,11 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         Assert.Equal(3, resourcePage.TotalCount);
         Assert.DoesNotContain("pan.baidu.com", resourcePage.Items[0].ToString(), StringComparison.OrdinalIgnoreCase);
         Assert.Equal(3, statistics.ResourceCount);
-        Assert.Equal(5, statistics.OperationCount);
+        Assert.Equal(6, statistics.OperationCount);
         Assert.Collection(
             statistics.Accounts,
-            a => { Assert.Equal(accountA, a.AccountId); Assert.Equal((1, 1, 1, 0), (a.NewCount, a.ExistingCount, a.FailedCount, a.PendingCount)); },
-            a => { Assert.Equal(accountB, a.AccountId); Assert.Equal((1, 0, 0, 1), (a.NewCount, a.ExistingCount, a.FailedCount, a.PendingCount)); });
+            a => { Assert.Equal(accountA, a.AccountId); Assert.Equal((1, 1, 1, 0, 0), (a.NewCount, a.ExistingCount, a.FailedCount, a.PendingCount, a.PausedCount)); },
+            a => { Assert.Equal(accountB, a.AccountId); Assert.Equal((1, 0, 0, 1, 1), (a.NewCount, a.ExistingCount, a.FailedCount, a.PendingCount, a.PausedCount)); });
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
             pages.GetOperationsAsync(new(batch, null, null, null, null, 0)));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
@@ -336,6 +376,7 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         Assert.Equal((50_000L, 50_000L, 50_000L, 50_000L),
             (statistics.Accounts[0].NewCount, statistics.Accounts[0].ExistingCount,
              statistics.Accounts[0].FailedCount, statistics.Accounts[0].PendingCount));
+        Assert.Equal(0L, statistics.Accounts[0].PausedCount);
         Assert.Equal(count, export.ExportedRows);
         Assert.Equal(count, timeExport.ExportedRows);
         Assert.Equal(count, accountWriter.RowCount);

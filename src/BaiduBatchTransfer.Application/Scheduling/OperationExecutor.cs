@@ -20,6 +20,13 @@ public sealed record OperationExecutionSnapshot(
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
 }
 
+public enum TransferPauseReason
+{
+    AccountSessionUnavailable,
+    AccountVerificationRequired,
+    UserInterventionRequired,
+}
+
 public interface IOperationExecutionStore
 {
     Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default);
@@ -55,6 +62,13 @@ public interface IOperationExecutionStore
         Guid operationId,
         string code,
         string safeMessage,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default);
+    Task PauseForAccountInterventionAsync(
+        Guid operationId,
+        TransferPauseReason reason,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset? observedSessionCapturedAtUtc,
         DateTimeOffset now,
         CancellationToken cancellationToken = default);
     Task MarkDefiniteAccountFailureAsync(
@@ -130,7 +144,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             .ConfigureAwait(false);
         if (session is null)
         {
-            await PauseAccountBeforeSubmissionAsync(snapshot.OperationId, BaiduErrorKind.ExpiredLogin, cancellationToken)
+            await PauseAccountBeforeSubmissionAsync(
+                    snapshot.OperationId, BaiduErrorKind.ExpiredLogin, observedSessionCapturedAtUtc: null, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -163,7 +178,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             var error = directoryResult.ErrorKind!.Value;
             if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
-                await PauseAccountBeforeSubmissionAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
+                await PauseAccountBeforeSubmissionAsync(
+                    snapshot.OperationId, error, session.CapturedAtUtc, cancellationToken).ConfigureAwait(false);
             else if (IsAccountPausingFailure(error))
                 await FailAndPauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
             else
@@ -213,7 +229,16 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         if (!saveResult.IsSuccess)
         {
             var errorKind = saveResult.ErrorKind!.Value;
-            if (saveResult.SubmissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
+            if (errorKind is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+            {
+                await PauseForAccountInterventionAsync(
+                    snapshot.OperationId,
+                    errorKind,
+                    saveResult.SubmissionAcceptance,
+                    session.CapturedAtUtc,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else if (saveResult.SubmissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
             {
                 await store.MarkResultPendingAsync(
                     snapshot.OperationId,
@@ -320,13 +345,42 @@ public sealed class OperationExecutor : ITransferOperationExecutor
     private Task PauseAccountBeforeSubmissionAsync(
         Guid operationId,
         BaiduErrorKind errorKind,
+        DateTimeOffset? observedSessionCapturedAtUtc,
         CancellationToken cancellationToken)
     {
-        var safe = BaiduAdapterResult.Failure(errorKind, null);
-        return store.PauseAccountBeforeSubmissionAsync(
+        var reason = errorKind switch
+        {
+            BaiduErrorKind.ExpiredLogin => TransferPauseReason.AccountSessionUnavailable,
+            BaiduErrorKind.VerificationRequired => TransferPauseReason.AccountVerificationRequired,
+            _ => throw new ArgumentOutOfRangeException(nameof(errorKind)),
+        };
+        return store.PauseForAccountInterventionAsync(
             operationId,
-            errorKind.ToString(),
-            safe.SafeMessage!,
+            reason,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            observedSessionCapturedAtUtc,
+            timeProvider.GetUtcNow(),
+            cancellationToken);
+    }
+
+    private Task PauseForAccountInterventionAsync(
+        Guid operationId,
+        BaiduErrorKind errorKind,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset? observedSessionCapturedAtUtc,
+        CancellationToken cancellationToken)
+    {
+        var reason = errorKind switch
+        {
+            BaiduErrorKind.ExpiredLogin => TransferPauseReason.AccountSessionUnavailable,
+            BaiduErrorKind.VerificationRequired => TransferPauseReason.AccountVerificationRequired,
+            _ => throw new ArgumentOutOfRangeException(nameof(errorKind)),
+        };
+        return store.PauseForAccountInterventionAsync(
+            operationId,
+            reason,
+            submissionAcceptance,
+            observedSessionCapturedAtUtc,
             timeProvider.GetUtcNow(),
             cancellationToken);
     }

@@ -6,7 +6,8 @@ using System.Text;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareExecutionStore, IExistingShareDecisionStore
+public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareExecutionStore, IExistingShareDecisionStore,
+    IShareReconciliationStore, IInterruptedShareOperationRecoveryStore
 {
     internal const string ResultKeysetSelectSql = ResultColumns +
         ",BaiduShareResults.CandidateSequence,BaiduShareResults.OutputOrdinal FROM BaiduShareResults " +
@@ -366,6 +367,22 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         await using var transaction = connection.BeginTransaction(deferred: false);
         try
         {
+            await using (var count = Command(connection, transaction, """
+                SELECT (SELECT COUNT(*) FROM TransferOperations
+                          WHERE Status IN ('Reserved','Preparing','Submitting')
+                            AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt>$now))+
+                       (SELECT COUNT(*) FROM ShareOperations
+                          WHERE Status IN ('Reserved','Preparing','Submitting')
+                            AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt>$now));
+                """))
+            {
+                Add(count, "$now", Time(now));
+                if (Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) >= TransferCoordinator.MaximumGlobalConcurrency)
+                {
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return null;
+                }
+            }
             async Task<string?> SelectAsync(string status, bool expired)
             {
                 if (expired)
@@ -390,6 +407,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                       SELECT 1 FROM ShareOperations candidate
                       WHERE candidate.BatchJobId=batch.Id AND candidate.Status=$status
                         AND candidate.LeaseExpiresAt IS NULL
+                        AND NOT EXISTS(SELECT 1 FROM TransferOperations transferBusy
+                          WHERE transferBusy.AssignedAccountId=candidate.AccountId
+                            AND transferBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
+                        AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy
+                          WHERE shareBusy.AccountId=candidate.AccountId AND shareBusy.Id<>candidate.Id
+                            AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
                         AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                           WHERE settings.BatchJobId=candidate.BatchJobId
                             AND settings.SettingsFingerprint=candidate.SettingsFingerprint)
@@ -417,6 +440,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 await using var select = Command(connection, transaction, $"""
                     SELECT operation.Id FROM ShareOperations operation
                     WHERE operation.BatchJobId=$batch AND operation.Status=$status AND operation.LeaseExpiresAt IS NULL
+                      AND NOT EXISTS(SELECT 1 FROM TransferOperations transferBusy
+                        WHERE transferBusy.AssignedAccountId=operation.AccountId
+                          AND transferBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
+                      AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy
+                        WHERE shareBusy.AccountId=operation.AccountId AND shareBusy.Id<>operation.Id
+                          AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
                       AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                         WHERE settings.BatchJobId=operation.BatchJobId
                           AND settings.SettingsFingerprint=operation.SettingsFingerprint)
@@ -453,6 +482,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 WHERE Id=$id AND (
                   (Status='WaitingShare' AND LeaseExpiresAt IS NULL)
                   OR (Status='Reserved' AND LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt<=$now))
+                  AND NOT EXISTS(SELECT 1 FROM TransferOperations transferBusy
+                    WHERE transferBusy.AssignedAccountId=ShareOperations.AccountId
+                      AND transferBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
+                  AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy
+                    WHERE shareBusy.AccountId=ShareOperations.AccountId AND shareBusy.Id<>ShareOperations.Id
+                      AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused'))
                   AND EXISTS(SELECT 1 FROM BatchShareSettings settings
                     WHERE settings.BatchJobId=ShareOperations.BatchJobId
                       AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
@@ -488,6 +523,46 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             return record;
         }
         catch { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); throw; }
+    }
+
+    public async Task<ShareOperationRecord?> TryGetDueResultPendingAsync(
+        Guid batchJobId,
+        DateTimeOffset dueAt,
+        IReadOnlyCollection<Guid> excludedAccountIds,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        ArgumentNullException.ThrowIfNull(excludedAccountIds);
+        var excluded = excludedAccountIds.Distinct().ToArray();
+        if (excluded.Any(accountId => accountId == Guid.Empty))
+            throw new ArgumentException("An excluded account cannot be empty.", nameof(excludedAccountIds));
+        var excludedPredicate = excluded.Length == 0
+            ? string.Empty
+            : $" AND operation.AccountId NOT IN ({string.Join(',', excluded.Select((_, index) => $"$excluded{index}"))})";
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        await using var command = Command(connection, transaction, $"""
+            SELECT Id FROM ShareOperations operation
+            WHERE operation.BatchJobId=$batch AND operation.Status='ResultPending'
+              AND operation.SubmissionAcceptance='Unknown' AND operation.RequestDescriptorJson IS NOT NULL
+              AND operation.SubmitStartedAt IS NOT NULL
+              AND (operation.NextReconcileAt IS NULL OR operation.NextReconcileAt<=$now)
+              {excludedPredicate}
+              AND EXISTS(SELECT 1 FROM BatchJobs batch WHERE batch.Id=operation.BatchJobId AND batch.Status='Active')
+              AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=operation.AccountId
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0)
+            ORDER BY COALESCE(operation.NextReconcileAt,operation.SubmitStartedAt),operation.OutputOrdinal,operation.Id
+            LIMIT 1;
+            """);
+        Add(command, "$batch", Id(batchJobId)); Add(command, "$now", Time(dueAt));
+        for (var index = 0; index < excluded.Length; index++)
+            Add(command, $"$excluded{index}", Id(excluded[index]));
+        var id = Convert.ToString(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        var value = string.IsNullOrEmpty(id)
+            ? null
+            : await GetOperationAsync(connection, transaction, id, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return value;
     }
 
     public async Task<StringKeysetPage<ShareOperationRemoteItemRecord>> GetRemoteItemsKeysetPageAsync(
@@ -1387,6 +1462,148 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             baselineMustContainShare: false, updatedAt, cancellationToken);
     }
 
+    public async Task<ShareExecutionContext?> LoadPendingAsync(
+        Guid operationId,
+        CancellationToken cancellationToken = default)
+    {
+        var value = await LoadAsync(operationId, cancellationToken).ConfigureAwait(false);
+        return value is not null && string.Equals(value.Operation.Status, "ResultPending", StringComparison.Ordinal)
+            ? value
+            : null;
+    }
+
+    public Task<StringKeysetPage<ShareDiscoveryBaselineRecord>> GetBaselinePageAsync(
+        Guid operationId,
+        string? afterShareId,
+        int pageSize,
+        CancellationToken cancellationToken = default) =>
+        GetDiscoveryBaselineKeysetPageAsync(operationId, afterShareId, pageSize, cancellationToken);
+
+    public Task<bool> TryAcceptAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        ShareReconciliationWriteSnapshot expected,
+        BaiduShareResultRecord result,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (generation != result.Generation) return Task.FromResult(false);
+        return PersistResultAsync(
+            operationId, ShareOperationStatus.ResultPending.ToString(), leaseGeneration, "Succeeded", result,
+            baselineMustContainShare: false, updatedAt, cancellationToken, expected);
+    }
+
+    public async Task<bool> TryKeepPendingAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        ShareReconciliationWriteSnapshot expected,
+        ShareReconciliationIssue issue,
+        DateTimeOffset? observedSessionCapturedAtUtc,
+        DateTimeOffset nextReconcileAt,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(issue)) throw new ArgumentOutOfRangeException(nameof(issue));
+        if (nextReconcileAt <= updatedAt) throw new ArgumentOutOfRangeException(nameof(nextReconcileAt));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await using var command = Command(connection, transaction, """
+            UPDATE ShareOperations SET NextReconcileAt=$next,LastErrorCode=$code,
+              LastErrorMessage=$message,UpdatedAt=$updated
+            WHERE Id=$id AND Status='ResultPending' AND Generation=$generation
+              AND LeaseGeneration=$leaseGeneration AND SubmissionAcceptance='Unknown'
+              AND RequestDescriptorJson IS NOT NULL AND SubmitStartedAt IS NOT NULL
+              AND UpdatedAt=$expectedUpdated AND NextReconcileAt IS $expectedNext;
+            """);
+        Add(command, "$next", Time(nextReconcileAt)); Add(command, "$code", issue.ToString());
+        Add(command, "$message", SafeReconciliationMessage(issue)); Add(command, "$updated", Time(updatedAt));
+        Add(command, "$id", Id(operationId)); Add(command, "$generation", generation);
+        Add(command, "$leaseGeneration", leaseGeneration);
+        Add(command, "$expectedUpdated", Time(expected.UpdatedAt));
+        Add(command, "$expectedNext", expected.NextReconcileAt is { } expectedNext ? Time(expectedNext) : null);
+        var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+        if (changed && observedSessionCapturedAtUtc is { } observedSession &&
+            issue is ShareReconciliationIssue.AccountSessionUnavailable or ShareReconciliationIssue.AccountVerificationRequired)
+        {
+            await using var account = Command(connection, transaction, """
+                UPDATE Accounts SET Status='Invalid'
+                WHERE Id=(SELECT AccountId FROM ShareOperations WHERE Id=$id) AND IsDeleted=0
+                  AND (LastValidatedAt IS NULL OR julianday(LastValidatedAt)<=julianday($observedSession));
+                """);
+            Add(account, "$observedSession", Time(observedSession)); Add(account, "$id", Id(operationId));
+            await account.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return changed;
+    }
+
+    public async Task<ShareLeaseRecoveryResult> RecoverInterruptedShareOperationsAsync(
+        DateTimeOffset recoveredAt,
+        CancellationToken cancellationToken = default) =>
+        await RecoverShareOperationsAsync(recoveredAt, onlyExpired: false, cancellationToken).ConfigureAwait(false);
+
+    public async Task<ShareLeaseRecoveryResult> RecoverExpiredShareOperationsAsync(
+        DateTimeOffset recoveredAt,
+        CancellationToken cancellationToken = default) =>
+        await RecoverShareOperationsAsync(recoveredAt, onlyExpired: true, cancellationToken).ConfigureAwait(false);
+
+    private async Task<ShareLeaseRecoveryResult> RecoverShareOperationsAsync(
+        DateTimeOffset recoveredAt,
+        bool onlyExpired,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            var leaseScope = onlyExpired
+                ? "LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt<=$now"
+                : "LeaseExpiresAt IS NOT NULL";
+            await using (var clearBaseline = Command(connection, transaction, $"""
+                DELETE FROM ShareDiscoveryBaselines WHERE ShareOperationId IN (
+                  SELECT Id FROM ShareOperations
+                  WHERE {leaseScope}
+                    AND ((Status IN ('Reserved','Preparing') AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL)
+                      OR (Status='Submitting' AND SubmissionAcceptance='DefinitelyNotAccepted')));
+                """))
+            {
+                Add(clearBaseline, "$now", Time(recoveredAt));
+                await clearBaseline.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            await using var retry = Command(connection, transaction, $"""
+                UPDATE ShareOperations SET Status='WaitingShare',LeaseExpiresAt=NULL,
+                  RequestDescriptorJson=NULL,AdapterRequestId=NULL,SubmissionAcceptance='Unknown',SubmitStartedAt=NULL,
+                  NextReconcileAt=NULL,BaselineGeneration=NULL,BaselineFingerprint=NULL,BaselineShareCount=0,
+                  BaselineCompletedAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
+                WHERE {leaseScope} AND (
+                  (Status IN ('Reserved','Preparing') AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL)
+                  OR (Status='Submitting' AND SubmissionAcceptance='DefinitelyNotAccepted'));
+                """);
+            Add(retry, "$now", Time(recoveredAt));
+            var retryable = await retry.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+            await using var pending = Command(connection, transaction, $"""
+                UPDATE ShareOperations SET Status='ResultPending',SubmissionAcceptance='Unknown',LeaseExpiresAt=NULL,
+                  NextReconcileAt=COALESCE(NextReconcileAt,$now),LastErrorCode='StartupUnknownAcceptance',
+                  LastErrorMessage='分享提交结果待确认',UpdatedAt=$now
+                WHERE Status IN ('Reserved','Preparing','Submitting') AND {leaseScope}
+                  AND SubmissionAcceptance<>'DefinitelyNotAccepted'
+                  AND (RequestDescriptorJson IS NOT NULL OR SubmitStartedAt IS NOT NULL OR Status='Submitting');
+                """);
+            Add(pending, "$now", Time(recoveredAt));
+            var resultPending = await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new(retryable, resultPending);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     public Task<bool> ReuseExistingResultAsync(
         Guid shareOperationId, long expectedLeaseGeneration, BaiduShareResultRecord result, DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default) =>
@@ -1395,7 +1612,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
 
     private async Task<bool> PersistResultAsync(
         Guid shareOperationId, string expectedStatus, long expectedLeaseGeneration, string finalStatus, BaiduShareResultRecord result,
-        bool baselineMustContainShare, DateTimeOffset updatedAt, CancellationToken cancellationToken)
+        bool baselineMustContainShare, DateTimeOffset updatedAt, CancellationToken cancellationToken,
+        ShareReconciliationWriteSnapshot? expectedSnapshot = null)
     {
         ArgumentNullException.ThrowIfNull(result);
         if (shareOperationId != result.ShareOperationId || !result.IsAccepted || !result.IsCurrent)
@@ -1409,6 +1627,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 WHERE Id=$id AND Status=$expected AND BatchJobId=$batch AND ResourceItemId=$resource
                   AND AccountId=$account AND ExactItemSetFingerprint=$items AND SettingsFingerprint=$settings
                   AND Generation=$generation AND LeaseGeneration=$leaseGeneration
+                  AND ($enforceSnapshot=0 OR (UpdatedAt=$expectedUpdated AND NextReconcileAt IS $expectedNext))
                   AND BaselineGeneration=$generation AND BaselineCompletedAt IS NOT NULL
                   AND ($requestRequired=0 OR AdapterRequestId IS NOT NULL)
                   AND EXISTS(SELECT 1 FROM BatchShareSettings settings
@@ -1429,6 +1648,9 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 Add(update,"$account",Id(result.AccountId)); Add(update,"$items",result.ExactItemSetFingerprint);
                 Add(update,"$settings",result.SettingsFingerprint); Add(update,"$generation",result.Generation);
                 Add(update,"$leaseGeneration",expectedLeaseGeneration);
+                Add(update,"$enforceSnapshot",expectedSnapshot is null ? 0 : 1);
+                Add(update,"$expectedUpdated",expectedSnapshot is { } expected ? Time(expected.UpdatedAt) : null);
+                Add(update,"$expectedNext",expectedSnapshot is { NextReconcileAt: { } expectedNext } ? Time(expectedNext) : null);
                 Add(update,"$requestRequired",string.Equals(expectedStatus, "Submitting", StringComparison.Ordinal) ? 1 : 0);
                 Add(update,"$share",result.ShareId); Add(update,"$baselineMustContain",baselineMustContainShare ? 1 : 0);
                 if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false)!=1)
@@ -1508,6 +1730,16 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
     private static BaiduShareResultRecord ReadResult(SqliteDataReader reader) => new(
         Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),
         reader.GetString(5),reader.GetString(6),reader.GetInt32(7),reader.GetString(8),reader.GetString(9),reader.GetString(10),reader.GetInt64(11)!=0,reader.GetInt64(12)!=0,ReadTime(reader,13),ReadTime(reader,14));
+
+    private static string SafeReconciliationMessage(ShareReconciliationIssue issue) => issue switch
+    {
+        ShareReconciliationIssue.ReconcileTimeout => "分享结果待确认",
+        ShareReconciliationIssue.MultipleCompatibleShares => "存在多个匹配分享，需人工确认",
+        ShareReconciliationIssue.AccountSessionUnavailable => "等待账号登录后继续确认分享结果",
+        ShareReconciliationIssue.AccountVerificationRequired => "账号完成安全验证后继续确认分享结果",
+        ShareReconciliationIssue.ListingUnavailable => "暂时无法读取分享结果",
+        _ => throw new ArgumentOutOfRangeException(nameof(issue)),
+    };
 
     private static ShareOperationRecord ReadOperation(SqliteDataReader reader) => new(
         Guid.Parse(reader.GetString(0)),Guid.Parse(reader.GetString(1)),Guid.Parse(reader.GetString(2)),Guid.Parse(reader.GetString(3)),Guid.Parse(reader.GetString(4)),

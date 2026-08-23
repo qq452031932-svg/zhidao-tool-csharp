@@ -104,6 +104,73 @@ public sealed class TransferCoordinatorTests
         Assert.Equal(1, store.ExhaustionChecks);
     }
 
+    [Fact]
+    public async Task TransferAndShareUseOneGlobalTwoWorkerPoolAndOneWorkerPerAccount()
+    {
+        var batch = Guid.NewGuid();
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var transfers = new RecordingAllocationStore(batch, [Candidate(accountA, 1, "Public")]);
+        var shares = new RecordingShareWorkSource([
+            new(CoordinatedWorkKind.Share, Guid.NewGuid(), batch, accountB, 1, 1),
+            new(CoordinatedWorkKind.Share, Guid.NewGuid(), batch, accountA, 1, 1),
+        ], expectedConcurrent: 2);
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(transfers), new ImmediateExecutor(),
+            new NetworkExecutionGate(true), shares).RunCycleAsync();
+
+        Assert.Equal(2, scheduled);
+        Assert.Single(shares.Executed);
+        Assert.Single(transfers.Reserved);
+        Assert.Equal(2, shares.MaximumCombinedConcurrency);
+        Assert.Equal(2, shares.Executed.Concat(transfers.Reserved.Select(x =>
+            new CoordinatedWork(CoordinatedWorkKind.Transfer, x.OperationId, x.BatchJobId, x.AccountId, 0, 0)))
+            .Select(x => x.AccountId).Distinct().Count());
+    }
+
+    [Fact]
+    public async Task DueResultPendingReconciliationUsesCapacityButIsNeverReservedAgain()
+    {
+        var batch = Guid.NewGuid();
+        var pendingAccount = Guid.NewGuid();
+        var transferAccount = Guid.NewGuid();
+        var transfers = new RecordingAllocationStore(batch, [Candidate(transferAccount, 1, "Public")]);
+        transfers.BusyAccounts.Add(pendingAccount);
+        var shares = new RecordingShareWorkSource([
+            new(CoordinatedWorkKind.ShareReconciliation, Guid.NewGuid(), batch, pendingAccount, 1, 7),
+        ], expectedConcurrent: 2);
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(transfers), new ImmediateExecutor(),
+            new NetworkExecutionGate(true), shares).RunCycleAsync();
+
+        Assert.Equal(2, scheduled);
+        Assert.Single(shares.Executed);
+        Assert.Equal(CoordinatedWorkKind.ShareReconciliation, shares.Executed[0].Kind);
+        Assert.Equal(0, shares.ShareReservationCount);
+    }
+
+    [Fact]
+    public async Task OfflineCyclePerformsLocalShareRecoveryButNoReconciliationOrExecution()
+    {
+        var batch = Guid.NewGuid();
+        var transfers = new RecordingAllocationStore(batch, []);
+        var shares = new RecordingShareWorkSource([
+            new(CoordinatedWorkKind.ShareReconciliation, Guid.NewGuid(), batch, Guid.NewGuid(), 1, 1),
+        ], expectedConcurrent: 1);
+        var gate = new NetworkExecutionGate(true);
+        gate.ReportOffline();
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(transfers), new ImmediateExecutor(), gate, shares).RunCycleAsync();
+
+        Assert.Equal(0, scheduled);
+        Assert.Equal(1, shares.RecoveryCount);
+        Assert.Empty(shares.Executed);
+        Assert.Equal(0, shares.ReconciliationTakeCount);
+    }
+
     private static ScheduledOperation Candidate(Guid account, long ordinal, string source) =>
         new(Guid.NewGuid(), Guid.NewGuid(), account, ordinal, source);
 
@@ -179,6 +246,60 @@ public sealed class TransferCoordinatorTests
             if (value == expectedConcurrent) release.TrySetResult();
             await release.Task.WaitAsync(cancellationToken);
             Interlocked.Decrement(ref current);
+        }
+    }
+
+    private sealed class RecordingShareWorkSource(IEnumerable<CoordinatedWork> work, int expectedConcurrent)
+        : IShareCoordinatorWorkSource
+    {
+        private readonly Queue<CoordinatedWork> work = new(work);
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int concurrent;
+        public List<CoordinatedWork> Executed { get; } = [];
+        public int MaximumCombinedConcurrency { get; private set; }
+        public int RecoveryCount { get; private set; }
+        public int ReconciliationTakeCount { get; private set; }
+        public int ShareReservationCount { get; private set; }
+
+        public Task<ShareLeaseRecoveryResult> RecoverExpiredLeasesAsync(DateTimeOffset now, CancellationToken cancellationToken = default)
+        {
+            RecoveryCount++;
+            return Task.FromResult(new ShareLeaseRecoveryResult(0, 0));
+        }
+
+        public Task<CoordinatedWork?> TryTakeDueReconciliationAsync(Guid batchId, DateTimeOffset now, IReadOnlyCollection<Guid> excludedAccounts, CancellationToken cancellationToken = default)
+        {
+            ReconciliationTakeCount++;
+            return Task.FromResult(Take(CoordinatedWorkKind.ShareReconciliation, excludedAccounts));
+        }
+
+        public Task<CoordinatedWork?> TryReserveShareAsync(Guid batchId, DateTimeOffset now, TimeSpan leaseDuration, IReadOnlyCollection<Guid> excludedAccounts, CancellationToken cancellationToken = default)
+        {
+            ShareReservationCount++;
+            return Task.FromResult(Take(CoordinatedWorkKind.Share, excludedAccounts));
+        }
+
+        private CoordinatedWork? Take(CoordinatedWorkKind kind, IReadOnlyCollection<Guid> excluded)
+        {
+            foreach (var item in work.ToArray())
+            {
+                if (item.Kind != kind || excluded.Contains(item.AccountId)) continue;
+                var retained = work.Where(x => x != item).ToArray();
+                work.Clear();
+                foreach (var value in retained) work.Enqueue(value);
+                return item;
+            }
+            return null;
+        }
+
+        public async Task ExecuteAsync(CoordinatedWork operation, CancellationToken cancellationToken = default)
+        {
+            Executed.Add(operation);
+            var value = Interlocked.Increment(ref concurrent);
+            MaximumCombinedConcurrency = Math.Max(MaximumCombinedConcurrency, value + 1);
+            if (value + 1 >= expectedConcurrent) release.TrySetResult();
+            await release.Task.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken);
+            Interlocked.Decrement(ref concurrent);
         }
     }
 }

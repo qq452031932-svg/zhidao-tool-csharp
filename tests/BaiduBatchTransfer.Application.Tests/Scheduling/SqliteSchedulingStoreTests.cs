@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Application.Tests.Jobs;
@@ -848,8 +849,6 @@ public sealed class SqliteSchedulingStoreTests
     }
 
     [Theory]
-    [InlineData("ExpiredLogin", "The account session has expired.")]
-    [InlineData("VerificationRequired", "Account verification is required.")]
     [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
     [InlineData("InvalidTargetPath", "The target path is invalid.")]
     [InlineData("InvalidLink", "The share link is invalid.")]
@@ -1390,9 +1389,9 @@ public sealed class SqliteSchedulingStoreTests
     }
 
     [Theory]
-    [InlineData("ExpiredLogin", "The account session has expired.")]
-    [InlineData("VerificationRequired", "Account verification is required.")]
-    public async Task PreSubmissionSessionPauseResumesSameOperationWithoutDuplicate(string code, string message)
+    [InlineData("ExpiredLogin")]
+    [InlineData("VerificationRequired")]
+    public async Task PreSubmissionSessionPauseResumesSameOperationWithoutDuplicate(string code)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
         var batch = Guid.NewGuid();
@@ -1407,18 +1406,26 @@ public sealed class SqliteSchedulingStoreTests
         Assert.NotNull(first);
         await store.MarkPreparingAsync(first.OperationId, Now.AddSeconds(1));
 
-        await store.PauseAccountBeforeSubmissionAsync(first.OperationId, code, message, Now.AddSeconds(2));
+        await store.PauseForAccountInterventionAsync(
+            first.OperationId,
+            code == "ExpiredLogin"
+                ? TransferPauseReason.AccountSessionUnavailable
+                : TransferPauseReason.AccountVerificationRequired,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            Now,
+            Now.AddSeconds(2));
 
         Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
-        Assert.Equal("Waiting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
-        Assert.Equal("Unoccupied", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
         Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
         Assert.Equal(account, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
-        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations"));
 
         await ExecuteAsync(db, "UPDATE Accounts SET Status='Active' WHERE Id=$id;", ("$id", account.ToString("D")));
+        Assert.True(await store.ResumePausedBeforeSubmissionAsync(first.OperationId, Now.AddSeconds(3)));
         var resumed = await store.TryReserveNextAsync(batch, Now.AddMinutes(1), Now.AddMinutes(6));
 
         Assert.Equal(first.OperationId, resumed?.OperationId);
@@ -1426,9 +1433,299 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
     }
 
+    [Fact]
+    public async Task PausedTransferPreventsTaskCountBatchFinalizationUntilExplicitResume()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved");
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        await store.PauseAccountBeforeSubmissionAsync(
+            operation.Id,
+            "ExpiredLogin",
+            "The account session has expired.",
+            Now.AddSeconds(2));
+
+        var outcome = await store.TryFinalizeExhaustedBatchAsync(batch, Now.AddSeconds(3));
+
+        Assert.Equal(BatchExhaustionOutcome.TemporarilyBlocked, outcome);
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM BatchJobs"));
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+    }
+
+    [Theory]
+    [InlineData(TransferPauseReason.AccountSessionUnavailable, SubmissionAcceptance.DefinitelyNotAccepted, "ExpiredLogin", "ResultReceived")]
+    [InlineData(TransferPauseReason.AccountSessionUnavailable, SubmissionAcceptance.Unknown, "ExpiredLogin", "PendingConfirmation")]
+    [InlineData(TransferPauseReason.AccountVerificationRequired, SubmissionAcceptance.DefinitelyNotAccepted, "VerificationRequired", "ResultReceived")]
+    [InlineData(TransferPauseReason.AccountVerificationRequired, SubmissionAcceptance.Unknown, "VerificationRequired", "PendingConfirmation")]
+    [InlineData(TransferPauseReason.UserInterventionRequired, SubmissionAcceptance.DefinitelyNotAccepted, "UserInterventionRequired", "ResultReceived")]
+    [InlineData(TransferPauseReason.UserInterventionRequired, SubmissionAcceptance.Unknown, "UserInterventionRequired", "PendingConfirmation")]
+    public async Task PostSubmissionInterventionPauseReleasesLeaseButRetainsBindingSlotAndEvidence(
+        TransferPauseReason reason,
+        SubmissionAcceptance acceptance,
+        string expectedCode,
+        string expectedSubmitState)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Submitting", "Submitting", "Reserved", "{\"safe\":true}") with
+        {
+            AdapterRequestId = "request-1",
+            RemoteItemIdsJson = "[\"remote-1\"]",
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+            LeaseExpiresAt = Now.AddMinutes(5),
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        IOperationExecutionStore store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.PauseForAccountInterventionAsync(operation.Id, reason, acceptance, Now, Now.AddSeconds(1));
+
+        Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal(expectedSubmitState, await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(account, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts"));
+        Assert.Equal("{\"safe\":true}", await ScalarStringAsync(db, "SELECT ConfirmationDescriptorJson FROM TransferOperations"));
+        Assert.Equal("request-1", await ScalarStringAsync(db, "SELECT AdapterRequestId FROM TransferOperations"));
+        Assert.Equal("[\"remote-1\"]", await ScalarStringAsync(db, "SELECT RemoteItemIdsJson FROM TransferOperations"));
+        Assert.Equal(expectedCode, await ScalarStringAsync(db, "SELECT LastErrorCode FROM TransferOperations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM TransferOperations WHERE LeaseExpiresAt IS NOT NULL"));
+    }
+
+    [Theory]
+    [InlineData(SubmissionAcceptance.DefinitelyNotAccepted, "Waiting", "Released", 0, 0)]
+    [InlineData(SubmissionAcceptance.Unknown, "ResultPending", "Reserved", 1, 1)]
+    public async Task ExplicitResumeRoutesPausedSubmissionWithoutBlindRetry(
+        SubmissionAcceptance acceptance,
+        string expectedStatus,
+        string expectedSlotState,
+        long expectedReservedCount,
+        long expectedEvidenceCount)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Submitting", "Submitting", "Reserved", "{\"safe\":true}") with
+        {
+            AdapterRequestId = "request-1",
+            RemoteItemIdsJson = "[\"remote-1\"]",
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+            LeaseExpiresAt = Now.AddMinutes(5),
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        await store.PauseForAccountInterventionAsync(
+            operation.Id,
+            TransferPauseReason.AccountSessionUnavailable,
+            acceptance,
+            Now,
+            Now.AddSeconds(1));
+        await ExecuteAsync(db, "UPDATE Accounts SET Status='Active' WHERE Id=$id;", ("$id", account.ToString("D")));
+
+        Assert.True(await store.ResumePausedAsync(operation.Id, Now.AddSeconds(2)));
+
+        Assert.Equal(expectedStatus, await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal(expectedSlotState, await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal(expectedReservedCount, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(expectedEvidenceCount, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM TransferOperations WHERE ConfirmationDescriptorJson IS NOT NULL AND AdapterRequestId IS NOT NULL AND RemoteItemIdsJson IS NOT NULL AND SubmitStartedAt IS NOT NULL"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts"));
+    }
+
+    [Fact]
+    public async Task DefinitelyNotAcceptedPauseCannotDowngradeExistingResultPendingEvidence()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "ResultPending", "PendingConfirmation", "Reserved", "{\"safe\":true}") with
+        {
+            AdapterRequestId = "request-1",
+            RemoteItemIdsJson = "[\"remote-1\"]",
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.PauseForAccountInterventionAsync(
+            operation.Id,
+            TransferPauseReason.AccountSessionUnavailable,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            Now,
+            Now.AddSeconds(1)));
+
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal("ResultPending", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("PendingConfirmation", await ScalarStringAsync(db, "SELECT SubmitState FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal("{\"safe\":true}", await ScalarStringAsync(db, "SELECT ConfirmationDescriptorJson FROM TransferOperations"));
+        Assert.Equal("request-1", await ScalarStringAsync(db, "SELECT AdapterRequestId FROM TransferOperations"));
+        Assert.Equal("[\"remote-1\"]", await ScalarStringAsync(db, "SELECT RemoteItemIdsJson FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT CandidateStatus FROM ResourceItems"));
+        Assert.Equal(account, await ScalarGuidAsync(db, "SELECT ReservedAccountId FROM ResourceItems WHERE Id=$id", resource.Id));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT DailyExecutedCount FROM Accounts"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT COUNT(*) FROM Accounts WHERE LastValidatedAt IS NULL"));
+        Assert.Equal(1L, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM TransferOperations WHERE LastErrorCode IS NULL AND LastErrorMessage IS NULL"));
+        Assert.False(await store.ResumePausedAsync(operation.Id, Now.AddSeconds(2)));
+        Assert.NotNull(await ((IOperationReconciliationStore)store).LoadPendingAsync(operation.Id));
+    }
+
+    [Fact]
+    public async Task SaveFailureObservedOnOldSessionDoesNotInvalidateNewActiveLoginButStillPausesOperation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null);
+        var observedSession = Now;
+        var refreshedLogin = Now.AddMinutes(1);
+        await db.SeedAsync([Account(account, 0) with { LastValidatedAt = observedSession }],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [resource],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var reserved = Assert.IsType<ScheduledOperation>(await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5)));
+        var adapter = new ReloginDuringSaveAdapter(async () =>
+            await ExecuteAsync(db,
+                "UPDATE Accounts SET Status='Active',LastValidatedAt=$validated WHERE Id=$id;",
+                ("$validated", refreshedLogin.ToString("O")), ("$id", account.ToString("D"))));
+        var session = new AccountSession(account, "baidu-user",
+            [new SessionCookie("BDUSS", "secret", ".baidu.com", "/", null, true, true)], observedSession);
+        var executor = new OperationExecutor(
+            adapter,
+            new FixedSessionStore(session),
+            store,
+            new AccountDailyLimitService(store, new FixedTimeProvider(Now)),
+            RetryPolicy.Default,
+            new NoDelay(),
+            new FixedTimeProvider(Now));
+
+        await executor.ExecuteAsync(reserved.OperationId);
+
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal(refreshedLogin, DateTimeOffset.Parse(await ScalarStringAsync(db, "SELECT LastValidatedAt FROM Accounts")));
+    }
+
+    [Fact]
+    public async Task PauseWithoutObservedSessionDoesNotInvalidateActiveAccountButStillPausesOperation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved");
+        await db.SeedAsync([Account(account, 0) with { LastValidatedAt = Now }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        IOperationExecutionStore store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.PauseForAccountInterventionAsync(
+            operation.Id,
+            TransferPauseReason.AccountSessionUnavailable,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            observedSessionCapturedAtUtc: null,
+            Now.AddSeconds(1));
+
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal(Now, DateTimeOffset.Parse(await ScalarStringAsync(db, "SELECT LastValidatedAt FROM Accounts")));
+    }
+
+    [Fact]
+    public async Task PauseObservedOnCurrentSessionInvalidatesAccountWithoutChangingValidationVersion()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved");
+        var lastValidated = Now.AddMinutes(-1);
+        await db.SeedAsync([Account(account, 0) with { LastValidatedAt = lastValidated }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        IOperationExecutionStore store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.PauseForAccountInterventionAsync(
+            operation.Id,
+            TransferPauseReason.AccountSessionUnavailable,
+            SubmissionAcceptance.DefinitelyNotAccepted,
+            observedSessionCapturedAtUtc: Now,
+            Now.AddSeconds(1));
+
+        Assert.Equal("Paused", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Invalid", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal(lastValidated, DateTimeOffset.Parse(await ScalarStringAsync(db, "SELECT LastValidatedAt FROM Accounts")));
+    }
+
     [Theory]
     [InlineData("ExpiredLogin", "The account session has expired.")]
     [InlineData("VerificationRequired", "Account verification is required.")]
+    public async Task SessionInterventionCannotUseDefiniteFailureReleasePath(string code, string message)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Reserved") with { ReservedAccountId = account };
+        var operation = Operation(resource, account, 1, "Submitting", "Submitting", "Reserved", "{}") with
+        {
+            DailyCountedAt = Now,
+            SubmitStartedAt = Now,
+        };
+        await db.SeedAsync([Account(account, 0) with { DailyExecutedCount = 1 }],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource],
+            operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.MarkDefiniteAccountFailureAsync(operation.Id, code, message, Now.AddSeconds(1)));
+
+        Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+        Assert.Equal("Submitting", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db, "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
+    }
+
+    [Theory]
     [InlineData("InsufficientCapacity", "The account has insufficient capacity.")]
     [InlineData("InvalidTargetPath", "The target path is invalid.")]
     public async Task DefiniteAccountFailureAfterSubmitIsFinalAndReleasesItsSlot(string code, string message)
@@ -1617,8 +1914,8 @@ public sealed class SqliteSchedulingStoreTests
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => store.MarkDefiniteAccountFailureAsync(
             operation.Id,
-            "ExpiredLogin",
-            "The account session has expired.",
+            "InsufficientCapacity",
+            "The account has insufficient capacity.",
             Now));
 
         Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts WHERE Id='" + account.ToString("D") + "'"));
@@ -1709,6 +2006,57 @@ public sealed class SqliteSchedulingStoreTests
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class FixedSessionStore(AccountSession? session) : IBaiduSessionStore
+    {
+        public Task<AccountSession?> LoadAsync(string accountId, CancellationToken cancellationToken) =>
+            Task.FromResult(session);
+
+        public Task SaveAsync(AccountSession value, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task RemoveAsync(string accountId, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class NoDelay : IAsyncDelay
+    {
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class ReloginDuringSaveAdapter(Func<Task> beforeFailure) : IBaiduNetdiskAdapter
+    {
+        public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(
+            AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(
+            AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(
+            AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(
+            AccountSession session, RemotePath path, CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<RemoteDirectory>.Success(new RemoteDirectory("directory-id", path)));
+
+        public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(
+            AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public async Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(
+            AccountSession session,
+            ShareReference share,
+            RemoteDirectory destination,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken)
+        {
+            await beforeFailure();
+            return BaiduAdapterResult<TransferReceipt>.Failure(
+                BaiduErrorKind.ExpiredLogin,
+                "private response",
+                submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+
+        public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(
+            AccountSession session, TransferConfirmationQuery query, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
     private static async Task<string> ExplainDetailsAsync(SqliteCommand command)
