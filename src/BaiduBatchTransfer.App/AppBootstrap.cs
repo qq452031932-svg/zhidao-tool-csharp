@@ -4,6 +4,7 @@ using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Transfers;
+using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
@@ -123,6 +124,8 @@ public static class AppBootstrap
         services.AddSingleton<BatchStatisticsQuery>();
         services.AddSingleton<BatchHistoryQuery>();
         services.AddSingleton<IWorkspaceBatchHistorySource, WorkspaceBatchHistorySource>();
+        services.AddSingleton<IRemoteResourcePicker, UnavailableRemoteResourcePicker>();
+        services.AddSingleton<IStandaloneShareStore, UnavailableStandaloneShareStore>();
         services.AddSingleton<PauseBatchService>();
         services.AddSingleton<ResumeBatchService>();
         services.AddSingleton<RetryFailedTransferService>();
@@ -375,6 +378,8 @@ public sealed class AppShellFactory(
     RetryFailedTransferService retryFailedTransferService,
     IWorkspaceBatchHistorySource batchHistorySource,
     ITransferResultDestinationSink resultDestinationSink,
+    IRemoteResourcePicker remoteResourcePicker,
+    IStandaloneShareStore standaloneShareStore,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -466,18 +471,22 @@ public sealed class AppShellFactory(
             (batchJobId, token) => handoff.ActivateJobAsync(batchJobId, token),
             transferOptions);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
-        var shareWorkspace = new System.Windows.Controls.ContentControl
-        {
-            Content = new System.Windows.Controls.TextBlock
-            {
-                Text = "分享功能将在此工作区提供。",
-                TextWrapping = System.Windows.TextWrapping.Wrap,
-            },
-        };
+        var shareViewModel = new ShareWorkspaceViewModel(
+            accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
+            remoteResourcePicker,
+            standaloneShareStore,
+            resultSaveDialog);
+        var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,
             accountSummaryProvider,
-            wizardViewModel.ReloadAccounts,
+            snapshot =>
+            {
+                wizardViewModel.ReloadAccounts(snapshot);
+                shareViewModel.ReloadAccounts(snapshot
+                    .Select(account => new ShareAccountOption(account.AccountId, account.DisplayName))
+                    .ToArray());
+            },
             DispatchOnUiAsync);
         mainViewModel = new MainWindowViewModel(
             transferWorkspace,
@@ -510,6 +519,7 @@ public sealed class AppShellFactory(
         async Task HandleLoadedAsync()
         {
             await runPanelViewModel.InitializeAsync(shellLifetime.Token).ConfigureAwait(true);
+            await shareViewModel.InitializeAsync(shellLifetime.Token).ConfigureAwait(true);
             await handoff.RestorePendingAsync().ConfigureAwait(true);
             await DispatchOnUiAsync(() =>
             {
@@ -529,6 +539,7 @@ public sealed class AppShellFactory(
             mainWindow.Loaded -= OnLoaded;
             mainWindow.Closed -= OnClosed;
             transferViewModel.Dispose();
+            shareViewModel.Dispose();
             handoff.Dispose();
             shellLifetime.Dispose();
         }

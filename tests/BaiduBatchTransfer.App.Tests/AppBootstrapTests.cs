@@ -3,6 +3,7 @@ using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Transfers;
+using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
@@ -61,6 +62,10 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<RetryFailedTransferService>());
         Assert.IsType<InMemoryTransferResultDestinationSink>(
             host.Services.GetRequiredService<ITransferResultDestinationSink>());
+        Assert.IsType<UnavailableRemoteResourcePicker>(
+            host.Services.GetRequiredService<IRemoteResourcePicker>());
+        Assert.IsType<UnavailableStandaloneShareStore>(
+            host.Services.GetRequiredService<IStandaloneShareStore>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
@@ -149,7 +154,7 @@ public sealed class AppBootstrapTests : IDisposable
             "AppBootstrap.cs"));
 
         Assert.Contains("var transferWorkspace = new TransferWorkspaceView(transferViewModel)", bootstrap);
-        Assert.Contains("var shareWorkspace = new System.Windows.Controls.ContentControl", bootstrap);
+        Assert.Contains("var shareWorkspace = new ShareWorkspaceView(shareViewModel)", bootstrap);
         Assert.Contains("transferWorkspace,", bootstrap);
         Assert.Contains("shareWorkspace,", bootstrap);
         Assert.DoesNotContain("mainViewModel.ShowResults", bootstrap);
