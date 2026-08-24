@@ -4,9 +4,25 @@ using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteWebAutomationAttemptStore(SqliteConnectionFactory factory) : IWebAutomationAttemptStore
+public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
 {
-    private readonly SqliteConnectionFactory factory = factory ?? throw new ArgumentNullException(nameof(factory));
+    private readonly SqliteConnectionFactory factory;
+    private readonly int maximumBaselineItemCount;
+    private readonly int baselineReadPageSize;
+
+    public SqliteWebAutomationAttemptStore(
+        SqliteConnectionFactory factory,
+        int maximumBaselineItemCount = 100_000,
+        int baselineReadPageSize = 1_000)
+    {
+        this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
+        if (maximumBaselineItemCount < 1)
+            throw new ArgumentOutOfRangeException(nameof(maximumBaselineItemCount));
+        if (baselineReadPageSize is < 1 or > 10_000)
+            throw new ArgumentOutOfRangeException(nameof(baselineReadPageSize));
+        this.maximumBaselineItemCount = maximumBaselineItemCount;
+        this.baselineReadPageSize = baselineReadPageSize;
+    }
 
     public async Task<bool> BeginAsync(
         WebAutomationAttemptRecord attempt,
@@ -107,6 +123,8 @@ public sealed class SqliteWebAutomationAttemptStore(SqliteConnectionFactory fact
         if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
         ArgumentNullException.ThrowIfNull(baseline);
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        if (baseline.Items.Length > maximumBaselineItemCount)
+            throw new ArgumentOutOfRangeException(nameof(baseline), "WEB_BASELINE_TOO_LARGE");
 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
@@ -222,7 +240,7 @@ public sealed class SqliteWebAutomationAttemptStore(SqliteConnectionFactory fact
         WebAutomationAttemptState.ResultPending or WebAutomationAttemptState.Succeeded or
         WebAutomationAttemptState.NeedsDecision;
 
-    private static async Task<WebAutomationAttemptRecord?> LoadAsync(
+    private async Task<WebAutomationAttemptRecord?> LoadAsync(
         SqliteConnection connection,
         SqliteTransaction? transaction,
         Guid operationId,
@@ -265,18 +283,51 @@ public sealed class SqliteWebAutomationAttemptStore(SqliteConnectionFactory fact
         WebAutomationBaseline? baseline = null;
         if (baselineFingerprint is not null)
         {
+            if (baselineCount < 0 || baselineCount > maximumBaselineItemCount)
+                throw new InvalidDataException("WEB_BASELINE_COUNT_OUT_OF_RANGE");
+            await using (var count = connection.CreateCommand())
+            {
+                count.Transaction = transaction;
+                count.CommandText = """
+                    SELECT COUNT(*) FROM WebAutomationAttemptRemoteItems
+                    WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation;
+                    """;
+                AddIdentity(count, operationId, accountId, generation);
+                if (Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != baselineCount)
+                    throw new InvalidDataException("WEB_BASELINE_COUNT_MISMATCH");
+            }
             var items = new List<RemoteItemIdentity>(baselineCount);
-            await using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
-                SELECT RemoteItemId,DisplayName FROM WebAutomationAttemptRemoteItems
-                WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
-                ORDER BY ItemOrdinal LIMIT 100000;
-                """;
-            AddIdentity(command, operationId, accountId, generation);
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                items.Add(new RemoteItemIdentity(reader.GetString(0), reader.GetString(1)));
+            var afterOrdinal = -1;
+            while (items.Count < baselineCount)
+            {
+                var read = 0;
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    SELECT ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName FROM WebAutomationAttemptRemoteItems
+                    WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+                      AND ItemOrdinal>$after
+                    ORDER BY ItemOrdinal LIMIT $take;
+                    """;
+                AddIdentity(command, operationId, accountId, generation);
+                command.Parameters.AddWithValue("$after", afterOrdinal);
+                command.Parameters.AddWithValue("$take", Math.Min(baselineReadPageSize, baselineCount - items.Count));
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var ordinal = reader.GetInt32(0);
+                    if (ordinal != items.Count)
+                        throw new InvalidDataException("WEB_BASELINE_ORDINAL_MISMATCH");
+                    var exactId = reader.GetString(1);
+                    if (!reader.GetFieldValue<byte[]>(2).AsSpan().SequenceEqual(
+                            RemoteItemIdentitySet.GetCanonicalSortKey(exactId)))
+                        throw new InvalidDataException("WEB_BASELINE_CANONICAL_SORT_KEY_MISMATCH");
+                    items.Add(new RemoteItemIdentity(exactId, reader.GetString(3)));
+                    afterOrdinal = ordinal;
+                    read++;
+                }
+                if (read == 0) break;
+            }
             if (items.Count != baselineCount) throw new InvalidDataException("WEB_BASELINE_COUNT_MISMATCH");
             baseline = WebAutomationBaseline.Create(items);
             if (!string.Equals(baseline.Fingerprint, baselineFingerprint, StringComparison.Ordinal))

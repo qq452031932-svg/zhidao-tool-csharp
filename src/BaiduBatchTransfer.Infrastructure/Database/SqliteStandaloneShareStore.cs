@@ -14,6 +14,10 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(envelope);
+        var resultDirectory = LocalResultDirectoryReference.Normalize(
+            envelope.Batch.ResultDirectoryReference, nameof(envelope));
+        if (!string.Equals(resultDirectory, envelope.Batch.ResultDirectoryReference, StringComparison.Ordinal))
+            throw new ArgumentException("STANDALONE_SHARE_RESULT_DIRECTORY_NOT_NORMALIZED", nameof(envelope));
         if (envelope.Operations.Length > MaximumOperationsPerBatch)
             throw new ArgumentOutOfRangeException(nameof(envelope), "STANDALONE_SHARE_BATCH_TOO_LARGE");
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -140,7 +144,7 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
                 UPDATE StandaloneShareOperations
                 SET Generation=Generation+1,Status='Queued',SubmissionState='NotStarted',SubmissionAcceptance='Unknown',
                     BaselineFingerprint=NULL,BaselineShareCount=NULL,BaselineCompletedAt=NULL,
-                    LeaseExpiresAt=NULL,LastErrorCode=NULL,Revision=Revision+1,UpdatedAt=$updated
+                    LeaseOwnerId=NULL,LeaseExpiresAt=NULL,LastErrorCode=NULL,Revision=Revision+1,UpdatedAt=$updated
                 WHERE Id=$id AND Generation=$generation AND Revision=$revision AND Status='Failed'
                   AND SubmissionState IN ('NotStarted','DefinitelyNotAccepted');
                 """;
@@ -171,15 +175,17 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
 
     public async Task<StandaloneShareOperationLease?> TryLeaseNextAsync(
         Guid batchId,
+        Guid leaseOwnerId,
         DateTimeOffset now,
         DateTimeOffset leaseExpiresAt,
         CancellationToken cancellationToken = default)
     {
         ValidateBatchId(batchId);
+        ValidateLeaseOwner(leaseOwnerId);
         if (leaseExpiresAt <= now) throw new ArgumentOutOfRangeException(nameof(leaseExpiresAt));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
-        Guid operationId;
+        StandaloneShareOperationRecord candidate;
         await using (var select = connection.CreateCommand())
         {
             select.Transaction = transaction;
@@ -199,18 +205,28 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return null;
             }
-            operationId = Guid.Parse((string)raw);
+            var operationId = Guid.Parse((string)raw);
+            candidate = await LoadOperationAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException("STANDALONE_SHARE_LEASE_CANDIDATE_MISSING");
         }
         await using (var update = connection.CreateCommand())
         {
             update.Transaction = transaction;
             update.CommandText = """
                 UPDATE StandaloneShareOperations
-                SET Status='Preparing',LeaseGeneration=LeaseGeneration+1,LeaseExpiresAt=$expires,
+                SET Status='Preparing',LeaseGeneration=LeaseGeneration+1,LeaseOwnerId=$owner,LeaseExpiresAt=$expires,
                     Revision=Revision+1,UpdatedAt=$now
-                WHERE Id=$id AND Status='Queued' AND LeaseExpiresAt IS NULL;
+                WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation
+                  AND LeaseGeneration=$lease AND Revision=$revision AND Status='Queued'
+                  AND LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL;
                 """;
-            update.Parameters.AddWithValue("$id", operationId.ToString("D"));
+            update.Parameters.AddWithValue("$id", candidate.Id.ToString("D"));
+            update.Parameters.AddWithValue("$batch", candidate.BatchId.ToString("D"));
+            update.Parameters.AddWithValue("$account", candidate.AccountId.ToString("D"));
+            update.Parameters.AddWithValue("$generation", candidate.Generation);
+            update.Parameters.AddWithValue("$lease", candidate.LeaseGeneration);
+            update.Parameters.AddWithValue("$revision", candidate.Revision);
+            update.Parameters.AddWithValue("$owner", leaseOwnerId.ToString("D"));
             update.Parameters.AddWithValue("$expires", leaseExpiresAt.ToUniversalTime().ToString("O"));
             update.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
             if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
@@ -230,25 +246,180 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             batch.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
             await batch.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
-        var operation = await LoadOperationAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false)
+        var operation = await LoadOperationAsync(connection, transaction, candidate.Id, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("STANDALONE_SHARE_LEASE_MISSING");
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new(operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            operation.LeaseGeneration, operation.Revision, operation.LeaseExpiresAt!.Value);
+            operation.LeaseGeneration, operation.LeaseOwnerId!.Value, operation.Revision, operation.LeaseExpiresAt!.Value);
+    }
+
+    public async Task<int> RecoverExpiredLeasesAsync(
+        DateTimeOffset now,
+        int maximumCount,
+        CancellationToken cancellationToken = default)
+    {
+        if (maximumCount is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(maximumCount));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var ids = new List<Guid>(maximumCount);
+        await using (var select = connection.CreateCommand())
+        {
+            select.Transaction = transaction;
+            select.CommandText = """
+                SELECT Id FROM StandaloneShareOperations
+                WHERE Status IN ('Preparing','Submitting','ResultPending')
+                  AND LeaseOwnerId IS NOT NULL AND LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt<=$now
+                ORDER BY LeaseExpiresAt,Id LIMIT $take;
+                """;
+            select.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
+            select.Parameters.AddWithValue("$take", maximumCount);
+            await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) ids.Add(Guid.Parse(reader.GetString(0)));
+        }
+
+        var recovered = 0;
+        foreach (var id in ids)
+        {
+            var operation = await LoadOperationAsync(connection, transaction, id, cancellationToken).ConfigureAwait(false);
+            if (operation?.LeaseOwnerId is null || operation.LeaseExpiresAt is null || operation.LeaseExpiresAt > now)
+                continue;
+
+            var safePreparing = operation.Status == StandaloneShareOperationStatus.Preparing &&
+                operation.SubmissionState is StandaloneShareSubmissionState.NotStarted or
+                    StandaloneShareSubmissionState.Prepared &&
+                operation.SubmissionAcceptance == SubmissionAcceptance.Unknown;
+            var completeBaseline = operation.BaselineFingerprint is not null &&
+                operation.BaselineShareCount is not null && operation.BaselineCompletedAt is not null;
+            var reconcile = operation.Status is StandaloneShareOperationStatus.Submitting or
+                    StandaloneShareOperationStatus.ResultPending &&
+                completeBaseline && operation.SubmissionAcceptance == SubmissionAcceptance.Unknown;
+            var nextStatus = safePreparing
+                ? StandaloneShareOperationStatus.Queued
+                : reconcile ? StandaloneShareOperationStatus.ResultPending : StandaloneShareOperationStatus.NeedsDecision;
+
+            await using var update = connection.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = safePreparing
+                ? """
+                    UPDATE StandaloneShareOperations
+                    SET Generation=Generation+1,Status='Queued',SubmissionState='NotStarted',
+                        SubmissionAcceptance='Unknown',BaselineFingerprint=NULL,BaselineShareCount=NULL,
+                        BaselineCompletedAt=NULL,LeaseOwnerId=NULL,LeaseExpiresAt=NULL,LastErrorCode=NULL,
+                        Revision=Revision+1,UpdatedAt=$now
+                    WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation
+                      AND LeaseGeneration=$lease AND LeaseOwnerId=$owner AND Revision=$revision
+                      AND Status=$status AND LeaseExpiresAt=$expires AND LeaseExpiresAt<=$now;
+                    """
+                : """
+                    UPDATE StandaloneShareOperations
+                    SET Status=$next,SubmissionState=CASE WHEN $next='ResultPending' THEN 'ResultPending' ELSE SubmissionState END,
+                        LeaseOwnerId=NULL,LeaseExpiresAt=NULL,Revision=Revision+1,UpdatedAt=$now
+                    WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation
+                      AND LeaseGeneration=$lease AND LeaseOwnerId=$owner AND Revision=$revision
+                      AND Status=$status AND LeaseExpiresAt=$expires AND LeaseExpiresAt<=$now;
+                    """;
+            update.Parameters.AddWithValue("$id", operation.Id.ToString("D"));
+            update.Parameters.AddWithValue("$batch", operation.BatchId.ToString("D"));
+            update.Parameters.AddWithValue("$account", operation.AccountId.ToString("D"));
+            update.Parameters.AddWithValue("$generation", operation.Generation);
+            update.Parameters.AddWithValue("$lease", operation.LeaseGeneration);
+            update.Parameters.AddWithValue("$owner", operation.LeaseOwnerId.Value.ToString("D"));
+            update.Parameters.AddWithValue("$revision", operation.Revision);
+            update.Parameters.AddWithValue("$status", operation.Status.ToString());
+            update.Parameters.AddWithValue("$expires", operation.LeaseExpiresAt.Value.ToUniversalTime().ToString("O"));
+            update.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
+            if (!safePreparing) update.Parameters.AddWithValue("$next", nextStatus.ToString());
+            recovered += await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return recovered;
+    }
+
+    public async Task<StandaloneShareOperationLease?> TryClaimReconciliationAsync(
+        Guid batchId,
+        Guid leaseOwnerId,
+        DateTimeOffset now,
+        DateTimeOffset leaseExpiresAt,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateBatchId(batchId);
+        ValidateLeaseOwner(leaseOwnerId);
+        if (leaseExpiresAt <= now) throw new ArgumentOutOfRangeException(nameof(leaseExpiresAt));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        Guid? id = null;
+        await using (var select = connection.CreateCommand())
+        {
+            select.Transaction = transaction;
+            select.CommandText = """
+                SELECT operation.Id FROM StandaloneShareOperations operation
+                JOIN StandaloneShareBatches batch ON batch.Id=operation.BatchId
+                JOIN Accounts account ON account.Id=operation.AccountId
+                WHERE operation.BatchId=$batch AND operation.Status='ResultPending'
+                  AND operation.LeaseOwnerId IS NULL AND operation.LeaseExpiresAt IS NULL
+                  AND batch.Status IN ('Queued','Active')
+                  AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0
+                ORDER BY operation.SequenceNumber,operation.Id LIMIT 1;
+                """;
+            select.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+            var raw = await select.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if (raw is not null) id = Guid.Parse((string)raw);
+        }
+        if (id is null)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+        var candidate = await LoadOperationAsync(connection, transaction, id.Value, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("STANDALONE_SHARE_RECONCILIATION_CANDIDATE_MISSING");
+        await using (var update = connection.CreateCommand())
+        {
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE StandaloneShareOperations
+                SET LeaseGeneration=LeaseGeneration+1,LeaseOwnerId=$newOwner,LeaseExpiresAt=$newExpires,
+                    Revision=Revision+1,UpdatedAt=$now
+                WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation
+                  AND LeaseGeneration=$lease AND Revision=$revision AND Status='ResultPending'
+                  AND LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL;
+                """;
+            update.Parameters.AddWithValue("$id", candidate.Id.ToString("D"));
+            update.Parameters.AddWithValue("$batch", candidate.BatchId.ToString("D"));
+            update.Parameters.AddWithValue("$account", candidate.AccountId.ToString("D"));
+            update.Parameters.AddWithValue("$generation", candidate.Generation);
+            update.Parameters.AddWithValue("$lease", candidate.LeaseGeneration);
+            update.Parameters.AddWithValue("$revision", candidate.Revision);
+            update.Parameters.AddWithValue("$newOwner", leaseOwnerId.ToString("D"));
+            update.Parameters.AddWithValue("$newExpires", leaseExpiresAt.ToUniversalTime().ToString("O"));
+            update.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                return null;
+            }
+        }
+        var claimed = await LoadOperationAsync(connection, transaction, candidate.Id, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("STANDALONE_SHARE_RECONCILIATION_LEASE_MISSING");
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return new(claimed.Id, claimed.BatchId, claimed.AccountId, claimed.Generation,
+            claimed.LeaseGeneration, claimed.LeaseOwnerId!.Value, claimed.Revision, claimed.LeaseExpiresAt!.Value);
     }
 
     public async Task<bool> TryCompleteBaselineAsync(
         Guid operationId,
+        Guid batchId,
         Guid accountId,
         int generation,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
         long expectedRevision,
         IReadOnlyCollection<string> existingShareIds,
         string baselineFingerprint,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default)
     {
-        ValidateOperationIdentity(operationId, accountId, generation, expectedLeaseGeneration, expectedRevision);
+        ValidateOperationIdentity(operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision);
         ArgumentNullException.ThrowIfNull(existingShareIds);
         ValidateFingerprint(baselineFingerprint, nameof(baselineFingerprint));
         var baseline = existingShareIds.OrderBy(value => value, StringComparer.Ordinal).ToArray();
@@ -258,7 +429,8 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var current = await LoadOperationAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
-        if (!MatchesLease(current, accountId, generation, expectedLeaseGeneration, expectedRevision,
+        if (!MatchesLease(current, batchId, accountId, generation, expectedLeaseGeneration,
+                expectedLeaseOwnerId, expectedRevision,
                 StandaloneShareOperationStatus.Preparing) || current!.SubmissionState != StandaloneShareSubmissionState.NotStarted)
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -283,11 +455,13 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             UPDATE StandaloneShareOperations
             SET SubmissionState='Prepared',BaselineFingerprint=$fingerprint,BaselineShareCount=$count,
                 BaselineCompletedAt=$updated,Revision=Revision+1,UpdatedAt=$updated
-            WHERE Id=$id AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+            WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+              AND LeaseOwnerId=$owner
               AND Revision=$revision AND Status='Preparing' AND SubmissionState='NotStarted'
               AND LeaseExpiresAt>=$updated;
             """;
-        AddOperationCas(update, operationId, accountId, generation, expectedLeaseGeneration, expectedRevision);
+        AddOperationCas(update, operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision);
         update.Parameters.AddWithValue("$fingerprint", baselineFingerprint);
         update.Parameters.AddWithValue("$count", baseline.Length);
         update.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
@@ -328,39 +502,47 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
     }
 
     public Task<bool> TryMarkSubmittingAsync(
-        Guid operationId, Guid accountId, int generation, long expectedLeaseGeneration,
-        long expectedRevision, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) =>
-        TransitionAsync(operationId, accountId, generation, expectedLeaseGeneration, expectedRevision,
+        Guid operationId, Guid batchId, Guid accountId, int generation, long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId, long expectedRevision, DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        TransitionAsync(operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision,
             StandaloneShareOperationStatus.Preparing, StandaloneShareSubmissionState.Prepared,
             StandaloneShareOperationStatus.Submitting, StandaloneShareSubmissionState.Accepted,
             SubmissionAcceptance.Unknown, updatedAt, cancellationToken);
 
     public Task<bool> TryMarkResultPendingAsync(
-        Guid operationId, Guid accountId, int generation, long expectedLeaseGeneration,
-        long expectedRevision, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) =>
-        TransitionAsync(operationId, accountId, generation, expectedLeaseGeneration, expectedRevision,
+        Guid operationId, Guid batchId, Guid accountId, int generation, long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId, long expectedRevision, DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        TransitionAsync(operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision,
             StandaloneShareOperationStatus.Submitting, StandaloneShareSubmissionState.Accepted,
             StandaloneShareOperationStatus.ResultPending, StandaloneShareSubmissionState.ResultPending,
             SubmissionAcceptance.Unknown, updatedAt, cancellationToken);
 
     public async Task<bool> TryFailAsync(
         Guid operationId,
+        Guid batchId,
         Guid accountId,
         int generation,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
         long expectedRevision,
         SubmissionAcceptance submissionAcceptance,
         string sanitizedErrorCode,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default)
     {
-        ValidateOperationIdentity(operationId, accountId, generation, expectedLeaseGeneration, expectedRevision);
+        ValidateOperationIdentity(operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision);
         if (!Enum.IsDefined(submissionAcceptance)) throw new ArgumentOutOfRangeException(nameof(submissionAcceptance));
         var error = LocalResultExportValidation.SanitizedErrorCode(sanitizedErrorCode, nameof(sanitizedErrorCode));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var current = await LoadOperationAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
-        if (!MatchesLease(current, accountId, generation, expectedLeaseGeneration, expectedRevision,
+        if (!MatchesLease(current, batchId, accountId, generation, expectedLeaseGeneration,
+                expectedLeaseOwnerId, expectedRevision,
                 current?.Status ?? StandaloneShareOperationStatus.Cancelled))
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -371,13 +553,15 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         command.CommandText = """
             UPDATE StandaloneShareOperations
             SET Status='Failed',SubmissionState=$submission,SubmissionAcceptance=$acceptance,
-                LastErrorCode=$error,LeaseExpiresAt=NULL,Revision=Revision+1,UpdatedAt=$updated
-            WHERE Id=$id AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+                LastErrorCode=$error,LeaseOwnerId=NULL,LeaseExpiresAt=NULL,Revision=Revision+1,UpdatedAt=$updated
+            WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+              AND LeaseOwnerId=$owner
               AND Revision=$revision AND LeaseExpiresAt>=$updated AND UpdatedAt<=$updated
               AND (($acceptance='DefinitelyNotAccepted' AND Status='Preparing' AND SubmissionState IN ('NotStarted','Prepared'))
                 OR ($acceptance='Unknown' AND Status IN ('Submitting','ResultPending')));
             """;
-        AddOperationCas(command, operationId, accountId, generation, expectedLeaseGeneration, expectedRevision);
+        AddOperationCas(command, operationId, batchId, accountId, generation, expectedLeaseGeneration,
+            expectedLeaseOwnerId, expectedRevision);
         command.Parameters.AddWithValue("$acceptance", submissionAcceptance.ToString());
         command.Parameters.AddWithValue("$submission", submissionAcceptance == SubmissionAcceptance.DefinitelyNotAccepted
             ? StandaloneShareSubmissionState.DefinitelyNotAccepted.ToString()
@@ -398,18 +582,19 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
     public async Task<bool> TryAcceptResultAsync(
         StandaloneShareResultRecord result,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
         long expectedRevision,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default)
     {
         ValidateResult(result);
-        ValidateOperationIdentity(result.OperationId, result.AccountId, result.Generation,
-            expectedLeaseGeneration, expectedRevision);
+        ValidateOperationIdentity(result.OperationId, result.BatchId, result.AccountId, result.Generation,
+            expectedLeaseGeneration, expectedLeaseOwnerId, expectedRevision);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var operation = await LoadOperationAsync(connection, transaction, result.OperationId, cancellationToken).ConfigureAwait(false);
-        if (!MatchesLease(operation, result.AccountId, result.Generation, expectedLeaseGeneration,
-                expectedRevision, StandaloneShareOperationStatus.ResultPending) ||
+        if (!MatchesLease(operation, result.BatchId, result.AccountId, result.Generation, expectedLeaseGeneration,
+                expectedLeaseOwnerId, expectedRevision, StandaloneShareOperationStatus.ResultPending) ||
             !string.Equals(operation!.ExactRemoteItems.Fingerprint, result.ExactItemSetFingerprint, StringComparison.Ordinal))
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -443,13 +628,14 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             update.Transaction = transaction;
             update.CommandText = """
                 UPDATE StandaloneShareOperations
-                SET Status='Succeeded',SubmissionState='Completed',LeaseExpiresAt=NULL,LastErrorCode=NULL,
+                SET Status='Succeeded',SubmissionState='Completed',LeaseOwnerId=NULL,LeaseExpiresAt=NULL,LastErrorCode=NULL,
                     Revision=Revision+1,UpdatedAt=$updated
-                WHERE Id=$id AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+                WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+                  AND LeaseOwnerId=$owner
                   AND Revision=$revision AND Status='ResultPending' AND LeaseExpiresAt>=$updated;
                 """;
-            AddOperationCas(update, result.OperationId, result.AccountId, result.Generation,
-                expectedLeaseGeneration, expectedRevision);
+            AddOperationCas(update, result.OperationId, result.BatchId, result.AccountId, result.Generation,
+                expectedLeaseGeneration, expectedLeaseOwnerId, expectedRevision);
             update.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
             if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             {
@@ -523,23 +709,25 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
     }
 
     private async Task<bool> TransitionAsync(
-        Guid operationId, Guid accountId, int generation, long leaseGeneration, long revision,
+        Guid operationId, Guid batchId, Guid accountId, int generation, long leaseGeneration,
+        Guid leaseOwnerId, long revision,
         StandaloneShareOperationStatus currentStatus, StandaloneShareSubmissionState currentSubmission,
         StandaloneShareOperationStatus nextStatus, StandaloneShareSubmissionState nextSubmission,
         SubmissionAcceptance acceptance, DateTimeOffset updatedAt, CancellationToken cancellationToken)
     {
-        ValidateOperationIdentity(operationId, accountId, generation, leaseGeneration, revision);
+        ValidateOperationIdentity(operationId, batchId, accountId, generation, leaseGeneration, leaseOwnerId, revision);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = """
             UPDATE StandaloneShareOperations
             SET Status=$nextStatus,SubmissionState=$nextSubmission,SubmissionAcceptance=$acceptance,
                 Revision=Revision+1,UpdatedAt=$updated
-            WHERE Id=$id AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+            WHERE Id=$id AND BatchId=$batch AND AccountId=$account AND Generation=$generation AND LeaseGeneration=$lease
+              AND LeaseOwnerId=$owner
               AND Revision=$revision AND Status=$currentStatus AND SubmissionState=$currentSubmission
               AND LeaseExpiresAt>=$updated AND UpdatedAt<=$updated;
             """;
-        AddOperationCas(command, operationId, accountId, generation, leaseGeneration, revision);
+        AddOperationCas(command, operationId, batchId, accountId, generation, leaseGeneration, leaseOwnerId, revision);
         command.Parameters.AddWithValue("$nextStatus", nextStatus.ToString());
         command.Parameters.AddWithValue("$nextSubmission", nextSubmission.ToString());
         command.Parameters.AddWithValue("$acceptance", acceptance.ToString());
@@ -587,9 +775,9 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
                 INSERT INTO StandaloneShareOperations(
                   Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,ExactItemSetFingerprint,
                   Generation,Status,SubmissionState,SubmissionAcceptance,BaselineFingerprint,BaselineShareCount,
-                  BaselineCompletedAt,LeaseGeneration,LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt)
+                  BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt)
                 VALUES($id,$batch,$account,$sequence,$display,$kind,$path,$fingerprint,$generation,$status,$submission,
-                  $acceptance,NULL,NULL,NULL,0,NULL,NULL,$revision,$created,$updated);
+                  $acceptance,NULL,NULL,NULL,0,NULL,NULL,NULL,$revision,$created,$updated);
                 """;
             command.Parameters.AddWithValue("$id", operation.Id.ToString("D"));
             command.Parameters.AddWithValue("$batch", operation.BatchId.ToString("D"));
@@ -695,30 +883,34 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         DateTimeOffset? leaseExpires;
         DateTimeOffset? baselineCompleted;
         int? baselineCount;
+        Guid? leaseOwnerId;
         await using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
             command.CommandText = """
                 SELECT Id,BatchId,AccountId,DisplayName,ResourceKind,ParentPath,Status,SubmissionState,
                        SubmissionAcceptance,ExactItemSetFingerprint,Generation,SequenceNumber,Revision,
-                       BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LeaseGeneration,LeaseExpiresAt,
+                       BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,
                        LastErrorCode,CreatedAt,UpdatedAt
                 FROM StandaloneShareOperations WHERE Id=$id;
                 """;
             command.Parameters.AddWithValue("$id", operationId.ToString("D"));
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
-            values = Enumerable.Range(0, 21).Select(index => reader.IsDBNull(index)
+            values = Enumerable.Range(0, 22).Select(index => reader.IsDBNull(index)
                 ? ""
                 : Convert.ToString(reader.GetValue(index), System.Globalization.CultureInfo.InvariantCulture)!).ToArray();
             revision = reader.GetInt64(12);
             baselineCount = reader.IsDBNull(14) ? null : reader.GetInt32(14);
             baselineCompleted = reader.IsDBNull(15) ? null : Parse(reader.GetString(15));
             leaseGeneration = reader.GetInt64(16);
-            leaseExpires = reader.IsDBNull(17) ? null : Parse(reader.GetString(17));
-            created = Parse(reader.GetString(19));
-            updated = Parse(reader.GetString(20));
+            leaseOwnerId = reader.IsDBNull(17) ? null : Guid.Parse(reader.GetString(17));
+            leaseExpires = reader.IsDBNull(18) ? null : Parse(reader.GetString(18));
+            created = Parse(reader.GetString(20));
+            updated = Parse(reader.GetString(21));
         }
+        if ((leaseOwnerId is null) != (leaseExpires is null))
+            throw new InvalidDataException("STANDALONE_SHARE_LEASE_EVIDENCE_MISMATCH");
         RemoteItemIdentity item;
         await using (var command = connection.CreateCommand())
         {
@@ -749,8 +941,9 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             BaselineShareCount = baselineCount,
             BaselineCompletedAt = baselineCompleted,
             LeaseGeneration = leaseGeneration,
+            LeaseOwnerId = leaseOwnerId,
             LeaseExpiresAt = leaseExpires,
-            LastErrorCode = string.IsNullOrEmpty(values[18]) ? null : values[18],
+            LastErrorCode = string.IsNullOrEmpty(values[19]) ? null : values[19],
         };
     }
 
@@ -792,29 +985,35 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
     }
 
     private static bool MatchesLease(
-        StandaloneShareOperationRecord? operation, Guid accountId, int generation,
-        long leaseGeneration, long revision, StandaloneShareOperationStatus status) =>
-        operation is not null && operation.AccountId == accountId && operation.Generation == generation &&
+        StandaloneShareOperationRecord? operation, Guid batchId, Guid accountId, int generation,
+        long leaseGeneration, Guid leaseOwnerId, long revision, StandaloneShareOperationStatus status) =>
+        operation is not null && operation.BatchId == batchId && operation.AccountId == accountId && operation.Generation == generation &&
         operation.LeaseGeneration == leaseGeneration && operation.Revision == revision &&
-        operation.Status == status && operation.LeaseExpiresAt is not null;
+        operation.LeaseOwnerId == leaseOwnerId && operation.Status == status && operation.LeaseExpiresAt is not null;
 
     private static void AddOperationCas(
-        SqliteCommand command, Guid operationId, Guid accountId, int generation, long leaseGeneration, long revision)
+        SqliteCommand command, Guid operationId, Guid batchId, Guid accountId, int generation,
+        long leaseGeneration, Guid leaseOwnerId, long revision)
     {
         command.Parameters.AddWithValue("$id", operationId.ToString("D"));
+        command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$generation", generation);
         command.Parameters.AddWithValue("$lease", leaseGeneration);
+        command.Parameters.AddWithValue("$owner", leaseOwnerId.ToString("D"));
         command.Parameters.AddWithValue("$revision", revision);
     }
 
     private static void ValidateOperationIdentity(
-        Guid operationId, Guid accountId, int generation, long leaseGeneration, long revision)
+        Guid operationId, Guid batchId, Guid accountId, int generation, long leaseGeneration,
+        Guid leaseOwnerId, long revision)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
+        ValidateBatchId(batchId);
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
         if (generation < 1) throw new ArgumentOutOfRangeException(nameof(generation));
         if (leaseGeneration < 1) throw new ArgumentOutOfRangeException(nameof(leaseGeneration));
+        ValidateLeaseOwner(leaseOwnerId);
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
     }
 
@@ -843,6 +1042,11 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
     private static void ValidateBatchId(Guid batchId)
     {
         if (batchId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchId));
+    }
+
+    private static void ValidateLeaseOwner(Guid leaseOwnerId)
+    {
+        if (leaseOwnerId == Guid.Empty) throw new ArgumentException("A lease owner is required.", nameof(leaseOwnerId));
     }
 
     private static DateTimeOffset Parse(string value) =>

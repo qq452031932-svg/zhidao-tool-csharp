@@ -28,13 +28,14 @@ CREATE TABLE StandaloneShareOperations (
     ParentPath TEXT NOT NULL,
     ExactItemSetFingerprint TEXT NOT NULL,
     Generation INTEGER NOT NULL DEFAULT 1 CHECK(Generation > 0),
-    Status TEXT NOT NULL CHECK(Status IN ('Queued','Reserved','Preparing','Submitting','ResultPending','Succeeded','Failed','Paused','Cancelled')),
+    Status TEXT NOT NULL CHECK(Status IN ('Queued','Reserved','Preparing','Submitting','ResultPending','NeedsDecision','Succeeded','Failed','Paused','Cancelled')),
     SubmissionState TEXT NOT NULL CHECK(SubmissionState IN ('NotStarted','Prepared','DefinitelyNotAccepted','Accepted','ResultPending','Completed')),
     SubmissionAcceptance TEXT NOT NULL DEFAULT 'Unknown' CHECK(SubmissionAcceptance IN ('Unknown','DefinitelyNotAccepted')),
     BaselineFingerprint TEXT NULL,
     BaselineShareCount INTEGER NULL CHECK(BaselineShareCount IS NULL OR BaselineShareCount >= 0),
     BaselineCompletedAt TEXT NULL,
     LeaseGeneration INTEGER NOT NULL DEFAULT 0 CHECK(LeaseGeneration >= 0),
+    LeaseOwnerId TEXT NULL,
     LeaseExpiresAt TEXT NULL,
     LastErrorCode TEXT NULL,
     Revision INTEGER NOT NULL DEFAULT 0 CHECK(Revision >= 0),
@@ -45,7 +46,9 @@ CREATE TABLE StandaloneShareOperations (
     UNIQUE(BatchId, SequenceNumber),
     UNIQUE(Id, BatchId, AccountId, Generation),
     CHECK((BaselineCompletedAt IS NULL AND BaselineFingerprint IS NULL AND BaselineShareCount IS NULL)
-       OR (BaselineCompletedAt IS NOT NULL AND BaselineFingerprint IS NOT NULL AND BaselineShareCount IS NOT NULL))
+       OR (BaselineCompletedAt IS NOT NULL AND BaselineFingerprint IS NOT NULL AND BaselineShareCount IS NOT NULL)),
+    CHECK((LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL)
+       OR (LeaseOwnerId IS NOT NULL AND LeaseExpiresAt IS NOT NULL))
 );
 
 CREATE INDEX IX_StandaloneShareOperations_Lease

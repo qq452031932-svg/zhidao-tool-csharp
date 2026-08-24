@@ -22,6 +22,7 @@ public enum StandaloneShareOperationStatus
     Preparing,
     Submitting,
     ResultPending,
+    NeedsDecision,
     Succeeded,
     Failed,
     Paused,
@@ -50,14 +51,14 @@ public sealed record StandaloneShareBatchRecord
         DateTimeOffset updatedAt)
     {
         if (id == Guid.Empty) throw new ArgumentException("A batch id is required.", nameof(id));
-        ArgumentException.ThrowIfNullOrWhiteSpace(resultDirectoryReference);
         if (!Enum.IsDefined(status)) throw new ArgumentOutOfRangeException(nameof(status));
         if (operationCount <= 0) throw new ArgumentOutOfRangeException(nameof(operationCount));
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         if (updatedAt < createdAt) throw new ArgumentOutOfRangeException(nameof(updatedAt));
 
         Id = id;
-        ResultDirectoryReference = resultDirectoryReference.Trim();
+        ResultDirectoryReference = LocalResultDirectoryReference.Normalize(
+            resultDirectoryReference, nameof(resultDirectoryReference));
         Status = status;
         OperationCount = operationCount;
         Revision = revision;
@@ -154,6 +155,7 @@ public sealed record StandaloneShareOperationRecord
     public DateTimeOffset? BaselineCompletedAt { get; init; }
     public long LeaseGeneration { get; init; }
     public DateTimeOffset? LeaseExpiresAt { get; init; }
+    public Guid? LeaseOwnerId { get; init; }
     public string? LastErrorCode { get; init; }
 
     public bool CanSafelyRetry => Status == StandaloneShareOperationStatus.Failed &&
@@ -195,11 +197,12 @@ public sealed record StandaloneShareOperationLease(
     Guid AccountId,
     int Generation,
     long LeaseGeneration,
+    Guid LeaseOwnerId,
     long Revision,
     DateTimeOffset LeaseExpiresAt)
 {
     public override string ToString() =>
-        $"StandaloneShareOperationLease {{ OperationId = {OperationId}, BatchId = {BatchId}, AccountId = {AccountId}, Generation = {Generation}, LeaseGeneration = {LeaseGeneration}, Revision = {Revision}, LeaseExpiresAt = [REDACTED] }}";
+        $"StandaloneShareOperationLease {{ OperationId = {OperationId}, BatchId = {BatchId}, AccountId = {AccountId}, Generation = {Generation}, LeaseGeneration = {LeaseGeneration}, LeaseOwnerId = [REDACTED], Revision = {Revision}, LeaseExpiresAt = [REDACTED] }}";
 }
 
 public sealed record StandaloneShareResultRecord(

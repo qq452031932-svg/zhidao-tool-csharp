@@ -128,6 +128,45 @@ public sealed class OwnedRemoteSelectionTests
     }
 
     [Fact]
+    public void StandaloneBatch_NormalizesLocalResultDirectoryAndRedactsIt()
+    {
+        var secret = Path.Combine(Path.GetTempPath(), "secret", "..", "results");
+
+        var batch = StandaloneShareBatchRecord.Create(
+            Guid.NewGuid(), secret, operationCount: 1, DateTimeOffset.UtcNow);
+
+        Assert.Equal(Path.GetFullPath(secret), batch.ResultDirectoryReference);
+        Assert.DoesNotContain(secret, batch.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED]", batch.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("relative\\results")]
+    [InlineData("https://example.test/results")]
+    [InlineData("http://example.test/results")]
+    [InlineData("file:///C:/results")]
+    [InlineData("C:\\results\u0001private")]
+    [InlineData("C:\\results\0private")]
+    public void StandaloneBatch_RejectsNonLocalOrUnsafeResultDirectoryWithoutEchoingIt(string value)
+    {
+        var error = Assert.Throws<ArgumentException>(() => StandaloneShareBatchRecord.Create(
+            Guid.NewGuid(), value, operationCount: 1, DateTimeOffset.UtcNow));
+
+        Assert.DoesNotContain(value, error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void StandaloneBatch_RejectsRootOnlyResultDirectory()
+    {
+        var root = Path.GetPathRoot(Path.GetTempPath())!;
+
+        var error = Assert.Throws<ArgumentException>(() => StandaloneShareBatchRecord.Create(
+            Guid.NewGuid(), root, operationCount: 1, DateTimeOffset.UtcNow));
+
+        Assert.DoesNotContain(root, error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void StandaloneRecords_RejectInvalidDurableState()
     {
         var now = DateTimeOffset.UtcNow;

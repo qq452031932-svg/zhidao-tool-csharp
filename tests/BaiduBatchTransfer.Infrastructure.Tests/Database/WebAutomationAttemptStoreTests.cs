@@ -33,6 +33,67 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task BaselineReadPagesPastTheOldPerQueryBoundaryWithoutTruncation()
+    {
+        var graph = await CreateAsync(baselineReadPageSize: 2);
+        var ids = Enumerable.Range(1, 5).Select(index => $"before-{index}").ToArray();
+        await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
+        Assert.True(await graph.Store.TryPersistBaselineAsync(
+            graph.OperationId, graph.AccountId, 1, 0,
+            ExactBaseline(ids), Fingerprint('d'), graph.Now.AddSeconds(1)));
+
+        var reopened = new SqliteWebAutomationAttemptStore(
+            graph.Factory, maximumBaselineItemCount: 100, baselineReadPageSize: 2);
+        var restored = await reopened.GetAsync(graph.OperationId, graph.AccountId, 1);
+
+        Assert.Equal(ids, restored!.BaselineRemoteItems.Select(item => item.ExactId));
+        Assert.Equal(5, restored.Baseline!.Items.Length);
+    }
+
+    [Fact]
+    public async Task OversizedBaselineIsRejectedBeforeAnyEvidenceIsWritten()
+    {
+        var graph = await CreateAsync(maximumBaselineItemCount: 2);
+        await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => graph.Store.TryPersistBaselineAsync(
+            graph.OperationId, graph.AccountId, 1, 0,
+            ExactBaseline("one", "two", "three"), Fingerprint('e'), graph.Now.AddSeconds(1)));
+
+        var unchanged = await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.Preparing, unchanged!.State);
+        Assert.Equal(0, unchanged.Revision);
+        Assert.Null(unchanged.Baseline);
+        Assert.Equal(0L, await ScalarAsync(graph.Factory,
+            "SELECT COUNT(*) FROM WebAutomationAttemptRemoteItems;"));
+    }
+
+    [Fact]
+    public async Task CorruptCanonicalSortKeyCannotMasqueradeAsAnExactBaseline()
+    {
+        var graph = await CreateAsync();
+        await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
+        Assert.True(await graph.Store.TryPersistBaselineAsync(
+            graph.OperationId, graph.AccountId, 1, 0,
+            ExactBaseline("before"), Fingerprint('f'), graph.Now.AddSeconds(1)));
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE WebAutomationAttemptRemoteItems SET CanonicalSortKey=X'00';";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new SqliteWebAutomationAttemptStore(graph.Factory).GetAsync(
+                graph.OperationId, graph.AccountId, 1));
+
+        Assert.Equal("WEB_BASELINE_CANONICAL_SORT_KEY_MISMATCH", error.Message);
+    }
+
+    [Fact]
     public async Task Advance_RejectsOldGenerationWrongAccountStaleRevisionAndInvalidTransition()
     {
         var graph = await CreateAsync();
@@ -94,16 +155,27 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
 
     private static string Fingerprint(char value) => new(value, 64);
 
-    private async Task<Graph> CreateAsync()
+    private async Task<Graph> CreateAsync(
+        int maximumBaselineItemCount = 100_000,
+        int baselineReadPageSize = 1_000)
     {
         Directory.CreateDirectory(root);
         var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"));
         await new DatabaseMigrator(factory,
             new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         return new Graph(
-            new SqliteWebAutomationAttemptStore(factory),
+            new SqliteWebAutomationAttemptStore(factory, maximumBaselineItemCount, baselineReadPageSize),
+            factory,
             Guid.NewGuid(), Guid.NewGuid(),
             new DateTimeOffset(2026, 8, 25, 0, 0, 0, TimeSpan.Zero));
+    }
+
+    private static async Task<long> ScalarAsync(SqliteConnectionFactory factory, string sql)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
     }
 
     public void Dispose()
@@ -113,6 +185,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
 
     private sealed record Graph(
         SqliteWebAutomationAttemptStore Store,
+        SqliteConnectionFactory Factory,
         Guid OperationId,
         Guid AccountId,
         DateTimeOffset Now);

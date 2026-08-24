@@ -12,6 +12,10 @@ public sealed class SqliteLocalResultDestinationStore(SqliteConnectionFactory fa
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(destination);
+        var directoryReference = LocalResultDirectoryReference.Normalize(
+            destination.DirectoryReference, nameof(destination));
+        if (!string.Equals(directoryReference, destination.DirectoryReference, StringComparison.Ordinal))
+            throw new ArgumentException("RESULT_DESTINATION_NOT_NORMALIZED", nameof(destination));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         await using (var owner = connection.CreateCommand())
