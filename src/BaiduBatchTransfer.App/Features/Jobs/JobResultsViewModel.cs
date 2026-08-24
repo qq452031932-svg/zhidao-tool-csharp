@@ -117,7 +117,16 @@ public sealed class JobResultsViewModel : ObservableObject
     public IAsyncRelayCommand SaveAsCommand { get; }
     public IRelayCommand CancelSaveCommand { get; }
 
-    public async Task InitializeAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default)
+    public Task InitializeAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default) =>
+        InitializeCoreAsync(requestedBatchJobId, propagateFailure: false, cancellationToken);
+
+    public Task InitializeForHandoffAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default) =>
+        InitializeCoreAsync(requestedBatchJobId, propagateFailure: true, cancellationToken);
+
+    private async Task InitializeCoreAsync(
+        Guid requestedBatchJobId,
+        bool propagateFailure,
+        CancellationToken cancellationToken)
     {
         if (requestedBatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(requestedBatchJobId));
         var capturedGeneration = Interlocked.Increment(ref generation);
@@ -146,10 +155,12 @@ public sealed class JobResultsViewModel : ObservableObject
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             if (capturedGeneration == generation) StatusMessage = "读取任务结果已取消。";
+            if (propagateFailure) throw;
         }
         catch (Exception)
         {
             if (capturedGeneration == generation) StatusMessage = "任务结果读取失败，请稍后重试。";
+            if (propagateFailure) throw;
         }
         finally
         {

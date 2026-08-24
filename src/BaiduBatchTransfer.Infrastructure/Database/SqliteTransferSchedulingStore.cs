@@ -167,7 +167,9 @@ public sealed class SqliteTransferSchedulingStore :
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         RetryFailedTransferSnapshot? snapshot;
-        await using (var read = Command(connection, transaction, """
+        var safeRetryPredicate = SqliteRetryFailedTransferSafety.Predicate(
+            "o", "b", "r", "a", "account", "output", "settings");
+        await using (var read = Command(connection, transaction, $"""
             SELECT o.BatchJobId,o.AssignedAccountId,o.Status,o.OutcomeKind,o.AttemptCount,o.UpdatedAt,
               o.SubmitState,o.TargetSlotState,o.DailyCountedAt,o.ConfirmationDescriptorJson,o.SubmitStartedAt,
               o.AdapterRequestId,o.RemoteItemIdsJson,o.LeaseExpiresAt,b.Status,r.CandidateStatus,
@@ -183,11 +185,15 @@ public sealed class SqliteTransferSchedulingStore :
                   AND waiting.Status='Waiting' AND waiting.TargetSlotState IN ('Unoccupied','Released')
                   AND waitingResource.CandidateStatus='Reserved'
                   AND waitingResource.ReservedAccountId=o.AssignedAccountId),o.ResourceItemId,
-              EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id)
+              EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id),
+              CASE WHEN {safeRetryPredicate} THEN 1 ELSE 0 END
             FROM TransferOperations o
             JOIN BatchJobs b ON b.Id=o.BatchJobId
             JOIN ResourceItems r ON r.Id=o.ResourceItemId
             JOIN AccountAllocations a ON a.BatchJobId=o.BatchJobId AND a.AccountId=o.AssignedAccountId
+            JOIN Accounts account ON account.Id=o.AssignedAccountId
+            LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId
+            LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=o.BatchJobId
             WHERE o.Id=$id;
             """))
         {
@@ -202,7 +208,8 @@ public sealed class SqliteTransferSchedulingStore :
                     reader.GetString(15), reader.GetString(16), ReadString(reader, 17), reader.GetInt32(18),
                     reader.GetInt64(19) != 0, reader.GetInt64(20) != 0, reader.GetString(21),
                     reader.GetInt32(22), reader.GetInt32(23), reader.GetInt32(24), reader.GetInt32(25),
-                    reader.GetInt32(26), Guid.Parse(reader.GetString(27)), reader.GetInt64(28) != 0)
+                    reader.GetInt32(26), Guid.Parse(reader.GetString(27)), reader.GetInt64(28) != 0,
+                    reader.GetInt64(29) != 0)
                 : null;
         }
 
@@ -231,33 +238,17 @@ public sealed class SqliteTransferSchedulingStore :
             return RetryFailedTransferDisposition.NeedsReconciliation;
         }
 
-        var batchMayRun = snapshot.BatchStatus is "Active" or "Queued" or "Paused" or "CompletedWithShortfall";
-        var sharePlan = await ReadRetrySharePlanAsync(
-            connection, transaction, snapshot.BatchJobId, snapshot.AccountId, cancellationToken).ConfigureAwait(false);
-        var sharePlanIsConsistent = !snapshot.HasAnyShareOperation &&
-                                    (sharePlan is null || !sharePlan.ShareEnabled ||
-                                     (!string.IsNullOrWhiteSpace(sharePlan.SettingsFingerprint) &&
-                                      sharePlan.PlannedShareCount > 0 &&
-                                      sharePlan.CreatedShareOperationCount < sharePlan.PlannedShareCount &&
-                                      sharePlan.BatchShareOperationCount == sharePlan.CurrentBatchShareOperationCount));
-        var freeSuccessSlots = (long)snapshot.EffectiveTargetSuccessCount - snapshot.FulfilledCount -
-                               snapshot.ReservedSlotCount - snapshot.WaitingSlotDemand;
-        var restoreSuccessCapacity = snapshot.QuotaBasis == "SuccessTarget" && freeSuccessSlots <= 0;
-        var successCapacityIsAvailable = snapshot.QuotaBasis != "SuccessTarget" ||
-                                         freeSuccessSlots > 0 ||
-                                         snapshot.EffectiveTargetSuccessCount < snapshot.TargetSuccessCount;
-        var durableFailureIsConsistent = snapshot.OutcomeKind == "Failed" &&
-                                         snapshot.TargetSlotState == "Released" && snapshot.LeaseExpiresAt is null &&
-                                         snapshot.CandidateStatus == "Expanded" && snapshot.GlobalValidityStatus != "Invalid" &&
-                                         snapshot.ReservedAccountId is null && snapshot.FailedItemCount > 0 &&
-                                         snapshot.AccountIsEligible && !snapshot.HasAdvancedShareOperation &&
-                                         snapshot.AttemptCount < int.MaxValue &&
-                                         successCapacityIsAvailable && sharePlanIsConsistent;
-        if (!batchMayRun || !durableFailureIsConsistent)
+        if (!snapshot.CanSafelyRetry)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return RetryFailedTransferDisposition.NotRetryable;
         }
+
+        var sharePlan = await ReadRetrySharePlanAsync(
+            connection, transaction, snapshot.BatchJobId, snapshot.AccountId, cancellationToken).ConfigureAwait(false);
+        var freeSuccessSlots = (long)snapshot.EffectiveTargetSuccessCount - snapshot.FulfilledCount -
+                               snapshot.ReservedSlotCount - snapshot.WaitingSlotDemand;
+        var restoreSuccessCapacity = snapshot.QuotaBasis == "SuccessTarget" && freeSuccessSlots <= 0;
 
         await using (var operation = Command(connection, transaction, """
             UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='PreparingToSubmit',
@@ -2017,7 +2008,8 @@ public sealed class SqliteTransferSchedulingStore :
         int ReservedSlotCount,
         int WaitingSlotDemand,
         Guid ResourceItemId,
-        bool HasAnyShareOperation);
+        bool HasAnyShareOperation,
+        bool CanSafelyRetry);
 
     private sealed record RetrySharePlan(
         bool ShareEnabled,

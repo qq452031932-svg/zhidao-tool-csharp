@@ -82,6 +82,137 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
 
         Assert.True(page.Items.Single(item => item.OperationId == safe.Id).CanSafelyRetryTransfer);
         Assert.False(page.Items.Single(item => item.OperationId == submitted.Id).CanSafelyRetryTransfer);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        Assert.Equal(RetryFailedTransferDisposition.NeedsReconciliation,
+            await store.TryRetryFailedTransferAsync(submitted.Id, BatchTestData.Now.AddMinutes(10)));
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await store.TryRetryFailedTransferAsync(safe.Id, BatchTestData.Now.AddMinutes(10)));
+    }
+
+    [Fact]
+    public async Task ExistingWaitingTransferShareMakesProjectionAndExecutionBothUnsafe()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1);
+        var failed = Operation(batch, resource, account, 1, "Failed", "Failed") with
+        {
+            SubmitState = "NotPrepared",
+            TargetSlotState = "Released",
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "waiting-share")],
+            job: Job(batch) with { Status = "Active", ResourceCount = 1, OperationCount = 1 },
+            resources: [resource],
+            operations: [failed],
+            allocations: [Allocation(batch, account, 1) with { FailedItemCount = 1 }]);
+        await SeedWaitingShareAsync(db, batch, account, failed, resource);
+
+        var page = await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, "Failed", null, null, 10));
+        var disposition = await new SqliteTransferSchedulingStore(db.ConnectionFactory)
+            .TryRetryFailedTransferAsync(failed.Id, BatchTestData.Now.AddMinutes(10));
+
+        Assert.False(Assert.Single(page.Items).CanSafelyRetryTransfer);
+        Assert.Equal(RetryFailedTransferDisposition.NotRetryable, disposition);
+    }
+
+    [Theory]
+    [InlineData(2, 1, 1, true)]
+    [InlineData(2, 2, 1, true)]
+    [InlineData(1, 1, 1, false)]
+    public async Task SuccessTargetCapacityBoundaryIsIdenticalForProjectionAndExecution(
+        int target,
+        int effective,
+        int fulfilled,
+        bool expectedSafe)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1);
+        var failed = Operation(batch, resource, account, 1, "Failed", "Failed") with
+        {
+            SubmitState = "NotPrepared",
+            TargetSlotState = "Released",
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "success-capacity")],
+            job: Job(batch) with
+            {
+                Status = "Active",
+                QuotaBasis = "SuccessTarget",
+                ResourceCount = 1,
+                OperationCount = 1,
+            },
+            resources: [resource],
+            operations: [failed],
+            allocations:
+            [
+                Allocation(batch, account, 1) with
+                {
+                    TargetSuccessCount = target,
+                    EffectiveTargetSuccessCount = effective,
+                    FulfilledCount = fulfilled,
+                    FailedItemCount = 1,
+                },
+            ]);
+
+        var projected = Assert.Single((await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, "Failed", null, null, 10))).Items).CanSafelyRetryTransfer;
+        var disposition = await new SqliteTransferSchedulingStore(db.ConnectionFactory)
+            .TryRetryFailedTransferAsync(failed.Id, BatchTestData.Now.AddMinutes(10));
+
+        Assert.Equal(expectedSafe, projected);
+        Assert.Equal(expectedSafe, disposition == RetryFailedTransferDisposition.Requeued);
+    }
+
+    [Fact]
+    public async Task ConsistentAutomaticSharePlanIsSafeAndRetryRecreatesWaitingShare()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1);
+        var failed = Operation(batch, resource, account, 1, "Failed", "Failed") with
+        {
+            SubmitState = "NotPrepared",
+            TargetSlotState = "Released",
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "share-plan")],
+            job: Job(batch) with { Status = "Active", ResourceCount = 1, OperationCount = 1 },
+            resources: [resource],
+            operations: [failed],
+            allocations: [Allocation(batch, account, 1) with { FailedItemCount = 1 }]);
+        await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, """
+                INSERT INTO BatchShareSettings(
+                  BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+                  ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+                VALUES($batch,1,1,'Random',NULL,'Ask','settings-fp',$time);
+                INSERT INTO BatchOutputAccounts(
+                  BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,
+                  CreatedShareOperationCount,ShareEnabled)
+                VALUES($batch,$account,1,'账号',1,1,0,1);
+                """,
+                ("$batch", batch.ToString("D")),
+                ("$account", account.ToString("D")),
+                ("$time", BatchTestData.Now.ToString("O")));
+        }
+
+        var projected = Assert.Single((await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, "Failed", null, null, 10))).Items).CanSafelyRetryTransfer;
+        var disposition = await new SqliteTransferSchedulingStore(db.ConnectionFactory)
+            .TryRetryFailedTransferAsync(failed.Id, BatchTestData.Now.AddMinutes(10));
+
+        Assert.True(projected);
+        Assert.Equal(RetryFailedTransferDisposition.Requeued, disposition);
+        Assert.Equal(1, await ScalarIntAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id AND Status='WaitingTransfer';",
+            failed.Id));
     }
 
     [Fact]
@@ -1019,6 +1150,38 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
             ("$error", errorCode ?? (object)DBNull.Value),
             ("$time", BatchTestData.Now.ToString("O")));
         return share;
+    }
+
+    private static async Task SeedWaitingShareAsync(
+        BatchTestDatabase db,
+        Guid batch,
+        Guid account,
+        TransferOperationRecord transfer,
+        ResourceItemRecord resource)
+    {
+        await using var connection = await db.ConnectionFactory.OpenConnectionAsync();
+        await ExecuteAsync(connection, """
+            INSERT INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','settings-fp',$time);
+            INSERT INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'账号',1,1,1);
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
+              AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,
+              SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES($share,$transfer,$resource,$batch,$account,1,'WaitingTransfer',
+              NULL,'settings-fp',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$time,$time);
+            """,
+            ("$batch", batch.ToString("D")),
+            ("$account", account.ToString("D")),
+            ("$share", Guid.NewGuid().ToString("D")),
+            ("$transfer", transfer.Id.ToString("D")),
+            ("$resource", resource.Id.ToString("D")),
+            ("$time", BatchTestData.Now.ToString("O")));
     }
 
     private static IJobResultActions Actions(BatchTestDatabase db) => new JobResultActions(

@@ -1,9 +1,61 @@
 using BaiduBatchTransfer.App;
+using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Services;
 
 namespace BaiduBatchTransfer.App.Tests;
 
 public sealed class ResultWorkspaceHandoffCoordinatorTests
 {
+    [Fact]
+    public async Task ProductionResultsAdapterReturnsTruthfulSuccessFailureAndCancellation()
+    {
+        static (ResultWorkspaceHandoffCoordinator Coordinator, List<Guid> Navigated, List<Exception> Errors)
+            Create(HandoffResultsWorkflow workflow)
+        {
+            var results = new JobResultsViewModel(
+                workflow,
+                new NoResultDialog(),
+                new EnabledCapabilities());
+            var navigated = new List<Guid>();
+            var errors = new List<Exception>();
+            return (new ResultWorkspaceHandoffCoordinator(
+                new JobResultsWorkspaceHandoffOperations(
+                    results,
+                    (batch, _) => { navigated.Add(batch); return Task.CompletedTask; }),
+                errors.Add), navigated, errors);
+        }
+
+        var successful = Create(new(HandoffLoadMode.Success));
+        using (successful.Coordinator)
+        {
+            var batch = Guid.NewGuid();
+            Assert.Equal(ResultWorkspaceHandoffStatus.Succeeded,
+                (await successful.Coordinator.ActivateJobAsync(batch)).Status);
+            Assert.Equal([batch], successful.Navigated);
+            Assert.Empty(successful.Errors);
+        }
+
+        var failed = Create(new(HandoffLoadMode.Failure));
+        using (failed.Coordinator)
+        {
+            Assert.Equal(ResultWorkspaceHandoffStatus.Failed,
+                (await failed.Coordinator.ActivateJobAsync(Guid.NewGuid())).Status);
+            Assert.Empty(failed.Navigated);
+            Assert.Single(failed.Errors);
+        }
+
+        var blockingWorkflow = new HandoffResultsWorkflow(HandoffLoadMode.Block);
+        var cancelled = Create(blockingWorkflow);
+        using (cancelled.Coordinator)
+        using (var cancellation = new CancellationTokenSource())
+        {
+            var activation = cancelled.Coordinator.ActivateJobAsync(Guid.NewGuid(), cancellation.Token);
+            await blockingWorkflow.Started.Task;
+            cancellation.Cancel();
+            Assert.Equal(ResultWorkspaceHandoffStatus.Cancelled, (await activation).Status);
+            Assert.Empty(cancelled.Navigated);
+        }
+    }
     [Fact]
     public async Task NewJobSupersedesAnInFlightRestoreBeforeItCanResolveOrNavigate()
     {
@@ -259,5 +311,42 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
                 SynchronizationContext.SetSynchronizationContext(previousContext);
             }
         }
+    }
+
+    private enum HandoffLoadMode { Success, Failure, Block }
+
+    private sealed class HandoffResultsWorkflow(HandoffLoadMode mode) : IJobResultsWorkflow
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            if (mode == HandoffLoadMode.Failure) throw new InvalidOperationException("private load detail");
+            if (mode == HandoffLoadMode.Block)
+            {
+                Started.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            return new(0, 0, 0, 0);
+        }
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) => Task.FromResult(new JobResultsPage([], 0, null));
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class NoResultDialog : IResultSaveDialog
+    {
+        public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
+    }
+
+    private sealed class EnabledCapabilities : IJobResultCapabilityAvailability
+    {
+        public bool CanUseTransferActions => true;
+        public bool CanUseShareActions => true;
+        public string TransferStatusMessage => string.Empty;
+        public string ShareStatusMessage => string.Empty;
     }
 }

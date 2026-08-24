@@ -356,6 +356,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             total = Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
         }
 
+        var safeRetryPredicate = SqliteRetryFailedTransferSafety.Predicate(
+            "o", "b", "r", "allocation", "a", "output", "settings");
         await using var command = Command(
             "SELECT o.Id,o.ResourceItemId,o.BatchJobId,r.CandidateSequence,o.AllocationOrdinal,r.ShareUrl,r.Note," +
             "o.AssignedAccountId,a.DisplayName,o.TargetPath,o.Status,o.OutcomeKind,o.LastErrorCode,o.LastErrorMessage,o.UpdatedAt,r.ResolvedOutputTitle," +
@@ -368,22 +370,13 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             "COALESCE(output.ShareEnabled,0)," +
             "CASE WHEN s.Id IS NOT NULL AND (s.SubmitStartedAt IS NULL OR s.SubmissionAcceptance='DefinitelyNotAccepted') THEN 1 ELSE 0 END," +
             "s.Generation,s.UpdatedAt,o.AttemptCount," +
-            "CASE WHEN o.Status='Failed' AND o.OutcomeKind='Failed' " +
-            "AND o.SubmitState IN ('NotPrepared','PreparingToSubmit') " +
-            "AND o.DailyCountedAt IS NULL AND o.ConfirmationDescriptorJson IS NULL " +
-            "AND o.SubmitStartedAt IS NULL AND o.AdapterRequestId IS NULL AND o.RemoteItemIdsJson IS NULL " +
-            "AND o.TargetSlotState='Released' AND o.LeaseExpiresAt IS NULL " +
-            "AND r.CandidateStatus='Expanded' AND r.GlobalValidityStatus<>'Invalid' AND r.ReservedAccountId IS NULL " +
-            "AND allocation.FailedItemCount>0 AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 " +
-            "AND b.Status IN ('Active','Queued','Paused','CompletedWithShortfall') " +
-            "AND o.AttemptCount<2147483647 " +
-            "AND NOT EXISTS(SELECT 1 FROM ShareOperations advanced WHERE advanced.TransferOperationId=o.Id AND advanced.Status<>'WaitingTransfer') " +
-            "THEN 1 ELSE 0 END " +
+            $"CASE WHEN {safeRetryPredicate} THEN 1 ELSE 0 END " +
             $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId " +
             "JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId " +
             "JOIN AccountAllocations allocation ON allocation.BatchJobId=o.BatchJobId AND allocation.AccountId=o.AssignedAccountId " +
             "LEFT JOIN ShareOperations s ON s.TransferOperationId=o.Id " +
             "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
+            "LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=o.BatchJobId " +
             "WHERE o.BatchJobId=$job" + filter +
             " AND o.AllocationOrdinal>$after ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT $limit;");
         BindOperationFilters(command, query);

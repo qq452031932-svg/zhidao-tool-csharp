@@ -6,6 +6,19 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class JobResultsViewModelTests
 {
     [Fact]
+    public async Task HandoffLoadPropagatesFailureWhileOrdinaryUiLoadKeepsFriendlyStatus()
+    {
+        var workflow = new ThrowingLoadWorkflow();
+        var vm = Create(workflow);
+
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.Equal("任务结果读取失败，请稍后重试。", vm.StatusMessage);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            vm.InitializeForHandoffAsync(Guid.NewGuid()));
+        Assert.Equal("任务结果读取失败，请稍后重试。", vm.StatusMessage);
+    }
+    [Fact]
     public async Task InitializesWithBoundedPageAndChineseFallbackStatuses()
     {
         var workflow = new FakeWorkflow
@@ -277,6 +290,20 @@ public sealed class JobResultsViewModelTests
             progress.Report(1);
             return 1;
         }
+    }
+
+    private sealed class ThrowingLoadWorkflow : IJobResultsWorkflow
+    {
+        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+            Task.FromException<JobResultsSummary>(new InvalidOperationException("private database detail"));
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new JobResultsPage([], 0, null));
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class DelayedWorkflow(Guid firstBatch, Guid secondBatch) : IJobResultsWorkflow

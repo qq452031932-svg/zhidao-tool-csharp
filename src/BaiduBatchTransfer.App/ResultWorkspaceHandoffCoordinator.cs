@@ -277,7 +277,7 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         CancellationToken CallerCancellation);
 }
 
-internal sealed class JobResultsWorkspaceHandoffOperations(
+public sealed class JobResultsWorkspaceHandoffOperations(
     JobResultsViewModel resultsViewModel,
     Func<Guid, CancellationToken, Task> navigateToResults) : IResultWorkspaceHandoffOperations
 {
@@ -285,7 +285,7 @@ internal sealed class JobResultsWorkspaceHandoffOperations(
         resultsViewModel.FindPendingExistingShareBatchAsync(cancellationToken);
 
     public Task InitializeAsync(Guid batchJobId, CancellationToken cancellationToken) =>
-        resultsViewModel.InitializeAsync(batchJobId, cancellationToken);
+        resultsViewModel.InitializeForHandoffAsync(batchJobId, cancellationToken);
 
     public Task ResolveExistingSharesAsync(Guid batchJobId, CancellationToken cancellationToken) =>
         resultsViewModel.ResolvePendingExistingSharesAsync(batchJobId, cancellationToken);
