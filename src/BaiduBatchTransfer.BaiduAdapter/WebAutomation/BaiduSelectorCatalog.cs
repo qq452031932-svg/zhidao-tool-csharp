@@ -35,7 +35,6 @@ public sealed class BaiduSelectorCatalog
 
     private static readonly ImmutableArray<BaiduSelectorDefinition> NotValidatedDefinitions =
     [
-        Definition(BaiduPageState.Unknown, BaiduAutomationAction.OpenOfficialUri),
         Definition(BaiduPageState.ExternalShareReady, BaiduAutomationAction.SelectExactItems),
         Definition(BaiduPageState.ExternalShareReady, BaiduAutomationAction.ClickSave),
         Definition(BaiduPageState.OwnDriveReady, BaiduAutomationAction.SelectExactItems),
@@ -52,14 +51,27 @@ public sealed class BaiduSelectorCatalog
         DefinitionsByStateAndAction = NotValidatedDefinitions.ToImmutableDictionary(
             definition => (definition.RequiredState, definition.Action));
 
+    private readonly BaiduProtocolValidationStatus validationStatus;
+
     private BaiduSelectorCatalog()
+        : this(BaiduProtocolValidationStatus.NotValidated)
     {
+    }
+
+    internal BaiduSelectorCatalog(BaiduProtocolValidationStatus validationStatus)
+    {
+        if (!Enum.IsDefined(validationStatus))
+            throw new ArgumentOutOfRangeException(nameof(validationStatus));
+
+        this.validationStatus = validationStatus;
     }
 
     public static BaiduSelectorCatalog Production { get; } = new();
 
-    public BaiduProtocolValidationStatus ValidationStatus =>
-        BaiduProtocolValidationStatus.NotValidated;
+    public static BaiduAutomationAction NavigationAction =>
+        BaiduAutomationAction.OpenOfficialUri;
+
+    public BaiduProtocolValidationStatus ValidationStatus => validationStatus;
 
     public ImmutableArray<BaiduSelectorDefinition> Definitions => NotValidatedDefinitions;
 
@@ -131,6 +143,61 @@ public sealed class BaiduSelectorCatalog
         return BaiduAutomationDecision.Allowed();
     }
 
+    public BaiduAutomationDecision AuthorizeNavigation(
+        BaiduNavigationAuthorizationRequest? request)
+    {
+        if (request is null ||
+            !Enum.IsDefined(request.Action) ||
+            request.Action is BaiduAutomationAction.Unspecified)
+        {
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.UnknownAction);
+        }
+
+        if (request.Action is not BaiduAutomationAction.OpenOfficialUri)
+        {
+            return BaiduAutomationDecision.Denied(
+                BaiduAutomationDenialReason.ActionNotAllowedForNavigation);
+        }
+
+        if (!IsAllowedOfficialUri(request.OfficialUri))
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.OfficialUriNotAllowed);
+
+        if (!string.Equals(request.ProtocolVersion, ProtocolVersion, StringComparison.Ordinal) ||
+            !string.Equals(request.Acceptance?.ProtocolVersion, ProtocolVersion, StringComparison.Ordinal))
+        {
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.ProtocolVersionMismatch);
+        }
+
+        if (!string.Equals(request.SelectorVersion, SelectorVersion, StringComparison.Ordinal) ||
+            !string.Equals(request.Acceptance?.SelectorVersion, SelectorVersion, StringComparison.Ordinal))
+        {
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.SelectorVersionMismatch);
+        }
+
+        if (request.Acceptance is not { IsAccepted: true })
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.AcceptanceMissing);
+
+        if (string.IsNullOrWhiteSpace(request.ApplicationBuildVersion) ||
+            !string.Equals(
+                request.ApplicationBuildVersion,
+                request.Acceptance.ApplicationBuildVersion,
+                StringComparison.Ordinal))
+        {
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.BuildVersionMismatch);
+        }
+
+        if (ValidationStatus is not BaiduProtocolValidationStatus.Validated)
+            return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.CatalogNotValidated);
+
+        if (request.FieldEvidenceValidationStatus is not BaiduProtocolValidationStatus.Validated)
+        {
+            return BaiduAutomationDecision.Denied(
+                BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+        }
+
+        return BaiduAutomationDecision.Allowed();
+    }
+
     public override string ToString() =>
         $"BaiduSelectorCatalog {{ ProtocolVersion = [REDACTED], SelectorVersion = [REDACTED], ValidationStatus = {ValidationStatus}, DefinitionCount = {Definitions.Length}, ExecutableLocatorCount = 0, HistoricalReference = [REDACTED] }}";
 
@@ -141,6 +208,18 @@ public sealed class BaiduSelectorCatalog
             action,
             CandidateStrategiesFor(requiredState, action),
             ImmutableArray<string>.Empty);
+
+    private static bool IsAllowedOfficialUri(Uri? uri) =>
+        uri is
+        {
+            IsAbsoluteUri: true,
+            IsDefaultPort: true,
+            HostNameType: UriHostNameType.Dns,
+        } &&
+        string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(uri.IdnHost, "pan.baidu.com", StringComparison.OrdinalIgnoreCase) &&
+        string.IsNullOrEmpty(uri.UserInfo) &&
+        string.IsNullOrEmpty(uri.Fragment);
 
     private static ImmutableArray<BaiduSelectorCandidateStrategy> CandidateStrategiesFor(
         BaiduPageState requiredState,
@@ -153,7 +232,6 @@ public sealed class BaiduSelectorCatalog
 
     private static string StateToken(BaiduPageState state) => state switch
     {
-        BaiduPageState.Unknown => "navigation",
         BaiduPageState.ExternalShareReady => "external-share",
         BaiduPageState.OwnDriveReady => "own-drive",
         BaiduPageState.SaveDestinationReady => "save-destination",

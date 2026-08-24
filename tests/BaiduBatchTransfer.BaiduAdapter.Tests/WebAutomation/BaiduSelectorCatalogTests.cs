@@ -54,7 +54,11 @@ public sealed class BaiduSelectorCatalogTests
 
         Assert.Equal(
             expected.Order(),
-            BaiduSelectorCatalog.Production.Definitions.Select(x => x.Action).Distinct().Order());
+            BaiduSelectorCatalog.Production.Definitions
+                .Select(x => x.Action)
+                .Append(BaiduSelectorCatalog.NavigationAction)
+                .Distinct()
+                .Order());
     }
 
     [Fact]
@@ -73,6 +77,10 @@ public sealed class BaiduSelectorCatalogTests
             definitions,
             definition => definition.RequiredState is BaiduPageState.ExternalShareReady &&
                           definition.Action is BaiduAutomationAction.ClickShare);
+        Assert.DoesNotContain(
+            definitions,
+            definition => definition.RequiredState is BaiduPageState.Unknown ||
+                          definition.Action is BaiduAutomationAction.OpenOfficialUri);
 
         var externalSelectionTokens = definitions.Single(definition =>
                 definition.RequiredState is BaiduPageState.ExternalShareReady &&
@@ -279,6 +287,178 @@ public sealed class BaiduSelectorCatalogTests
         Assert.False(decision.IsAllowed);
         Assert.Equal(BaiduAutomationDenialReason.ActionNotAllowedForState, decision.DenialReason);
     }
+
+    [Fact]
+    public void AuthorizeNavigation_ValidOfficialUriReachesProductionCatalogValidationGate()
+    {
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(
+            NavigationRequest(new Uri("https://pan.baidu.com/")));
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.CatalogNotValidated, decision.DenialReason);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, BaiduSelectorCatalog.Production.ValidationStatus);
+    }
+
+    [Theory]
+    [InlineData("/disk/home")]
+    [InlineData("http://pan.baidu.com/")]
+    [InlineData("https://pan.baidu.com.evil/")]
+    [InlineData("https://user@pan.baidu.com/")]
+    [InlineData("https://pan.baidu.com:444/")]
+    [InlineData("https://pan.baidu.com/#section")]
+    public void AuthorizeNavigation_RejectsUnsafeOfficialUri(string value)
+    {
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(
+            NavigationRequest(new Uri(value, UriKind.RelativeOrAbsolute)));
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.OfficialUriNotAllowed, decision.DenialReason);
+    }
+
+    [Fact]
+    public void AuthorizeNavigation_RejectsMissingOfficialUri()
+    {
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(
+            NavigationRequest(new Uri("https://pan.baidu.com/")) with { OfficialUri = null! });
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.OfficialUriNotAllowed, decision.DenialReason);
+    }
+
+    [Theory]
+    [InlineData(BaiduAutomationAction.Unspecified)]
+    [InlineData(BaiduAutomationAction.SelectExactItems)]
+    [InlineData((BaiduAutomationAction)999)]
+    public void AuthorizeNavigation_RejectsAnythingExceptExactNavigationAction(
+        BaiduAutomationAction action)
+    {
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(
+            NavigationRequest(new Uri("https://pan.baidu.com/")) with { Action = action });
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(
+            Enum.IsDefined(action) && action is not BaiduAutomationAction.Unspecified
+                ? BaiduAutomationDenialReason.ActionNotAllowedForNavigation
+                : BaiduAutomationDenialReason.UnknownAction,
+            decision.DenialReason);
+    }
+
+    [Fact]
+    public void Authorize_DomActionStillRequiresObservation()
+    {
+        var decision = BaiduSelectorCatalog.Production.Authorize(
+            null,
+            BaiduAutomationAction.ClickShare);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.AmbiguousOrUnknownState, decision.DenialReason);
+    }
+
+    [Theory]
+    [InlineData("future-protocol", "baidu-selectors-v1", "build-a", true, BaiduAutomationDenialReason.ProtocolVersionMismatch)]
+    [InlineData("baidu-visible-web-v1", "future-selectors", "build-a", true, BaiduAutomationDenialReason.SelectorVersionMismatch)]
+    [InlineData("baidu-visible-web-v1", "baidu-selectors-v1", "build-b", true, BaiduAutomationDenialReason.BuildVersionMismatch)]
+    [InlineData("baidu-visible-web-v1", "baidu-selectors-v1", "build-a", false, BaiduAutomationDenialReason.AcceptanceMissing)]
+    public void AuthorizeNavigation_RejectsMismatchedOrMissingAcceptance(
+        string acceptedProtocol,
+        string acceptedSelector,
+        string acceptedBuild,
+        bool isAccepted,
+        BaiduAutomationDenialReason expected)
+    {
+        var request = NavigationRequest(new Uri("https://pan.baidu.com/")) with
+        {
+            Acceptance = new BaiduAutomationAcceptance(
+                isAccepted,
+                acceptedProtocol,
+                acceptedSelector,
+                acceptedBuild),
+        };
+
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(request);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(expected, decision.DenialReason);
+    }
+
+    [Theory]
+    [InlineData("future-protocol", "baidu-selectors-v1", "build-a", BaiduAutomationDenialReason.ProtocolVersionMismatch)]
+    [InlineData("baidu-visible-web-v1", "future-selectors", "build-a", BaiduAutomationDenialReason.SelectorVersionMismatch)]
+    [InlineData("baidu-visible-web-v1", "baidu-selectors-v1", "build-b", BaiduAutomationDenialReason.BuildVersionMismatch)]
+    public void AuthorizeNavigation_RejectsCurrentRequestVersionOrBuildMismatch(
+        string protocol,
+        string selector,
+        string build,
+        BaiduAutomationDenialReason expected)
+    {
+        var request = NavigationRequest(new Uri("https://pan.baidu.com/")) with
+        {
+            ProtocolVersion = protocol,
+            SelectorVersion = selector,
+            ApplicationBuildVersion = build,
+        };
+
+        var decision = BaiduSelectorCatalog.Production.AuthorizeNavigation(request);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(expected, decision.DenialReason);
+    }
+
+    [Fact]
+    public void AuthorizeNavigation_FutureValidatedCatalogCanAuthorizeWithoutChangingProduction()
+    {
+        var validatedCatalog = new BaiduSelectorCatalog(BaiduProtocolValidationStatus.Validated);
+
+        var decision = validatedCatalog.AuthorizeNavigation(
+            NavigationRequest(new Uri("https://pan.baidu.com/disk/main")));
+
+        Assert.True(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.None, decision.DenialReason);
+        Assert.Equal(BaiduProtocolValidationStatus.Validated, validatedCatalog.ValidationStatus);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, BaiduSelectorCatalog.Production.ValidationStatus);
+        Assert.All(validatedCatalog.Definitions, definition => Assert.Empty(definition.ExecutableLocators));
+    }
+
+    [Fact]
+    public void AuthorizeNavigation_RejectsUnvalidatedFieldEvidence()
+    {
+        var validatedCatalog = new BaiduSelectorCatalog(BaiduProtocolValidationStatus.Validated);
+        var request = NavigationRequest(new Uri("https://pan.baidu.com/")) with
+        {
+            FieldEvidenceValidationStatus = BaiduProtocolValidationStatus.NotValidated,
+        };
+
+        var decision = validatedCatalog.AuthorizeNavigation(request);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.FieldEvidenceNotValidated, decision.DenialReason);
+    }
+
+    [Fact]
+    public void NavigationRequest_ToStringRedactsOfficialUriAndVersions()
+    {
+        var request = NavigationRequest(new Uri("https://pan.baidu.com/disk/main?private=value"));
+
+        var text = request.ToString();
+
+        Assert.Contains("[REDACTED]", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("pan.baidu.com", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("build-a", text, StringComparison.Ordinal);
+    }
+
+    private static BaiduNavigationAuthorizationRequest NavigationRequest(Uri uri) => new(
+        BaiduAutomationAction.OpenOfficialUri,
+        uri,
+        BaiduSelectorCatalog.ProtocolVersion,
+        BaiduSelectorCatalog.SelectorVersion,
+        "build-a",
+        new BaiduAutomationAcceptance(
+            true,
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a"),
+        BaiduProtocolValidationStatus.Validated);
 
     private static BaiduPageObservation Load(string name)
     {

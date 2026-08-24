@@ -20,12 +20,15 @@ public enum BaiduAutomationDenialReason
     UnknownAction,
     AmbiguousOrUnknownState,
     ActionNotAllowedForState,
+    ActionNotAllowedForNavigation,
+    OfficialUriNotAllowed,
     ProtocolVersionMismatch,
     SelectorVersionMismatch,
     AcceptanceMissing,
     BuildVersionMismatch,
     CandidateNotUnique,
     ObservationNotValidated,
+    FieldEvidenceNotValidated,
     CatalogNotValidated,
 }
 
@@ -49,6 +52,19 @@ public sealed record BaiduAutomationActionContext(
 {
     public override string ToString() =>
         $"BaiduAutomationActionContext {{ Observation = {Observation}, ProtocolVersion = [REDACTED], SelectorVersion = [REDACTED], ApplicationBuildVersion = [REDACTED], Acceptance = {Acceptance}, CandidateCount = {CandidateCount} }}";
+}
+
+public sealed record BaiduNavigationAuthorizationRequest(
+    BaiduAutomationAction Action,
+    Uri OfficialUri,
+    string ProtocolVersion,
+    string SelectorVersion,
+    string ApplicationBuildVersion,
+    BaiduAutomationAcceptance Acceptance,
+    BaiduProtocolValidationStatus FieldEvidenceValidationStatus)
+{
+    public override string ToString() =>
+        $"BaiduNavigationAuthorizationRequest {{ Action = {Action}, OfficialUri = [REDACTED], ProtocolVersion = [REDACTED], SelectorVersion = [REDACTED], ApplicationBuildVersion = [REDACTED], Acceptance = {Acceptance}, FieldEvidenceValidationStatus = {FieldEvidenceValidationStatus} }}";
 }
 
 public readonly record struct BaiduAutomationDecision(
