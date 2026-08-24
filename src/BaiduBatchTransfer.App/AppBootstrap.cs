@@ -125,7 +125,20 @@ public static class AppBootstrap
         services.AddSingleton<BatchHistoryQuery>();
         services.AddSingleton<IWorkspaceBatchHistorySource, WorkspaceBatchHistorySource>();
         services.AddSingleton<IRemoteResourcePicker, UnavailableRemoteResourcePicker>();
-        services.AddSingleton<IStandaloneShareStore, UnavailableStandaloneShareStore>();
+        services.AddSingleton<SqliteStandaloneShareStore>();
+        services.AddSingleton<IStandaloneShareStore>(sp =>
+            sp.GetRequiredService<SqliteStandaloneShareStore>());
+        services.AddSingleton<IStandaloneShareExecutionStore>(sp =>
+            sp.GetRequiredService<SqliteStandaloneShareStore>());
+        services.AddSingleton<SqliteWebAutomationAttemptStore>();
+        services.AddSingleton<IWebAutomationAttemptStore>(sp =>
+            sp.GetRequiredService<SqliteWebAutomationAttemptStore>());
+        services.AddSingleton<SqliteLocalResultDestinationStore>();
+        services.AddSingleton<ILocalResultDestinationStore>(sp =>
+            sp.GetRequiredService<SqliteLocalResultDestinationStore>());
+        services.AddSingleton<SqliteLocalResultExportStore>();
+        services.AddSingleton<ILocalResultExportStore>(sp =>
+            sp.GetRequiredService<SqliteLocalResultExportStore>());
         services.AddSingleton<PauseBatchService>();
         services.AddSingleton<ResumeBatchService>();
         services.AddSingleton<RetryFailedTransferService>();
@@ -208,9 +221,9 @@ public static class AppBootstrap
         services.AddSingleton<IFolderDialog, WpfFolderDialog>();
         services.AddSingleton<IResultSaveDialog, ResultSaveDialog>();
         services.AddSingleton<IDialogService, DialogService>();
-        services.AddSingleton<InMemoryTransferResultDestinationSink>();
+        services.AddSingleton<DurableTransferResultDestinationSink>();
         services.AddSingleton<ITransferResultDestinationSink>(sp =>
-            sp.GetRequiredService<InMemoryTransferResultDestinationSink>());
+            sp.GetRequiredService<DurableTransferResultDestinationSink>());
 #if DEBUG
         services.AddSingleton(new BaiduAcceptanceProbeOutputStore(paths.RootDirectory));
         services.AddSingleton<IBaiduAcceptanceProbeOutputStore>(serviceProvider =>

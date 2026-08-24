@@ -72,7 +72,6 @@ public sealed record StandaloneShareBatchRecord
     public long Revision { get; }
     public DateTimeOffset CreatedAt { get; }
     public DateTimeOffset UpdatedAt { get; }
-
     public static StandaloneShareBatchRecord Create(
         Guid id,
         string resultDirectoryReference,
@@ -148,6 +147,14 @@ public sealed record StandaloneShareOperationRecord
     public long Revision { get; }
     public DateTimeOffset CreatedAt { get; }
     public DateTimeOffset UpdatedAt { get; }
+    public SubmissionAcceptance SubmissionAcceptance { get; init; } =
+        BaiduBatchTransfer.Core.Domain.SubmissionAcceptance.Unknown;
+    public string? BaselineFingerprint { get; init; }
+    public int? BaselineShareCount { get; init; }
+    public DateTimeOffset? BaselineCompletedAt { get; init; }
+    public long LeaseGeneration { get; init; }
+    public DateTimeOffset? LeaseExpiresAt { get; init; }
+    public string? LastErrorCode { get; init; }
 
     public bool CanSafelyRetry => Status == StandaloneShareOperationStatus.Failed &&
         SubmissionState is StandaloneShareSubmissionState.NotStarted or
@@ -179,7 +186,40 @@ public sealed record StandaloneShareOperationRecord
     }
 
     public override string ToString() =>
-        $"StandaloneShareOperationRecord {{ Id = {Id}, BatchId = {BatchId}, AccountId = {AccountId}, SequenceNumber = {SequenceNumber}, Generation = {Generation}, Status = {Status}, SubmissionState = {SubmissionState}, ExactItems = [REDACTED], DisplayName = [REDACTED] }}";
+        $"StandaloneShareOperationRecord {{ Id = {Id}, BatchId = {BatchId}, AccountId = {AccountId}, SequenceNumber = {SequenceNumber}, Generation = {Generation}, Status = {Status}, SubmissionState = {SubmissionState}, SubmissionAcceptance = {SubmissionAcceptance}, ExactItems = [REDACTED], Baseline = [REDACTED], Lease = [REDACTED], Error = [REDACTED], DisplayName = [REDACTED], ParentPath = [REDACTED] }}";
+}
+
+public sealed record StandaloneShareOperationLease(
+    Guid OperationId,
+    Guid BatchId,
+    Guid AccountId,
+    int Generation,
+    long LeaseGeneration,
+    long Revision,
+    DateTimeOffset LeaseExpiresAt)
+{
+    public override string ToString() =>
+        $"StandaloneShareOperationLease {{ OperationId = {OperationId}, BatchId = {BatchId}, AccountId = {AccountId}, Generation = {Generation}, LeaseGeneration = {LeaseGeneration}, Revision = {Revision}, LeaseExpiresAt = [REDACTED] }}";
+}
+
+public sealed record StandaloneShareResultRecord(
+    Guid Id,
+    Guid OperationId,
+    Guid BatchId,
+    Guid AccountId,
+    int Generation,
+    string ExactItemSetFingerprint,
+    string SettingsFingerprint,
+    string ShareId,
+    string ShareUrl,
+    string ExtractionCode,
+    bool IsPermanent,
+    bool IsAccessUnlimited,
+    DateTimeOffset AcceptedAt,
+    DateTimeOffset CreatedAt)
+{
+    public override string ToString() =>
+        $"StandaloneShareResultRecord {{ Id = {Id}, OperationId = {OperationId}, BatchId = {BatchId}, AccountId = {AccountId}, Generation = {Generation}, ExactItems = [REDACTED], Settings = [REDACTED], ShareId = [REDACTED], ShareUrl = [REDACTED], ExtractionCode = [REDACTED], IsPermanent = {IsPermanent}, IsAccessUnlimited = {IsAccessUnlimited} }}";
 }
 
 public enum StandaloneShareMutationDisposition

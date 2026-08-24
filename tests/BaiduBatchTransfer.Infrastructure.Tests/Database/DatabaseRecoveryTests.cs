@@ -127,7 +127,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
     }
 
     [Fact]
-    public async Task RestoreAcceptsValidatedVersionSevenBackupThenMigratesExactlyOnceToVersionEight()
+    public async Task RestoreAcceptsValidatedVersionSevenBackupThenMigratesExactlyOnceToCurrentVersion()
     {
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v7-restore.db");
@@ -151,15 +151,17 @@ public sealed class DatabaseRecoveryTests : IDisposable
 
         await recovery.RestoreAsync(candidate.Path);
 
-        Assert.Equal(8, DatabaseMigrator.LatestVersion);
+        Assert.Equal(9, DatabaseMigrator.LatestVersion);
         await using var verify = await factory.OpenConnectionAsync();
         await using var versionCommand = verify.CreateCommand();
-        versionCommand.CommandText = "SELECT MAX(Version), COUNT(*) FROM SchemaVersions WHERE Version=8;";
+        versionCommand.CommandText = "SELECT MAX(Version), COUNT(*) FROM SchemaVersions WHERE Version=$version;";
+        versionCommand.Parameters.AddWithValue("$version", DatabaseMigrator.LatestVersion);
         await using var reader = await versionCommand.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync());
-        Assert.Equal(8L, reader.GetInt64(0));
+        Assert.Equal((long)DatabaseMigrator.LatestVersion, reader.GetInt64(0));
         Assert.Equal(1L, reader.GetInt64(1));
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(verify, 8)).IsValid);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            verify, DatabaseMigrator.LatestVersion)).IsValid);
     }
 
     [Fact]

@@ -60,12 +60,21 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<PauseBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<ResumeBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<RetryFailedTransferService>());
-        Assert.IsType<InMemoryTransferResultDestinationSink>(
+        Assert.IsType<DurableTransferResultDestinationSink>(
             host.Services.GetRequiredService<ITransferResultDestinationSink>());
+        Assert.IsType<SqliteLocalResultDestinationStore>(
+            host.Services.GetRequiredService<ILocalResultDestinationStore>());
+        Assert.IsType<SqliteLocalResultExportStore>(
+            host.Services.GetRequiredService<ILocalResultExportStore>());
+        Assert.IsType<SqliteWebAutomationAttemptStore>(
+            host.Services.GetRequiredService<IWebAutomationAttemptStore>());
         Assert.IsType<UnavailableRemoteResourcePicker>(
             host.Services.GetRequiredService<IRemoteResourcePicker>());
-        Assert.IsType<UnavailableStandaloneShareStore>(
+        Assert.IsType<SqliteStandaloneShareStore>(
             host.Services.GetRequiredService<IStandaloneShareStore>());
+        Assert.Same(
+            host.Services.GetRequiredService<IStandaloneShareStore>(),
+            host.Services.GetRequiredService<IStandaloneShareExecutionStore>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
