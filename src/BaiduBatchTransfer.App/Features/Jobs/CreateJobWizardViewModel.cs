@@ -28,6 +28,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private int readyResourceCount;
     private bool hasExcelAccountColumn;
     private int unresolvedAccountMappingCount;
+    private readonly HashSet<Guid> mappedAccountIds = [];
     private int conflictRowCount;
     private int needsResolutionRowCount;
     private string defaultTargetPath = "/";
@@ -180,6 +181,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     }
     public bool HasExcelAccountColumn => hasExcelAccountColumn;
     public int UnresolvedAccountMappingCount => unresolvedAccountMappingCount;
+    public IReadOnlyCollection<Guid> MappedAccountIds => mappedAccountIds;
     public string ExcelAccountStatusMessage => !hasExcelAccountColumn
         ? string.Empty
         : unresolvedAccountMappingCount > 0
@@ -338,6 +340,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         readyResourceCount = Math.Max(0, context.ReadyResourceCount);
         hasExcelAccountColumn = context.HasExcelAccountColumn;
         unresolvedAccountMappingCount = Math.Max(0, context.UnresolvedAccountMappingCount);
+        ReplaceMappedAccountIds(context.MappedAccountIds);
         conflictRowCount = Math.Max(0, context.ConflictRowCount);
         needsResolutionRowCount = Math.Max(0, context.NeedsResolutionRowCount);
         defaultTargetPath = context.DefaultTargetPath;
@@ -377,13 +380,15 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         int conflictRows,
         int needsResolutionRows,
         bool excelAccountColumn,
-        int unresolvedAccountMappings)
+        int unresolvedAccountMappings,
+        IReadOnlyList<Guid>? refreshedMappedAccountIds = null)
     {
         readyResourceCount = Math.Max(0, readyRows);
         conflictRowCount = Math.Max(0, conflictRows);
         needsResolutionRowCount = Math.Max(0, needsResolutionRows);
         hasExcelAccountColumn = excelAccountColumn;
         unresolvedAccountMappingCount = Math.Max(0, unresolvedAccountMappings);
+        ReplaceMappedAccountIds(refreshedMappedAccountIds);
         InvalidateConfirmation();
         RaiseAll();
     }
@@ -519,8 +524,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             var mutation = await draftWorkflow.IgnoreAllAccountNamesAsync(session, mode, cancellationToken);
             if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
+            unresolvedAccountMappingCount = mutation.UnresolvedAccountMappings;
             ExcelAccountHandling = ExcelAccountHandling.IgnoreColumn;
-            unresolvedAccountMappingCount = 0;
         }
         catch (Exception)
         {
@@ -573,8 +578,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             var mutation = await draftWorkflow.OverrideAllAccountsAsync(session, account.AccountId, mode, cancellationToken);
             if (!IsCurrentDraft(session, generation)) return;
             ApplyMutation(mutation);
+            unresolvedAccountMappingCount = mutation.UnresolvedAccountMappings;
             ExcelAccountHandling = ExcelAccountHandling.OverrideAll;
-            unresolvedAccountMappingCount = 0;
         }
         catch (Exception)
         {
@@ -614,7 +619,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 WizardPrecheckStatus.Completed => $"链接检查已继续并完成，共处理 {result.ProcessedRows:N0} 条记录。",
                 WizardPrecheckStatus.PausedForLogin => "预检已暂停，请完成账号登录后点击继续预检。",
                 WizardPrecheckStatus.PausedForVerification => "预检已暂停，请完成安全验证后点击继续预检。",
-                _ => "百度网盘适配器尚不可用，暂时无法执行预检。",
+                _ => "百度网盘检查功能暂不可用，请稍后重试。",
             };
             return result;
         }
@@ -941,6 +946,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 ExcelAccountHandling is ExcelAccountHandling.KeepMappings or ExcelAccountHandling.MapNames &&
                 unresolvedAccountMappingCount > 0)
                 return $"Excel 中有 {unresolvedAccountMappingCount:N0} 个账号名称尚未映射，请完成映射或覆盖全部记录。";
+            if (transferMode == Core.Domain.TransferMode.Distribution &&
+                mappedAccountIds.Any(accountId => Accounts.All(account => account.AccountId != accountId)))
+                return "Excel 中映射的账号已不可用，请重新匹配或统一指定账号。";
+            if (transferMode == Core.Domain.TransferMode.Distribution &&
+                mappedAccountIds.Any(accountId => selected.All(account => account.AccountId != accountId)))
+                return "请选中 Excel 已映射的全部账号，或统一指定参与账号。";
         }
         if (selected.Any(x => string.IsNullOrWhiteSpace(x.DefaultTargetPath))) return "每个参与账号都必须设置目标目录。";
         if (transferMode == Core.Domain.TransferMode.Distribution && quotaBasis == Core.Domain.QuotaBasis.TaskCount)
@@ -969,6 +980,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (result.MissingExtractionCodeCount > 0) messages.Add($"缺少提取码 {result.MissingExtractionCodeCount:N0} 条");
         if (result.AccountIssueCount > 0) messages.Add($"账号问题 {result.AccountIssueCount:N0} 项");
         if (result.ConflictCount > 0) messages.Add($"冲突 {result.ConflictCount:N0} 条");
+        if (result.OtherFailureCount > 0) messages.Add($"暂时无法确认 {result.OtherFailureCount:N0} 条");
+        if (!result.SnapshotIsConsistent) messages.Add("链接检查状态已变化");
         return $"请先处理：{string.Join("、", messages)}。";
     }
 
@@ -1000,6 +1013,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         readyResourceCount = mutation.ReadyRows;
         conflictRowCount = mutation.ConflictRows;
         needsResolutionRowCount = mutation.NeedsResolutionRows;
+        unresolvedAccountMappingCount = mutation.UnresolvedAccountMappings;
+        ReplaceMappedAccountIds(mutation.MappedAccountIds);
         InvalidateConfirmation();
         RaiseAll();
     }
@@ -1048,6 +1063,15 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         OnPropertyChanged(nameof(WarningMessage));
         ValidationMessage = EvaluateValidation();
         RaiseDerived();
+    }
+
+    private void ReplaceMappedAccountIds(IReadOnlyList<Guid>? accountIds)
+    {
+        mappedAccountIds.Clear();
+        if (accountIds is not null)
+            foreach (var accountId in accountIds.Take(1_000))
+                if (accountId != Guid.Empty) mappedAccountIds.Add(accountId);
+        OnPropertyChanged(nameof(MappedAccountIds));
     }
 
     private void ApplyConfirmationSummary(WizardConfirmationSummary summary)

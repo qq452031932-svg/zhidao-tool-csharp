@@ -35,7 +35,8 @@ public sealed record ImportDraftStatistics(
     int Conflict = 0,
     int NeedsResolution = 0,
     bool HasExcelAccountColumn = false,
-    int UnresolvedAccountMappings = 0);
+    int UnresolvedAccountMappings = 0,
+    IReadOnlyList<Guid>? MappedAccountIds = null);
 public sealed record ImportWorkflowResult(Guid SessionId, ImportDraftStatistics Statistics);
 public sealed record ImportDraftReady(Guid SessionId, ImportDraftStatistics Statistics);
 
@@ -85,7 +86,7 @@ public sealed class UnavailableImportWorkflow : IImportWorkflow
     public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
 }
 
-public sealed class ImportViewModel : ObservableObject
+public sealed class ImportViewModel : ObservableObject, IDisposable
 {
     private const int PageSize = 100;
     private readonly IImportWorkflow workflow;
@@ -93,6 +94,7 @@ public sealed class ImportViewModel : ObservableObject
     private readonly IDialogService dialogService;
     private readonly IAdapterAvailability adapterAvailability;
     private readonly CancellationTokenSource lifetime = new();
+    private readonly SemaphoreSlim mutationGate = new(1, 1);
     private CancellationTokenSource? operationCancellation;
     private Guid? sessionId;
     private string textContent = string.Empty;
@@ -109,6 +111,8 @@ public sealed class ImportViewModel : ObservableObject
     private string selectedExtractionCode = string.Empty;
     private bool selectedRowIsExcluded;
     private long pageGeneration;
+    private long mutationGeneration;
+    private int mutationRequests;
 
     public ImportViewModel(
         IImportWorkflow workflow,
@@ -145,7 +149,8 @@ public sealed class ImportViewModel : ObservableObject
     public string TextContent { get => textContent; set { if (SetProperty(ref textContent, value ?? string.Empty)) RaiseCommands(); } }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string StatisticsText { get => statisticsText; private set => SetProperty(ref statisticsText, value); }
-    public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) RaiseCommands(); } }
+    public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) { OnPropertyChanged(nameof(CanEdit)); RaiseCommands(); } } }
+    public bool CanEdit => !isClosed && !IsBusy;
     public bool CanResumeImport { get => canResumeImport; private set { if (SetProperty(ref canResumeImport, value)) RaiseCommands(); } }
     public bool CanImport => !isClosed && workflow.IsAvailable && !IsBusy;
     public bool CanImportText => CanImport && !string.IsNullOrWhiteSpace(TextContent);
@@ -267,60 +272,35 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken = default)
     {
-        if (isClosed) return;
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
-        try
-        {
-            var result = await workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, linked.Token);
-            if (isClosed || linked.IsCancellationRequested) return;
-            StatusMessage = "预检结果已失效，需要重新预检或按未预检状态继续。";
-            await ApplyMutationAsync(result, linked.Token);
-        }
-        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
-        catch (Exception) { if (!isClosed) StatusMessage = "修改失败，请检查链接与提取码。"; }
+        _ = await RunMutationAsync(
+            token => workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, token),
+            "预检结果已失效，需要重新预检或按未预检状态继续。",
+            "修改失败，请检查链接与提取码。",
+            cancellationToken);
     }
 
     public async Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken = default)
     {
-        if (isClosed) return;
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
-        try
-        {
-            var result = await workflow.SetExcludedAsync(rowId, excluded, linked.Token);
-            if (isClosed || linked.IsCancellationRequested) return;
-            StatusMessage = excluded ? "已排除该记录。" : "已恢复该记录。";
-            await ApplyMutationAsync(result, linked.Token);
-        }
-        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
-        catch (Exception) { if (!isClosed) StatusMessage = "无法更新记录，请刷新后重试。"; }
+        _ = await RunMutationAsync(
+            token => workflow.SetExcludedAsync(rowId, excluded, token),
+            excluded ? "已排除该记录。" : "已恢复该记录。",
+            "无法更新记录，请刷新后重试。",
+            cancellationToken);
     }
 
     public async Task<bool> SaveCurrentRowEditAsync(CancellationToken cancellationToken = default)
     {
         if (isClosed) return false;
         if (SelectedRow is null) return true;
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
-        try
-        {
-            var result = await workflow.UpdateLinkAsync(
+        return await RunMutationAsync(
+            token => workflow.UpdateLinkAsync(
                 SelectedRow.RowId,
                 SelectedShareUrl,
                 string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
-                linked.Token);
-            if (isClosed || linked.IsCancellationRequested) return false;
-            StatusMessage = "链接修改已保存，开始前会重新检查。";
-            await ApplyMutationAsync(result, linked.Token);
-            return true;
-        }
-        catch (OperationCanceledException) when (linked.IsCancellationRequested)
-        {
-            return false;
-        }
-        catch (Exception)
-        {
-            StatusMessage = "修改失败，请检查链接与提取码。";
-            return false;
-        }
+                token),
+            "链接修改已保存，开始前会重新检查。",
+            "修改失败，请检查链接与提取码。",
+            cancellationToken);
     }
 
     private async Task SaveSelectedRowAsync(CancellationToken cancellationToken)
@@ -332,20 +312,62 @@ public sealed class ImportViewModel : ObservableObject
     {
         if (SelectedRow is null) return;
         var exclude = !selectedRowIsExcluded;
-        await SetExcludedAsync(SelectedRow.RowId, exclude, cancellationToken);
+        var applied = await RunMutationAsync(
+            token => workflow.SetExcludedAsync(SelectedRow.RowId, exclude, token),
+            exclude ? "已排除该记录。" : "已恢复该记录。",
+            "无法更新记录，请刷新后重试。",
+            cancellationToken);
+        if (!applied) return;
         selectedRowIsExcluded = exclude;
         OnPropertyChanged(nameof(SelectedExclusionActionText));
     }
 
+    private async Task<bool> RunMutationAsync(
+        Func<CancellationToken, Task<ImportWorkflowResult>> mutation,
+        string successMessage,
+        string failureMessage,
+        CancellationToken cancellationToken)
+    {
+        if (isClosed) return false;
+        var generation = Interlocked.Increment(ref mutationGeneration);
+        if (Interlocked.Increment(ref mutationRequests) == 1) IsBusy = true;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var entered = false;
+        try
+        {
+            await mutationGate.WaitAsync(linked.Token);
+            entered = true;
+            var result = await mutation(linked.Token);
+            if (!IsCurrentMutation(generation, linked)) return false;
+            StatusMessage = successMessage;
+            await ApplyMutationAsync(result, generation, linked.Token);
+            return IsCurrentMutation(generation, linked);
+        }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { return false; }
+        catch (Exception)
+        {
+            if (IsCurrentMutation(generation, linked)) StatusMessage = failureMessage;
+            return false;
+        }
+        finally
+        {
+            if (entered) mutationGate.Release();
+            if (Interlocked.Decrement(ref mutationRequests) == 0 && !isClosed) IsBusy = false;
+        }
+    }
+
     private async Task ApplyMutationAsync(
         ImportWorkflowResult result,
+        long generation,
         CancellationToken cancellationToken)
     {
         if (sessionId != result.SessionId)
             throw new InvalidOperationException("The import mutation returned a different session.");
+        if (generation != Volatile.Read(ref mutationGeneration)) return;
         ApplyStatistics(result.Statistics);
         DraftReady?.Invoke(this, new(result.SessionId, result.Statistics));
-        await LoadFirstPageAsync(cancellationToken);
+        nextCursor = null;
+        await LoadPageAsync(null, cancellationToken, generation);
     }
 
     private async Task RunImportAsync(
@@ -406,7 +428,10 @@ public sealed class ImportViewModel : ObservableObject
         }
     }
 
-    private async Task LoadPageAsync(long? cursor, CancellationToken cancellationToken)
+    private async Task LoadPageAsync(
+        long? cursor,
+        CancellationToken cancellationToken,
+        long? expectedMutationGeneration = null)
     {
         if (isClosed || sessionId is null) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
@@ -415,7 +440,8 @@ public sealed class ImportViewModel : ObservableObject
         try
         {
             var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), linked.Token);
-            if (isClosed || linked.IsCancellationRequested || sessionId != expectedSession || generation != pageGeneration) return;
+            if (isClosed || linked.IsCancellationRequested || sessionId != expectedSession || generation != pageGeneration ||
+                expectedMutationGeneration is { } mutation && mutation != Volatile.Read(ref mutationGeneration)) return;
             var selectedRowId = SelectedRow?.RowId;
             void Apply()
             {
@@ -448,8 +474,19 @@ public sealed class ImportViewModel : ObservableObject
         CanResumeImport = false;
         IsBusy = false;
         OnPropertyChanged(nameof(IsClosed));
+        OnPropertyChanged(nameof(CanEdit));
         RaiseCommands();
     }
+
+    public void Dispose()
+    {
+        Close();
+        operationCancellation?.Dispose();
+        lifetime.Dispose();
+    }
+
+    private bool IsCurrentMutation(long generation, CancellationTokenSource operation) =>
+        !isClosed && !operation.IsCancellationRequested && generation == Volatile.Read(ref mutationGeneration);
 
     private Task<bool> HasResumableSourceAsync(Guid operationSessionId) =>
         durableSessionObserved &&
@@ -504,7 +541,7 @@ public sealed class ImportViewModel : ObservableObject
         ImportUiError.UnsafeWorkbook => "Excel 文件包含异常内容，为保护本机已停止导入。",
         ImportUiError.MissingHeader => "Excel 缺少“分享链接”列，请使用软件提供的模板。",
         ImportUiError.InvalidData => "导入内容有误，请修改异常记录后重试。",
-        ImportUiError.AdapterUnavailable => "百度适配器尚不可用，当前版本不能开始导入或转存。",
+        ImportUiError.AdapterUnavailable => "百度网盘功能暂不可用，当前版本不能开始导入或转存。",
         _ => "导入失败，请检查文件后重试。",
     };
 

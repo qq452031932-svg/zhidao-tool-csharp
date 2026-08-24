@@ -106,9 +106,28 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
         await operations.FirstActivationStarted.Task;
         cancellation.Cancel();
         operations.ReleaseFirstActivation();
-        await activate;
+        var outcome = await activate;
 
         Assert.Empty(operations.NavigatedBatches);
+        Assert.Equal(ResultWorkspaceHandoffStatus.Cancelled, outcome.Status);
+    }
+
+    [Fact]
+    public async Task ActivationReportsExplicitSuccessAndFailureOutcomes()
+    {
+        using var successful = new ResultWorkspaceHandoffCoordinator(new ControlledOperations());
+        Assert.Equal(
+            ResultWorkspaceHandoffStatus.Succeeded,
+            (await successful.ActivateJobAsync(Guid.NewGuid())).Status);
+
+        var errors = new List<Exception>();
+        using var failed = new ResultWorkspaceHandoffCoordinator(
+            new ControlledOperations { InitializationException = new InvalidOperationException("boom") },
+            errors.Add);
+        Assert.Equal(
+            ResultWorkspaceHandoffStatus.Failed,
+            (await failed.ActivateJobAsync(Guid.NewGuid())).Status);
+        Assert.Single(errors);
     }
 
     [Fact]
@@ -152,6 +171,7 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
         public bool BlockPendingLookup { get; init; }
         public bool BlockFirstActivation { get; init; }
         public Exception? PendingLookupException { get; init; }
+        public Exception? InitializationException { get; init; }
         public Func<bool>? HasDispatcherAccess { get; init; }
         public int PendingLookupCalls { get; private set; }
         public List<Guid> InitializedBatches { get; } = [];
@@ -175,6 +195,7 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
         public async Task InitializeAsync(Guid batchJobId, CancellationToken cancellationToken)
         {
             VerifyDispatcher("initialize");
+            if (InitializationException is not null) throw InitializationException;
             if (BlockFirstActivation && InitializedBatches.Count == 0)
             {
                 InitializedBatches.Add(batchJobId);

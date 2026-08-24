@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
@@ -123,6 +124,22 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal(0, fixture.BatchService.PreviewCalls);
         Assert.Contains("无效链接", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Contains("缺少提取码", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnknownPrecheckFailureStopsTheWholeBatchBeforePreviewOrConfirmation()
+    {
+        using var fixture = Fixture.Valid(precheck: new WizardPrecheckResult(
+            WizardPrecheckStatus.Completed,
+            2,
+            OtherFailureCount: 1));
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.Equal(0, fixture.BatchService.ConfirmCalls);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Contains("暂时无法确认", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -312,6 +329,55 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task ExcelMappingsRequireCurrentEligibleSelectedAccountsAndReevaluateImmediately()
+    {
+        using var fixture = Fixture.Create(accountCount: 3, ready: 3);
+        var mapped = fixture.Wizard.Accounts[2].AccountId;
+        fixture.ApplyDraft(new ImportDraftStatistics(
+            3, 3, 0, 0, 0,
+            HasExcelAccountColumn: true,
+            MappedAccountIds: [mapped]));
+        fixture.Wizard.Accounts[0].IsSelected = true;
+        fixture.Wizard.Accounts[1].IsSelected = true;
+        await fixture.ViewModel.SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution);
+        fixture.Wizard.RefreshImportSnapshot(3, 0, 0, true, 0, [mapped]);
+        fixture.Wizard.ExcelAccountHandling = ExcelAccountHandling.KeepMappings;
+        fixture.Wizard.QuotaBasis = QuotaBasis.TaskCount;
+        fixture.Wizard.Accounts[0].TargetItemCount = 1;
+        fixture.Wizard.Accounts[1].TargetItemCount = 1;
+        fixture.Wizard.Accounts[2].TargetItemCount = 1;
+
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Contains("已映射", fixture.ViewModel.ConfigurationMessage, StringComparison.Ordinal);
+
+        fixture.Wizard.Accounts[2].IsSelected = true;
+
+        Assert.True(fixture.ViewModel.CanStart);
+    }
+
+    [Fact]
+    public async Task ExcelMappingToUnavailableAccountRequiresOverride()
+    {
+        using var fixture = Fixture.Create(accountCount: 2, ready: 2);
+        var unavailable = Guid.NewGuid();
+        fixture.ApplyDraft(new ImportDraftStatistics(
+            2, 2, 0, 0, 0,
+            HasExcelAccountColumn: true,
+            MappedAccountIds: [unavailable]));
+        fixture.Wizard.Accounts[0].IsSelected = true;
+        fixture.Wizard.Accounts[1].IsSelected = true;
+        await fixture.ViewModel.SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution);
+        fixture.Wizard.RefreshImportSnapshot(2, 0, 0, true, 0, [unavailable]);
+        fixture.Wizard.ExcelAccountHandling = ExcelAccountHandling.KeepMappings;
+        fixture.Wizard.QuotaBasis = QuotaBasis.TaskCount;
+        fixture.Wizard.Accounts[0].TargetItemCount = 1;
+        fixture.Wizard.Accounts[1].TargetItemCount = 1;
+
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Contains("账号已不可用", fixture.ViewModel.ConfigurationMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task CloseCancelsStartAndPreventsLateSinkHandoffOrStatusMutation()
     {
         var precheck = new BlockingPrecheckWorkflow();
@@ -393,9 +459,51 @@ public sealed class TransferWorkspaceViewModelTests
         fixture.Handoff.Release();
         await start;
 
-        Assert.True(fixture.Handoff.CancellationObserved);
+        Assert.True(SpinWait.SpinUntil(() => fixture.Handoff.CancellationObserved, TimeSpan.FromSeconds(1)));
         Assert.Equal(changesAtClose, changes.Count);
         Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+    }
+
+    [Fact]
+    public async Task NonCooperativeHandoffTimesOutWithRecoverableBatchAndCannotDuplicateCreate()
+    {
+        using var fixture = Fixture.Valid(options: new TransferWorkspaceOptions(PostCommitTimeoutSeconds: 1));
+        fixture.Handoff.Block = true;
+
+        var start = fixture.ViewModel.StartAsync();
+        await fixture.Handoff.Started.Task;
+        await start.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Contains("批次已创建", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.Contains("恢复查看", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+
+        await fixture.ViewModel.StartAsync();
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        fixture.Handoff.Release();
+    }
+
+    [Fact]
+    public async Task RealHandoffCoordinatorTimeoutReportsLateFailureWithoutChangingCreatedBatchOutcome()
+    {
+        var operations = new NonCooperativeHandoffOperations();
+        var reported = new List<Exception>();
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations, reported.Add);
+        using var fixture = Fixture.Valid(
+            options: new TransferWorkspaceOptions(PostCommitTimeoutSeconds: 1),
+            explicitHandoff: coordinator.ActivateJobAsync);
+
+        var start = fixture.ViewModel.StartAsync();
+        await operations.Started.Task;
+        await start.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Contains("恢复查看", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        operations.ReleaseWithFailure();
+        Assert.True(SpinWait.SpinUntil(() => reported.Count == 1, TimeSpan.FromSeconds(1)));
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
     }
 
     [Fact]
@@ -478,7 +586,9 @@ public sealed class TransferWorkspaceViewModelTests
             int accountCount,
             int ready,
             WizardPrecheckResult? precheck,
-            IWizardPrecheckWorkflow? precheckWorkflow)
+            IWizardPrecheckWorkflow? precheckWorkflow,
+            TransferWorkspaceOptions? options,
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff)
         {
             Ready = ready;
             Events = [];
@@ -507,13 +617,11 @@ public sealed class TransferWorkspaceViewModelTests
                 new RetryFailedTransferService(new FakeRunControlStore()));
             DestinationSink = new RecordingDestinationSink(Events);
             Handoff = new RecordingHandoff(Events, HandedOffBatches);
-            ViewModel = new TransferWorkspaceViewModel(
-                Import,
-                Wizard,
-                RunPanel,
-                new FakeResultSaveDialog(),
-                DestinationSink,
-                Handoff.RunAsync);
+            ViewModel = explicitHandoff is null
+                ? new TransferWorkspaceViewModel(
+                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, Handoff.RunAsync, options)
+                : new TransferWorkspaceViewModel(
+                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, explicitHandoff, options);
         }
 
         public int Ready { get; }
@@ -535,16 +643,20 @@ public sealed class TransferWorkspaceViewModelTests
             int accountCount = 1,
             int ready = 4,
             WizardPrecheckResult? precheck = null,
-            IWizardPrecheckWorkflow? precheckWorkflow = null) =>
-            new(accountCount, ready, precheck, precheckWorkflow);
+            IWizardPrecheckWorkflow? precheckWorkflow = null,
+            TransferWorkspaceOptions? options = null,
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null) =>
+            new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff);
 
         public static Fixture Valid(
             int accountCount = 1,
             int ready = 4,
             WizardPrecheckResult? precheck = null,
-            IWizardPrecheckWorkflow? precheckWorkflow = null)
+            IWizardPrecheckWorkflow? precheckWorkflow = null,
+            TransferWorkspaceOptions? options = null,
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null)
         {
-            var fixture = Create(accountCount, ready, precheck, precheckWorkflow);
+            var fixture = Create(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff);
             fixture.ApplyReadyDraft();
             if (accountCount == 1)
             {
@@ -756,6 +868,22 @@ public sealed class TransferWorkspaceViewModelTests
         }
 
         public void Release() => release.TrySetResult();
+    }
+
+    private sealed class NonCooperativeHandoffOperations : IResultWorkspaceHandoffOperations
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task<Guid?> FindPendingBatchAsync(CancellationToken cancellationToken) => Task.FromResult<Guid?>(null);
+        public async Task InitializeAsync(Guid batchJobId, CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task;
+            throw new InvalidOperationException("late private detail");
+        }
+        public Task ResolveExistingSharesAsync(Guid batchJobId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task NavigateToResultsAsync(Guid batchJobId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public void ReleaseWithFailure() => release.TrySetResult();
     }
 
     private sealed class FakeDialog : IDialogService

@@ -19,7 +19,8 @@ public sealed record JobResultRow(
     bool CanResumeTransfer = false,
     bool CanResumeShare = false,
     int TransferAttemptCount = 0,
-    string TransferStatus = "");
+    string TransferStatus = "",
+    bool CanSafelyRetryTransfer = false);
 
 public sealed record JobResultsPage(
     IReadOnlyList<JobResultRow> Items,
@@ -76,6 +77,6 @@ public sealed class UnavailableJobResultCapabilityAvailability : IJobResultCapab
 {
     public bool CanUseTransferActions => false;
     public bool CanUseShareActions => false;
-    public string TransferStatusMessage => "百度转存适配器尚未通过现场验证，转存操作暂不可用。";
-    public string ShareStatusMessage => "百度分享适配器尚未通过现场验证，分享操作暂不可用。";
+    public string TransferStatusMessage => "百度转存功能尚未通过现场验证，转存操作暂不可用。";
+    public string ShareStatusMessage => "百度分享功能尚未通过现场验证，分享操作暂不可用。";
 }

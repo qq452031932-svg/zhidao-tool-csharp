@@ -5,6 +5,10 @@ public interface IJobRepository
     Task AddAsync(BatchJobRecord job, CancellationToken cancellationToken = default);
     Task UpdateAsync(BatchJobRecord job, CancellationToken cancellationToken = default);
     Task<BatchJobRecord?> GetAsync(Guid id, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<BatchJobRecord>> GetRecentAsync(
+        int limit,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<BatchJobRecord>>([]);
     Task AddResourcesAsync(IEnumerable<ResourceItemRecord> resources, CancellationToken cancellationToken = default);
     Task<Page<ResourceItemRecord>> GetResourcesPageAsync(Guid batchJobId, PageQuery query, CancellationToken cancellationToken = default);
     Task AddOperationsAsync(IEnumerable<TransferOperationRecord> operations, CancellationToken cancellationToken = default);

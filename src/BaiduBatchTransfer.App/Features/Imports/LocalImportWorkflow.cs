@@ -353,7 +353,8 @@ public sealed class LocalImportWorkflow(
             counts.ConflictRows,
             counts.NeedsResolutionRows,
             accountResolution.TotalGroups > 0,
-            (int)Math.Min(int.MaxValue, accountResolution.UnresolvedGroups)));
+            (int)Math.Min(int.MaxValue, accountResolution.UnresolvedGroups),
+            accountResolution.MappedAccountIds ?? []));
     }
 
     private async Task<ReplaySource> RestoreReplaySourceAsync(

@@ -60,7 +60,8 @@ public sealed record OperationPageItem(
     bool CanReconcileShare,
     bool CanResumeTransfer,
     bool CanResumeShare,
-    int TransferAttemptCount)
+    int TransferAttemptCount,
+    bool CanSafelyRetryTransfer = false)
 {
     public string StatusText => TransferStatusText;
 
@@ -112,7 +113,8 @@ public sealed record OperationPageItem(
             record.Status == OperationStatus.Paused.ToString(),
             record.ShareStatus == ShareOperationStatus.Paused.ToString() && shareActionGate &&
                 record.ShareLastErrorCode is not ("AwaitingExistingShareDecision" or "CancelledByUser" or "IncompatibleExistingShare"),
-            record.TransferAttemptCount);
+            record.TransferAttemptCount,
+            record.CanSafelyRetryTransfer);
     }
 
     public override string ToString() =>

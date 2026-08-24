@@ -3,12 +3,13 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
         <StackPanel Margin="0,0,10,20">
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" IsEnabled="{Binding CanEditConfiguration}">
                 <StackPanel>
                     <TextBlock Text="导入链接" FontSize="18" FontWeight="SemiBold" />
                     <TextBlock Text="粘贴百度分享文字，或选择 Excel 文件；导入后可直接修改链接、提取码和排除记录。"
                                Foreground="{StaticResource MutedBrush}" Margin="0,5,0,10" TextWrapping="Wrap" />
                     <TextBox Text="{Binding Import.TextContent, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="百度分享文字"
                              AcceptsReturn="True" Height="110" TextWrapping="Wrap"
                              VerticalScrollBarVisibility="Auto" />
                     <WrapPanel Margin="0,10,0,10">
@@ -20,6 +21,7 @@
                     </WrapPanel>
                     <TextBlock Text="{Binding Import.StatisticsText}" FontWeight="SemiBold" />
                     <TextBlock Text="{Binding Import.StatusMessage}" Foreground="{StaticResource MutedBrush}"
+                               AutomationProperties.LiveSetting="Polite"
                                TextWrapping="Wrap" Margin="0,4,0,8" />
                     <DataGrid ItemsSource="{Binding Import.Rows}" SelectedItem="{Binding Import.SelectedRow}"
                               Height="230" AutoGenerateColumns="False" IsReadOnly="True"
@@ -56,7 +58,7 @@
                 </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" IsEnabled="{Binding CanEditConfiguration}">
                 <StackPanel>
                     <TextBlock Text="选择账号和保存目录" FontSize="18" FontWeight="SemiBold" />
                     <TextBlock Text="每个参与账号都可以使用不同的百度网盘保存目录。"
@@ -88,6 +90,7 @@
                                 Visibility="{Binding Wizard.HasExcelAccountColumn, Converter={StaticResource BooleanToVisibilityConverter}}">
                         <TextBlock Text="Excel 账号列" FontWeight="SemiBold" />
                         <TextBlock Text="{Binding Wizard.ExcelAccountStatusMessage}"
+                                   AutomationProperties.LiveSetting="Polite"
                                    Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,4,0,8" />
                         <WrapPanel>
                             <Button Content="复制时忽略账号列" Command="{Binding Wizard.IgnoreExcelAccountColumnCommand}" />
@@ -96,6 +99,7 @@
                         </WrapPanel>
                         <WrapPanel Margin="0,8,0,0">
                             <ComboBox Width="220" ItemsSource="{Binding Wizard.Accounts}"
+                                      AutomationProperties.Name="统一指定账号"
                                       DisplayMemberPath="DisplayName" SelectedValuePath="AccountId"
                                       SelectedValue="{Binding Wizard.ExcelOverrideAccountId}" />
                             <Button Content="统一使用所选账号" Command="{Binding Wizard.OverrideExcelMappingsCommand}"
@@ -105,7 +109,7 @@
                 </StackPanel>
             </Border>
 
-            <Border Style="{StaticResource Card}">
+            <Border Style="{StaticResource Card}" IsEnabled="{Binding CanEditConfiguration}">
                 <StackPanel>
                     <TextBlock Text="自动分享" FontSize="18" FontWeight="SemiBold" />
                     <CheckBox Content="转存完成后自动分享" IsChecked="{Binding AutoShare}"
@@ -117,6 +121,7 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBox Text="{Binding ShareResultDirectory, UpdateSourceTrigger=PropertyChanged}"
+                                     AutomationProperties.Name="本机结果目录"
                                      ToolTip="本机结果目录" />
                             <Button Grid.Column="1" Content="选择本机目录"
                                     Command="{Binding PickShareResultDirectoryCommand}" Margin="8,0,0,0" />
@@ -137,6 +142,7 @@
                 <StackPanel>
                     <TextBlock Text="开始转存" FontSize="18" FontWeight="SemiBold" />
                     <TextBlock Text="{Binding ConfigurationMessage}" Foreground="#B54708"
+                               AutomationProperties.LiveSetting="Polite"
                                TextWrapping="Wrap" Margin="0,6,0,10" />
                     <WrapPanel>
                         <Button Content="开始转存" Command="{Binding StartCommand}"
@@ -153,6 +159,7 @@
                     <TextBlock Text="进度与结果" FontSize="18" FontWeight="SemiBold" />
                     <WrapPanel Margin="0,10,0,10">
                         <ComboBox Width="260" ItemsSource="{Binding RunPanel.Batches}"
+                                  AutomationProperties.Name="最近批次"
                                   SelectedItem="{Binding RunPanel.SelectedBatch}" />
                         <Button Content="查看" Command="{Binding RunPanel.LoadSelectedBatchCommand}" Margin="8,0,0,0" />
                         <Button Content="暂停批次" Command="{Binding RunPanel.PauseCommand}" />
@@ -160,6 +167,7 @@
                         <Button Content="重试失败转存" Command="{Binding RunPanel.RetryFailedTransferCommand}" />
                     </WrapPanel>
                     <TextBlock Text="{Binding RunPanel.StatusMessage}" Foreground="{StaticResource MutedBrush}"
+                               AutomationProperties.LiveSetting="Polite"
                                TextWrapping="Wrap" Margin="0,0,0,10" />
                     <ContentControl x:Name="ResultsHost" Height="520" />
                 </StackPanel>

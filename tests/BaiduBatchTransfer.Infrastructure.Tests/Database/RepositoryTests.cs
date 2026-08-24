@@ -269,6 +269,29 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task RecentBatchHistoryIsDurableNewestFirstAndBounded()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var older = new BatchJobRecord(Guid.NewGuid(), "Older", "Text", "Distribution", "TaskCount",
+            "ProportionalReduction", 0, 0, "/", "None", "Skip", "Immediate", "Completed",
+            now.AddMinutes(-1), null, now, null, 1);
+        var newer = older with { Id = Guid.NewGuid(), Name = "Newer", Status = "Queued", CreatedAt = now, CompletedAt = null };
+        await using (var seed = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await seed.Jobs.AddAsync(older);
+            await seed.Jobs.AddAsync(newer);
+            await seed.CommitAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(factory);
+        var recent = await read.Jobs.GetRecentAsync(1);
+
+        Assert.Equal(newer.Id, Assert.Single(recent).Id);
+        Assert.Equal("Queued", recent[0].Status);
+    }
+
+    [Fact]
     public async Task ImportBatchCreationBoundaryUsesSnapshotCompareAndSwap()
     {
         var factory = await CreateFactoryAsync();

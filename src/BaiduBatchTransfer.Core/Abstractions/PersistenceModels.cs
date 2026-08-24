@@ -107,7 +107,8 @@ public sealed record OperationResultRecord(
       bool ShareCanRestartSafely = false,
       int? ShareGeneration = null,
       DateTimeOffset? ShareUpdatedAt = null,
-      int TransferAttemptCount = 0)
+      int TransferAttemptCount = 0,
+      bool CanSafelyRetryTransfer = false)
 {
     public override string ToString() =>
         $"OperationResultRecord {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, UserContent = [REDACTED] }}";
@@ -142,7 +143,10 @@ public sealed record RequestedAccountNameGroupRecord(string RequestedAccountName
         $"RequestedAccountNameGroupRecord {{ RequestedAccountName = [REDACTED], RowCount = {RowCount} }}";
 }
 
-public sealed record RequestedAccountResolutionCounts(long TotalGroups, long UnresolvedGroups);
+public sealed record RequestedAccountResolutionCounts(
+    long TotalGroups,
+    long UnresolvedGroups,
+    IReadOnlyList<Guid>? MappedAccountIds = null);
 
 public sealed record ImportDispositionCounts(
     int TotalRows,

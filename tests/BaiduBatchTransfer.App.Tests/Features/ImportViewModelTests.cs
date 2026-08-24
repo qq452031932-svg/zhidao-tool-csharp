@@ -526,6 +526,33 @@ public sealed class ImportViewModelTests
         Assert.Equal(statusAtClose, vm.StatusMessage);
     }
 
+    [Fact]
+    public async Task OverlappingRowMutationsAreSerializedAndOnlyNewestStatisticsArePublished()
+    {
+        var session = Guid.NewGuid();
+        var workflow = new BlockingMutationWorkflow(session);
+        using var vm = Create(workflow);
+        vm.AttachSession(session);
+        var drafts = new List<ImportDraftReady>();
+        vm.DraftReady += (_, draft) => drafts.Add(draft);
+
+        var older = vm.UpdateLinkAsync(Guid.NewGuid(), "https://pan.baidu.com/s/older", null);
+        await workflow.FirstStarted.Task;
+        var newer = vm.SetExcludedAsync(Guid.NewGuid(), true);
+
+        Assert.True(vm.IsBusy);
+        Assert.False(vm.CanEdit);
+        Assert.Equal(["update"], workflow.Calls);
+        workflow.ReleaseFirst();
+        await Task.WhenAll(older, newer);
+
+        Assert.Equal(["update", "exclude"], workflow.Calls);
+        var latest = Assert.Single(drafts);
+        Assert.Equal(0, latest.Statistics.Ready);
+        Assert.Equal(1, latest.Statistics.Excluded);
+        Assert.False(vm.IsBusy);
+    }
+
     private static ImportViewModel Create(
         IImportWorkflow workflow,
         IImportPreviewPageSource? source = null) =>
@@ -779,6 +806,39 @@ public sealed class ImportViewModelTests
             }
             throw new InvalidOperationException();
         }
+    }
+
+    private sealed class BlockingMutationWorkflow(Guid sessionId) : IImportWorkflow
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<string> Calls { get; } = [];
+
+        public async Task<ImportWorkflowResult> UpdateLinkAsync(
+            Guid rowId,
+            string shareUrl,
+            string? extractionCode,
+            CancellationToken cancellationToken)
+        {
+            Calls.Add("update");
+            FirstStarted.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            return new(sessionId, new(1, 1, 0, 0, 0));
+        }
+
+        public Task<ImportWorkflowResult> SetExcludedAsync(
+            Guid rowId,
+            bool excluded,
+            CancellationToken cancellationToken)
+        {
+            Calls.Add("exclude");
+            return Task.FromResult(new ImportWorkflowResult(sessionId, new(1, 0, 0, 0, 1)));
+        }
+
+        public void ReleaseFirst() => release.TrySetResult();
+        public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class BlockingExcelDialog : IDialogService

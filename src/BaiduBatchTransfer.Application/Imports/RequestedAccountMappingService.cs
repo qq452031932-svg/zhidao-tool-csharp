@@ -61,6 +61,19 @@ public sealed class RequestedAccountMappingService(IUnitOfWorkFactory unitOfWork
     private readonly IUnitOfWorkFactory unitOfWorkFactory =
         unitOfWorkFactory ?? throw new ArgumentNullException(nameof(unitOfWorkFactory));
 
+    public async Task<RequestedAccountResolutionCounts> GetResolutionCountsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
+        _ = await unit.Imports.GetSessionAsync(sessionId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The import session does not exist.");
+        var result = await unit.Imports.GetRequestedAccountResolutionCountsAsync(sessionId, cancellationToken)
+            .ConfigureAwait(false);
+        await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
     public async Task<Page<RequestedAccountNameGroup>> GetGroupsPageAsync(
         Guid sessionId,
         int pageNumber,

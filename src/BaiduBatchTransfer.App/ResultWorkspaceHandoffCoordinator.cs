@@ -14,6 +14,19 @@ public delegate Task ResultWorkspaceHandoffDispatchAsync(
     Func<CancellationToken, Task> operation,
     CancellationToken cancellationToken);
 
+public enum ResultWorkspaceHandoffStatus
+{
+    Succeeded,
+    Cancelled,
+    Failed,
+    Stale,
+}
+
+public sealed record ResultWorkspaceHandoffOutcome(ResultWorkspaceHandoffStatus Status)
+{
+    public bool Succeeded => Status == ResultWorkspaceHandoffStatus.Succeeded;
+}
+
 public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
 {
     private readonly object sync = new();
@@ -53,12 +66,16 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         }
     }
 
-    public Task ActivateJobAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+    public Task<ResultWorkspaceHandoffOutcome> ActivateJobAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
     {
         if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
         Request? request;
         lock (sync) request = BeginRequest(cancellationToken);
-        return request is null ? Task.CompletedTask : ActivateJobCoreAsync(request, batchJobId);
+        return request is null
+            ? Task.FromResult(new ResultWorkspaceHandoffOutcome(ResultWorkspaceHandoffStatus.Cancelled))
+            : ActivateJobCoreAsync(request, batchJobId);
     }
 
     public Task RestorePendingAsync()
@@ -101,35 +118,51 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         activeRequest?.Cancel();
         var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         activeRequest = requestCancellation;
-        return new Request(++generation, requestCancellation);
+        return new Request(++generation, requestCancellation, cancellationToken);
     }
 
-    private async Task ActivateJobCoreAsync(Request request, Guid batchJobId)
+    private async Task<ResultWorkspaceHandoffOutcome> ActivateJobCoreAsync(Request request, Guid batchJobId)
     {
         try
         {
             await gate.WaitAsync(request.Cancellation.Token).ConfigureAwait(false);
             try
             {
-                if (!IsCurrent(request)) return;
+                if (!IsCurrent(request)) return StoppedOutcome(request);
                 await InvokeOnDispatcherAsync(
                     request,
                     cancellationToken => operations.InitializeAsync(batchJobId, cancellationToken)).ConfigureAwait(false);
+                if (!IsCurrent(request)) return StoppedOutcome(request);
                 await NavigateIfCurrentAsync(request, batchJobId).ConfigureAwait(false);
+                return IsCurrent(request)
+                    ? new(ResultWorkspaceHandoffStatus.Succeeded)
+                    : StoppedOutcome(request);
             }
             finally
             {
                 gate.Release();
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { return StoppedOutcome(request); }
         catch (Exception exception)
         {
             Report(exception);
+            return new(ResultWorkspaceHandoffStatus.Failed);
         }
         finally
         {
             Complete(request);
+        }
+    }
+
+    private ResultWorkspaceHandoffOutcome StoppedOutcome(Request request)
+    {
+        lock (sync)
+        {
+            var cancelled = isClosed || lifetime.IsCancellationRequested || request.CallerCancellation.IsCancellationRequested;
+            return new(cancelled
+                ? ResultWorkspaceHandoffStatus.Cancelled
+                : ResultWorkspaceHandoffStatus.Stale);
         }
     }
 
@@ -238,7 +271,10 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         catch { }
     }
 
-    private sealed record Request(long Generation, CancellationTokenSource Cancellation);
+    private sealed record Request(
+        long Generation,
+        CancellationTokenSource Cancellation,
+        CancellationToken CallerCancellation);
 }
 
 internal sealed class JobResultsWorkspaceHandoffOperations(

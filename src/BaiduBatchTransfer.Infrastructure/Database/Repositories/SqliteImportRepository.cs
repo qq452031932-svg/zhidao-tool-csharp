@@ -307,9 +307,29 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
             WHERE ImportSessionId=$session AND RequestedAccountName IS NOT NULL;
             """);
         Add(command, "$session", Id(sessionId));
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-        return new RequestedAccountResolutionCounts(reader.GetInt64(0), reader.GetInt64(1));
+        long totalGroups;
+        long unresolvedGroups;
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            totalGroups = reader.GetInt64(0);
+            unresolvedGroups = reader.GetInt64(1);
+        }
+        await using var mapped = Command("""
+            SELECT DISTINCT MappedAccountId
+            FROM StagedImportRows
+            WHERE ImportSessionId=$session AND Disposition<>'Excluded' AND MappedAccountId IS NOT NULL
+            ORDER BY MappedAccountId
+            LIMIT 1001;
+            """);
+        Add(mapped, "$session", Id(sessionId));
+        var mappedAccountIds = new List<Guid>();
+        await using var mappedReader = await mapped.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await mappedReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            mappedAccountIds.Add(Guid.Parse(mappedReader.GetString(0)));
+        if (mappedAccountIds.Count > 1_000)
+            throw new InvalidDataException("The import contains too many mapped accounts.");
+        return new RequestedAccountResolutionCounts(totalGroups, unresolvedGroups, mappedAccountIds);
     }
 
     public async Task<ImportDispositionCounts> GetDispositionCountsAsync(

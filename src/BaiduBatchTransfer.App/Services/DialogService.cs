@@ -86,7 +86,7 @@ public interface IAccountSummaryProvider
 public sealed class UnavailableAccountLoginLauncher : IAccountLoginLauncher
 {
     public bool IsAvailable => false;
-    public string StatusMessage => "百度登录适配器尚不可用，当前版本不能开始转存。";
+    public string StatusMessage => "百度登录功能尚不可用，当前版本不能开始转存。";
     public Task OpenAsync(CancellationToken cancellationToken = default) =>
         throw new InvalidOperationException(StatusMessage);
 }
@@ -100,5 +100,5 @@ public interface IAdapterAvailability
 public sealed class UnavailableAdapterAvailability : IAdapterAvailability
 {
     public bool CanStartTransfers => false;
-    public string StatusMessage => "百度转存适配器尚不可用，当前版本不能开始任务。";
+    public string StatusMessage => "百度转存功能尚不可用，当前版本不能开始任务。";
 }

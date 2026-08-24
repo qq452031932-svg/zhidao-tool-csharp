@@ -98,6 +98,48 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
+    public async Task ProductionPrecheckSnapshotCountsEveryUnknownOrTransientFailureAndChecksAuthority()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = AccountRecord.Create(Guid.NewGuid(), "precheck-user", "检查账号");
+        var now = DateTimeOffset.UtcNow;
+        var session = ImportSessionRecord.Create(sessionId, "Text", "paste") with
+        {
+            Status = "ReadyToConfirm",
+            TotalRows = 4,
+            ReadyRows = 4,
+            PrecheckAccountId = account.Id,
+        };
+        var succeeded = StagedImportRowRecord.Create(Guid.NewGuid(), sessionId, 1, "ok", "Ready") with
+        {
+            NormalizedShareId = "ok",
+            PrecheckStatus = "Succeeded",
+            PrecheckedAt = now,
+        };
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            await unit.Accounts.UpsertAsync(account);
+            await unit.Imports.AddSessionAsync(session);
+            await unit.Imports.AddRowsAsync([
+                succeeded,
+                FailedRow(sessionId, 2, "TEMPORARY_UNAVAILABLE", now),
+                FailedRow(sessionId, 3, "UNKNOWN_RESPONSE", now),
+                FailedRow(sessionId, 4, "FUTURE_SERVER_CODE", now),
+            ]);
+            await unit.CommitAsync();
+        }
+
+        var snapshot = await host.Services.GetRequiredService<IWizardPrecheckSnapshotQuery>()
+            .LoadAsync(sessionId, account.Id, CancellationToken.None);
+
+        Assert.Equal(3, snapshot.OtherFailureCount);
+        Assert.Equal(3, snapshot.FailedRowCount);
+        Assert.True(snapshot.IsConsistent);
+    }
+
+    [Fact]
     public void ShellCompositionBuildsOnlyTransferAndShareWorkspaces()
     {
         var bootstrap = File.ReadAllText(Path.Combine(

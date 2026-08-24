@@ -52,6 +52,39 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task OperationQueryProjectsSafeRetryOnlyForNeverSubmittedFailedTransfer()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resources = new[] { Resource(batch, 1), Resource(batch, 2) };
+        var safe = Operation(batch, resources[0], account, 1, "Failed", "Failed") with
+        {
+            SubmitState = "NotPrepared",
+            TargetSlotState = "Released",
+        };
+        var submitted = Operation(batch, resources[1], account, 2, "Failed", "Failed") with
+        {
+            SubmitState = "PendingConfirmation",
+            ConfirmationDescriptorJson = "{}",
+            SubmitStartedAt = BatchTestData.Now,
+            TargetSlotState = "Released",
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "safe-retry")],
+            job: Job(batch) with { Status = "Active", ResourceCount = 2, OperationCount = 2 },
+            resources: resources,
+            operations: [safe, submitted],
+            allocations: [Allocation(batch, account, 1) with { FailedItemCount = 2 }]);
+
+        var page = await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, "Failed", null, null, 10));
+
+        Assert.True(page.Items.Single(item => item.OperationId == safe.Id).CanSafelyRetryTransfer);
+        Assert.False(page.Items.Single(item => item.OperationId == submitted.Id).CanSafelyRetryTransfer);
+    }
+
+    [Fact]
     public void UnknownPersistedTransferStatusDoesNotLeakRawStatusText()
     {
         var record = new OperationResultRecord(

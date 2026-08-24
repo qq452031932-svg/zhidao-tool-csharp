@@ -190,6 +190,32 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         }
     }
 
+    public async Task<IReadOnlyList<BatchJobRecord>> GetRecentAsync(
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(limit));
+        await using var command = Command("""
+            SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,
+              DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,
+              CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount
+            FROM BatchJobs
+            ORDER BY julianday(CreatedAt) DESC,Id DESC
+            LIMIT $limit;
+            """);
+        Add(command, "$limit", limit);
+        var items = new List<BatchJobRecord>(limit);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            items.Add(new(
+                Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), reader.GetString(3),
+                reader.GetString(4), reader.GetString(5), reader.GetInt32(6), reader.GetInt32(7),
+                reader.GetString(8), reader.GetString(9), reader.GetString(10), reader.GetString(11),
+                reader.GetString(12), ReadTime(reader, 13), ReadNullableTime(reader, 14),
+                ReadNullableTime(reader, 15), ReadNullableId(reader, 16), reader.GetInt64(17), reader.GetInt32(18)));
+        return items;
+    }
+
     public async Task UpdateAllocationsAsync(IEnumerable<AccountAllocationRecord> allocations, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(allocations);
@@ -341,9 +367,21 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             "CASE WHEN a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 THEN 1 ELSE 0 END," +
             "COALESCE(output.ShareEnabled,0)," +
             "CASE WHEN s.Id IS NOT NULL AND (s.SubmitStartedAt IS NULL OR s.SubmissionAcceptance='DefinitelyNotAccepted') THEN 1 ELSE 0 END," +
-            "s.Generation,s.UpdatedAt,o.AttemptCount " +
+            "s.Generation,s.UpdatedAt,o.AttemptCount," +
+            "CASE WHEN o.Status='Failed' AND o.OutcomeKind='Failed' " +
+            "AND o.SubmitState IN ('NotPrepared','PreparingToSubmit') " +
+            "AND o.DailyCountedAt IS NULL AND o.ConfirmationDescriptorJson IS NULL " +
+            "AND o.SubmitStartedAt IS NULL AND o.AdapterRequestId IS NULL AND o.RemoteItemIdsJson IS NULL " +
+            "AND o.TargetSlotState='Released' AND o.LeaseExpiresAt IS NULL " +
+            "AND r.CandidateStatus='Expanded' AND r.GlobalValidityStatus<>'Invalid' AND r.ReservedAccountId IS NULL " +
+            "AND allocation.FailedItemCount>0 AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 " +
+            "AND b.Status IN ('Active','Queued','Paused','CompletedWithShortfall') " +
+            "AND o.AttemptCount<2147483647 " +
+            "AND NOT EXISTS(SELECT 1 FROM ShareOperations advanced WHERE advanced.TransferOperationId=o.Id AND advanced.Status<>'WaitingTransfer') " +
+            "THEN 1 ELSE 0 END " +
             $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId " +
             "JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId " +
+            "JOIN AccountAllocations allocation ON allocation.BatchJobId=o.BatchJobId AND allocation.AccountId=o.AssignedAccountId " +
             "LEFT JOIN ShareOperations s ON s.TransferOperationId=o.Id " +
             "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
             "WHERE o.BatchJobId=$job" + filter +
@@ -370,7 +408,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.GetInt64(23) != 0, reader.GetInt64(24) != 0,
                 reader.IsDBNull(25) ? null : reader.GetInt32(25),
                 reader.IsDBNull(26) ? null : ReadTime(reader, 26),
-                reader.GetInt32(27)));
+                reader.GetInt32(27),
+                reader.GetInt64(28) != 0));
         }
         if (items.Zip(items.Skip(1), static (left, right) => left.AllocationOrdinal == right.AllocationOrdinal).Any(equal => equal))
             throw new InvalidDataException("The operation result keyset contains duplicate allocation ordinals.");

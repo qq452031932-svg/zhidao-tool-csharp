@@ -14,7 +14,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 {
     private readonly IResultSaveDialog resultDirectoryDialog;
     private readonly ITransferResultDestinationSink destinationSink;
-    private readonly Func<Guid, CancellationToken, Task> handoffBatchAsync;
+    private readonly Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>> handoffBatchAsync;
     private readonly TransferWorkspaceOptions options;
     private readonly CancellationTokenSource lifetime = new();
     private TransferAccountMode? accountMode;
@@ -32,7 +32,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         WorkspaceRunPanelViewModel runPanel,
         IResultSaveDialog resultDirectoryDialog,
         ITransferResultDestinationSink destinationSink,
-        Func<Guid, CancellationToken, Task> handoffBatchAsync,
+        Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>> handoffBatchAsync,
         TransferWorkspaceOptions? options = null)
     {
         Import = import ?? throw new ArgumentNullException(nameof(import));
@@ -45,19 +45,42 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
         SelectSingleAccountCommand = new AsyncRelayCommand(
             () => SelectAccountModeAsync(TransferAccountMode.SingleAccount),
-            () => !IsStarting);
+            () => CanEditConfiguration);
         SelectReplicationCommand = new AsyncRelayCommand(
             () => SelectAccountModeAsync(TransferAccountMode.MultiAccountReplication),
-            () => !IsStarting);
+            () => CanEditConfiguration);
         SelectDistributionCommand = new AsyncRelayCommand(
             () => SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution),
-            () => !IsStarting);
+            () => CanEditConfiguration);
         PickShareResultDirectoryCommand = new AsyncRelayCommand(
             PickShareResultDirectoryAsync,
-            () => AutoShare && !IsStarting);
+            () => AutoShare && CanEditConfiguration);
         Import.DraftReady += OnDraftReady;
         Import.PropertyChanged += OnComposedPropertyChanged;
         Wizard.PropertyChanged += OnComposedPropertyChanged;
+    }
+
+    public TransferWorkspaceViewModel(
+        ImportViewModel import,
+        CreateJobWizardViewModel wizard,
+        WorkspaceRunPanelViewModel runPanel,
+        IResultSaveDialog resultDirectoryDialog,
+        ITransferResultDestinationSink destinationSink,
+        Func<Guid, CancellationToken, Task> handoffBatchAsync,
+        TransferWorkspaceOptions? options = null)
+        : this(
+            import,
+            wizard,
+            runPanel,
+            resultDirectoryDialog,
+            destinationSink,
+            async (batchJobId, cancellationToken) =>
+            {
+                await handoffBatchAsync(batchJobId, cancellationToken).ConfigureAwait(false);
+                return new(ResultWorkspaceHandoffStatus.Succeeded);
+            },
+            options)
+    {
     }
 
     public ImportViewModel Import { get; }
@@ -138,6 +161,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         private set
         {
             if (!SetProperty(ref isStarting, value)) return;
+            OnPropertyChanged(nameof(CanEditConfiguration));
             RaiseStartState();
             SelectSingleAccountCommand.NotifyCanExecuteChanged();
             SelectReplicationCommand.NotifyCanExecuteChanged();
@@ -146,6 +170,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool IsClosed => isClosed;
+    public bool CanEditConfiguration => !isClosed && !IsStarting;
     public Guid? CreatedBatchJobId => createdBatchJobId;
     public bool CanStart => !isClosed && !IsStarting && string.IsNullOrEmpty(EvaluateConfiguration());
     public string ConfigurationMessage => EvaluateConfiguration();
@@ -166,7 +191,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                 draft.Statistics.Conflict,
                 draft.Statistics.NeedsResolution,
                 draft.Statistics.HasExcelAccountColumn,
-                draft.Statistics.UnresolvedAccountMappings);
+                draft.Statistics.UnresolvedAccountMappings,
+                draft.Statistics.MappedAccountIds);
             StatusMessage = draft.Statistics.Conflict + draft.Statistics.NeedsResolution > 0
                 ? "导入内容中还有冲突或待处理记录，请先修正或排除。"
                 : "导入数据已更新。";
@@ -186,7 +212,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             draft.Statistics.UnresolvedAccountMappings,
             draft.Statistics.Conflict,
             draft.Statistics.NeedsResolution,
-            options.DefaultTargetDirectory));
+            options.DefaultTargetDirectory,
+            draft.Statistics.MappedAccountIds));
         foreach (var account in Wizard.Accounts) account.ShareEnabled = AutoShare;
         AccountMode = Wizard.Accounts.Count == 1 ? TransferAccountMode.SingleAccount : null;
         StatusMessage = draft.Statistics.Conflict + draft.Statistics.NeedsResolution > 0
@@ -199,7 +226,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         TransferAccountMode mode,
         CancellationToken cancellationToken = default)
     {
-        if (isClosed || IsStarting) return;
+        if (!CanEditConfiguration) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var transferMode = mode == TransferAccountMode.MultiAccountReplication
             ? TransferMode.Replication
@@ -315,6 +342,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     {
         Close();
         RunPanel.Dispose();
+        Import.Dispose();
         lifetime.Dispose();
     }
 
@@ -361,6 +389,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (result.MissingExtractionCodeCount > 0) parts.Add($"缺少提取码 {result.MissingExtractionCodeCount:N0} 条");
         if (result.AccountIssueCount > 0) parts.Add($"账号问题 {result.AccountIssueCount:N0} 项");
         if (result.ConflictCount > 0) parts.Add($"冲突 {result.ConflictCount:N0} 条");
+        if (result.OtherFailureCount > 0) parts.Add($"暂时无法确认 {result.OtherFailureCount:N0} 条");
+        if (!result.SnapshotIsConsistent) parts.Add("链接检查状态已变化");
         return $"请先处理：{string.Join("、", parts)}。";
     }
 
@@ -383,11 +413,14 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         var destinationSaved = resultDirectory is null;
         if (resultDirectory is not null)
         {
-            destinationSaved = await TryPostCommitAsync(token => destinationSink.SetAsync(
-                new TransferResultDestination(batchJobId, resultDirectory), token)).ConfigureAwait(true);
+            destinationSaved = await TryPostCommitAsync(
+                token => CompletedAsync(destinationSink.SetAsync(
+                    new TransferResultDestination(batchJobId, resultDirectory), token)),
+                static _ => true).ConfigureAwait(true);
         }
         var handedOff = await TryPostCommitAsync(
-            token => handoffBatchAsync(batchJobId, token)).ConfigureAwait(true);
+            token => handoffBatchAsync(batchJobId, token),
+            static outcome => outcome.Succeeded).ConfigureAwait(true);
         if (isClosed) return;
         StatusMessage = (destinationSaved, handedOff) switch
         {
@@ -398,17 +431,49 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         };
     }
 
-    private async Task<bool> TryPostCommitAsync(Func<CancellationToken, Task> operation)
+    private async Task<bool> TryPostCommitAsync<T>(
+        Func<CancellationToken, Task<T>> operation,
+        Func<T, bool> isSuccessful)
     {
         using var completion = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        completion.CancelAfter(TimeSpan.FromSeconds(options.PostCommitTimeoutSeconds));
+        Task<T>? pending = null;
         try
         {
-            await operation(completion.Token).ConfigureAwait(true);
-            return true;
+            pending = operation(completion.Token);
+            var result = await pending.WaitAsync(
+                TimeSpan.FromSeconds(options.PostCommitTimeoutSeconds),
+                lifetime.Token).ConfigureAwait(true);
+            return isSuccessful(result);
         }
-        catch (OperationCanceledException) when (completion.IsCancellationRequested) { return false; }
+        catch (TimeoutException)
+        {
+            completion.Cancel();
+            ObserveLateFault(pending);
+            return false;
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+            completion.Cancel();
+            ObserveLateFault(pending);
+            return false;
+        }
         catch (Exception) { return false; }
+    }
+
+    private static async Task<bool> CompletedAsync(Task operation)
+    {
+        await operation.ConfigureAwait(false);
+        return true;
+    }
+
+    private static void ObserveLateFault(Task? task)
+    {
+        if (task is null) return;
+        _ = task.ContinueWith(
+            static completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private void OnDraftReady(object? sender, ImportDraftReady draft) => ApplyImportedDraft(draft);
@@ -416,6 +481,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private void OnComposedPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (ReferenceEquals(sender, Wizard)) SynchronizeAccountState();
+        OnPropertyChanged(nameof(CanEditConfiguration));
         RaiseStartState();
     }
 
@@ -441,6 +507,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     {
         OnPropertyChanged(nameof(CanStart));
         OnPropertyChanged(nameof(ConfigurationMessage));
+        OnPropertyChanged(nameof(CanEditConfiguration));
         StartCommand.NotifyCanExecuteChanged();
     }
 }

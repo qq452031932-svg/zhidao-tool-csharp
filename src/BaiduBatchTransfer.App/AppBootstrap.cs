@@ -121,6 +121,8 @@ public static class AppBootstrap
         services.AddSingleton<IWizardBatchService, WizardBatchService>();
         services.AddSingleton<JobPageQuery>();
         services.AddSingleton<BatchStatisticsQuery>();
+        services.AddSingleton<BatchHistoryQuery>();
+        services.AddSingleton<IWorkspaceBatchHistorySource, WorkspaceBatchHistorySource>();
         services.AddSingleton<PauseBatchService>();
         services.AddSingleton<ResumeBatchService>();
         services.AddSingleton<RetryFailedTransferService>();
@@ -371,6 +373,7 @@ public sealed class AppShellFactory(
     PauseBatchService pauseBatchService,
     ResumeBatchService resumeBatchService,
     RetryFailedTransferService retryFailedTransferService,
+    IWorkspaceBatchHistorySource batchHistorySource,
     ITransferResultDestinationSink resultDestinationSink,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
@@ -394,7 +397,8 @@ public sealed class AppShellFactory(
             pauseBatchService,
             resumeBatchService,
             retryFailedTransferService,
-            transferOptions.MaximumRecentBatches);
+            transferOptions.MaximumRecentBatches,
+            batchHistorySource);
 
         async Task DispatchOnUiAsync(Action action)
         {
@@ -505,6 +509,7 @@ public sealed class AppShellFactory(
 
         async Task HandleLoadedAsync()
         {
+            await runPanelViewModel.InitializeAsync(shellLifetime.Token).ConfigureAwait(true);
             await handoff.RestorePendingAsync().ConfigureAwait(true);
             await DispatchOnUiAsync(() =>
             {

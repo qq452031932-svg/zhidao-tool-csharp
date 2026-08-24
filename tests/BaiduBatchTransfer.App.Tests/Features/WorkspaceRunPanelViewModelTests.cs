@@ -27,6 +27,55 @@ public sealed class WorkspaceRunPanelViewModelTests
     }
 
     [Fact]
+    public async Task DurableRecentBatchIsLoadedAndSelectedAfterViewModelRestart()
+    {
+        var durable = new WorkspaceBatchItem(Guid.NewGuid(), "普通转存批次", "Queued", DateTimeOffset.UtcNow);
+        var results = CreateResults(new FakeResultsWorkflow());
+        var store = new FakeRunControlStore();
+        using var vm = new WorkspaceRunPanelViewModel(
+            results,
+            new PauseBatchService(store),
+            new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            historySource: new FakeHistorySource([durable]));
+
+        await vm.InitializeAsync();
+
+        Assert.Equal(durable.BatchJobId, vm.SelectedBatch?.BatchJobId);
+        Assert.Equal(durable.BatchJobId, results.BatchJobId);
+    }
+
+    [Theory]
+    [InlineData("Queued", true, false)]
+    [InlineData("Active", true, false)]
+    [InlineData("Paused", false, true)]
+    [InlineData("Completed", false, false)]
+    [InlineData("Failed", false, false)]
+    public void PauseAndResumeCommandsUseDurableBatchStatus(
+        string status,
+        bool canPause,
+        bool canResume)
+    {
+        using var vm = Create(CreateResults(new FakeResultsWorkflow()), new FakeRunControlStore());
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: status);
+
+        Assert.Equal(canPause, vm.PauseCommand.CanExecute(null));
+        Assert.Equal(canResume, vm.ResumeCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task SubmittedFailedRowIsNotExposedAsSafeRetry()
+    {
+        var unsafeRow = Row("Failed", "失败") with { CanSafelyRetryTransfer = false };
+        var results = CreateResults(new FakeResultsWorkflow { Page = new([unsafeRow], 1, null) });
+        using var vm = Create(results, new FakeRunControlStore());
+        await vm.ActivateBatchAsync(Guid.NewGuid());
+        results.SelectedItem = Assert.Single(results.Items);
+
+        Assert.False(vm.RetryFailedTransferCommand.CanExecute(null));
+    }
+
+    [Fact]
     public async Task PauseResumeAndSafeFailedRetryUseTask3AServices()
     {
         var workflow = new FakeResultsWorkflow
@@ -121,7 +170,8 @@ public sealed class WorkspaceRunPanelViewModelTests
     private static JobResultRow Row(string rawStatus, string statusText) => new(
         Guid.NewGuid(), null, 1, "账号", "资源", statusText, "未启用分享", null, null,
         DateTimeOffset.UtcNow, null, null, false, false, false,
-        TransferStatus: rawStatus);
+        TransferStatus: rawStatus,
+        CanSafelyRetryTransfer: rawStatus == "Failed");
 
     private sealed class FakeResultsWorkflow : IJobResultsWorkflow
     {
@@ -134,6 +184,15 @@ public sealed class WorkspaceRunPanelViewModelTests
         public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class FakeHistorySource(IReadOnlyList<WorkspaceBatchItem> items)
+        : IWorkspaceBatchHistorySource
+    {
+        public Task<IReadOnlyList<WorkspaceBatchItem>> LoadRecentAsync(
+            int limit,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<WorkspaceBatchItem>>(items.Take(limit).ToArray());
     }
 
     private class FakeRunControlStore : IBatchRunControlStore

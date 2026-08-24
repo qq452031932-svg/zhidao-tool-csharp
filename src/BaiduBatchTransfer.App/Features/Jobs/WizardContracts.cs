@@ -61,7 +61,8 @@ public sealed record ImportWizardContext(
     int UnresolvedAccountMappingCount,
     int ConflictRowCount,
     int NeedsResolutionRowCount,
-    string DefaultTargetPath);
+    string DefaultTargetPath,
+    IReadOnlyList<Guid>? MappedAccountIds = null);
 
 public sealed record ImportPreviewPageRequest(
     Guid ImportSessionId,
@@ -207,7 +208,8 @@ public sealed record WizardDraftMutation(
     int ConflictRows,
     int NeedsResolutionRows,
     int ExcludedRows,
-    int UnresolvedAccountMappings = 0);
+    int UnresolvedAccountMappings = 0,
+    IReadOnlyList<Guid>? MappedAccountIds = null);
 
 public interface IWizardDraftWorkflow
 {
@@ -231,10 +233,15 @@ public sealed record WizardPrecheckResult(
     int InvalidLinkCount = 0,
     int MissingExtractionCodeCount = 0,
     int AccountIssueCount = 0,
-    int ConflictCount = 0)
+    int ConflictCount = 0,
+    int OtherFailureCount = 0,
+    bool SnapshotIsConsistent = true)
 {
+    public int FailedRowCount => checked(
+        InvalidLinkCount + MissingExtractionCodeCount + AccountIssueCount + OtherFailureCount);
+
     public bool HasActionableFailures =>
-        InvalidLinkCount > 0 || MissingExtractionCodeCount > 0 || AccountIssueCount > 0 || ConflictCount > 0;
+        FailedRowCount > 0 || ConflictCount > 0 || !SnapshotIsConsistent;
 }
 
 public interface IWizardPrecheckWorkflow
@@ -259,7 +266,8 @@ public sealed class WizardDraftWorkflow(
     RequestedAccountMappingService mappings) : IWizardDraftWorkflow
 {
     public async Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
-        Map(await reclassification.SwitchAsync(sessionId, mode, cancellationToken).ConfigureAwait(false));
+        await MapAsync(sessionId, await reclassification.SwitchAsync(sessionId, mode, cancellationToken).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
 
     public async Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(
         Guid sessionId,
@@ -281,18 +289,30 @@ public sealed class WizardDraftWorkflow(
         var result = unique.Count == 0
             ? await reclassification.SwitchAsync(sessionId, mode, cancellationToken).ConfigureAwait(false)
             : await mappings.ApplyAsync(sessionId, unique, mode, cancellationToken).ConfigureAwait(false);
-        return Map(result) with { UnresolvedAccountMappings = unresolved };
+        var mapped = await MapAsync(sessionId, result, cancellationToken).ConfigureAwait(false);
+        return mapped with { UnresolvedAccountMappings = Math.Max(unresolved, mapped.UnresolvedAccountMappings) };
     }
 
     public async Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
-        Map(await mappings.IgnoreAllAsync(sessionId, mode, cancellationToken).ConfigureAwait(false));
+        await MapAsync(sessionId, await mappings.IgnoreAllAsync(sessionId, mode, cancellationToken).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
 
     public async Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) =>
-        Map(await mappings.OverrideAllAsync(sessionId, accountId, mode, cancellationToken).ConfigureAwait(false));
+        await MapAsync(sessionId, await mappings.OverrideAllAsync(sessionId, accountId, mode, cancellationToken).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
 
-    private static WizardDraftMutation Map(DraftMutationResult value) => new(
-        value.TotalRows, value.ReadyRows, value.InvalidRows, value.DuplicateRows,
-        value.ConflictRows, value.NeedsResolutionRows, value.ExcludedRows);
+    private async Task<WizardDraftMutation> MapAsync(
+        Guid sessionId,
+        DraftMutationResult value,
+        CancellationToken cancellationToken)
+    {
+        var resolution = await mappings.GetResolutionCountsAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        return new(
+            value.TotalRows, value.ReadyRows, value.InvalidRows, value.DuplicateRows,
+            value.ConflictRows, value.NeedsResolutionRows, value.ExcludedRows,
+            (int)Math.Min(int.MaxValue, resolution.UnresolvedGroups),
+            resolution.MappedAccountIds ?? []);
+    }
 }
 
 internal sealed class PassiveWizardDraftWorkflow : IWizardDraftWorkflow
