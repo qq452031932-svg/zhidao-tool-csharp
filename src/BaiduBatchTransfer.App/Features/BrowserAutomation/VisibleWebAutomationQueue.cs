@@ -13,6 +13,7 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
     private readonly IAccountProfilePathPolicy profilePathPolicy;
     private readonly WebView2ProfileCloser profileCloser;
     private readonly UserHandoffCoordinator handoffCoordinator;
+    private readonly IWebAutomationBatchCancellation batchCancellation;
     private readonly IWebAutomationRequestOwnershipStore ownershipStore;
     private readonly IWebAutomationNavigationAuthorizer navigationAuthorizer;
     private readonly VisibleWebAutomationQueueOptions options;
@@ -27,6 +28,7 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         IAccountProfilePathPolicy profilePathPolicy,
         WebView2ProfileCloser profileCloser,
         UserHandoffCoordinator handoffCoordinator,
+        IWebAutomationBatchCancellation batchCancellation,
         IWebAutomationRequestOwnershipStore ownershipStore,
         IWebAutomationNavigationAuthorizer navigationAuthorizer,
         VisibleWebAutomationQueueOptions? options = null)
@@ -36,6 +38,7 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         this.profilePathPolicy = profilePathPolicy ?? throw new ArgumentNullException(nameof(profilePathPolicy));
         this.profileCloser = profileCloser ?? throw new ArgumentNullException(nameof(profileCloser));
         this.handoffCoordinator = handoffCoordinator ?? throw new ArgumentNullException(nameof(handoffCoordinator));
+        this.batchCancellation = batchCancellation ?? throw new ArgumentNullException(nameof(batchCancellation));
         this.ownershipStore = ownershipStore ?? throw new ArgumentNullException(nameof(ownershipStore));
         this.navigationAuthorizer = navigationAuthorizer ?? throw new ArgumentNullException(nameof(navigationAuthorizer));
         this.options = (options ?? new VisibleWebAutomationQueueOptions()).Validate();
@@ -121,7 +124,22 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         using var queueScope = CancellationTokenSource.CreateLinkedTokenSource(
             requestCancellation,
             queueCancellation);
+        using var batchCancellationRequested = new CancellationTokenSource();
+        using var batchRegistration = batchCancellation.Register(
+            request.Identity.BatchId,
+            request.Identity.OwnerKind,
+            batchCancellationRequested.Cancel);
         ValidateRequest(request);
+        if (await batchCancellation.IsCancelledAsync(
+                request.Identity.BatchId,
+                request.Identity.OwnerKind,
+                queueScope.Token).ConfigureAwait(false))
+        {
+            return new(
+                VisibleWebAutomationDisposition.BatchCancelled,
+                default,
+                WebAutomationAttemptState.DefinitelyNotSubmitted);
+        }
         if (!await ownershipStore.IsBoundAsync(
                 request.Identity.OperationId,
                 request.Identity.BatchId,
@@ -184,6 +202,7 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                 queueScope.Token,
                 session.UserClosed,
                 profileCloseRequested.Token,
+                batchCancellationRequested.Token,
                 sessionTimeout.Token);
             try
             {
@@ -220,25 +239,35 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
             }
             catch (OperationCanceledException exception) when (activeCancellation.IsCancellationRequested)
             {
-                var interrupted = await context.InterruptAsync(CancellationToken.None).ConfigureAwait(false);
                 if (showTask is not null && !showTask.IsCompleted)
                     _ = ObserveLateCompletionAsync(showTask);
                 if (actionTask is not null)
                     await AwaitOrObserveLateAsync(actionTask, options.ActionStopTimeout).ConfigureAwait(false);
-                if (session.UserClosed.IsCancellationRequested || profileCloseRequested.IsCancellationRequested)
+                if (batchCancellationRequested.IsCancellationRequested)
                 {
                     completion = new(
-                        VisibleWebAutomationDisposition.Skipped,
+                        VisibleWebAutomationDisposition.BatchCancelled,
                         default,
-                        interrupted.PersistentState);
+                        SafeCancellationState(context.CurrentStage));
                 }
-                else if (sessionTimeout.IsCancellationRequested)
+                else
                 {
-                    completionException = new TimeoutException(
-                        "可见浏览器操作等待超时，当前项目已安全停止。",
-                        exception);
+                    var interrupted = await context.InterruptAsync(CancellationToken.None).ConfigureAwait(false);
+                    if (session.UserClosed.IsCancellationRequested || profileCloseRequested.IsCancellationRequested)
+                    {
+                        completion = new(
+                            VisibleWebAutomationDisposition.Skipped,
+                            default,
+                            interrupted.PersistentState);
+                    }
+                    else if (sessionTimeout.IsCancellationRequested)
+                    {
+                        completionException = new TimeoutException(
+                            "可见浏览器操作等待超时，当前项目已安全停止。",
+                            exception);
+                    }
+                    else completionException = exception;
                 }
-                else completionException = exception;
             }
             catch (Exception exception)
             {
@@ -357,6 +386,11 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         try { await task.ConfigureAwait(false); }
         catch (Exception) { }
     }
+
+    private static WebAutomationAttemptState SafeCancellationState(WebAutomationAttemptState stage) =>
+        stage is WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted
+            ? WebAutomationAttemptState.DefinitelyNotSubmitted
+            : WebAutomationAttemptState.NeedsDecision;
 
     private interface IQueuedOperation
     {

@@ -175,7 +175,13 @@ public static class AppBootstrap
         services.AddSingleton<WebView2ProfileCloser>();
         services.AddSingleton<IWebViewProfileCloser>(sp => sp.GetRequiredService<WebView2ProfileCloser>());
         services.AddSingleton<IWebAutomationNavigationAuthorizer, ProductionWebAutomationNavigationAuthorizer>();
-        services.AddSingleton<IWebAutomationBatchCancellation, UnavailableWebAutomationBatchCancellation>();
+        services.AddSingleton<SqliteWebAutomationBatchCancellationStore>();
+        services.AddSingleton<IWebAutomationBatchCancellationStore>(sp =>
+            sp.GetRequiredService<SqliteWebAutomationBatchCancellationStore>());
+        services.AddSingleton<IWebAutomationBatchCancellation>(sp =>
+            new WebAutomationBatchCancellation(
+                sp.GetRequiredService<IWebAutomationBatchCancellationStore>(),
+                TimeProvider.System));
         services.AddSingleton<IWebAutomationUiDispatcher, WpfWebAutomationUiDispatcher>();
         services.AddSingleton<IVisibleWebAutomationSessionFactory, WebView2AutomationSessionFactory>();
         services.AddSingleton(sp => new UserHandoffCoordinator(

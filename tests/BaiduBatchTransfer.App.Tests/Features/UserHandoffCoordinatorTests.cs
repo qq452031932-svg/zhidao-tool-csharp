@@ -73,6 +73,44 @@ public sealed class UserHandoffCoordinatorTests
     }
 
     [Fact]
+    public async Task CancelPersistenceFailureLeavesHandoffPending()
+    {
+        var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
+        var handoff = await fixture.Coordinator.EnterAsync(
+            fixture.Identity,
+            WebAutomationAttemptState.Preparing,
+            fixture.Fingerprint);
+        fixture.Cancellation.ThrowOnCancel = true;
+
+        await Assert.ThrowsAsync<IOException>(() => fixture.Coordinator.ResolveAsync(
+            fixture.Identity,
+            handoff,
+            WebAutomationUserChoice.CancelBatch));
+
+        Assert.Equal(WebAutomationAttemptState.UserHandoff, fixture.Store.Current.State);
+        Assert.True(fixture.Store.Current.IsWaitingForUser);
+    }
+
+    [Fact]
+    public async Task DuplicateCancelCannotReuseAResolvedHandoff()
+    {
+        var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
+        var handoff = await fixture.Coordinator.EnterAsync(
+            fixture.Identity,
+            WebAutomationAttemptState.Preparing,
+            fixture.Fingerprint);
+
+        var first = await fixture.Coordinator.ResolveAsync(
+            fixture.Identity, handoff, WebAutomationUserChoice.CancelBatch);
+        var duplicate = await fixture.Coordinator.ResolveAsync(
+            fixture.Identity, handoff, WebAutomationUserChoice.CancelBatch);
+
+        Assert.Equal(UserHandoffResolution.BatchCancelled, first.Resolution);
+        Assert.Equal(UserHandoffResolution.Stale, duplicate.Resolution);
+        Assert.Single(fixture.Cancellation.Cancelled);
+    }
+
+    [Fact]
     public async Task WrongOperationAccountOrGenerationCannotResumeHandoff()
     {
         var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
@@ -141,16 +179,37 @@ public sealed class UserHandoffCoordinatorTests
     {
         public List<WebAutomationRequestIdentity> Cancelled { get; } = [];
         public bool StateWasPersistentWhenCalled { get; private set; }
+        public bool ThrowOnCancel { get; set; }
 
-        public Task CancelAsync(
+        public Task<bool> CancelAsync(
             WebAutomationRequestIdentity identity,
+            long expectedAttemptRevision,
+            WebAutomationAttemptState expectedResumeStage,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (ThrowOnCancel) throw new IOException("synthetic durable cancellation failure");
+            if (!store.ResolveBatchCancellation(identity, expectedAttemptRevision, expectedResumeStage))
+                return Task.FromResult(false);
             StateWasPersistentWhenCalled = store.Current.State is
                 WebAutomationAttemptState.DefinitelyNotSubmitted or WebAutomationAttemptState.NeedsDecision;
             Cancelled.Add(identity);
-            return Task.CompletedTask;
+            return Task.FromResult(true);
+        }
+
+        public Task<bool> IsCancelledAsync(
+            Guid batchId,
+            WebAutomationOwnerKind ownerKind,
+            CancellationToken cancellationToken = default) => Task.FromResult(false);
+
+        public IDisposable Register(
+            Guid batchId,
+            WebAutomationOwnerKind ownerKind,
+            Action cancellationRequested) => new NoopDisposable();
+
+        private sealed class NoopDisposable : IDisposable
+        {
+            public void Dispose() { }
         }
     }
 
@@ -159,6 +218,32 @@ public sealed class UserHandoffCoordinatorTests
     {
         private readonly object gate = new();
         public WebAutomationAttemptRecord Current { get; private set; } = initial;
+
+        public bool ResolveBatchCancellation(
+            WebAutomationRequestIdentity identity,
+            long expectedAttemptRevision,
+            WebAutomationAttemptState expectedResumeStage)
+        {
+            lock (gate)
+            {
+                if (!Matches(identity.OperationId, identity.AccountId, identity.Generation) ||
+                    Current.OwnerKind != identity.OwnerKind ||
+                    Current.State != WebAutomationAttemptState.UserHandoff ||
+                    Current.ResumeStage != expectedResumeStage ||
+                    Current.Revision != expectedAttemptRevision)
+                {
+                    return false;
+                }
+                var terminal = expectedResumeStage is WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted
+                    ? WebAutomationAttemptState.DefinitelyNotSubmitted
+                    : WebAutomationAttemptState.NeedsDecision;
+                Current = new(
+                    Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                    terminal, null, Current.Baseline, Current.ObservationFingerprint, false,
+                    Current.Revision + 1, Current.CreatedAt, DateTimeOffset.UtcNow);
+                return true;
+            }
+        }
 
         public Task<bool> BeginAsync(WebAutomationAttemptRecord attempt, CancellationToken cancellationToken = default) =>
             Task.FromResult(false);

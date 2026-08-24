@@ -15,6 +15,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task TransferBaseline_RoundTripsExactPreSubmitDirectorySet()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
         var attempt = WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now);
 
@@ -36,6 +37,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task BaselineReadPagesPastTheOldPerQueryBoundaryWithoutTruncation()
     {
         var graph = await CreateAsync(baselineReadPageSize: 2);
+        await SetTransferGenerationAsync(graph, 1);
         var ids = Enumerable.Range(1, 5).Select(index => $"before-{index}").ToArray();
         await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
@@ -55,6 +57,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task OversizedBaselineIsRejectedBeforeAnyEvidenceIsWritten()
     {
         var graph = await CreateAsync(maximumBaselineItemCount: 2);
+        await SetTransferGenerationAsync(graph, 1);
         await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
 
@@ -74,6 +77,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task CorruptCanonicalSortKeyCannotMasqueradeAsAnExactBaseline()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
         await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
         Assert.True(await graph.Store.TryPersistBaselineAsync(
@@ -97,6 +101,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task BaselineSchemaAndModelDoNotRetainRemoteDisplayNames()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
         var baseline = ExactBaseline("private-item");
         await using var connection = await graph.Factory.OpenConnectionAsync();
         await using var command = connection.CreateCommand();
@@ -116,6 +121,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task BeginAcceptsEveryOwnerKindOnlyForItsAuthoritativeBusinessRow()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
 
         Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
@@ -129,6 +135,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task RequestOwnershipRequiresTheExactAuthoritativeBatchAccountAndGeneration()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 7);
         var ownership = new SqliteWebAutomationRequestOwnershipStore(graph.Factory);
 
         Assert.True(await ownership.IsBoundAsync(
@@ -145,6 +152,43 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Assert.False(await ownership.IsBoundAsync(
             graph.StandaloneOperationId, graph.StandaloneBatchId, graph.OtherAccountId, 1,
             WebAutomationOwnerKind.StandaloneShare));
+    }
+
+    [Fact]
+    public async Task TransferRequestAndAttemptRequireCurrentAuthoritativeAttemptCount()
+    {
+        var graph = await CreateAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE TransferOperations SET AttemptCount=2 WHERE Id=$operation;";
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+        var ownership = new SqliteWebAutomationRequestOwnershipStore(graph.Factory);
+
+        Assert.True(await ownership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer));
+        Assert.False(await ownership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer));
+        Assert.False(await ownership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 3, WebAutomationOwnerKind.Transfer));
+        Assert.False(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.False(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 3, WebAutomationOwnerKind.Transfer, graph.Now)));
+
+        await SetTransferGenerationAsync(graph, 3);
+        var restartedOwnership = new SqliteWebAutomationRequestOwnershipStore(graph.Factory);
+        var restartedAttempts = new SqliteWebAutomationAttemptStore(graph.Factory);
+        Assert.False(await restartedOwnership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer));
+        Assert.False(await restartedAttempts.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.True(await restartedOwnership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 3, WebAutomationOwnerKind.Transfer));
     }
 
     [Theory]
@@ -265,6 +309,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task Advance_RejectsOldGenerationWrongAccountStaleRevisionAndInvalidTransition()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
         await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now));
 
@@ -286,6 +331,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     public async Task ResultCannotSucceedFromFingerprintWithoutExactPersistedBaseline()
     {
         var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
         await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now));
 
@@ -304,6 +350,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         var graph = await CreateAsync();
         for (var index = 0; index < 3; index++)
         {
+            await SetTransferGenerationAsync(graph, index + 1);
             await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
                 graph.OperationId, graph.AccountId, index + 1, WebAutomationOwnerKind.Transfer,
                 graph.Now.AddSeconds(index)));
@@ -326,6 +373,7 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         int generation,
         WebAutomationAttemptState stage)
     {
+        await SetTransferGenerationAsync(graph, generation);
         Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, generation, WebAutomationOwnerKind.Transfer, graph.Now)));
         if (stage == WebAutomationAttemptState.Preparing)
@@ -352,6 +400,16 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     }
 
     private static string Fingerprint(char value) => new(value, 64);
+
+    private static async Task SetTransferGenerationAsync(Graph graph, int generation)
+    {
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE TransferOperations SET AttemptCount=$generation WHERE Id=$operation;";
+        command.Parameters.AddWithValue("$generation", generation);
+        command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+        await command.ExecuteNonQueryAsync();
+    }
 
     private async Task<Graph> CreateAsync(
         int maximumBaselineItemCount = 100_000,

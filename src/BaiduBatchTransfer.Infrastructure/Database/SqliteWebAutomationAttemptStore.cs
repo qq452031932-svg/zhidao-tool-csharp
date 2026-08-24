@@ -460,7 +460,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         {
             WebAutomationOwnerKind.Transfer => """
                 SELECT COUNT(*) FROM TransferOperations
-                WHERE Id=$operation AND AssignedAccountId=$account;
+                WHERE Id=$operation AND AssignedAccountId=$account AND AttemptCount=$generation;
                 """,
             WebAutomationOwnerKind.TransferShare => """
                 SELECT COUNT(*) FROM ShareOperations share

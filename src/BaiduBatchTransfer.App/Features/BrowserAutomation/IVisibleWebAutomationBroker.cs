@@ -123,9 +123,21 @@ public interface IWebAutomationNavigationAuthorizer
 
 public interface IWebAutomationBatchCancellation
 {
-    Task CancelAsync(
+    Task<bool> CancelAsync(
         WebAutomationRequestIdentity identity,
+        long expectedAttemptRevision,
+        WebAutomationAttemptState expectedResumeStage,
         CancellationToken cancellationToken = default);
+
+    Task<bool> IsCancelledAsync(
+        Guid batchId,
+        WebAutomationOwnerKind ownerKind,
+        CancellationToken cancellationToken = default);
+
+    IDisposable Register(
+        Guid batchId,
+        WebAutomationOwnerKind ownerKind,
+        Action cancellationRequested);
 }
 
 public sealed class WebAutomationAuthorizationException(
@@ -139,14 +151,6 @@ public sealed class ProductionWebAutomationNavigationAuthorizer : IWebAutomation
 {
     public BaiduAutomationDecision Authorize(BaiduNavigationAuthorizationRequest request) =>
         BaiduSelectorCatalog.Production.AuthorizeNavigation(request);
-}
-
-public sealed class UnavailableWebAutomationBatchCancellation : IWebAutomationBatchCancellation
-{
-    public Task CancelAsync(
-        WebAutomationRequestIdentity identity,
-        CancellationToken cancellationToken = default) =>
-        throw new InvalidOperationException("浏览器批次取消尚未接通。当前浏览器写操作仍未开放。");
 }
 
 public sealed record VisibleWebAutomationQueueOptions

@@ -2,6 +2,7 @@ using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Extensions.DependencyInjection;
 using System.Runtime.CompilerServices;
@@ -205,6 +206,80 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         Assert.Equal(1, fixture.Factory.MaximumConcurrentSessions);
         if (choice == WebAutomationUserChoice.CancelBatch)
             Assert.Equal([firstRequest.Identity], fixture.Cancellation.Cancelled);
+    }
+
+    [Fact]
+    public async Task CancelBatchStopsActiveAndAllQueuedItemsButOtherBatchContinuesFifo()
+    {
+        await using var fixture = CreateFixture();
+        var sameBatchCallbacks = 0;
+        var otherBatchCallback = false;
+        var activeRequest = fixture.Request(async (_, context, token) =>
+        {
+            await context.RequestUserHandoffAsync(
+                WebAutomationAttemptState.Preparing,
+                WebAutomationHandoffReason.Captcha,
+                fixture.Fingerprint,
+                token);
+            return 1;
+        });
+        var sameBatchOne = fixture.Request((_, _, _) =>
+        {
+            Interlocked.Increment(ref sameBatchCallbacks);
+            return Task.FromResult(2);
+        }) with
+        {
+            Identity = fixture.RequestIdentity(activeRequest.Identity.BatchId),
+        };
+        var sameBatchTwo = fixture.Request((_, _, _) =>
+        {
+            Interlocked.Increment(ref sameBatchCallbacks);
+            return Task.FromResult(3);
+        }) with
+        {
+            Identity = fixture.RequestIdentity(activeRequest.Identity.BatchId),
+        };
+        var otherBatch = fixture.Request((_, _, _) =>
+        {
+            otherBatchCallback = true;
+            return Task.FromResult(4);
+        });
+
+        var active = fixture.Queue.EnqueueAsync(activeRequest);
+        var queuedOne = fixture.Queue.EnqueueAsync(sameBatchOne);
+        var queuedTwo = fixture.Queue.EnqueueAsync(sameBatchTwo);
+        var other = fixture.Queue.EnqueueAsync(otherBatch);
+        var session = await fixture.Factory.WaitForSessionAsync(0);
+        await session.HandoffShown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        session.Decide(WebAutomationUserChoice.CancelBatch);
+
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, (await active).Disposition);
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, (await queuedOne).Disposition);
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, (await queuedTwo).Disposition);
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, (await other).Disposition);
+        Assert.Equal(0, sameBatchCallbacks);
+        Assert.True(otherBatchCallback);
+        Assert.Equal(2, fixture.Factory.CreatedCount);
+    }
+
+    [Fact]
+    public async Task PersistedBatchCancellationBeforeEnqueueNeverOpensWindowOrRunsCallback()
+    {
+        await using var fixture = CreateFixture();
+        var callbackStarted = false;
+        var request = fixture.Request((_, _, _) =>
+        {
+            callbackStarted = true;
+            return Task.FromResult(1);
+        });
+        fixture.Cancellation.SeedCancelled(request.Identity.BatchId, request.Identity.OwnerKind);
+
+        var result = await fixture.Queue.EnqueueAsync(request);
+
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, result.Disposition);
+        Assert.False(callbackStarted);
+        Assert.Equal(0, fixture.Factory.CreatedCount);
     }
 
     [Fact]
@@ -496,6 +571,10 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             host.Services.GetRequiredService<IVisibleWebAutomationSessionFactory>());
         Assert.IsType<ProductionWebAutomationNavigationAuthorizer>(
             host.Services.GetRequiredService<IWebAutomationNavigationAuthorizer>());
+        Assert.IsType<WebAutomationBatchCancellation>(
+            host.Services.GetRequiredService<IWebAutomationBatchCancellation>());
+        Assert.IsType<SqliteWebAutomationBatchCancellationStore>(
+            host.Services.GetRequiredService<IWebAutomationBatchCancellationStore>());
     }
 
     private QueueFixture CreateFixture(
@@ -552,6 +631,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
                 PathPolicy,
                 ProfileCloser,
                 handoff,
+                Cancellation,
                 Ownership,
                 authorizer ?? new AllowingAuthorizer(),
                 new VisibleWebAutomationQueueOptions
@@ -599,6 +679,13 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
                 Navigation(new Uri("https://pan.baidu.com/disk/main")),
                 action);
         }
+
+        public WebAutomationRequestIdentity RequestIdentity(Guid batchId) => new(
+            Guid.NewGuid(),
+            batchId,
+            DefaultAccount,
+            Interlocked.Increment(ref sequence),
+            WebAutomationOwnerKind.Transfer);
 
         public BaiduNavigationAuthorizationRequest Navigation(Uri uri) => new(
             BaiduAutomationAction.OpenOfficialUri,
@@ -750,12 +837,51 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
 
     private sealed class RecordingCancellation : IWebAutomationBatchCancellation
     {
+        private readonly Dictionary<(Guid, WebAutomationOwnerKind), CancellationTokenSource> signals = [];
+        private readonly HashSet<(Guid, WebAutomationOwnerKind)> cancelledBatches = [];
         public List<WebAutomationRequestIdentity> Cancelled { get; } = [];
-        public Task CancelAsync(WebAutomationRequestIdentity identity, CancellationToken cancellationToken = default)
+
+        public void SeedCancelled(Guid batchId, WebAutomationOwnerKind ownerKind)
+        {
+            var key = Key(batchId, ownerKind);
+            cancelledBatches.Add(key);
+            Signal(key).Cancel();
+        }
+        public Task<bool> CancelAsync(
+            WebAutomationRequestIdentity identity,
+            long expectedAttemptRevision,
+            WebAutomationAttemptState expectedResumeStage,
+            CancellationToken cancellationToken = default)
         {
             Cancelled.Add(identity);
-            return Task.CompletedTask;
+            var key = Key(identity.BatchId, identity.OwnerKind);
+            cancelledBatches.Add(key);
+            Signal(key).Cancel();
+            return Task.FromResult(true);
         }
+
+        public Task<bool> IsCancelledAsync(
+            Guid batchId,
+            WebAutomationOwnerKind ownerKind,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(cancelledBatches.Contains(Key(batchId, ownerKind)));
+
+        public IDisposable Register(
+            Guid batchId,
+            WebAutomationOwnerKind ownerKind,
+            Action cancellationRequested) =>
+            Signal(Key(batchId, ownerKind)).Token.Register(cancellationRequested);
+
+        private CancellationTokenSource Signal((Guid, WebAutomationOwnerKind) key)
+        {
+            if (!signals.TryGetValue(key, out var signal)) signals[key] = signal = new();
+            return signal;
+        }
+
+        private static (Guid, WebAutomationOwnerKind) Key(Guid batchId, WebAutomationOwnerKind ownerKind) =>
+            (batchId, ownerKind == WebAutomationOwnerKind.StandaloneShare
+                ? WebAutomationOwnerKind.StandaloneShare
+                : WebAutomationOwnerKind.Transfer);
     }
 
     private sealed class RecordingOwnershipStore : IWebAutomationRequestOwnershipStore

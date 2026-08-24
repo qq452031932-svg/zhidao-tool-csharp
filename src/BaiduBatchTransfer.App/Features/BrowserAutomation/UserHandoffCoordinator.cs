@@ -121,6 +121,17 @@ public sealed class UserHandoffCoordinator
         }
 
         var terminal = SafeTerminalState(handoff.ResumeStage);
+        if (choice == WebAutomationUserChoice.CancelBatch)
+        {
+            var cancelled = await batchCancellation.CancelAsync(
+                identity,
+                handoff.Revision,
+                handoff.ResumeStage,
+                cancellationToken).ConfigureAwait(false);
+            return cancelled
+                ? new(UserHandoffResolution.BatchCancelled, terminal)
+                : new(UserHandoffResolution.Stale, WebAutomationAttemptState.UserHandoff);
+        }
         var resolved = await store.TryResolveUserHandoffAsync(
             identity.OperationId,
             identity.AccountId,
@@ -133,11 +144,6 @@ public sealed class UserHandoffCoordinator
             cancellationToken).ConfigureAwait(false);
         if (!resolved) return new(UserHandoffResolution.Stale, WebAutomationAttemptState.UserHandoff);
 
-        if (choice == WebAutomationUserChoice.CancelBatch)
-        {
-            await batchCancellation.CancelAsync(identity, cancellationToken).ConfigureAwait(false);
-            return new(UserHandoffResolution.BatchCancelled, terminal);
-        }
         return new(UserHandoffResolution.Skipped, terminal);
     }
 
