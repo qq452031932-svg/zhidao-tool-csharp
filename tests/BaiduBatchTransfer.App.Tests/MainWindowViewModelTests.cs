@@ -9,41 +9,43 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class MainWindowViewModelTests
 {
     [Fact]
-    public void NavigationUsesChineseLabelsAndDoesNotExposeUnavailableFeaturesAsRunnable()
+    public void ShellExposesOnlyTransferAndShareWorkspaces()
     {
         var login = new FakeLoginLauncher();
-        var vm = new MainWindowViewModel(new object(), new object(), login);
+        var transfer = new object();
+        var share = new object();
+        var vm = new MainWindowViewModel(transfer, share, login);
 
-        Assert.Equal("导入与草稿", vm.CurrentPageTitle);
+        Assert.Equal("转存", vm.CurrentWorkspaceTitle);
+        Assert.Same(transfer, vm.CurrentContent);
         Assert.Equal("百度批量转存", vm.ApplicationTitle);
         Assert.False(vm.OpenAccountLoginCommand.CanExecute(null));
         Assert.Contains("尚不可用", vm.AdapterStatusMessage);
         Assert.False(vm.OpenAccountManagementCommand.CanExecute(null));
         Assert.Contains("尚不可用", vm.AccountManagementStatusMessage);
 
-        vm.ShowCreateJobCommand.Execute(null);
+        vm.ShowShareCommand.Execute(null);
 
-        Assert.Equal("创建任务", vm.CurrentPageTitle);
+        Assert.Equal("分享", vm.CurrentWorkspaceTitle);
+        Assert.Same(share, vm.CurrentContent);
+
+        vm.ShowTransferCommand.Execute(null);
+
+        Assert.Equal("转存", vm.CurrentWorkspaceTitle);
+        Assert.Same(transfer, vm.CurrentContent);
     }
 
     [Fact]
-    public void ResultNavigationUsesDedicatedPageAndIsUnavailableWhenPageWasNotProvided()
+    public void ShellDoesNotExposeLegacyNavigationCommands()
     {
-        var results = new object();
-        var vm = new MainWindowViewModel(
-            new object(),
-            new object(),
-            new FakeLoginLauncher(),
-            resultsPage: results);
+        var navigationProperties = typeof(MainWindowViewModel)
+            .GetProperties()
+            .Where(property => property.Name.StartsWith("Show", StringComparison.Ordinal))
+            .Select(property => property.Name)
+            .OrderBy(name => name)
+            .ToArray();
 
-        Assert.True(vm.ShowResultsCommand.CanExecute(null));
-        vm.ShowResultsCommand.Execute(null);
-
-        Assert.Same(results, vm.CurrentContent);
-        Assert.Equal("任务结果", vm.CurrentPageTitle);
-
-        var withoutResults = new MainWindowViewModel(new object(), new object(), new FakeLoginLauncher());
-        Assert.False(withoutResults.ShowResultsCommand.CanExecute(null));
+        Assert.Equal(["ShowShareCommand", "ShowTransferCommand"], navigationProperties);
     }
 
     [Fact]
@@ -215,7 +217,15 @@ public sealed class MainWindowViewModelTests
             "MainWindow.xaml"));
 
         Assert.Contains("Content=\"刷新账号\" Command=\"{Binding RefreshAccountsCommand}\"", xaml);
-        Assert.Contains("Content=\"任务结果\" Command=\"{Binding ShowResultsCommand}\"", xaml);
+        Assert.Contains("Content=\"转存\" Command=\"{Binding ShowTransferCommand}\"", xaml);
+        Assert.Contains("Content=\"分享\" Command=\"{Binding ShowShareCommand}\"", xaml);
+        Assert.DoesNotContain("导入与草稿", xaml);
+        Assert.DoesNotContain("创建任务", xaml);
+        Assert.DoesNotContain("任务结果", xaml);
+        Assert.DoesNotContain("批量预检", xaml);
+        Assert.DoesNotContain("ShowImportCommand", xaml);
+        Assert.DoesNotContain("ShowCreateJobCommand", xaml);
+        Assert.DoesNotContain("ShowResultsCommand", xaml);
         Assert.Contains("x:Name=\"AccountStatusLiveRegion\"", xaml);
         Assert.Contains("AutomationProperties.Name=\"{Binding AccountStatusMessage}\"", xaml);
         Assert.Contains("x:Name=\"OperationStatusLiveRegion\"", xaml);
@@ -247,7 +257,7 @@ public sealed class MainWindowViewModelTests
             },
             action => dispatched.Add(action));
 
-        source.Raise(nameof(MainWindowViewModel.CurrentPageTitle));
+        source.Raise(nameof(MainWindowViewModel.CurrentWorkspaceTitle));
         Assert.Empty(dispatched);
 
         source.Raise(nameof(MainWindowViewModel.AccountStatusMessage));

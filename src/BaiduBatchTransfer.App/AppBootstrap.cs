@@ -382,32 +382,56 @@ public sealed class AppShellFactory(
             accountSummaryProvider,
             wizardViewModel.ReloadAccounts,
             DispatchOnUiAsync);
-        importViewModel.DraftReady += (_, draft) => wizardViewModel.Initialize(new ImportWizardContext(
-            draft.SessionId,
-            $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
-            draft.Statistics.Ready,
-            draft.Statistics.HasExcelAccountColumn,
-            draft.Statistics.UnresolvedAccountMappings,
-            draft.Statistics.Conflict,
-            draft.Statistics.NeedsResolution,
-            "/我的资源"));
         var importView = new ImportView(importViewModel);
         var wizardView = new CreateJobWizardView(wizardViewModel);
         var resultsViewModel = new JobResultsViewModel(
             jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction);
         var resultsView = new JobResultsView(resultsViewModel);
-        var mainViewModel = new MainWindowViewModel(
-            importView,
-            wizardView,
+        var transferWorkspace = new System.Windows.Controls.ContentControl
+        {
+            Content = importView,
+        };
+        var shareWorkspace = new System.Windows.Controls.ContentControl
+        {
+            Content = new System.Windows.Controls.TextBlock
+            {
+                Text = "分享功能将在此工作区提供。",
+                TextWrapping = System.Windows.TextWrapping.Wrap,
+            },
+        };
+        MainWindowViewModel? mainViewModel = null;
+        importViewModel.DraftReady += async (_, draft) =>
+        {
+            await DispatchOnUiAsync(() =>
+            {
+                wizardViewModel.Initialize(new ImportWizardContext(
+                    draft.SessionId,
+                    $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
+                    draft.Statistics.Ready,
+                    draft.Statistics.HasExcelAccountColumn,
+                    draft.Statistics.UnresolvedAccountMappings,
+                    draft.Statistics.Conflict,
+                    draft.Statistics.NeedsResolution,
+                    "/我的资源"));
+                transferWorkspace.Content = wizardView;
+                mainViewModel?.ShowTransferCommand.Execute(null);
+            }).ConfigureAwait(true);
+        };
+        mainViewModel = new MainWindowViewModel(
+            transferWorkspace,
+            shareWorkspace,
             loginLauncher,
             accountManagementLauncher,
             accountRefresh.RefreshAsync,
-            initialActiveAccountCount,
-            resultsView);
+            initialActiveAccountCount);
         wizardViewModel.JobCreated += async (_, batchId) =>
         {
             await resultsViewModel.InitializeAsync(batchId).ConfigureAwait(true);
-            mainViewModel.ShowResults();
+            await DispatchOnUiAsync(() =>
+            {
+                transferWorkspace.Content = resultsView;
+                mainViewModel.ShowTransferCommand.Execute(null);
+            }).ConfigureAwait(true);
         };
         var mainWindow = new MainWindow(mainViewModel);
         var decisionPoll = new System.Windows.Threading.DispatcherTimer
@@ -422,7 +446,11 @@ public sealed class AppShellFactory(
             try
             {
                 var pendingBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
-                if (pendingBatch is not null) mainViewModel.ShowResults();
+                if (pendingBatch is not null)
+                {
+                    transferWorkspace.Content = resultsView;
+                    mainViewModel.ShowTransferCommand.Execute(null);
+                }
             }
             finally
             {
@@ -432,7 +460,11 @@ public sealed class AppShellFactory(
         mainWindow.Loaded += async (_, _) =>
         {
             var restoredBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
-            if (restoredBatch is not null) mainViewModel.ShowResults();
+            if (restoredBatch is not null)
+            {
+                transferWorkspace.Content = resultsView;
+                mainViewModel.ShowTransferCommand.Execute(null);
+            }
             if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
         };
         mainWindow.Closed += (_, _) => decisionPoll.Stop();

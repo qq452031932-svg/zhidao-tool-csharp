@@ -11,6 +11,7 @@ using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Excel;
 using Microsoft.Extensions.DependencyInjection;
+using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
 
@@ -55,6 +56,25 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
         Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
+    }
+
+    [Fact]
+    public void ShellCompositionBuildsOnlyTransferAndShareWorkspaces()
+    {
+        var bootstrap = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "AppBootstrap.cs"));
+
+        Assert.Contains("var transferWorkspace = new System.Windows.Controls.ContentControl", bootstrap);
+        Assert.Contains("var shareWorkspace = new System.Windows.Controls.ContentControl", bootstrap);
+        Assert.Contains("transferWorkspace,", bootstrap);
+        Assert.Contains("shareWorkspace,", bootstrap);
+        Assert.DoesNotContain("mainViewModel.ShowResults", bootstrap);
+        Assert.DoesNotContain("ShowImportCommand", bootstrap);
+        Assert.DoesNotContain("ShowCreateJobCommand", bootstrap);
+        Assert.DoesNotContain("ShowResultsCommand", bootstrap);
     }
 
     [Fact]
@@ -175,6 +195,19 @@ public sealed class AppBootstrapTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
+    private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
+    {
+        var current = new DirectoryInfo(Path.GetDirectoryName(sourceFilePath)!);
+        while (current is not null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "BaiduBatchTransfer.sln")))
+                return current.FullName;
+            current = current.Parent;
+        }
+
+        throw new DirectoryNotFoundException("未找到测试仓库目录。");
     }
 
     private static WizardAccountOption AccountOption(int value) => new(

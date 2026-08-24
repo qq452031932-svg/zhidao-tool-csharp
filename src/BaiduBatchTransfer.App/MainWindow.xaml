@@ -49,9 +49,8 @@
             <Border Background="#102A43" Padding="14,20">
                 <StackPanel>
                     <TextBlock Text="工作区" Foreground="#AFC6DB" Margin="8,0,0,10" />
-                    <Button Content="导入与草稿" Command="{Binding ShowImportCommand}" HorizontalContentAlignment="Left" />
-                    <Button Content="创建任务" Command="{Binding ShowCreateJobCommand}" HorizontalContentAlignment="Left" Margin="0,8,8,0" />
-                    <Button Content="任务结果" Command="{Binding ShowResultsCommand}" HorizontalContentAlignment="Left" Margin="0,8,8,0" />
+                    <Button Content="转存" Command="{Binding ShowTransferCommand}" HorizontalContentAlignment="Left" />
+                    <Button Content="分享" Command="{Binding ShowShareCommand}" HorizontalContentAlignment="Left" Margin="0,8,8,0" />
                     <Border Background="#183B56" CornerRadius="8" Padding="10" Margin="0,24,0,0">
                         <TextBlock Text="{Binding AdapterStatusMessage}" TextWrapping="Wrap" Foreground="#D7E8F7" FontSize="12" />
                     </Border>
@@ -62,7 +61,7 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
-                <TextBlock Text="{Binding CurrentPageTitle}" FontSize="24" FontWeight="SemiBold" Margin="0,0,0,16" />
+                <TextBlock Text="{Binding CurrentWorkspaceTitle}" FontSize="24" FontWeight="SemiBold" Margin="0,0,0,16" />
                 <ContentControl Grid.Row="1" Content="{Binding CurrentContent}" />
             </Grid>
         </Grid>

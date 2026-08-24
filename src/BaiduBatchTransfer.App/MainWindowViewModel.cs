@@ -7,38 +7,34 @@ namespace BaiduBatchTransfer.App;
 
 public sealed class MainWindowViewModel : ObservableObject
 {
-    private readonly object importPage;
-    private readonly object createJobPage;
-    private readonly object? resultsPage;
+    private readonly object transferWorkspace;
+    private readonly object shareWorkspace;
     private readonly IAccountLoginLauncher loginLauncher;
     private readonly IAccountManagementLauncher? accountManagementLauncher;
     private readonly Func<Action<int>, CancellationToken, Task>? refreshAccounts;
     private object currentContent;
-    private string currentPageTitle = "导入与草稿";
+    private string currentWorkspaceTitle = "转存";
     private string statusMessage = "就绪";
     private string accountStatusMessage;
     private bool isAccountOperationBusy;
 
     public MainWindowViewModel(
-        object importPage,
-        object createJobPage,
+        object transferWorkspace,
+        object shareWorkspace,
         IAccountLoginLauncher loginLauncher,
         IAccountManagementLauncher? accountManagementLauncher = null,
         Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
-        int initialActiveAccountCount = 0,
-        object? resultsPage = null)
+        int initialActiveAccountCount = 0)
     {
-        this.importPage = importPage ?? throw new ArgumentNullException(nameof(importPage));
-        this.createJobPage = createJobPage ?? throw new ArgumentNullException(nameof(createJobPage));
-        this.resultsPage = resultsPage;
+        this.transferWorkspace = transferWorkspace ?? throw new ArgumentNullException(nameof(transferWorkspace));
+        this.shareWorkspace = shareWorkspace ?? throw new ArgumentNullException(nameof(shareWorkspace));
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
         this.accountManagementLauncher = accountManagementLauncher;
         this.refreshAccounts = refreshAccounts;
         accountStatusMessage = FormatAccountStatus(initialActiveAccountCount);
-        currentContent = importPage;
-        ShowImportCommand = new RelayCommand(ShowImport);
-        ShowCreateJobCommand = new RelayCommand(ShowCreateJob);
-        ShowResultsCommand = new RelayCommand(ShowResults, () => this.resultsPage is not null);
+        currentContent = transferWorkspace;
+        ShowTransferCommand = new RelayCommand(ShowTransfer);
+        ShowShareCommand = new RelayCommand(ShowShare);
         OpenAccountLoginCommand = new AsyncRelayCommand(
             OpenAccountLoginAsync,
             () => loginLauncher.IsAvailable && !IsAccountOperationBusy);
@@ -52,7 +48,7 @@ public sealed class MainWindowViewModel : ObservableObject
 
     public string ApplicationTitle => "百度批量转存";
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
-    public string CurrentPageTitle { get => currentPageTitle; private set => SetProperty(ref currentPageTitle, value); }
+    public string CurrentWorkspaceTitle { get => currentWorkspaceTitle; private set => SetProperty(ref currentWorkspaceTitle, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string AdapterStatusMessage => loginLauncher.StatusMessage;
     public string AccountStatusMessage { get => accountStatusMessage; private set => SetProperty(ref accountStatusMessage, value); }
@@ -73,9 +69,8 @@ public sealed class MainWindowViewModel : ObservableObject
             RefreshAccountsCommand.NotifyCanExecuteChanged();
         }
     }
-    public IRelayCommand ShowImportCommand { get; }
-    public IRelayCommand ShowCreateJobCommand { get; }
-    public IRelayCommand ShowResultsCommand { get; }
+    public IRelayCommand ShowTransferCommand { get; }
+    public IRelayCommand ShowShareCommand { get; }
     public IAsyncRelayCommand OpenAccountLoginCommand { get; }
     public IAsyncRelayCommand OpenAccountManagementCommand { get; }
     public IAsyncRelayCommand RefreshAccountsCommand { get; }
@@ -197,22 +192,15 @@ public sealed class MainWindowViewModel : ObservableObject
     private static string FormatAccountStatus(int count) =>
         count > 0 ? $"已登录 {count:N0} 个百度账号" : "尚未登录百度账号";
 
-    private void ShowImport()
+    private void ShowTransfer()
     {
-        CurrentContent = importPage;
-        CurrentPageTitle = "导入与草稿";
+        CurrentContent = transferWorkspace;
+        CurrentWorkspaceTitle = "转存";
     }
 
-    private void ShowCreateJob()
+    private void ShowShare()
     {
-        CurrentContent = createJobPage;
-        CurrentPageTitle = "创建任务";
-    }
-
-    public void ShowResults()
-    {
-        if (resultsPage is null) return;
-        CurrentContent = resultsPage;
-        CurrentPageTitle = "任务结果";
+        CurrentContent = shareWorkspace;
+        CurrentWorkspaceTitle = "分享";
     }
 }
