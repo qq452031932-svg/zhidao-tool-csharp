@@ -39,6 +39,23 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
+    public async Task PreparedRetryGenerationIsUsedWithoutASecondAttemptIncrement()
+    {
+        var snapshot = Snapshot(createFolderName: null) with
+        {
+            AttemptCount = int.MaxValue,
+            AttemptGenerationPrepared = true,
+        };
+        var store = new RecordingExecutionStore(snapshot);
+
+        await Executor(store, new RecordingAdapter()).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal(int.MaxValue, store.PreparingExpectedAttemptCount);
+        Assert.Equal(int.MaxValue, store.BoundaryExpectedAttemptCount);
+        Assert.Equal(int.MaxValue, store.SucceededExpectedAttemptCount);
+    }
+
+    [Fact]
     public async Task DirectoryFailurePausesAccountWithoutCallingSaveOrCrossingSubmitBoundary()
     {
         var snapshot = Snapshot(createFolderName: "outer");
@@ -487,6 +504,9 @@ public sealed class OperationExecutorTests
         public string? AccountPauseCode { get; private set; }
         public string? AccountPauseMessage { get; private set; }
         public DateTimeOffset? ObservedSessionCapturedAtUtc { get; private set; }
+        public int? PreparingExpectedAttemptCount { get; private set; }
+        public int? BoundaryExpectedAttemptCount { get; private set; }
+        public int? SucceededExpectedAttemptCount { get; private set; }
 
         public Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default)
         {
@@ -497,6 +517,7 @@ public sealed class OperationExecutorTests
         public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now,
             CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
+            PreparingExpectedAttemptCount = expectedAttemptCount;
             Events.Add((++order, "Preparing"));
             timeline?.Add("Preparing");
             return Task.CompletedTask;
@@ -504,6 +525,7 @@ public sealed class OperationExecutorTests
 
         public Task<SubmissionBoundaryResult> PersistAsync(SubmissionBoundaryPersistence persistence, CancellationToken cancellationToken = default)
         {
+            BoundaryExpectedAttemptCount = persistence.Command.ExpectedAttemptCount;
             Events.Add((++order, "Boundary"));
             timeline?.Add("Boundary");
             return Task.FromResult(new SubmissionBoundaryResult(true, true, 1));
@@ -526,6 +548,7 @@ public sealed class OperationExecutorTests
             CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             if (RejectSplitSuccessWrites) throw new InvalidOperationException("split success write");
+            SucceededExpectedAttemptCount = expectedAttemptCount;
             Succeeded = true;
             SucceededOrder = ++order;
             Events.Add((order, "Succeeded"));

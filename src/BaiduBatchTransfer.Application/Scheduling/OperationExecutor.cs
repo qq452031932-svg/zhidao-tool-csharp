@@ -15,7 +15,8 @@ public sealed record OperationExecutionSnapshot(
     DuplicatePolicy DuplicatePolicy,
     string OperationFingerprint,
     bool RequiresExactShareEvidence = false,
-    int AttemptCount = 0)
+    int AttemptCount = 0,
+    bool AttemptGenerationPrepared = false)
 {
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
@@ -178,7 +179,9 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         var now = timeProvider.GetUtcNow();
         await store.MarkPreparingAsync(
             snapshot.OperationId, now, cancellationToken, snapshot.AttemptCount).ConfigureAwait(false);
-        var attemptCount = checked(snapshot.AttemptCount + 1);
+        var attemptCount = snapshot.AttemptGenerationPrepared
+            ? snapshot.AttemptCount
+            : checked(snapshot.AttemptCount + 1);
         RemotePath completePath;
         try
         {
