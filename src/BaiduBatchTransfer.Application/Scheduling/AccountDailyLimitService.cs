@@ -4,7 +4,8 @@ public sealed record SubmissionBoundaryCommand(
     Guid OperationId,
     Guid AccountId,
     string ConfirmationDescriptorJson,
-    DateTimeOffset LeaseExpiresAt)
+    DateTimeOffset LeaseExpiresAt,
+    int? ExpectedAttemptCount = null)
 {
     public override string ToString() =>
         "SubmissionBoundaryCommand { EntityIds = [REDACTED], ConfirmationDescriptorJson = [REDACTED] }";

@@ -18,7 +18,8 @@ public sealed class SqliteTransferSchedulingStore :
     IAllocationCounterStore,
     IOperationReconciliationStore,
     ICancelOperationStore,
-    IJobResultTransferActionStore
+    IJobResultTransferActionStore,
+    IBatchRunControlStore
 {
     private readonly SqliteConnectionFactory factory;
     private readonly TimeProvider timeProvider;
@@ -98,6 +99,189 @@ public sealed class SqliteTransferSchedulingStore :
             "UPDATE BatchJobs SET Status='Queued' WHERE Id=$id AND Status='PausedReady';");
         Add(command, "$id", Id(batchJobId));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+    }
+
+    public async Task<PauseBatchDisposition> TryPauseBatchAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await using (var update = Command(connection, transaction,
+            "UPDATE BatchJobs SET Status='Paused' WHERE Id=$id AND Status IN ('Queued','Active');"))
+        {
+            Add(update, "$id", Id(batchJobId));
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return PauseBatchDisposition.Paused;
+            }
+        }
+
+        var status = await ScalarStringOrNullAsync(connection, transaction,
+            "SELECT Status FROM BatchJobs WHERE Id=$id;", cancellationToken, ("$id", Id(batchJobId)))
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return status switch
+        {
+            null => PauseBatchDisposition.NotFound,
+            "Paused" => PauseBatchDisposition.AlreadyPaused,
+            _ => PauseBatchDisposition.NotPausable,
+        };
+    }
+
+    public async Task<ResumeBatchDisposition> TryResumeBatchAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await using (var update = Command(connection, transaction,
+            "UPDATE BatchJobs SET Status='Queued' WHERE Id=$id AND Status='Paused';"))
+        {
+            Add(update, "$id", Id(batchJobId));
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1)
+            {
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return ResumeBatchDisposition.Queued;
+            }
+        }
+
+        var status = await ScalarStringOrNullAsync(connection, transaction,
+            "SELECT Status FROM BatchJobs WHERE Id=$id;", cancellationToken, ("$id", Id(batchJobId)))
+            .ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return status switch
+        {
+            null => ResumeBatchDisposition.NotFound,
+            "Queued" or "Active" => ResumeBatchDisposition.AlreadyResumed,
+            _ => ResumeBatchDisposition.NotResumable,
+        };
+    }
+
+    public async Task<RetryFailedTransferDisposition> TryRetryFailedTransferAsync(
+        Guid operationId,
+        DateTimeOffset retriedAt,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        RetryFailedTransferSnapshot? snapshot;
+        await using (var read = Command(connection, transaction, """
+            SELECT o.BatchJobId,o.AssignedAccountId,o.Status,o.OutcomeKind,o.AttemptCount,o.UpdatedAt,
+              o.SubmitState,o.TargetSlotState,o.DailyCountedAt,o.ConfirmationDescriptorJson,o.SubmitStartedAt,
+              o.AdapterRequestId,o.RemoteItemIdsJson,o.LeaseExpiresAt,b.Status,r.CandidateStatus,
+              r.GlobalValidityStatus,r.ReservedAccountId,a.FailedItemCount,
+              EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=o.AssignedAccountId
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0),
+              EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id
+                AND share.Status<>'WaitingTransfer'),b.QuotaBasis
+            FROM TransferOperations o
+            JOIN BatchJobs b ON b.Id=o.BatchJobId
+            JOIN ResourceItems r ON r.Id=o.ResourceItemId
+            JOIN AccountAllocations a ON a.BatchJobId=o.BatchJobId AND a.AccountId=o.AssignedAccountId
+            WHERE o.Id=$id;
+            """))
+        {
+            Add(read, "$id", Id(operationId));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            snapshot = await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+                ? new RetryFailedTransferSnapshot(
+                    Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), reader.GetString(2),
+                    ReadString(reader, 3), reader.GetInt32(4), reader.GetString(5), reader.GetString(6),
+                    reader.GetString(7), ReadString(reader, 8), ReadString(reader, 9), ReadString(reader, 10),
+                    ReadString(reader, 11), ReadString(reader, 12), ReadString(reader, 13), reader.GetString(14),
+                    reader.GetString(15), reader.GetString(16), ReadString(reader, 17), reader.GetInt32(18),
+                    reader.GetInt64(19) != 0, reader.GetInt64(20) != 0, reader.GetString(21))
+                : null;
+        }
+
+        if (snapshot is null)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return RetryFailedTransferDisposition.NotFound;
+        }
+        if (snapshot.Status != "Failed")
+        {
+            var disposition = snapshot.Status is "Submitting" or "ResultPending" ||
+                              snapshot.SubmitState is "Submitting" or "PendingConfirmation"
+                ? RetryFailedTransferDisposition.NeedsReconciliation
+                : RetryFailedTransferDisposition.NotRetryable;
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return disposition;
+        }
+
+        var neverSubmitted = snapshot.SubmitState is "NotPrepared" or "PreparingToSubmit" &&
+                             snapshot.DailyCountedAt is null && snapshot.ConfirmationDescriptorJson is null &&
+                             snapshot.SubmitStartedAt is null && snapshot.AdapterRequestId is null &&
+                             snapshot.RemoteItemIdsJson is null;
+        if (!neverSubmitted)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return RetryFailedTransferDisposition.NeedsReconciliation;
+        }
+
+        var batchMayRun = snapshot.BatchStatus is "Active" or "Queued" or "Paused" or "CompletedWithShortfall";
+        var durableFailureIsConsistent = snapshot.OutcomeKind == "Failed" &&
+                                         snapshot.TargetSlotState == "Released" && snapshot.LeaseExpiresAt is null &&
+                                         snapshot.CandidateStatus == "Expanded" && snapshot.GlobalValidityStatus != "Invalid" &&
+                                         snapshot.ReservedAccountId is null && snapshot.FailedItemCount > 0 &&
+                                         snapshot.AccountIsEligible && !snapshot.HasAdvancedShareOperation;
+        if (!batchMayRun || !durableFailureIsConsistent)
+        {
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return RetryFailedTransferDisposition.NotRetryable;
+        }
+
+        await using (var operation = Command(connection, transaction, """
+            UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,SubmitState='NotPrepared',
+              AttemptCount=AttemptCount+1,TargetSlotState='Released',TargetSlotReservedAt=NULL,
+              ConfirmationDescriptorJson=NULL,AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,
+              LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Failed' AND OutcomeKind='Failed' AND AttemptCount=$attempt
+              AND UpdatedAt=$updated AND SubmitState=$submit AND TargetSlotState='Released' AND LeaseExpiresAt IS NULL;
+            """))
+        {
+            Add(operation, "$now", Time(retriedAt)); Add(operation, "$id", Id(operationId));
+            Add(operation, "$attempt", snapshot.AttemptCount); Add(operation, "$updated", snapshot.UpdatedAt);
+            Add(operation, "$submit", snapshot.SubmitState);
+            if (await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return RetryFailedTransferDisposition.NotRetryable;
+            }
+        }
+        await using (var allocation = Command(connection, transaction,
+            "UPDATE AccountAllocations SET FailedItemCount=FailedItemCount-1,EffectiveTargetSuccessCount=CASE WHEN $restore=1 THEN EffectiveTargetSuccessCount+1 ELSE EffectiveTargetSuccessCount END WHERE BatchJobId=$batch AND AccountId=$account AND FailedItemCount>0 AND ($restore=0 OR EffectiveTargetSuccessCount<TargetSuccessCount);"))
+        {
+            Add(allocation, "$batch", Id(snapshot.BatchJobId)); Add(allocation, "$account", Id(snapshot.AccountId));
+            Add(allocation, "$restore", snapshot.BatchStatus == "CompletedWithShortfall" &&
+                snapshot.QuotaBasis == "SuccessTarget" ? 1 : 0);
+            RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The failed-operation allocation changed during retry.");
+        }
+        await using (var resource = Command(connection, transaction, """
+            UPDATE ResourceItems SET CandidateStatus='Reserved',ReservedAccountId=$account,
+              ReservationExpiresAt=NULL,UpdatedAt=$now
+            WHERE Id=(SELECT ResourceItemId FROM TransferOperations WHERE Id=$operation)
+              AND CandidateStatus='Expanded' AND ReservedAccountId IS NULL AND GlobalValidityStatus<>'Invalid';
+            """))
+        {
+            Add(resource, "$account", Id(snapshot.AccountId)); Add(resource, "$now", Time(retriedAt));
+            Add(resource, "$operation", Id(operationId));
+            RequireOne(await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The failed-operation resource changed during retry.");
+        }
+        if (snapshot.BatchStatus == "CompletedWithShortfall")
+        {
+            await using var batch = Command(connection, transaction,
+                "UPDATE BatchJobs SET Status='Queued',CompletedAt=NULL WHERE Id=$batch AND Status='CompletedWithShortfall';");
+            Add(batch, "$batch", Id(snapshot.BatchJobId));
+            RequireOne(await batch.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The completed batch changed during retry.");
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return RetryFailedTransferDisposition.Requeued;
     }
 
     public async Task<ScheduledOperation?> TryReserveNextAsync(
@@ -693,21 +877,32 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer') FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
+            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
-        return new OperationExecutionSnapshot(
-            Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)),
-            new ShareReference(reader.GetString(2), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4)),
-            new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
-            Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0);
+        var attemptCount = reader.GetInt32(10);
+        try
+        {
+            return new OperationExecutionSnapshot(
+                Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)),
+                new ShareReference(reader.GetString(2), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4)),
+                new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
+                Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0,
+                attemptCount);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+            throw new OperationSnapshotValidationException(attemptCount, exception);
+        }
     }
 
-    public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default) =>
+    public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null) =>
         ExecuteRequiredAsync(
-            "UPDATE TransferOperations SET Status='Preparing',SubmitState='PreparingToSubmit',AttemptCount=AttemptCount+1,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status='Reserved' AND TargetSlotState='Reserved';",
-            "Operation is not reserved for preparation.", cancellationToken, ("$now", Time(now)), ("$id", Id(operationId)));
+            "UPDATE TransferOperations SET Status='Preparing',SubmitState='PreparingToSubmit',AttemptCount=AttemptCount+1,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status='Reserved' AND TargetSlotState='Reserved' AND ($attempt IS NULL OR AttemptCount=$attempt);",
+            "Operation is not reserved for preparation.", cancellationToken, ("$now", Time(now)),
+            ("$id", Id(operationId)), ("$attempt", expectedAttemptCount));
 
     public async Task<SubmissionBoundaryResult> PersistAsync(
         SubmissionBoundaryPersistence persistence,
@@ -717,25 +912,29 @@ public sealed class SqliteTransferSchedulingStore :
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         await using var read = Command(connection, transaction,
-            "SELECT o.AssignedAccountId,o.DailyCountedAt,o.SubmitState,a.DailyLimit,a.DailyExecutedCount,a.DailyCountDateKey,o.BatchJobId,o.Status FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId WHERE o.Id=$id;");
+            "SELECT o.AssignedAccountId,o.DailyCountedAt,o.SubmitState,a.DailyLimit,a.DailyExecutedCount,a.DailyCountDateKey,o.BatchJobId,o.Status,o.AttemptCount FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId WHERE o.Id=$id;");
         Add(read, "$id", Id(commandValue.OperationId));
-        Guid accountId; Guid batchId; bool alreadyCounted; string submitState; string status; int dailyLimit; int count; string dateKey;
+        Guid accountId; Guid batchId; bool alreadyCounted; string submitState; string status; int dailyLimit; int count; string dateKey; int attemptCount;
         await using (var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
         {
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) throw new InvalidOperationException("The operation no longer exists.");
             accountId = Guid.Parse(reader.GetString(0)); alreadyCounted = !reader.IsDBNull(1); submitState = reader.GetString(2);
             dailyLimit = reader.GetInt32(3); count = reader.GetInt32(4); dateKey = reader.GetString(5);
-            batchId = Guid.Parse(reader.GetString(6)); status = reader.GetString(7);
+            batchId = Guid.Parse(reader.GetString(6)); status = reader.GetString(7); attemptCount = reader.GetInt32(8);
         }
         if (accountId != commandValue.AccountId) throw new InvalidOperationException("The operation account binding changed.");
+        if (commandValue.ExpectedAttemptCount is not null &&
+            commandValue.ExpectedAttemptCount.Value != attemptCount)
+            throw new InvalidOperationException("The operation attempt changed before the submit boundary.");
         if (alreadyCounted)
         {
             if (status == "Preparing" && submitState == "PreparingToSubmit")
             {
                 await using var retryBoundary = Command(connection, transaction,
-                    "UPDATE TransferOperations SET ConfirmationDescriptorJson=$descriptor,SubmitState='Submitting',Status='Submitting',SubmitStartedAt=$now,LeaseExpiresAt=$lease,UpdatedAt=$now WHERE Id=$id AND DailyCountedAt IS NOT NULL AND Status='Preparing' AND SubmitState='PreparingToSubmit' AND ConfirmationDescriptorJson IS NULL;");
+                    "UPDATE TransferOperations SET ConfirmationDescriptorJson=$descriptor,SubmitState='Submitting',Status='Submitting',SubmitStartedAt=$now,LeaseExpiresAt=$lease,UpdatedAt=$now WHERE Id=$id AND DailyCountedAt IS NOT NULL AND Status='Preparing' AND SubmitState='PreparingToSubmit' AND ConfirmationDescriptorJson IS NULL AND ($attempt IS NULL OR AttemptCount=$attempt);");
                 Add(retryBoundary, "$descriptor", commandValue.ConfirmationDescriptorJson); Add(retryBoundary, "$now", Time(persistence.PersistedAt));
                 Add(retryBoundary, "$lease", Time(commandValue.LeaseExpiresAt)); Add(retryBoundary, "$id", Id(commandValue.OperationId));
+                Add(retryBoundary, "$attempt", commandValue.ExpectedAttemptCount);
                 RequireOne(await retryBoundary.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The retry operation is not eligible to cross the submit boundary.");
             }
             else if (submitState is not ("Submitting" or "ResultReceived" or "PendingConfirmation"))
@@ -757,10 +956,11 @@ public sealed class SqliteTransferSchedulingStore :
         }
         var newCount = checked(count + 1);
         await using (var updateOperation = Command(connection, transaction,
-            "UPDATE TransferOperations SET ConfirmationDescriptorJson=$descriptor,SubmitState='Submitting',Status='Submitting',DailyCountedAt=$now,SubmitStartedAt=$now,LeaseExpiresAt=$lease,UpdatedAt=$now WHERE Id=$id AND DailyCountedAt IS NULL AND Status='Preparing' AND SubmitState='PreparingToSubmit';"))
+            "UPDATE TransferOperations SET ConfirmationDescriptorJson=$descriptor,SubmitState='Submitting',Status='Submitting',DailyCountedAt=$now,SubmitStartedAt=$now,LeaseExpiresAt=$lease,UpdatedAt=$now WHERE Id=$id AND DailyCountedAt IS NULL AND Status='Preparing' AND SubmitState='PreparingToSubmit' AND ($attempt IS NULL OR AttemptCount=$attempt);"))
         {
             Add(updateOperation, "$descriptor", commandValue.ConfirmationDescriptorJson); Add(updateOperation, "$now", Time(persistence.PersistedAt));
             Add(updateOperation, "$lease", Time(commandValue.LeaseExpiresAt)); Add(updateOperation, "$id", Id(commandValue.OperationId));
+            Add(updateOperation, "$attempt", commandValue.ExpectedAttemptCount);
             if (await updateOperation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new InvalidOperationException("Operation is not eligible to cross the submit boundary.");
         }
@@ -781,13 +981,15 @@ public sealed class SqliteTransferSchedulingStore :
         return new SubmissionBoundaryResult(true, true, newCount);
     }
 
-    public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId, IReadOnlyList<string> remoteItemIds, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId, IReadOnlyList<string> remoteItemIds,
+        DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
     {
         var remoteJson = System.Text.Json.JsonSerializer.Serialize(remoteItemIds ?? []);
         return ExecuteRequiredAsync(
-            "UPDATE TransferOperations SET AdapterRequestId=COALESCE($request,AdapterRequestId),RemoteItemIdsJson=$remote,UpdatedAt=$now WHERE Id=$id AND Status='Submitting' AND SubmitState='Submitting' AND ConfirmationDescriptorJson IS NOT NULL;",
+            "UPDATE TransferOperations SET AdapterRequestId=COALESCE($request,AdapterRequestId),RemoteItemIdsJson=$remote,UpdatedAt=$now WHERE Id=$id AND Status='Submitting' AND SubmitState='Submitting' AND ConfirmationDescriptorJson IS NOT NULL AND ($attempt IS NULL OR AttemptCount=$attempt);",
             "Operation has not crossed the submit boundary.", cancellationToken,
-            ("$request", requestId), ("$remote", remoteJson), ("$now", Time(now)), ("$id", Id(operationId)));
+            ("$request", requestId), ("$remote", remoteJson), ("$now", Time(now)), ("$id", Id(operationId)),
+            ("$attempt", expectedAttemptCount));
     }
 
     public async Task CompleteSucceededWithEvidenceAsync(
@@ -795,13 +997,15 @@ public sealed class SqliteTransferSchedulingStore :
         string? requestId,
         RemoteItemIdentitySet exactRemoteItems,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null)
         => await CompleteSucceededWithEvidenceCoreAsync(
             operationId,
             requestId,
             exactRemoteItems,
             now,
             expected: null,
+            expectedAttemptCount,
             cancellationToken).ConfigureAwait(false);
 
     public Task MarkConfirmedPresentWithEvidenceAsync(
@@ -817,6 +1021,7 @@ public sealed class SqliteTransferSchedulingStore :
             exactRemoteItems,
             confirmedAt,
             expected,
+            expectedAttemptCount: null,
             cancellationToken);
     }
 
@@ -826,6 +1031,7 @@ public sealed class SqliteTransferSchedulingStore :
         RemoteItemIdentitySet exactRemoteItems,
         DateTimeOffset now,
         PendingReconciliationOperation? expected,
+        int? expectedAttemptCount,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(exactRemoteItems);
@@ -877,17 +1083,22 @@ public sealed class SqliteTransferSchedulingStore :
         var expectedPredicate = expected is null
             ? string.Empty
             : " AND AttemptCount=$attempt AND ConfirmationDescriptorJson=$descriptor AND AdapterRequestId IS $expectedRequest AND RemoteItemIdsJson IS $expectedRemote";
+        var executionAttemptPredicate = expectedAttemptCount is null
+            ? string.Empty
+            : " AND AttemptCount=$executionAttempt";
         await using (var operation = Command(connection, transaction, $"""
             UPDATE TransferOperations
             SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',
                 AdapterRequestId=COALESCE($request,AdapterRequestId),RemoteItemIdsJson=$remote,LeaseExpiresAt=NULL,
                 LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
             WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved'
-              AND ConfirmationDescriptorJson IS NOT NULL{expectedPredicate};
+              AND ConfirmationDescriptorJson IS NOT NULL{expectedPredicate}{executionAttemptPredicate};
             """))
         {
             Add(operation, "$request", requestId); Add(operation, "$remote", remoteJson);
             Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
+            if (expectedAttemptCount is not null)
+                Add(operation, "$executionAttempt", expectedAttemptCount.Value);
             if (expected is not null)
             {
                 Add(operation, "$attempt", expected.AttemptCount);
@@ -996,7 +1207,8 @@ public sealed class SqliteTransferSchedulingStore :
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public async Task MarkSucceededAsync(Guid operationId, DateTimeOffset now,
+        CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
@@ -1007,13 +1219,13 @@ public sealed class SqliteTransferSchedulingStore :
             operationId,
             cancellationToken).ConfigureAwait(false);
         await using (var operation = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved';"))
-        { Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId)); RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be marked successful."); }
+            "UPDATE TransferOperations SET Status='Succeeded',OutcomeKind='NewTransfer',SubmitState='ResultReceived',TargetSlotState='Fulfilled',LeaseExpiresAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now WHERE Id=$id AND Status IN ('Submitting','ResultPending') AND TargetSlotState='Reserved' AND ($attempt IS NULL OR AttemptCount=$attempt);"))
+        { Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId)); Add(operation, "$attempt", expectedAttemptCount); RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be marked successful."); }
         await using (var allocation = Command(connection, transaction,
             "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1,FulfilledCount=FulfilledCount+1,SuccessItemCount=SuccessItemCount+1,NewSuccessItemCount=NewSuccessItemCount+1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
         { Add(allocation, "$batch", Id(ids.BatchId)); Add(allocation, "$account", Id(ids.AccountId)); RequireOne(await allocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Allocation reservation is missing."); }
         await using (var resource = Command(connection, transaction,
-            "UPDATE ResourceItems SET CandidateStatus='Expanded',ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved';"))
+            "UPDATE ResourceItems SET CandidateStatus='Expanded',ReservedAccountId=NULL,ReservationExpiresAt=NULL,UpdatedAt=$now WHERE Id=$resource AND CandidateStatus='Reserved';"))
         { Add(resource, "$now", Time(now)); Add(resource, "$resource", Id(ids.ResourceId)); await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false); }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -1036,15 +1248,20 @@ public sealed class SqliteTransferSchedulingStore :
         }
     }
 
-    public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid, DateTimeOffset now, CancellationToken cancellationToken = default) =>
-        CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid, resultPending: false, now, cancellationToken);
+    public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid,
+        DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null) =>
+        CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid, resultPending: false, now,
+            cancellationToken, expectedAttemptCount);
 
-    public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, SubmissionAcceptance submissionAcceptance, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage,
+        SubmissionAcceptance submissionAcceptance, DateTimeOffset now,
+        CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
     {
         ValidateSafeError(code, safeMessage);
         if (submissionAcceptance != SubmissionAcceptance.Unknown)
             throw new ArgumentException("Only an uncertain remote submission acceptance can remain pending.", nameof(submissionAcceptance));
-        return CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid: false, resultPending: true, now, cancellationToken);
+        return CompleteFailureAsync(operationId, code, safeMessage, globallyInvalid: false, resultPending: true, now,
+            cancellationToken, expectedAttemptCount);
     }
 
     public Task PauseAccountBeforeSubmissionAsync(
@@ -1052,7 +1269,8 @@ public sealed class SqliteTransferSchedulingStore :
         string code,
         string safeMessage,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null)
     {
         ValidateSafeError(code, safeMessage);
         var reason = code switch
@@ -1068,7 +1286,8 @@ public sealed class SqliteTransferSchedulingStore :
             SubmissionAcceptance.DefinitelyNotAccepted,
             observedSessionCapturedAtUtc: null,
             now,
-            cancellationToken);
+            cancellationToken,
+            expectedAttemptCount);
     }
 
     public async Task PauseForAccountInterventionAsync(
@@ -1077,7 +1296,8 @@ public sealed class SqliteTransferSchedulingStore :
         SubmissionAcceptance submissionAcceptance,
         DateTimeOffset? observedSessionCapturedAtUtc,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null)
     {
         var (code, safeMessage) = reason switch
         {
@@ -1101,9 +1321,10 @@ public sealed class SqliteTransferSchedulingStore :
             ? "'PendingConfirmation'"
             : "CASE WHEN Status='Submitting' THEN 'ResultReceived' ELSE 'NotPrepared' END";
         await using (var operation = Command(connection, transaction,
-            $"UPDATE TransferOperations SET Status='Paused',SubmitState={nextSubmitState},LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND TargetSlotState='Reserved' AND {acceptanceGuard};"))
+            $"UPDATE TransferOperations SET Status='Paused',SubmitState={nextSubmitState},LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND TargetSlotState='Reserved' AND {acceptanceGuard} AND ($attempt IS NULL OR AttemptCount=$attempt);"))
         {
             Add(operation, "$code", code); Add(operation, "$message", safeMessage); Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
+            Add(operation, "$attempt", expectedAttemptCount);
             RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The account intervention pause is no longer current.");
         }
         if (observedSessionCapturedAtUtc is not null)
@@ -1218,7 +1439,8 @@ public sealed class SqliteTransferSchedulingStore :
         return true;
     }
 
-    public async Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public async Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage,
+        DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
     {
         ValidateSafeError(code, safeMessage);
         if (code is not ("InsufficientCapacity" or "InvalidTargetPath"))
@@ -1233,9 +1455,10 @@ public sealed class SqliteTransferSchedulingStore :
             RequireOne(await account.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The unavailable account no longer exists.");
         }
         await using (var failed = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState=CASE WHEN SubmitState IN ('Submitting','PendingConfirmation') OR DailyCountedAt IS NOT NULL THEN 'ResultReceived' ELSE SubmitState END,TargetSlotState='Released',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting','ResultPending') AND TargetSlotState='Reserved';"))
+            "UPDATE TransferOperations SET Status='Failed',OutcomeKind='Failed',SubmitState=CASE WHEN SubmitState IN ('Submitting','PendingConfirmation') OR DailyCountedAt IS NOT NULL THEN 'ResultReceived' ELSE SubmitState END,TargetSlotState='Released',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting','ResultPending') AND TargetSlotState='Reserved' AND ($attempt IS NULL OR AttemptCount=$attempt);"))
         {
             Add(failed, "$code", code); Add(failed, "$message", safeMessage); Add(failed, "$now", Time(now)); Add(failed, "$id", Id(operationId));
+            Add(failed, "$attempt", expectedAttemptCount);
             RequireOne(await failed.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The account failure operation cannot be finalized.");
         }
         await using (var allocation = Command(connection, transaction,
@@ -1251,14 +1474,16 @@ public sealed class SqliteTransferSchedulingStore :
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task ReturnToWaitingForDailyLimitAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
+    public async Task ReturnToWaitingForDailyLimitAsync(Guid operationId, DateTimeOffset now,
+        CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
         await using var operation = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Waiting',SubmitState='NotPrepared',TargetSlotState='Unoccupied',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,UpdatedAt=$now WHERE Id=$id AND Status='Preparing' AND DailyCountedAt IS NULL;");
+            "UPDATE TransferOperations SET Status='Waiting',SubmitState='NotPrepared',TargetSlotState='Unoccupied',TargetSlotReservedAt=NULL,LeaseExpiresAt=NULL,UpdatedAt=$now WHERE Id=$id AND Status='Preparing' AND DailyCountedAt IS NULL AND ($attempt IS NULL OR AttemptCount=$attempt);");
         Add(operation, "$now", Time(now)); Add(operation, "$id", Id(operationId));
+        Add(operation, "$attempt", expectedAttemptCount);
         RequireOne(await operation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be released for the daily limit.");
         await using var allocation = Command(connection, transaction,
             "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;");
@@ -1360,7 +1585,8 @@ public sealed class SqliteTransferSchedulingStore :
         return true;
     }
 
-    private async Task CompleteFailureAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid, bool resultPending, DateTimeOffset now, CancellationToken cancellationToken)
+    private async Task CompleteFailureAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid,
+        bool resultPending, DateTimeOffset now, CancellationToken cancellationToken, int? expectedAttemptCount)
     {
         ValidateSafeError(code, safeMessage);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -1369,17 +1595,19 @@ public sealed class SqliteTransferSchedulingStore :
         if (resultPending)
         {
             await using var pending = Command(connection, transaction,
-                "UPDATE TransferOperations SET Status='ResultPending',SubmitState='PendingConfirmation',LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Preparing','Submitting') AND TargetSlotState='Reserved';");
+                "UPDATE TransferOperations SET Status='ResultPending',SubmitState='PendingConfirmation',LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Preparing','Submitting') AND TargetSlotState='Reserved' AND ($attempt IS NULL OR AttemptCount=$attempt);");
             Add(pending, "$code", code); Add(pending, "$message", safeMessage); Add(pending, "$now", Time(now)); Add(pending, "$id", Id(operationId));
+            Add(pending, "$attempt", expectedAttemptCount);
             RequireOne(await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be marked result pending.");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
         await using (var failed = Command(connection, transaction,
-            "UPDATE TransferOperations SET Status='Failed',OutcomeKind=$outcome,SubmitState=CASE WHEN SubmitState='Submitting' THEN 'ResultReceived' ELSE SubmitState END,TargetSlotState='Released',LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting','ResultPending') AND TargetSlotState='Reserved';"))
+            "UPDATE TransferOperations SET Status='Failed',OutcomeKind=$outcome,SubmitState=CASE WHEN SubmitState='Submitting' THEN 'ResultReceived' ELSE SubmitState END,TargetSlotState='Released',LeaseExpiresAt=NULL,LastErrorCode=$code,LastErrorMessage=$message,UpdatedAt=$now WHERE Id=$id AND Status IN ('Reserved','Preparing','Submitting','ResultPending') AND TargetSlotState='Reserved' AND ($attempt IS NULL OR AttemptCount=$attempt);"))
         {
             Add(failed, "$outcome", globallyInvalid ? "GloballyInvalid" : "Failed"); Add(failed, "$code", code); Add(failed, "$message", safeMessage);
-            Add(failed, "$now", Time(now)); Add(failed, "$id", Id(operationId)); RequireOne(await failed.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be failed.");
+            Add(failed, "$now", Time(now)); Add(failed, "$id", Id(operationId)); Add(failed, "$attempt", expectedAttemptCount);
+            RequireOne(await failed.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "Operation cannot be failed.");
         }
         await using (var allocation = Command(connection, transaction,
             "UPDATE AccountAllocations SET ReservedSlotCount=ReservedSlotCount-1,FailedItemCount=FailedItemCount+1 WHERE BatchJobId=$batch AND AccountId=$account AND ReservedSlotCount>0;"))
@@ -1620,6 +1848,30 @@ public sealed class SqliteTransferSchedulingStore :
         };
         if (!string.Equals(expected, safeMessage, StringComparison.Ordinal)) throw new ArgumentException("Only canonical safe scheduler messages may be persisted.", nameof(safeMessage));
     }
+
+    private sealed record RetryFailedTransferSnapshot(
+        Guid BatchJobId,
+        Guid AccountId,
+        string Status,
+        string? OutcomeKind,
+        int AttemptCount,
+        string UpdatedAt,
+        string SubmitState,
+        string TargetSlotState,
+        string? DailyCountedAt,
+        string? ConfirmationDescriptorJson,
+        string? SubmitStartedAt,
+        string? AdapterRequestId,
+        string? RemoteItemIdsJson,
+        string? LeaseExpiresAt,
+        string BatchStatus,
+        string CandidateStatus,
+        string GlobalValidityStatus,
+        string? ReservedAccountId,
+        int FailedItemCount,
+        bool AccountIsEligible,
+        bool HasAdvancedShareOperation,
+        string QuotaBasis);
 
     private static void RequireOne(int changed, string message) { if (changed != 1) throw new InvalidOperationException(message); }
     private static string Fingerprint(string shareId, Guid accountId, string path, string folder) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"operation-v1\n{shareId}\n{accountId:N}\n{path}\n{folder}")));

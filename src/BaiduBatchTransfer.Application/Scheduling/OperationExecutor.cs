@@ -14,10 +14,23 @@ public sealed record OperationExecutionSnapshot(
     string? CreateFolderName,
     DuplicatePolicy DuplicatePolicy,
     string OperationFingerprint,
-    bool RequiresExactShareEvidence = false)
+    bool RequiresExactShareEvidence = false,
+    int AttemptCount = 0)
 {
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
+}
+
+public sealed class OperationSnapshotValidationException : ArgumentException
+{
+    public OperationSnapshotValidationException(int expectedAttemptCount, Exception innerException)
+        : base("The persisted operation snapshot is invalid.", innerException)
+    {
+        if (expectedAttemptCount < 0) throw new ArgumentOutOfRangeException(nameof(expectedAttemptCount));
+        ExpectedAttemptCount = expectedAttemptCount;
+    }
+
+    public int ExpectedAttemptCount { get; }
 }
 
 public enum TransferPauseReason
@@ -30,58 +43,68 @@ public enum TransferPauseReason
 public interface IOperationExecutionStore
 {
     Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default);
-    Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default);
+    Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task RecordSubmissionIdentifiersAsync(
         Guid operationId,
         string? requestId,
         IReadOnlyList<string> remoteItemIds,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
-    Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
+    Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task CompleteSucceededWithEvidenceAsync(
         Guid operationId,
         string? requestId,
         RemoteItemIdentitySet exactRemoteItems,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task MarkFailedAsync(
         Guid operationId,
         string code,
         string safeMessage,
         bool globallyInvalid,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task MarkResultPendingAsync(
         Guid operationId,
         string code,
         string safeMessage,
         SubmissionAcceptance submissionAcceptance,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task PauseAccountBeforeSubmissionAsync(
         Guid operationId,
         string code,
         string safeMessage,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task PauseForAccountInterventionAsync(
         Guid operationId,
         TransferPauseReason reason,
         SubmissionAcceptance submissionAcceptance,
         DateTimeOffset? observedSessionCapturedAtUtc,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
     Task MarkDefiniteAccountFailureAsync(
         Guid operationId,
         string code,
         string safeMessage,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null);
 
     Task ReturnToWaitingForDailyLimitAsync(
         Guid operationId,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default) =>
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null) =>
         throw new NotSupportedException("The execution store does not support daily-limit release.");
 }
 
@@ -133,9 +156,10 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             snapshot = await store.LoadAsync(operationId, cancellationToken).ConfigureAwait(false);
         }
-        catch (ArgumentException)
+        catch (OperationSnapshotValidationException exception)
         {
-            await FailAndPauseAccountAsync(operationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(
+                    operationId, BaiduErrorKind.InvalidTargetPath, exception.ExpectedAttemptCount, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -145,13 +169,16 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         if (session is null)
         {
             await PauseAccountBeforeSubmissionAsync(
-                    snapshot.OperationId, BaiduErrorKind.ExpiredLogin, observedSessionCapturedAtUtc: null, cancellationToken)
+                    snapshot.OperationId, BaiduErrorKind.ExpiredLogin, observedSessionCapturedAtUtc: null,
+                    snapshot.AttemptCount, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
 
         var now = timeProvider.GetUtcNow();
-        await store.MarkPreparingAsync(snapshot.OperationId, now, cancellationToken).ConfigureAwait(false);
+        await store.MarkPreparingAsync(
+            snapshot.OperationId, now, cancellationToken, snapshot.AttemptCount).ConfigureAwait(false);
+        var attemptCount = checked(snapshot.AttemptCount + 1);
         RemotePath completePath;
         try
         {
@@ -159,7 +186,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
-            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(
+                    snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, attemptCount, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -170,7 +198,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
-            await FailAndPauseAccountAsync(snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, cancellationToken)
+            await FailAndPauseAccountAsync(
+                    snapshot.OperationId, BaiduErrorKind.InvalidTargetPath, attemptCount, cancellationToken)
                 .ConfigureAwait(false);
             return;
         }
@@ -179,11 +208,11 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             var error = directoryResult.ErrorKind!.Value;
             if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
                 await PauseAccountBeforeSubmissionAsync(
-                    snapshot.OperationId, error, session.CapturedAtUtc, cancellationToken).ConfigureAwait(false);
+                    snapshot.OperationId, error, session.CapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
             else if (IsAccountPausingFailure(error))
-                await FailAndPauseAccountAsync(snapshot.OperationId, error, cancellationToken).ConfigureAwait(false);
+                await FailAndPauseAccountAsync(snapshot.OperationId, error, attemptCount, cancellationToken).ConfigureAwait(false);
             else
-                await FailAsync(snapshot.OperationId, error, false, cancellationToken).ConfigureAwait(false);
+                await FailAsync(snapshot.OperationId, error, false, attemptCount, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -194,11 +223,13 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 snapshot.OperationId,
                 snapshot.AccountId,
                 descriptor,
-                now.Add(ConfirmationWindow)),
+                now.Add(ConfirmationWindow),
+                attemptCount),
             cancellationToken).ConfigureAwait(false);
         if (!boundary.Accepted)
         {
-            await store.ReturnToWaitingForDailyLimitAsync(snapshot.OperationId, now, cancellationToken)
+            await store.ReturnToWaitingForDailyLimitAsync(
+                    snapshot.OperationId, now, cancellationToken, attemptCount)
                 .ConfigureAwait(false);
             return;
         }
@@ -217,12 +248,12 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         }
         catch (OperationCanceledException)
         {
-            await MarkUnknownSubmissionResultAsync(snapshot.OperationId).ConfigureAwait(false);
+            await MarkUnknownSubmissionResultAsync(snapshot.OperationId, attemptCount).ConfigureAwait(false);
             throw;
         }
         catch (Exception)
         {
-            await MarkUnknownSubmissionResultAsync(snapshot.OperationId).ConfigureAwait(false);
+            await MarkUnknownSubmissionResultAsync(snapshot.OperationId, attemptCount).ConfigureAwait(false);
             return;
         }
         now = timeProvider.GetUtcNow();
@@ -236,6 +267,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     errorKind,
                     saveResult.SubmissionAcceptance,
                     session.CapturedAtUtc,
+                    attemptCount,
                     cancellationToken).ConfigureAwait(false);
             }
             else if (saveResult.SubmissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
@@ -246,11 +278,13 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     saveResult.SafeMessage!,
                     saveResult.SubmissionAcceptance,
                     now,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    attemptCount).ConfigureAwait(false);
             }
             else if (IsAccountPausingFailure(errorKind))
             {
-                await FailAndPauseAccountAsync(snapshot.OperationId, errorKind, cancellationToken).ConfigureAwait(false);
+                await FailAndPauseAccountAsync(
+                    snapshot.OperationId, errorKind, attemptCount, cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -258,6 +292,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     snapshot.OperationId,
                     errorKind,
                     errorKind is BaiduErrorKind.InvalidLink or BaiduErrorKind.InvalidExtractionCode,
+                    attemptCount,
                     cancellationToken).ConfigureAwait(false);
             }
             return;
@@ -271,7 +306,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 receipt.AdapterRequestId,
                 receipt.ExactRemoteItems,
                 now,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                attemptCount).ConfigureAwait(false);
             return;
         }
         await store.RecordSubmissionIdentifiersAsync(
@@ -279,7 +315,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             receipt.AdapterRequestId,
             receipt.RemoteItemIds,
             now,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            attemptCount).ConfigureAwait(false);
         if (snapshot.RequiresExactShareEvidence)
         {
             var unknown = BaiduAdapterResult.Failure(BaiduErrorKind.UnknownResponse, null);
@@ -289,10 +326,12 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 unknown.SafeMessage!,
                 SubmissionAcceptance.Unknown,
                 now,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                attemptCount).ConfigureAwait(false);
             return;
         }
-        await store.MarkSucceededAsync(snapshot.OperationId, now, cancellationToken).ConfigureAwait(false);
+        await store.MarkSucceededAsync(
+            snapshot.OperationId, now, cancellationToken, attemptCount).ConfigureAwait(false);
     }
 
     private async Task<BaiduAdapterResult<RemoteDirectory>> EnsureWithRetryAsync(
@@ -316,6 +355,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         Guid operationId,
         BaiduErrorKind errorKind,
         bool globallyInvalid,
+        int? expectedAttemptCount,
         CancellationToken cancellationToken)
     {
         var safe = BaiduAdapterResult.Failure(errorKind, null);
@@ -325,12 +365,14 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             safe.SafeMessage!,
             globallyInvalid,
             timeProvider.GetUtcNow(),
-            cancellationToken);
+            cancellationToken,
+            expectedAttemptCount);
     }
 
     private Task FailAndPauseAccountAsync(
         Guid operationId,
         BaiduErrorKind errorKind,
+        int? expectedAttemptCount,
         CancellationToken cancellationToken)
     {
         var safe = BaiduAdapterResult.Failure(errorKind, null);
@@ -339,13 +381,15 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             errorKind.ToString(),
             safe.SafeMessage!,
             timeProvider.GetUtcNow(),
-            cancellationToken);
+            cancellationToken,
+            expectedAttemptCount);
     }
 
     private Task PauseAccountBeforeSubmissionAsync(
         Guid operationId,
         BaiduErrorKind errorKind,
         DateTimeOffset? observedSessionCapturedAtUtc,
+        int? expectedAttemptCount,
         CancellationToken cancellationToken)
     {
         var reason = errorKind switch
@@ -360,7 +404,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             SubmissionAcceptance.DefinitelyNotAccepted,
             observedSessionCapturedAtUtc,
             timeProvider.GetUtcNow(),
-            cancellationToken);
+            cancellationToken,
+            expectedAttemptCount);
     }
 
     private Task PauseForAccountInterventionAsync(
@@ -368,6 +413,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         BaiduErrorKind errorKind,
         SubmissionAcceptance submissionAcceptance,
         DateTimeOffset? observedSessionCapturedAtUtc,
+        int expectedAttemptCount,
         CancellationToken cancellationToken)
     {
         var reason = errorKind switch
@@ -382,10 +428,11 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             submissionAcceptance,
             observedSessionCapturedAtUtc,
             timeProvider.GetUtcNow(),
-            cancellationToken);
+            cancellationToken,
+            expectedAttemptCount);
     }
 
-    private Task MarkUnknownSubmissionResultAsync(Guid operationId)
+    private Task MarkUnknownSubmissionResultAsync(Guid operationId, int expectedAttemptCount)
     {
         var failure = BaiduAdapterResult.Failure(BaiduErrorKind.UnknownResponse, null);
         return store.MarkResultPendingAsync(
@@ -394,7 +441,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             failure.SafeMessage!,
             SubmissionAcceptance.Unknown,
             timeProvider.GetUtcNow(),
-            CancellationToken.None);
+            CancellationToken.None,
+            expectedAttemptCount);
     }
 
     private static bool IsAccountPausingFailure(BaiduErrorKind errorKind) =>

@@ -313,7 +313,7 @@ public sealed class OperationExecutorTests
         var snapshot = Snapshot(createFolderName: null);
         var store = new RecordingExecutionStore(snapshot)
         {
-            LoadException = new ArgumentException("untrusted persisted path"),
+            LoadException = new OperationSnapshotValidationException(0, new ArgumentException("untrusted persisted path")),
         };
         var adapter = new RecordingAdapter();
 
@@ -494,7 +494,8 @@ public sealed class OperationExecutorTests
             return Task.FromResult<OperationExecutionSnapshot?>(Snapshot);
         }
 
-        public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkPreparingAsync(Guid operationId, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             Events.Add((++order, "Preparing"));
             timeline?.Add("Preparing");
@@ -508,7 +509,9 @@ public sealed class OperationExecutorTests
             return Task.FromResult(new SubmissionBoundaryResult(true, true, 1));
         }
 
-        public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId, IReadOnlyList<string> remoteItemIds, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId,
+            IReadOnlyList<string> remoteItemIds, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             if (RejectSplitSuccessWrites) throw new InvalidOperationException("split success write");
             IdentifierOrder = ++order;
@@ -519,7 +522,8 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task MarkSucceededAsync(Guid operationId, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkSucceededAsync(Guid operationId, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             if (RejectSplitSuccessWrites) throw new InvalidOperationException("split success write");
             Succeeded = true;
@@ -534,7 +538,8 @@ public sealed class OperationExecutorTests
             string? requestId,
             RemoteItemIdentitySet exactRemoteItems,
             DateTimeOffset now,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            int? expectedAttemptCount = null)
         {
             ExactCompleted = true;
             ExactRemoteItems = exactRemoteItems;
@@ -543,7 +548,8 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkFailedAsync(Guid operationId, string code, string safeMessage, bool globallyInvalid,
+            DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             FailureCode = code;
             FailureMessage = safeMessage;
@@ -551,7 +557,9 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage, SubmissionAcceptance submissionAcceptance, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkResultPendingAsync(Guid operationId, string code, string safeMessage,
+            SubmissionAcceptance submissionAcceptance, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             ResultPending = true;
             PendingAcceptance = submissionAcceptance;
@@ -561,7 +569,8 @@ public sealed class OperationExecutorTests
             return Task.CompletedTask;
         }
 
-        public Task PauseAccountBeforeSubmissionAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task PauseAccountBeforeSubmissionAsync(Guid operationId, string code, string safeMessage,
+            DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             AccountPaused = true;
             PreSubmissionPaused = true;
@@ -577,7 +586,8 @@ public sealed class OperationExecutorTests
             SubmissionAcceptance submissionAcceptance,
             DateTimeOffset? observedSessionCapturedAtUtc,
             DateTimeOffset now,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            int? expectedAttemptCount = null)
         {
             var (code, message) = reason switch
             {
@@ -588,10 +598,12 @@ public sealed class OperationExecutorTests
             };
             PausedAcceptance = submissionAcceptance;
             ObservedSessionCapturedAtUtc = observedSessionCapturedAtUtc;
-            return PauseAccountBeforeSubmissionAsync(operationId, code, message, now, cancellationToken);
+            return PauseAccountBeforeSubmissionAsync(
+                operationId, code, message, now, cancellationToken, expectedAttemptCount);
         }
 
-        public Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage, DateTimeOffset now, CancellationToken cancellationToken = default)
+        public Task MarkDefiniteAccountFailureAsync(Guid operationId, string code, string safeMessage,
+            DateTimeOffset now, CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
         {
             AccountPaused = true;
             DefiniteAccountFailure = true;

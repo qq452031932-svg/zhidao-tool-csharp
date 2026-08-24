@@ -82,6 +82,7 @@ public static class AppBootstrap
         services.AddSingleton<IAllocationCounterStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
         services.AddSingleton<IOperationReconciliationStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
         services.AddSingleton<IJobResultTransferActionStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
+        services.AddSingleton<IBatchRunControlStore>(sp => sp.GetRequiredService<SqliteTransferSchedulingStore>());
         services.AddSingleton<IShareReconciliationStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<IExistingShareDecisionStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<IJobResultShareActionStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
@@ -115,6 +116,9 @@ public static class AppBootstrap
         services.AddSingleton<IWizardBatchService, WizardBatchService>();
         services.AddSingleton<JobPageQuery>();
         services.AddSingleton<BatchStatisticsQuery>();
+        services.AddSingleton<PauseBatchService>();
+        services.AddSingleton<ResumeBatchService>();
+        services.AddSingleton<RetryFailedTransferService>();
         services.AddSingleton<SqliteBatchResultProjectionRepository>();
         services.AddSingleton<IBatchResultProjectionRepository>(sp =>
             sp.GetRequiredService<SqliteBatchResultProjectionRepository>());

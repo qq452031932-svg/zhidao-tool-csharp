@@ -52,6 +52,9 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IExistingShareDecisionInteraction>());
         Assert.NotNull(host.Services.GetRequiredService<IJobResultActions>());
         Assert.NotNull(host.Services.GetRequiredService<ReplacementWorkbookExportService>());
+        Assert.NotNull(host.Services.GetRequiredService<PauseBatchService>());
+        Assert.NotNull(host.Services.GetRequiredService<ResumeBatchService>());
+        Assert.NotNull(host.Services.GetRequiredService<RetryFailedTransferService>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
