@@ -140,6 +140,46 @@ public sealed class BaiduPageObservationParserTests
         Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
     }
 
+    [Fact]
+    public void Parse_EmptyDirectoryObservationFailsClosedAndBlocksResourceActions()
+    {
+        var observation = Load("own-drive-empty-directory.synthetic.json");
+
+        var result = BaiduPageObservationParser.Parse(observation);
+
+        Assert.Equal(BaiduObservationProvenance.Synthetic, observation.Provenance);
+        Assert.Equal(BaiduObservationValidationStatus.NotFieldValidated, observation.ValidationStatus);
+        Assert.Empty(observation.IdentityPlaceholders);
+        Assert.Equal(0, observation.CandidateCounts["resource-item"]);
+        Assert.Equal(BaiduPageState.Unknown, result.State);
+        Assert.False(result.IsUnambiguous);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, result.ValidationStatus);
+
+        var acceptance = new BaiduAutomationAcceptance(
+            true,
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a");
+        var context = new BaiduAutomationActionContext(
+            result,
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a",
+            acceptance,
+            0);
+
+        foreach (var action in new[]
+                 {
+                     BaiduAutomationAction.SelectExactItems,
+                     BaiduAutomationAction.ClickShare,
+                 })
+        {
+            var decision = BaiduSelectorCatalog.Production.Authorize(context, action);
+            Assert.False(decision.IsAllowed);
+            Assert.Equal(BaiduAutomationDenialReason.AmbiguousOrUnknownState, decision.DenialReason);
+        }
+    }
+
     [Theory]
     [InlineData("https://pan.baidu.com/s/fictional")]
     [InlineData("pwd=four-digits")]

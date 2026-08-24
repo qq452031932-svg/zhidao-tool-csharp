@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["own-drive"],
+  "visibleSemanticLabels": ["resource-list", "share-entry"],
+  "stableAttributeTokens": { "view": "drive-list" },
+  "candidateCounts": { "share-action": 1, "resource-item": 0 },
+  "identityPlaceholders": []
+}
