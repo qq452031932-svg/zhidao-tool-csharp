@@ -526,6 +526,7 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         var actions = Actions(db);
 
         Assert.True((await actions.ResumeTransferAsync(transfer.Id, transfer.AttemptCount, transfer.UpdatedAt)).Accepted);
+        var newerPausedAt = transfer.UpdatedAt.AddMinutes(20);
         await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
         {
             await ExecuteAsync(connection, """
@@ -534,7 +535,7 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
                 WHERE Id=$id;
                 """,
                 ("$id", transfer.Id.ToString("D")),
-                ("$updated", transfer.UpdatedAt.ToString("O")));
+                ("$updated", newerPausedAt.ToString("O")));
         }
 
         var stale = await actions.ResumeTransferAsync(transfer.Id, transfer.AttemptCount, transfer.UpdatedAt);
@@ -546,7 +547,7 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         command.Parameters.AddWithValue("$id", transfer.Id.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync());
-        Assert.Equal(("Paused", "Reserved", transfer.UpdatedAt, transfer.AttemptCount + 1),
+        Assert.Equal(("Paused", "Reserved", newerPausedAt, transfer.AttemptCount),
             (reader.GetString(0), reader.GetString(1), DateTimeOffset.Parse(reader.GetString(2)), reader.GetInt32(3)));
     }
 

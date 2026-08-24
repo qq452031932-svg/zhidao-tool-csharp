@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 
 namespace BaiduBatchTransfer.Application.Tests.Jobs;
@@ -590,6 +591,197 @@ public sealed class BatchRunControlServiceTests
     }
 
     [Fact]
+    public async Task SafeRetryRestoresPlannedShareLineageAndSuccessActivatesAutoShare()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedShareEnabledFailedTransferAsync(db);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await new RetryFailedTransferService(store, new FixedTimeProvider(Now.AddMinutes(2)))
+                .RetryAsync(data.Operation.Id));
+
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id AND Status='WaitingTransfer'", data.Operation.Id));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", data.BatchId));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT CreatedShareOperationCount FROM BatchOutputAccounts WHERE BatchJobId=$id", data.BatchId));
+        await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT ResourceItemId,BatchJobId,AccountId,OutputOrdinal,SettingsFingerprint,Generation,AttemptCount,LeaseGeneration FROM ShareOperations WHERE TransferOperationId=$operation;";
+            command.Parameters.AddWithValue("$operation", data.Operation.Id.ToString("D"));
+            await using var reader = await command.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(data.Resource.Id.ToString("D"), reader.GetString(0));
+            Assert.Equal(data.BatchId.ToString("D"), reader.GetString(1));
+            Assert.Equal(data.AccountId.ToString("D"), reader.GetString(2));
+            Assert.Equal(1, reader.GetInt32(3));
+            Assert.Equal("settings-fp", reader.GetString(4));
+            Assert.Equal((1, 0, 0), (reader.GetInt32(5), reader.GetInt32(6), reader.GetInt32(7)));
+        }
+
+        Assert.Equal(data.Operation.Id,
+            (await store.TryReserveNextAsync(data.BatchId, Now.AddMinutes(3), Now.AddMinutes(8)))?.OperationId);
+        var attempt = data.Operation.AttemptCount + 1;
+        await store.MarkPreparingAsync(data.Operation.Id, Now.AddMinutes(4), expectedAttemptCount: attempt);
+        Assert.True((await store.PersistAsync(new SubmissionBoundaryPersistence(
+            new SubmissionBoundaryCommand(data.Operation.Id, data.AccountId, "{\"operation\":\"retry-share\"}",
+                Now.AddMinutes(9), ExpectedAttemptCount: attempt),
+            "2026-08-19", Now.AddMinutes(5)))).Accepted);
+        await store.CompleteSucceededWithEvidenceAsync(
+            data.Operation.Id, "request-1",
+            new RemoteItemIdentitySet([new RemoteItemIdentity("remote-1", "Title")]),
+            Now.AddMinutes(6), expectedAttemptCount: attempt);
+
+        Assert.Equal("WaitingShare", await ScalarStringAsync(db,
+            "SELECT Status FROM ShareOperations WHERE TransferOperationId=$id", data.Operation.Id));
+    }
+
+    [Fact]
+    public async Task TransferOnlyRetryDoesNotCreateShareLineage()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1);
+        var operation = Operation(resource, accountId, 1,
+            status: "Failed", outcomeKind: "Failed", submitState: "NotPrepared", slotState: "Released",
+            errorCode: "TransientService", errorMessage: "The service is temporarily unavailable.");
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, failed: 1)]);
+        await ConfigureOutputAsync(db, batchId, accountId, shareEnabled: false);
+
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await new RetryFailedTransferService(new SqliteTransferSchedulingStore(db.ConnectionFactory))
+                .RetryAsync(operation.Id));
+
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id", operation.Id));
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", batchId));
+    }
+
+    [Fact]
+    public async Task ConcurrentSafeRetryRestoresPlannedShareExactlyOnce()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedShareEnabledFailedTransferAsync(db);
+        var retry = new RetryFailedTransferService(new SqliteTransferSchedulingStore(db.ConnectionFactory));
+
+        var results = await Task.WhenAll(retry.RetryAsync(data.Operation.Id), retry.RetryAsync(data.Operation.Id));
+
+        Assert.Equal(1, results.Count(result => result == RetryFailedTransferDisposition.Requeued));
+        Assert.Equal(1, results.Count(result => result == RetryFailedTransferDisposition.NotRetryable));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id", data.Operation.Id));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", data.BatchId));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT CreatedShareOperationCount FROM BatchOutputAccounts WHERE BatchJobId=$id", data.BatchId));
+    }
+
+    [Fact]
+    public async Task SafeRetryRejectsExistingCurrentShareInsteadOfDuplicatingLineage()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedShareEnabledFailedTransferAsync(db);
+        await InsertWaitingShareAsync(db, data.BatchId, data.AccountId, data.Resource.Id, data.Operation.Id);
+        await ExecuteAsync(db,
+            "UPDATE BatchJobs SET ShareOperationCount=ShareOperationCount+1 WHERE Id=$id;",
+            ("$id", data.BatchId.ToString("D")));
+
+        Assert.Equal(RetryFailedTransferDisposition.NotRetryable,
+            await new RetryFailedTransferService(new SqliteTransferSchedulingStore(db.ConnectionFactory))
+                .RetryAsync(data.Operation.Id));
+        Assert.Equal("Failed", await ScalarStringAsync(db,
+            "SELECT Status FROM TransferOperations WHERE Id=$id", data.Operation.Id));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id", data.Operation.Id));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", data.BatchId));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT CreatedShareOperationCount FROM BatchOutputAccounts WHERE BatchJobId=$id", data.BatchId));
+    }
+
+    [Fact]
+    public async Task RestartPreservesRestoredPlannedShareLineage()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedShareEnabledFailedTransferAsync(db);
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await new RetryFailedTransferService(new SqliteTransferSchedulingStore(db.ConnectionFactory))
+                .RetryAsync(data.Operation.Id));
+
+        var restarted = new SqliteTransferSchedulingStore(new SqliteConnectionFactory(db.DatabasePath));
+        Assert.Equal(data.Operation.Id,
+            (await restarted.TryReserveNextAsync(data.BatchId, Now.AddMinutes(3), Now.AddMinutes(8)))?.OperationId);
+        var snapshot = await restarted.LoadOperationAsync(data.Operation.Id);
+
+        Assert.NotNull(snapshot);
+        Assert.True(snapshot.RequiresExactShareEvidence);
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id AND Status='WaitingTransfer'", data.Operation.Id));
+    }
+
+    [Theory]
+    [InlineData("NotPrepared", 7, 8)]
+    [InlineData("ResultReceived", 7, 8)]
+    [InlineData("PreparingToSubmit", 7, 7)]
+    [InlineData("NotPrepared", int.MaxValue - 1, int.MaxValue)]
+    [InlineData("ResultReceived", int.MaxValue - 1, int.MaxValue)]
+    [InlineData("PreparingToSubmit", int.MaxValue, int.MaxValue)]
+    public async Task ResumeBeforeSubmissionPreservesGenerationAndBeginAdvancesExactlyOnce(
+        string submitState,
+        int attemptCount,
+        int expectedAfterBegin)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with { CandidateStatus = "Reserved", ReservedAccountId = accountId };
+        var operation = Operation(resource, accountId, 1, status: "Paused", submitState: submitState,
+            slotState: "Reserved", attemptCount: attemptCount,
+            descriptor: submitState == "ResultReceived" ? "{\"operation\":\"previous\"}" : null);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.True(await store.ResumePausedAsync(operation.Id, attemptCount, operation.UpdatedAt, Now.AddMinutes(1)));
+        Assert.False(await store.ResumePausedAsync(operation.Id, attemptCount, operation.UpdatedAt, Now.AddMinutes(2)));
+        Assert.Equal(attemptCount, await ScalarInt32Async(db,
+            "SELECT AttemptCount FROM TransferOperations WHERE Id=$id", operation.Id));
+        Assert.NotNull(await store.TryReserveNextAsync(batchId, Now.AddMinutes(3), Now.AddMinutes(8)));
+        await store.MarkPreparingAsync(operation.Id, Now.AddMinutes(4), expectedAttemptCount: attemptCount);
+        Assert.Equal(expectedAfterBegin, await ScalarInt32Async(db,
+            "SELECT AttemptCount FROM TransferOperations WHERE Id=$id", operation.Id));
+    }
+
+    [Fact]
+    public async Task MaximumUnpreparedPauseRemainsPausedBecauseNoFreshGenerationCanBeAllocated()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with { CandidateStatus = "Reserved", ReservedAccountId = accountId };
+        var operation = Operation(resource, accountId, 1, status: "Paused", submitState: "NotPrepared",
+            slotState: "Reserved", attemptCount: int.MaxValue);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.False(await store.ResumePausedAsync(operation.Id, int.MaxValue, operation.UpdatedAt, Now.AddMinutes(1)));
+        Assert.Equal("Paused", await ScalarStringAsync(db,
+            "SELECT Status FROM TransferOperations WHERE Id=$id", operation.Id));
+        Assert.Equal(int.MaxValue, await ScalarInt32Async(db,
+            "SELECT AttemptCount FROM TransferOperations WHERE Id=$id", operation.Id));
+    }
+
+    [Fact]
     public async Task RestartObservesPersistedPausedAndRequeuedStates()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -689,6 +881,67 @@ public sealed class BatchRunControlServiceTests
             "2026-08-19", Now.AddMinutes(minute + 2)))).Accepted);
         await store.MarkSucceededAsync(operation.Id, Now.AddMinutes(minute + 3), expectedAttemptCount: attempt);
     }
+
+    private static async Task<(Guid BatchId, Guid AccountId, ResourceItemRecord Resource, TransferOperationRecord Operation)>
+        SeedShareEnabledFailedTransferAsync(BatchTestDatabase db)
+    {
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with
+        {
+            CandidateStatus = "Reserved",
+            ReservedAccountId = accountId,
+            ResolvedOutputTitle = "Title",
+        };
+        var operation = Operation(resource, accountId, 1, status: "Preparing",
+            submitState: "PreparingToSubmit", slotState: "Reserved", attemptCount: 1);
+        await db.SeedAsync([Account(accountId)],
+            job: Job(batchId, "Active", 1, 1, quotaBasis: "SuccessTarget") with { ShareOperationCount = 1 },
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        await ConfigureOutputAsync(db, batchId, accountId, shareEnabled: true);
+        await InsertWaitingShareAsync(db, batchId, accountId, resource.Id, operation.Id);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        await store.MarkFailedAsync(operation.Id, "TransientService",
+            "The service is temporarily unavailable.", false, Now.AddMinutes(1), expectedAttemptCount: 1);
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE TransferOperationId=$id", operation.Id));
+        return (batchId, accountId, resource, operation);
+    }
+
+    private static Task InsertWaitingShareAsync(
+        BatchTestDatabase db,
+        Guid batchId,
+        Guid accountId,
+        Guid resourceId,
+        Guid operationId) =>
+        ExecuteAsync(db, """
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
+              SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
+              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,
+              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+            """, ("$share", Guid.NewGuid().ToString("D")), ("$operation", operationId.ToString("D")),
+            ("$resource", resourceId.ToString("D")), ("$batch", batchId.ToString("D")),
+            ("$account", accountId.ToString("D")), ("$now", Now.ToString("O")));
+
+    private static Task ConfigureOutputAsync(
+        BatchTestDatabase db,
+        Guid batchId,
+        Guid accountId,
+        bool shareEnabled) =>
+        ExecuteAsync(db, """
+            INSERT INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            SELECT $batch,1,1,'Random',NULL,'Reuse','settings-fp',$now WHERE $share=1;
+            INSERT INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'Output',1,$share,$share);
+            """, ("$batch", batchId.ToString("D")), ("$account", accountId.ToString("D")),
+            ("$share", shareEnabled ? 1 : 0), ("$now", Now.ToString("O")));
 
     private static async Task AddJobAsync(BatchTestDatabase db, BatchJobRecord job)
     {

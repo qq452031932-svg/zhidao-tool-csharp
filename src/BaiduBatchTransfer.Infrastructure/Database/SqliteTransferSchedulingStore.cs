@@ -182,7 +182,8 @@ public sealed class SqliteTransferSchedulingStore :
                 WHERE waiting.BatchJobId=o.BatchJobId AND waiting.AssignedAccountId=o.AssignedAccountId
                   AND waiting.Status='Waiting' AND waiting.TargetSlotState IN ('Unoccupied','Released')
                   AND waitingResource.CandidateStatus='Reserved'
-                  AND waitingResource.ReservedAccountId=o.AssignedAccountId)
+                  AND waitingResource.ReservedAccountId=o.AssignedAccountId),o.ResourceItemId,
+              EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id)
             FROM TransferOperations o
             JOIN BatchJobs b ON b.Id=o.BatchJobId
             JOIN ResourceItems r ON r.Id=o.ResourceItemId
@@ -201,7 +202,7 @@ public sealed class SqliteTransferSchedulingStore :
                     reader.GetString(15), reader.GetString(16), ReadString(reader, 17), reader.GetInt32(18),
                     reader.GetInt64(19) != 0, reader.GetInt64(20) != 0, reader.GetString(21),
                     reader.GetInt32(22), reader.GetInt32(23), reader.GetInt32(24), reader.GetInt32(25),
-                    reader.GetInt32(26))
+                    reader.GetInt32(26), Guid.Parse(reader.GetString(27)), reader.GetInt64(28) != 0)
                 : null;
         }
 
@@ -231,6 +232,14 @@ public sealed class SqliteTransferSchedulingStore :
         }
 
         var batchMayRun = snapshot.BatchStatus is "Active" or "Queued" or "Paused" or "CompletedWithShortfall";
+        var sharePlan = await ReadRetrySharePlanAsync(
+            connection, transaction, snapshot.BatchJobId, snapshot.AccountId, cancellationToken).ConfigureAwait(false);
+        var sharePlanIsConsistent = !snapshot.HasAnyShareOperation &&
+                                    (sharePlan is null || !sharePlan.ShareEnabled ||
+                                     (!string.IsNullOrWhiteSpace(sharePlan.SettingsFingerprint) &&
+                                      sharePlan.PlannedShareCount > 0 &&
+                                      sharePlan.CreatedShareOperationCount < sharePlan.PlannedShareCount &&
+                                      sharePlan.BatchShareOperationCount == sharePlan.CurrentBatchShareOperationCount));
         var freeSuccessSlots = (long)snapshot.EffectiveTargetSuccessCount - snapshot.FulfilledCount -
                                snapshot.ReservedSlotCount - snapshot.WaitingSlotDemand;
         var restoreSuccessCapacity = snapshot.QuotaBasis == "SuccessTarget" && freeSuccessSlots <= 0;
@@ -243,7 +252,7 @@ public sealed class SqliteTransferSchedulingStore :
                                          snapshot.ReservedAccountId is null && snapshot.FailedItemCount > 0 &&
                                          snapshot.AccountIsEligible && !snapshot.HasAdvancedShareOperation &&
                                          snapshot.AttemptCount < int.MaxValue &&
-                                         successCapacityIsAvailable;
+                                         successCapacityIsAvailable && sharePlanIsConsistent;
         if (!batchMayRun || !durableFailureIsConsistent)
         {
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -289,6 +298,32 @@ public sealed class SqliteTransferSchedulingStore :
             Add(resource, "$operation", Id(operationId));
             RequireOne(await resource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
                 "The failed-operation resource changed during retry.");
+        }
+        if (sharePlan is { ShareEnabled: true })
+        {
+            await using (var share = Command(connection, transaction, """
+                INSERT INTO ShareOperations(
+                  Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
+                  SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
+                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,
+                  NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+                """))
+            {
+                Add(share, "$id", Id(Guid.NewGuid())); Add(share, "$transfer", Id(operationId));
+                Add(share, "$resource", Id(snapshot.ResourceItemId)); Add(share, "$batch", Id(snapshot.BatchJobId));
+                Add(share, "$account", Id(snapshot.AccountId)); Add(share, "$ordinal", sharePlan.OutputOrdinal);
+                Add(share, "$settings", sharePlan.SettingsFingerprint); Add(share, "$now", Time(retriedAt));
+                RequireOne(await share.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                    "The planned share handoff could not be restored.");
+            }
+            await using var batchShareCount = Command(connection, transaction,
+                "UPDATE BatchJobs SET ShareOperationCount=ShareOperationCount+1 WHERE Id=$batch AND ShareOperationCount=$expected;");
+            Add(batchShareCount, "$batch", Id(snapshot.BatchJobId));
+            Add(batchShareCount, "$expected", sharePlan.BatchShareOperationCount);
+            RequireOne(await batchShareCount.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
+                "The batch share count could not be restored.");
         }
         if (snapshot.BatchStatus == "CompletedWithShortfall")
         {
@@ -1429,7 +1464,6 @@ public sealed class SqliteTransferSchedulingStore :
         await using (var retryable = Command(connection, transaction, """
             UPDATE TransferOperations SET Status='Waiting',OutcomeKind=NULL,
               SubmitState=CASE WHEN SubmitState='PreparingToSubmit' THEN 'PreparingToSubmit' ELSE 'NotPrepared' END,
-              AttemptCount=CASE WHEN SubmitState='PreparingToSubmit' THEN AttemptCount ELSE AttemptCount+1 END,
               TargetSlotState='Released',TargetSlotReservedAt=NULL,ConfirmationDescriptorJson=NULL,
               AdapterRequestId=NULL,RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,LeaseExpiresAt=NULL,
               LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
@@ -1805,6 +1839,38 @@ public sealed class SqliteTransferSchedulingStore :
             : null;
     }
 
+    private static async Task<RetrySharePlan?> ReadRetrySharePlanAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchId,
+        Guid accountId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT output.ShareEnabled,output.OutputOrdinal,output.PlannedShareCount,
+              output.CreatedShareOperationCount,settings.SettingsFingerprint,
+              (SELECT batch.ShareOperationCount FROM BatchJobs batch WHERE batch.Id=output.BatchJobId),
+              (SELECT COUNT(*) FROM ShareOperations share WHERE share.BatchJobId=output.BatchJobId)
+            FROM BatchOutputAccounts output
+            LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=output.BatchJobId
+            WHERE output.BatchJobId=$batch AND output.AccountId=$account;
+            """);
+        Add(command, "$batch", Id(batchId)); Add(command, "$account", Id(accountId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var result = new RetrySharePlan(
+            reader.GetInt32(0) != 0,
+            reader.GetInt32(1),
+            reader.GetInt32(2),
+            reader.GetInt32(3),
+            ReadString(reader, 4),
+            reader.GetInt32(5),
+            reader.GetInt32(6));
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("A batch account has multiple output definitions.");
+        return result;
+    }
+
     private static async Task<(Guid ResourceId,long Sequence,string NormalizedShareId,string? TargetOverride,string? NormalizedTargetOverride,string? Folder,Guid? ConstraintAccountId,bool WasUnused)?> SelectCandidateAsync(SqliteConnection connection, SqliteTransaction transaction, Guid batchId, Guid accountId, CancellationToken cancellationToken)
     {
         var exclusive = Earlier(
@@ -1949,7 +2015,18 @@ public sealed class SqliteTransferSchedulingStore :
         int EffectiveTargetSuccessCount,
         int FulfilledCount,
         int ReservedSlotCount,
-        int WaitingSlotDemand);
+        int WaitingSlotDemand,
+        Guid ResourceItemId,
+        bool HasAnyShareOperation);
+
+    private sealed record RetrySharePlan(
+        bool ShareEnabled,
+        int OutputOrdinal,
+        int PlannedShareCount,
+        int CreatedShareOperationCount,
+        string? SettingsFingerprint,
+        int BatchShareOperationCount,
+        int CurrentBatchShareOperationCount);
 
     private static void RequireOne(int changed, string message) { if (changed != 1) throw new InvalidOperationException(message); }
     private static string Fingerprint(string shareId, Guid accountId, string path, string folder) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"operation-v1\n{shareId}\n{accountId:N}\n{path}\n{folder}")));
