@@ -93,17 +93,20 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
     }
 
     [Fact]
-    public async Task FailedCloseStillFencesReopenUntilCallbackHasFinishedThenCleansUp()
+    public async Task FailedCloseKeepsLeaseIsolatedUntilARetryConfirmsClosure()
     {
         var closer = new WebView2ProfileCloser();
         var accountId = Guid.NewGuid();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fail = true;
+        var closeCalls = 0;
         using var registration = closer.Register(accountId, async _ =>
         {
+            closeCalls++;
             entered.TrySetResult();
             await release.Task;
-            throw new InvalidOperationException("synthetic close failure");
+            if (fail) throw new InvalidOperationException("synthetic close failure");
         });
 
         var closing = closer.CloseAsync(accountId, CancellationToken.None);
@@ -112,6 +115,53 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
 
         release.TrySetResult();
         await Assert.ThrowsAsync<InvalidOperationException>(() => closing);
+        registration.Dispose();
+        Assert.Throws<InvalidOperationException>(() => closer.Register(accountId, _ => Task.CompletedTask));
+
+        fail = false;
+        await closer.CloseAsync(accountId, CancellationToken.None);
+        Assert.Equal(2, closeCalls);
+        using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
+    }
+
+    [Fact]
+    public async Task CancelledCloseKeepsLeaseAndCanBeRetried()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var calls = 0;
+        using var registration = closer.Register(accountId, cancellationToken =>
+        {
+            calls++;
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        });
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            closer.CloseAsync(accountId, cancelled.Token));
+        Assert.Throws<InvalidOperationException>(() => closer.Register(accountId, _ => Task.CompletedTask));
+
+        await closer.CloseAsync(accountId, CancellationToken.None);
+        Assert.Equal(2, calls);
+        using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
+    }
+
+    [Fact]
+    public async Task CloseWaitsForBlockedProfilePreparationBeforeReleasingLease()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var preparationStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = closer.Register(accountId, async _ => await preparationStopped.Task);
+
+        var closing = closer.CloseAsync(accountId, CancellationToken.None);
+
+        Assert.False(closing.IsCompleted);
+        Assert.Throws<InvalidOperationException>(() => closer.Register(accountId, _ => Task.CompletedTask));
+        preparationStopped.TrySetResult();
+        await closing;
         using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
     }
 

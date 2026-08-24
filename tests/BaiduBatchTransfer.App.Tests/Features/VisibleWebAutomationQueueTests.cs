@@ -184,6 +184,20 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task PersistedCancellationCannotBypassFullRequestOwnershipValidation()
+    {
+        await using var fixture = CreateFixture();
+        var request = fixture.Request((_, _, _) => Task.FromResult(1));
+        fixture.Ownership.RejectedIdentity = request.Identity;
+        fixture.Cancellation.SeedCancelled(request.Identity.BatchId, request.Identity.OwnerKind);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Queue.EnqueueAsync(request));
+
+        Assert.Equal(0, fixture.Factory.CreatedCount);
+    }
+
+    [Fact]
     public async Task Queue_IsFifoAcrossAccountsAndUsesDispatcherForWindowOperations()
     {
         await using var fixture = CreateFixture();
@@ -334,6 +348,65 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, result.Disposition);
         Assert.False(callbackStarted);
         Assert.Equal(0, fixture.Factory.CreatedCount);
+    }
+
+    [Fact]
+    public async Task PersistedBatchCancellationReloadsTheExactAttemptStateAfterRestart()
+    {
+        await using var fixture = CreateFixture();
+        var request = fixture.Request((_, _, _) => Task.FromResult(1));
+        fixture.Store.Seed(new WebAutomationAttemptRecord(
+            request.Identity.OperationId,
+            request.Identity.AccountId,
+            request.Identity.Generation,
+            request.Identity.OwnerKind,
+            WebAutomationAttemptState.NeedsDecision,
+            null,
+            null,
+            fixture.Fingerprint,
+            false,
+            3,
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            DateTimeOffset.UtcNow));
+        fixture.Cancellation.SeedCancelled(request.Identity.BatchId, request.Identity.OwnerKind);
+
+        var result = await fixture.Queue.EnqueueAsync(request);
+
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, result.Disposition);
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision, result.PersistentState);
+        Assert.Equal(0, fixture.Factory.CreatedCount);
+    }
+
+    [Fact]
+    public async Task ActiveDurableBatchCancellationReturnsTheCommittedAttemptState()
+    {
+        await using var fixture = CreateFixture();
+        var request = fixture.Request(async (_, _, token) =>
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            return 1;
+        });
+        var active = fixture.Queue.EnqueueAsync(request);
+        await fixture.Factory.WaitForSessionAsync(0);
+        fixture.Store.Seed(new WebAutomationAttemptRecord(
+            request.Identity.OperationId,
+            request.Identity.AccountId,
+            request.Identity.Generation,
+            request.Identity.OwnerKind,
+            WebAutomationAttemptState.NeedsDecision,
+            null,
+            null,
+            fixture.Fingerprint,
+            false,
+            4,
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            DateTimeOffset.UtcNow));
+
+        fixture.Cancellation.SeedCancelled(request.Identity.BatchId, request.Identity.OwnerKind);
+        var result = await active;
+
+        Assert.Equal(VisibleWebAutomationDisposition.BatchCancelled, result.Disposition);
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision, result.PersistentState);
     }
 
     [Fact]
@@ -936,7 +1009,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             cancelledBatches.Add(key);
             Signal(key).Cancel();
         }
-        public Task<bool> CancelAsync(
+        public Task<WebAutomationBatchCancellationResult> CancelAsync(
             WebAutomationRequestIdentity identity,
             long expectedAttemptRevision,
             WebAutomationAttemptState expectedResumeStage,
@@ -946,7 +1019,11 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             var key = Key(identity.BatchId, identity.OwnerKind);
             cancelledBatches.Add(key);
             Signal(key).Cancel();
-            return Task.FromResult(true);
+            var state = expectedResumeStage is WebAutomationAttemptState.Preparing or
+                WebAutomationAttemptState.BaselinePersisted
+                ? WebAutomationAttemptState.DefinitelyNotSubmitted
+                : WebAutomationAttemptState.NeedsDecision;
+            return Task.FromResult(new WebAutomationBatchCancellationResult(true, state));
         }
 
         public Task<bool> IsCancelledAsync(

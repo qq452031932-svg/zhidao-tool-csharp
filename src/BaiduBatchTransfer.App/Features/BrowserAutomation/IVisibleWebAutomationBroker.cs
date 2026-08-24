@@ -123,7 +123,7 @@ public interface IWebAutomationNavigationAuthorizer
 
 public interface IWebAutomationBatchCancellation
 {
-    Task<bool> CancelAsync(
+    Task<WebAutomationBatchCancellationResult> CancelAsync(
         WebAutomationRequestIdentity identity,
         long expectedAttemptRevision,
         WebAutomationAttemptState expectedResumeStage,
@@ -139,6 +139,10 @@ public interface IWebAutomationBatchCancellation
         WebAutomationOwnerKind ownerKind,
         Action cancellationRequested);
 }
+
+public sealed record WebAutomationBatchCancellationResult(
+    bool IsCancelled,
+    WebAutomationAttemptState PersistentState);
 
 public sealed class WebAutomationAuthorizationException(
     BaiduAutomationDenialReason denialReason,

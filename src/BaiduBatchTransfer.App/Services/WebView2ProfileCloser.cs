@@ -30,24 +30,39 @@ public sealed class WebView2ProfileCloser : IWebViewProfileCloser
             close = registration.BeginClose(cancellationToken);
         }
         try { await close.ConfigureAwait(false); }
-        finally { CompleteClose(registration); }
+        catch
+        {
+            MarkCloseFailed(registration, close);
+            throw;
+        }
+        CompleteClose(registration, close);
     }
 
     private void Unregister(Registration registration)
     {
         lock (gate)
-            if (!registration.IsClosing &&
+            if (registration.CanUnregister &&
                 registrations.GetValueOrDefault(registration.AccountId) == registration)
                 registrations.Remove(registration.AccountId);
     }
 
-    private void CompleteClose(Registration registration)
+    private void CompleteClose(Registration registration, Task close)
+    {
+        lock (gate)
+        {
+            if (registrations.GetValueOrDefault(registration.AccountId) == registration &&
+                registration.TryComplete(close))
+                registrations.Remove(registration.AccountId);
+            registration.Detach();
+        }
+    }
+
+    private void MarkCloseFailed(Registration registration, Task close)
     {
         lock (gate)
         {
             if (registrations.GetValueOrDefault(registration.AccountId) == registration)
-                registrations.Remove(registration.AccountId);
-            registration.Detach();
+                registration.TryFail(close);
         }
     }
 
@@ -56,12 +71,39 @@ public sealed class WebView2ProfileCloser : IWebViewProfileCloser
         Guid accountId,
         Func<CancellationToken, Task> closeAsync) : IDisposable
     {
+        private enum RegistrationState { Open, Closing, CloseFailed, Closed }
         private WebView2ProfileCloser? owner = owner;
         private Task? closeTask;
+        private RegistrationState state;
         public Guid AccountId { get; } = accountId;
-        public bool IsClosing => closeTask is not null;
-        public Task BeginClose(CancellationToken cancellationToken) =>
-            closeTask ??= closeAsync(cancellationToken);
+        public bool CanUnregister => state == RegistrationState.Open;
+
+        public Task BeginClose(CancellationToken cancellationToken)
+        {
+            if (state == RegistrationState.Closing) return closeTask!;
+            if (state == RegistrationState.Closed) return Task.CompletedTask;
+            state = RegistrationState.Closing;
+            return closeTask = InvokeCloseAsync(cancellationToken);
+        }
+
+        public bool TryComplete(Task close)
+        {
+            if (state != RegistrationState.Closing || closeTask != close) return false;
+            state = RegistrationState.Closed;
+            closeTask = null;
+            return true;
+        }
+
+        public void TryFail(Task close)
+        {
+            if (state != RegistrationState.Closing || closeTask != close) return;
+            state = RegistrationState.CloseFailed;
+            closeTask = null;
+        }
+
+        private async Task InvokeCloseAsync(CancellationToken cancellationToken) =>
+            await closeAsync(cancellationToken).ConfigureAwait(false);
+
         public void Detach() => Interlocked.Exchange(ref owner, null);
         public void Dispose() => Interlocked.Exchange(ref owner, null)?.Unregister(this);
     }

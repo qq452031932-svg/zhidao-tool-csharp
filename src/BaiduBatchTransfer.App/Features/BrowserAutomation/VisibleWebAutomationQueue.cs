@@ -130,16 +130,6 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
             request.Identity.OwnerKind,
             batchCancellationRequested.Cancel);
         ValidateRequest(request);
-        if (await batchCancellation.IsCancelledAsync(
-                request.Identity.BatchId,
-                request.Identity.OwnerKind,
-                queueScope.Token).ConfigureAwait(false))
-        {
-            return new(
-                VisibleWebAutomationDisposition.BatchCancelled,
-                default,
-                WebAutomationAttemptState.DefinitelyNotSubmitted);
-        }
         if (!await ownershipStore.IsBoundAsync(
                 request.Identity.OperationId,
                 request.Identity.BatchId,
@@ -149,6 +139,18 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                 queueScope.Token).ConfigureAwait(false))
         {
             throw new InvalidOperationException("浏览器操作与批次、账号或代次的持久绑定不一致。");
+        }
+        if (await batchCancellation.IsCancelledAsync(
+                request.Identity.BatchId,
+                request.Identity.OwnerKind,
+                queueScope.Token).ConfigureAwait(false))
+        {
+            var persistedCancellationState = await handoffCoordinator
+                .LoadPersistentStateAsync(request.Identity, CancellationToken.None).ConfigureAwait(false);
+            return new(
+                VisibleWebAutomationDisposition.BatchCancelled,
+                default,
+                persistedCancellationState ?? WebAutomationAttemptState.DefinitelyNotSubmitted);
         }
         var persistedAttempt = await handoffCoordinator
             .EnsureStartedAsync(request.Identity, queueScope.Token).ConfigureAwait(false);
@@ -245,10 +247,14 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                     await AwaitOrObserveLateAsync(actionTask, options.ActionStopTimeout).ConfigureAwait(false);
                 if (batchCancellationRequested.IsCancellationRequested)
                 {
+                    var persistedCancellationState = await handoffCoordinator
+                        .LoadPersistentStateAsync(request.Identity, CancellationToken.None).ConfigureAwait(false)
+                        ?? throw new InvalidOperationException(
+                            "批次已经取消，但无法读取对应网页操作的持久状态。");
                     completion = new(
                         VisibleWebAutomationDisposition.BatchCancelled,
                         default,
-                        SafeCancellationState(context.CurrentStage));
+                        persistedCancellationState);
                 }
                 else
                 {
@@ -390,11 +396,6 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         try { await task.ConfigureAwait(false); }
         catch (Exception) { }
     }
-
-    private static WebAutomationAttemptState SafeCancellationState(WebAutomationAttemptState stage) =>
-        stage is WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted
-            ? WebAutomationAttemptState.DefinitelyNotSubmitted
-            : WebAutomationAttemptState.NeedsDecision;
 
     private interface IQueuedOperation
     {

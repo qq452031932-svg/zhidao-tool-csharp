@@ -181,6 +181,7 @@ public static class AppBootstrap
         services.AddSingleton<IWebAutomationBatchCancellation>(sp =>
             new WebAutomationBatchCancellation(
                 sp.GetRequiredService<IWebAutomationBatchCancellationStore>(),
+                sp.GetRequiredService<IWebAutomationAttemptStore>(),
                 TimeProvider.System));
         services.AddSingleton<IWebAutomationUiDispatcher, WpfWebAutomationUiDispatcher>();
         services.AddSingleton<IVisibleWebAutomationSessionFactory, WebView2AutomationSessionFactory>();

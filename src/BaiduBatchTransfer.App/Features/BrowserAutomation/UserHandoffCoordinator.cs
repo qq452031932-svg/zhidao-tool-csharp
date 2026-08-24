@@ -128,8 +128,8 @@ public sealed class UserHandoffCoordinator
                 handoff.Revision,
                 handoff.ResumeStage,
                 cancellationToken).ConfigureAwait(false);
-            return cancelled
-                ? new(UserHandoffResolution.BatchCancelled, terminal)
+            return cancelled.IsCancelled
+                ? new(UserHandoffResolution.BatchCancelled, cancelled.PersistentState)
                 : new(UserHandoffResolution.Stale, WebAutomationAttemptState.UserHandoff);
         }
         var resolved = await store.TryResolveUserHandoffAsync(
@@ -193,6 +193,19 @@ public sealed class UserHandoffCoordinator
         await EnterAsync(identity, resumeStage, observationFingerprint, cancellationToken)
             .ConfigureAwait(false);
         return WebAutomationAttemptState.UserHandoff;
+    }
+
+    public async Task<WebAutomationAttemptState?> LoadPersistentStateAsync(
+        WebAutomationRequestIdentity identity,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        identity.Validate();
+        var attempt = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false);
+        if (attempt is null) return null;
+        if (attempt.OwnerKind != identity.OwnerKind)
+            throw new InvalidOperationException("浏览器操作的持久记录与当前请求不一致。");
+        return attempt.State;
     }
 
     private Task<WebAutomationAttemptRecord?> LoadExactAsync(

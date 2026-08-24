@@ -5,12 +5,13 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebAutomationBatchCancellation(
     IWebAutomationBatchCancellationStore store,
+    IWebAutomationAttemptStore attemptStore,
     TimeProvider timeProvider) : IWebAutomationBatchCancellation, IDisposable
 {
     private readonly ConcurrentDictionary<BatchKey, CancellationTokenSource> signals = [];
     private int disposed;
 
-    public async Task<bool> CancelAsync(
+    public async Task<WebAutomationBatchCancellationResult> CancelAsync(
         WebAutomationRequestIdentity identity,
         long expectedAttemptRevision,
         WebAutomationAttemptState expectedResumeStage,
@@ -33,10 +34,21 @@ public sealed class WebAutomationBatchCancellation(
         {
             case WebAutomationBatchCancellationDisposition.Cancelled:
             case WebAutomationBatchCancellationDisposition.AlreadyCancelled:
-                Signal(identity.BatchId, identity.OwnerKind);
-                return true;
+                WebAutomationAttemptRecord? attempt;
+                try
+                {
+                    attempt = await attemptStore.GetAsync(
+                        identity.OperationId,
+                        identity.AccountId,
+                        identity.Generation,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                finally { Signal(identity.BatchId, identity.OwnerKind); }
+                if (attempt is null || attempt.OwnerKind != identity.OwnerKind)
+                    throw new InvalidOperationException("批次已经取消，但无法读取对应网页操作的持久状态。");
+                return new(true, attempt.State);
             case WebAutomationBatchCancellationDisposition.StaleHandoff:
-                return false;
+                return new(false, WebAutomationAttemptState.UserHandoff);
             case WebAutomationBatchCancellationDisposition.Terminal:
                 throw new InvalidOperationException("批次已经结束，不能再取消。");
             case WebAutomationBatchCancellationDisposition.OwnershipMismatch:

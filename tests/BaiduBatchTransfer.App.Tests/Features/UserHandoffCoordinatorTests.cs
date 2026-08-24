@@ -92,6 +92,25 @@ public sealed class UserHandoffCoordinatorTests
     }
 
     [Fact]
+    public async Task CancelUsesThePersistedStateReturnedByDurableCancellation()
+    {
+        var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
+        var handoff = await fixture.Coordinator.EnterAsync(
+            fixture.Identity,
+            WebAutomationAttemptState.Preparing,
+            fixture.Fingerprint);
+        fixture.Cancellation.PersistentStateOverride = WebAutomationAttemptState.NeedsDecision;
+
+        var result = await fixture.Coordinator.ResolveAsync(
+            fixture.Identity,
+            handoff,
+            WebAutomationUserChoice.CancelBatch);
+
+        Assert.Equal(UserHandoffResolution.BatchCancelled, result.Resolution);
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision, result.PersistentState);
+    }
+
+    [Fact]
     public async Task DuplicateCancelCannotReuseAResolvedHandoff()
     {
         var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
@@ -180,8 +199,9 @@ public sealed class UserHandoffCoordinatorTests
         public List<WebAutomationRequestIdentity> Cancelled { get; } = [];
         public bool StateWasPersistentWhenCalled { get; private set; }
         public bool ThrowOnCancel { get; set; }
+        public WebAutomationAttemptState? PersistentStateOverride { get; set; }
 
-        public Task<bool> CancelAsync(
+        public Task<WebAutomationBatchCancellationResult> CancelAsync(
             WebAutomationRequestIdentity identity,
             long expectedAttemptRevision,
             WebAutomationAttemptState expectedResumeStage,
@@ -190,11 +210,14 @@ public sealed class UserHandoffCoordinatorTests
             cancellationToken.ThrowIfCancellationRequested();
             if (ThrowOnCancel) throw new IOException("synthetic durable cancellation failure");
             if (!store.ResolveBatchCancellation(identity, expectedAttemptRevision, expectedResumeStage))
-                return Task.FromResult(false);
+                return Task.FromResult(new WebAutomationBatchCancellationResult(
+                    false,
+                    WebAutomationAttemptState.UserHandoff));
+            if (PersistentStateOverride is { } forced) store.OverrideTerminalState(forced);
             StateWasPersistentWhenCalled = store.Current.State is
                 WebAutomationAttemptState.DefinitelyNotSubmitted or WebAutomationAttemptState.NeedsDecision;
             Cancelled.Add(identity);
-            return Task.FromResult(true);
+            return Task.FromResult(new WebAutomationBatchCancellationResult(true, store.Current.State));
         }
 
         public Task<bool> IsCancelledAsync(
@@ -242,6 +265,17 @@ public sealed class UserHandoffCoordinatorTests
                     terminal, null, Current.Baseline, Current.ObservationFingerprint, false,
                     Current.Revision + 1, Current.CreatedAt, DateTimeOffset.UtcNow);
                 return true;
+            }
+        }
+
+        public void OverrideTerminalState(WebAutomationAttemptState state)
+        {
+            lock (gate)
+            {
+                Current = new(
+                    Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                    state, null, Current.Baseline, Current.ObservationFingerprint, false,
+                    Current.Revision, Current.CreatedAt, DateTimeOffset.UtcNow);
             }
         }
 
