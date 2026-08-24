@@ -125,6 +125,28 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
             graph.StandaloneOperationId, graph.AccountId, 1, WebAutomationOwnerKind.StandaloneShare, graph.Now)));
     }
 
+    [Fact]
+    public async Task RequestOwnershipRequiresTheExactAuthoritativeBatchAccountAndGeneration()
+    {
+        var graph = await CreateAsync();
+        var ownership = new SqliteWebAutomationRequestOwnershipStore(graph.Factory);
+
+        Assert.True(await ownership.IsBoundAsync(
+            graph.OperationId, graph.BatchId, graph.AccountId, 7, WebAutomationOwnerKind.Transfer));
+        Assert.True(await ownership.IsBoundAsync(
+            graph.ShareOperationId, graph.BatchId, graph.AccountId, 1, WebAutomationOwnerKind.TransferShare));
+        Assert.True(await ownership.IsBoundAsync(
+            graph.StandaloneOperationId, graph.StandaloneBatchId, graph.AccountId, 1,
+            WebAutomationOwnerKind.StandaloneShare));
+        Assert.False(await ownership.IsBoundAsync(
+            graph.OperationId, Guid.NewGuid(), graph.AccountId, 7, WebAutomationOwnerKind.Transfer));
+        Assert.False(await ownership.IsBoundAsync(
+            graph.ShareOperationId, graph.BatchId, graph.AccountId, 2, WebAutomationOwnerKind.TransferShare));
+        Assert.False(await ownership.IsBoundAsync(
+            graph.StandaloneOperationId, graph.StandaloneBatchId, graph.OtherAccountId, 1,
+            WebAutomationOwnerKind.StandaloneShare));
+    }
+
     [Theory]
     [InlineData(WebAutomationOwnerKind.Transfer)]
     [InlineData(WebAutomationOwnerKind.TransferShare)]
@@ -195,6 +217,48 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Assert.Null(resumed.ResumeStage);
         Assert.False(resumed.IsWaitingForUser);
         Assert.Equal(beforeHandoff.Baseline?.Fingerprint, resumed.Baseline?.Fingerprint);
+    }
+
+    [Theory]
+    [InlineData(WebAutomationAttemptState.Preparing, WebAutomationAttemptState.DefinitelyNotSubmitted)]
+    [InlineData(WebAutomationAttemptState.BaselinePersisted, WebAutomationAttemptState.DefinitelyNotSubmitted)]
+    [InlineData(WebAutomationAttemptState.Submitting, WebAutomationAttemptState.NeedsDecision)]
+    [InlineData(WebAutomationAttemptState.ResultPending, WebAutomationAttemptState.NeedsDecision)]
+    public async Task UserHandoffSkipAtomicallyPersistsOnlyItsSafeTerminalState(
+        WebAutomationAttemptState priorStage,
+        WebAutomationAttemptState terminalState)
+    {
+        var graph = await CreateAsync();
+        var generation = (int)priorStage + 40;
+        var beforeHandoff = await MoveToStageAsync(graph, generation, priorStage);
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, generation, priorStage, beforeHandoff.Revision,
+            WebAutomationAttemptState.UserHandoff, Fingerprint('9'), true,
+            graph.Now.AddMinutes(1)));
+        var handoff = (await graph.Store.GetAsync(
+            graph.OperationId, graph.AccountId, generation))!;
+        var unsafeTerminal = terminalState == WebAutomationAttemptState.NeedsDecision
+            ? WebAutomationAttemptState.DefinitelyNotSubmitted
+            : WebAutomationAttemptState.NeedsDecision;
+
+        Assert.False(await graph.Store.TryResolveUserHandoffAsync(
+            graph.OperationId, graph.AccountId, generation, handoff.Revision,
+            priorStage, unsafeTerminal, Fingerprint('a'), graph.Now.AddMinutes(2)));
+        Assert.False(await graph.Store.TryResolveUserHandoffAsync(
+            graph.OperationId, graph.OtherAccountId, generation, handoff.Revision,
+            priorStage, terminalState, Fingerprint('a'), graph.Now.AddMinutes(2)));
+        Assert.True(await graph.Store.TryResolveUserHandoffAsync(
+            graph.OperationId, graph.AccountId, generation, handoff.Revision,
+            priorStage, terminalState, Fingerprint('a'), graph.Now.AddMinutes(2)));
+        Assert.False(await graph.Store.TryResolveUserHandoffAsync(
+            graph.OperationId, graph.AccountId, generation, handoff.Revision,
+            priorStage, terminalState, Fingerprint('a'), graph.Now.AddMinutes(2)));
+
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, generation);
+        Assert.Equal(terminalState, restored!.State);
+        Assert.Null(restored.ResumeStage);
+        Assert.False(restored.IsWaitingForUser);
     }
 
     [Fact]
@@ -312,7 +376,8 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         return new Graph(
             new SqliteWebAutomationAttemptStore(factory, maximumBaselineItemCount, baselineReadPageSize),
             factory,
-            operationId, shareOperationId, standaloneOperationId, accountId, otherAccountId, now);
+            operationId, shareOperationId, standaloneOperationId, batchId, standaloneBatchId,
+            accountId, otherAccountId, now);
     }
 
     private static async Task SeedBusinessOwnersAsync(
@@ -399,6 +464,8 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Guid OperationId,
         Guid ShareOperationId,
         Guid StandaloneOperationId,
+        Guid BatchId,
+        Guid StandaloneBatchId,
         Guid AccountId,
         Guid OtherAccountId,
         DateTimeOffset Now);

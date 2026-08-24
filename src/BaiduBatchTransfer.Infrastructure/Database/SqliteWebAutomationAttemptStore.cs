@@ -272,6 +272,52 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
     }
 
+    public async Task<bool> TryResolveUserHandoffAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        WebAutomationAttemptState resumeStage,
+        WebAutomationAttemptState terminalState,
+        string? observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateIdentity(operationId, accountId, generation);
+        if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        if (!WebAutomationAttemptRecord.CanResumeStage(resumeStage))
+            throw new ArgumentOutOfRangeException(nameof(resumeStage));
+        if (terminalState is not (WebAutomationAttemptState.DefinitelyNotSubmitted or WebAutomationAttemptState.NeedsDecision))
+            throw new ArgumentOutOfRangeException(nameof(terminalState));
+        if (resumeStage is WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted)
+        {
+            if (terminalState != WebAutomationAttemptState.DefinitelyNotSubmitted) return false;
+        }
+        else if (terminalState != WebAutomationAttemptState.NeedsDecision) return false;
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE WebAutomationAttempts
+            SET State=$terminal,ResumeStage=NULL,
+                ObservationFingerprint=COALESCE($observation,ObservationFingerprint),
+                IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+              AND State='UserHandoff' AND ResumeStage=$resume AND Revision=$revision
+              AND UpdatedAt<=$updated
+              AND ($terminal='DefinitelyNotSubmitted' OR
+                   (BaselineFingerprint IS NOT NULL AND BaselinePersistedAt IS NOT NULL));
+            """;
+        AddIdentity(command, operationId, accountId, generation);
+        command.Parameters.AddWithValue("$resume", resumeStage.ToString());
+        command.Parameters.AddWithValue("$terminal", terminalState.ToString());
+        command.Parameters.AddWithValue("$revision", expectedRevision);
+        command.Parameters.AddWithValue("$observation", (object?)observationFingerprint ?? DBNull.Value);
+        command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+    }
+
     private static bool IsAllowed(WebAutomationAttemptState current, WebAutomationAttemptState next) => current switch
     {
         WebAutomationAttemptState.Preparing => next is WebAutomationAttemptState.DefinitelyNotSubmitted or

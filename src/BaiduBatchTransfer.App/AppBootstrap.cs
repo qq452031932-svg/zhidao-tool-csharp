@@ -7,6 +7,7 @@ using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
+using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Imports;
@@ -133,6 +134,9 @@ public static class AppBootstrap
         services.AddSingleton<SqliteWebAutomationAttemptStore>();
         services.AddSingleton<IWebAutomationAttemptStore>(sp =>
             sp.GetRequiredService<SqliteWebAutomationAttemptStore>());
+        services.AddSingleton<SqliteWebAutomationRequestOwnershipStore>();
+        services.AddSingleton<IWebAutomationRequestOwnershipStore>(sp =>
+            sp.GetRequiredService<SqliteWebAutomationRequestOwnershipStore>());
         services.AddSingleton<SqliteLocalResultDestinationStore>();
         services.AddSingleton<ILocalResultDestinationStore>(sp =>
             sp.GetRequiredService<SqliteLocalResultDestinationStore>());
@@ -170,6 +174,17 @@ public static class AppBootstrap
             sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
         services.AddSingleton<WebView2ProfileCloser>();
         services.AddSingleton<IWebViewProfileCloser>(sp => sp.GetRequiredService<WebView2ProfileCloser>());
+        services.AddSingleton<IWebAutomationNavigationAuthorizer, ProductionWebAutomationNavigationAuthorizer>();
+        services.AddSingleton<IWebAutomationBatchCancellation, UnavailableWebAutomationBatchCancellation>();
+        services.AddSingleton<IWebAutomationUiDispatcher, WpfWebAutomationUiDispatcher>();
+        services.AddSingleton<IVisibleWebAutomationSessionFactory, WebView2AutomationSessionFactory>();
+        services.AddSingleton(sp => new UserHandoffCoordinator(
+            sp.GetRequiredService<IWebAutomationAttemptStore>(),
+            sp.GetRequiredService<IWebAutomationBatchCancellation>(),
+            TimeProvider.System));
+        services.AddSingleton<VisibleWebAutomationQueue>();
+        services.AddSingleton<IVisibleWebAutomationBroker>(sp =>
+            sp.GetRequiredService<VisibleWebAutomationQueue>());
         services.AddSingleton<FileSystemWebViewProfileStore>();
         services.AddSingleton<IWebViewProfileStore>(sp => sp.GetRequiredService<FileSystemWebViewProfileStore>());
         services.AddSingleton<LoginProfileBootstrapper>();

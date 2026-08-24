@@ -67,6 +67,8 @@ public partial class BaiduLoginWindow : Window
             profilePrepared = true;
             lifetime.Token.ThrowIfCancellationRequested();
 
+            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
+
             var environment = await CoreWebView2Environment
                 .CreateAsync(userDataFolder: profilePath)
                 .ConfigureAwait(true);
@@ -74,7 +76,6 @@ public partial class BaiduLoginWindow : Window
             await Browser.EnsureCoreWebView2Async(environment).ConfigureAwait(true);
             lifetime.Token.ThrowIfCancellationRequested();
 
-            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
             Browser.CoreWebView2.NavigationStarting += OnNavigationStarting;
             Browser.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
             Browser.CoreWebView2.Settings.AreDevToolsEnabled = false;
