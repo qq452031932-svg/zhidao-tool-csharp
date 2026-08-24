@@ -2,6 +2,7 @@ using System.Reflection;
 using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
@@ -193,6 +194,14 @@ public static class AppBootstrap
         services.AddSingleton<IFolderDialog, WpfFolderDialog>();
         services.AddSingleton<IResultSaveDialog, ResultSaveDialog>();
         services.AddSingleton<IDialogService, DialogService>();
+#if DEBUG
+        services.AddSingleton(new BaiduAcceptanceProbeOutputStore(paths.RootDirectory));
+        services.AddSingleton<IBaiduAcceptanceProbeOutputStore>(serviceProvider =>
+            serviceProvider.GetRequiredService<BaiduAcceptanceProbeOutputStore>());
+        services.AddSingleton<IBaiduAcceptanceProbeAccountSelector, BaiduAcceptanceProbeAccountSelector>();
+        services.AddSingleton<IBaiduAcceptanceProbePresenter, BaiduAcceptanceProbePresenter>();
+        services.AddSingleton<IBaiduAcceptanceProbeLauncher, BaiduAcceptanceProbeLauncher>();
+#endif
         services.AddSingleton<IWizardAccountProvider, WizardAccountProvider>();
         services.AddSingleton<IAccountSummaryProvider, WizardAccountSummaryProvider>();
         services.AddSingleton<IImportWorkspaceFactory, ImportWorkspaceFactory>();

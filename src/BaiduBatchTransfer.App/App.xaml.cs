@@ -2,6 +2,9 @@ using System.Windows;
 using System.IO;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+#if DEBUG
+using BaiduBatchTransfer.App.Features.Acceptance;
+#endif
 
 namespace BaiduBatchTransfer.App;
 
@@ -29,6 +32,16 @@ public partial class App : System.Windows.Application
             }
             MainWindow = await host.Services.GetRequiredService<IAppShellFactory>().CreateAsync().ConfigureAwait(true);
             MainWindow.Show();
+#if DEBUG
+            var probeOptions = BaiduAcceptanceProbeLaunchOptions.FromStartup(e.Args);
+            if (probeOptions.IsEnabled)
+            {
+                var probe = await host.Services.GetRequiredService<IBaiduAcceptanceProbeLauncher>()
+                    .OpenAsync(probeOptions).ConfigureAwait(true);
+                if (!probe.Started)
+                    MessageBox.Show(probe.SafeMessage, "百度现场验收", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+#endif
         }
         catch (Exception)
         {
