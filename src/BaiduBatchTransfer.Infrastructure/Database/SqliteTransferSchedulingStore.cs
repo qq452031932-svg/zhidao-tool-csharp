@@ -1410,8 +1410,8 @@ public sealed class SqliteTransferSchedulingStore :
         await using var transaction = connection.BeginTransaction(deferred: false);
         var ids = await ReadOperationIdsAsync(connection, transaction, operationId, cancellationToken).ConfigureAwait(false);
         await using (var pending = Command(connection, transaction, """
-            UPDATE TransferOperations SET Status='ResultPending',AttemptCount=AttemptCount+1,LeaseExpiresAt=NULL,UpdatedAt=$now
-            WHERE Id=$id AND Status='Paused' AND AttemptCount=$expectedAttempt AND AttemptCount<$max AND UpdatedAt=$expectedUpdated AND SubmitState='PendingConfirmation'
+            UPDATE TransferOperations SET Status='ResultPending',LeaseExpiresAt=NULL,UpdatedAt=$now
+            WHERE Id=$id AND Status='Paused' AND AttemptCount=$expectedAttempt AND UpdatedAt=$expectedUpdated AND SubmitState='PendingConfirmation'
               AND TargetSlotState='Reserved' AND ConfirmationDescriptorJson IS NOT NULL
               AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=AssignedAccountId
                 AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0);
@@ -1419,7 +1419,6 @@ public sealed class SqliteTransferSchedulingStore :
         {
             Add(pending, "$now", Time(now)); Add(pending, "$id", Id(operationId));
             Add(pending, "$expectedAttempt", expectedAttemptCount);
-            Add(pending, "$max", int.MaxValue);
             Add(pending, "$expectedUpdated", Time(expectedUpdatedAt));
             if (await pending.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1)
             {

@@ -533,6 +533,63 @@ public sealed class BatchRunControlServiceTests
     }
 
     [Fact]
+    public async Task MigratedTerminalShareTriggerRemovesWaitingShareWhenMaximumGenerationCrashes()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var shareId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with
+        {
+            CandidateStatus = "Reserved",
+            ReservedAccountId = accountId,
+            ReservationExpiresAt = Now.AddMinutes(-1),
+        };
+        var operation = Operation(resource, accountId, 1, status: "Preparing",
+            submitState: "PreparingToSubmit", slotState: "Reserved", attemptCount: int.MaxValue) with
+        {
+            LeaseExpiresAt = Now.AddMinutes(-1),
+        };
+        await db.SeedAsync([Account(accountId)],
+            job: Job(batchId, "Active", 1, 1, quotaBasis: "SuccessTarget") with { ShareOperationCount = 1 },
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        await ExecuteAsync(db, """
+            INSERT INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','settings-fp',$now);
+            INSERT INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'Output',1,1,1);
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
+              SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
+              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,
+              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+            """,
+            ("$batch", batchId.ToString("D")), ("$account", accountId.ToString("D")),
+            ("$share", shareId.ToString("D")), ("$operation", operation.Id.ToString("D")),
+            ("$resource", resource.Id.ToString("D")), ("$now", Now.ToString("O")));
+        Assert.Equal(1, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='TR_TransferOperations_RemoveTerminalPendingShare'", batchId));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.RecoverExpiredLeasesAsync(Now);
+
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$id", batchId));
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$id", batchId));
+        Assert.Equal(0, await ScalarLongAsync(db,
+            "SELECT CreatedShareOperationCount FROM BatchOutputAccounts WHERE BatchJobId=$id", batchId));
+        Assert.Equal(BatchExhaustionOutcome.CompletedWithShortfall,
+            await store.TryFinalizeExhaustedBatchAsync(batchId, Now.AddMinutes(1)));
+    }
+
+    [Fact]
     public async Task RestartObservesPersistedPausedAndRequeuedStates()
     {
         await using var db = await BatchTestDatabase.CreateAsync();

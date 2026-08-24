@@ -452,6 +452,55 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         Assert.Equal("Released", reader.GetString(1));
     }
 
+    [Theory]
+    [InlineData(7)]
+    [InlineData(int.MaxValue)]
+    public async Task PendingConfirmationResumePreservesAttemptAndBecomesReconciliable(int attemptCount)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1) with
+        {
+            CandidateStatus = "Reserved",
+            ReservedAccountId = account,
+        };
+        const string descriptor = "{\"safe\":true}";
+        var transfer = Operation(batch, resource, account, 1, "Paused", null) with
+        {
+            AttemptCount = attemptCount,
+            SubmitState = "PendingConfirmation",
+            ConfirmationDescriptorJson = descriptor,
+            AdapterRequestId = "request-1",
+            DailyCountedAt = BatchTestData.Now,
+            SubmitStartedAt = BatchTestData.Now,
+            TargetSlotState = "Reserved",
+            TargetSlotReservedAt = BatchTestData.Now,
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "pending-resume")],
+            job: Job(batch) with { Status = "Active", ResourceCount = 1, OperationCount = 1 },
+            resources: [resource], operations: [transfer],
+            allocations: [Allocation(batch, account, 1) with { ReservedSlotCount = 1 }]);
+        var actions = Actions(db);
+
+        var resumed = await actions.ResumeTransferAsync(transfer.Id, attemptCount, transfer.UpdatedAt);
+        var stale = await actions.ResumeTransferAsync(transfer.Id, attemptCount, transfer.UpdatedAt);
+        var page = await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, null, null, null, 10));
+
+        Assert.True(resumed.Accepted);
+        Assert.True(stale.IsStale);
+        Assert.Equal("ResultPending", page.Items.Single().Status);
+        Assert.True(((dynamic)page.Items.Single()).CanReconcileTransfer);
+        Assert.Equal(attemptCount, await ScalarIntAsync(db,
+            "SELECT AttemptCount FROM TransferOperations WHERE Id=$id", transfer.Id));
+        Assert.Equal(descriptor, await ScalarTextAsync(db,
+            "SELECT ConfirmationDescriptorJson FROM TransferOperations WHERE Id=$id", transfer.Id));
+        Assert.NotNull(await ((IOperationReconciliationStore)new SqliteTransferSchedulingStore(db.ConnectionFactory))
+            .LoadPendingAsync(transfer.Id));
+    }
+
     [Fact]
     public async Task OldTransferSnapshotCannotResumeANewerPausedState()
     {
@@ -1011,6 +1060,24 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         command.CommandText = sql;
         foreach (var parameter in parameters) command.Parameters.AddWithValue(parameter.Name, parameter.Value);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<int> ScalarIntAsync(BatchTestDatabase db, string sql, Guid id)
+    {
+        await using var connection = await db.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$id", id.ToString("D"));
+        return Convert.ToInt32(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task<string> ScalarTextAsync(BatchTestDatabase db, string sql, Guid id)
+    {
+        await using var connection = await db.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$id", id.ToString("D"));
+        return Convert.ToString(await command.ExecuteScalarAsync())!;
     }
 
     private static async Task<IReadOnlyList<string>> ExplainAsync(
