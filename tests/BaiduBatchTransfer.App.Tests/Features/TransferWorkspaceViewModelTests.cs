@@ -126,15 +126,62 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
-    public async Task UnavailablePrecheckPlaceholderDoesNotBlockAnOtherwiseAvailableConfiguration()
+    public async Task DirectUnavailablePrecheckStopsBeforeDurableCreationAndAllowsRetry()
     {
         using var fixture = Fixture.Valid(precheck: new WizardPrecheckResult(
             WizardPrecheckStatus.Unavailable,
             0));
+        fixture.ViewModel.AutoShare = true;
+        fixture.ViewModel.ShareResultDirectory = "C:\\results";
 
         await fixture.ViewModel.StartAsync();
 
+        Assert.Equal("链接检查暂不可用，请稍后重试。", fixture.ViewModel.StatusMessage);
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.Equal(0, fixture.BatchService.ConfirmCalls);
+        Assert.Empty(fixture.DestinationSink.Values);
+        Assert.Empty(fixture.HandedOffBatches);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
+        Assert.True(fixture.ViewModel.CanStart);
+    }
+
+    [Fact]
+    public async Task PrecheckExceptionMapsToUnavailableAndStopsEveryPostCheckAction()
+    {
+        using var fixture = Fixture.Valid(
+            precheckWorkflow: new ThrowingPrecheckWorkflow());
+        fixture.ViewModel.AutoShare = true;
+        fixture.ViewModel.ShareResultDirectory = "C:\\results";
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal("链接检查暂不可用，请稍后重试。", fixture.ViewModel.StatusMessage);
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.Equal(0, fixture.BatchService.ConfirmCalls);
+        Assert.Empty(fixture.DestinationSink.Values);
+        Assert.Empty(fixture.HandedOffBatches);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
+        Assert.True(fixture.ViewModel.CanStart);
+    }
+
+    [Fact]
+    public async Task CompletedRetryAfterUnavailableCreatesExactlyOneBatch()
+    {
+        var precheck = new SequencePrecheckWorkflow(
+            new(WizardPrecheckStatus.Unavailable, 0),
+            new(WizardPrecheckStatus.Completed, 4));
+        using var fixture = Fixture.Valid(precheckWorkflow: precheck);
+
+        await fixture.ViewModel.StartAsync();
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.True(fixture.ViewModel.CanStart);
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(2, precheck.Calls);
+        Assert.Equal(1, fixture.BatchService.PreviewCalls);
         Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        Assert.Single(fixture.HandedOffBatches);
         Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
     }
 
@@ -618,6 +665,30 @@ public sealed class TransferWorkspaceViewModelTests
         {
             events.Add("precheck");
             return Task.FromResult(result);
+        }
+    }
+
+    private sealed class ThrowingPrecheckWorkflow : IWizardPrecheckWorkflow
+    {
+        public Task<WizardPrecheckResult> RunAsync(
+            Guid sessionId,
+            Guid accountId,
+            CancellationToken cancellationToken) =>
+            Task.FromException<WizardPrecheckResult>(new InvalidOperationException("adapter detail"));
+    }
+
+    private sealed class SequencePrecheckWorkflow(params WizardPrecheckResult[] results) : IWizardPrecheckWorkflow
+    {
+        private readonly Queue<WizardPrecheckResult> remaining = new(results);
+        public int Calls { get; private set; }
+
+        public Task<WizardPrecheckResult> RunAsync(
+            Guid sessionId,
+            Guid accountId,
+            CancellationToken cancellationToken)
+        {
+            Calls++;
+            return Task.FromResult(remaining.Dequeue());
         }
     }
 

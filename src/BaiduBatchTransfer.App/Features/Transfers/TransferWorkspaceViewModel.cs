@@ -248,6 +248,11 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             StatusMessage = "正在检查链接和账号配置……";
             var precheck = await Wizard.RunBackgroundPrecheckAsync(linked.Token).ConfigureAwait(true);
             if (!IsAlive(linked)) return;
+            if (precheck.Status == WizardPrecheckStatus.Unavailable)
+            {
+                StatusMessage = "链接检查暂不可用，请稍后重试。";
+                return;
+            }
             if (precheck.Status is WizardPrecheckStatus.PausedForLogin or WizardPrecheckStatus.PausedForVerification)
             {
                 StatusMessage = precheck.Status switch
