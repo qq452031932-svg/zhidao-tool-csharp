@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["verification"],
+  "visibleSemanticLabels": ["verification-required", "user-must-continue"],
+  "stableAttributeTokens": { "challenge": "user-verification" },
+  "candidateCounts": { "verification-challenge": 1 },
+  "identityPlaceholders": ["fictional-verification-eta"]
+}

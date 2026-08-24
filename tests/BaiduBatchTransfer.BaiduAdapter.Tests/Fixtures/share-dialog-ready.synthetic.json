@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["share-dialog"],
+  "visibleSemanticLabels": ["create-share", "permanent-validity"],
+  "stableAttributeTokens": { "dialog": "share-create" },
+  "candidateCounts": { "create-link-action": 1, "permanent-option": 1 },
+  "identityPlaceholders": ["fictional-share-target-epsilon"]
+}

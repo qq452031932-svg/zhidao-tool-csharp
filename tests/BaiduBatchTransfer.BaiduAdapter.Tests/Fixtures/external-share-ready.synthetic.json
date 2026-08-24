@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["external-share"],
+  "visibleSemanticLabels": ["shared-content", "save-to-drive"],
+  "stableAttributeTokens": { "view": "share-content" },
+  "candidateCounts": { "save-action": 1 },
+  "identityPlaceholders": ["fictional-folder-alpha"]
+}

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["save-destination"],
+  "visibleSemanticLabels": ["choose-destination", "confirm-save"],
+  "stableAttributeTokens": { "dialog": "save-destination" },
+  "candidateCounts": { "confirm-save-action": 1 },
+  "identityPlaceholders": ["fictional-destination-gamma"]
+}

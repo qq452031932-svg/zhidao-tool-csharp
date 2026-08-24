@@ -25,4 +25,8 @@
     <ProjectReference Include="..\..\src\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="Fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

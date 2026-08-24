@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["share-result"],
+  "visibleSemanticLabels": ["share-created", "export-result"],
+  "stableAttributeTokens": { "dialog": "share-result" },
+  "candidateCounts": { "export-result-action": 1 },
+  "identityPlaceholders": ["fictional-share-result-zeta"]
+}

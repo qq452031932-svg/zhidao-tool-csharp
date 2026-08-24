@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Synthetic",
+  "validationStatus": "NotFieldValidated",
+  "pageRoles": ["transfer-result"],
+  "visibleSemanticLabels": ["transfer-accepted", "destination-confirmed"],
+  "stableAttributeTokens": { "outcome": "accepted" },
+  "candidateCounts": { "accepted-result": 1 },
+  "identityPlaceholders": ["fictional-receipt-delta"]
+}
