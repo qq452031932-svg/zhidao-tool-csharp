@@ -27,12 +27,13 @@ public sealed class BaiduAcceptanceProbeOutputStore : IBaiduAcceptanceProbeOutpu
         Directory.CreateDirectory(outputDirectory);
         var path = Path.Combine(
             outputDirectory,
-            $"baidu-field-evidence-{DateTime.UtcNow:yyyyMMdd-HHmmss}.json");
-        await File.WriteAllTextAsync(
-            path,
-            BaiduAcceptanceEvidenceDocument.Serialize(evidence),
-            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            cancellationToken).ConfigureAwait(false);
+            $"baidu-field-evidence-{DateTime.UtcNow:yyyyMMdd-HHmmssfffffff}-{Guid.NewGuid():N}.json");
+        await using var stream = new FileStream(
+            path, FileMode.CreateNew, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true);
+        await using var writer = new StreamWriter(
+            stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        await writer.WriteAsync(BaiduAcceptanceEvidenceDocument.Serialize(evidence).AsMemory(), cancellationToken)
+            .ConfigureAwait(false);
         return path;
     }
 

@@ -2,6 +2,8 @@ namespace BaiduBatchTransfer.App.Features.Acceptance;
 
 public static class BaiduAcceptanceProbeWebPolicy
 {
+    public static bool IsDownloadAllowed() => false;
+
     public static bool IsAllowedNavigation(Uri? destination) =>
         destination is not null && IsOfficialHttps(destination);
 

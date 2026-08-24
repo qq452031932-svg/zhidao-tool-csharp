@@ -21,7 +21,7 @@ public sealed class BaiduAcceptanceEvidenceSanitizerTests
         Assert.Equal("/segments/2", result.Path);
         Assert.Equal("POST", result.Method);
         Assert.Equal(200, result.StatusCode);
-        Assert.Equal(["data", "errno", "fs_id", "share_url"], result.JsonPropertyNames);
+        Assert.Equal(["data", "errno"], result.JsonPropertyNames);
 
         var serialized = JsonSerializer.Serialize(result);
         Assert.DoesNotContain(secret, serialized, StringComparison.Ordinal);
@@ -51,7 +51,7 @@ public sealed class BaiduAcceptanceEvidenceSanitizerTests
 
         Assert.NotNull(result);
         Assert.Equal("/segments/6", result.Path);
-        Assert.Equal(["safe_name"], result.JsonPropertyNames);
+        Assert.Empty(result.JsonPropertyNames);
     }
 
     [Fact]
@@ -85,5 +85,19 @@ public sealed class BaiduAcceptanceEvidenceSanitizerTests
         Assert.Equal("/segments/4", result.Path);
         foreach (var secret in new[] { "alice", "secret-file", "abc123", "report-final.xlsx", "account-123", "private-fragment" })
             Assert.DoesNotContain(secret, serialized, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void KeepsOnlyReviewedStructuralJsonKeys()
+    {
+        var result = BaiduAcceptanceEvidenceSanitizer.TryCreate(
+            new Uri("https://pan.baidu.com/api/list"), "GET", 200,
+            "{\"errno\":0,\"data\":{\"privateAccountAlias\":1,\"secretFileName\":2,\"a1\":3,\"file9\":4}}");
+
+        Assert.NotNull(result);
+        Assert.Equal(["data", "errno"], result.JsonPropertyNames);
+        var serialized = JsonSerializer.Serialize(result);
+        foreach (var value in new[] { "privateAccountAlias", "secretFileName", "a1", "file9" })
+            Assert.DoesNotContain(value, serialized, StringComparison.OrdinalIgnoreCase);
     }
 }

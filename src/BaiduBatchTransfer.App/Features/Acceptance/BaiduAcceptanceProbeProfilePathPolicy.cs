@@ -7,15 +7,22 @@ public interface IBaiduAcceptanceProbeProfilePathPolicy
     BaiduAcceptanceProbeProfileLease Create(Guid accountId);
 }
 
-public sealed class BaiduAcceptanceProbeProfileLease(string profilePath, Action release) : IAsyncDisposable
-{
-    private Action? release = release ?? throw new ArgumentNullException(nameof(release));
-    public string ProfilePath { get; } = Path.GetFullPath(profilePath);
+public enum BaiduAcceptanceProbeCleanupOutcome { Cleaned, Deferred }
 
-    public ValueTask DisposeAsync()
+public sealed class BaiduAcceptanceProbeProfileLease(string profilePath, Func<Task<BaiduAcceptanceProbeCleanupOutcome>> release) : IAsyncDisposable
+{
+    private Func<Task<BaiduAcceptanceProbeCleanupOutcome>>? release = release ?? throw new ArgumentNullException(nameof(release));
+    public string ProfilePath { get; } = Path.GetFullPath(profilePath);
+    public BaiduAcceptanceProbeCleanupOutcome CleanupOutcome { get; private set; } = BaiduAcceptanceProbeCleanupOutcome.Cleaned;
+
+    public BaiduAcceptanceProbeProfileLease(string profilePath, Action release) : this(
+        profilePath,
+        () => { release(); return Task.FromResult(BaiduAcceptanceProbeCleanupOutcome.Cleaned); }) { }
+
+    public async ValueTask DisposeAsync()
     {
-        Interlocked.Exchange(ref release, null)?.Invoke();
-        return ValueTask.CompletedTask;
+        var cleanup = Interlocked.Exchange(ref release, null);
+        if (cleanup is not null) CleanupOutcome = await cleanup().ConfigureAwait(false);
     }
 }
 
@@ -29,14 +36,33 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBa
         Directory.CreateDirectory(rootDirectory);
         var profilePath = Path.Combine(rootDirectory, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(profilePath);
-        return new(profilePath, () => DeleteIsolatedProfile(profilePath));
+        return new(profilePath, () => DeleteIsolatedProfileAsync(profilePath));
     }
 
-    private void DeleteIsolatedProfile(string profilePath)
+    private async Task<BaiduAcceptanceProbeCleanupOutcome> DeleteIsolatedProfileAsync(string profilePath)
     {
         var relativePath = Path.GetRelativePath(rootDirectory, profilePath);
         if (relativePath.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relativePath))
-            throw new InvalidOperationException("The probe profile is outside its isolated root.");
-        if (Directory.Exists(profilePath)) Directory.Delete(profilePath, recursive: true);
+            return BaiduAcceptanceProbeCleanupOutcome.Deferred;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(profilePath)) Directory.Delete(profilePath, recursive: true);
+                return BaiduAcceptanceProbeCleanupOutcome.Cleaned;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(50 * (attempt + 1))).ConfigureAwait(false);
+            }
+        }
+        try
+        {
+            var quarantine = Path.Combine(rootDirectory, "quarantine", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path.GetDirectoryName(quarantine)!);
+            if (Directory.Exists(profilePath)) Directory.Move(profilePath, quarantine);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        return BaiduAcceptanceProbeCleanupOutcome.Deferred;
     }
 }

@@ -15,4 +15,10 @@ public sealed class BaiduAcceptanceProbeWebPolicyTests
     {
         Assert.Equal(expected, BaiduAcceptanceProbeWebPolicy.IsAllowedRequest(new Uri(destination), method));
     }
+
+    [Fact]
+    public void NeverAllowsDownloads()
+    {
+        Assert.False(BaiduAcceptanceProbeWebPolicy.IsDownloadAllowed());
+    }
 }

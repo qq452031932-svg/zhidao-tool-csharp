@@ -18,7 +18,7 @@ public sealed class BaiduAcceptanceProbeSessionTests
         session.Complete("request-secret", $"{{\"errno\":0,\"fs_id\":\"{secret}\"}}");
 
         var evidence = Assert.Single(session.Snapshot());
-        Assert.Equal(["errno", "fs_id"], evidence.JsonPropertyNames);
+        Assert.Equal(["errno"], evidence.JsonPropertyNames);
         Assert.False(session.ShouldInspectBody("request-secret"));
         var serialized = BaiduAcceptanceEvidenceDocument.Serialize(session.Snapshot());
         Assert.DoesNotContain(secret, serialized, StringComparison.Ordinal);
@@ -52,6 +52,16 @@ public sealed class BaiduAcceptanceProbeSessionTests
 
         Assert.False(session.ShouldInspectBody("write"));
         Assert.Empty(session.Snapshot());
+    }
+
+    [Fact]
+    public void RecognizesJsonStructuredSuffixWhenContentTypeHasParameters()
+    {
+        var session = new BaiduAcceptanceProbeSession();
+        session.ObserveRequest("problem", new Uri("https://pan.baidu.com/api/list"), "GET");
+        session.ObserveResponse("problem", 200, "application/problem+json; charset=utf-8");
+
+        Assert.True(session.ShouldInspectBody("problem"));
     }
 
     [Fact]

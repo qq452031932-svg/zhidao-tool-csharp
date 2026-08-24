@@ -14,7 +14,6 @@ public sealed class BaiduAcceptanceProbeAccountSelectorTests
 
         Assert.True(result.CanOpen);
         Assert.Equal(account.Id, result.AccountId);
-        Assert.Equal("C:\\safe\\profile", result.ProfilePath);
         Assert.DoesNotContain(account.BaiduUserId, result.SafeMessage, StringComparison.Ordinal);
         Assert.DoesNotContain(account.DisplayName, result.SafeMessage, StringComparison.Ordinal);
     }
@@ -36,8 +35,6 @@ public sealed class BaiduAcceptanceProbeAccountSelectorTests
         Assert.Contains("一个", none.SafeMessage);
         Assert.False(many.CanOpen);
         Assert.Contains("一个", many.SafeMessage);
-        Assert.Null(none.ProfilePath);
-        Assert.Null(many.ProfilePath);
     }
 
     private static AccountRecord Account(string? profilePath) => new(

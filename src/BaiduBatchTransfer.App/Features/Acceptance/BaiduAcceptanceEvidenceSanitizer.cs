@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace BaiduBatchTransfer.App.Features.Acceptance;
 
@@ -13,13 +12,17 @@ public sealed record BaiduAcceptanceEvidence(
     public override string ToString() => "BaiduAcceptanceEvidence { ShapeOnly = true }";
 }
 
-public static partial class BaiduAcceptanceEvidenceSanitizer
+public static class BaiduAcceptanceEvidenceSanitizer
 {
     private const int MaximumBodyCharacters = 256_000;
     private const int MaximumPropertyNames = 128;
     private static readonly HashSet<string> AllowedMethods = new(StringComparer.Ordinal)
     {
         "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    };
+    private static readonly HashSet<string> AllowedPropertyNames = new(StringComparer.Ordinal)
+    {
+        "code", "data", "errno", "has_more", "items", "list", "message", "result", "status", "success", "total",
     };
 
     public static BaiduAcceptanceEvidence? TryCreate(
@@ -95,7 +98,7 @@ public static partial class BaiduAcceptanceEvidenceSanitizer
                 foreach (var property in element.EnumerateObject())
                 {
                     if (names.Count >= MaximumPropertyNames) return;
-                    if (SafePropertyName().IsMatch(property.Name)) names.Add(property.Name);
+                    if (AllowedPropertyNames.Contains(property.Name)) names.Add(property.Name);
                     Visit(property.Value, names);
                 }
                 break;
@@ -109,6 +112,4 @@ public static partial class BaiduAcceptanceEvidenceSanitizer
         }
     }
 
-    [GeneratedRegex("^[A-Za-z_][A-Za-z0-9_.-]{0,63}$", RegexOptions.CultureInvariant)]
-    private static partial Regex SafePropertyName();
 }

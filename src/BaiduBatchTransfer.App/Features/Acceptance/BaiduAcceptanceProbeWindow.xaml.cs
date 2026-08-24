@@ -1,8 +1,8 @@
 using System.ComponentModel;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
-using BaiduBatchTransfer.App.Services;
 using Microsoft.Web.WebView2.Core;
 
 namespace BaiduBatchTransfer.App.Features.Acceptance;
@@ -13,6 +13,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     private readonly IBaiduAcceptanceProbeOutputStore outputStore;
     private readonly BaiduAcceptanceProbeSession session = new();
     private readonly CancellationTokenSource lifetime = new();
+    private readonly BaiduAcceptanceProbeObservationCoordinator observations = new();
     private readonly TaskCompletionSource initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CoreWebView2Environment? environment;
@@ -22,6 +23,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     private CoreWebView2DevToolsProtocolEventReceiver? loadingFailedReceiver;
     private bool allowClose;
     private bool saving;
+    private Task? teardownTask;
 
     public BaiduAcceptanceProbeWindow(
         Guid accountId,
@@ -71,6 +73,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     {
         core.NavigationStarting += OnNavigationStarting;
         core.NewWindowRequested += OnNewWindowRequested;
+        core.DownloadStarting += OnDownloadStarting;
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
         core.WebResourceRequested += OnWebResourceRequested;
         core.Settings.AreDevToolsEnabled = false;
@@ -111,13 +114,31 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
         StatusText.Text = "已阻止打开新窗口。";
     }
 
+    private void OnDownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
+    {
+        e.Cancel = true;
+        e.Handled = true;
+        StatusText.Text = "已阻止下载。";
+    }
+
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
     {
-        var destination = Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var parsed) ? parsed : null;
-        if (BaiduAcceptanceProbeWebPolicy.IsAllowedRequest(destination, e.Request.Method)) return;
+        try
+        {
+            var destination = Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var parsed) ? parsed : null;
+            if (BaiduAcceptanceProbeWebPolicy.IsAllowedRequest(destination, e.Request.Method)) return;
+            BlockRequest(e);
+        }
+        catch (COMException)
+        {
+            try { BlockRequest(e); }
+            catch (COMException) { }
+        }
+    }
+
+    private void BlockRequest(CoreWebView2WebResourceRequestedEventArgs e) =>
         e.Response = environment?.CreateWebResourceResponse(
             new MemoryStream(), 403, "Blocked", "Content-Type: text/plain");
-    }
 
     private void OnRequestWillBeSent(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
     {
@@ -132,7 +153,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
                 !Uri.TryCreate(url, UriKind.Absolute, out var destination)) return;
             session.ObserveRequest(requestId, destination, method);
         }
-        catch (JsonException) { }
+        catch (Exception exception) when (exception is JsonException or COMException) { }
     }
 
     private void OnResponseReceived(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
@@ -150,15 +171,19 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             _ = TryGetString(response, "mimeType", out var mimeType);
             session.ObserveResponse(requestId, status, mimeType);
         }
-        catch (Exception exception) when (exception is JsonException or OverflowException) { }
+        catch (Exception exception) when (exception is JsonException or OverflowException or COMException) { }
     }
 
-    private async void OnLoadingFinished(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
+    private void OnLoadingFinished(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e) =>
+        observations.Track(cancellationToken => ObserveLoadingFinishedAsync(e.ParameterObjectAsJson, cancellationToken));
+
+    private async Task ObserveLoadingFinishedAsync(string parameterObjectAsJson, CancellationToken cancellationToken)
     {
         string? requestId = null;
         try
         {
-            using (var document = JsonDocument.Parse(e.ParameterObjectAsJson))
+            cancellationToken.ThrowIfCancellationRequested();
+            using (var document = JsonDocument.Parse(parameterObjectAsJson))
             {
                 if (!TryGetString(document.RootElement, "requestId", out requestId)) return;
             }
@@ -169,7 +194,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             }
             var response = await Browser.CoreWebView2.CallDevToolsProtocolMethodAsync(
                 "Network.getResponseBody",
-                JsonSerializer.Serialize(new { requestId })).ConfigureAwait(true);
+                JsonSerializer.Serialize(new { requestId })).WaitAsync(cancellationToken).ConfigureAwait(true);
             using var bodyDocument = JsonDocument.Parse(response);
             var root = bodyDocument.RootElement;
             var isBase64 = root.TryGetProperty("base64Encoded", out var encoded) && encoded.GetBoolean();
@@ -177,7 +202,8 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             session.Complete(requestId, body);
             StatusText.Text = $"已捕获 {session.Snapshot().Count} 种脱敏接口结构。只读观察仍在进行。";
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException or ArgumentException)
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or
+            ArgumentException or COMException or ObjectDisposedException or OperationCanceledException)
         {
             if (!string.IsNullOrWhiteSpace(requestId)) session.Complete(requestId, null);
         }
@@ -191,7 +217,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             if (TryGetString(document.RootElement, "requestId", out var requestId))
                 session.Complete(requestId, null);
         }
-        catch (JsonException) { }
+        catch (Exception exception) when (exception is JsonException or COMException) { }
     }
 
     private static bool TryGetString(JsonElement element, string name, out string value)
@@ -266,8 +292,57 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     {
         lifetime.Cancel();
         initialization.TrySetException(new InvalidOperationException("现场验收窗口在初始化前关闭。"));
-        try { Browser.Dispose(); }
+        teardownTask ??= CompleteTeardownAsync();
+    }
+
+    private async Task CompleteTeardownAsync()
+    {
+        UnsubscribeNetworkObservation();
+        await observations.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
+
+        EventHandler<CoreWebView2BrowserProcessExitedEventArgs>? exited = null;
+        var processExited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            if (environment is not null)
+            {
+                exited = (_, _) => processExited.TrySetResult();
+                environment.BrowserProcessExited += exited;
+            }
+            Browser.Dispose();
+            if (environment is not null)
+            {
+                try { await processExited.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(true); }
+                catch (TimeoutException) { }
+            }
+        }
         catch (Exception) { }
-        closed.TrySetResult();
+        finally
+        {
+            try
+            {
+                if (environment is not null && exited is not null) environment.BrowserProcessExited -= exited;
+            }
+            catch (COMException) { }
+            observations.Dispose();
+            closed.TrySetResult();
+        }
+    }
+
+    private void UnsubscribeNetworkObservation()
+    {
+        if (requestReceiver is not null) requestReceiver.DevToolsProtocolEventReceived -= OnRequestWillBeSent;
+        if (responseReceiver is not null) responseReceiver.DevToolsProtocolEventReceived -= OnResponseReceived;
+        if (loadingFinishedReceiver is not null) loadingFinishedReceiver.DevToolsProtocolEventReceived -= OnLoadingFinished;
+        if (loadingFailedReceiver is not null) loadingFailedReceiver.DevToolsProtocolEventReceived -= OnLoadingFailed;
+        try
+        {
+            var core = Browser.CoreWebView2;
+            core.NavigationStarting -= OnNavigationStarting;
+            core.NewWindowRequested -= OnNewWindowRequested;
+            core.DownloadStarting -= OnDownloadStarting;
+            core.WebResourceRequested -= OnWebResourceRequested;
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or COMException) { }
     }
 }

@@ -83,10 +83,13 @@ public sealed class BaiduAcceptanceProbeSession
         lock (gate) return evidence.ToArray();
     }
 
-    private static bool IsJsonMimeType(string? mimeType) =>
-        !string.IsNullOrWhiteSpace(mimeType) &&
-        (mimeType.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) ||
-         mimeType.EndsWith("+json", StringComparison.OrdinalIgnoreCase));
+    private static bool IsJsonMimeType(string? mimeType)
+    {
+        var mediaType = mimeType?.Split(';', 2)[0].Trim();
+        return !string.IsNullOrWhiteSpace(mediaType) &&
+            (string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase) ||
+             mediaType.EndsWith("+json", StringComparison.OrdinalIgnoreCase));
+    }
 
     private sealed record PendingRequest(
         BaiduAcceptanceEvidence Shape,

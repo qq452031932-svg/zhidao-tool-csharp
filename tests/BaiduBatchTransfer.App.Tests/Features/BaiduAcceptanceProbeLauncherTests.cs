@@ -92,6 +92,19 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         Assert.Null(presenter.AccountId);
     }
 
+    [Fact]
+    public async Task ReportsDeferredCleanupWithoutChangingASuccessfulPresentationToFailure()
+    {
+        var presenter = new RecordingPresenter();
+        var launcher = Launcher([Account()], presenter, profiles: new DeferredCleanupProfilePathPolicy());
+
+        var result = await launcher.OpenAsync(EnabledOptions());
+
+        Assert.True(result.Started);
+        Assert.Equal("PROBE_CLEANUP_DEFERRED", result.SafeMessage);
+        Assert.NotNull(presenter.AccountId);
+    }
+
     private static BaiduAcceptanceProbeLaunchOptions EnabledOptions() =>
         new(isDebugBuild: true, ["--baidu-field-probe"]);
 
@@ -146,6 +159,13 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         public bool LeaseDisposed { get; private set; }
         public BaiduAcceptanceProbeProfileLease Create(Guid accountId) =>
             new(IsolatedProfilePath, () => LeaseDisposed = true);
+    }
+
+    private sealed class DeferredCleanupProfilePathPolicy : IBaiduAcceptanceProbeProfilePathPolicy
+    {
+        public BaiduAcceptanceProbeProfileLease Create(Guid accountId) => new(
+            Path.Combine(Path.GetTempPath(), "isolated-probe-profile"),
+            () => Task.FromResult(BaiduAcceptanceProbeCleanupOutcome.Deferred));
     }
 
     private sealed class InlineProbeDispatcher : IBaiduAcceptanceProbeUiDispatcher

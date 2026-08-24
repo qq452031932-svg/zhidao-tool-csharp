@@ -75,7 +75,7 @@ public sealed class BaiduAcceptanceProbeLauncher(
         {
             return new(false, "PROBE_ACCOUNT_LOOKUP_FAILED");
         }
-        if (!selection.CanOpen || selection.AccountId is null || selection.ProfilePath is null)
+        if (!selection.CanOpen || selection.AccountId is null)
             return new(false, "PROBE_NO_ELIGIBLE_ACCOUNT");
 
         try
@@ -91,21 +91,28 @@ public sealed class BaiduAcceptanceProbeLauncher(
             return new(false, "PROBE_OUTPUT_UNAVAILABLE");
         }
 
+        BaiduAcceptanceProbeProfileLease? profileLease = null;
         try
         {
-            await using var profileLease = profilePathPolicy.Create(selection.AccountId.Value);
+            profileLease = profilePathPolicy.Create(selection.AccountId.Value);
             await presenter.ShowAsync(
                 selection.AccountId.Value,
                 profileLease.ProfilePath,
                 cancellationToken).ConfigureAwait(false);
-            return new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ");
+            try { await profileLease.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception) { return new(true, "PROBE_CLEANUP_DEFERRED"); }
+            return profileLease.CleanupOutcome == BaiduAcceptanceProbeCleanupOutcome.Cleaned
+                ? new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ")
+                : new(true, "PROBE_CLEANUP_DEFERRED");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            if (profileLease is not null) await profileLease.DisposeAsync().ConfigureAwait(false);
             throw;
         }
         catch (Exception)
         {
+            if (profileLease is not null) await profileLease.DisposeAsync().ConfigureAwait(false);
             return new(false, "PROBE_PRESENTATION_FAILED");
         }
     }
