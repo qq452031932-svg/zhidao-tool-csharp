@@ -2,7 +2,8 @@ namespace BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 public enum BaiduAutomationAction
 {
-    OpenOfficialUri = 0,
+    Unspecified = 0,
+    OpenOfficialUri,
     SelectExactItems,
     ClickSave,
     ChooseDestination,

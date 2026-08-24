@@ -14,7 +14,8 @@ public enum BaiduPageState
 
 public enum BaiduObservationProvenance
 {
-    Synthetic = 0,
+    Unspecified = 0,
+    Synthetic,
     FieldEvidence,
 }
 
@@ -26,7 +27,8 @@ public enum BaiduProtocolValidationStatus
 
 public enum BaiduObservationValidationStatus
 {
-    NotFieldValidated = 0,
+    Unspecified = 0,
+    NotFieldValidated,
     FieldValidated,
 }
 

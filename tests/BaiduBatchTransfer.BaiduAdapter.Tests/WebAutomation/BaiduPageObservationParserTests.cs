@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 namespace BaiduBatchTransfer.BaiduAdapter.Tests.WebAutomation;
@@ -103,6 +104,78 @@ public sealed class BaiduPageObservationParserTests
         Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
     }
 
+    [Theory]
+    [InlineData("provenance")]
+    [InlineData("validationStatus")]
+    public void Parse_JsonMissingRequiredEvidenceEnumFailsClosed(string propertyName)
+    {
+        var json = JsonNode.Parse(File.ReadAllText(
+            Path.Combine(FixtureDirectory, "own-drive-ready.synthetic.json")))!.AsObject();
+        Assert.True(json.Remove(propertyName));
+        var observation = JsonSerializer.Deserialize<BaiduPageObservation>(
+            json.ToJsonString(),
+            JsonOptions)!;
+
+        var result = BaiduPageObservationParser.Parse(observation);
+
+        Assert.Equal(BaiduPageState.Unknown, result.State);
+        Assert.False(result.IsUnambiguous);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, result.ValidationStatus);
+    }
+
+    [Theory]
+    [InlineData("provenance")]
+    [InlineData("validationStatus")]
+    public void Parse_JsonNullRequiredEvidenceEnumIsRejectedDuringDeserialization(
+        string propertyName)
+    {
+        var json = JsonNode.Parse(File.ReadAllText(
+            Path.Combine(FixtureDirectory, "own-drive-ready.synthetic.json")))!.AsObject();
+        json[propertyName] = null;
+
+        Assert.Throws<JsonException>(() =>
+            JsonSerializer.Deserialize<BaiduPageObservation>(json.ToJsonString(), JsonOptions));
+    }
+
+    [Fact]
+    public void Parse_DefaultEvidenceEnumsFailClosed()
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            Provenance = default,
+            ValidationStatus = default,
+        };
+
+        Assert.Equal(BaiduObservationProvenance.Unspecified, observation.Provenance);
+        Assert.Equal(BaiduObservationValidationStatus.Unspecified, observation.ValidationStatus);
+        Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
+    }
+
+    [Fact]
+    public void Parse_NullCollectionFailsClosedWithoutThrowing()
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            IdentityPlaceholders = null!,
+        };
+
+        var result = BaiduPageObservationParser.Parse(observation);
+
+        Assert.Equal(BaiduPageState.Unknown, result.State);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, result.ValidationStatus);
+    }
+
+    [Fact]
+    public void Parse_UnknownProvenanceIntegerFailsClosed()
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            Provenance = (BaiduObservationProvenance)999,
+        };
+
+        Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
+    }
+
     [Fact]
     public void Parse_DoesNotTrustSelfAssertedFieldValidationBeforeLiveAcceptance()
     {
@@ -181,21 +254,69 @@ public sealed class BaiduPageObservationParserTests
     }
 
     [Theory]
-    [InlineData("https://pan.baidu.com/s/fictional")]
-    [InlineData("pwd=four-digits")]
-    [InlineData("cookie-token")]
-    [InlineData("C:\\private\\folder")]
+    [InlineData("fictional-https://pan.baidu.com/s/example")]
+    [InlineData("fictional-pwd=four-digits")]
+    [InlineData("fictional-cookie-token")]
+    [InlineData("fictional-C:\\private\\folder")]
     public void Parse_RejectsUnsafeObservationValues(string unsafeValue)
     {
         var observation = Load("own-drive-ready.synthetic.json") with
         {
-            VisibleSemanticLabels = [unsafeValue],
+            IdentityPlaceholders = [unsafeValue],
         };
 
         var result = BaiduPageObservationParser.Parse(observation);
 
         Assert.Equal(BaiduPageState.Unknown, result.State);
         Assert.Equal(BaiduProtocolValidationStatus.NotValidated, result.ValidationStatus);
+    }
+
+    [Theory]
+    [InlineData("fictional-bduss-leak")]
+    [InlineData("fictional-uid-value")]
+    [InlineData("fictional-cookie-value")]
+    [InlineData("fictional-request-header-value")]
+    [InlineData("fictional-authorization-value")]
+    [InlineData("fictional-pwd-value")]
+    [InlineData("fictional-extraction-code-value")]
+    [InlineData("fictional-ｂｄｕｓｓ-leak")]
+    public void Parse_RejectsSensitiveSegmentInsideOtherwiseValidIdentityPlaceholder(
+        string unsafeIdentity)
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            IdentityPlaceholders = [unsafeIdentity],
+        };
+
+        var result = BaiduPageObservationParser.Parse(observation);
+
+        Assert.Equal(BaiduPageState.Unknown, result.State);
+        Assert.False(result.IsUnambiguous);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, result.ValidationStatus);
+    }
+
+    [Fact]
+    public void Parse_RejectsOversizedObservationToken()
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            IdentityPlaceholders = ["fictional-" + new string('a', 65)],
+        };
+
+        Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
+    }
+
+    [Fact]
+    public void Parse_RejectsTooManyIdentityPlaceholders()
+    {
+        var observation = Load("own-drive-ready.synthetic.json") with
+        {
+            IdentityPlaceholders = Enumerable.Range(0, 65)
+                .Select(index => $"fictional-item-{index}")
+                .ToArray(),
+        };
+
+        Assert.Equal(BaiduPageState.Unknown, BaiduPageObservationParser.Parse(observation).State);
     }
 
     [Fact]
@@ -213,11 +334,30 @@ public sealed class BaiduPageObservationParserTests
     [Fact]
     public void SyntheticFixturesContainNoSecretsOrRealIdentifiers()
     {
-        foreach (var path in Directory.EnumerateFiles(FixtureDirectory, "*.json"))
+        Assert.Contains(
+            Directory.EnumerateFiles(FixtureDirectory, "*.json", SearchOption.AllDirectories),
+            path => Path.GetFileName(path) == "nested-own-drive-ready.synthetic.json");
+        Assert.Empty(SyntheticFixturePrivacyAudit.FindUnsafeJsonFiles(FixtureDirectory));
+    }
+
+    [Fact]
+    public void FixtureAuditFindsSensitiveJsonInNestedDirectory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "baidu-fixture-audit", Guid.NewGuid().ToString("N"));
+        var nested = Path.Combine(root, "nested", "deeper");
+        Directory.CreateDirectory(nested);
+        try
         {
-            var text = File.ReadAllText(path);
-            Assert.DoesNotMatch(@"(?i)https?://|pan\.baidu\.com|\bpwd\s*=|extraction.?code|cookie|authorization|request.?header|response.?body|\buid\b|[a-z]:\\|/(?:users|home)/", text);
-            Assert.DoesNotMatch(@"(?i)bduss|stoken|baiduid|client_secret|app_secret", text);
+            var unsafePath = Path.Combine(nested, "unsafe.synthetic.json");
+            File.WriteAllText(unsafePath, "{ \"credential-kind\": \"cookie\" }");
+
+            var unsafeFiles = SyntheticFixturePrivacyAudit.FindUnsafeJsonFiles(root);
+
+            Assert.Equal(unsafePath, Assert.Single(unsafeFiles));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 
@@ -229,4 +369,21 @@ public sealed class BaiduPageObservationParserTests
         return JsonSerializer.Deserialize<BaiduPageObservation>(json, JsonOptions)
             ?? throw new InvalidOperationException("Synthetic fixture could not be read.");
     }
+}
+
+internal static class SyntheticFixturePrivacyAudit
+{
+    private static readonly System.Text.RegularExpressions.Regex UnsafePattern = new(
+        @"https?://|pan\.baidu\.com|\bpwd\s*=|extraction.?code|cookie|authorization|request.?header|response.?body|\buid\b|[a-z]:\\|/(?:users|home)/|bduss|stoken|baiduid|client_secret|app_secret",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    public static IReadOnlyList<string> FindUnsafeJsonFiles(string rootDirectory) =>
+        Directory.EnumerateFiles(
+                rootDirectory,
+                "*.json",
+                SearchOption.AllDirectories)
+            .Where(path => UnsafePattern.IsMatch(File.ReadAllText(path)))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 }

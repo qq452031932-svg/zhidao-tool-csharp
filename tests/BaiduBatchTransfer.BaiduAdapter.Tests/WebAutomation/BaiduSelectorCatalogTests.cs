@@ -52,7 +52,37 @@ public sealed class BaiduSelectorCatalogTests
             BaiduAutomationAction.ExportResult,
         };
 
-        Assert.Equal(expected.Order(), BaiduSelectorCatalog.Production.Definitions.Select(x => x.Action).Order());
+        Assert.Equal(
+            expected.Order(),
+            BaiduSelectorCatalog.Production.Definitions.Select(x => x.Action).Distinct().Order());
+    }
+
+    [Fact]
+    public void CatalogDefinitionsAreUniquelyBoundToRequiredStateAndAction()
+    {
+        var definitions = BaiduSelectorCatalog.Production.Definitions;
+
+        Assert.Equal(
+            definitions.Length,
+            definitions.Select(definition => (definition.RequiredState, definition.Action)).Distinct().Count());
+        Assert.Contains(
+            definitions,
+            definition => definition.RequiredState is BaiduPageState.OwnDriveReady &&
+                          definition.Action is BaiduAutomationAction.ClickShare);
+        Assert.DoesNotContain(
+            definitions,
+            definition => definition.RequiredState is BaiduPageState.ExternalShareReady &&
+                          definition.Action is BaiduAutomationAction.ClickShare);
+
+        var externalSelectionTokens = definitions.Single(definition =>
+                definition.RequiredState is BaiduPageState.ExternalShareReady &&
+                definition.Action is BaiduAutomationAction.SelectExactItems)
+            .CandidateStrategies.Select(strategy => strategy.Token);
+        var ownDriveSelectionTokens = definitions.Single(definition =>
+                definition.RequiredState is BaiduPageState.OwnDriveReady &&
+                definition.Action is BaiduAutomationAction.SelectExactItems)
+            .CandidateStrategies.Select(strategy => strategy.Token);
+        Assert.Empty(externalSelectionTokens.Intersect(ownDriveSelectionTokens, StringComparer.Ordinal));
     }
 
     [Theory]
@@ -194,6 +224,60 @@ public sealed class BaiduSelectorCatalogTests
 
         Assert.False(decision.IsAllowed);
         Assert.Equal(BaiduAutomationDenialReason.UnknownAction, decision.DenialReason);
+    }
+
+    [Fact]
+    public void Authorize_RejectsDefaultActionEnum()
+    {
+        var context = new BaiduAutomationActionContext(
+            new BaiduPageParseResult(
+                BaiduPageState.OwnDriveReady,
+                true,
+                BaiduProtocolValidationStatus.NotValidated,
+                "safe-test-reason"),
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a",
+            new BaiduAutomationAcceptance(
+                true,
+                BaiduSelectorCatalog.ProtocolVersion,
+                BaiduSelectorCatalog.SelectorVersion,
+                "build-a"),
+            1);
+
+        Assert.Equal(BaiduAutomationAction.Unspecified, default(BaiduAutomationAction));
+        var decision = BaiduSelectorCatalog.Production.Authorize(context, default);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.UnknownAction, decision.DenialReason);
+    }
+
+    [Fact]
+    public void CatalogDoesNotReuseStateBoundSelectorAcrossPages()
+    {
+        var parsed = new BaiduPageParseResult(
+            BaiduPageState.ExternalShareReady,
+            true,
+            BaiduProtocolValidationStatus.NotValidated,
+            "safe-test-reason");
+        var context = new BaiduAutomationActionContext(
+            parsed,
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a",
+            new BaiduAutomationAcceptance(
+                true,
+                BaiduSelectorCatalog.ProtocolVersion,
+                BaiduSelectorCatalog.SelectorVersion,
+                "build-a"),
+            1);
+
+        var decision = BaiduSelectorCatalog.Production.Authorize(
+            context,
+            BaiduAutomationAction.ClickShare);
+
+        Assert.False(decision.IsAllowed);
+        Assert.Equal(BaiduAutomationDenialReason.ActionNotAllowedForState, decision.DenialReason);
     }
 
     private static BaiduPageObservation Load(string name)

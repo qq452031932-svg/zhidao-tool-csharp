@@ -4,7 +4,8 @@ namespace BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 public enum BaiduSelectorStrategyKind
 {
-    SemanticLabel = 0,
+    Unspecified = 0,
+    SemanticLabel,
     AccessibilityRole,
     StableAttribute,
 }
@@ -18,12 +19,13 @@ public sealed record BaiduSelectorCandidateStrategy(
 }
 
 public sealed record BaiduSelectorDefinition(
+    BaiduPageState RequiredState,
     BaiduAutomationAction Action,
     ImmutableArray<BaiduSelectorCandidateStrategy> CandidateStrategies,
     ImmutableArray<string> ExecutableLocators)
 {
     public override string ToString() =>
-        $"BaiduSelectorDefinition {{ Action = {Action}, CandidateStrategyCount = {CandidateStrategies.Length}, ExecutableLocatorCount = {ExecutableLocators.Length} }}";
+        $"BaiduSelectorDefinition {{ RequiredState = {RequiredState}, Action = {Action}, CandidateStrategyCount = {CandidateStrategies.Length}, ExecutableLocatorCount = {ExecutableLocators.Length} }}";
 }
 
 public sealed class BaiduSelectorCatalog
@@ -31,33 +33,24 @@ public sealed class BaiduSelectorCatalog
     public const string ProtocolVersion = "baidu-visible-web-v1";
     public const string SelectorVersion = "baidu-selectors-v1";
 
-    private static readonly ImmutableDictionary<BaiduPageState, ImmutableHashSet<BaiduAutomationAction>>
-        AllowedActions = new Dictionary<BaiduPageState, ImmutableHashSet<BaiduAutomationAction>>
-        {
-            [BaiduPageState.ExternalShareReady] =
-                [BaiduAutomationAction.SelectExactItems, BaiduAutomationAction.ClickSave],
-            [BaiduPageState.OwnDriveReady] =
-                [BaiduAutomationAction.SelectExactItems, BaiduAutomationAction.ClickShare],
-            [BaiduPageState.SaveDestinationReady] =
-                [BaiduAutomationAction.ChooseDestination, BaiduAutomationAction.ClickSave],
-            [BaiduPageState.TransferAccepted] = [],
-            [BaiduPageState.ShareDialogReady] =
-                [
-                    BaiduAutomationAction.ChoosePermanent,
-                    BaiduAutomationAction.SetExtractionCode,
-                    BaiduAutomationAction.CreateLink,
-                ],
-            [BaiduPageState.ShareResultReady] = [BaiduAutomationAction.ExportResult],
-            [BaiduPageState.UserVerificationRequired] = [],
-        }.ToImmutableDictionary();
-
     private static readonly ImmutableArray<BaiduSelectorDefinition> NotValidatedDefinitions =
-        Enum.GetValues<BaiduAutomationAction>()
-            .Select(action => new BaiduSelectorDefinition(
-                action,
-                CandidateStrategiesFor(action),
-                ImmutableArray<string>.Empty))
-            .ToImmutableArray();
+    [
+        Definition(BaiduPageState.Unknown, BaiduAutomationAction.OpenOfficialUri),
+        Definition(BaiduPageState.ExternalShareReady, BaiduAutomationAction.SelectExactItems),
+        Definition(BaiduPageState.ExternalShareReady, BaiduAutomationAction.ClickSave),
+        Definition(BaiduPageState.OwnDriveReady, BaiduAutomationAction.SelectExactItems),
+        Definition(BaiduPageState.OwnDriveReady, BaiduAutomationAction.ClickShare),
+        Definition(BaiduPageState.SaveDestinationReady, BaiduAutomationAction.ChooseDestination),
+        Definition(BaiduPageState.SaveDestinationReady, BaiduAutomationAction.ClickSave),
+        Definition(BaiduPageState.ShareDialogReady, BaiduAutomationAction.ChoosePermanent),
+        Definition(BaiduPageState.ShareDialogReady, BaiduAutomationAction.SetExtractionCode),
+        Definition(BaiduPageState.ShareDialogReady, BaiduAutomationAction.CreateLink),
+        Definition(BaiduPageState.ShareResultReady, BaiduAutomationAction.ExportResult),
+    ];
+
+    private static readonly ImmutableDictionary<(BaiduPageState State, BaiduAutomationAction Action), BaiduSelectorDefinition>
+        DefinitionsByStateAndAction = NotValidatedDefinitions.ToImmutableDictionary(
+            definition => (definition.RequiredState, definition.Action));
 
     private BaiduSelectorCatalog()
     {
@@ -75,20 +68,19 @@ public sealed class BaiduSelectorCatalog
 
     public bool IsActionAllowedForState(BaiduPageState state, BaiduAutomationAction action)
     {
-        if (!Enum.IsDefined(state) || !Enum.IsDefined(action))
+        if (!Enum.IsDefined(state) ||
+            !Enum.IsDefined(action) ||
+            action is BaiduAutomationAction.Unspecified)
             return false;
 
-        if (action is BaiduAutomationAction.OpenOfficialUri)
-            return true;
-
-        return AllowedActions.TryGetValue(state, out var actions) && actions.Contains(action);
+        return DefinitionsByStateAndAction.ContainsKey((state, action));
     }
 
     public BaiduAutomationDecision Authorize(
         BaiduAutomationActionContext? context,
         BaiduAutomationAction action)
     {
-        if (!Enum.IsDefined(action))
+        if (!Enum.IsDefined(action) || action is BaiduAutomationAction.Unspecified)
             return BaiduAutomationDecision.Denied(BaiduAutomationDenialReason.UnknownAction);
 
         if (context?.Observation is null ||
@@ -142,13 +134,33 @@ public sealed class BaiduSelectorCatalog
     public override string ToString() =>
         $"BaiduSelectorCatalog {{ ProtocolVersion = [REDACTED], SelectorVersion = [REDACTED], ValidationStatus = {ValidationStatus}, DefinitionCount = {Definitions.Length}, ExecutableLocatorCount = 0, HistoricalReference = [REDACTED] }}";
 
+    private static BaiduSelectorDefinition Definition(
+        BaiduPageState requiredState,
+        BaiduAutomationAction action) => new(
+            requiredState,
+            action,
+            CandidateStrategiesFor(requiredState, action),
+            ImmutableArray<string>.Empty);
+
     private static ImmutableArray<BaiduSelectorCandidateStrategy> CandidateStrategiesFor(
+        BaiduPageState requiredState,
         BaiduAutomationAction action) =>
         [
-            new(BaiduSelectorStrategyKind.SemanticLabel, $"{ActionToken(action)}-semantic"),
-            new(BaiduSelectorStrategyKind.AccessibilityRole, $"{ActionToken(action)}-role"),
-            new(BaiduSelectorStrategyKind.StableAttribute, $"{ActionToken(action)}-attribute"),
+            new(BaiduSelectorStrategyKind.SemanticLabel, $"{StateToken(requiredState)}-{ActionToken(action)}-semantic"),
+            new(BaiduSelectorStrategyKind.AccessibilityRole, $"{StateToken(requiredState)}-{ActionToken(action)}-role"),
+            new(BaiduSelectorStrategyKind.StableAttribute, $"{StateToken(requiredState)}-{ActionToken(action)}-attribute"),
         ];
+
+    private static string StateToken(BaiduPageState state) => state switch
+    {
+        BaiduPageState.Unknown => "navigation",
+        BaiduPageState.ExternalShareReady => "external-share",
+        BaiduPageState.OwnDriveReady => "own-drive",
+        BaiduPageState.SaveDestinationReady => "save-destination",
+        BaiduPageState.ShareDialogReady => "share-dialog",
+        BaiduPageState.ShareResultReady => "share-result",
+        _ => throw new ArgumentOutOfRangeException(nameof(state)),
+    };
 
     private static string ActionToken(BaiduAutomationAction action) => action switch
     {

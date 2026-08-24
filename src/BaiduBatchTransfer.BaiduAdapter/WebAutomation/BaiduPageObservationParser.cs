@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Text;
 
 namespace BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
@@ -6,7 +7,7 @@ public static class BaiduPageObservationParser
 {
     public const int SchemaVersion = 1;
 
-    private static readonly FrozenSet<string> SensitiveTokens = new[]
+    private static readonly FrozenSet<string> SensitiveSegments = new[]
     {
         "authorization",
         "baiduid",
@@ -19,6 +20,22 @@ public static class BaiduPageObservationParser
         "secret",
         "stoken",
         "uid",
+    }.ToFrozenSet(StringComparer.Ordinal);
+
+    private static readonly FrozenSet<string> SensitiveFragments = new[]
+    {
+        "appsecret",
+        "authorization",
+        "baiduid",
+        "bduss",
+        "clientsecret",
+        "cookie",
+        "extractioncode",
+        "header",
+        "pwd",
+        "requestheader",
+        "responsebody",
+        "stoken",
     }.ToFrozenSet(StringComparer.Ordinal);
 
     private static readonly StateRule[] Rules =
@@ -130,22 +147,46 @@ public static class BaiduPageObservationParser
 
     private static bool IsSafeToken(string? value)
     {
-        if (string.IsNullOrEmpty(value) || value.Length > 64 ||
-            value[0] is < 'a' or > 'z')
+        if (string.IsNullOrEmpty(value) || value.Length > 64)
         {
             return false;
         }
 
-        foreach (var character in value)
+        var normalized = value.Normalize(NormalizationForm.FormKC).ToLowerInvariant();
+        if (normalized.Length > 64 ||
+            normalized[0] is < 'a' or > 'z' ||
+            ContainsSensitiveContent(normalized))
+        {
+            return false;
+        }
+
+        foreach (var character in normalized)
         {
             if (character is not (>= 'a' and <= 'z') and not (>= '0' and <= '9') and not '-')
                 return false;
         }
 
-        return !SensitiveTokens.Any(sensitive =>
-            value.Equals(sensitive, StringComparison.Ordinal) ||
-            value.StartsWith(sensitive + "-", StringComparison.Ordinal) ||
-            value.EndsWith("-" + sensitive, StringComparison.Ordinal));
+        return string.Equals(value, normalized, StringComparison.Ordinal);
+    }
+
+    private static bool ContainsSensitiveContent(string normalized)
+    {
+        if (normalized.Contains("://", StringComparison.Ordinal) ||
+            normalized.Contains('\\') ||
+            normalized.Length >= 3 &&
+            normalized[0] is >= 'a' and <= 'z' &&
+            normalized[1] == ':' &&
+            normalized[2] is '/' or '\\')
+        {
+            return true;
+        }
+
+        var segments = normalized.Split('-', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(SensitiveSegments.Contains))
+            return true;
+
+        var compact = string.Concat(normalized.Where(char.IsAsciiLetterOrDigit));
+        return SensitiveFragments.Any(compact.Contains);
     }
 
     private static BaiduPageParseResult Unknown(string reason) => new(
