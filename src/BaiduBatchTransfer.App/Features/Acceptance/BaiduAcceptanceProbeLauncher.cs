@@ -1,10 +1,16 @@
 using System.Windows;
+using System.Runtime.ExceptionServices;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Abstractions;
 
 namespace BaiduBatchTransfer.App.Features.Acceptance;
 
 public sealed record BaiduAcceptanceProbeLaunchResult(bool Started, string SafeMessage);
+
+public static class BaiduAcceptanceProbeResultCodes
+{
+    public const string CleanupDeferred = "PROBE_CLEANUP_DEFERRED";
+}
 
 public sealed class BaiduAcceptanceProbeLaunchOptions(bool isDebugBuild, IReadOnlyList<string> arguments)
 {
@@ -101,7 +107,7 @@ public sealed class BaiduAcceptanceProbeLauncher(
                 cancellationToken).ConfigureAwait(false);
             return await CleanupResultAsync(profileLease).ConfigureAwait(false) == BaiduAcceptanceProbeCleanupOutcome.Cleaned
                 ? new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ")
-                : new(true, "PROBE_CLEANUP_DEFERRED");
+                : new(true, BaiduAcceptanceProbeResultCodes.CleanupDeferred);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -156,9 +162,12 @@ public sealed class BaiduAcceptanceProbePresenter(
             window = windowFactory.Create(accountId, profilePath);
             window.Show();
         }, cancellationToken).ConfigureAwait(false);
-        await (window ?? throw new InvalidOperationException("现场验收窗口未创建。"))
-            .WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
-        await window.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
+        var shownWindow = window ?? throw new InvalidOperationException("现场验收窗口未创建。");
+        ExceptionDispatchInfo? initializationFailure = null;
+        try { await shownWindow.WaitForInitializationAsync(cancellationToken).ConfigureAwait(false); }
+        catch (Exception exception) { initializationFailure = ExceptionDispatchInfo.Capture(exception); }
+        await shownWindow.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
+        initializationFailure?.Throw();
     }
 }
 

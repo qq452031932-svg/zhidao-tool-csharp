@@ -80,6 +80,24 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     }
 
     [Fact]
+    public async Task WaitsForWindowClosureBeforeReportingInitializationFailureAndCleaningTheProfile()
+    {
+        var window = new PendingCloseFailingProbeWindow();
+        var profiles = new RecordingProfilePathPolicy();
+        var presenter = new BaiduAcceptanceProbePresenter(new InlineProbeDispatcher(), new PendingCloseFactory(window));
+        var launch = Launcher([Account()], presenter, profiles: profiles).OpenAsync(EnabledOptions());
+
+        await Task.Yield();
+        Assert.False(launch.IsCompleted);
+        Assert.False(profiles.LeaseDisposed);
+
+        window.Close();
+        var result = await launch;
+        Assert.False(result.Started);
+        Assert.True(profiles.LeaseDisposed);
+    }
+
+    [Fact]
     public async Task DoesNotPresentWhenTheEvidenceDirectoryIsUnavailable()
     {
         var presenter = new RecordingPresenter();
@@ -190,6 +208,21 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("private initialization failure"));
         public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    }
+
+    private sealed class PendingCloseFactory(PendingCloseFailingProbeWindow window) : IBaiduAcceptanceProbeWindowFactory
+    {
+        public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) => window;
+    }
+
+    private sealed class PendingCloseFailingProbeWindow : IBaiduAcceptanceProbeWindow
+    {
+        private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void Show() { }
+        public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromException(new InvalidOperationException("private initialization failure"));
+        public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => closed.Task;
+        public void Close() => closed.TrySetResult();
     }
 
     private sealed class FakeUnitOfWorkFactory(IReadOnlyList<AccountRecord> accounts) : IUnitOfWorkFactory

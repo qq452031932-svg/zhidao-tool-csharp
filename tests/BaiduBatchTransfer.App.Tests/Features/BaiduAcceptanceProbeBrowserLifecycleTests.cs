@@ -10,9 +10,12 @@ public sealed class BaiduAcceptanceProbeBrowserLifecycleTests
         var events = new List<string>();
         var lifecycle = new BaiduAcceptanceProbeBrowserLifecycle(7, () => events.Add("dispose"), TimeSpan.FromSeconds(1));
         lifecycle.NotifyBrowserProcessExited(6);
+        var closing = lifecycle.DisposeAfterExitAsync();
+        await Task.Yield();
+        Assert.False(closing.IsCompleted);
         lifecycle.NotifyBrowserProcessExited(7);
 
-        var exited = await lifecycle.DisposeAfterExitAsync();
+        var exited = await closing;
 
         Assert.True(exited);
         Assert.Equal(["dispose"], events);

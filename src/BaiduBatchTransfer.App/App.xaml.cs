@@ -38,7 +38,7 @@ public partial class App : System.Windows.Application
             {
                 var probe = await host.Services.GetRequiredService<IBaiduAcceptanceProbeLauncher>()
                     .OpenAsync(probeOptions).ConfigureAwait(true);
-                if (!probe.Started || probe.SafeMessage == "PROBE_CLEANUP_DEFERRED")
+                if (!probe.Started || probe.SafeMessage == BaiduAcceptanceProbeResultCodes.CleanupDeferred)
                     MessageBox.Show(probe.SafeMessage, "百度现场验收", MessageBoxButton.OK, MessageBoxImage.Information);
             }
 #endif

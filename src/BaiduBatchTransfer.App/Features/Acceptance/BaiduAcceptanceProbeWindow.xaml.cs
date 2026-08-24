@@ -22,6 +22,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     private CoreWebView2DevToolsProtocolEventReceiver? responseReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? loadingFinishedReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? loadingFailedReceiver;
+    private IDisposable? downloadSubscription;
     private bool allowClose;
     private bool saving;
     private Task? teardownTask;
@@ -75,7 +76,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     {
         core.NavigationStarting += OnNavigationStarting;
         core.NewWindowRequested += OnNewWindowRequested;
-        core.DownloadStarting += OnDownloadStarting;
+        downloadSubscription = BaiduAcceptanceProbeDownloadSafety.Configure(new WebView2BaiduAcceptanceProbeDownloadHost(core));
         core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
         core.WebResourceRequested += OnWebResourceRequested;
         core.Settings.AreDevToolsEnabled = false;
@@ -114,13 +115,6 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     {
         e.Handled = true;
         StatusText.Text = "已阻止打开新窗口。";
-    }
-
-    private void OnDownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
-    {
-        e.Cancel = true;
-        e.Handled = true;
-        StatusText.Text = "已阻止下载。";
     }
 
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
@@ -355,7 +349,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             if (Browser.CoreWebView2 is not { } core) return;
             core.NavigationStarting -= OnNavigationStarting;
             core.NewWindowRequested -= OnNewWindowRequested;
-            core.DownloadStarting -= OnDownloadStarting;
+            downloadSubscription?.Dispose();
             core.WebResourceRequested -= OnWebResourceRequested;
         }
         catch (Exception exception) when (exception is InvalidOperationException or COMException) { }
