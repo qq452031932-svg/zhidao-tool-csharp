@@ -34,6 +34,24 @@ public sealed class OwnedRemoteSelectionTests
     }
 
     [Fact]
+    public void Constructor_RequiresExactlyOneRemoteItem()
+    {
+        Assert.Throws<ArgumentException>(() => new RemoteItemIdentitySet([]));
+
+        var error = Assert.Throws<ArgumentException>(() => new OwnedRemoteSelection(
+            AccountId,
+            new RemoteItemIdentitySet([
+                new RemoteItemIdentity("fs-id-1", "文件一"),
+                new RemoteItemIdentity("fs-id-2", "文件二"),
+            ]),
+            "两个文件",
+            RemoteResourceKind.File,
+            new RemotePath("/应用")));
+
+        Assert.Equal("remoteItems", error.ParamName);
+    }
+
+    [Fact]
     public void DisplayName_IsUiOnlyAndDoesNotReplaceExactIdentity()
     {
         var exact = ExactItems("opaque-fs-id-739", "旧名称.apk");
@@ -122,6 +140,23 @@ public sealed class OwnedRemoteSelectionTests
             RemoteResourceKind.File, new RemotePath("/"), 1, 0,
             StandaloneShareOperationStatus.Queued, StandaloneShareSubmissionState.NotStarted,
             0, now, now));
+    }
+
+    [Fact]
+    public void StandaloneOperationPersistenceBoundary_RejectsMoreThanOneRemoteItem()
+    {
+        var exactItems = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("fs-id-1", "文件一"),
+            new RemoteItemIdentity("fs-id-2", "文件二"),
+        ]);
+
+        var error = Assert.Throws<ArgumentException>(() => new StandaloneShareOperationRecord(
+            Guid.NewGuid(), Guid.NewGuid(), AccountId, exactItems, "两个文件",
+            RemoteResourceKind.File, new RemotePath("/"), 1, 1,
+            StandaloneShareOperationStatus.Queued, StandaloneShareSubmissionState.NotStarted,
+            0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+
+        Assert.Equal("exactRemoteItems", error.ParamName);
     }
 
     private static OwnedRemoteSelection Selection(Guid accountId, string exactId) => new(

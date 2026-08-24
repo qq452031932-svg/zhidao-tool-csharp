@@ -18,6 +18,8 @@ public sealed record OwnedRemoteSelection
         if (accountId == Guid.Empty)
             throw new ArgumentException("An owning account is required.", nameof(accountId));
         ArgumentNullException.ThrowIfNull(remoteItems);
+        if (remoteItems.Count != 1)
+            throw new ArgumentException("Exactly one remote item is required.", nameof(remoteItems));
         ArgumentException.ThrowIfNullOrWhiteSpace(displayName);
         if (!Enum.IsDefined(kind))
             throw new ArgumentOutOfRangeException(nameof(kind));

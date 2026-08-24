@@ -2,6 +2,8 @@ using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using System.Collections;
+using System.Reflection;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -21,6 +23,37 @@ public sealed class ShareWorkspaceViewModelTests
 
         Assert.Equal("所选资源不属于当前账号，请切回对应账号重新选择。", error.Message);
         Assert.Empty(vm.SelectionGroups);
+    }
+
+    [Fact]
+    public void SelectionCollections_AreReadOnlyThroughThePublicApi()
+    {
+        var vm = Fixture(activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+
+        var publicGroups = Assert.IsAssignableFrom<IList>(vm.SelectionGroups);
+        var publicSelections = Assert.IsAssignableFrom<IList>(vm.SelectionGroups.Single().Selections);
+
+        Assert.True(publicGroups.IsReadOnly);
+        Assert.True(publicSelections.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => publicGroups.Add(new ShareSelectionGroup(AccountA.AccountId, AccountA.DisplayName)));
+        Assert.Throws<NotSupportedException>(() => publicSelections.Add(Selection(AccountA, "a-2")));
+    }
+
+    [Fact]
+    public async Task Start_RevalidatesTheWholeSnapshotAndRejectsInjectedCrossAccountData()
+    {
+        var store = new FakeStore();
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        var injected = new ShareSelectionGroup(AccountA.AccountId, AccountA.DisplayName);
+        InjectSelection(injected, Selection(AccountB, "b-foreign"));
+        InjectGroup(vm, injected);
+        vm.ResultDirectory = @"C:\结果";
+
+        await vm.StartAsync();
+
+        Assert.Empty(store.Created);
+        Assert.Equal("所选资源与账号不一致，请重新选择。", vm.StatusMessage);
     }
 
     [Fact]
@@ -236,6 +269,165 @@ public sealed class ShareWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task InitializeCompletion_CannotOverwriteASelectionMadeAfterTheRequestStarted()
+    {
+        var store = new FakeStore();
+        var older = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 10);
+        store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 1);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforeGetBatches = _ => release.Task;
+
+        var loading = vm.InitializeAsync();
+        await store.DelayedHistoryStarted.Task;
+        vm.SelectedBatch = older;
+        var statusAfterSelection = vm.StatusMessage;
+        release.SetResult();
+        await loading;
+
+        Assert.Equal(older.Id, vm.SelectedBatch?.Id);
+        Assert.Equal(statusAfterSelection, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task LoadCompletion_IsRejectedAfterSwitchingAwayAndBackToTheSameBatch()
+    {
+        var store = new FakeStore();
+        var older = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 10);
+        var newest = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 1);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforeGetOperations = (batchId, _) => batchId == older.Id ? release.Task : Task.CompletedTask;
+
+        vm.SelectedBatch = older;
+        var loading = vm.LoadSelectedBatchAsync();
+        await store.DelayedLoadStarted.Task;
+        vm.SelectedBatch = newest;
+        vm.SelectedBatch = older;
+        var statusAfterSwitch = vm.StatusMessage;
+        release.SetResult();
+        await loading;
+
+        Assert.Equal(older.Id, vm.SelectedBatch?.Id);
+        Assert.All(vm.Operations, operation => Assert.Equal(newest.Id, operation.BatchId));
+        Assert.Equal(statusAfterSwitch, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task PauseCompletion_CannotSelectItsOldTargetAfterTheUserSwitchesBatch()
+    {
+        var store = new FakeStore();
+        var older = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 10);
+        var newest = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 1);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforePause = (batchId, _) => batchId == older.Id ? release.Task : Task.CompletedTask;
+
+        vm.SelectedBatch = older;
+        var pausing = vm.PauseAsync();
+        await store.DelayedPauseStarted.Task;
+        vm.SelectedBatch = newest;
+        var statusAfterSwitch = vm.StatusMessage;
+        release.SetResult();
+        await pausing;
+
+        Assert.Equal(newest.Id, vm.SelectedBatch?.Id);
+        Assert.Equal(statusAfterSwitch, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ResumeCompletion_CannotSelectItsOldTargetAfterTheUserSwitchesBatch()
+    {
+        var store = new FakeStore();
+        var older = store.SeedBatch(StandaloneShareBatchStatus.Paused, createdMinutesAgo: 10);
+        var newest = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 1);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforeResume = (batchId, _) => batchId == older.Id ? release.Task : Task.CompletedTask;
+
+        vm.SelectedBatch = older;
+        var resuming = vm.ResumeAsync();
+        await store.DelayedResumeStarted.Task;
+        vm.SelectedBatch = newest;
+        var statusAfterSwitch = vm.StatusMessage;
+        release.SetResult();
+        await resuming;
+
+        Assert.Equal(newest.Id, vm.SelectedBatch?.Id);
+        Assert.Equal(statusAfterSwitch, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task RetryCompletion_CannotRestoreItsOldOperationAfterTheUserSwitchesBatch()
+    {
+        var store = new FakeStore();
+        var older = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 10);
+        var newest = store.SeedBatch(StandaloneShareBatchStatus.Active, createdMinutesAgo: 1);
+        var safe = store.ReplaceOnlyOperation(newest.Id, operation => RebuildOperation(
+            operation,
+            StandaloneShareOperationStatus.Failed,
+            StandaloneShareSubmissionState.DefinitelyNotAccepted));
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        vm.SelectedOperation = safe;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforeRetry = (operationId, _) => operationId == safe.Id ? release.Task : Task.CompletedTask;
+
+        var retrying = vm.RetryFailedAsync();
+        await store.DelayedRetryStarted.Task;
+        vm.SelectedBatch = older;
+        var statusAfterSwitch = vm.StatusMessage;
+        release.SetResult();
+        await retrying;
+
+        Assert.Equal(older.Id, vm.SelectedBatch?.Id);
+        Assert.Null(vm.SelectedOperation);
+        Assert.Equal(statusAfterSwitch, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task LoadSelectedBatch_RefreshesItsDurableHeaderBeforeShowingOperations()
+    {
+        var store = new FakeStore();
+        var original = store.SeedBatch(StandaloneShareBatchStatus.Active);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var durable = store.ReplaceBatch(original.Id, StandaloneShareBatchStatus.Paused);
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.Equal(durable.Revision, vm.SelectedBatch?.Revision);
+        Assert.Equal(StandaloneShareBatchStatus.Paused, vm.SelectedBatch?.Status);
+    }
+
+    [Fact]
+    public async Task BusyWorkspace_DisablesSelectionHistoryAndOperationPickers()
+    {
+        var store = new FakeStore();
+        store.SeedBatch(StandaloneShareBatchStatus.Active);
+        var vm = Fixture(store: store);
+        await vm.InitializeAsync();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        store.BeforeGetOperations = (_, _) => release.Task;
+
+        var loading = vm.LoadSelectedBatchAsync();
+        await store.DelayedLoadStarted.Task;
+
+        Assert.False(vm.CanEditSelection);
+        Assert.False(vm.CanSelectHistory);
+        var xaml = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml"));
+        Assert.True(xaml.Split("IsEnabled=\"{Binding CanSelectHistory}\"").Length - 1 >= 2);
+
+        release.SetResult();
+        await loading;
+    }
+
+    [Fact]
     public async Task ResultDirectoryCommand_UsesChosenLocalDirectory()
     {
         var vm = Fixture(resultDialog: new FakeResultDialog(@"D:\导出"));
@@ -272,7 +464,8 @@ public sealed class ShareWorkspaceViewModelTests
 
         Assert.False(vm.IsBusy);
         Assert.Single(vm.SelectionGroups.Single().Selections);
-        Assert.Equal("暂时无法开始分享，请稍后重试。", vm.StatusMessage);
+        Assert.Equal("创建结果需要确认，请再次点击开始分享。", vm.StatusMessage);
+        Assert.True(vm.HasPendingBatchConfirmation);
         Assert.DoesNotContain("secret", vm.StatusMessage, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -291,6 +484,111 @@ public sealed class ShareWorkspaceViewModelTests
         Assert.Empty(vm.SelectionGroups);
         Assert.Single(vm.Batches);
         Assert.Equal("分享任务已加入队列。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task CommitThenThrow_RetryUsesTheSameBatchAndConvergesWithoutADuplicate()
+    {
+        var store = new FakeStore
+        {
+            ErrorAfterFirstCommit = new InvalidOperationException("connection lost after commit"),
+        };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\结果";
+
+        await vm.StartAsync();
+        var committedId = Assert.Single(store.Created).Batch.Id;
+        await vm.StartAsync();
+
+        Assert.Single(store.Created);
+        Assert.Equal(committedId, vm.SelectedBatch?.Id);
+        Assert.Empty(vm.SelectionGroups);
+        Assert.Equal("分享任务已加入队列。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task CommitThenCancellation_RetryReconcilesTheStableBatchId()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var store = new FakeStore
+        {
+            AfterFirstCommit = cancellation.Cancel,
+            ErrorAfterFirstCommit = new OperationCanceledException(cancellation.Token),
+        };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\结果";
+
+        await vm.StartAsync(cancellation.Token);
+        var committedId = Assert.Single(store.Created).Batch.Id;
+        await vm.StartAsync();
+
+        Assert.Single(store.Created);
+        Assert.Equal(committedId, vm.SelectedBatch?.Id);
+        Assert.Empty(vm.SelectionGroups);
+    }
+
+    [Fact]
+    public async Task UnconfirmedCreate_LocksDraftUntilResetProvesNothingWasCommitted()
+    {
+        var store = new FakeStore { CreateError = new InvalidOperationException("before commit") };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\旧结果";
+        await vm.StartAsync();
+
+        Assert.True(vm.HasPendingBatchConfirmation);
+        Assert.False(vm.CanEditSelection);
+        Assert.Throws<InvalidOperationException>(() => vm.Add(Selection(AccountA, "a-2")));
+        Assert.Throws<InvalidOperationException>(() => vm.ResultDirectory = @"C:\新结果");
+
+        store.CreateError = null;
+        await vm.ResetPendingDraftAsync();
+
+        Assert.False(vm.HasPendingBatchConfirmation);
+        Assert.True(vm.CanEditSelection);
+        vm.ResultDirectory = @"C:\新结果";
+        Assert.Equal(@"C:\新结果", vm.ResultDirectory);
+    }
+
+    [Fact]
+    public async Task ResetPendingDraft_WhenCommitActuallyHappened_ConvergesInsteadOfDiscardingIt()
+    {
+        var store = new FakeStore
+        {
+            ErrorAfterFirstCommit = new InvalidOperationException("after commit"),
+        };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\结果";
+        await vm.StartAsync();
+        var committed = Assert.Single(store.Created).Batch;
+
+        await vm.ResetPendingDraftAsync();
+
+        Assert.False(vm.HasPendingBatchConfirmation);
+        Assert.Equal(committed.Id, vm.SelectedBatch?.Id);
+        Assert.Empty(vm.SelectionGroups);
+        Assert.Single(store.Created);
+    }
+
+    [Fact]
+    public async Task PendingDraft_IsNotSubmittedIfItsAccountBecameUnavailableBeforeRetry()
+    {
+        var store = new FakeStore { CreateError = new InvalidOperationException("before commit") };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\结果";
+        await vm.StartAsync();
+        store.CreateError = null;
+        vm.ReloadAccounts([AccountB]);
+
+        await vm.StartAsync();
+
+        Assert.Empty(store.Created);
+        Assert.True(vm.HasPendingBatchConfirmation);
+        Assert.Equal("所选账号当前不可用，请先检查账号。", vm.StatusMessage);
     }
 
     [Fact]
@@ -371,6 +669,22 @@ public sealed class ShareWorkspaceViewModelTests
         throw new DirectoryNotFoundException();
     }
 
+    private static void InjectGroup(ShareWorkspaceViewModel viewModel, ShareSelectionGroup group)
+    {
+        var field = typeof(ShareWorkspaceViewModel).GetField(
+            "selectionGroups", BindingFlags.Instance | BindingFlags.NonPublic);
+        var target = field?.GetValue(viewModel) ?? viewModel.SelectionGroups;
+        ((IList)target).Add(group);
+    }
+
+    private static void InjectSelection(ShareSelectionGroup group, OwnedRemoteSelection selection)
+    {
+        var field = typeof(ShareSelectionGroup).GetField(
+            "selections", BindingFlags.Instance | BindingFlags.NonPublic);
+        var target = field?.GetValue(group) ?? group.Selections;
+        ((IList)target).Add(selection);
+    }
+
     private sealed class FakePicker(
         Func<Guid, CancellationToken, IReadOnlyList<OwnedRemoteSelection>> pick) : IRemoteResourcePicker
     {
@@ -396,41 +710,89 @@ public sealed class ShareWorkspaceViewModelTests
         private readonly List<StandaloneShareBatchRecord> batches = [];
         private readonly Dictionary<Guid, List<StandaloneShareOperationRecord>> operations = [];
 
-        public Exception? CreateError { get; init; }
+        public Exception? CreateError { get; set; }
         public Action? AfterCreate { get; init; }
+        public Action? AfterFirstCommit { get; init; }
+        public Exception? ErrorAfterFirstCommit { get; set; }
+        public Func<CancellationToken, Task>? BeforeGetBatches { get; set; }
         public Func<Guid, CancellationToken, Task>? BeforeGetOperations { get; set; }
+        public Func<Guid, CancellationToken, Task>? BeforePause { get; set; }
+        public Func<Guid, CancellationToken, Task>? BeforeResume { get; set; }
+        public Func<Guid, CancellationToken, Task>? BeforeRetry { get; set; }
+        public TaskCompletionSource DelayedHistoryStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource DelayedLoadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource DelayedPauseStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource DelayedResumeStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource DelayedRetryStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public List<(StandaloneShareBatchRecord Batch, IReadOnlyList<StandaloneShareOperationRecord> Operations)> Created { get; } = [];
         public List<(Guid BatchId, long Revision)> PauseCalls { get; } = [];
         public List<(Guid BatchId, long Revision)> ResumeCalls { get; } = [];
         public List<(Guid OperationId, int Generation, long Revision)> RetryCalls { get; } = [];
 
-        public Task CreateBatchAsync(
-            StandaloneShareBatchRecord batch,
-            IReadOnlyList<StandaloneShareOperationRecord> operationRecords,
+        public Task<StandaloneShareBatchCreationReceipt> CreateOrGetBatchAsync(
+            StandaloneSharePendingBatchEnvelope envelope,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (CreateError is not null) throw CreateError;
+            var existing = Created.FirstOrDefault(item => item.Batch.Id == envelope.Batch.Id);
+            if (existing.Batch is not null)
+            {
+                var existingEnvelope = StandaloneSharePendingBatchEnvelope.Create(existing.Batch, existing.Operations);
+                if (!string.Equals(existingEnvelope.DraftFingerprint, envelope.DraftFingerprint, StringComparison.Ordinal))
+                    throw new InvalidOperationException("idempotency conflict");
+                return Task.FromResult(new StandaloneShareBatchCreationReceipt(
+                    existingEnvelope.DraftFingerprint, existing.Batch, existing.Operations, alreadyExisted: true));
+            }
+            var batch = envelope.Batch;
+            var operationRecords = envelope.Operations;
             Created.Add((batch, operationRecords.ToArray()));
             batches.Add(batch);
             operations.Add(batch.Id, operationRecords.ToList());
             AfterCreate?.Invoke();
-            return Task.CompletedTask;
+            if (Created.Count == 1 && ErrorAfterFirstCommit is { } error)
+            {
+                ErrorAfterFirstCommit = null;
+                AfterFirstCommit?.Invoke();
+                throw error;
+            }
+            return Task.FromResult(new StandaloneShareBatchCreationReceipt(
+                envelope.DraftFingerprint, batch, operationRecords, alreadyExisted: false));
         }
 
-        public Task<Page<StandaloneShareBatchRecord>> GetBatchesAsync(
+        public Task<StandaloneShareBatchCreationReceipt?> GetBatchCreationAsync(
+            Guid batchId,
+            string draftFingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var existing = Created.FirstOrDefault(item => item.Batch.Id == batchId);
+            if (existing.Batch is null) return Task.FromResult<StandaloneShareBatchCreationReceipt?>(null);
+            var envelope = StandaloneSharePendingBatchEnvelope.Create(existing.Batch, existing.Operations);
+            return Task.FromResult<StandaloneShareBatchCreationReceipt?>(
+                string.Equals(envelope.DraftFingerprint, draftFingerprint, StringComparison.Ordinal)
+                    ? new StandaloneShareBatchCreationReceipt(
+                        envelope.DraftFingerprint, existing.Batch, existing.Operations, alreadyExisted: true)
+                    : null);
+        }
+
+        public async Task<Page<StandaloneShareBatchRecord>> GetBatchesAsync(
             PageQuery query,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
             query.Validate();
             var ordered = batches.OrderByDescending(item => item.CreatedAt).ToArray();
-            return Task.FromResult(new Page<StandaloneShareBatchRecord>(
+            if (BeforeGetBatches is not null)
+            {
+                DelayedHistoryStarted.TrySetResult();
+                await BeforeGetBatches(cancellationToken);
+            }
+            return new Page<StandaloneShareBatchRecord>(
                 ordered.Skip(query.Offset).Take(query.PageSize).ToArray(),
                 ordered.Length,
                 query.PageNumber,
-                query.PageSize));
+                query.PageSize);
         }
 
         public async Task<IReadOnlyList<StandaloneShareOperationRecord>> GetOperationsAsync(
@@ -438,41 +800,70 @@ public sealed class ShareWorkspaceViewModelTests
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            IReadOnlyList<StandaloneShareOperationRecord> snapshot =
+                operations.TryGetValue(batchId, out var found)
+                    ? found.OrderBy(item => item.SequenceNumber).ToArray()
+                    : [];
             if (BeforeGetOperations is not null)
             {
                 DelayedLoadStarted.TrySetResult();
                 await BeforeGetOperations(batchId, cancellationToken);
             }
-            return operations.TryGetValue(batchId, out var found)
-                ? found.OrderBy(item => item.SequenceNumber).ToArray()
-                : [];
+            return snapshot;
         }
 
-        public Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryPauseBatchAsync(
+        public async Task<StandaloneShareBatchSnapshot?> GetBatchSnapshotAsync(
+            Guid batchId,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var batch = batches.FirstOrDefault(item => item.Id == batchId);
+            if (batch is null || !operations.TryGetValue(batchId, out var found)) return null;
+            var snapshot = new StandaloneShareBatchSnapshot(
+                batch, found.OrderBy(item => item.SequenceNumber).ToArray());
+            if (BeforeGetOperations is not null)
+            {
+                DelayedLoadStarted.TrySetResult();
+                await BeforeGetOperations(batchId, cancellationToken);
+            }
+            return snapshot;
+        }
+
+        public async Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryPauseBatchAsync(
             Guid batchId,
             long expectedRevision,
             DateTimeOffset updatedAt,
             CancellationToken cancellationToken = default)
         {
             PauseCalls.Add((batchId, expectedRevision));
-            return Task.FromResult(ChangeBatch(
+            if (BeforePause is not null)
+            {
+                DelayedPauseStarted.TrySetResult();
+                await BeforePause(batchId, cancellationToken);
+            }
+            return ChangeBatch(
                 batchId, expectedRevision, StandaloneShareBatchStatus.Paused,
-                [StandaloneShareBatchStatus.Queued, StandaloneShareBatchStatus.Active], updatedAt));
+                [StandaloneShareBatchStatus.Queued, StandaloneShareBatchStatus.Active], updatedAt);
         }
 
-        public Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryResumeBatchAsync(
+        public async Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>> TryResumeBatchAsync(
             Guid batchId,
             long expectedRevision,
             DateTimeOffset updatedAt,
             CancellationToken cancellationToken = default)
         {
             ResumeCalls.Add((batchId, expectedRevision));
-            return Task.FromResult(ChangeBatch(
+            if (BeforeResume is not null)
+            {
+                DelayedResumeStarted.TrySetResult();
+                await BeforeResume(batchId, cancellationToken);
+            }
+            return ChangeBatch(
                 batchId, expectedRevision, StandaloneShareBatchStatus.Queued,
-                [StandaloneShareBatchStatus.Paused], updatedAt));
+                [StandaloneShareBatchStatus.Paused], updatedAt);
         }
 
-        public Task<StandaloneShareMutationResult<StandaloneShareOperationRecord>> TryRetryFailedOperationAsync(
+        public async Task<StandaloneShareMutationResult<StandaloneShareOperationRecord>> TryRetryFailedOperationAsync(
             Guid operationId,
             int expectedGeneration,
             long expectedRevision,
@@ -480,17 +871,22 @@ public sealed class ShareWorkspaceViewModelTests
             CancellationToken cancellationToken = default)
         {
             RetryCalls.Add((operationId, expectedGeneration, expectedRevision));
+            if (BeforeRetry is not null)
+            {
+                DelayedRetryStarted.TrySetResult();
+                await BeforeRetry(operationId, cancellationToken);
+            }
             var pair = operations.SelectMany(pair => pair.Value.Select((item, index) => (pair.Key, item, index)))
                 .FirstOrDefault(value => value.item.Id == operationId);
             if (pair.item is null)
-                return Task.FromResult(new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
-                    StandaloneShareMutationDisposition.NotFound, null));
+                return new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
+                    StandaloneShareMutationDisposition.NotFound, null);
             if (pair.item.Generation != expectedGeneration || pair.item.Revision != expectedRevision)
-                return Task.FromResult(new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
-                    StandaloneShareMutationDisposition.Conflict, pair.item));
+                return new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
+                    StandaloneShareMutationDisposition.Conflict, pair.item);
             if (!pair.item.CanSafelyRetry)
-                return Task.FromResult(new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
-                    StandaloneShareMutationDisposition.Unsafe, pair.item));
+                return new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
+                    StandaloneShareMutationDisposition.Unsafe, pair.item);
             var updated = RebuildOperation(
                 pair.item,
                 StandaloneShareOperationStatus.Queued,
@@ -498,8 +894,8 @@ public sealed class ShareWorkspaceViewModelTests
                 pair.item.Generation + 1,
                 pair.item.Revision + 1);
             operations[pair.Key][pair.index] = updated;
-            return Task.FromResult(new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
-                StandaloneShareMutationDisposition.Applied, updated));
+            return new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
+                StandaloneShareMutationDisposition.Applied, updated);
         }
 
         public StandaloneShareBatchRecord SeedBatch(
@@ -524,6 +920,19 @@ public sealed class ShareWorkspaceViewModelTests
         {
             var updated = replace(Assert.Single(operations[batchId]));
             operations[batchId][0] = updated;
+            return updated;
+        }
+
+        public StandaloneShareBatchRecord ReplaceBatch(
+            Guid batchId,
+            StandaloneShareBatchStatus status)
+        {
+            var index = batches.FindIndex(item => item.Id == batchId);
+            var current = batches[index];
+            var updated = new StandaloneShareBatchRecord(
+                current.Id, current.ResultDirectoryReference, status, current.OperationCount,
+                current.Revision + 1, current.CreatedAt, DateTimeOffset.UtcNow);
+            batches[index] = updated;
             return updated;
         }
 

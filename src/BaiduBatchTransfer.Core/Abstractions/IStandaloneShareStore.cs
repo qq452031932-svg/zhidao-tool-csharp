@@ -2,9 +2,13 @@ namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IStandaloneShareStore
 {
-    Task CreateBatchAsync(
-        StandaloneShareBatchRecord batch,
-        IReadOnlyList<StandaloneShareOperationRecord> operations,
+    Task<StandaloneShareBatchCreationReceipt> CreateOrGetBatchAsync(
+        StandaloneSharePendingBatchEnvelope envelope,
+        CancellationToken cancellationToken = default);
+
+    Task<StandaloneShareBatchCreationReceipt?> GetBatchCreationAsync(
+        Guid batchId,
+        string draftFingerprint,
         CancellationToken cancellationToken = default);
 
     Task<Page<StandaloneShareBatchRecord>> GetBatchesAsync(
@@ -12,6 +16,10 @@ public interface IStandaloneShareStore
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<StandaloneShareOperationRecord>> GetOperationsAsync(
+        Guid batchId,
+        CancellationToken cancellationToken = default);
+
+    Task<StandaloneShareBatchSnapshot?> GetBatchSnapshotAsync(
         Guid batchId,
         CancellationToken cancellationToken = default);
 

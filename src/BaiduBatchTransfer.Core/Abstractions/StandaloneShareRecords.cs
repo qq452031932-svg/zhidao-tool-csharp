@@ -1,4 +1,7 @@
 using BaiduBatchTransfer.Core.Domain;
+using System.Collections.Immutable;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace BaiduBatchTransfer.Core.Abstractions;
 
@@ -103,6 +106,8 @@ public sealed record StandaloneShareOperationRecord
         if (batchId == Guid.Empty) throw new ArgumentException("A batch id is required.", nameof(batchId));
         if (accountId == Guid.Empty) throw new ArgumentException("An owning account is required.", nameof(accountId));
         ArgumentNullException.ThrowIfNull(exactRemoteItems);
+        if (exactRemoteItems.Count != 1)
+            throw new ArgumentException("Exactly one remote item is required.", nameof(exactRemoteItems));
         ArgumentException.ThrowIfNullOrWhiteSpace(displayName);
         if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
         ArgumentNullException.ThrowIfNull(parentPath);
@@ -190,3 +195,117 @@ public sealed record StandaloneShareMutationResult<T>(
     StandaloneShareMutationDisposition Disposition,
     T? Value)
     where T : class;
+
+public sealed record StandaloneSharePendingBatchEnvelope
+{
+    public StandaloneSharePendingBatchEnvelope(
+        string draftFingerprint,
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(draftFingerprint);
+        ArgumentNullException.ThrowIfNull(batch);
+        ArgumentNullException.ThrowIfNull(operations);
+        var snapshot = operations.ToImmutableArray();
+        ValidateGraph(batch, snapshot);
+        var computed = ComputeDraftFingerprint(batch, snapshot);
+        if (!string.Equals(draftFingerprint, computed, StringComparison.Ordinal))
+            throw new ArgumentException("The draft fingerprint does not match the batch contents.", nameof(draftFingerprint));
+        DraftFingerprint = draftFingerprint;
+        Batch = batch;
+        Operations = snapshot;
+    }
+
+    public string DraftFingerprint { get; }
+    public StandaloneShareBatchRecord Batch { get; }
+    public ImmutableArray<StandaloneShareOperationRecord> Operations { get; }
+
+    public static StandaloneSharePendingBatchEnvelope Create(
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        ArgumentNullException.ThrowIfNull(operations);
+        return new(ComputeDraftFingerprint(batch, operations), batch, operations);
+    }
+
+    internal static void ValidateGraph(
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        if (operations.Count != batch.OperationCount)
+            throw new ArgumentException("The operation count does not match the batch.", nameof(operations));
+        if (operations.Select(operation => operation.Id).Distinct().Count() != operations.Count)
+            throw new ArgumentException("Operation ids must be unique.", nameof(operations));
+        for (var index = 0; index < operations.Count; index++)
+        {
+            var operation = operations[index];
+            if (operation.BatchId != batch.Id || operation.SequenceNumber != index + 1 ||
+                operation.ExactRemoteItems.Count != 1)
+            {
+                throw new ArgumentException("The operation graph does not match the batch.", nameof(operations));
+            }
+        }
+    }
+
+    private static string ComputeDraftFingerprint(
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        ValidateGraph(batch, operations);
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, new UTF8Encoding(false, true), leaveOpen: true))
+        {
+            writer.Write(batch.ResultDirectoryReference);
+            writer.Write(operations.Count);
+            foreach (var operation in operations.OrderBy(item => item.SequenceNumber))
+            {
+                writer.Write(operation.AccountId.ToByteArray());
+                writer.Write(operation.ExactRemoteItems.Fingerprint);
+                writer.Write(operation.DisplayName);
+                writer.Write((int)operation.Kind);
+                writer.Write(operation.ParentPath.Value);
+            }
+        }
+        return Convert.ToHexString(SHA256.HashData(stream.ToArray())).ToLowerInvariant();
+    }
+}
+
+public sealed record StandaloneShareBatchCreationReceipt
+{
+    public StandaloneShareBatchCreationReceipt(
+        string draftFingerprint,
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations,
+        bool alreadyExisted)
+    {
+        var envelope = new StandaloneSharePendingBatchEnvelope(draftFingerprint, batch, operations);
+        DraftFingerprint = envelope.DraftFingerprint;
+        Batch = envelope.Batch;
+        Operations = envelope.Operations;
+        AlreadyExisted = alreadyExisted;
+    }
+
+    public string DraftFingerprint { get; }
+    public StandaloneShareBatchRecord Batch { get; }
+    public ImmutableArray<StandaloneShareOperationRecord> Operations { get; }
+    public bool AlreadyExisted { get; }
+}
+
+public sealed record StandaloneShareBatchSnapshot
+{
+    public StandaloneShareBatchSnapshot(
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        ArgumentNullException.ThrowIfNull(operations);
+        var snapshot = operations.ToImmutableArray();
+        StandaloneSharePendingBatchEnvelope.ValidateGraph(batch, snapshot);
+        Batch = batch;
+        Operations = snapshot;
+    }
+
+    public StandaloneShareBatchRecord Batch { get; }
+    public ImmutableArray<StandaloneShareOperationRecord> Operations { get; }
+}
