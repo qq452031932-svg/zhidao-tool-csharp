@@ -78,6 +78,23 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
+    public void ShellCompositionKeepsItsLifetimeUntilWindowClose()
+    {
+        var bootstrap = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "AppBootstrap.cs"));
+
+        Assert.DoesNotContain("using var shellLifetime", bootstrap);
+        Assert.DoesNotContain("using var handoff", bootstrap);
+        Assert.Contains("handoff.Dispose();", bootstrap);
+        Assert.Contains("decisionPoll.Tick -= OnDecisionPollTick;", bootstrap);
+        Assert.Contains("importViewModel.DraftReady -= OnDraftReady;", bootstrap);
+        Assert.Contains("wizardViewModel.JobCreated -= OnJobCreated;", bootstrap);
+    }
+
+    [Fact]
     public async Task LocalTextImportWorksWhileLiveTransfersRemainDisabled()
     {
         using var host = AppBootstrap.CreateHost(root);

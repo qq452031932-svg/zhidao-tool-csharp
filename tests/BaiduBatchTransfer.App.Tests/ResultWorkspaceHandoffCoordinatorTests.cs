@@ -1,0 +1,168 @@
+using BaiduBatchTransfer.App;
+
+namespace BaiduBatchTransfer.App.Tests;
+
+public sealed class ResultWorkspaceHandoffCoordinatorTests
+{
+    [Fact]
+    public async Task NewJobSupersedesAnInFlightRestoreBeforeItCanResolveOrNavigate()
+    {
+        var pending = Guid.NewGuid();
+        var job = Guid.NewGuid();
+        var operations = new ControlledOperations { PendingBatch = pending, BlockPendingLookup = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+
+        var restore = coordinator.RestorePendingAsync();
+        await operations.PendingLookupStarted.Task;
+
+        var activate = coordinator.ActivateJobAsync(job);
+        operations.ReleasePendingLookup();
+        await Task.WhenAll(restore, activate);
+
+        Assert.DoesNotContain(pending, operations.InitializedBatches);
+        Assert.DoesNotContain(pending, operations.ResolvedBatches);
+        Assert.Equal([job], operations.InitializedBatches);
+        Assert.Equal([job], operations.NavigatedBatches);
+    }
+
+    [Fact]
+    public async Task ConcurrentRestoreRequestsCoalesceToOnePendingLookup()
+    {
+        var operations = new ControlledOperations { BlockPendingLookup = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+
+        var first = coordinator.RestorePendingAsync();
+        await operations.PendingLookupStarted.Task;
+        var second = coordinator.RestorePendingAsync();
+
+        Assert.Same(first, second);
+        operations.ReleasePendingLookup();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, operations.PendingLookupCalls);
+    }
+
+    [Fact]
+    public async Task LatestJobActivationOwnsTheResultsWorkspace()
+    {
+        var firstJob = Guid.NewGuid();
+        var latestJob = Guid.NewGuid();
+        var operations = new ControlledOperations { BlockFirstActivation = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+
+        var first = coordinator.ActivateJobAsync(firstJob);
+        await operations.FirstActivationStarted.Task;
+        var latest = coordinator.ActivateJobAsync(latestJob);
+        operations.ReleaseFirstActivation();
+        await Task.WhenAll(first, latest);
+
+        Assert.Equal(latestJob, operations.VisibleBatch);
+        Assert.Equal([latestJob], operations.NavigatedBatches);
+    }
+
+    [Fact]
+    public async Task RestoreTickCannotSupersedeAnInFlightJobActivation()
+    {
+        var job = Guid.NewGuid();
+        var operations = new ControlledOperations { BlockFirstActivation = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+
+        var activate = coordinator.ActivateJobAsync(job);
+        await operations.FirstActivationStarted.Task;
+        var restore = coordinator.RestorePendingAsync();
+        operations.ReleaseFirstActivation();
+        await Task.WhenAll(activate, restore);
+
+        Assert.Equal(job, operations.VisibleBatch);
+        Assert.Equal([job], operations.NavigatedBatches);
+        Assert.Equal(0, operations.PendingLookupCalls);
+    }
+
+    [Fact]
+    public async Task CloseCancelsRestoreAndPreventsPostCloseNavigation()
+    {
+        var operations = new ControlledOperations { PendingBatch = Guid.NewGuid(), BlockPendingLookup = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+
+        var restore = coordinator.RestorePendingAsync();
+        await operations.PendingLookupStarted.Task;
+        coordinator.Close();
+        operations.ReleasePendingLookup();
+        await restore;
+
+        Assert.True(coordinator.IsClosed);
+        Assert.Empty(operations.NavigatedBatches);
+        Assert.Empty(operations.ResolvedBatches);
+    }
+
+    [Fact]
+    public async Task HandoffExceptionsAreObservedAndDoNotEscapeQueuedWork()
+    {
+        var exceptions = new List<Exception>();
+        var operations = new ControlledOperations { PendingLookupException = new InvalidOperationException("boom") };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations, exceptions.Add);
+
+        await coordinator.RestorePendingAsync();
+
+        Assert.IsType<InvalidOperationException>(Assert.Single(exceptions));
+    }
+
+    private sealed class ControlledOperations : IResultWorkspaceHandoffOperations
+    {
+        private readonly TaskCompletionSource pendingLookupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource firstActivationRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Guid? PendingBatch { get; init; }
+        public bool BlockPendingLookup { get; init; }
+        public bool BlockFirstActivation { get; init; }
+        public Exception? PendingLookupException { get; init; }
+        public int PendingLookupCalls { get; private set; }
+        public List<Guid> InitializedBatches { get; } = [];
+        public List<Guid> ResolvedBatches { get; } = [];
+        public List<Guid> NavigatedBatches { get; } = [];
+        public Guid? VisibleBatch { get; private set; }
+        public TaskCompletionSource PendingLookupStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstActivationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<Guid?> FindPendingBatchAsync(CancellationToken cancellationToken)
+        {
+            PendingLookupCalls++;
+            PendingLookupStarted.TrySetResult();
+            if (PendingLookupException is not null) throw PendingLookupException;
+            if (BlockPendingLookup) await pendingLookupRelease.Task;
+            return PendingBatch;
+        }
+
+        public async Task InitializeAsync(Guid batchJobId, CancellationToken cancellationToken)
+        {
+            if (BlockFirstActivation && InitializedBatches.Count == 0)
+            {
+                InitializedBatches.Add(batchJobId);
+                FirstActivationStarted.TrySetResult();
+                await firstActivationRelease.Task;
+                cancellationToken.ThrowIfCancellationRequested();
+                InitializedBatches.Remove(batchJobId);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            InitializedBatches.Add(batchJobId);
+            VisibleBatch = batchJobId;
+        }
+
+        public Task ResolveExistingSharesAsync(Guid batchJobId, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ResolvedBatches.Add(batchJobId);
+            return Task.CompletedTask;
+        }
+
+        public Task NavigateToResultsAsync(Guid batchJobId, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            NavigatedBatches.Add(batchJobId);
+            return Task.CompletedTask;
+        }
+
+        public void ReleasePendingLookup() => pendingLookupRelease.TrySetResult();
+        public void ReleaseFirstActivation() => firstActivationRelease.TrySetResult();
+    }
+}

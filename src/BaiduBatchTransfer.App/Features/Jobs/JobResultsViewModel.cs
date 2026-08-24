@@ -254,17 +254,22 @@ public sealed class JobResultsViewModel : ObservableObject
     public async Task<Guid?> RestorePendingExistingShareDecisionAsync(
         CancellationToken cancellationToken = default)
     {
+        var pendingBatch = await FindPendingExistingShareBatchAsync(cancellationToken).ConfigureAwait(true);
+        if (pendingBatch is not { } batchJobId) return null;
+        await InitializeAsync(batchJobId, cancellationToken).ConfigureAwait(true);
+        await ResolvePendingExistingSharesAsync(batchJobId, cancellationToken).ConfigureAwait(true);
+        return batchJobId;
+    }
+
+    internal async Task<Guid?> FindPendingExistingShareBatchAsync(
+        CancellationToken cancellationToken = default)
+    {
         if (!capabilities.CanUseShareActions || existingShareInteraction is null || IsBusy || IsSaving) return null;
         try
         {
             var pending = await existingShareInteraction.GetPendingBatchIdsAsync(100, cancellationToken).ConfigureAwait(true);
             var pendingBatch = pending.FirstOrDefault(id => !autoPromptedExistingShareBatches.Contains(id));
-            if (pendingBatch == Guid.Empty) return null;
-            await InitializeAsync(pendingBatch, cancellationToken).ConfigureAwait(true);
-            var outcome = await ResolveExistingSharesCoreAsync(cancellationToken).ConfigureAwait(true);
-            if (outcome?.UserClosed == true) autoPromptedExistingShareBatches.Add(pendingBatch);
-            else if (outcome?.Completed == true) autoPromptedExistingShareBatches.Remove(pendingBatch);
-            return pendingBatch;
+            return pendingBatch == Guid.Empty ? null : pendingBatch;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -276,6 +281,17 @@ public sealed class JobResultsViewModel : ObservableObject
             StatusMessage = "无法恢复待确认的已有分享，请稍后重试。";
             return null;
         }
+    }
+
+    internal async Task ResolvePendingExistingSharesAsync(
+        Guid expectedBatchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        if (expectedBatchJobId == Guid.Empty || batchJobId != expectedBatchJobId) return;
+        var outcome = await ResolveExistingSharesCoreAsync(cancellationToken).ConfigureAwait(true);
+        if (batchJobId != expectedBatchJobId) return;
+        if (outcome?.UserClosed == true) autoPromptedExistingShareBatches.Add(expectedBatchJobId);
+        else if (outcome?.Completed == true) autoPromptedExistingShareBatches.Remove(expectedBatchJobId);
     }
 
     public async Task SaveAsAsync(CancellationToken cancellationToken = default)

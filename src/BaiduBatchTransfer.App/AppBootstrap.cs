@@ -399,75 +399,106 @@ public sealed class AppShellFactory(
                 TextWrapping = System.Windows.TextWrapping.Wrap,
             },
         };
-        MainWindowViewModel? mainViewModel = null;
-        importViewModel.DraftReady += async (_, draft) =>
-        {
-            await DispatchOnUiAsync(() =>
-            {
-                wizardViewModel.Initialize(new ImportWizardContext(
-                    draft.SessionId,
-                    $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
-                    draft.Statistics.Ready,
-                    draft.Statistics.HasExcelAccountColumn,
-                    draft.Statistics.UnresolvedAccountMappings,
-                    draft.Statistics.Conflict,
-                    draft.Statistics.NeedsResolution,
-                    "/我的资源"));
-                transferWorkspace.Content = wizardView;
-                mainViewModel?.ShowTransferCommand.Execute(null);
-            }).ConfigureAwait(true);
-        };
-        mainViewModel = new MainWindowViewModel(
+        var mainViewModel = new MainWindowViewModel(
             transferWorkspace,
             shareWorkspace,
             loginLauncher,
             accountManagementLauncher,
             accountRefresh.RefreshAsync,
             initialActiveAccountCount);
-        wizardViewModel.JobCreated += async (_, batchId) =>
+        var mainWindow = new MainWindow(mainViewModel);
+        var shellLifetime = new CancellationTokenSource();
+        var shellClosed = 0;
+
+        async Task NavigateToResultsAsync(Guid _, CancellationToken cancellationToken)
         {
-            await resultsViewModel.InitializeAsync(batchId).ConfigureAwait(true);
             await DispatchOnUiAsync(() =>
             {
+                if (cancellationToken.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
                 transferWorkspace.Content = resultsView;
                 mainViewModel.ShowTransferCommand.Execute(null);
             }).ConfigureAwait(true);
-        };
-        var mainWindow = new MainWindow(mainViewModel);
+        }
+
+        var handoff = new ResultWorkspaceHandoffCoordinator(
+            new JobResultsWorkspaceHandoffOperations(resultsViewModel, NavigateToResultsAsync));
+
+        async Task HandleDraftReadyAsync(ImportDraftReady draft)
+        {
+            try
+            {
+                await DispatchOnUiAsync(() =>
+                {
+                    if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
+                    wizardViewModel.Initialize(new ImportWizardContext(
+                        draft.SessionId,
+                        $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
+                        draft.Statistics.Ready,
+                        draft.Statistics.HasExcelAccountColumn,
+                        draft.Statistics.UnresolvedAccountMappings,
+                        draft.Statistics.Conflict,
+                        draft.Statistics.NeedsResolution,
+                        "/我的资源"));
+                    transferWorkspace.Content = wizardView;
+                    mainViewModel.ShowTransferCommand.Execute(null);
+                }).ConfigureAwait(true);
+            }
+            catch (OperationCanceledException) when (shellLifetime.IsCancellationRequested) { }
+            catch { }
+        }
+
+        static async Task ObserveAsync(Task task)
+        {
+            try { await task.ConfigureAwait(true); }
+            catch { }
+        }
+
+        void Observe(Task task) => _ = ObserveAsync(task);
+        void OnDraftReady(object? _, ImportDraftReady draft) => Observe(HandleDraftReadyAsync(draft));
+        void OnJobCreated(object? _, Guid batchId) => Observe(handoff.ActivateJobAsync(batchId));
+
         var decisionPoll = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(2),
         };
-        var decisionCheckRunning = false;
-        decisionPoll.Tick += async (_, _) =>
+
+        void OnDecisionPollTick(object? _, EventArgs __)
         {
-            if (decisionCheckRunning) return;
-            decisionCheckRunning = true;
-            try
-            {
-                var pendingBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
-                if (pendingBatch is not null)
-                {
-                    transferWorkspace.Content = resultsView;
-                    mainViewModel.ShowTransferCommand.Execute(null);
-                }
-            }
-            finally
-            {
-                decisionCheckRunning = false;
-            }
-        };
-        mainWindow.Loaded += async (_, _) =>
+            if (Volatile.Read(ref shellClosed) != 0) return;
+            Observe(handoff.RestorePendingAsync());
+        }
+
+        async Task HandleLoadedAsync()
         {
-            var restoredBatch = await resultsViewModel.RestorePendingExistingShareDecisionAsync().ConfigureAwait(true);
-            if (restoredBatch is not null)
+            await handoff.RestorePendingAsync().ConfigureAwait(true);
+            await DispatchOnUiAsync(() =>
             {
-                transferWorkspace.Content = resultsView;
-                mainViewModel.ShowTransferCommand.Execute(null);
-            }
-            if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
-        };
-        mainWindow.Closed += (_, _) => decisionPoll.Stop();
+                if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
+                if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
+            }).ConfigureAwait(true);
+        }
+
+        void OnLoaded(object? _, System.Windows.RoutedEventArgs __) => Observe(HandleLoadedAsync());
+        void OnClosed(object? _, EventArgs __)
+        {
+            if (Interlocked.Exchange(ref shellClosed, 1) != 0) return;
+            shellLifetime.Cancel();
+            handoff.Close();
+            decisionPoll.Stop();
+            decisionPoll.Tick -= OnDecisionPollTick;
+            importViewModel.DraftReady -= OnDraftReady;
+            wizardViewModel.JobCreated -= OnJobCreated;
+            mainWindow.Loaded -= OnLoaded;
+            mainWindow.Closed -= OnClosed;
+            handoff.Dispose();
+            shellLifetime.Dispose();
+        }
+
+        importViewModel.DraftReady += OnDraftReady;
+        wizardViewModel.JobCreated += OnJobCreated;
+        decisionPoll.Tick += OnDecisionPollTick;
+        mainWindow.Loaded += OnLoaded;
+        mainWindow.Closed += OnClosed;
         return mainWindow;
     }
 }
