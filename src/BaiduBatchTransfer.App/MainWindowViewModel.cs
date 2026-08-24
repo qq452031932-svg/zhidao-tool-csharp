@@ -181,6 +181,9 @@ public sealed class MainWindowViewModel : ObservableObject
         }
     }
 
+    internal void ReportHandoffFailure() =>
+        StatusMessage = "结果工作区操作失败，请稍后重试。";
+
     private async Task RefreshAccountsAsync(CancellationToken cancellationToken)
     {
         if (refreshAccounts is null) return;

@@ -10,12 +10,17 @@ public interface IResultWorkspaceHandoffOperations
     Task NavigateToResultsAsync(Guid batchJobId, CancellationToken cancellationToken);
 }
 
+public delegate Task ResultWorkspaceHandoffDispatchAsync(
+    Func<CancellationToken, Task> operation,
+    CancellationToken cancellationToken);
+
 public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
 {
     private readonly object sync = new();
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly CancellationTokenSource lifetime = new();
     private readonly IResultWorkspaceHandoffOperations operations;
+    private readonly ResultWorkspaceHandoffDispatchAsync dispatchAsync;
     private readonly Action<Exception>? reportException;
     private CancellationTokenSource? activeRequest;
     private Request? activeRestore;
@@ -26,8 +31,17 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
     public ResultWorkspaceHandoffCoordinator(
         IResultWorkspaceHandoffOperations operations,
         Action<Exception>? reportException = null)
+        : this(operations, static (operation, cancellationToken) => operation(cancellationToken), reportException)
+    {
+    }
+
+    public ResultWorkspaceHandoffCoordinator(
+        IResultWorkspaceHandoffOperations operations,
+        ResultWorkspaceHandoffDispatchAsync dispatchAsync,
+        Action<Exception>? reportException = null)
     {
         this.operations = operations ?? throw new ArgumentNullException(nameof(operations));
+        this.dispatchAsync = dispatchAsync ?? throw new ArgumentNullException(nameof(dispatchAsync));
         this.reportException = reportException;
     }
 
@@ -98,7 +112,9 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
             try
             {
                 if (!IsCurrent(request)) return;
-                await operations.InitializeAsync(batchJobId, request.Cancellation.Token).ConfigureAwait(false);
+                await InvokeOnDispatcherAsync(
+                    request,
+                    cancellationToken => operations.InitializeAsync(batchJobId, cancellationToken)).ConfigureAwait(false);
                 await NavigateIfCurrentAsync(request, batchJobId).ConfigureAwait(false);
             }
             finally
@@ -126,9 +142,17 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
             try
             {
                 if (!IsCurrent(request)) return;
-                var batchJobId = await operations.FindPendingBatchAsync(request.Cancellation.Token).ConfigureAwait(false);
+                Guid? batchJobId = null;
+                await InvokeOnDispatcherAsync(
+                    request,
+                    async cancellationToken =>
+                    {
+                        batchJobId = await operations.FindPendingBatchAsync(cancellationToken).ConfigureAwait(true);
+                    }).ConfigureAwait(false);
                 if (batchJobId is not { } batch || !IsCurrent(request)) return;
-                await operations.InitializeAsync(batch, request.Cancellation.Token).ConfigureAwait(false);
+                await InvokeOnDispatcherAsync(
+                    request,
+                    cancellationToken => operations.InitializeAsync(batch, cancellationToken)).ConfigureAwait(false);
                 if (!IsCurrent(request)) return;
                 await ResolveIfCurrentAsync(request, batch).ConfigureAwait(false);
                 await NavigateIfCurrentAsync(request, batch).ConfigureAwait(false);
@@ -157,27 +181,36 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         }
     }
 
-    private async Task ResolveIfCurrentAsync(Request request, Guid batchJobId)
+    private Task ResolveIfCurrentAsync(Request request, Guid batchJobId)
     {
-        Task resolve;
         lock (sync)
         {
-            if (!IsCurrentLocked(request)) return;
-            resolve = operations.ResolveExistingSharesAsync(batchJobId, request.Cancellation.Token);
+            if (!IsCurrentLocked(request)) return Task.CompletedTask;
         }
-        await resolve.ConfigureAwait(false);
+        return InvokeOnDispatcherAsync(
+            request,
+            cancellationToken => operations.ResolveExistingSharesAsync(batchJobId, cancellationToken));
     }
 
-    private async Task NavigateIfCurrentAsync(Request request, Guid batchJobId)
+    private Task NavigateIfCurrentAsync(Request request, Guid batchJobId)
     {
-        Task navigate;
         lock (sync)
         {
-            if (!IsCurrentLocked(request)) return;
-            navigate = operations.NavigateToResultsAsync(batchJobId, request.Cancellation.Token);
+            if (!IsCurrentLocked(request)) return Task.CompletedTask;
         }
-        await navigate.ConfigureAwait(false);
+        return InvokeOnDispatcherAsync(
+            request,
+            cancellationToken => operations.NavigateToResultsAsync(batchJobId, cancellationToken));
     }
+
+    private Task InvokeOnDispatcherAsync(
+        Request request,
+        Func<CancellationToken, Task> operation) =>
+        dispatchAsync(
+            cancellationToken => IsCurrent(request)
+                ? operation(cancellationToken)
+                : Task.CompletedTask,
+            request.Cancellation.Token);
 
     private bool IsCurrent(Request request)
     {

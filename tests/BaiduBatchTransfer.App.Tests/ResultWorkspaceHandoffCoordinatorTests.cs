@@ -107,6 +107,27 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
         Assert.IsType<InvalidOperationException>(Assert.Single(exceptions));
     }
 
+    [Fact]
+    public async Task ViewModelOperationsUseTheInjectedDispatcherAfterAnAwaitedLookup()
+    {
+        var dispatcher = new AffinityDispatcher();
+        var operations = new ControlledOperations
+        {
+            PendingBatch = Guid.NewGuid(),
+            BlockPendingLookup = true,
+            HasDispatcherAccess = () => dispatcher.HasAccess,
+        };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations, dispatcher.InvokeAsync);
+
+        var restore = coordinator.RestorePendingAsync();
+        await operations.PendingLookupStarted.Task;
+        operations.ReleasePendingLookup();
+        await restore;
+
+        Assert.Equal(["find", "initialize", "resolve", "navigate"], operations.DispatcherBoundOperations);
+        Assert.Equal(4, dispatcher.InvocationCount);
+    }
+
     private sealed class ControlledOperations : IResultWorkspaceHandoffOperations
     {
         private readonly TaskCompletionSource pendingLookupRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -115,16 +136,19 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
         public bool BlockPendingLookup { get; init; }
         public bool BlockFirstActivation { get; init; }
         public Exception? PendingLookupException { get; init; }
+        public Func<bool>? HasDispatcherAccess { get; init; }
         public int PendingLookupCalls { get; private set; }
         public List<Guid> InitializedBatches { get; } = [];
         public List<Guid> ResolvedBatches { get; } = [];
         public List<Guid> NavigatedBatches { get; } = [];
+        public List<string> DispatcherBoundOperations { get; } = [];
         public Guid? VisibleBatch { get; private set; }
         public TaskCompletionSource PendingLookupStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource FirstActivationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task<Guid?> FindPendingBatchAsync(CancellationToken cancellationToken)
         {
+            VerifyDispatcher("find");
             PendingLookupCalls++;
             PendingLookupStarted.TrySetResult();
             if (PendingLookupException is not null) throw PendingLookupException;
@@ -134,6 +158,7 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
 
         public async Task InitializeAsync(Guid batchJobId, CancellationToken cancellationToken)
         {
+            VerifyDispatcher("initialize");
             if (BlockFirstActivation && InitializedBatches.Count == 0)
             {
                 InitializedBatches.Add(batchJobId);
@@ -150,6 +175,7 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
 
         public Task ResolveExistingSharesAsync(Guid batchJobId, CancellationToken cancellationToken)
         {
+            VerifyDispatcher("resolve");
             cancellationToken.ThrowIfCancellationRequested();
             ResolvedBatches.Add(batchJobId);
             return Task.CompletedTask;
@@ -157,6 +183,7 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
 
         public Task NavigateToResultsAsync(Guid batchJobId, CancellationToken cancellationToken)
         {
+            VerifyDispatcher("navigate");
             cancellationToken.ThrowIfCancellationRequested();
             NavigatedBatches.Add(batchJobId);
             return Task.CompletedTask;
@@ -164,5 +191,36 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
 
         public void ReleasePendingLookup() => pendingLookupRelease.TrySetResult();
         public void ReleaseFirstActivation() => firstActivationRelease.TrySetResult();
+
+        private void VerifyDispatcher(string operation)
+        {
+            if (HasDispatcherAccess is null) return;
+            Assert.True(HasDispatcherAccess(), $"{operation} must run through the dispatcher.");
+            DispatcherBoundOperations.Add(operation);
+        }
+    }
+
+    private sealed class AffinityDispatcher
+    {
+        private readonly AsyncLocal<bool> hasAccess = new();
+        public int InvocationCount { get; private set; }
+        public bool HasAccess => hasAccess.Value;
+
+        public async Task InvokeAsync(Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+        {
+            InvocationCount++;
+            var previousContext = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
+            hasAccess.Value = true;
+            try
+            {
+                await operation(cancellationToken);
+            }
+            finally
+            {
+                hasAccess.Value = false;
+                SynchronizationContext.SetSynchronizationContext(previousContext);
+            }
+        }
     }
 }

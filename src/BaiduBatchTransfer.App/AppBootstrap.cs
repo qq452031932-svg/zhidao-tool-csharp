@@ -410,18 +410,52 @@ public sealed class AppShellFactory(
         var shellLifetime = new CancellationTokenSource();
         var shellClosed = 0;
 
-        async Task NavigateToResultsAsync(Guid _, CancellationToken cancellationToken)
+        async Task DispatchHandoffAsync(
+            Func<CancellationToken, Task> operation,
+            CancellationToken cancellationToken)
         {
-            await DispatchOnUiAsync(() =>
+            cancellationToken.ThrowIfCancellationRequested();
+            var dispatcher = System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.CheckAccess())
             {
-                if (cancellationToken.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
-                transferWorkspace.Content = resultsView;
-                mainViewModel.ShowTransferCommand.Execute(null);
-            }).ConfigureAwait(true);
+                await operation(cancellationToken).ConfigureAwait(true);
+                return;
+            }
+
+            var dispatched = dispatcher.InvokeAsync(
+                () => operation(cancellationToken),
+                System.Windows.Threading.DispatcherPriority.Normal,
+                cancellationToken);
+            var nestedOperation = await dispatched.Task.ConfigureAwait(false);
+            await nestedOperation.ConfigureAwait(false);
+        }
+
+        Task NavigateToResultsAsync(Guid _, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0)
+                return Task.CompletedTask;
+            transferWorkspace.Content = resultsView;
+            mainViewModel.ShowTransferCommand.Execute(null);
+            return Task.CompletedTask;
+        }
+
+        async Task ReportHandoffFailureAsync()
+        {
+            try
+            {
+                await DispatchOnUiAsync(() =>
+                {
+                    if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
+                    mainViewModel.ReportHandoffFailure();
+                }).ConfigureAwait(true);
+            }
+            catch { }
         }
 
         var handoff = new ResultWorkspaceHandoffCoordinator(
-            new JobResultsWorkspaceHandoffOperations(resultsViewModel, NavigateToResultsAsync));
+            new JobResultsWorkspaceHandoffOperations(resultsViewModel, NavigateToResultsAsync),
+            DispatchHandoffAsync,
+            exception => { _ = ReportHandoffFailureAsync(); });
 
         async Task HandleDraftReadyAsync(ImportDraftReady draft)
         {

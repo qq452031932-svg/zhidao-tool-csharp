@@ -2,6 +2,7 @@ using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using System.ComponentModel;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
@@ -58,6 +59,20 @@ public sealed class MainWindowViewModelTests
 
         Assert.Equal("无法打开账号登录，请稍后重试。", vm.StatusMessage);
         Assert.DoesNotContain("InvalidOperationException", vm.StatusMessage);
+    }
+
+    [Fact]
+    public void UnexpectedHandoffFailureUsesStableSanitizedShellStatus()
+    {
+        var vm = new MainWindowViewModel(new object(), new object(), new FakeLoginLauncher());
+        var report = typeof(MainWindowViewModel).GetMethod(
+            "ReportHandoffFailure",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+
+        Assert.NotNull(report);
+        report.Invoke(vm, null);
+
+        Assert.Equal("结果工作区操作失败，请稍后重试。", vm.StatusMessage);
     }
 
     [Fact]
