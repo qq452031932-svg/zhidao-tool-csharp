@@ -34,6 +34,7 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBa
     {
         if (accountId == Guid.Empty) throw new ArgumentException("An account ID is required.", nameof(accountId));
         Directory.CreateDirectory(rootDirectory);
+        ScavengeQuarantine();
         var profilePath = Path.Combine(rootDirectory, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(profilePath);
         return new(profilePath, () => DeleteIsolatedProfileAsync(profilePath));
@@ -64,5 +65,18 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBa
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
         return BaiduAcceptanceProbeCleanupOutcome.Deferred;
+    }
+
+    private void ScavengeQuarantine()
+    {
+        var quarantineRoot = Path.Combine(rootDirectory, "quarantine");
+        if (!Directory.Exists(quarantineRoot)) return;
+        foreach (var candidate in Directory.EnumerateDirectories(quarantineRoot).Take(8))
+        {
+            var relative = Path.GetRelativePath(quarantineRoot, candidate);
+            if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative)) continue;
+            try { Directory.Delete(candidate, recursive: true); }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+        }
     }
 }

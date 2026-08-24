@@ -17,6 +17,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     private readonly TaskCompletionSource initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private CoreWebView2Environment? environment;
+    private uint? browserProcessId;
     private CoreWebView2DevToolsProtocolEventReceiver? requestReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? responseReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? loadingFinishedReceiver;
@@ -50,6 +51,7 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
             lifetime.Token.ThrowIfCancellationRequested();
             await Browser.EnsureCoreWebView2Async(environment).ConfigureAwait(true);
             lifetime.Token.ThrowIfCancellationRequested();
+            browserProcessId = Browser.CoreWebView2.BrowserProcessId;
             ConfigureBrowser(Browser.CoreWebView2);
             await EnableNetworkObservationAsync(Browser.CoreWebView2).ConfigureAwait(true);
             StatusText.Text = "隔离的只读观察页已启动；不会登录、转存、分享或提交远端写入。";
@@ -175,7 +177,17 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     }
 
     private void OnLoadingFinished(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e) =>
-        observations.Track(cancellationToken => ObserveLoadingFinishedAsync(e.ParameterObjectAsJson, cancellationToken));
+        TryTrackLoadingFinished(e);
+
+    private void TryTrackLoadingFinished(CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
+    {
+        try
+        {
+            var payload = e.ParameterObjectAsJson;
+            observations.Track(cancellationToken => ObserveLoadingFinishedAsync(payload, cancellationToken));
+        }
+        catch (Exception exception) when (exception is COMException or InvalidOperationException or ObjectDisposedException) { }
+    }
 
     private async Task ObserveLoadingFinishedAsync(string parameterObjectAsJson, CancellationToken cancellationToken)
     {
@@ -297,24 +309,26 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
 
     private async Task CompleteTeardownAsync()
     {
-        UnsubscribeNetworkObservation();
-        await observations.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
-
         EventHandler<CoreWebView2BrowserProcessExitedEventArgs>? exited = null;
-        var processExited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
+            UnsubscribeNetworkObservation();
+            await observations.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
+            var lifecycle = new BaiduAcceptanceProbeBrowserLifecycle(
+                browserProcessId ?? uint.MaxValue, () => Browser.Dispose(), TimeSpan.FromSeconds(5));
             if (environment is not null)
             {
-                exited = (_, _) => processExited.TrySetResult();
+                exited = (_, eventArgs) =>
+                {
+                    lifecycle.NotifyBrowserProcessExited(eventArgs.BrowserProcessId);
+                };
                 environment.BrowserProcessExited += exited;
             }
-            Browser.Dispose();
             if (environment is not null)
             {
-                try { await processExited.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(true); }
-                catch (TimeoutException) { }
+                await lifecycle.DisposeAfterExitAsync().ConfigureAwait(true);
             }
+            else Browser.Dispose();
         }
         catch (Exception) { }
         finally
@@ -324,20 +338,21 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
                 if (environment is not null && exited is not null) environment.BrowserProcessExited -= exited;
             }
             catch (COMException) { }
-            observations.Dispose();
+            try { observations.Dispose(); }
+            catch (Exception) { }
             closed.TrySetResult();
         }
     }
 
     private void UnsubscribeNetworkObservation()
     {
-        if (requestReceiver is not null) requestReceiver.DevToolsProtocolEventReceived -= OnRequestWillBeSent;
-        if (responseReceiver is not null) responseReceiver.DevToolsProtocolEventReceived -= OnResponseReceived;
-        if (loadingFinishedReceiver is not null) loadingFinishedReceiver.DevToolsProtocolEventReceived -= OnLoadingFinished;
-        if (loadingFailedReceiver is not null) loadingFailedReceiver.DevToolsProtocolEventReceived -= OnLoadingFailed;
+        try { if (requestReceiver is not null) requestReceiver.DevToolsProtocolEventReceived -= OnRequestWillBeSent; } catch (COMException) { }
+        try { if (responseReceiver is not null) responseReceiver.DevToolsProtocolEventReceived -= OnResponseReceived; } catch (COMException) { }
+        try { if (loadingFinishedReceiver is not null) loadingFinishedReceiver.DevToolsProtocolEventReceived -= OnLoadingFinished; } catch (COMException) { }
+        try { if (loadingFailedReceiver is not null) loadingFailedReceiver.DevToolsProtocolEventReceived -= OnLoadingFailed; } catch (COMException) { }
         try
         {
-            var core = Browser.CoreWebView2;
+            if (Browser.CoreWebView2 is not { } core) return;
             core.NavigationStarting -= OnNavigationStarting;
             core.NewWindowRequested -= OnNewWindowRequested;
             core.DownloadStarting -= OnDownloadStarting;

@@ -1,26 +1,26 @@
 namespace BaiduBatchTransfer.App.Features.Acceptance;
 
-public interface IBaiduAcceptanceProbeBrowserProcess
-{
-    Task ObserveExitAsync(CancellationToken cancellationToken = default);
-    void DisposeBrowser();
-    Task WaitForObservationAsync(Task observation, CancellationToken cancellationToken = default);
-}
-
 public sealed class BaiduAcceptanceProbeBrowserLifecycle(
-    IBaiduAcceptanceProbeBrowserProcess browser,
+    uint activeBrowserProcessId,
+    Action disposeBrowser,
     TimeSpan exitTimeout)
 {
+    private readonly TaskCompletionSource exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void NotifyBrowserProcessExited(uint browserProcessId)
+    {
+        if (browserProcessId == activeBrowserProcessId) exited.TrySetResult();
+    }
+
     public async Task<bool> DisposeAfterExitAsync(CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(browser);
-        var observation = browser.ObserveExitAsync(cancellationToken);
-        browser.DisposeBrowser();
+        ArgumentNullException.ThrowIfNull(disposeBrowser);
+        disposeBrowser();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(exitTimeout);
         try
         {
-            await browser.WaitForObservationAsync(observation, timeout.Token).ConfigureAwait(false);
+            await exited.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
             return true;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

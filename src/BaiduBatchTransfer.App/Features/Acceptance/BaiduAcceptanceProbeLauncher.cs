@@ -99,22 +99,27 @@ public sealed class BaiduAcceptanceProbeLauncher(
                 selection.AccountId.Value,
                 profileLease.ProfilePath,
                 cancellationToken).ConfigureAwait(false);
-            try { await profileLease.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception) { return new(true, "PROBE_CLEANUP_DEFERRED"); }
-            return profileLease.CleanupOutcome == BaiduAcceptanceProbeCleanupOutcome.Cleaned
+            return await CleanupResultAsync(profileLease).ConfigureAwait(false) == BaiduAcceptanceProbeCleanupOutcome.Cleaned
                 ? new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ")
                 : new(true, "PROBE_CLEANUP_DEFERRED");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            if (profileLease is not null) await profileLease.DisposeAsync().ConfigureAwait(false);
+            if (profileLease is not null) await CleanupResultAsync(profileLease).ConfigureAwait(false);
             throw;
         }
         catch (Exception)
         {
-            if (profileLease is not null) await profileLease.DisposeAsync().ConfigureAwait(false);
+            if (profileLease is not null) await CleanupResultAsync(profileLease).ConfigureAwait(false);
             return new(false, "PROBE_PRESENTATION_FAILED");
         }
+    }
+
+    private static async Task<BaiduAcceptanceProbeCleanupOutcome> CleanupResultAsync(BaiduAcceptanceProbeProfileLease profileLease)
+    {
+        try { await profileLease.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception) { return BaiduAcceptanceProbeCleanupOutcome.Deferred; }
+        return profileLease.CleanupOutcome;
     }
 }
 

@@ -48,7 +48,7 @@ public sealed class BaiduAcceptanceProbeOutputStore : IBaiduAcceptanceProbeOutpu
         finally
         {
             try { File.Delete(probePath); }
-            catch (IOException) { }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
         }
     }
 }
