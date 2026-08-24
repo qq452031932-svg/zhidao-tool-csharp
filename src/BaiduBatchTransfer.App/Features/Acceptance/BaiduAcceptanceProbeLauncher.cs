@@ -47,6 +47,7 @@ public interface IBaiduAcceptanceProbeLauncher
 public sealed class BaiduAcceptanceProbeLauncher(
     IUnitOfWorkFactory unitOfWorkFactory,
     IBaiduAcceptanceProbeAccountSelector accountSelector,
+    IBaiduAcceptanceProbeProfilePathPolicy profilePathPolicy,
     IBaiduAcceptanceProbeOutputStore outputStore,
     IBaiduAcceptanceProbePresenter presenter) : IBaiduAcceptanceProbeLauncher
 {
@@ -92,43 +93,81 @@ public sealed class BaiduAcceptanceProbeLauncher(
 
         try
         {
+            await using var profileLease = profilePathPolicy.Create(selection.AccountId.Value);
             await presenter.ShowAsync(
                 selection.AccountId.Value,
-                selection.ProfilePath,
+                profileLease.ProfilePath,
                 cancellationToken).ConfigureAwait(false);
             return new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ");
         }
-        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
         {
             return new(false, "PROBE_PRESENTATION_FAILED");
         }
     }
 }
 
+public interface IBaiduAcceptanceProbeUiDispatcher
+{
+    Task InvokeAsync(Action action, CancellationToken cancellationToken = default);
+}
+
+public interface IBaiduAcceptanceProbeWindow
+{
+    void Show();
+    Task WaitForInitializationAsync(CancellationToken cancellationToken = default);
+    Task WaitForClosedAsync(CancellationToken cancellationToken = default);
+}
+
+public interface IBaiduAcceptanceProbeWindowFactory
+{
+    IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath);
+}
+
 public sealed class BaiduAcceptanceProbePresenter(
-    WebView2ProfileCloser profileCloser,
-    IBaiduAcceptanceProbeOutputStore outputStore) : IBaiduAcceptanceProbePresenter
+    IBaiduAcceptanceProbeUiDispatcher dispatcher,
+    IBaiduAcceptanceProbeWindowFactory windowFactory) : IBaiduAcceptanceProbePresenter
 {
     public async Task ShowAsync(
         Guid accountId,
         string profilePath,
         CancellationToken cancellationToken = default)
     {
+        IBaiduAcceptanceProbeWindow? window = null;
+        await dispatcher.InvokeAsync(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            window = windowFactory.Create(accountId, profilePath);
+            window.Show();
+        }, cancellationToken).ConfigureAwait(false);
+        await (window ?? throw new InvalidOperationException("现场验收窗口未创建。"))
+            .WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
+        await window.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
+    }
+}
+
+public sealed class WpfBaiduAcceptanceProbeUiDispatcher : IBaiduAcceptanceProbeUiDispatcher
+{
+    public async Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(action);
         cancellationToken.ThrowIfCancellationRequested();
         var application = System.Windows.Application.Current ??
             throw new InvalidOperationException("现场验收窗口只能从桌面应用中打开。");
-        await application.Dispatcher.InvokeAsync(() =>
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var window = new BaiduAcceptanceProbeWindow(
-                accountId,
-                profilePath,
-                profileCloser,
-                outputStore)
-            {
-                Owner = application.MainWindow,
-            };
-            window.ShowDialog();
-        });
+        await application.Dispatcher.InvokeAsync(action).Task.ConfigureAwait(false);
     }
+}
+
+public sealed class BaiduAcceptanceProbeWindowFactory(IBaiduAcceptanceProbeOutputStore outputStore)
+    : IBaiduAcceptanceProbeWindowFactory
+{
+    public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) =>
+        new BaiduAcceptanceProbeWindow(accountId, profilePath, outputStore)
+        {
+            Owner = System.Windows.Application.Current?.MainWindow,
+        };
 }

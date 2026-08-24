@@ -43,6 +43,18 @@ public sealed class BaiduAcceptanceProbeSessionTests
     }
 
     [Fact]
+    public void RejectsWriteCapableRequestsBeforeAnyResponseBodyCanBeObserved()
+    {
+        var session = new BaiduAcceptanceProbeSession();
+        session.ObserveRequest("write", new Uri("https://pan.baidu.com/api/create"), "POST");
+        session.ObserveResponse("write", 200, "application/json");
+        session.Complete("write", "{\"secret\":1}");
+
+        Assert.False(session.ShouldInspectBody("write"));
+        Assert.Empty(session.Snapshot());
+    }
+
+    [Fact]
     public void DeduplicatesEquivalentShapesAndBoundsTheEvidenceCount()
     {
         var session = new BaiduAcceptanceProbeSession(maximumEvidenceCount: 2);
@@ -53,7 +65,7 @@ public sealed class BaiduAcceptanceProbeSessionTests
 
         var evidence = session.Snapshot();
         Assert.Equal(2, evidence.Count);
-        Assert.Equal(["/api/one", "/api/two"], evidence.Select(item => item.Path));
+        Assert.Equal(["/segments/2", "/segments/2"], evidence.Select(item => item.Path));
     }
 
     [Fact]
@@ -78,7 +90,7 @@ public sealed class BaiduAcceptanceProbeSessionTests
         string path,
         string body)
     {
-        session.ObserveRequest(requestId, new Uri("https://pan.baidu.com" + path), "POST");
+        session.ObserveRequest(requestId, new Uri("https://pan.baidu.com" + path), "GET");
         session.ObserveResponse(requestId, 200, "application/json; charset=utf-8");
         session.Complete(requestId, body);
     }

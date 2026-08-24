@@ -7,15 +7,15 @@ using Microsoft.Web.WebView2.Core;
 
 namespace BaiduBatchTransfer.App.Features.Acceptance;
 
-public partial class BaiduAcceptanceProbeWindow : Window
+public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeWindow
 {
-    private readonly Guid accountId;
     private readonly string profilePath;
-    private readonly WebView2ProfileCloser profileCloser;
     private readonly IBaiduAcceptanceProbeOutputStore outputStore;
     private readonly BaiduAcceptanceProbeSession session = new();
     private readonly CancellationTokenSource lifetime = new();
-    private IDisposable? profileRegistration;
+    private readonly TaskCompletionSource initialization = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private CoreWebView2Environment? environment;
     private CoreWebView2DevToolsProtocolEventReceiver? requestReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? responseReceiver;
     private CoreWebView2DevToolsProtocolEventReceiver? loadingFinishedReceiver;
@@ -26,14 +26,11 @@ public partial class BaiduAcceptanceProbeWindow : Window
     public BaiduAcceptanceProbeWindow(
         Guid accountId,
         string profilePath,
-        WebView2ProfileCloser profileCloser,
         IBaiduAcceptanceProbeOutputStore outputStore)
     {
         if (accountId == Guid.Empty) throw new ArgumentException("An account ID is required.", nameof(accountId));
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
-        this.accountId = accountId;
         this.profilePath = Path.GetFullPath(profilePath);
-        this.profileCloser = profileCloser ?? throw new ArgumentNullException(nameof(profileCloser));
         this.outputStore = outputStore ?? throw new ArgumentNullException(nameof(outputStore));
         InitializeComponent();
         Loaded += OnLoaded;
@@ -45,33 +42,43 @@ public partial class BaiduAcceptanceProbeWindow : Window
     {
         try
         {
-            var environment = await CoreWebView2Environment
+            environment = await CoreWebView2Environment
                 .CreateAsync(userDataFolder: profilePath)
                 .ConfigureAwait(true);
             lifetime.Token.ThrowIfCancellationRequested();
             await Browser.EnsureCoreWebView2Async(environment).ConfigureAwait(true);
             lifetime.Token.ThrowIfCancellationRequested();
-            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
             ConfigureBrowser(Browser.CoreWebView2);
             await EnableNetworkObservationAsync(Browser.CoreWebView2).ConfigureAwait(true);
-            StatusText.Text = "安全探针已启动。请完成一次测试转存和分享，完成后点击“保存脱敏证据并关闭”。";
-            Browser.CoreWebView2.Navigate("https://pan.baidu.com/disk/main#/index");
+            StatusText.Text = "隔离的只读观察页已启动；不会登录、转存、分享或提交远端写入。";
+            Browser.CoreWebView2.Navigate("https://pan.baidu.com/");
+            initialization.TrySetResult();
         }
-        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+            initialization.TrySetCanceled(lifetime.Token);
+        }
         catch (Exception)
         {
+            initialization.TrySetException(new InvalidOperationException("现场验收窗口初始化失败。"));
             StatusText.Text = "现场验收窗口初始化失败。未保存任何网络数据。";
+            allowClose = true;
+            Close();
         }
     }
 
     private void ConfigureBrowser(CoreWebView2 core)
     {
         core.NavigationStarting += OnNavigationStarting;
+        core.NewWindowRequested += OnNewWindowRequested;
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+        core.WebResourceRequested += OnWebResourceRequested;
         core.Settings.AreDevToolsEnabled = false;
         core.Settings.AreDefaultContextMenusEnabled = false;
         core.Settings.IsStatusBarEnabled = false;
         core.Settings.IsPasswordAutosaveEnabled = false;
         core.Settings.IsGeneralAutofillEnabled = false;
+        core.Settings.IsScriptEnabled = false;
     }
 
     private async Task EnableNetworkObservationAsync(CoreWebView2 core)
@@ -93,10 +100,23 @@ public partial class BaiduAcceptanceProbeWindow : Window
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
         var destination = Uri.TryCreate(e.Uri, UriKind.Absolute, out var parsed) ? parsed : null;
-        var decision = BaiduNavigationPolicy.Evaluate(destination);
-        if (decision.IsAllowed) return;
+        if (BaiduAcceptanceProbeWebPolicy.IsAllowedNavigation(destination)) return;
         e.Cancel = true;
-        StatusText.Text = decision.SafeMessage ?? "已阻止不安全的页面跳转。";
+        StatusText.Text = "已阻止非白名单页面跳转。";
+    }
+
+    private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        e.Handled = true;
+        StatusText.Text = "已阻止打开新窗口。";
+    }
+
+    private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
+    {
+        var destination = Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var parsed) ? parsed : null;
+        if (BaiduAcceptanceProbeWebPolicy.IsAllowedRequest(destination, e.Request.Method)) return;
+        e.Response = environment?.CreateWebResourceResponse(
+            new MemoryStream(), 403, "Blocked", "Content-Type: text/plain");
     }
 
     private void OnRequestWillBeSent(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
@@ -155,7 +175,7 @@ public partial class BaiduAcceptanceProbeWindow : Window
             var isBase64 = root.TryGetProperty("base64Encoded", out var encoded) && encoded.GetBoolean();
             var body = !isBase64 && TryGetString(root, "body", out var text) ? text : null;
             session.Complete(requestId, body);
-            StatusText.Text = $"已捕获 {session.Snapshot().Count} 种脱敏接口结构。请继续完成测试操作。";
+            StatusText.Text = $"已捕获 {session.Snapshot().Count} 种脱敏接口结构。只读观察仍在进行。";
         }
         catch (Exception exception) when (exception is JsonException or InvalidOperationException or ArgumentException)
         {
@@ -191,7 +211,7 @@ public partial class BaiduAcceptanceProbeWindow : Window
             var evidence = session.Snapshot();
             if (evidence.Count == 0)
             {
-                StatusText.Text = "还没有捕获到可保存的百度 JSON 接口结构。请先完成一次测试操作。";
+                StatusText.Text = "还没有捕获到可保存的百度 JSON 接口结构。请等待只读页面加载。";
                 return;
             }
             await outputStore.SaveAsync(evidence, lifetime.Token).ConfigureAwait(true);
@@ -236,17 +256,18 @@ public partial class BaiduAcceptanceProbeWindow : Window
         lifetime.Cancel();
     }
 
-    private async Task CloseBrowserAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        await Dispatcher.InvokeAsync(() => Browser.Dispose());
-    }
+    public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
+        initialization.Task.WaitAsync(cancellationToken);
+
+    public Task WaitForClosedAsync(CancellationToken cancellationToken = default) =>
+        closed.Task.WaitAsync(cancellationToken);
 
     private void OnClosed(object? sender, EventArgs e)
     {
         lifetime.Cancel();
-        profileRegistration?.Dispose();
+        initialization.TrySetException(new InvalidOperationException("现场验收窗口在初始化前关闭。"));
         try { Browser.Dispose(); }
         catch (Exception) { }
+        closed.TrySetResult();
     }
 }

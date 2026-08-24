@@ -199,6 +199,10 @@ public static class AppBootstrap
         services.AddSingleton<IBaiduAcceptanceProbeOutputStore>(serviceProvider =>
             serviceProvider.GetRequiredService<BaiduAcceptanceProbeOutputStore>());
         services.AddSingleton<IBaiduAcceptanceProbeAccountSelector, BaiduAcceptanceProbeAccountSelector>();
+        services.AddSingleton<IBaiduAcceptanceProbeProfilePathPolicy>(_ =>
+            new BaiduAcceptanceProbeProfilePathPolicy(paths.RootDirectory));
+        services.AddSingleton<IBaiduAcceptanceProbeUiDispatcher, WpfBaiduAcceptanceProbeUiDispatcher>();
+        services.AddSingleton<IBaiduAcceptanceProbeWindowFactory, BaiduAcceptanceProbeWindowFactory>();
         services.AddSingleton<IBaiduAcceptanceProbePresenter, BaiduAcceptanceProbePresenter>();
         services.AddSingleton<IBaiduAcceptanceProbeLauncher, BaiduAcceptanceProbeLauncher>();
 #endif

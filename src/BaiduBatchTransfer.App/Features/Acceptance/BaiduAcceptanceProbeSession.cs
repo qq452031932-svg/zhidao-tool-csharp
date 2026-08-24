@@ -22,6 +22,7 @@ public sealed class BaiduAcceptanceProbeSession
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
         ArgumentNullException.ThrowIfNull(destination);
+        if (!BaiduAcceptanceProbeWebPolicy.IsAllowedRequest(destination, method)) return;
         var shape = BaiduAcceptanceEvidenceSanitizer.TryCreate(destination, method, 0, null);
         if (shape is null) return;
         lock (gate)

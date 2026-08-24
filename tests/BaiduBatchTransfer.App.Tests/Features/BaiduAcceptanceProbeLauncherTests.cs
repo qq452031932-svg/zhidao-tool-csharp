@@ -10,13 +10,16 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         var account = Account();
         var presenter = new RecordingPresenter();
-        var launcher = Launcher([account], presenter);
+        var profiles = new RecordingProfilePathPolicy();
+        var launcher = Launcher([account], presenter, profiles: profiles);
 
         var result = await launcher.OpenAsync(EnabledOptions());
 
         Assert.True(result.Started);
         Assert.Equal(account.Id, presenter.AccountId);
-        Assert.Equal(account.WebView2ProfileDirectory, presenter.ProfilePath);
+        Assert.Equal(profiles.IsolatedProfilePath, presenter.ProfilePath);
+        Assert.NotEqual(account.WebView2ProfileDirectory, presenter.ProfilePath);
+        Assert.True(profiles.LeaseDisposed);
     }
 
     [Theory]
@@ -62,6 +65,21 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     }
 
     [Fact]
+    public async Task ReturnsPresentationFailureWhenTheActualPresenterReportsWindowInitializationFailure()
+    {
+        var window = new FailingProbeWindow();
+        var presenter = new BaiduAcceptanceProbePresenter(
+            new InlineProbeDispatcher(), new FailingProbeWindowFactory(window));
+        var launcher = Launcher([Account()], presenter);
+
+        var result = await launcher.OpenAsync(EnabledOptions());
+
+        Assert.False(result.Started);
+        Assert.Equal("PROBE_PRESENTATION_FAILED", result.SafeMessage);
+        Assert.True(window.WasShown);
+    }
+
+    [Fact]
     public async Task DoesNotPresentWhenTheEvidenceDirectoryIsUnavailable()
     {
         var presenter = new RecordingPresenter();
@@ -80,8 +98,10 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     private static BaiduAcceptanceProbeLauncher Launcher(
         IReadOnlyList<AccountRecord> accounts,
         IBaiduAcceptanceProbePresenter presenter,
-        IBaiduAcceptanceProbeOutputStore? outputStore = null) =>
-        new(new FakeUnitOfWorkFactory(accounts), new BaiduAcceptanceProbeAccountSelector(), outputStore ?? new AvailableOutputStore(), presenter);
+        IBaiduAcceptanceProbeOutputStore? outputStore = null,
+        IBaiduAcceptanceProbeProfilePathPolicy? profiles = null) =>
+        new(new FakeUnitOfWorkFactory(accounts), new BaiduAcceptanceProbeAccountSelector(),
+            profiles ?? new RecordingProfilePathPolicy(), outputStore ?? new AvailableOutputStore(), presenter);
 
     private static AccountRecord Account() => new(
         Guid.NewGuid(), "private-user", "private-name", [1], "C:\\safe\\profile", "WebView2", "Active",
@@ -118,6 +138,38 @@ public sealed class BaiduAcceptanceProbeLauncherTests
             throw new IOException("private output directory");
         public Task<string> SaveAsync(IReadOnlyList<BaiduAcceptanceEvidence> evidence, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class RecordingProfilePathPolicy : IBaiduAcceptanceProbeProfilePathPolicy
+    {
+        public string IsolatedProfilePath { get; } = Path.Combine(Path.GetTempPath(), "isolated-probe-profile");
+        public bool LeaseDisposed { get; private set; }
+        public BaiduAcceptanceProbeProfileLease Create(Guid accountId) =>
+            new(IsolatedProfilePath, () => LeaseDisposed = true);
+    }
+
+    private sealed class InlineProbeDispatcher : IBaiduAcceptanceProbeUiDispatcher
+    {
+        public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            action();
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FailingProbeWindowFactory(FailingProbeWindow window) : IBaiduAcceptanceProbeWindowFactory
+    {
+        public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) => window;
+    }
+
+    private sealed class FailingProbeWindow : IBaiduAcceptanceProbeWindow
+    {
+        public bool WasShown { get; private set; }
+        public void Show() => WasShown = true;
+        public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromException(new InvalidOperationException("private initialization failure"));
+        public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
     private sealed class FakeUnitOfWorkFactory(IReadOnlyList<AccountRecord> accounts) : IUnitOfWorkFactory

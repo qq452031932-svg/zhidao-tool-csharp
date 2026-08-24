@@ -17,7 +17,6 @@ public static partial class BaiduAcceptanceEvidenceSanitizer
 {
     private const int MaximumBodyCharacters = 256_000;
     private const int MaximumPropertyNames = 128;
-    private const int MaximumPathSegments = 24;
     private static readonly HashSet<string> AllowedMethods = new(StringComparer.Ordinal)
     {
         "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
@@ -61,23 +60,10 @@ public static partial class BaiduAcceptanceEvidenceSanitizer
 
     private static string SanitizePath(string absolutePath)
     {
-        if (string.IsNullOrEmpty(absolutePath)) return "/";
-        var segments = absolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Take(MaximumPathSegments)
-            .Select(SanitizePathSegment);
-        var sanitized = "/" + string.Join('/', segments);
-        return sanitized.Length <= 512 ? sanitized : sanitized[..512];
-    }
-
-    private static string SanitizePathSegment(string segment)
-    {
-        if (segment.Length > 18 || segment.Contains('%') ||
-            (segment.Length > 6 && segment.All(char.IsDigit)) ||
-            !SafePathSegment().IsMatch(segment))
-        {
-            return "{dynamic}";
-        }
-        return segment;
+        var count = string.IsNullOrEmpty(absolutePath)
+            ? 0
+            : absolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Length;
+        return $"/segments/{count}";
     }
 
     private static IReadOnlyList<string> ExtractPropertyNames(string responseBody)
@@ -122,9 +108,6 @@ public static partial class BaiduAcceptanceEvidenceSanitizer
                 break;
         }
     }
-
-    [GeneratedRegex("^[A-Za-z0-9._~-]+$", RegexOptions.CultureInvariant)]
-    private static partial Regex SafePathSegment();
 
     [GeneratedRegex("^[A-Za-z_][A-Za-z0-9_.-]{0,63}$", RegexOptions.CultureInvariant)]
     private static partial Regex SafePropertyName();
