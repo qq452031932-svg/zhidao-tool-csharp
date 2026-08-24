@@ -29,7 +29,14 @@ public sealed record BulkPrecheckResult(
         $"BulkPrecheckResult {{ Status = {Status}, ProcessedRows = {ProcessedRows}, PauseReason = {PauseReason} }}";
 }
 
-public sealed class BulkPrecheckService
+public interface IBulkPrecheckRunner
+{
+    Task<BulkPrecheckResult> RunAsync(
+        BulkPrecheckRequest request,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class BulkPrecheckService : IBulkPrecheckRunner
 {
     private static readonly object RunGatesSync = new();
     private static readonly Dictionary<Guid, SessionRunGate> RunGates = [];

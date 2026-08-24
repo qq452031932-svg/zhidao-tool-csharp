@@ -24,6 +24,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private bool isStarting;
     private bool isClosed;
     private bool synchronizingAccounts;
+    private Guid? createdBatchJobId;
 
     public TransferWorkspaceViewModel(
         ImportViewModel import,
@@ -145,6 +146,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
     public bool IsClosed => isClosed;
+    public Guid? CreatedBatchJobId => createdBatchJobId;
     public bool CanStart => !isClosed && !IsStarting && string.IsNullOrEmpty(EvaluateConfiguration());
     public string ConfigurationMessage => EvaluateConfiguration();
     public IAsyncRelayCommand StartCommand { get; }
@@ -157,6 +159,25 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     {
         if (isClosed) return;
         if (Import.SessionId != draft.SessionId) Import.AttachSession(draft.SessionId);
+        if (Wizard.CurrentImportSessionId == draft.SessionId)
+        {
+            Wizard.RefreshImportSnapshot(
+                draft.Statistics.Ready,
+                draft.Statistics.Conflict,
+                draft.Statistics.NeedsResolution,
+                draft.Statistics.HasExcelAccountColumn,
+                draft.Statistics.UnresolvedAccountMappings);
+            StatusMessage = draft.Statistics.Conflict + draft.Statistics.NeedsResolution > 0
+                ? "导入内容中还有冲突或待处理记录，请先修正或排除。"
+                : "导入数据已更新。";
+            RaiseStartState();
+            return;
+        }
+        if (createdBatchJobId is not null)
+        {
+            createdBatchJobId = null;
+            OnPropertyChanged(nameof(CreatedBatchJobId));
+        }
         Wizard.Initialize(new(
             draft.SessionId,
             $"{options.JobNamePrefix} {DateTime.Now:yyyy-MM-dd HH:mm}",
@@ -205,7 +226,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed || IsStarting) return;
+        if (isClosed || IsStarting || createdBatchJobId is not null) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         IsStarting = true;
         try
@@ -219,6 +240,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                 StatusMessage = validation;
                 return;
             }
+            var resultDirectory = AutoShare ? ShareResultDirectory : null;
 
             var selectedAccount = Wizard.Accounts.First(account => account.IsSelected);
             Wizard.UseBulkPrecheck = true;
@@ -226,13 +248,13 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             StatusMessage = "正在检查链接和账号配置……";
             var precheck = await Wizard.RunBackgroundPrecheckAsync(linked.Token).ConfigureAwait(true);
             if (!IsAlive(linked)) return;
-            if (precheck.Status != WizardPrecheckStatus.Completed)
+            if (precheck.Status is WizardPrecheckStatus.PausedForLogin or WizardPrecheckStatus.PausedForVerification)
             {
                 StatusMessage = precheck.Status switch
                 {
                     WizardPrecheckStatus.PausedForLogin => "请先完成账号登录，再重新开始转存。",
                     WizardPrecheckStatus.PausedForVerification => "请先完成百度安全验证，再重新开始转存。",
-                    _ => "当前无法检查链接，转存尚未开始。",
+                    _ => throw new ArgumentOutOfRangeException(nameof(precheck)),
                 };
                 return;
             }
@@ -253,23 +275,16 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             }
 
             var batchJobId = await Wizard.ConfirmPreparedFromUserIntentAsync(linked.Token).ConfigureAwait(true);
-            if (!IsAlive(linked) || batchJobId is not { } batch) return;
-            if (AutoShare)
-            {
-                await destinationSink.SetAsync(
-                    new TransferResultDestination(batch, ShareResultDirectory),
-                    linked.Token).ConfigureAwait(true);
-                if (!IsAlive(linked)) return;
-            }
-
-            await handoffBatchAsync(batch, linked.Token).ConfigureAwait(true);
-            if (!IsAlive(linked)) return;
-            StatusMessage = "转存批次已创建，可在下方查看进度与结果。";
+            if (batchJobId is not { } batch) return;
+            RecordCreatedBatch(batch);
+            await CompletePostCommitAsync(batch, resultDirectory).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
         catch (Exception)
         {
-            if (IsAlive(linked)) StatusMessage = "转存未能开始，请检查配置后重试。";
+            if (IsAlive(linked)) StatusMessage = createdBatchJobId is null
+                ? "转存未能开始，请检查配置后重试。"
+                : "批次已创建，可稍后从进度与结果中恢复查看。";
         }
         finally
         {
@@ -282,6 +297,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         if (isClosed) return;
         isClosed = true;
         lifetime.Cancel();
+        Import.Close();
         Import.DraftReady -= OnDraftReady;
         Import.PropertyChanged -= OnComposedPropertyChanged;
         Wizard.PropertyChanged -= OnComposedPropertyChanged;
@@ -299,6 +315,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     private string EvaluateConfiguration()
     {
+        if (createdBatchJobId is not null) return "当前导入数据的批次已创建。";
         if (Import.SessionId is not { } session || Wizard.CurrentImportSessionId != session)
             return "请先导入至少一条有效链接。";
         if (Wizard.ReadyResourceCount <= 0) return "没有可转存的有效链接。";
@@ -344,6 +361,50 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     private bool IsAlive(CancellationTokenSource operation) =>
         !isClosed && !lifetime.IsCancellationRequested && !operation.IsCancellationRequested;
+
+    private void RecordCreatedBatch(Guid batchJobId)
+    {
+        createdBatchJobId = batchJobId;
+        if (!isClosed)
+        {
+            RunPanel.PresentBatch(batchJobId);
+            OnPropertyChanged(nameof(CreatedBatchJobId));
+            RaiseStartState();
+        }
+    }
+
+    private async Task CompletePostCommitAsync(Guid batchJobId, string? resultDirectory)
+    {
+        var destinationSaved = resultDirectory is null;
+        if (resultDirectory is not null)
+        {
+            destinationSaved = await TryPostCommitAsync(token => destinationSink.SetAsync(
+                new TransferResultDestination(batchJobId, resultDirectory), token)).ConfigureAwait(true);
+        }
+        var handedOff = await TryPostCommitAsync(
+            token => handoffBatchAsync(batchJobId, token)).ConfigureAwait(true);
+        if (isClosed) return;
+        StatusMessage = (destinationSaved, handedOff) switch
+        {
+            (true, true) => "转存批次已创建，可在下方查看进度与结果。",
+            (false, true) => "批次已创建，结果目录暂未保存。",
+            (true, false) => "批次已创建，可稍后从进度与结果中恢复查看。",
+            _ => "批次已创建，结果目录暂未保存；可稍后从进度与结果中恢复查看。",
+        };
+    }
+
+    private async Task<bool> TryPostCommitAsync(Func<CancellationToken, Task> operation)
+    {
+        using var completion = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        completion.CancelAfter(TimeSpan.FromSeconds(options.PostCommitTimeoutSeconds));
+        try
+        {
+            await operation(completion.Token).ConfigureAwait(true);
+            return true;
+        }
+        catch (OperationCanceledException) when (completion.IsCancellationRequested) { return false; }
+        catch (Exception) { return false; }
+    }
 
     private void OnDraftReady(object? sender, ImportDraftReady draft) => ApplyImportedDraft(draft);
 

@@ -74,7 +74,7 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         if (value.AccountId != AccountId)
             throw new ArgumentException("账号确认结果与当前账号不匹配。", nameof(value));
         if (value.ShareEnabled != ShareEnabled)
-            throw new ArgumentException("账号分享设置与当前草稿不匹配。", nameof(value));
+            throw new ArgumentException("账号分享设置与当前导入数据不匹配。", nameof(value));
         var plannedTransfer = RequireCount(value.PlannedTransferCount, nameof(value.PlannedTransferCount));
         var plannedShare = RequireCount(value.PlannedShareCount, nameof(value.PlannedShareCount));
         var confirmedTransfer = RequireCount(value.ConfirmedTransferCount, nameof(value.ConfirmedTransferCount));

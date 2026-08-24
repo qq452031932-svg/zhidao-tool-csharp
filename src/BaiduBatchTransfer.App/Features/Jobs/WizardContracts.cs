@@ -196,7 +196,7 @@ public sealed record WizardAccountConfirmation(
 public interface IWizardBatchService
 {
     Task<WizardConfirmationSummary> PreviewAsync(WizardBatchDraft draft, CancellationToken cancellationToken);
-    Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken);
+    Task<Guid> ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken);
 }
 
 public sealed record WizardDraftMutation(
@@ -298,13 +298,13 @@ public sealed class WizardDraftWorkflow(
 internal sealed class PassiveWizardDraftWorkflow : IWizardDraftWorkflow
 {
     public Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
-        throw new InvalidOperationException("草稿服务尚未连接。");
+        throw new InvalidOperationException("导入数据服务尚未连接。");
     public Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
-        throw new InvalidOperationException("草稿服务尚未连接。");
+        throw new InvalidOperationException("导入数据服务尚未连接。");
     public Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) =>
-        throw new InvalidOperationException("草稿服务尚未连接。");
+        throw new InvalidOperationException("导入数据服务尚未连接。");
     public Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) =>
-        throw new InvalidOperationException("草稿服务尚未连接。");
+        throw new InvalidOperationException("导入数据服务尚未连接。");
 }
 
 public sealed class WizardBatchService(CreateBatchService service) : IWizardBatchService
@@ -339,9 +339,10 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
             summary.ResultColumnCount);
     }
 
-    public async Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
+    public async Task<Guid> ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
     {
-        _ = await service.ConfirmAsync(ToApplicationDraft(draft), confirmationToken, cancellationToken).ConfigureAwait(false);
+        var result = await service.ConfirmAsync(ToApplicationDraft(draft), confirmationToken, cancellationToken).ConfigureAwait(false);
+        return result.BatchJobId;
     }
 
     private static BatchDraft ToApplicationDraft(WizardBatchDraft draft) => new(

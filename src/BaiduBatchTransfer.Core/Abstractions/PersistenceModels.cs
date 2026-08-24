@@ -142,6 +142,8 @@ public sealed record RequestedAccountNameGroupRecord(string RequestedAccountName
         $"RequestedAccountNameGroupRecord {{ RequestedAccountName = [REDACTED], RowCount = {RowCount} }}";
 }
 
+public sealed record RequestedAccountResolutionCounts(long TotalGroups, long UnresolvedGroups);
+
 public sealed record ImportDispositionCounts(
     int TotalRows,
     int ReadyRows,

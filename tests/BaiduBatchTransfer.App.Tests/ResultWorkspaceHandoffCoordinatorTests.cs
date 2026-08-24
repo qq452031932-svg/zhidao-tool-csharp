@@ -96,6 +96,22 @@ public sealed class ResultWorkspaceHandoffCoordinatorTests
     }
 
     [Fact]
+    public async Task ActivationHonorsCallerCancellationToken()
+    {
+        var operations = new ControlledOperations { BlockFirstActivation = true };
+        using var coordinator = new ResultWorkspaceHandoffCoordinator(operations);
+        using var cancellation = new CancellationTokenSource();
+
+        var activate = coordinator.ActivateJobAsync(Guid.NewGuid(), cancellation.Token);
+        await operations.FirstActivationStarted.Task;
+        cancellation.Cancel();
+        operations.ReleaseFirstActivation();
+        await activate;
+
+        Assert.Empty(operations.NavigatedBatches);
+    }
+
+    [Fact]
     public async Task HandoffExceptionsAreObservedAndDoNotEscapeQueuedWork()
     {
         var exceptions = new List<Exception>();

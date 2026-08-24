@@ -240,7 +240,7 @@ public sealed class LocalImportWorkflow(
         return session is not null && TryReconstructMapping(session, definitions, out _);
     }
 
-    public async Task UpdateLinkAsync(
+    public async Task<ImportWorkflowResult> UpdateLinkAsync(
         Guid rowId,
         string shareUrl,
         string? extractionCode,
@@ -259,9 +259,10 @@ public sealed class LocalImportWorkflow(
                 clearExtractionCode: string.IsNullOrWhiteSpace(extractionCode)),
             TransferMode.Distribution,
             cancellationToken).ConfigureAwait(false);
+        return await LoadResultAsync(row.ImportSessionId, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task SetExcludedAsync(
+    public async Task<ImportWorkflowResult> SetExcludedAsync(
         Guid rowId,
         bool excluded,
         CancellationToken cancellationToken)
@@ -276,6 +277,7 @@ public sealed class LocalImportWorkflow(
         else
             await editingService.RestoreAsync(
                 row.ImportSessionId, rowId, TransferMode.Distribution, cancellationToken).ConfigureAwait(false);
+        return await LoadResultAsync(row.ImportSessionId, cancellationToken).ConfigureAwait(false);
     }
 
     private IAsyncEnumerable<ImportSourceRow> ReadTextAsync(string text, CancellationToken cancellationToken) =>
@@ -339,8 +341,8 @@ public sealed class LocalImportWorkflow(
     {
         await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
         var counts = await unit.Imports.GetDispositionCountsAsync(sessionId, cancellationToken).ConfigureAwait(false);
-        var accountGroups = await unit.Imports.GetRequestedAccountNameGroupsPageAsync(
-            sessionId, new PageQuery(1, 1), cancellationToken).ConfigureAwait(false);
+        var accountResolution = await unit.Imports.GetRequestedAccountResolutionCountsAsync(
+            sessionId, cancellationToken).ConfigureAwait(false);
         await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
         return new ImportWorkflowResult(sessionId, new ImportDraftStatistics(
             counts.TotalRows,
@@ -350,8 +352,8 @@ public sealed class LocalImportWorkflow(
             counts.ExcludedRows,
             counts.ConflictRows,
             counts.NeedsResolutionRows,
-            accountGroups.TotalCount > 0,
-            (int)Math.Min(int.MaxValue, accountGroups.TotalCount)));
+            accountResolution.TotalGroups > 0,
+            (int)Math.Min(int.MaxValue, accountResolution.UnresolvedGroups)));
     }
 
     private async Task<ReplaySource> RestoreReplaySourceAsync(

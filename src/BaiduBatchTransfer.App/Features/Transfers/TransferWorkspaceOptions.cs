@@ -12,7 +12,8 @@ public enum TransferAccountMode
 public sealed record TransferWorkspaceOptions(
     string DefaultTargetDirectory = "/我的资源",
     string JobNamePrefix = "批量转存",
-    int MaximumRecentBatches = 20)
+    int MaximumRecentBatches = 20,
+    int PostCommitTimeoutSeconds = 10)
 {
     public TransferWorkspaceOptions Validate()
     {
@@ -22,6 +23,8 @@ public sealed record TransferWorkspaceOptions(
             throw new ArgumentException("A job-name prefix is required.", nameof(JobNamePrefix));
         if (MaximumRecentBatches is < 1 or > 100)
             throw new ArgumentOutOfRangeException(nameof(MaximumRecentBatches));
+        if (PostCommitTimeoutSeconds is < 1 or > 120)
+            throw new ArgumentOutOfRangeException(nameof(PostCommitTimeoutSeconds));
         return this;
     }
 }

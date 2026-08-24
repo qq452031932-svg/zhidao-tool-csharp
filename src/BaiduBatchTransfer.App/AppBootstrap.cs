@@ -109,7 +109,10 @@ public static class AppBootstrap
         services.AddSingleton<RequestedAccountMappingService>();
         services.AddSingleton<DraftRowEditingService>();
         services.AddSingleton<IWizardDraftWorkflow, WizardDraftWorkflow>();
-        services.AddSingleton<IWizardPrecheckWorkflow, UnavailableWizardPrecheckWorkflow>();
+        services.AddSingleton<BulkPrecheckService>();
+        services.AddSingleton<IBulkPrecheckRunner>(sp => sp.GetRequiredService<BulkPrecheckService>());
+        services.AddSingleton<IWizardPrecheckSnapshotQuery, LocalWizardPrecheckSnapshotQuery>();
+        services.AddSingleton<IWizardPrecheckWorkflow, BulkWizardPrecheckWorkflow>();
         services.AddSingleton<BatchDraftValidator>();
         services.AddSingleton<IDiskSpaceProbe, WindowsDiskSpaceProbe>();
         services.AddSingleton(sp => new ReplicationPreflightEstimator(
@@ -456,7 +459,7 @@ public sealed class AppShellFactory(
             runPanelViewModel,
             resultSaveDialog,
             resultDestinationSink,
-            (batchJobId, _) => handoff.ActivateJobAsync(batchJobId),
+            (batchJobId, token) => handoff.ActivateJobAsync(batchJobId, token),
             transferOptions);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         var shareWorkspace = new System.Windows.Controls.ContentControl

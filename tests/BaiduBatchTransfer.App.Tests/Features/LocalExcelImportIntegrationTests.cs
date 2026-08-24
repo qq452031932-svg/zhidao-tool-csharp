@@ -290,10 +290,56 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
 
         Assert.Contains("请选择 Excel 文件", statuses);
         Assert.Contains("已选择 Excel 文件，正在检查", statuses);
-        Assert.Contains(statuses, status => status.Contains("正在解析并写入草稿", StringComparison.Ordinal));
+        Assert.Contains(statuses, status => status.Contains("正在解析并保存数据", StringComparison.Ordinal));
+        Assert.All(statuses, status => Assert.DoesNotContain("草稿", status, StringComparison.Ordinal));
         Assert.Contains("导入完成，请分页检查异常、重复和账号映射。", statuses);
         Assert.All(statuses, status => Assert.DoesNotContain(workbookPath, status, StringComparison.OrdinalIgnoreCase));
         Assert.Equal(1, presenter.ConfirmationCount);
+    }
+
+    [Fact]
+    public async Task LinkEditKeepsResolvedExcelAccountMappingOutOfTheUnresolvedSnapshot()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sessionId = Guid.NewGuid();
+        var rowId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            await unit.Accounts.UpsertAsync(AccountRecord.Create(accountId, "mapped-user", "账号甲"));
+            await unit.Imports.AddSessionAsync(ImportSessionRecord.Create(sessionId, "Excel", "mapped.xlsx") with
+            {
+                Status = "Draft",
+                TotalRows = 1,
+                ReadyRows = 1,
+            });
+            await unit.Imports.AddRowsAsync(
+            [
+                StagedImportRowRecord.Create(
+                    rowId,
+                    sessionId,
+                    2,
+                    "https://pan.baidu.com/s/mapped-before",
+                    "Ready") with
+                {
+                    NormalizedShareId = "mapped-before",
+                    ExtractionCode = "a1b2",
+                    RequestedAccountName = "账号甲",
+                    MappedAccountId = accountId,
+                },
+            ]);
+            await unit.CommitAsync();
+        }
+
+        var result = await host.Services.GetRequiredService<IImportWorkflow>().UpdateLinkAsync(
+            rowId,
+            "https://pan.baidu.com/s/mapped-after",
+            "a1b2",
+            CancellationToken.None);
+
+        Assert.True(result.Statistics.HasExcelAccountColumn);
+        Assert.Equal(0, result.Statistics.UnresolvedAccountMappings);
     }
 
     [Fact]

@@ -117,7 +117,8 @@ public sealed class ImportViewModelTests
 
         Assert.False(vm.CanResumeImport);
         Assert.Null(vm.SessionId);
-        Assert.Equal("导入已取消，尚未保存可继续的草稿。", vm.StatusMessage);
+        Assert.Equal("导入已取消，尚未保存可继续的数据。", vm.StatusMessage);
+        Assert.DoesNotContain("草稿", vm.StatusMessage, StringComparison.Ordinal);
 
         workflow.Cancel = false;
         await vm.ImportExcelAsync("D:\\data.xlsx");
@@ -160,7 +161,7 @@ public sealed class ImportViewModelTests
 
     [Theory]
     [InlineData(false, "导入失败，请检查文件后重试。")]
-    [InlineData(true, "导入已取消，草稿已保存，但没有可继续的解析进度。")]
+    [InlineData(true, "导入已取消，数据已保存，但没有可继续的解析进度。")]
     public async Task PostStagingFailureWithoutReplayDoesNotClaimResume(
         bool cancellation,
         string expectedMessage)
@@ -202,6 +203,7 @@ public sealed class ImportViewModelTests
             50);
         var vm = Create(workflow, source);
         vm.AttachSession(Guid.NewGuid());
+        workflow.MutationSessionId = vm.SessionId;
 
         await vm.LoadFirstPageAsync();
         await vm.UpdateLinkAsync(vm.Rows[0].RowId, "https://pan.baidu.com/s/new1", "a1b2");
@@ -223,6 +225,7 @@ public sealed class ImportViewModelTests
         var workflow = new FakeImportWorkflow();
         var vm = Create(workflow, new FakePageSource([row], 1, null));
         vm.AttachSession(Guid.NewGuid());
+        workflow.MutationSessionId = vm.SessionId;
         await vm.LoadFirstPageAsync();
         vm.SelectedRow = vm.Rows[0];
         vm.SelectedShareUrl = "https://pan.baidu.com/s/new";
@@ -260,21 +263,21 @@ public sealed class ImportViewModelTests
 
         var import = vm.ImportTextAsync();
         await workflow.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.NotEqual("正在解析并写入草稿", vm.StatusMessage);
+        Assert.NotEqual("正在解析并保存数据", vm.StatusMessage);
 
         await Task.Run(() => workflow.Report(
             new ImportCommittedProgress(ImportProgressKind.SessionCreated, 0)));
-        Assert.Equal("正在解析并写入草稿", vm.StatusMessage);
+        Assert.Equal("正在解析并保存数据", vm.StatusMessage);
 
         await Task.Run(() => workflow.Report(
             new ImportCommittedProgress(ImportProgressKind.ChunkCommitted, 3)));
-        Assert.Equal("正在解析并写入草稿，已保存 3 行", vm.StatusMessage);
+        Assert.Equal("正在解析并保存数据，已保存 3 行", vm.StatusMessage);
 
         workflow.Fail();
         await import;
 
-        Assert.Contains("正在解析并写入草稿", statuses);
-        Assert.Contains("正在解析并写入草稿，已保存 3 行", statuses);
+        Assert.Contains("正在解析并保存数据", statuses);
+        Assert.Contains("正在解析并保存数据，已保存 3 行", statuses);
         Assert.DoesNotContain(statuses, status => status.Contains("6 行", StringComparison.Ordinal));
         Assert.All(statuses, status => Assert.DoesNotContain("abc1", status, StringComparison.Ordinal));
         Assert.True(vm.CanResumeImport);
@@ -479,6 +482,50 @@ public sealed class ImportViewModelTests
         Assert.Equal(sessions[^1], newest.SessionId);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CloseCancelsPasteOrExcelAndPreventsLateStatusMutation(bool excel)
+    {
+        var workflow = new BlockingLifecycleWorkflow();
+        var vm = Create(workflow);
+        vm.TextContent = "https://pan.baidu.com/s/example";
+
+        var operation = excel
+            ? vm.ImportExcelAsync("C:\\input.xlsx")
+            : vm.ImportTextAsync();
+        await workflow.Started.Task;
+        var statusAtClose = vm.StatusMessage;
+        vm.Close();
+        await operation;
+
+        Assert.True(vm.IsClosed);
+        Assert.False(vm.CanImport);
+        Assert.True(workflow.CancellationObserved);
+        Assert.Equal(statusAtClose, vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task CloseWhileChoosingExcelCancelsPickerAndPreventsLateStatusMutation()
+    {
+        var dialog = new BlockingExcelDialog();
+        var vm = new ImportViewModel(
+            new FakeImportWorkflow(),
+            new FakePageSource([], 0, null),
+            dialog);
+
+        var operation = vm.SelectAndImportExcelAsync();
+        await dialog.Started.Task;
+        var statusAtClose = vm.StatusMessage;
+        vm.Close();
+        var cancellationObservedAtClose = dialog.CapturedToken.IsCancellationRequested;
+        dialog.Release();
+        await operation;
+
+        Assert.True(cancellationObservedAtClose);
+        Assert.Equal(statusAtClose, vm.StatusMessage);
+    }
+
     private static ImportViewModel Create(
         IImportWorkflow workflow,
         IImportPreviewPageSource? source = null) =>
@@ -493,6 +540,7 @@ public sealed class ImportViewModelTests
         public (Guid, string, string?) LastEdit { get; private set; }
         public (Guid, bool) LastExclusion { get; private set; }
         public List<(Guid, bool)> Exclusions { get; } = [];
+        public Guid? MutationSessionId { get; set; }
 
         public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken)
             => Result();
@@ -506,18 +554,22 @@ public sealed class ImportViewModelTests
 
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => Result();
 
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
         {
             LastEdit = (rowId, shareUrl, extractionCode);
-            return Task.CompletedTask;
+            return MutationResult();
         }
 
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
         {
             LastExclusion = (rowId, excluded);
             Exclusions.Add((rowId, excluded));
-            return Task.CompletedTask;
+            return MutationResult();
         }
+
+        private Task<ImportWorkflowResult> MutationResult() => Task.FromResult(new ImportWorkflowResult(
+            MutationSessionId ?? throw new InvalidOperationException("A mutation session is required."),
+            new(1, 1, 0, 0, 0)));
 
         private Task<ImportWorkflowResult> Result()
         {
@@ -593,10 +645,10 @@ public sealed class ImportViewModelTests
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 
@@ -624,9 +676,9 @@ public sealed class ImportViewModelTests
             throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 
@@ -655,9 +707,9 @@ public sealed class ImportViewModelTests
             throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
     }
 
@@ -683,10 +735,74 @@ public sealed class ImportViewModelTests
             throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class BlockingLifecycleWorkflow : IImportWorkflow
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool CancellationObserved { get; private set; }
+
+        public Task<ImportWorkflowResult> ImportTextAsync(
+            Guid sessionId,
+            string text,
+            CancellationToken cancellationToken) => RunAsync(sessionId, cancellationToken);
+
+        public Task<ImportWorkflowResult> ImportExcelAsync(
+            Guid sessionId,
+            string filePath,
+            CancellationToken cancellationToken) => RunAsync(sessionId, cancellationToken);
+
+        public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        private async Task<ImportWorkflowResult> RunAsync(Guid sessionId, CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                CancellationObserved = true;
+                throw;
+            }
+            throw new InvalidOperationException();
+        }
+    }
+
+    private sealed class BlockingExcelDialog : IDialogService
+    {
+        private readonly TaskCompletionSource<string?> selection =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken CapturedToken { get; private set; }
+
+        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) =>
+            Task.FromResult(true);
+
+        public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default)
+        {
+            CapturedToken = cancellationToken;
+            Started.TrySetResult();
+            return selection.Task;
+        }
+
+        public void Release() => selection.TrySetResult("C:\\input.xlsx");
     }
 
     private sealed class TransferUnavailable : IAdapterAvailability

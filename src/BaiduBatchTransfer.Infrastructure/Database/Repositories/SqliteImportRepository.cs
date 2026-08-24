@@ -294,6 +294,24 @@ public sealed class SqliteImportRepository : SqliteRepositoryBase, IImportReposi
         return new(items, total, query.PageNumber, query.PageSize);
     }
 
+    public async Task<RequestedAccountResolutionCounts> GetRequestedAccountResolutionCountsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            SELECT COUNT(DISTINCT RequestedAccountName),
+              COUNT(DISTINCT CASE
+                WHEN Disposition<>'Excluded' AND MappedAccountId IS NULL THEN RequestedAccountName
+              END)
+            FROM StagedImportRows
+            WHERE ImportSessionId=$session AND RequestedAccountName IS NOT NULL;
+            """);
+        Add(command, "$session", Id(sessionId));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return new RequestedAccountResolutionCounts(reader.GetInt64(0), reader.GetInt64(1));
+    }
+
     public async Task<ImportDispositionCounts> GetDispositionCountsAsync(
         Guid sessionId,
         CancellationToken cancellationToken = default)

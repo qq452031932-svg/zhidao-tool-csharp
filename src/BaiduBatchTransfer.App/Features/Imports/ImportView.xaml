@@ -44,7 +44,7 @@
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <TextBlock Text="草稿记录（仅加载当前页）" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10" />
+                <TextBlock Text="导入记录（仅加载当前页）" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10" />
                 <DataGrid Grid.Row="1" ItemsSource="{Binding Rows}" SelectedItem="{Binding SelectedRow}" AutoGenerateColumns="False" IsReadOnly="True"
                           EnableRowVirtualization="True" EnableColumnVirtualization="True"
                           VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
@@ -54,7 +54,7 @@
                         <DataGridTextColumn Header="分享链接" Binding="{Binding ShareUrl}" Width="*" />
                         <DataGridTextColumn Header="提取码" Binding="{Binding ExtractionCode}" Width="90" />
                         <DataGridTextColumn Header="表格账号" Binding="{Binding RequestedAccountName}" Width="130" />
-                        <DataGridTextColumn Header="草稿状态" Binding="{Binding DispositionText}" Width="120" />
+                        <DataGridTextColumn Header="记录状态" Binding="{Binding DispositionText}" Width="120" />
                         <DataGridTextColumn Header="预检结果" Binding="{Binding PrecheckText}" Width="110" />
                     </DataGrid.Columns>
                 </DataGrid>

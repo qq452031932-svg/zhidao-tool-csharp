@@ -84,6 +84,24 @@
                         <Button Content="平均分配" Command="{Binding Wizard.ApplyEqualAllocationCommand}" />
                         <Button Content="按容量分配" Command="{Binding Wizard.ApplyCapacityAllocationCommand}" />
                     </WrapPanel>
+                    <StackPanel Margin="0,12,0,0"
+                                Visibility="{Binding Wizard.HasExcelAccountColumn, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <TextBlock Text="Excel 账号列" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Wizard.ExcelAccountStatusMessage}"
+                                   Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" Margin="0,4,0,8" />
+                        <WrapPanel>
+                            <Button Content="复制时忽略账号列" Command="{Binding Wizard.IgnoreExcelAccountColumnCommand}" />
+                            <Button Content="保留已匹配账号" Command="{Binding Wizard.KeepExcelMappingsCommand}" />
+                            <Button Content="自动匹配唯一账号" Command="{Binding Wizard.AutoMapUniqueExcelAccountsCommand}" />
+                        </WrapPanel>
+                        <WrapPanel Margin="0,8,0,0">
+                            <ComboBox Width="220" ItemsSource="{Binding Wizard.Accounts}"
+                                      DisplayMemberPath="DisplayName" SelectedValuePath="AccountId"
+                                      SelectedValue="{Binding Wizard.ExcelOverrideAccountId}" />
+                            <Button Content="统一使用所选账号" Command="{Binding Wizard.OverrideExcelMappingsCommand}"
+                                    Margin="8,0,0,0" />
+                        </WrapPanel>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 

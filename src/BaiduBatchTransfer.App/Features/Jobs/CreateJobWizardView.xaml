@@ -31,7 +31,7 @@
                     <WrapPanel>
                         <Button Content="多账号复制" Command="{Binding SelectReplicationCommand}" />
                         <Button Content="多账号分流" Command="{Binding SelectDistributionCommand}" />
-                        <CheckBox Content="需要批量预检" IsChecked="{Binding UseBulkPrecheck}" VerticalAlignment="Center" Margin="12,0" />
+                        <CheckBox Content="需要后台检查" IsChecked="{Binding UseBulkPrecheck}" VerticalAlignment="Center" Margin="12,0" />
                     </WrapPanel>
                     <TextBlock Text="{Binding AccountSelectionNotice}" Margin="0,10,0,0" Foreground="{StaticResource MutedBrush}" />
                 </StackPanel>
@@ -39,8 +39,8 @@
 
             <Border Style="{StaticResource Card}" Visibility="{Binding IsPrecheckStepVisible, Converter={StaticResource BooleanToVisibilityConverter}}" IsEnabled="{Binding CanEdit}">
                 <StackPanel>
-                    <TextBlock Text="2. 批量预检" FontSize="18" FontWeight="SemiBold" />
-                    <CheckBox Content="创建任务前批量检查链接有效性" IsChecked="{Binding UseBulkPrecheck}" Margin="0,12,0,8" />
+                    <TextBlock Text="2. 后台检查" FontSize="18" FontWeight="SemiBold" />
+                    <CheckBox Content="开始转存前检查链接有效性" IsChecked="{Binding UseBulkPrecheck}" Margin="0,12,0,8" />
                     <TextBlock Text="预检固定使用一个明确选择的账号；登录或安全验证暂停后仍使用该账号继续。" Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" />
                     <ComboBox ItemsSource="{Binding Accounts}" DisplayMemberPath="DisplayName" SelectedValuePath="AccountId"
                               SelectedValue="{Binding PrecheckAccountId}" Margin="0,10,0,8" Width="280" HorizontalAlignment="Left" />
@@ -218,7 +218,7 @@
                               IsChecked="{Binding IsFinalConfirmationChecked}" Margin="0,12,0,12" />
                     <WrapPanel>
                         <Button Content="生成最终预览" Command="{Binding PrepareConfirmationCommand}" />
-                        <Button Content="确认创建任务" Command="{Binding CreateJobCommand}" Style="{StaticResource PrimaryButton}" />
+                        <Button Content="确认开始转存" Command="{Binding CreateJobCommand}" Style="{StaticResource PrimaryButton}" />
                     </WrapPanel>
                 </StackPanel>
             </Border>

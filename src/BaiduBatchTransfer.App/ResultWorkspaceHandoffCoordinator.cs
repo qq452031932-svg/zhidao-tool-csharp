@@ -53,11 +53,11 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         }
     }
 
-    public Task ActivateJobAsync(Guid batchJobId)
+    public Task ActivateJobAsync(Guid batchJobId, CancellationToken cancellationToken = default)
     {
         if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
         Request? request;
-        lock (sync) request = BeginRequest();
+        lock (sync) request = BeginRequest(cancellationToken);
         return request is null ? Task.CompletedTask : ActivateJobCoreAsync(request, batchJobId);
     }
 
@@ -95,11 +95,11 @@ public sealed class ResultWorkspaceHandoffCoordinator : IDisposable
         lifetime.Dispose();
     }
 
-    private Request? BeginRequest()
+    private Request? BeginRequest(CancellationToken cancellationToken = default)
     {
         if (isClosed) return null;
         activeRequest?.Cancel();
-        var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         activeRequest = requestCancellation;
         return new Request(++generation, requestCancellation);
     }

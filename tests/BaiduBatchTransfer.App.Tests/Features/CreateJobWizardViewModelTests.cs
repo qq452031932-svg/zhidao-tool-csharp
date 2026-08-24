@@ -27,7 +27,7 @@ public sealed class CreateJobWizardViewModelTests
     {
         var vm = Create(Accounts(2), ready: 100);
 
-        Assert.Equal(["导入数据", "批量预检", "选择目录", "分配账号", "确认任务"], vm.Steps.Select(x => x.Title));
+        Assert.Equal(["导入数据", "后台检查", "选择目录", "分配账号", "转存确认"], vm.Steps.Select(x => x.Title));
         Assert.True(vm.Steps.Single(x => x.Kind == WizardStepKind.Precheck).IsSkipped);
 
         vm.UseBulkPrecheck = true;
@@ -1195,10 +1195,10 @@ public sealed class CreateJobWizardViewModelTests
                 ResultColumnCount: checked(2 + selected.Length * 3)));
         }
 
-        public Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
+        public Task<Guid> ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
         {
             ConfirmedToken = confirmationToken;
-            return Task.CompletedTask;
+            return Task.FromResult(draft.BatchJobId);
         }
     }
 
@@ -1216,10 +1216,10 @@ public sealed class CreateJobWizardViewModelTests
             return new(draft.ReadyResourceCount, draft.ReadyResourceCount, "stale-token", true);
         }
 
-        public Task ConfirmAsync(
+        public Task<Guid> ConfirmAsync(
             WizardBatchDraft draft,
             string confirmationToken,
-            CancellationToken cancellationToken) => Task.CompletedTask;
+            CancellationToken cancellationToken) => Task.FromResult(draft.BatchJobId);
 
         public void Complete() => release.TrySetResult();
     }

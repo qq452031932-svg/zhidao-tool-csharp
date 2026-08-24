@@ -35,6 +35,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private QuotaBasis quotaBasis = QuotaBasis.SuccessTarget;
     private ShortagePolicy shortagePolicy = ShortagePolicy.ProportionalReduction;
     private ExcelAccountHandling excelAccountHandling;
+    private Guid? excelOverrideAccountId;
     private bool useBulkPrecheck;
     private Guid? precheckAccountId;
     private bool isFinalConfirmationChecked;
@@ -89,10 +90,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         foreach (var account in Accounts) account.PropertyChanged += AccountChanged;
         Steps = new([
             new(WizardStepKind.Import, "导入数据") { IsCurrent = true },
-            new(WizardStepKind.Precheck, "批量预检") { IsSkipped = true },
+            new(WizardStepKind.Precheck, "后台检查") { IsSkipped = true },
             new(WizardStepKind.Destination, "选择目录"),
             new(WizardStepKind.Allocation, "分配账号"),
-            new(WizardStepKind.Confirmation, "确认任务"),
+            new(WizardStepKind.Confirmation, "转存确认"),
         ]);
         PreviewRows = new();
         PrepareConfirmationCommand = new AsyncRelayCommand(PrepareConfirmationAsync, () => !IsBusy);
@@ -167,6 +168,30 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public QuotaBasis QuotaBasis { get => quotaBasis; set => SetAndInvalidate(ref quotaBasis, value); }
     public ShortagePolicy ShortagePolicy { get => shortagePolicy; set => SetAndInvalidate(ref shortagePolicy, value); }
     public ExcelAccountHandling ExcelAccountHandling { get => excelAccountHandling; set => SetAndInvalidate(ref excelAccountHandling, value); }
+    public Guid? ExcelOverrideAccountId
+    {
+        get => excelOverrideAccountId;
+        set
+        {
+            if (!SetProperty(ref excelOverrideAccountId, value)) return;
+            OnPropertyChanged(nameof(ExcelAccountStatusMessage));
+            OverrideExcelMappingsCommand.NotifyCanExecuteChanged();
+        }
+    }
+    public bool HasExcelAccountColumn => hasExcelAccountColumn;
+    public int UnresolvedAccountMappingCount => unresolvedAccountMappingCount;
+    public string ExcelAccountStatusMessage => !hasExcelAccountColumn
+        ? string.Empty
+        : unresolvedAccountMappingCount > 0
+            ? $"Excel 账号列仍有 {unresolvedAccountMappingCount:N0} 个名称需要匹配或统一指定账号。"
+            : ExcelAccountHandling switch
+            {
+                ExcelAccountHandling.IgnoreColumn => "转存时将忽略 Excel 账号列。",
+                ExcelAccountHandling.KeepMappings => "将保留 Excel 中已经匹配的账号。",
+                ExcelAccountHandling.MapNames => "Excel 账号名称已完成匹配。",
+                ExcelAccountHandling.OverrideAll => "Excel 行已统一使用所选账号。",
+                _ => "请选择 Excel 账号列的处理方式。",
+            };
     public bool UseBulkPrecheck
     {
         get => useBulkPrecheck;
@@ -237,7 +262,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         _ => false,
     });
     public string AccountSelectionNotice { get; private set; } = string.Empty;
-    public string ValidationModeText => UseBulkPrecheck ? "批量预检" : "执行前即时检测";
+    public string ValidationModeText => UseBulkPrecheck ? "后台检查" : "执行前即时检测";
     public string TransferModeText => transferMode switch
     {
         Core.Domain.TransferMode.Replication => "多账号复制",
@@ -333,16 +358,34 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 ? Accounts[0].OriginalTargetSuccessCount
                 : readyResourceCount;
             AccountSelectionNotice = $"已自动选择唯一可用账号：{Accounts[0].DisplayName}，请在确认页核对。";
+            excelOverrideAccountId = Accounts[0].AccountId;
         }
         else
         {
             transferMode = null;
+            excelOverrideAccountId = null;
             AccountSelectionNotice = "请选择多账号复制或多账号分流。";
         }
         suppressInvalidation = false;
         InvalidateConfirmation();
         RaiseAll();
         OnPropertyChanged(nameof(CurrentImportSessionId));
+    }
+
+    public void RefreshImportSnapshot(
+        int readyRows,
+        int conflictRows,
+        int needsResolutionRows,
+        bool excelAccountColumn,
+        int unresolvedAccountMappings)
+    {
+        readyResourceCount = Math.Max(0, readyRows);
+        conflictRowCount = Math.Max(0, conflictRows);
+        needsResolutionRowCount = Math.Max(0, needsResolutionRows);
+        hasExcelAccountColumn = excelAccountColumn;
+        unresolvedAccountMappingCount = Math.Max(0, unresolvedAccountMappings);
+        InvalidateConfirmation();
+        RaiseAll();
     }
 
     public void ReloadAccounts(IReadOnlyList<WizardAccountOption> accounts)
@@ -416,6 +459,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                     ? "请选择多账号复制或多账号分流。"
                     : "账号列表已刷新，请重新核对分配。";
             }
+            if (excelOverrideAccountId is not { } overrideId ||
+                Accounts.All(account => account.AccountId != overrideId || !account.IsSelected))
+                excelOverrideAccountId = Accounts.FirstOrDefault(account => account.IsSelected)?.AccountId;
         }
         finally
         {
@@ -456,7 +502,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         catch (Exception)
         {
             if (IsCurrentDraft(session, generation))
-                ValidationMessage = "无法切换模式，请先处理草稿冲突。";
+                ValidationMessage = "无法切换模式，请先处理导入数据冲突。";
         }
         finally { EndBusy(busyToken); }
     }
@@ -479,7 +525,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         catch (Exception)
         {
             if (IsCurrentDraft(session, generation))
-                ValidationMessage = "无法忽略 Excel 账号列，请刷新草稿后重试。";
+                ValidationMessage = "无法忽略 Excel 账号列，请刷新导入数据后重试。";
         }
         finally { EndBusy(busyToken); }
     }
@@ -506,7 +552,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         catch (Exception)
         {
             if (IsCurrentDraft(session, generation))
-                ValidationMessage = "无法匹配 Excel 账号名称，请刷新草稿后重试。";
+                ValidationMessage = "无法匹配 Excel 账号名称，请刷新导入数据后重试。";
         }
         finally { EndBusy(busyToken); }
     }
@@ -514,7 +560,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public async Task OverrideAllExcelAccountsAsync(CancellationToken cancellationToken = default)
     {
         if (importSessionId == Guid.Empty || transferMode is null) return;
-        var account = Accounts.FirstOrDefault(x => x.IsSelected);
+        var account = ExcelOverrideAccountId is { } accountId
+            ? Accounts.FirstOrDefault(x => x.AccountId == accountId && x.IsSelected)
+            : null;
         if (account is null) { ValidationMessage = "请先选择用于覆盖的账号。"; return; }
         var session = importSessionId;
         var generation = draftGeneration;
@@ -531,7 +579,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         catch (Exception)
         {
             if (IsCurrentDraft(session, generation))
-                ValidationMessage = "无法覆盖逐行账号，请刷新草稿后重试。";
+                ValidationMessage = "无法覆盖逐行账号，请刷新导入数据后重试。";
         }
         finally { EndBusy(busyToken); }
     }
@@ -700,7 +748,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "本机磁盘空间不足，无法安全创建任务。请释放空间后重新预览。";
+                ValidationMessage = "本机磁盘空间不足，无法安全开始转存。请释放空间后重新预览。";
             }
         }
         catch (BatchDraftValidationException)
@@ -708,7 +756,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "任务配置或导入草稿已变化，请返回检查并重新预览。";
+                ValidationMessage = "转存配置或导入数据已变化，请返回检查并重新预览。";
             }
         }
         catch (Exception)
@@ -743,15 +791,14 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         var generation = draftGeneration;
         var confirmed = await dialogService.ConfirmAsync(
             "最终确认",
-            $"将创建任务“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
+            $"将开始转存“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
             cancellationToken);
         if (!confirmed || !IsCurrentDraft(session, generation)) return null;
         var busyToken = BeginBusy();
-        var created = false;
+        Guid? createdBatchJobId = null;
         try
         {
-            await batchService.ConfirmAsync(draft, token, cancellationToken);
-            created = true;
+            createdBatchJobId = await batchService.ConfirmAsync(draft, token, cancellationToken);
             if (IsCurrentDraft(session, generation))
             {
                 ConfirmationToken = null;
@@ -764,7 +811,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "导入草稿或任务设置已变化，请重新预览并确认。";
+                ValidationMessage = "导入数据或转存设置已变化，请重新预览并确认。";
             }
         }
         catch (StorageCapacityException)
@@ -784,8 +831,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             }
         }
         finally { EndBusy(busyToken); }
-        if (created) JobCreated?.Invoke(this, draft.BatchJobId);
-        return created ? draft.BatchJobId : null;
+        if (createdBatchJobId is { } created) JobCreated?.Invoke(this, created);
+        return createdBatchJobId;
     }
 
     private async Task LoadPreviewPageAsync(long? cursor, bool replace, CancellationToken cancellationToken)
@@ -941,6 +988,9 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private void AccountChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (suppressInvalidation) return;
+        if (ExcelOverrideAccountId is not { } overrideId ||
+            Accounts.All(account => account.AccountId != overrideId || !account.IsSelected))
+            ExcelOverrideAccountId = Accounts.FirstOrDefault(account => account.IsSelected)?.AccountId;
         InvalidateConfirmation();
         RaiseAll();
     }
@@ -1018,7 +1068,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             confirmations.Any(value => !selected.ContainsKey(value.AccountId)))
             throw new BatchDraftValidationException("预览账号确认快照与当前选择不一致。");
         if (confirmations.Any(value => selected[value.AccountId].ShareEnabled != value.ShareEnabled))
-            throw new BatchDraftValidationException("预览账号分享设置与当前草稿不一致。");
+            throw new BatchDraftValidationException("预览账号分享设置与当前导入数据不一致。");
         if (confirmations.Any(value =>
                 value.PlannedTransferCount is null or < 0 ||
                 value.PlannedShareCount is null or < 0 ||
@@ -1075,6 +1125,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         OnPropertyChanged(nameof(QuotaBasis));
         OnPropertyChanged(nameof(ShortagePolicy));
         OnPropertyChanged(nameof(ExcelAccountHandling));
+        OnPropertyChanged(nameof(ExcelOverrideAccountId));
+        OnPropertyChanged(nameof(HasExcelAccountColumn));
+        OnPropertyChanged(nameof(UnresolvedAccountMappingCount));
+        OnPropertyChanged(nameof(ExcelAccountStatusMessage));
         OnPropertyChanged(nameof(TransferModeText));
         OnPropertyChanged(nameof(QuotaBasisText));
         OnPropertyChanged(nameof(ShortagePolicyText));

@@ -69,8 +69,8 @@ public interface IImportWorkflow
         Task.FromResult(HasResumableReplaySource(sessionId));
     bool HasResumableReplaySource(Guid sessionId) => true;
     void DiscardReplaySource(Guid sessionId) { }
-    Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
-    Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken);
+    Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken);
 }
 
 public sealed class UnavailableImportWorkflow : IImportWorkflow
@@ -81,8 +81,8 @@ public sealed class UnavailableImportWorkflow : IImportWorkflow
     public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
     public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
     public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
-    public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) => Task.FromException(Error());
-    public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => Task.FromException(Error());
+    public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
+    public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => Task.FromException<ImportWorkflowResult>(Error());
 }
 
 public sealed class ImportViewModel : ObservableObject
@@ -92,6 +92,7 @@ public sealed class ImportViewModel : ObservableObject
     private readonly IImportPreviewPageSource pageSource;
     private readonly IDialogService dialogService;
     private readonly IAdapterAvailability adapterAvailability;
+    private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource? operationCancellation;
     private Guid? sessionId;
     private string textContent = string.Empty;
@@ -100,6 +101,7 @@ public sealed class ImportViewModel : ObservableObject
     private bool isBusy;
     private bool canResumeImport;
     private bool durableSessionObserved;
+    private bool isClosed;
     private long totalRows;
     private long? nextCursor;
     private ImportPreviewRow? selectedRow;
@@ -121,12 +123,12 @@ public sealed class ImportViewModel : ObservableObject
         Rows = new();
         ImportTextCommand = new AsyncRelayCommand(ImportTextAsync, () => CanImportText);
         SelectAndImportExcelCommand = new AsyncRelayCommand(SelectAndImportExcelAsync, () => CanImport);
-        ResumeImportCommand = new AsyncRelayCommand(ResumeImportAsync, () => CanResumeImport && !IsBusy);
+        ResumeImportCommand = new AsyncRelayCommand(ResumeImportAsync, () => !isClosed && CanResumeImport && !IsBusy);
         CancelCommand = new RelayCommand(Cancel, () => IsBusy);
-        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => sessionId is not null && !IsBusy);
-        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => nextCursor is not null && !IsBusy);
-        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => SelectedRow is not null && !IsBusy);
-        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => SelectedRow is not null && !IsBusy);
+        LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => !isClosed && sessionId is not null && !IsBusy);
+        LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => !isClosed && nextCursor is not null && !IsBusy);
+        SaveSelectedRowCommand = new AsyncRelayCommand(SaveSelectedRowAsync, () => !isClosed && SelectedRow is not null && !IsBusy);
+        ToggleSelectedExclusionCommand = new AsyncRelayCommand(ToggleSelectedExclusionAsync, () => !isClosed && SelectedRow is not null && !IsBusy);
     }
 
     public ObservableCollection<ImportPreviewRow> Rows { get; }
@@ -145,14 +147,15 @@ public sealed class ImportViewModel : ObservableObject
     public string StatisticsText { get => statisticsText; private set => SetProperty(ref statisticsText, value); }
     public bool IsBusy { get => isBusy; private set { if (SetProperty(ref isBusy, value)) RaiseCommands(); } }
     public bool CanResumeImport { get => canResumeImport; private set { if (SetProperty(ref canResumeImport, value)) RaiseCommands(); } }
-    public bool CanImport => workflow.IsAvailable && !IsBusy;
+    public bool CanImport => !isClosed && workflow.IsAvailable && !IsBusy;
     public bool CanImportText => CanImport && !string.IsNullOrWhiteSpace(TextContent);
     public string AdapterStatusMessage => !workflow.IsAvailable
         ? workflow.StatusMessage
         : adapterAvailability.CanStartTransfers
             ? string.Empty
-            : "可以先导入并整理草稿；实际转存功能仍在验证中。";
+            : "可以先导入并整理数据；实际转存功能仍在验证中。";
     public long TotalRows { get => totalRows; private set => SetProperty(ref totalRows, value); }
+    public bool IsClosed => isClosed;
     public Guid? SessionId => sessionId;
     public ImportPreviewRow? SelectedRow
     {
@@ -189,7 +192,10 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        var resumableSessionId = await workflow.FindLatestResumableExcelSessionAsync(cancellationToken);
+        if (isClosed) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var resumableSessionId = await workflow.FindLatestResumableExcelSessionAsync(linked.Token);
+        if (isClosed || linked.IsCancellationRequested) return;
         if (resumableSessionId is not { } value) return;
         AttachSession(value);
         CanResumeImport = true;
@@ -198,7 +204,7 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task ImportTextAsync(CancellationToken cancellationToken = default)
     {
-        if (IsBusy) return;
+        if (isClosed || IsBusy) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -210,7 +216,7 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task ImportExcelAsync(string filePath, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(filePath) || IsBusy) return;
+        if (isClosed || string.IsNullOrWhiteSpace(filePath) || IsBusy) return;
         var newSessionId = Guid.NewGuid();
         BeginNewImport();
         await RunImportAsync(
@@ -222,8 +228,11 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task SelectAndImportExcelAsync(CancellationToken cancellationToken = default)
     {
+        if (isClosed) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         StatusMessage = "请选择 Excel 文件";
-        var path = await dialogService.PickExcelFileAsync(cancellationToken);
+        var path = await dialogService.PickExcelFileAsync(linked.Token);
+        if (isClosed || linked.IsCancellationRequested) return;
         if (path is null)
         {
             StatusMessage = "未选择文件";
@@ -231,12 +240,12 @@ public sealed class ImportViewModel : ObservableObject
         }
 
         StatusMessage = "已选择 Excel 文件，正在检查";
-        await ImportExcelAsync(path, cancellationToken);
+        await ImportExcelAsync(path, linked.Token);
     }
 
     public async Task ResumeImportAsync(CancellationToken cancellationToken = default)
     {
-        if (sessionId is null || IsBusy) return;
+        if (isClosed || sessionId is null || IsBusy) return;
         await RunImportAsync(
             sessionId.Value,
             isResume: true,
@@ -258,40 +267,52 @@ public sealed class ImportViewModel : ObservableObject
 
     public async Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken = default)
     {
+        if (isClosed) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         try
         {
-            await workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, cancellationToken);
+            var result = await workflow.UpdateLinkAsync(rowId, shareUrl, extractionCode, linked.Token);
+            if (isClosed || linked.IsCancellationRequested) return;
             StatusMessage = "预检结果已失效，需要重新预检或按未预检状态继续。";
-            await LoadFirstPageAsync(cancellationToken);
+            await ApplyMutationAsync(result, linked.Token);
         }
-        catch (Exception) { StatusMessage = "修改失败，请检查链接与提取码。"; }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
+        catch (Exception) { if (!isClosed) StatusMessage = "修改失败，请检查链接与提取码。"; }
     }
 
     public async Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken = default)
     {
+        if (isClosed) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         try
         {
-            await workflow.SetExcludedAsync(rowId, excluded, cancellationToken);
+            var result = await workflow.SetExcludedAsync(rowId, excluded, linked.Token);
+            if (isClosed || linked.IsCancellationRequested) return;
             StatusMessage = excluded ? "已排除该记录。" : "已恢复该记录。";
+            await ApplyMutationAsync(result, linked.Token);
         }
-        catch (Exception) { StatusMessage = "无法更新记录，请刷新后重试。"; }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
+        catch (Exception) { if (!isClosed) StatusMessage = "无法更新记录，请刷新后重试。"; }
     }
 
     public async Task<bool> SaveCurrentRowEditAsync(CancellationToken cancellationToken = default)
     {
+        if (isClosed) return false;
         if (SelectedRow is null) return true;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         try
         {
-            await workflow.UpdateLinkAsync(
+            var result = await workflow.UpdateLinkAsync(
                 SelectedRow.RowId,
                 SelectedShareUrl,
                 string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
-                cancellationToken);
+                linked.Token);
+            if (isClosed || linked.IsCancellationRequested) return false;
             StatusMessage = "链接修改已保存，开始前会重新检查。";
-            await LoadFirstPageAsync(cancellationToken);
+            await ApplyMutationAsync(result, linked.Token);
             return true;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (linked.IsCancellationRequested)
         {
             return false;
         }
@@ -316,15 +337,26 @@ public sealed class ImportViewModel : ObservableObject
         OnPropertyChanged(nameof(SelectedExclusionActionText));
     }
 
+    private async Task ApplyMutationAsync(
+        ImportWorkflowResult result,
+        CancellationToken cancellationToken)
+    {
+        if (sessionId != result.SessionId)
+            throw new InvalidOperationException("The import mutation returned a different session.");
+        ApplyStatistics(result.Statistics);
+        DraftReady?.Invoke(this, new(result.SessionId, result.Statistics));
+        await LoadFirstPageAsync(cancellationToken);
+    }
+
     private async Task RunImportAsync(
         Guid operationSessionId,
         bool isResume,
         Func<IProgress<ImportCommittedProgress>, CancellationToken, Task<ImportWorkflowResult>> action,
         CancellationToken externalCancellation)
     {
-        if (IsBusy) return;
+        if (isClosed || IsBusy) return;
         if (isResume) durableSessionObserved = true;
-        operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(externalCancellation);
+        operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, externalCancellation);
         IsBusy = true;
         StatusMessage = "正在流式导入，已保存的批次会持续写入本机数据库…";
         try
@@ -332,24 +364,27 @@ public sealed class ImportViewModel : ObservableObject
             var progress = new UiProgress<ImportCommittedProgress>(
                 value => ApplyCommittedProgress(operationSessionId, value));
             var result = await action(progress, operationCancellation.Token);
+            if (isClosed) return;
             AttachSession(result.SessionId);
             ApplyStatistics(result.Statistics);
             CanResumeImport = false;
             StatusMessage = "导入完成，请分页检查异常、重复和账号映射。";
             DraftReady?.Invoke(this, new(result.SessionId, result.Statistics));
-            await LoadFirstPageAsync(externalCancellation);
+            await LoadFirstPageAsync(operationCancellation.Token);
         }
         catch (OperationCanceledException)
         {
+            if (isClosed) return;
             CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入已取消，已保存的进度可以继续。"
                 : durableSessionObserved
-                    ? "导入已取消，草稿已保存，但没有可继续的解析进度。"
-                    : "导入已取消，尚未保存可继续的草稿。";
+                    ? "导入已取消，数据已保存，但没有可继续的解析进度。"
+                    : "导入已取消，尚未保存可继续的数据。";
         }
         catch (ImportWorkflowException error)
         {
+            if (isClosed) return;
             CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入中断，已保存的进度可以继续。"
@@ -357,6 +392,7 @@ public sealed class ImportViewModel : ObservableObject
         }
         catch (Exception)
         {
+            if (isClosed) return;
             CanResumeImport = await HasResumableSourceAsync(operationSessionId);
             StatusMessage = CanResumeImport
                 ? "导入中断，已保存的进度可以继续。"
@@ -366,19 +402,20 @@ public sealed class ImportViewModel : ObservableObject
         {
             operationCancellation.Dispose();
             operationCancellation = null;
-            IsBusy = false;
+            if (!isClosed) IsBusy = false;
         }
     }
 
     private async Task LoadPageAsync(long? cursor, CancellationToken cancellationToken)
     {
-        if (sessionId is null) return;
+        if (isClosed || sessionId is null) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var expectedSession = sessionId.Value;
         var generation = pageGeneration;
         try
         {
-            var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), cancellationToken);
-            if (sessionId != expectedSession || generation != pageGeneration) return;
+            var page = await pageSource.LoadAsync(new(expectedSession, PageSize, cursor), linked.Token);
+            if (isClosed || linked.IsCancellationRequested || sessionId != expectedSession || generation != pageGeneration) return;
             var selectedRowId = SelectedRow?.RowId;
             void Apply()
             {
@@ -395,11 +432,24 @@ public sealed class ImportViewModel : ObservableObject
             if (dispatcher is null || dispatcher.CheckAccess()) Apply();
             else await dispatcher.InvokeAsync(Apply);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception) { StatusMessage = "无法加载导入记录，请稍后重试。"; }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
+        catch (Exception) { if (!isClosed) StatusMessage = "无法加载导入记录，请稍后重试。"; }
     }
 
     private void Cancel() => operationCancellation?.Cancel();
+
+    public void Close()
+    {
+        if (isClosed) return;
+        isClosed = true;
+        pageGeneration++;
+        lifetime.Cancel();
+        operationCancellation?.Cancel();
+        CanResumeImport = false;
+        IsBusy = false;
+        OnPropertyChanged(nameof(IsClosed));
+        RaiseCommands();
+    }
 
     private Task<bool> HasResumableSourceAsync(Guid operationSessionId) =>
         durableSessionObserved &&
@@ -423,12 +473,13 @@ public sealed class ImportViewModel : ObservableObject
 
     private void ApplyCommittedProgress(Guid operationSessionId, ImportCommittedProgress progress)
     {
+        if (isClosed) return;
         if (progress.Kind == ImportProgressKind.SessionCreated)
             AttachSession(operationSessionId);
         StatusMessage = progress.Kind switch
         {
-            ImportProgressKind.SessionCreated => "正在解析并写入草稿",
-            ImportProgressKind.ChunkCommitted => $"正在解析并写入草稿，已保存 {progress.PersistedRows:N0} 行",
+            ImportProgressKind.SessionCreated => "正在解析并保存数据",
+            ImportProgressKind.ChunkCommitted => $"正在解析并保存数据，已保存 {progress.PersistedRows:N0} 行",
             _ => StatusMessage,
         };
     }

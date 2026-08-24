@@ -6,6 +6,7 @@ using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -43,6 +44,8 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<ExcelColumnSuggestionEngine>());
         Assert.NotNull(host.Services.GetRequiredService<IImportPreviewPageSource>());
         Assert.NotNull(host.Services.GetRequiredService<IWizardBatchService>());
+        Assert.NotNull(host.Services.GetRequiredService<BulkPrecheckService>());
+        Assert.IsType<BulkWizardPrecheckWorkflow>(host.Services.GetRequiredService<IWizardPrecheckWorkflow>());
         Assert.IsType<LocalJobResultsWorkflow>(host.Services.GetRequiredService<IJobResultsWorkflow>());
         Assert.IsType<ResultSaveDialog>(host.Services.GetRequiredService<IResultSaveDialog>());
         Assert.IsType<UnavailableJobResultCapabilityAvailability>(
@@ -62,6 +65,36 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
         Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
+    }
+
+    [Fact]
+    public async Task ProductionPrecheckSnapshotReadsUpdatedActionableCountsFromMigratedDatabase()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sessionId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+        var rows = new[]
+        {
+            StagedImportRowRecord.Create(Guid.NewGuid(), sessionId, 1, "invalid", "Invalid"),
+            StagedImportRowRecord.Create(Guid.NewGuid(), sessionId, 2, "pending", "NeedsResolution"),
+            StagedImportRowRecord.Create(Guid.NewGuid(), sessionId, 3, "conflict", "Conflict"),
+            FailedRow(sessionId, 4, "INVALID_LINK", now),
+            FailedRow(sessionId, 5, "INVALID_EXTRACTION_CODE", now),
+            FailedRow(sessionId, 6, "ACCOUNT_CAPACITY", now),
+            FailedRow(sessionId, 7, "INVALID_TARGET_PATH", now),
+        };
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            await unit.Imports.AddSessionAsync(ImportSessionRecord.Create(sessionId, "Text", "paste"));
+            await unit.Imports.AddRowsAsync(rows);
+            await unit.CommitAsync();
+        }
+
+        var snapshot = await host.Services.GetRequiredService<IWizardPrecheckSnapshotQuery>()
+            .LoadAsync(sessionId, CancellationToken.None);
+
+        Assert.Equal(new WizardPrecheckActionableSnapshot(3, 1, 2, 1), snapshot);
     }
 
     [Fact]
@@ -232,6 +265,19 @@ public sealed class AppBootstrapTests : IDisposable
 
         throw new DirectoryNotFoundException("未找到测试仓库目录。");
     }
+
+    private static StagedImportRowRecord FailedRow(
+        Guid sessionId,
+        int sourceRow,
+        string errorCode,
+        DateTimeOffset now) =>
+        StagedImportRowRecord.Create(Guid.NewGuid(), sessionId, sourceRow, $"link-{sourceRow}", "Ready") with
+        {
+            NormalizedShareId = $"share-{sourceRow}",
+            PrecheckStatus = "Failed",
+            PrecheckErrorCode = errorCode,
+            PrecheckedAt = now,
+        };
 
     private static WizardAccountOption AccountOption(int value) => new(
         Guid.Parse($"00000000-0000-0000-0000-{value:000000000000}"),

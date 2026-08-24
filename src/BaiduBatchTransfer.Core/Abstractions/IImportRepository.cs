@@ -54,6 +54,16 @@ public interface IImportRepository
         PageQuery query,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Requested-account aggregation is not supported by this repository.");
+    async Task<RequestedAccountResolutionCounts> GetRequestedAccountResolutionCountsAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken = default)
+    {
+        var groups = await GetRequestedAccountNameGroupsPageAsync(
+            sessionId,
+            new PageQuery(1, 1),
+            cancellationToken).ConfigureAwait(false);
+        return new RequestedAccountResolutionCounts(groups.TotalCount, groups.TotalCount);
+    }
     Task<ImportDispositionCounts> GetDispositionCountsAsync(
         Guid sessionId,
         CancellationToken cancellationToken = default) =>

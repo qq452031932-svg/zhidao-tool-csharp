@@ -106,6 +106,7 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal(["save", "precheck", "preview", "confirm", "sink", "handoff"], fixture.Events);
         Assert.Equal("https://pan.baidu.com/s/edited", fixture.ImportWorkflow.SavedUrl);
         Assert.Equal("c3d4", fixture.ImportWorkflow.SavedCode);
+        Assert.DoesNotContain("创建任务", fixture.Dialog.LastConfirmationMessage, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -122,6 +123,19 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal(0, fixture.BatchService.PreviewCalls);
         Assert.Contains("无效链接", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
         Assert.Contains("缺少提取码", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnavailablePrecheckPlaceholderDoesNotBlockAnOtherwiseAvailableConfiguration()
+    {
+        using var fixture = Fixture.Valid(precheck: new WizardPrecheckResult(
+            WizardPrecheckStatus.Unavailable,
+            0));
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
     }
 
     [Fact]
@@ -170,6 +184,87 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task ExcludingEveryReadyRowRefreshesSnapshotAndDisablesStart()
+    {
+        using var fixture = Fixture.Valid(ready: 1);
+        var session = Assert.IsType<Guid>(fixture.Import.SessionId);
+        fixture.ImportWorkflow.NextMutation = new(
+            session,
+            new ImportDraftStatistics(1, 0, 0, 0, 1));
+
+        await fixture.Import.SetExcludedAsync(Guid.NewGuid(), excluded: true);
+
+        Assert.Equal(0, fixture.Wizard.ReadyResourceCount);
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Contains("就绪 0", fixture.Import.StatisticsText, StringComparison.Ordinal);
+        Assert.True(fixture.PageSource.LoadCalls > 0);
+    }
+
+    [Fact]
+    public async Task RepairingAConflictRefreshesSameSessionAndCanEnableStart()
+    {
+        using var fixture = Fixture.Create(accountCount: 1, ready: 1);
+        fixture.ApplyDraft(new ImportDraftStatistics(2, 1, 0, 0, 0, Conflict: 1));
+        fixture.Wizard.QuotaBasis = QuotaBasis.TaskCount;
+        fixture.Wizard.Accounts[0].TargetItemCount = 1;
+        Assert.False(fixture.ViewModel.CanStart);
+        var session = Assert.IsType<Guid>(fixture.Import.SessionId);
+        fixture.ImportWorkflow.NextMutation = new(
+            session,
+            new ImportDraftStatistics(2, 1, 0, 0, 1));
+
+        await fixture.Import.UpdateLinkAsync(Guid.NewGuid(), "https://pan.baidu.com/s/repaired", "a1b2");
+
+        Assert.Equal(session, fixture.Wizard.CurrentImportSessionId);
+        Assert.True(fixture.ViewModel.CanStart);
+    }
+
+    [Fact]
+    public async Task ExcelAccountColumnCanBeResolvedForReplicationAndDistributionOnPage()
+    {
+        using var fixture = Fixture.Create(accountCount: 2, ready: 2);
+        fixture.ApplyDraft(new ImportDraftStatistics(
+            2, 2, 0, 0, 0,
+            HasExcelAccountColumn: true,
+            UnresolvedAccountMappings: 2));
+        fixture.Wizard.Accounts[0].IsSelected = true;
+        fixture.Wizard.Accounts[1].IsSelected = true;
+
+        await fixture.ViewModel.SelectAccountModeAsync(TransferAccountMode.MultiAccountReplication);
+        Assert.False(fixture.ViewModel.CanStart);
+        await fixture.Wizard.IgnoreExcelAccountsAsync();
+        Assert.True(fixture.ViewModel.CanStart);
+
+        await fixture.ViewModel.SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution);
+        fixture.Wizard.QuotaBasis = QuotaBasis.TaskCount;
+        fixture.Wizard.Accounts[0].TargetItemCount = 1;
+        fixture.Wizard.Accounts[1].TargetItemCount = 1;
+        fixture.Wizard.RefreshImportSnapshot(2, 0, 0, true, 2);
+        Assert.False(fixture.ViewModel.CanStart);
+        await fixture.Wizard.AutoMapUniqueExcelAccountsAsync();
+        Assert.True(fixture.ViewModel.CanStart);
+    }
+
+    [Fact]
+    public async Task ExcelOverrideUsesExplicitlySelectedParticipatingAccount()
+    {
+        using var fixture = Fixture.Create(accountCount: 2, ready: 2);
+        fixture.ApplyDraft(new ImportDraftStatistics(
+            2, 2, 0, 0, 0,
+            HasExcelAccountColumn: true,
+            UnresolvedAccountMappings: 1));
+        fixture.Wizard.Accounts[0].IsSelected = true;
+        fixture.Wizard.Accounts[1].IsSelected = true;
+        await fixture.ViewModel.SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution);
+        fixture.Wizard.ExcelOverrideAccountId = fixture.Wizard.Accounts[1].AccountId;
+
+        await fixture.Wizard.OverrideAllExcelAccountsAsync();
+
+        Assert.Equal(fixture.Wizard.Accounts[1].AccountId, fixture.DraftWorkflow.LastOverrideAccountId);
+        Assert.Equal(ExcelAccountHandling.OverrideAll, fixture.Wizard.ExcelAccountHandling);
+    }
+
+    [Fact]
     public async Task CloseCancelsStartAndPreventsLateSinkHandoffOrStatusMutation()
     {
         var precheck = new BlockingPrecheckWorkflow();
@@ -184,6 +279,76 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal(statusAtClose, fixture.ViewModel.StatusMessage);
         Assert.Empty(fixture.DestinationSink.Values);
         Assert.Empty(fixture.HandedOffBatches);
+        Assert.True(fixture.Import.IsClosed);
+    }
+
+    [Fact]
+    public async Task SinkFailureAfterDurableCreationStillHandsOffAndCannotCreateDuplicate()
+    {
+        using var fixture = Fixture.Valid();
+        fixture.ViewModel.AutoShare = true;
+        fixture.ViewModel.ShareResultDirectory = "C:\\results";
+        fixture.DestinationSink.Error = new IOException("sink unavailable");
+
+        await fixture.ViewModel.StartAsync();
+        var created = Assert.IsType<Guid>(fixture.ViewModel.CreatedBatchJobId);
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        Assert.Equal([created], fixture.HandedOffBatches);
+        Assert.False(fixture.ViewModel.CanStart);
+        Assert.Equal("批次已创建，结果目录暂未保存。", fixture.ViewModel.StatusMessage);
+    }
+
+    [Fact]
+    public async Task HandoffFailureAfterDurableCreationReportsRecoverableBatch()
+    {
+        using var fixture = Fixture.Valid();
+        fixture.Handoff.Error = new InvalidOperationException("navigation unavailable");
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+        Assert.Contains(fixture.RunPanel.Batches,
+            item => item.BatchJobId == fixture.ViewModel.CreatedBatchJobId);
+        Assert.Contains("批次已创建", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.Contains("稍后", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("转存未能开始", fixture.ViewModel.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CallerCancellationAfterDurableConfirmationStillCompletesPostCommitHandoff()
+    {
+        using var fixture = Fixture.Valid();
+        using var cancellation = new CancellationTokenSource();
+        fixture.BatchService.AfterConfirm = cancellation.Cancel;
+
+        await fixture.ViewModel.StartAsync(cancellation.Token);
+
+        var created = Assert.IsType<Guid>(fixture.ViewModel.CreatedBatchJobId);
+        Assert.Equal([created], fixture.HandedOffBatches);
+        Assert.Equal(1, fixture.BatchService.ConfirmCalls);
+    }
+
+    [Fact]
+    public async Task CloseDuringPostCommitHandoffCancelsTokenWithoutLateUiMutation()
+    {
+        using var fixture = Fixture.Valid();
+        fixture.Handoff.Block = true;
+        var changes = new List<string?>();
+        fixture.ViewModel.PropertyChanged += (_, args) => changes.Add(args.PropertyName);
+
+        var start = fixture.ViewModel.StartAsync();
+        await fixture.Handoff.Started.Task;
+        fixture.ViewModel.Close();
+        var changesAtClose = changes.Count;
+        fixture.Handoff.Release();
+        await start;
+
+        Assert.True(fixture.Handoff.CancellationObserved);
+        Assert.Equal(changesAtClose, changes.Count);
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
     }
 
     [Fact]
@@ -205,6 +370,42 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.DoesNotContain("确认任务", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("NextStepCommand", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("PreviousStepCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Wizard.IgnoreExcelAccountColumnCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Wizard.KeepExcelMappingsCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Wizard.AutoMapUniqueExcelAccountsCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Wizard.OverrideExcelMappingsCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Wizard.ExcelOverrideAccountId", xaml, StringComparison.Ordinal);
+
+        var appRoot = Path.Combine(root, "src", "BaiduBatchTransfer.App");
+        foreach (var xamlPath in Directory.EnumerateFiles(appRoot, "*.xaml", SearchOption.AllDirectories))
+        {
+            var source = File.ReadAllText(xamlPath);
+            Assert.DoesNotContain("草稿", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("创建任务", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("批量预检", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("确认任务", source, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void RuntimeWorkspaceCopyDoesNotExposeForbiddenWorkflowTerms()
+    {
+        using var fixture = Fixture.Valid();
+        var copy = fixture.Wizard.Steps.Select(step => step.Title)
+            .Append(fixture.Wizard.ValidationModeText)
+            .Append(fixture.Import.StatusMessage)
+            .Append(fixture.Import.AdapterStatusMessage)
+            .Append(fixture.ViewModel.StatusMessage)
+            .Append(fixture.Wizard.ValidationMessage)
+            .ToArray();
+
+        Assert.All(copy, value =>
+        {
+            Assert.DoesNotContain("草稿", value, StringComparison.Ordinal);
+            Assert.DoesNotContain("创建任务", value, StringComparison.Ordinal);
+            Assert.DoesNotContain("批量预检", value, StringComparison.Ordinal);
+            Assert.DoesNotContain("确认任务", value, StringComparison.Ordinal);
+        });
     }
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
@@ -235,17 +436,19 @@ public sealed class TransferWorkspaceViewModelTests
             Ready = ready;
             Events = [];
             ImportWorkflow = new FakeImportWorkflow(Events);
-            var pageSource = new FakePageSource();
+            PageSource = new FakePageSource();
+            Dialog = new FakeDialog();
             Import = new ImportViewModel(
-                ImportWorkflow, pageSource, new FakeDialog(), new AvailableAdapter());
+                ImportWorkflow, PageSource, Dialog, new AvailableAdapter());
             BatchService = new FakeBatchService(Events);
+            DraftWorkflow = new FakeDraftWorkflow(ready);
             Wizard = new CreateJobWizardViewModel(
                 Enumerable.Range(1, accountCount).Select(index => Account($"账号 {index}")).ToArray(),
-                pageSource,
+                PageSource,
                 BatchService,
-                new FakeDialog(),
+                Dialog,
                 new AvailableAdapter(),
-                new FakeDraftWorkflow(ready),
+                DraftWorkflow,
                 precheckWorkflow ?? new FakePrecheckWorkflow(Events, precheck ?? new(WizardPrecheckStatus.Completed, ready)),
                 new AvailableCapabilities());
             var results = new JobResultsViewModel(
@@ -256,28 +459,28 @@ public sealed class TransferWorkspaceViewModelTests
                 new ResumeBatchService(new FakeRunControlStore()),
                 new RetryFailedTransferService(new FakeRunControlStore()));
             DestinationSink = new RecordingDestinationSink(Events);
+            Handoff = new RecordingHandoff(Events, HandedOffBatches);
             ViewModel = new TransferWorkspaceViewModel(
                 Import,
                 Wizard,
                 RunPanel,
                 new FakeResultSaveDialog(),
                 DestinationSink,
-                (batch, _) =>
-                {
-                    Events.Add("handoff");
-                    HandedOffBatches.Add(batch);
-                    return Task.CompletedTask;
-                });
+                Handoff.RunAsync);
         }
 
         public int Ready { get; }
         public List<string> Events { get; }
         public FakeImportWorkflow ImportWorkflow { get; }
+        public FakePageSource PageSource { get; }
+        public FakeDialog Dialog { get; }
         public ImportViewModel Import { get; }
         public FakeBatchService BatchService { get; }
         public CreateJobWizardViewModel Wizard { get; }
+        public FakeDraftWorkflow DraftWorkflow { get; }
         public WorkspaceRunPanelViewModel RunPanel { get; }
         public RecordingDestinationSink DestinationSink { get; }
+        public RecordingHandoff Handoff { get; }
         public List<Guid> HandedOffBatches { get; } = [];
         public TransferWorkspaceViewModel ViewModel { get; }
 
@@ -312,8 +515,15 @@ public sealed class TransferWorkspaceViewModelTests
             return fixture;
         }
 
-        public void ApplyReadyDraft() => ViewModel.ApplyImportedDraft(new(
-            Guid.NewGuid(), new(Ready, Ready, 0, 0, 0)));
+        public void ApplyReadyDraft() => ApplyDraft(new(Ready, Ready, 0, 0, 0));
+
+        public void ApplyDraft(ImportDraftStatistics statistics)
+        {
+            var draft = new ImportDraftReady(Guid.NewGuid(), statistics);
+            ImportWorkflow.NextMutation = new(draft.SessionId, statistics);
+            Import.AttachSession(draft.SessionId);
+            ViewModel.ApplyImportedDraft(draft);
+        }
 
         public void Dispose()
         {
@@ -331,23 +541,30 @@ public sealed class TransferWorkspaceViewModelTests
     {
         public string? SavedUrl { get; private set; }
         public string? SavedCode { get; private set; }
+        public ImportWorkflowResult? NextMutation { get; set; }
         public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
+        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
+            Task.FromResult(NextMutation ?? throw new InvalidOperationException("A mutation result is required."));
+        public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
         {
             events.Add("save");
             SavedUrl = shareUrl;
             SavedCode = extractionCode;
-            return Task.CompletedTask;
+            return Task.FromResult(NextMutation ?? new ImportWorkflowResult(
+                Guid.NewGuid(), new ImportDraftStatistics(4, 4, 0, 0, 0)));
         }
     }
 
     private sealed class FakePageSource : IImportPreviewPageSource
     {
-        public Task<ImportPreviewPage> LoadAsync(ImportPreviewPageRequest request, CancellationToken cancellationToken) =>
-            Task.FromResult(new ImportPreviewPage([], 0, null));
+        public int LoadCalls { get; private set; }
+        public Task<ImportPreviewPage> LoadAsync(ImportPreviewPageRequest request, CancellationToken cancellationToken)
+        {
+            LoadCalls++;
+            return Task.FromResult(new ImportPreviewPage([], 0, null));
+        }
     }
 
     private sealed class FakeBatchService(List<string> events) : IWizardBatchService
@@ -355,6 +572,8 @@ public sealed class TransferWorkspaceViewModelTests
         public int PreviewCalls { get; private set; }
         public int ShareOperationCount { get; private set; }
         public WizardBatchDraft? ConfirmedDraft { get; private set; }
+        public int ConfirmCalls { get; private set; }
+        public Action? AfterConfirm { get; set; }
 
         public Task<WizardConfirmationSummary> PreviewAsync(WizardBatchDraft draft, CancellationToken cancellationToken)
         {
@@ -383,11 +602,13 @@ public sealed class TransferWorkspaceViewModelTests
                 TotalActionCount: transferCount + shareCount, ResultColumnCount: selected.Length * 3));
         }
 
-        public Task ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
+        public Task<Guid> ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
         {
             events.Add("confirm");
+            ConfirmCalls++;
             ConfirmedDraft = draft;
-            return Task.CompletedTask;
+            AfterConfirm?.Invoke();
+            return Task.FromResult(draft.BatchJobId);
         }
     }
 
@@ -416,28 +637,65 @@ public sealed class TransferWorkspaceViewModelTests
 
     private sealed class FakeDraftWorkflow(int ready) : IWizardDraftWorkflow
     {
+        public Guid? LastOverrideAccountId { get; private set; }
         private WizardDraftMutation Mutation => new(ready, ready, 0, 0, 0, 0, 0);
         public Task<WizardDraftMutation> SwitchModeAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => Task.FromResult(Mutation);
         public Task<WizardDraftMutation> AutoMapUniqueAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => Task.FromResult(Mutation);
         public Task<WizardDraftMutation> IgnoreAllAccountNamesAsync(Guid sessionId, TransferMode mode, CancellationToken cancellationToken) => Task.FromResult(Mutation);
-        public Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken) => Task.FromResult(Mutation);
+        public Task<WizardDraftMutation> OverrideAllAccountsAsync(Guid sessionId, Guid accountId, TransferMode mode, CancellationToken cancellationToken)
+        {
+            LastOverrideAccountId = accountId;
+            return Task.FromResult(Mutation);
+        }
     }
 
     private sealed class RecordingDestinationSink(List<string> events) : ITransferResultDestinationSink
     {
         public List<TransferResultDestination> Values { get; } = [];
+        public Exception? Error { get; set; }
         public Task SetAsync(TransferResultDestination destination, CancellationToken cancellationToken = default)
         {
             events.Add("sink");
+            if (Error is not null) throw Error;
             Values.Add(destination);
             return Task.CompletedTask;
         }
     }
 
+    private sealed class RecordingHandoff(List<string> events, List<Guid> batches)
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Exception? Error { get; set; }
+        public bool Block { get; set; }
+        public bool CancellationObserved { get; private set; }
+
+        public async Task RunAsync(Guid batch, CancellationToken cancellationToken)
+        {
+            events.Add("handoff");
+            if (Error is not null) throw Error;
+            if (Block)
+            {
+                Started.TrySetResult();
+                await release.Task;
+                CancellationObserved = cancellationToken.IsCancellationRequested;
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            batches.Add(batch);
+        }
+
+        public void Release() => release.TrySetResult();
+    }
+
     private sealed class FakeDialog : IDialogService
     {
+        public string LastConfirmationMessage { get; private set; } = string.Empty;
         public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
-        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) => Task.FromResult(true);
+        public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
+        {
+            LastConfirmationMessage = message;
+            return Task.FromResult(true);
+        }
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
