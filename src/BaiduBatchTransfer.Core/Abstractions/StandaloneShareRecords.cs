@@ -250,7 +250,7 @@ public sealed record StandaloneSharePendingBatchEnvelope
         ArgumentNullException.ThrowIfNull(batch);
         ArgumentNullException.ThrowIfNull(operations);
         var snapshot = operations.ToImmutableArray();
-        ValidateGraph(batch, snapshot);
+        ValidateNewGraph(batch, snapshot);
         var computed = ComputeDraftFingerprint(batch, snapshot);
         if (!string.Equals(draftFingerprint, computed, StringComparison.Ordinal))
             throw new ArgumentException("The draft fingerprint does not match the batch contents.", nameof(draftFingerprint));
@@ -291,7 +291,34 @@ public sealed record StandaloneSharePendingBatchEnvelope
         }
     }
 
-    private static string ComputeDraftFingerprint(
+    public static void ValidateNewGraph(
+        StandaloneShareBatchRecord batch,
+        IReadOnlyList<StandaloneShareOperationRecord> operations)
+    {
+        ValidateGraph(batch, operations);
+        if (batch.Status != StandaloneShareBatchStatus.Queued || batch.Revision != 0 ||
+            batch.UpdatedAt != batch.CreatedAt)
+            throw new ArgumentException("A standalone share draft must contain a new queued batch.", nameof(batch));
+
+        foreach (var operation in operations)
+        {
+            if (operation.Status != StandaloneShareOperationStatus.Queued ||
+                operation.SubmissionState != StandaloneShareSubmissionState.NotStarted ||
+                operation.SubmissionAcceptance != SubmissionAcceptance.Unknown ||
+                operation.Generation != 1 || operation.Revision != 0 ||
+                operation.UpdatedAt != operation.CreatedAt ||
+                operation.BaselineFingerprint is not null || operation.BaselineShareCount is not null ||
+                operation.BaselineCompletedAt is not null || operation.LeaseGeneration != 0 ||
+                operation.LeaseOwnerId is not null || operation.LeaseExpiresAt is not null ||
+                operation.LastErrorCode is not null)
+            {
+                throw new ArgumentException(
+                    "A standalone share draft cannot contain execution evidence.", nameof(operations));
+            }
+        }
+    }
+
+    internal static string ComputeDraftFingerprint(
         StandaloneShareBatchRecord batch,
         IReadOnlyList<StandaloneShareOperationRecord> operations)
     {
@@ -322,10 +349,19 @@ public sealed record StandaloneShareBatchCreationReceipt
         IReadOnlyList<StandaloneShareOperationRecord> operations,
         bool alreadyExisted)
     {
-        var envelope = new StandaloneSharePendingBatchEnvelope(draftFingerprint, batch, operations);
-        DraftFingerprint = envelope.DraftFingerprint;
-        Batch = envelope.Batch;
-        Operations = envelope.Operations;
+        ArgumentException.ThrowIfNullOrWhiteSpace(draftFingerprint);
+        ArgumentNullException.ThrowIfNull(batch);
+        ArgumentNullException.ThrowIfNull(operations);
+        var snapshot = operations.ToImmutableArray();
+        StandaloneSharePendingBatchEnvelope.ValidateGraph(batch, snapshot);
+        if (!string.Equals(
+                draftFingerprint,
+                StandaloneSharePendingBatchEnvelope.ComputeDraftFingerprint(batch, snapshot),
+                StringComparison.Ordinal))
+            throw new ArgumentException("The draft fingerprint does not match the batch contents.", nameof(draftFingerprint));
+        DraftFingerprint = draftFingerprint;
+        Batch = batch;
+        Operations = snapshot;
         AlreadyExisted = alreadyExisted;
     }
 

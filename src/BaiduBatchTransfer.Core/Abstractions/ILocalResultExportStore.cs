@@ -87,8 +87,13 @@ public sealed record LocalResultExportLease(
     Guid ExportId,
     LocalResultExportKey Key,
     long LeaseGeneration,
+    Guid LeaseOwnerId,
     DateTimeOffset LeaseExpiresAt,
-    long Revision);
+    long Revision)
+{
+    public override string ToString() =>
+        $"LocalResultExportLease {{ ExportId = {ExportId}, Key = {Key}, LeaseGeneration = {LeaseGeneration}, LeaseOwnerId = [REDACTED], LeaseExpiresAt = [REDACTED], Revision = {Revision} }}";
+}
 
 public interface ILocalResultExportStore
 {
@@ -107,20 +112,29 @@ public interface ILocalResultExportStore
     Task<LocalResultExportLease?> TryAcquireAsync(
         LocalResultExportKey key,
         long expectedRevision,
+        Guid leaseOwnerId,
         DateTimeOffset now,
         DateTimeOffset leaseExpiresAt,
         CancellationToken cancellationToken = default);
 
     Task<bool> TryCompleteAsync(
         Guid exportId,
+        int expectedGeneration,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset expectedLeaseExpiresAt,
         string finalFileName,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
 
     Task<bool> TryFailAsync(
         Guid exportId,
+        int expectedGeneration,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset expectedLeaseExpiresAt,
         string sanitizedErrorCode,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);

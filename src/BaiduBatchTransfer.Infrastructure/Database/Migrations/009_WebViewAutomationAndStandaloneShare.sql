@@ -129,13 +129,16 @@ CREATE TABLE LocalResultExports (
     FinalFileName TEXT NULL,
     SanitizedErrorCode TEXT NULL,
     LeaseGeneration INTEGER NOT NULL DEFAULT 0 CHECK(LeaseGeneration >= 0),
+    LeaseOwnerId TEXT NULL,
     LeaseExpiresAt TEXT NULL,
     Revision INTEGER NOT NULL DEFAULT 0 CHECK(Revision >= 0),
     CreatedAt TEXT NOT NULL,
     UpdatedAt TEXT NOT NULL,
     UNIQUE(OwnerKind, OwnerId, ExportKind, Generation),
     CHECK(Status <> 'Succeeded' OR (FinalFileName IS NOT NULL AND LeaseExpiresAt IS NULL)),
-    CHECK(Status <> 'InProgress' OR LeaseExpiresAt IS NOT NULL)
+    CHECK(Status <> 'InProgress' OR LeaseExpiresAt IS NOT NULL),
+    CHECK((LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL)
+       OR (LeaseOwnerId IS NOT NULL AND LeaseExpiresAt IS NOT NULL))
 );
 
 CREATE INDEX IX_LocalResultExports_Recoverable
@@ -147,6 +150,7 @@ CREATE TABLE WebAutomationAttempts (
     Generation INTEGER NOT NULL CHECK(Generation > 0),
     OwnerKind TEXT NOT NULL CHECK(OwnerKind IN ('Transfer','TransferShare','StandaloneShare')),
     State TEXT NOT NULL CHECK(State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff','Succeeded','DefinitelyNotSubmitted','NeedsDecision')),
+    ResumeStage TEXT NULL CHECK(ResumeStage IS NULL OR ResumeStage IN ('Preparing','BaselinePersisted','Submitting','ResultPending')),
     ObservationFingerprint TEXT NULL,
     BaselineFingerprint TEXT NULL,
     BaselineItemCount INTEGER NOT NULL DEFAULT 0 CHECK(BaselineItemCount >= 0),
@@ -157,6 +161,10 @@ CREATE TABLE WebAutomationAttempts (
     UpdatedAt TEXT NOT NULL,
     PRIMARY KEY(OperationId, AccountId, Generation),
     CHECK(State NOT IN ('BaselinePersisted','Submitting','ResultPending','Succeeded','NeedsDecision')
+       OR (BaselineFingerprint IS NOT NULL AND BaselinePersistedAt IS NOT NULL)),
+    CHECK((State='UserHandoff' AND ResumeStage IS NOT NULL AND IsWaitingForUser=1)
+       OR (State<>'UserHandoff' AND ResumeStage IS NULL)),
+    CHECK(State<>'UserHandoff' OR ResumeStage='Preparing'
        OR (BaselineFingerprint IS NOT NULL AND BaselinePersistedAt IS NOT NULL))
 );
 
@@ -170,7 +178,6 @@ CREATE TABLE WebAutomationAttemptRemoteItems (
     ItemOrdinal INTEGER NOT NULL CHECK(ItemOrdinal >= 0),
     RemoteItemId TEXT NOT NULL,
     CanonicalSortKey BLOB NOT NULL,
-    DisplayName TEXT NOT NULL,
     PRIMARY KEY(OperationId, AccountId, Generation, ItemOrdinal),
     UNIQUE(OperationId, AccountId, Generation, RemoteItemId),
     FOREIGN KEY(OperationId, AccountId, Generation)

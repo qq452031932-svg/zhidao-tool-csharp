@@ -32,8 +32,8 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
         command.CommandText = """
             INSERT INTO LocalResultExports(
               Id,OwnerKind,OwnerId,ExportKind,Generation,Status,TargetFileName,FinalFileName,
-              SanitizedErrorCode,LeaseGeneration,LeaseExpiresAt,Revision,CreatedAt,UpdatedAt)
-            VALUES($id,$ownerKind,$ownerId,$exportKind,$generation,'Pending',$target,NULL,NULL,0,NULL,0,$now,$now);
+              SanitizedErrorCode,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,Revision,CreatedAt,UpdatedAt)
+            VALUES($id,$ownerKind,$ownerId,$exportKind,$generation,'Pending',$target,NULL,NULL,0,NULL,NULL,0,$now,$now);
             """;
         AddKey(command, request.Key);
         command.Parameters.AddWithValue("$id", id.ToString("D"));
@@ -85,12 +85,14 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
     public async Task<LocalResultExportLease?> TryAcquireAsync(
         LocalResultExportKey key,
         long expectedRevision,
+        Guid leaseOwnerId,
         DateTimeOffset now,
         DateTimeOffset leaseExpiresAt,
         CancellationToken cancellationToken = default)
     {
         key.Validate();
         if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        ValidateLeaseOwner(leaseOwnerId);
         if (leaseExpiresAt <= now) throw new ArgumentOutOfRangeException(nameof(leaseExpiresAt));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
@@ -99,15 +101,17 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
             command.Transaction = transaction;
             command.CommandText = """
                 UPDATE LocalResultExports
-                SET Status='InProgress',LeaseGeneration=LeaseGeneration+1,LeaseExpiresAt=$expires,
+                SET Status='InProgress',LeaseGeneration=LeaseGeneration+1,LeaseOwnerId=$leaseOwner,LeaseExpiresAt=$expires,
                     SanitizedErrorCode=NULL,Revision=Revision+1,UpdatedAt=$now
                 WHERE OwnerKind=$ownerKind AND OwnerId=$ownerId AND ExportKind=$exportKind AND Generation=$generation
-                  AND Revision=$revision AND Status IN ('Pending','Failed') AND LeaseExpiresAt IS NULL AND UpdatedAt<=$now;
+                  AND Revision=$revision AND Status IN ('Pending','Failed')
+                  AND LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL AND UpdatedAt<=$now;
                 """;
             AddKey(command, key);
             command.Parameters.AddWithValue("$revision", expectedRevision);
             command.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
             command.Parameters.AddWithValue("$expires", leaseExpiresAt.ToUniversalTime().ToString("O"));
+            command.Parameters.AddWithValue("$leaseOwner", leaseOwnerId.ToString("D"));
             if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             {
                 await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -117,26 +121,37 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
         var record = await LoadAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidDataException("LOCAL_EXPORT_LEASE_MISSING");
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new(record.Id, record.Key, record.LeaseGeneration, record.LeaseExpiresAt!.Value, record.Revision);
+        return new(record.Id, record.Key, record.LeaseGeneration, leaseOwnerId,
+            record.LeaseExpiresAt!.Value, record.Revision);
     }
 
     public Task<bool> TryCompleteAsync(
         Guid exportId,
+        int expectedGeneration,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset expectedLeaseExpiresAt,
         string finalFileName,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default) =>
-        FinishAsync(exportId, expectedLeaseGeneration, "Succeeded",
+        FinishAsync(exportId, expectedGeneration, expectedLeaseGeneration, expectedLeaseOwnerId,
+            expectedRevision, expectedLeaseExpiresAt, "Succeeded",
             LocalResultExportValidation.SafeFileName(finalFileName, nameof(finalFileName)), null,
             updatedAt, cancellationToken);
 
     public Task<bool> TryFailAsync(
         Guid exportId,
+        int expectedGeneration,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset expectedLeaseExpiresAt,
         string sanitizedErrorCode,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default) =>
-        FinishAsync(exportId, expectedLeaseGeneration, "Failed", null,
+        FinishAsync(exportId, expectedGeneration, expectedLeaseGeneration, expectedLeaseOwnerId,
+            expectedRevision, expectedLeaseExpiresAt, "Failed", null,
             LocalResultExportValidation.SanitizedErrorCode(sanitizedErrorCode, nameof(sanitizedErrorCode)),
             updatedAt, cancellationToken);
 
@@ -148,40 +163,56 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
         if (maximumCount is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(maximumCount));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
-        var ids = new List<string>(maximumCount);
+        var leases = new List<ExpiredExportLease>(maximumCount);
         await using (var select = connection.CreateCommand())
         {
             select.Transaction = transaction;
             select.CommandText = """
-                SELECT Id FROM LocalResultExports
-                WHERE Status='InProgress' AND LeaseExpiresAt<=$now
+                SELECT Id,Generation,LeaseGeneration,LeaseOwnerId,Revision,LeaseExpiresAt
+                FROM LocalResultExports
+                WHERE Status='InProgress' AND LeaseOwnerId IS NOT NULL AND LeaseExpiresAt<=$now
                 ORDER BY LeaseExpiresAt,Id LIMIT $take;
                 """;
             select.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
             select.Parameters.AddWithValue("$take", maximumCount);
             await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) ids.Add(reader.GetString(0));
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                leases.Add(new(
+                    Guid.Parse(reader.GetString(0)), reader.GetInt32(1), reader.GetInt64(2),
+                    Guid.Parse(reader.GetString(3)), reader.GetInt64(4), Parse(reader.GetString(5))));
         }
-        foreach (var id in ids)
+        var recovered = 0;
+        foreach (var lease in leases)
         {
             await using var update = connection.CreateCommand();
             update.Transaction = transaction;
             update.CommandText = """
-                UPDATE LocalResultExports SET Status='Pending',LeaseExpiresAt=NULL,
+                UPDATE LocalResultExports SET Status='Pending',LeaseOwnerId=NULL,LeaseExpiresAt=NULL,
                   SanitizedErrorCode='RECOVERED_EXPIRED_LEASE',Revision=Revision+1,UpdatedAt=$now
-                WHERE Id=$id AND Status='InProgress' AND LeaseExpiresAt<=$now;
+                WHERE Id=$id AND Generation=$generation AND LeaseGeneration=$lease
+                  AND LeaseOwnerId=$owner AND Revision=$revision AND Status='InProgress'
+                  AND LeaseExpiresAt=$expires AND LeaseExpiresAt<=$now;
                 """;
-            update.Parameters.AddWithValue("$id", id);
+            update.Parameters.AddWithValue("$id", lease.ExportId.ToString("D"));
+            update.Parameters.AddWithValue("$generation", lease.Generation);
+            update.Parameters.AddWithValue("$lease", lease.LeaseGeneration);
+            update.Parameters.AddWithValue("$owner", lease.LeaseOwnerId.ToString("D"));
+            update.Parameters.AddWithValue("$revision", lease.Revision);
+            update.Parameters.AddWithValue("$expires", lease.LeaseExpiresAt.ToUniversalTime().ToString("O"));
             update.Parameters.AddWithValue("$now", now.ToUniversalTime().ToString("O"));
-            await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            recovered += await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return ids.Count;
+        return recovered;
     }
 
     private async Task<bool> FinishAsync(
         Guid exportId,
+        int expectedGeneration,
         long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset expectedLeaseExpiresAt,
         string status,
         string? finalFileName,
         string? errorCode,
@@ -189,14 +220,19 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
         CancellationToken cancellationToken)
     {
         if (exportId == Guid.Empty) throw new ArgumentException("An export is required.", nameof(exportId));
+        if (expectedGeneration < 1) throw new ArgumentOutOfRangeException(nameof(expectedGeneration));
         if (expectedLeaseGeneration < 1) throw new ArgumentOutOfRangeException(nameof(expectedLeaseGeneration));
+        ValidateLeaseOwner(expectedLeaseOwnerId);
+        if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = """
             UPDATE LocalResultExports
-            SET Status=$status,FinalFileName=$final,SanitizedErrorCode=$error,LeaseExpiresAt=NULL,
+            SET Status=$status,FinalFileName=$final,SanitizedErrorCode=$error,
+                LeaseOwnerId=NULL,LeaseExpiresAt=NULL,
                 Revision=Revision+1,UpdatedAt=$updated
-            WHERE Id=$id AND Status='InProgress' AND LeaseGeneration=$lease
+            WHERE Id=$id AND Generation=$generation AND Status='InProgress' AND LeaseGeneration=$lease
+              AND LeaseOwnerId=$owner AND Revision=$revision AND LeaseExpiresAt=$expires
               AND LeaseExpiresAt>=$updated AND UpdatedAt<=$updated;
             """;
         command.Parameters.AddWithValue("$status", status);
@@ -204,7 +240,11 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
         command.Parameters.AddWithValue("$error", (object?)errorCode ?? DBNull.Value);
         command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
         command.Parameters.AddWithValue("$id", exportId.ToString("D"));
+        command.Parameters.AddWithValue("$generation", expectedGeneration);
         command.Parameters.AddWithValue("$lease", expectedLeaseGeneration);
+        command.Parameters.AddWithValue("$owner", expectedLeaseOwnerId.ToString("D"));
+        command.Parameters.AddWithValue("$revision", expectedRevision);
+        command.Parameters.AddWithValue("$expires", expectedLeaseExpiresAt.ToUniversalTime().ToString("O"));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
     }
 
@@ -262,4 +302,17 @@ public sealed class SqliteLocalResultExportStore(SqliteConnectionFactory factory
 
     private static DateTimeOffset Parse(string value) =>
         DateTimeOffset.Parse(value, null, System.Globalization.DateTimeStyles.RoundtripKind);
+
+    private static void ValidateLeaseOwner(Guid leaseOwnerId)
+    {
+        if (leaseOwnerId == Guid.Empty) throw new ArgumentException("A lease owner is required.", nameof(leaseOwnerId));
+    }
+
+    private sealed record ExpiredExportLease(
+        Guid ExportId,
+        int Generation,
+        long LeaseGeneration,
+        Guid LeaseOwnerId,
+        long Revision,
+        DateTimeOffset LeaseExpiresAt);
 }

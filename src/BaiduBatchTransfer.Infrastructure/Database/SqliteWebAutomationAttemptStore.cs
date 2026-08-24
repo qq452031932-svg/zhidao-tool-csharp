@@ -33,12 +33,19 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             throw new ArgumentException("A new browser attempt must start in Preparing without evidence.", nameof(attempt));
 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        if (!await OwnerExistsAsync(connection, transaction, attempt, cancellationToken).ConfigureAwait(false))
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO WebAutomationAttempts(
-              OperationId,AccountId,Generation,OwnerKind,State,ObservationFingerprint,
+              OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
               BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt)
-            VALUES($operation,$account,$generation,$owner,$state,NULL,NULL,0,NULL,0,0,$created,$updated);
+            VALUES($operation,$account,$generation,$owner,$state,NULL,NULL,NULL,0,NULL,0,0,$created,$updated);
             """;
         AddIdentity(command, attempt.OperationId, attempt.AccountId, attempt.Generation);
         command.Parameters.AddWithValue("$owner", attempt.OwnerKind.ToString());
@@ -47,10 +54,14 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.Parameters.AddWithValue("$updated", attempt.UpdatedAt.ToUniversalTime().ToString("O"));
         try
         {
-            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            if (changed) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            else await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return changed;
         }
         catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
         {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return false;
         }
     }
@@ -144,14 +155,13 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             insert.Transaction = transaction;
             insert.CommandText = """
                 INSERT INTO WebAutomationAttemptRemoteItems(
-                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
-                VALUES($operation,$account,$generation,$ordinal,$item,$sort,$display);
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,$generation,$ordinal,$item,$sort);
                 """;
             AddIdentity(insert, operationId, accountId, generation);
             insert.Parameters.AddWithValue("$ordinal", index);
             insert.Parameters.AddWithValue("$item", item.ExactId);
-            insert.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey(item.ExactId));
-            insert.Parameters.AddWithValue("$display", item.DisplayedTopLevelName);
+            insert.Parameters.AddWithValue("$sort", item.CanonicalSortKey.ToArray());
             await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -194,6 +204,14 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         if (!Enum.IsDefined(nextState)) throw new ArgumentOutOfRangeException(nameof(nextState));
         if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        if (nextState == WebAutomationAttemptState.UserHandoff)
+        {
+            if (!isWaitingForUser || !WebAutomationAttemptRecord.CanResumeStage(expectedState)) return false;
+        }
+        else if (isWaitingForUser)
+        {
+            return false;
+        }
         if (!IsAllowed(expectedState, nextState)) return false;
 
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -201,6 +219,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.CommandText = """
             UPDATE WebAutomationAttempts
             SET State=$next,ObservationFingerprint=COALESCE($observation,ObservationFingerprint),
+                ResumeStage=CASE WHEN $next='UserHandoff' THEN $expected ELSE NULL END,
                 IsWaitingForUser=$waiting,Revision=Revision+1,UpdatedAt=$updated
             WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
               AND State=$expected AND Revision=$revision AND UpdatedAt<=$updated
@@ -217,6 +236,42 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
     }
 
+    public async Task<bool> TryResumeFromUserHandoffAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        WebAutomationAttemptState resumeStage,
+        string? observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateIdentity(operationId, accountId, generation);
+        if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        if (!Enum.IsDefined(resumeStage)) throw new ArgumentOutOfRangeException(nameof(resumeStage));
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        if (!WebAutomationAttemptRecord.CanResumeStage(resumeStage)) return false;
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE WebAutomationAttempts
+            SET State=$resume,ResumeStage=NULL,
+                ObservationFingerprint=COALESCE($observation,ObservationFingerprint),
+                IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+              AND State='UserHandoff' AND ResumeStage=$resume AND Revision=$revision
+              AND UpdatedAt<=$updated
+              AND ($resume='Preparing' OR (BaselineFingerprint IS NOT NULL AND BaselinePersistedAt IS NOT NULL));
+            """;
+        AddIdentity(command, operationId, accountId, generation);
+        command.Parameters.AddWithValue("$resume", resumeStage.ToString());
+        command.Parameters.AddWithValue("$revision", expectedRevision);
+        command.Parameters.AddWithValue("$observation", (object?)observationFingerprint ?? DBNull.Value);
+        command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+    }
+
     private static bool IsAllowed(WebAutomationAttemptState current, WebAutomationAttemptState next) => current switch
     {
         WebAutomationAttemptState.Preparing => next is WebAutomationAttemptState.DefinitelyNotSubmitted or
@@ -227,11 +282,9 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             WebAutomationAttemptState.UserHandoff or WebAutomationAttemptState.NeedsDecision,
         WebAutomationAttemptState.ResultPending => next is WebAutomationAttemptState.Succeeded or
             WebAutomationAttemptState.UserHandoff or WebAutomationAttemptState.NeedsDecision,
-        WebAutomationAttemptState.UserHandoff => next is WebAutomationAttemptState.ResultPending or
-            WebAutomationAttemptState.Succeeded or WebAutomationAttemptState.DefinitelyNotSubmitted or
-            WebAutomationAttemptState.NeedsDecision,
-        WebAutomationAttemptState.NeedsDecision => next is WebAutomationAttemptState.UserHandoff or
-            WebAutomationAttemptState.Succeeded or WebAutomationAttemptState.DefinitelyNotSubmitted,
+        WebAutomationAttemptState.UserHandoff => false,
+        WebAutomationAttemptState.NeedsDecision => next is WebAutomationAttemptState.Succeeded or
+            WebAutomationAttemptState.DefinitelyNotSubmitted,
         _ => false,
     };
 
@@ -250,6 +303,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
     {
         string owner;
         string state;
+        string? resumeStage;
         string? observation;
         string? baselineFingerprint;
         int baselineCount;
@@ -261,7 +315,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         {
             command.Transaction = transaction;
             command.CommandText = """
-                SELECT OwnerKind,State,ObservationFingerprint,BaselineFingerprint,BaselineItemCount,
+                SELECT OwnerKind,State,ResumeStage,ObservationFingerprint,BaselineFingerprint,BaselineItemCount,
                        IsWaitingForUser,Revision,CreatedAt,UpdatedAt
                 FROM WebAutomationAttempts
                 WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation;
@@ -271,13 +325,14 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
             owner = reader.GetString(0);
             state = reader.GetString(1);
-            observation = reader.IsDBNull(2) ? null : reader.GetString(2);
-            baselineFingerprint = reader.IsDBNull(3) ? null : reader.GetString(3);
-            baselineCount = reader.GetInt32(4);
-            waiting = reader.GetInt64(5) != 0;
-            revision = reader.GetInt64(6);
-            created = DateTimeOffset.Parse(reader.GetString(7), null, System.Globalization.DateTimeStyles.RoundtripKind);
-            updated = DateTimeOffset.Parse(reader.GetString(8), null, System.Globalization.DateTimeStyles.RoundtripKind);
+            resumeStage = reader.IsDBNull(2) ? null : reader.GetString(2);
+            observation = reader.IsDBNull(3) ? null : reader.GetString(3);
+            baselineFingerprint = reader.IsDBNull(4) ? null : reader.GetString(4);
+            baselineCount = reader.GetInt32(5);
+            waiting = reader.GetInt64(6) != 0;
+            revision = reader.GetInt64(7);
+            created = DateTimeOffset.Parse(reader.GetString(8), null, System.Globalization.DateTimeStyles.RoundtripKind);
+            updated = DateTimeOffset.Parse(reader.GetString(9), null, System.Globalization.DateTimeStyles.RoundtripKind);
         }
 
         WebAutomationBaseline? baseline = null;
@@ -296,7 +351,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                 if (Convert.ToInt64(await count.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != baselineCount)
                     throw new InvalidDataException("WEB_BASELINE_COUNT_MISMATCH");
             }
-            var items = new List<RemoteItemIdentity>(baselineCount);
+            var items = new List<string>(baselineCount);
             var afterOrdinal = -1;
             while (items.Count < baselineCount)
             {
@@ -304,7 +359,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                 await using var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText = """
-                    SELECT ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName FROM WebAutomationAttemptRemoteItems
+                    SELECT ItemOrdinal,RemoteItemId,CanonicalSortKey FROM WebAutomationAttemptRemoteItems
                     WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
                       AND ItemOrdinal>$after
                     ORDER BY ItemOrdinal LIMIT $take;
@@ -322,7 +377,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                     if (!reader.GetFieldValue<byte[]>(2).AsSpan().SequenceEqual(
                             RemoteItemIdentitySet.GetCanonicalSortKey(exactId)))
                         throw new InvalidDataException("WEB_BASELINE_CANONICAL_SORT_KEY_MISMATCH");
-                    items.Add(new RemoteItemIdentity(exactId, reader.GetString(3)));
+                    items.Add(exactId);
                     afterOrdinal = ordinal;
                     read++;
                 }
@@ -336,6 +391,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
 
         return new(operationId, accountId, generation,
             Enum.Parse<WebAutomationOwnerKind>(owner), Enum.Parse<WebAutomationAttemptState>(state),
+            resumeStage is null ? null : Enum.Parse<WebAutomationAttemptState>(resumeStage),
             baseline, observation, waiting, revision, created, updated);
     }
 
@@ -344,6 +400,36 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$generation", generation);
+    }
+
+    private static async Task<bool> OwnerExistsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        WebAutomationAttemptRecord attempt,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = attempt.OwnerKind switch
+        {
+            WebAutomationOwnerKind.Transfer => """
+                SELECT COUNT(*) FROM TransferOperations
+                WHERE Id=$operation AND AssignedAccountId=$account;
+                """,
+            WebAutomationOwnerKind.TransferShare => """
+                SELECT COUNT(*) FROM ShareOperations share
+                JOIN TransferOperations transfer ON transfer.Id=share.TransferOperationId
+                  AND transfer.AssignedAccountId=share.AccountId
+                WHERE share.Id=$operation AND share.AccountId=$account AND share.Generation=$generation;
+                """,
+            WebAutomationOwnerKind.StandaloneShare => """
+                SELECT COUNT(*) FROM StandaloneShareOperations
+                WHERE Id=$operation AND AccountId=$account AND Generation=$generation;
+                """,
+            _ => throw new ArgumentOutOfRangeException(nameof(attempt)),
+        };
+        AddIdentity(command, attempt.OperationId, attempt.AccountId, attempt.Generation);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
 
     private static void ValidateIdentity(Guid operationId, Guid accountId, int generation)

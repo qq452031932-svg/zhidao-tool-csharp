@@ -14,6 +14,7 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(envelope);
+        StandaloneSharePendingBatchEnvelope.ValidateNewGraph(envelope.Batch, envelope.Operations);
         var resultDirectory = LocalResultDirectoryReference.Normalize(
             envelope.Batch.ResultDirectoryReference, nameof(envelope));
         if (!string.Equals(resultDirectory, envelope.Batch.ResultDirectoryReference, StringComparison.Ordinal))

@@ -24,27 +24,41 @@ public enum WebAutomationAttemptState
     NeedsDecision,
 }
 
+public sealed record WebAutomationBaselineItem
+{
+    public WebAutomationBaselineItem(string exactId)
+    {
+        ExactId = exactId;
+        CanonicalSortKey = RemoteItemIdentitySet.GetCanonicalSortKey(exactId).ToImmutableArray();
+    }
+
+    public string ExactId { get; }
+    public ImmutableArray<byte> CanonicalSortKey { get; }
+
+    public override string ToString() =>
+        "WebAutomationBaselineItem { ExactId = [REDACTED], CanonicalSortKey = [REDACTED] }";
+}
+
 public sealed record WebAutomationBaseline
 {
-    private WebAutomationBaseline(ImmutableArray<RemoteItemIdentity> items, string fingerprint)
+    private WebAutomationBaseline(ImmutableArray<WebAutomationBaselineItem> items, string fingerprint)
     {
         Items = items;
         Fingerprint = fingerprint;
     }
 
-    public ImmutableArray<RemoteItemIdentity> Items { get; }
+    public ImmutableArray<WebAutomationBaselineItem> Items { get; }
     public string Fingerprint { get; }
 
-    public static WebAutomationBaseline Create(IEnumerable<RemoteItemIdentity> items)
+    public static WebAutomationBaseline Create(IEnumerable<string> exactIds)
     {
-        ArgumentNullException.ThrowIfNull(items);
-        var snapshot = items
-            .Select(item => item ?? throw new ArgumentException("Baseline items cannot contain null.", nameof(items)))
+        ArgumentNullException.ThrowIfNull(exactIds);
+        var snapshot = exactIds
+            .Select(exactId => new WebAutomationBaselineItem(exactId))
             .OrderBy(item => item.ExactId, StringComparer.Ordinal)
             .ToImmutableArray();
         if (snapshot.Select(item => item.ExactId).Distinct(StringComparer.Ordinal).Count() != snapshot.Length)
-            throw new ArgumentException("Baseline item identities must be unique.", nameof(items));
-        foreach (var item in snapshot) _ = RemoteItemIdentitySet.GetCanonicalSortKey(item.ExactId);
+            throw new ArgumentException("Baseline item identities must be unique.", nameof(exactIds));
 
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         Append(hash, "web-automation-baseline-v1");
@@ -71,6 +85,7 @@ public sealed record WebAutomationAttemptRecord
         int generation,
         WebAutomationOwnerKind ownerKind,
         WebAutomationAttemptState state,
+        WebAutomationAttemptState? resumeStage,
         WebAutomationBaseline? baseline,
         string? observationFingerprint,
         bool isWaitingForUser,
@@ -83,10 +98,22 @@ public sealed record WebAutomationAttemptRecord
         if (generation < 1) throw new ArgumentOutOfRangeException(nameof(generation));
         if (!Enum.IsDefined(ownerKind)) throw new ArgumentOutOfRangeException(nameof(ownerKind));
         if (!Enum.IsDefined(state)) throw new ArgumentOutOfRangeException(nameof(state));
+        if (resumeStage is not null && !Enum.IsDefined(resumeStage.Value))
+            throw new ArgumentOutOfRangeException(nameof(resumeStage));
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         if (updatedAt < createdAt) throw new ArgumentOutOfRangeException(nameof(updatedAt));
         ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
-        if (RequiresBaseline(state) && baseline is null)
+        if (state == WebAutomationAttemptState.UserHandoff)
+        {
+            if (resumeStage is null || !CanResumeStage(resumeStage.Value) || !isWaitingForUser)
+                throw new ArgumentException("A user handoff requires its exact resumable prior stage.", nameof(resumeStage));
+        }
+        else if (resumeStage is not null)
+        {
+            throw new ArgumentException("Only a user handoff can retain a resume stage.", nameof(resumeStage));
+        }
+        if ((RequiresBaseline(state) || resumeStage is not null && resumeStage != WebAutomationAttemptState.Preparing) &&
+            baseline is null)
         {
             throw new ArgumentException("This state requires an exact baseline.", nameof(baseline));
         }
@@ -96,6 +123,7 @@ public sealed record WebAutomationAttemptRecord
         Generation = generation;
         OwnerKind = ownerKind;
         State = state;
+        ResumeStage = resumeStage;
         Baseline = baseline;
         ObservationFingerprint = observationFingerprint;
         IsWaitingForUser = isWaitingForUser;
@@ -109,8 +137,9 @@ public sealed record WebAutomationAttemptRecord
     public int Generation { get; }
     public WebAutomationOwnerKind OwnerKind { get; }
     public WebAutomationAttemptState State { get; }
+    public WebAutomationAttemptState? ResumeStage { get; }
     public WebAutomationBaseline? Baseline { get; }
-    public ImmutableArray<RemoteItemIdentity> BaselineRemoteItems => Baseline?.Items ?? [];
+    public ImmutableArray<WebAutomationBaselineItem> BaselineRemoteItems => Baseline?.Items ?? [];
     public string? ObservationFingerprint { get; }
     public bool IsWaitingForUser { get; }
     public long Revision { get; }
@@ -124,10 +153,10 @@ public sealed record WebAutomationAttemptRecord
         WebAutomationOwnerKind ownerKind,
         DateTimeOffset createdAt) =>
         new(operationId, accountId, generation, ownerKind, WebAutomationAttemptState.Preparing,
-            null, null, false, 0, createdAt, createdAt);
+            null, null, null, false, 0, createdAt, createdAt);
 
     public override string ToString() =>
-        $"WebAutomationAttemptRecord {{ OperationId = {OperationId}, AccountId = {AccountId}, Generation = {Generation}, OwnerKind = {OwnerKind}, State = {State}, Baseline = [REDACTED], Observation = [REDACTED], IsWaitingForUser = {IsWaitingForUser}, Revision = {Revision} }}";
+        $"WebAutomationAttemptRecord {{ OperationId = {OperationId}, AccountId = {AccountId}, Generation = {Generation}, OwnerKind = {OwnerKind}, State = {State}, ResumeStage = {ResumeStage}, Baseline = [REDACTED], Observation = [REDACTED], IsWaitingForUser = {IsWaitingForUser}, Revision = {Revision} }}";
 
     public static void ValidateFingerprint(string? value, string parameterName)
     {
@@ -140,4 +169,8 @@ public sealed record WebAutomationAttemptRecord
         WebAutomationAttemptState.BaselinePersisted or WebAutomationAttemptState.Submitting or
         WebAutomationAttemptState.ResultPending or WebAutomationAttemptState.Succeeded or
         WebAutomationAttemptState.NeedsDecision;
+
+    public static bool CanResumeStage(WebAutomationAttemptState state) => state is
+        WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted or
+        WebAutomationAttemptState.Submitting or WebAutomationAttemptState.ResultPending;
 }

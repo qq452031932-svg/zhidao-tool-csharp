@@ -19,16 +19,18 @@ public sealed class LocalResultExportStoreTests : IDisposable
 
         var first = await graph.Store.CreateOrGetAsync(request);
         var afterUnknownCommit = await graph.Store.CreateOrGetAsync(request);
-        var lease = await graph.Store.TryAcquireAsync(request.Key, first.Revision, graph.Now, graph.Now.AddMinutes(1));
+        var lease = await graph.Store.TryAcquireAsync(
+            request.Key, first.Revision, Guid.NewGuid(), graph.Now, graph.Now.AddMinutes(1));
         Assert.NotNull(lease);
         Assert.True(await graph.Store.TryCompleteAsync(
-            first.Id, lease.LeaseGeneration, "result_001.xlsx", graph.Now.AddSeconds(2)));
+            first.Id, lease.Key.Generation, lease.LeaseGeneration, lease.LeaseOwnerId, lease.Revision,
+            lease.LeaseExpiresAt, "result_001.xlsx", graph.Now.AddSeconds(2)));
 
         Assert.Equal(first.Id, afterUnknownCommit.Id);
         var completed = await graph.Store.GetAsync(request.Key);
         Assert.Equal(LocalResultExportStatus.Succeeded, completed!.Status);
         Assert.Null(await graph.Store.TryAcquireAsync(
-            request.Key, completed.Revision, graph.Now.AddMinutes(2), graph.Now.AddMinutes(3)));
+            request.Key, completed.Revision, Guid.NewGuid(), graph.Now.AddMinutes(2), graph.Now.AddMinutes(3)));
     }
 
     [Fact]
@@ -40,18 +42,20 @@ public sealed class LocalResultExportStoreTests : IDisposable
             3, "result.xlsx", graph.Now);
         var created = await graph.Store.CreateOrGetAsync(request);
         var first = (await graph.Store.TryAcquireAsync(
-            request.Key, created.Revision, graph.Now, graph.Now.AddMinutes(1)))!;
+            request.Key, created.Revision, Guid.NewGuid(), graph.Now, graph.Now.AddMinutes(1)))!;
         Assert.True(await graph.Store.TryFailAsync(
-            created.Id, first.LeaseGeneration, "LOCAL_WRITE_FAILED", graph.Now.AddSeconds(1)));
+            created.Id, first.Key.Generation, first.LeaseGeneration, first.LeaseOwnerId, first.Revision,
+            first.LeaseExpiresAt, "LOCAL_WRITE_FAILED", graph.Now.AddSeconds(1)));
         var failed = (await graph.Store.GetAsync(request.Key))!;
 
         var second = await graph.Store.TryAcquireAsync(
-            request.Key, failed.Revision, graph.Now.AddSeconds(2), graph.Now.AddMinutes(2));
+            request.Key, failed.Revision, Guid.NewGuid(), graph.Now.AddSeconds(2), graph.Now.AddMinutes(2));
 
         Assert.NotNull(second);
         Assert.True(second.LeaseGeneration > first.LeaseGeneration);
         Assert.False(await graph.Store.TryCompleteAsync(
-            created.Id, first.LeaseGeneration, "late.xlsx", graph.Now.AddSeconds(3)));
+            created.Id, first.Key.Generation, first.LeaseGeneration, first.LeaseOwnerId, first.Revision,
+            first.LeaseExpiresAt, "late.xlsx", graph.Now.AddSeconds(3)));
         Assert.Equal("Queued", await BatchStatusAsync(graph.Factory, graph.BatchId));
     }
 
@@ -66,7 +70,7 @@ public sealed class LocalResultExportStoreTests : IDisposable
                 generation, $"result-{generation}.xlsx", graph.Now.AddSeconds(generation));
             var created = await graph.Store.CreateOrGetAsync(request);
             Assert.NotNull(await graph.Store.TryAcquireAsync(
-                request.Key, created.Revision, graph.Now.AddSeconds(10), graph.Now.AddSeconds(11)));
+                request.Key, created.Revision, Guid.NewGuid(), graph.Now.AddSeconds(10), graph.Now.AddSeconds(11)));
         }
 
         Assert.Equal(1, await graph.Store.RecoverExpiredAsync(graph.Now.AddMinutes(1), 1));
@@ -84,11 +88,75 @@ public sealed class LocalResultExportStoreTests : IDisposable
             1, "late-result.xlsx", graph.Now);
         var created = await graph.Store.CreateOrGetAsync(request);
         var lease = (await graph.Store.TryAcquireAsync(
-            request.Key, created.Revision, graph.Now, graph.Now.AddSeconds(1)))!;
+            request.Key, created.Revision, Guid.NewGuid(), graph.Now, graph.Now.AddSeconds(1)))!;
 
         Assert.False(await graph.Store.TryCompleteAsync(
-            created.Id, lease.LeaseGeneration, "late-result.xlsx", graph.Now.AddSeconds(2)));
+            created.Id, lease.Key.Generation, lease.LeaseGeneration, lease.LeaseOwnerId, lease.Revision,
+            lease.LeaseExpiresAt, "late-result.xlsx", graph.Now.AddSeconds(2)));
         Assert.Equal(LocalResultExportStatus.InProgress, (await graph.Store.GetAsync(request.Key))!.Status);
+    }
+
+    [Fact]
+    public async Task LeaseOwnerAndRevisionAreRequiredForCompletionButHiddenFromReadModels()
+    {
+        var graph = await CreateAsync();
+        var request = LocalResultExportRequest.Create(
+            LocalResultOwnerKind.TransferBatch, graph.BatchId, LocalResultExportKind.ReplacementWorkbook,
+            5, "owned-result.xlsx", graph.Now);
+        var created = await graph.Store.CreateOrGetAsync(request);
+        var owner = Guid.NewGuid();
+        var lease = (await graph.Store.TryAcquireAsync(
+            request.Key, created.Revision, owner, graph.Now, graph.Now.AddMinutes(1)))!;
+
+        Assert.Equal(owner, lease.LeaseOwnerId);
+        Assert.DoesNotContain(owner.ToString("D"), lease.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            typeof(LocalResultExportRecord).GetProperties(),
+            property => property.Name == "LeaseOwnerId");
+        Assert.False(await graph.Store.TryCompleteAsync(
+            lease.ExportId, lease.Key.Generation, lease.LeaseGeneration, Guid.NewGuid(), lease.Revision,
+            lease.LeaseExpiresAt, "owned-result.xlsx", graph.Now.AddSeconds(1)));
+        Assert.False(await graph.Store.TryCompleteAsync(
+            lease.ExportId, lease.Key.Generation, lease.LeaseGeneration, owner, lease.Revision - 1,
+            lease.LeaseExpiresAt, "owned-result.xlsx", graph.Now.AddSeconds(1)));
+        Assert.True(await graph.Store.TryCompleteAsync(
+            lease.ExportId, lease.Key.Generation, lease.LeaseGeneration, owner, lease.Revision,
+            lease.LeaseExpiresAt, "owned-result.xlsx", graph.Now.AddSeconds(1)));
+
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA table_info(LocalResultExports);";
+        var columns = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) columns.Add(reader.GetString(1));
+        Assert.Contains("LeaseOwnerId", columns, StringComparer.Ordinal);
+    }
+
+    [Fact]
+    public async Task RecoveryUsesExactExpiredLeaseCasAndOldOwnerCannotFinishAfterReopen()
+    {
+        var graph = await CreateAsync();
+        var request = LocalResultExportRequest.Create(
+            LocalResultOwnerKind.TransferBatch, graph.BatchId, LocalResultExportKind.ReplacementWorkbook,
+            6, "recovered.xlsx", graph.Now);
+        var created = await graph.Store.CreateOrGetAsync(request);
+        var oldOwner = Guid.NewGuid();
+        var oldLease = (await graph.Store.TryAcquireAsync(
+            request.Key, created.Revision, oldOwner, graph.Now, graph.Now.AddSeconds(1)))!;
+        var reopened = new SqliteLocalResultExportStore(graph.Factory);
+
+        Assert.Equal(1, await reopened.RecoverExpiredAsync(graph.Now.AddSeconds(1), 10));
+        Assert.False(await reopened.TryFailAsync(
+            oldLease.ExportId, oldLease.Key.Generation, oldLease.LeaseGeneration, oldOwner,
+            oldLease.Revision, oldLease.LeaseExpiresAt, "LATE_FAILURE", graph.Now.AddSeconds(2)));
+        var pending = (await reopened.GetAsync(request.Key))!;
+        var newOwner = Guid.NewGuid();
+        var newLease = await reopened.TryAcquireAsync(
+            request.Key, pending.Revision, newOwner, graph.Now.AddSeconds(2), graph.Now.AddMinutes(1));
+
+        Assert.NotNull(newLease);
+        Assert.Equal(newOwner, newLease.LeaseOwnerId);
+        Assert.True(newLease.LeaseGeneration > oldLease.LeaseGeneration);
     }
 
     [Theory]

@@ -37,4 +37,14 @@ public interface IWebAutomationAttemptStore
         bool isWaitingForUser,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
+
+    Task<bool> TryResumeFromUserHandoffAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        WebAutomationAttemptState resumeStage,
+        string? observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default);
 }

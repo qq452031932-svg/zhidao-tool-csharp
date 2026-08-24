@@ -198,6 +198,93 @@ public sealed class OwnedRemoteSelectionTests
         Assert.Equal("exactRemoteItems", error.ParamName);
     }
 
+    [Theory]
+    [InlineData(StandaloneShareBatchStatus.Active, 0, 0)]
+    [InlineData(StandaloneShareBatchStatus.Queued, 1, 0)]
+    [InlineData(StandaloneShareBatchStatus.Queued, 0, 1)]
+    public void StandaloneCreateGraph_RejectsNonInitialBatchState(
+        StandaloneShareBatchStatus status,
+        long revision,
+        int updatedSeconds)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var batchId = Guid.NewGuid();
+        var batch = new StandaloneShareBatchRecord(
+            batchId, Path.Combine(Path.GetTempPath(), $"results-{batchId:N}"), status,
+            1, revision, now, now.AddSeconds(updatedSeconds));
+
+        Assert.Throws<ArgumentException>(() => StandaloneSharePendingBatchEnvelope.Create(
+            batch, [InitialOperation(batchId, now)]));
+    }
+
+    [Theory]
+    [InlineData("submitting")]
+    [InlineData("result-pending")]
+    [InlineData("succeeded")]
+    [InlineData("generation")]
+    [InlineData("revision")]
+    [InlineData("submission")]
+    [InlineData("acceptance")]
+    [InlineData("baseline")]
+    [InlineData("lease")]
+    [InlineData("error")]
+    [InlineData("updated")]
+    public void StandaloneCreateGraph_RejectsAnyOperationExecutionEvidence(string invalidFamily)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var batchId = Guid.NewGuid();
+        var batch = StandaloneShareBatchRecord.Create(
+            batchId, Path.Combine(Path.GetTempPath(), $"results-{batchId:N}"), 1, now);
+        var initial = InitialOperation(batchId, now);
+        var operation = invalidFamily switch
+        {
+            "submitting" => OperationWith(initial, now, status: StandaloneShareOperationStatus.Submitting),
+            "result-pending" => OperationWith(initial, now, status: StandaloneShareOperationStatus.ResultPending),
+            "succeeded" => OperationWith(initial, now, status: StandaloneShareOperationStatus.Succeeded),
+            "generation" => OperationWith(initial, now, generation: 2),
+            "revision" => OperationWith(initial, now, revision: 1),
+            "submission" => OperationWith(initial, now, submission: StandaloneShareSubmissionState.Prepared),
+            "acceptance" => OperationWith(initial, now) with
+            {
+                SubmissionAcceptance = SubmissionAcceptance.DefinitelyNotAccepted,
+            },
+            "baseline" => OperationWith(initial, now) with
+            {
+                BaselineFingerprint = new string('a', 64),
+                BaselineShareCount = 0,
+                BaselineCompletedAt = now,
+            },
+            "lease" => OperationWith(initial, now) with
+            {
+                LeaseGeneration = 1,
+                LeaseOwnerId = Guid.NewGuid(),
+                LeaseExpiresAt = now.AddMinutes(1),
+            },
+            "error" => OperationWith(initial, now) with { LastErrorCode = "FAILED" },
+            "updated" => OperationWith(initial, now, updatedAt: now.AddSeconds(1)),
+            _ => throw new InvalidOperationException(),
+        };
+
+        Assert.Throws<ArgumentException>(() => StandaloneSharePendingBatchEnvelope.Create(batch, [operation]));
+    }
+
+    private static StandaloneShareOperationRecord InitialOperation(Guid batchId, DateTimeOffset now) =>
+        StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), batchId, Selection(AccountId, $"remote-{batchId:N}"), 1, now);
+
+    private static StandaloneShareOperationRecord OperationWith(
+        StandaloneShareOperationRecord initial,
+        DateTimeOffset now,
+        int generation = 1,
+        StandaloneShareOperationStatus status = StandaloneShareOperationStatus.Queued,
+        StandaloneShareSubmissionState submission = StandaloneShareSubmissionState.NotStarted,
+        long revision = 0,
+        DateTimeOffset? updatedAt = null) =>
+        new(
+            initial.Id, initial.BatchId, initial.AccountId, initial.ExactRemoteItems,
+            initial.DisplayName, initial.Kind, initial.ParentPath, initial.SequenceNumber,
+            generation, status, submission, revision, now, updatedAt ?? now);
+
     private static OwnedRemoteSelection Selection(Guid accountId, string exactId) => new(
         accountId,
         ExactItems(exactId, "资源"),
