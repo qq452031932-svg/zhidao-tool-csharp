@@ -1,0 +1,67 @@
+using System.IO;
+
+namespace BaiduBatchTransfer.App.Features.Transfers;
+
+public enum TransferAccountMode
+{
+    SingleAccount,
+    MultiAccountReplication,
+    MultiAccountDistribution,
+}
+
+public sealed record TransferWorkspaceOptions(
+    string DefaultTargetDirectory = "/我的资源",
+    string JobNamePrefix = "批量转存",
+    int MaximumRecentBatches = 20)
+{
+    public TransferWorkspaceOptions Validate()
+    {
+        if (string.IsNullOrWhiteSpace(DefaultTargetDirectory))
+            throw new ArgumentException("A default target directory is required.", nameof(DefaultTargetDirectory));
+        if (string.IsNullOrWhiteSpace(JobNamePrefix))
+            throw new ArgumentException("A job-name prefix is required.", nameof(JobNamePrefix));
+        if (MaximumRecentBatches is < 1 or > 100)
+            throw new ArgumentOutOfRangeException(nameof(MaximumRecentBatches));
+        return this;
+    }
+}
+
+public sealed record TransferResultDestination(Guid BatchJobId, string ResultDirectory)
+{
+    public TransferResultDestination Validate()
+    {
+        if (BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(BatchJobId));
+        if (string.IsNullOrWhiteSpace(ResultDirectory) || !Path.IsPathFullyQualified(ResultDirectory))
+            throw new ArgumentException("A fully qualified local result directory is required.", nameof(ResultDirectory));
+        return this;
+    }
+
+    public override string ToString() =>
+        $"TransferResultDestination {{ BatchJobId = {BatchJobId}, ResultDirectory = [REDACTED] }}";
+}
+
+public interface ITransferResultDestinationSink
+{
+    Task SetAsync(
+        TransferResultDestination destination,
+        CancellationToken cancellationToken = default);
+}
+
+// Task 6 replaces this process-local bridge with durable storage.
+public sealed class InMemoryTransferResultDestinationSink : ITransferResultDestinationSink
+{
+    private readonly object sync = new();
+    private readonly Dictionary<Guid, TransferResultDestination> values = [];
+
+    public Task SetAsync(
+        TransferResultDestination destination,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        cancellationToken.ThrowIfCancellationRequested();
+        var validated = destination.Validate();
+        lock (sync) values[validated.BatchJobId] = validated;
+        return Task.CompletedTask;
+    }
+
+}

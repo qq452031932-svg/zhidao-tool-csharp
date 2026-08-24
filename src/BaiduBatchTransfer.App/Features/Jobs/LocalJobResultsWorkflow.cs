@@ -55,7 +55,8 @@ public sealed class LocalJobResultsWorkflow(
                 item.CanRetryShare,
                 item.CanResumeTransfer,
                 item.CanResumeShare,
-                item.TransferAttemptCount)).ToArray(),
+                item.TransferAttemptCount,
+                item.Status)).ToArray(),
             page.TotalCount,
             page.NextCursor);
     }

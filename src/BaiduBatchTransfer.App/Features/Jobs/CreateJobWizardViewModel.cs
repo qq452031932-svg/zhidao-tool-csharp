@@ -61,6 +61,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random;
     private string fixedExtractionCode = string.Empty;
     private string precheckStatusMessage = string.Empty;
+    private WizardPrecheckResult? lastPrecheckResult;
 
     public event EventHandler<Guid>? JobCreated;
 
@@ -294,8 +295,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         ? string.Empty
         : resultCapabilities.ShareStatusMessage;
     public string PrecheckStatusMessage { get => precheckStatusMessage; private set => SetProperty(ref precheckStatusMessage, value); }
+    public WizardPrecheckResult? LastPrecheckResult { get => lastPrecheckResult; private set => SetProperty(ref lastPrecheckResult, value); }
     public string WarningMessage => BuildWarning();
     public bool CanContinue => string.IsNullOrEmpty(EvaluateValidation());
+    public bool CanStartTransfers => adapterAvailability.CanStartTransfers;
     public bool CanCreateJob => adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
         IsFinalConfirmationChecked && CanContinue && !IsBusy;
 
@@ -535,11 +538,18 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task RunPrecheckAsync(CancellationToken cancellationToken = default)
     {
-        if (!UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId) return;
+        _ = await RunBackgroundPrecheckAsync(cancellationToken);
+    }
+
+    public async Task<WizardPrecheckResult> RunBackgroundPrecheckAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (!UseBulkPrecheck || importSessionId == Guid.Empty || PrecheckAccountId is not Guid accountId)
+            return new(WizardPrecheckStatus.Unavailable, 0);
         if (Accounts.All(x => x.AccountId != accountId))
         {
             ValidationMessage = "请选择一个可用账号执行预检。";
-            return;
+            return new(WizardPrecheckStatus.Unavailable, 0, AccountIssueCount: 1);
         }
 
         var session = importSessionId;
@@ -548,24 +558,29 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         try
         {
             var result = await precheckWorkflow.RunAsync(session, accountId, cancellationToken);
-            if (!IsCurrentDraft(session, generation)) return;
+            if (!IsCurrentDraft(session, generation)) return result;
+            LastPrecheckResult = result;
             PrecheckStatusMessage = result.Status switch
             {
-                WizardPrecheckStatus.Completed => $"预检已继续并完成，已处理 {result.ProcessedRows:N0} 条记录。",
+                WizardPrecheckStatus.Completed when result.HasActionableFailures => BuildActionablePrecheckMessage(result),
+                WizardPrecheckStatus.Completed => $"链接检查已继续并完成，共处理 {result.ProcessedRows:N0} 条记录。",
                 WizardPrecheckStatus.PausedForLogin => "预检已暂停，请完成账号登录后点击继续预检。",
                 WizardPrecheckStatus.PausedForVerification => "预检已暂停，请完成安全验证后点击继续预检。",
                 _ => "百度网盘适配器尚不可用，暂时无法执行预检。",
             };
+            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             if (IsCurrentDraft(session, generation))
                 PrecheckStatusMessage = "预检已取消，可使用同一账号继续。";
+            return new(WizardPrecheckStatus.Unavailable, 0);
         }
         catch (Exception)
         {
             if (IsCurrentDraft(session, generation))
                 PrecheckStatusMessage = "预检失败，可使用同一账号继续重试。";
+            return new(WizardPrecheckStatus.Unavailable, 0);
         }
         finally { EndBusy(busyToken); }
     }
@@ -709,7 +724,19 @@ public sealed class CreateJobWizardViewModel : ObservableObject
 
     public async Task CreateJobAsync(CancellationToken cancellationToken = default)
     {
-        if (!CanCreateJob || ConfirmationToken is null) return;
+        _ = await ConfirmPreparedCoreAsync(requireFinalCheck: true, cancellationToken);
+    }
+
+    public Task<Guid?> ConfirmPreparedFromUserIntentAsync(CancellationToken cancellationToken = default) =>
+        ConfirmPreparedCoreAsync(requireFinalCheck: false, cancellationToken);
+
+    private async Task<Guid?> ConfirmPreparedCoreAsync(
+        bool requireFinalCheck,
+        CancellationToken cancellationToken)
+    {
+        var mayConfirm = adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
+            CanContinue && !IsBusy && (!requireFinalCheck || IsFinalConfirmationChecked);
+        if (!mayConfirm || ConfirmationToken is null) return null;
         var token = ConfirmationToken;
         var draft = BuildDraft();
         var session = importSessionId;
@@ -718,7 +745,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             "最终确认",
             $"将创建任务“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
             cancellationToken);
-        if (!confirmed || !IsCurrentDraft(session, generation)) return;
+        if (!confirmed || !IsCurrentDraft(session, generation)) return null;
         var busyToken = BeginBusy();
         var created = false;
         try
@@ -758,6 +785,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         }
         finally { EndBusy(busyToken); }
         if (created) JobCreated?.Invoke(this, draft.BatchJobId);
+        return created ? draft.BatchJobId : null;
     }
 
     private async Task LoadPreviewPageAsync(long? cursor, bool replace, CancellationToken cancellationToken)
@@ -802,6 +830,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             account.TargetSuccessCount,
             account.IsSelected ? BatchAccountSelectionDecision.Selected : BatchAccountSelectionDecision.NotSelected,
             account.ShareEnabled)).ToArray();
+        var anyShareEnabled = accountDrafts.Any(account => account.IsSelected && account.ShareEnabled);
         return new(
             batchJobId,
             importSessionId,
@@ -818,8 +847,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             readyResourceCount,
             IsSharePermanent,
             IsShareAccessUnlimited,
-            ExtractionCodeBehavior,
-            ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed ? FixedExtractionCode.Trim() : null,
+            anyShareEnabled ? ExtractionCodeBehavior : ShareExtractionCodeBehavior.Random,
+            anyShareEnabled && ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed ? FixedExtractionCode.Trim() : null,
             ExistingSharePolicy);
     }
 
@@ -847,9 +876,10 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             return string.IsNullOrWhiteSpace(resultCapabilities.ShareStatusMessage)
                 ? "分享功能尚未通过现场验证；请先关闭分享或完成能力验收。"
                 : resultCapabilities.ShareStatusMessage;
-        if (ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
-            string.IsNullOrWhiteSpace(FixedExtractionCode))
-            return "固定提取码模式必须填写固定提取码。";
+        if (selected.Any(account => account.ShareEnabled) &&
+            ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
+            !PermanentShareRequest.IsValidFixedExtractionCode(FixedExtractionCode))
+            return "固定提取码必须是 4 位英文字母或数字。";
         if (string.IsNullOrWhiteSpace(JobName)) return "请输入任务名称。";
         if (string.IsNullOrWhiteSpace(DefaultTargetPath)) return "请选择默认目标目录。";
         if (UseBulkPrecheck && (PrecheckAccountId is null || Accounts.All(x => x.AccountId != PrecheckAccountId)))
@@ -883,6 +913,16 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 return "成功目标总数超过当前候选资源数；只有“暂停等待补充”可以保留更高目标。";
         }
         return string.Empty;
+    }
+
+    private static string BuildActionablePrecheckMessage(WizardPrecheckResult result)
+    {
+        var messages = new List<string>();
+        if (result.InvalidLinkCount > 0) messages.Add($"无效链接 {result.InvalidLinkCount:N0} 条");
+        if (result.MissingExtractionCodeCount > 0) messages.Add($"缺少提取码 {result.MissingExtractionCodeCount:N0} 条");
+        if (result.AccountIssueCount > 0) messages.Add($"账号问题 {result.AccountIssueCount:N0} 项");
+        if (result.ConflictCount > 0) messages.Add($"冲突 {result.ConflictCount:N0} 条");
+        return $"请先处理：{string.Join("、", messages)}。";
     }
 
     private string BuildWarning()

@@ -1,0 +1,151 @@
+<UserControl x:Class="BaiduBatchTransfer.App.Features.Transfers.TransferWorkspaceView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Margin="0,0,10,20">
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="导入链接" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="粘贴百度分享文字，或选择 Excel 文件；导入后可直接修改链接、提取码和排除记录。"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,5,0,10" TextWrapping="Wrap" />
+                    <TextBox Text="{Binding Import.TextContent, UpdateSourceTrigger=PropertyChanged}"
+                             AcceptsReturn="True" Height="110" TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto" />
+                    <WrapPanel Margin="0,10,0,10">
+                        <Button Content="导入粘贴内容" Command="{Binding Import.ImportTextCommand}"
+                                Style="{StaticResource PrimaryButton}" />
+                        <Button Content="选择 Excel 文件" Command="{Binding Import.SelectAndImportExcelCommand}" />
+                        <Button Content="继续上次导入" Command="{Binding Import.ResumeImportCommand}" />
+                        <Button Content="取消导入" Command="{Binding Import.CancelCommand}" />
+                    </WrapPanel>
+                    <TextBlock Text="{Binding Import.StatisticsText}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding Import.StatusMessage}" Foreground="{StaticResource MutedBrush}"
+                               TextWrapping="Wrap" Margin="0,4,0,8" />
+                    <DataGrid ItemsSource="{Binding Import.Rows}" SelectedItem="{Binding Import.SelectedRow}"
+                              Height="230" AutoGenerateColumns="False" IsReadOnly="True"
+                              EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                              VirtualizingPanel.IsVirtualizing="True"
+                              VirtualizingPanel.VirtualizationMode="Recycling">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="行号" Binding="{Binding SourceRowNumber}" Width="70" />
+                            <DataGridTextColumn Header="分享链接" Binding="{Binding ShareUrl}" Width="*" />
+                            <DataGridTextColumn Header="提取码" Binding="{Binding ExtractionCode}" Width="90" />
+                            <DataGridTextColumn Header="账号" Binding="{Binding RequestedAccountName}" Width="120" />
+                            <DataGridTextColumn Header="处理状态" Binding="{Binding DispositionText}" Width="110" />
+                            <DataGridTextColumn Header="检查结果" Binding="{Binding PrecheckText}" Width="110" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <Grid Margin="0,10,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="110" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox Text="{Binding Import.SelectedShareUrl, UpdateSourceTrigger=PropertyChanged}"
+                                 ToolTip="修改所选记录的分享链接" />
+                        <TextBox Grid.Column="1" Margin="8,0,0,0"
+                                 Text="{Binding Import.SelectedExtractionCode, UpdateSourceTrigger=PropertyChanged}"
+                                 ToolTip="修改所选记录的提取码" />
+                    </Grid>
+                    <WrapPanel Margin="0,8,0,0">
+                        <Button Content="保存所选修改" Command="{Binding Import.SaveSelectedRowCommand}" />
+                        <Button Content="{Binding Import.SelectedExclusionActionText}"
+                                Command="{Binding Import.ToggleSelectedExclusionCommand}" />
+                        <Button Content="刷新记录" Command="{Binding Import.LoadFirstPageCommand}" />
+                        <Button Content="下一页" Command="{Binding Import.LoadNextPageCommand}" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="选择账号和保存目录" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="每个参与账号都可以使用不同的百度网盘保存目录。"
+                               Foreground="{StaticResource MutedBrush}" Margin="0,5,0,10" />
+                    <WrapPanel Margin="0,0,0,10">
+                        <Button Content="单账号" Command="{Binding SelectSingleAccountCommand}" />
+                        <Button Content="多账号复制" Command="{Binding SelectReplicationCommand}" />
+                        <Button Content="多账号分流" Command="{Binding SelectDistributionCommand}" />
+                        <TextBlock Text="{Binding AccountModeText}" VerticalAlignment="Center"
+                                   Foreground="{StaticResource MutedBrush}" Margin="8,0,0,0" />
+                    </WrapPanel>
+                    <DataGrid ItemsSource="{Binding Wizard.Accounts}" Height="230" AutoGenerateColumns="False"
+                              EnableRowVirtualization="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                        <DataGrid.Columns>
+                            <DataGridCheckBoxColumn Header="参与" Binding="{Binding IsSelected}" Width="65" />
+                            <DataGridTextColumn Header="账号" Binding="{Binding DisplayName}" IsReadOnly="True" Width="*" />
+                            <DataGridTextColumn Header="百度保存目录" Binding="{Binding DefaultTargetPath, UpdateSourceTrigger=PropertyChanged}" Width="2*" />
+                            <DataGridTextColumn Header="分配数量" Binding="{Binding TargetItemCount, UpdateSourceTrigger=PropertyChanged}" Width="100" />
+                            <DataGridTextColumn Header="成功目标" Binding="{Binding TargetSuccessCount, UpdateSourceTrigger=PropertyChanged}" Width="100" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <WrapPanel Margin="0,10,0,0">
+                        <Button Content="按任务数量" Command="{Binding Wizard.UseTaskQuotaCommand}" />
+                        <Button Content="按成功数量" Command="{Binding Wizard.UseSuccessTargetCommand}" />
+                        <Button Content="平均分配" Command="{Binding Wizard.ApplyEqualAllocationCommand}" />
+                        <Button Content="按容量分配" Command="{Binding Wizard.ApplyCapacityAllocationCommand}" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="自动分享" FontSize="18" FontWeight="SemiBold" />
+                    <CheckBox Content="转存完成后自动分享" IsChecked="{Binding AutoShare}"
+                              Margin="0,10,0,8" />
+                    <StackPanel Visibility="{Binding IsShareConfigurationVisible, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Text="{Binding ShareResultDirectory, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="本机结果目录" />
+                            <Button Grid.Column="1" Content="选择本机目录"
+                                    Command="{Binding PickShareResultDirectoryCommand}" Margin="8,0,0,0" />
+                        </Grid>
+                        <WrapPanel Margin="0,8,0,0">
+                            <CheckBox Content="使用固定提取码" IsChecked="{Binding UsesFixedExtractionCode}"
+                                      VerticalAlignment="Center" Margin="0,0,12,0" />
+                            <TextBox Width="120" MaxLength="4" Text="{Binding FixedExtractionCode, UpdateSourceTrigger=PropertyChanged}"
+                                     IsEnabled="{Binding UsesFixedExtractionCode}" ToolTip="4 位英文字母或数字" />
+                            <TextBlock Text="永久有效 · 不限次数" VerticalAlignment="Center"
+                                       Foreground="{StaticResource MutedBrush}" Margin="12,0,0,0" />
+                        </WrapPanel>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="开始转存" FontSize="18" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding ConfigurationMessage}" Foreground="#B54708"
+                               TextWrapping="Wrap" Margin="0,6,0,10" />
+                    <WrapPanel>
+                        <Button Content="开始转存" Command="{Binding StartCommand}"
+                                Style="{StaticResource PrimaryButton}" MinWidth="140" />
+                        <TextBlock Text="{Binding StatusMessage}" VerticalAlignment="Center"
+                                   AutomationProperties.LiveSetting="Polite"
+                                   AutomationProperties.Name="{Binding StatusMessage}" TextWrapping="Wrap" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}" Margin="0">
+                <StackPanel>
+                    <TextBlock Text="进度与结果" FontSize="18" FontWeight="SemiBold" />
+                    <WrapPanel Margin="0,10,0,10">
+                        <ComboBox Width="260" ItemsSource="{Binding RunPanel.Batches}"
+                                  SelectedItem="{Binding RunPanel.SelectedBatch}" />
+                        <Button Content="查看" Command="{Binding RunPanel.LoadSelectedBatchCommand}" Margin="8,0,0,0" />
+                        <Button Content="暂停批次" Command="{Binding RunPanel.PauseCommand}" />
+                        <Button Content="继续批次" Command="{Binding RunPanel.ResumeCommand}" />
+                        <Button Content="重试失败转存" Command="{Binding RunPanel.RetryFailedTransferCommand}" />
+                    </WrapPanel>
+                    <TextBlock Text="{Binding RunPanel.StatusMessage}" Foreground="{StaticResource MutedBrush}"
+                               TextWrapping="Wrap" Margin="0,0,0,10" />
+                    <ContentControl x:Name="ResultsHost" Height="520" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

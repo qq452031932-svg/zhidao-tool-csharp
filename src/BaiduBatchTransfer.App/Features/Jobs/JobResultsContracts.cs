@@ -18,7 +18,8 @@ public sealed record JobResultRow(
     bool CanRetryShare,
     bool CanResumeTransfer = false,
     bool CanResumeShare = false,
-    int TransferAttemptCount = 0);
+    int TransferAttemptCount = 0,
+    string TransferStatus = "");
 
 public sealed record JobResultsPage(
     IReadOnlyList<JobResultRow> Items,

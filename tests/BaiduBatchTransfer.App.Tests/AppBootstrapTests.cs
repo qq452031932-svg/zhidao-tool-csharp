@@ -2,6 +2,7 @@ using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
@@ -55,6 +56,8 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<PauseBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<ResumeBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<RetryFailedTransferService>());
+        Assert.IsType<InMemoryTransferResultDestinationSink>(
+            host.Services.GetRequiredService<ITransferResultDestinationSink>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
@@ -70,7 +73,7 @@ public sealed class AppBootstrapTests : IDisposable
             "BaiduBatchTransfer.App",
             "AppBootstrap.cs"));
 
-        Assert.Contains("var transferWorkspace = new System.Windows.Controls.ContentControl", bootstrap);
+        Assert.Contains("var transferWorkspace = new TransferWorkspaceView(transferViewModel)", bootstrap);
         Assert.Contains("var shareWorkspace = new System.Windows.Controls.ContentControl", bootstrap);
         Assert.Contains("transferWorkspace,", bootstrap);
         Assert.Contains("shareWorkspace,", bootstrap);
@@ -78,6 +81,7 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.DoesNotContain("ShowImportCommand", bootstrap);
         Assert.DoesNotContain("ShowCreateJobCommand", bootstrap);
         Assert.DoesNotContain("ShowResultsCommand", bootstrap);
+        Assert.DoesNotContain("transferWorkspace.Content = resultsView", bootstrap);
     }
 
     [Fact]
@@ -93,8 +97,7 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.DoesNotContain("using var handoff", bootstrap);
         Assert.Contains("handoff.Dispose();", bootstrap);
         Assert.Contains("decisionPoll.Tick -= OnDecisionPollTick;", bootstrap);
-        Assert.Contains("importViewModel.DraftReady -= OnDraftReady;", bootstrap);
-        Assert.Contains("wizardViewModel.JobCreated -= OnJobCreated;", bootstrap);
+        Assert.Contains("transferViewModel.Dispose();", bootstrap);
     }
 
     [Fact]

@@ -2,6 +2,8 @@ using System.Reflection;
 using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Features.Common;
+using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
@@ -198,6 +200,9 @@ public static class AppBootstrap
         services.AddSingleton<IFolderDialog, WpfFolderDialog>();
         services.AddSingleton<IResultSaveDialog, ResultSaveDialog>();
         services.AddSingleton<IDialogService, DialogService>();
+        services.AddSingleton<InMemoryTransferResultDestinationSink>();
+        services.AddSingleton<ITransferResultDestinationSink>(sp =>
+            sp.GetRequiredService<InMemoryTransferResultDestinationSink>());
 #if DEBUG
         services.AddSingleton(new BaiduAcceptanceProbeOutputStore(paths.RootDirectory));
         services.AddSingleton<IBaiduAcceptanceProbeOutputStore>(serviceProvider =>
@@ -360,6 +365,10 @@ public sealed class AppShellFactory(
     IResultSaveDialog resultSaveDialog,
     IJobResultCapabilityAvailability resultCapabilities,
     IExistingShareDecisionInteraction existingShareInteraction,
+    PauseBatchService pauseBatchService,
+    ResumeBatchService resumeBatchService,
+    RetryFailedTransferService retryFailedTransferService,
+    ITransferResultDestinationSink resultDestinationSink,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -374,6 +383,15 @@ public sealed class AppShellFactory(
         var wizardViewModel = new CreateJobWizardViewModel(
             accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow,
             resultCapabilities);
+        var resultsViewModel = new JobResultsViewModel(
+            jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction);
+        var transferOptions = new TransferWorkspaceOptions().Validate();
+        var runPanelViewModel = new WorkspaceRunPanelViewModel(
+            resultsViewModel,
+            pauseBatchService,
+            resumeBatchService,
+            retryFailedTransferService,
+            transferOptions.MaximumRecentBatches);
 
         async Task DispatchOnUiAsync(Action action)
         {
@@ -381,38 +399,9 @@ public sealed class AppShellFactory(
             if (dispatcher is null || dispatcher.CheckAccess()) action();
             else await dispatcher.InvokeAsync(action);
         }
-        var accountRefresh = new AccountRefreshCoordinator(
-            accountProvider,
-            accountSummaryProvider,
-            wizardViewModel.ReloadAccounts,
-            DispatchOnUiAsync);
-        var importView = new ImportView(importViewModel);
-        var wizardView = new CreateJobWizardView(wizardViewModel);
-        var resultsViewModel = new JobResultsViewModel(
-            jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction);
-        var resultsView = new JobResultsView(resultsViewModel);
-        var transferWorkspace = new System.Windows.Controls.ContentControl
-        {
-            Content = importView,
-        };
-        var shareWorkspace = new System.Windows.Controls.ContentControl
-        {
-            Content = new System.Windows.Controls.TextBlock
-            {
-                Text = "分享功能将在此工作区提供。",
-                TextWrapping = System.Windows.TextWrapping.Wrap,
-            },
-        };
-        var mainViewModel = new MainWindowViewModel(
-            transferWorkspace,
-            shareWorkspace,
-            loginLauncher,
-            accountManagementLauncher,
-            accountRefresh.RefreshAsync,
-            initialActiveAccountCount);
-        var mainWindow = new MainWindow(mainViewModel);
         var shellLifetime = new CancellationTokenSource();
         var shellClosed = 0;
+        MainWindowViewModel? mainViewModel = null;
 
         async Task DispatchHandoffAsync(
             Func<CancellationToken, Task> operation,
@@ -434,12 +423,12 @@ public sealed class AppShellFactory(
             await nestedOperation.ConfigureAwait(false);
         }
 
-        Task NavigateToResultsAsync(Guid _, CancellationToken cancellationToken)
+        Task NavigateToResultsAsync(Guid batchJobId, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0)
                 return Task.CompletedTask;
-            transferWorkspace.Content = resultsView;
-            mainViewModel.ShowTransferCommand.Execute(null);
+            runPanelViewModel.PresentBatch(batchJobId);
+            mainViewModel?.ShowTransferCommand.Execute(null);
             return Task.CompletedTask;
         }
 
@@ -450,7 +439,7 @@ public sealed class AppShellFactory(
                 await DispatchOnUiAsync(() =>
                 {
                     if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
-                    mainViewModel.ReportHandoffFailure();
+                    mainViewModel?.ReportHandoffFailure();
                 }).ConfigureAwait(true);
             }
             catch { }
@@ -461,29 +450,36 @@ public sealed class AppShellFactory(
             DispatchHandoffAsync,
             exception => { _ = ReportHandoffFailureAsync(); });
 
-        async Task HandleDraftReadyAsync(ImportDraftReady draft)
+        var transferViewModel = new TransferWorkspaceViewModel(
+            importViewModel,
+            wizardViewModel,
+            runPanelViewModel,
+            resultSaveDialog,
+            resultDestinationSink,
+            (batchJobId, _) => handoff.ActivateJobAsync(batchJobId),
+            transferOptions);
+        var transferWorkspace = new TransferWorkspaceView(transferViewModel);
+        var shareWorkspace = new System.Windows.Controls.ContentControl
         {
-            try
+            Content = new System.Windows.Controls.TextBlock
             {
-                await DispatchOnUiAsync(() =>
-                {
-                    if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
-                    wizardViewModel.Initialize(new ImportWizardContext(
-                        draft.SessionId,
-                        $"批量转存 {DateTime.Now:yyyy-MM-dd HH:mm}",
-                        draft.Statistics.Ready,
-                        draft.Statistics.HasExcelAccountColumn,
-                        draft.Statistics.UnresolvedAccountMappings,
-                        draft.Statistics.Conflict,
-                        draft.Statistics.NeedsResolution,
-                        "/我的资源"));
-                    transferWorkspace.Content = wizardView;
-                    mainViewModel.ShowTransferCommand.Execute(null);
-                }).ConfigureAwait(true);
-            }
-            catch (OperationCanceledException) when (shellLifetime.IsCancellationRequested) { }
-            catch { }
-        }
+                Text = "分享功能将在此工作区提供。",
+                TextWrapping = System.Windows.TextWrapping.Wrap,
+            },
+        };
+        var accountRefresh = new AccountRefreshCoordinator(
+            accountProvider,
+            accountSummaryProvider,
+            wizardViewModel.ReloadAccounts,
+            DispatchOnUiAsync);
+        mainViewModel = new MainWindowViewModel(
+            transferWorkspace,
+            shareWorkspace,
+            loginLauncher,
+            accountManagementLauncher,
+            accountRefresh.RefreshAsync,
+            initialActiveAccountCount);
+        var mainWindow = new MainWindow(mainViewModel);
 
         static async Task ObserveAsync(Task task)
         {
@@ -492,8 +488,6 @@ public sealed class AppShellFactory(
         }
 
         void Observe(Task task) => _ = ObserveAsync(task);
-        void OnDraftReady(object? _, ImportDraftReady draft) => Observe(HandleDraftReadyAsync(draft));
-        void OnJobCreated(object? _, Guid batchId) => Observe(handoff.ActivateJobAsync(batchId));
 
         var decisionPoll = new System.Windows.Threading.DispatcherTimer
         {
@@ -524,16 +518,13 @@ public sealed class AppShellFactory(
             handoff.Close();
             decisionPoll.Stop();
             decisionPoll.Tick -= OnDecisionPollTick;
-            importViewModel.DraftReady -= OnDraftReady;
-            wizardViewModel.JobCreated -= OnJobCreated;
             mainWindow.Loaded -= OnLoaded;
             mainWindow.Closed -= OnClosed;
+            transferViewModel.Dispose();
             handoff.Dispose();
             shellLifetime.Dispose();
         }
 
-        importViewModel.DraftReady += OnDraftReady;
-        wizardViewModel.JobCreated += OnJobCreated;
         decisionPoll.Tick += OnDecisionPollTick;
         mainWindow.Loaded += OnLoaded;
         mainWindow.Closed += OnClosed;

@@ -1,0 +1,380 @@
+using System.ComponentModel;
+using System.IO;
+using BaiduBatchTransfer.App.Features.Common;
+using BaiduBatchTransfer.App.Features.Imports;
+using BaiduBatchTransfer.App.Features.Jobs;
+using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Core.Domain;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+
+namespace BaiduBatchTransfer.App.Features.Transfers;
+
+public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
+{
+    private readonly IResultSaveDialog resultDirectoryDialog;
+    private readonly ITransferResultDestinationSink destinationSink;
+    private readonly Func<Guid, CancellationToken, Task> handoffBatchAsync;
+    private readonly TransferWorkspaceOptions options;
+    private readonly CancellationTokenSource lifetime = new();
+    private TransferAccountMode? accountMode;
+    private bool autoShare;
+    private string shareResultDirectory = string.Empty;
+    private string statusMessage = "请先导入链接，再选择账号和保存目录。";
+    private bool isStarting;
+    private bool isClosed;
+    private bool synchronizingAccounts;
+
+    public TransferWorkspaceViewModel(
+        ImportViewModel import,
+        CreateJobWizardViewModel wizard,
+        WorkspaceRunPanelViewModel runPanel,
+        IResultSaveDialog resultDirectoryDialog,
+        ITransferResultDestinationSink destinationSink,
+        Func<Guid, CancellationToken, Task> handoffBatchAsync,
+        TransferWorkspaceOptions? options = null)
+    {
+        Import = import ?? throw new ArgumentNullException(nameof(import));
+        Wizard = wizard ?? throw new ArgumentNullException(nameof(wizard));
+        RunPanel = runPanel ?? throw new ArgumentNullException(nameof(runPanel));
+        this.resultDirectoryDialog = resultDirectoryDialog ?? throw new ArgumentNullException(nameof(resultDirectoryDialog));
+        this.destinationSink = destinationSink ?? throw new ArgumentNullException(nameof(destinationSink));
+        this.handoffBatchAsync = handoffBatchAsync ?? throw new ArgumentNullException(nameof(handoffBatchAsync));
+        this.options = (options ?? new TransferWorkspaceOptions()).Validate();
+        StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
+        SelectSingleAccountCommand = new AsyncRelayCommand(
+            () => SelectAccountModeAsync(TransferAccountMode.SingleAccount),
+            () => !IsStarting);
+        SelectReplicationCommand = new AsyncRelayCommand(
+            () => SelectAccountModeAsync(TransferAccountMode.MultiAccountReplication),
+            () => !IsStarting);
+        SelectDistributionCommand = new AsyncRelayCommand(
+            () => SelectAccountModeAsync(TransferAccountMode.MultiAccountDistribution),
+            () => !IsStarting);
+        PickShareResultDirectoryCommand = new AsyncRelayCommand(
+            PickShareResultDirectoryAsync,
+            () => AutoShare && !IsStarting);
+        Import.DraftReady += OnDraftReady;
+        Import.PropertyChanged += OnComposedPropertyChanged;
+        Wizard.PropertyChanged += OnComposedPropertyChanged;
+    }
+
+    public ImportViewModel Import { get; }
+    public CreateJobWizardViewModel Wizard { get; }
+    public WorkspaceRunPanelViewModel RunPanel { get; }
+    public TransferAccountMode? AccountMode
+    {
+        get => accountMode;
+        private set
+        {
+            if (!SetProperty(ref accountMode, value)) return;
+            OnPropertyChanged(nameof(AccountModeText));
+            RaiseStartState();
+        }
+    }
+    public string AccountModeText => AccountMode switch
+    {
+        TransferAccountMode.SingleAccount => "单账号",
+        TransferAccountMode.MultiAccountReplication => "多账号复制",
+        TransferAccountMode.MultiAccountDistribution => "多账号分流",
+        _ => "请选择账号模式",
+    };
+    public bool AutoShare
+    {
+        get => autoShare;
+        set
+        {
+            if (!SetProperty(ref autoShare, value)) return;
+            foreach (var account in Wizard.Accounts) account.ShareEnabled = value;
+            OnPropertyChanged(nameof(IsShareConfigurationVisible));
+            RaiseStartState();
+        }
+    }
+    public bool IsShareConfigurationVisible => AutoShare;
+    public string ShareResultDirectory
+    {
+        get => shareResultDirectory;
+        set
+        {
+            if (!SetProperty(ref shareResultDirectory, value?.Trim() ?? string.Empty)) return;
+            RaiseStartState();
+        }
+    }
+    public ShareExtractionCodeBehavior ExtractionCodeBehavior
+    {
+        get => Wizard.ExtractionCodeBehavior;
+        set
+        {
+            if (Wizard.ExtractionCodeBehavior == value) return;
+            Wizard.ExtractionCodeBehavior = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(UsesFixedExtractionCode));
+            RaiseStartState();
+        }
+    }
+    public bool UsesFixedExtractionCode
+    {
+        get => ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed;
+        set => ExtractionCodeBehavior = value
+            ? ShareExtractionCodeBehavior.Fixed
+            : ShareExtractionCodeBehavior.Random;
+    }
+    public string FixedExtractionCode
+    {
+        get => Wizard.FixedExtractionCode;
+        set
+        {
+            if (Wizard.FixedExtractionCode == (value ?? string.Empty)) return;
+            Wizard.FixedExtractionCode = value ?? string.Empty;
+            OnPropertyChanged();
+            RaiseStartState();
+        }
+    }
+    public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
+    public bool IsStarting
+    {
+        get => isStarting;
+        private set
+        {
+            if (!SetProperty(ref isStarting, value)) return;
+            RaiseStartState();
+            SelectSingleAccountCommand.NotifyCanExecuteChanged();
+            SelectReplicationCommand.NotifyCanExecuteChanged();
+            SelectDistributionCommand.NotifyCanExecuteChanged();
+            PickShareResultDirectoryCommand.NotifyCanExecuteChanged();
+        }
+    }
+    public bool IsClosed => isClosed;
+    public bool CanStart => !isClosed && !IsStarting && string.IsNullOrEmpty(EvaluateConfiguration());
+    public string ConfigurationMessage => EvaluateConfiguration();
+    public IAsyncRelayCommand StartCommand { get; }
+    public IAsyncRelayCommand SelectSingleAccountCommand { get; }
+    public IAsyncRelayCommand SelectReplicationCommand { get; }
+    public IAsyncRelayCommand SelectDistributionCommand { get; }
+    public IAsyncRelayCommand PickShareResultDirectoryCommand { get; }
+
+    public void ApplyImportedDraft(ImportDraftReady draft)
+    {
+        if (isClosed) return;
+        if (Import.SessionId != draft.SessionId) Import.AttachSession(draft.SessionId);
+        Wizard.Initialize(new(
+            draft.SessionId,
+            $"{options.JobNamePrefix} {DateTime.Now:yyyy-MM-dd HH:mm}",
+            draft.Statistics.Ready,
+            draft.Statistics.HasExcelAccountColumn,
+            draft.Statistics.UnresolvedAccountMappings,
+            draft.Statistics.Conflict,
+            draft.Statistics.NeedsResolution,
+            options.DefaultTargetDirectory));
+        foreach (var account in Wizard.Accounts) account.ShareEnabled = AutoShare;
+        AccountMode = Wizard.Accounts.Count == 1 ? TransferAccountMode.SingleAccount : null;
+        StatusMessage = draft.Statistics.Conflict + draft.Statistics.NeedsResolution > 0
+            ? "导入内容中还有冲突或待处理记录，请先修正或排除。"
+            : "导入完成，请选择参与账号和保存目录。";
+        RaiseStartState();
+    }
+
+    public async Task SelectAccountModeAsync(
+        TransferAccountMode mode,
+        CancellationToken cancellationToken = default)
+    {
+        if (isClosed || IsStarting) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var transferMode = mode == TransferAccountMode.MultiAccountReplication
+            ? TransferMode.Replication
+            : TransferMode.Distribution;
+        await Wizard.SelectModeAsync(transferMode, linked.Token).ConfigureAwait(true);
+        if (linked.IsCancellationRequested || isClosed || Wizard.TransferMode != transferMode) return;
+        AccountMode = mode;
+        StatusMessage = mode switch
+        {
+            TransferAccountMode.SingleAccount => "已选择单账号转存。",
+            TransferAccountMode.MultiAccountReplication => "已选择多账号复制。",
+            _ => "已选择多账号分流。",
+        };
+    }
+
+    public async Task PickShareResultDirectoryAsync(CancellationToken cancellationToken = default)
+    {
+        if (!AutoShare || isClosed || IsStarting) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var selected = await resultDirectoryDialog.PickDestinationDirectoryAsync(linked.Token).ConfigureAwait(true);
+        if (linked.IsCancellationRequested || isClosed || string.IsNullOrWhiteSpace(selected)) return;
+        ShareResultDirectory = selected;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        if (isClosed || IsStarting) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        IsStarting = true;
+        try
+        {
+            var saved = await Import.SaveCurrentRowEditAsync(linked.Token).ConfigureAwait(true);
+            if (!IsAlive(linked) || !saved) return;
+
+            var validation = EvaluateConfiguration();
+            if (validation.Length != 0)
+            {
+                StatusMessage = validation;
+                return;
+            }
+
+            var selectedAccount = Wizard.Accounts.First(account => account.IsSelected);
+            Wizard.UseBulkPrecheck = true;
+            Wizard.PrecheckAccountId = selectedAccount.AccountId;
+            StatusMessage = "正在检查链接和账号配置……";
+            var precheck = await Wizard.RunBackgroundPrecheckAsync(linked.Token).ConfigureAwait(true);
+            if (!IsAlive(linked)) return;
+            if (precheck.Status != WizardPrecheckStatus.Completed)
+            {
+                StatusMessage = precheck.Status switch
+                {
+                    WizardPrecheckStatus.PausedForLogin => "请先完成账号登录，再重新开始转存。",
+                    WizardPrecheckStatus.PausedForVerification => "请先完成百度安全验证，再重新开始转存。",
+                    _ => "当前无法检查链接，转存尚未开始。",
+                };
+                return;
+            }
+            if (precheck.HasActionableFailures)
+            {
+                StatusMessage = BuildActionableFailureMessage(precheck);
+                return;
+            }
+
+            await Wizard.PrepareConfirmationAsync(linked.Token).ConfigureAwait(true);
+            if (!IsAlive(linked)) return;
+            if (Wizard.ConfirmationToken is null)
+            {
+                StatusMessage = string.IsNullOrWhiteSpace(Wizard.ValidationMessage)
+                    ? "无法准备转存，请检查链接、账号和保存目录。"
+                    : Wizard.ValidationMessage;
+                return;
+            }
+
+            var batchJobId = await Wizard.ConfirmPreparedFromUserIntentAsync(linked.Token).ConfigureAwait(true);
+            if (!IsAlive(linked) || batchJobId is not { } batch) return;
+            if (AutoShare)
+            {
+                await destinationSink.SetAsync(
+                    new TransferResultDestination(batch, ShareResultDirectory),
+                    linked.Token).ConfigureAwait(true);
+                if (!IsAlive(linked)) return;
+            }
+
+            await handoffBatchAsync(batch, linked.Token).ConfigureAwait(true);
+            if (!IsAlive(linked)) return;
+            StatusMessage = "转存批次已创建，可在下方查看进度与结果。";
+        }
+        catch (OperationCanceledException) when (linked.IsCancellationRequested) { }
+        catch (Exception)
+        {
+            if (IsAlive(linked)) StatusMessage = "转存未能开始，请检查配置后重试。";
+        }
+        finally
+        {
+            if (!isClosed) IsStarting = false;
+        }
+    }
+
+    public void Close()
+    {
+        if (isClosed) return;
+        isClosed = true;
+        lifetime.Cancel();
+        Import.DraftReady -= OnDraftReady;
+        Import.PropertyChanged -= OnComposedPropertyChanged;
+        Wizard.PropertyChanged -= OnComposedPropertyChanged;
+        RunPanel.Close();
+        OnPropertyChanged(nameof(IsClosed));
+        RaiseStartState();
+    }
+
+    public void Dispose()
+    {
+        Close();
+        RunPanel.Dispose();
+        lifetime.Dispose();
+    }
+
+    private string EvaluateConfiguration()
+    {
+        if (Import.SessionId is not { } session || Wizard.CurrentImportSessionId != session)
+            return "请先导入至少一条有效链接。";
+        if (Wizard.ReadyResourceCount <= 0) return "没有可转存的有效链接。";
+        if (Wizard.Accounts.Count == 0) return "请先添加可用百度账号。";
+        var selected = Wizard.Accounts.Where(account => account.IsSelected).ToArray();
+        if (selected.Length == 0) return "请至少选择一个参与账号。";
+        if (AccountMode is null) return "请选择单账号、多账号复制或多账号分流。";
+        if (AccountMode == TransferAccountMode.SingleAccount && selected.Length != 1)
+            return "单账号模式只能选择一个参与账号。";
+        if (AccountMode is TransferAccountMode.MultiAccountReplication or TransferAccountMode.MultiAccountDistribution &&
+            selected.Length < 2)
+            return "多账号模式至少需要两个参与账号。";
+        if (AccountMode == TransferAccountMode.MultiAccountReplication && Wizard.TransferMode != TransferMode.Replication)
+            return "账号模式尚未配置完成。";
+        if (AccountMode != TransferAccountMode.MultiAccountReplication && Wizard.TransferMode != TransferMode.Distribution)
+            return "账号模式尚未配置完成。";
+        if (selected.Any(account => string.IsNullOrWhiteSpace(account.DefaultTargetPath)))
+            return "每个参与账号都必须填写百度保存目录。";
+        if (AutoShare && !IsValidLocalDirectory(ShareResultDirectory))
+            return "自动分享需要选择本机结果目录。";
+        if (AutoShare && ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
+            !PermanentShareRequest.IsValidFixedExtractionCode(FixedExtractionCode))
+            return "固定提取码必须是 4 位英文字母或数字。";
+        if (!Wizard.CanContinue) return Wizard.ValidationMessage.Length == 0
+            ? "请检查账号模式、分配数量和保存目录。"
+            : Wizard.ValidationMessage;
+        if (!Wizard.CanStartTransfers) return "百度转存能力尚未通过验证，当前不能开始。";
+        return string.Empty;
+    }
+
+    private static bool IsValidLocalDirectory(string value) =>
+        !string.IsNullOrWhiteSpace(value) && Path.IsPathFullyQualified(value);
+
+    private static string BuildActionableFailureMessage(WizardPrecheckResult result)
+    {
+        var parts = new List<string>();
+        if (result.InvalidLinkCount > 0) parts.Add($"无效链接 {result.InvalidLinkCount:N0} 条");
+        if (result.MissingExtractionCodeCount > 0) parts.Add($"缺少提取码 {result.MissingExtractionCodeCount:N0} 条");
+        if (result.AccountIssueCount > 0) parts.Add($"账号问题 {result.AccountIssueCount:N0} 项");
+        if (result.ConflictCount > 0) parts.Add($"冲突 {result.ConflictCount:N0} 条");
+        return $"请先处理：{string.Join("、", parts)}。";
+    }
+
+    private bool IsAlive(CancellationTokenSource operation) =>
+        !isClosed && !lifetime.IsCancellationRequested && !operation.IsCancellationRequested;
+
+    private void OnDraftReady(object? sender, ImportDraftReady draft) => ApplyImportedDraft(draft);
+
+    private void OnComposedPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (ReferenceEquals(sender, Wizard)) SynchronizeAccountState();
+        RaiseStartState();
+    }
+
+    private void SynchronizeAccountState()
+    {
+        if (synchronizingAccounts) return;
+        synchronizingAccounts = true;
+        try
+        {
+            foreach (var account in Wizard.Accounts)
+                if (account.ShareEnabled != AutoShare) account.ShareEnabled = AutoShare;
+            if (Wizard.TransferMode is null) AccountMode = null;
+            else if (Wizard.Accounts.Count == 1 && Wizard.Accounts[0].IsSelected)
+                AccountMode = TransferAccountMode.SingleAccount;
+        }
+        finally
+        {
+            synchronizingAccounts = false;
+        }
+    }
+
+    private void RaiseStartState()
+    {
+        OnPropertyChanged(nameof(CanStart));
+        OnPropertyChanged(nameof(ConfigurationMessage));
+        StartCommand.NotifyCanExecuteChanged();
+    }
+}

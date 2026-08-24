@@ -277,14 +277,34 @@ public sealed class ImportViewModel : ObservableObject
         catch (Exception) { StatusMessage = "无法更新记录，请刷新后重试。"; }
     }
 
+    public async Task<bool> SaveCurrentRowEditAsync(CancellationToken cancellationToken = default)
+    {
+        if (SelectedRow is null) return true;
+        try
+        {
+            await workflow.UpdateLinkAsync(
+                SelectedRow.RowId,
+                SelectedShareUrl,
+                string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
+                cancellationToken);
+            StatusMessage = "链接修改已保存，开始前会重新检查。";
+            await LoadFirstPageAsync(cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            StatusMessage = "修改失败，请检查链接与提取码。";
+            return false;
+        }
+    }
+
     private async Task SaveSelectedRowAsync(CancellationToken cancellationToken)
     {
-        if (SelectedRow is null) return;
-        await UpdateLinkAsync(
-            SelectedRow.RowId,
-            SelectedShareUrl,
-            string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
-            cancellationToken);
+        _ = await SaveCurrentRowEditAsync(cancellationToken);
     }
 
     private async Task ToggleSelectedExclusionAsync(CancellationToken cancellationToken)

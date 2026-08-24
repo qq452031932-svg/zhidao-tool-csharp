@@ -225,7 +225,17 @@ public enum WizardPrecheckStatus
     Unavailable,
 }
 
-public sealed record WizardPrecheckResult(WizardPrecheckStatus Status, int ProcessedRows);
+public sealed record WizardPrecheckResult(
+    WizardPrecheckStatus Status,
+    int ProcessedRows,
+    int InvalidLinkCount = 0,
+    int MissingExtractionCodeCount = 0,
+    int AccountIssueCount = 0,
+    int ConflictCount = 0)
+{
+    public bool HasActionableFailures =>
+        InvalidLinkCount > 0 || MissingExtractionCodeCount > 0 || AccountIssueCount > 0 || ConflictCount > 0;
+}
 
 public interface IWizardPrecheckWorkflow
 {
