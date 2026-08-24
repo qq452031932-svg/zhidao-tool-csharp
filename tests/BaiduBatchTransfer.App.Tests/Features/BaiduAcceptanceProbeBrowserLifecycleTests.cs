@@ -32,4 +32,12 @@ public sealed class BaiduAcceptanceProbeBrowserLifecycleTests
         Assert.False(exited);
         Assert.Equal(["dispose"], events);
     }
+
+    [Fact]
+    public void PresenterReportingBudgetCoversObservationAndBrowserExitBudgets()
+    {
+        Assert.True(BaiduAcceptanceProbeTeardownTiming.PresenterReportingTimeout >=
+            BaiduAcceptanceProbeTeardownTiming.ObservationStopTimeout +
+            BaiduAcceptanceProbeTeardownTiming.BrowserExitTimeout);
+    }
 }

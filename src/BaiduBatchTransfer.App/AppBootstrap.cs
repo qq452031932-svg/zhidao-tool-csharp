@@ -201,6 +201,7 @@ public static class AppBootstrap
         services.AddSingleton<IBaiduAcceptanceProbeAccountSelector, BaiduAcceptanceProbeAccountSelector>();
         services.AddSingleton<IBaiduAcceptanceProbeProfilePathPolicy>(_ =>
             new BaiduAcceptanceProbeProfilePathPolicy(paths.RootDirectory));
+        services.AddSingleton<IBaiduAcceptanceProbeDeferredCleanupRegistry, BaiduAcceptanceProbeDeferredCleanupRegistry>();
         services.AddSingleton<IBaiduAcceptanceProbeUiDispatcher, WpfBaiduAcceptanceProbeUiDispatcher>();
         services.AddSingleton<IBaiduAcceptanceProbeWindowFactory, BaiduAcceptanceProbeWindowFactory>();
         services.AddSingleton<IBaiduAcceptanceProbePresenter, BaiduAcceptanceProbePresenter>();

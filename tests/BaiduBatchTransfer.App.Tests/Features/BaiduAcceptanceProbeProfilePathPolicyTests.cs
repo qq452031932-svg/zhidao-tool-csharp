@@ -50,4 +50,31 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicyTests
             if (Directory.Exists(outside)) Directory.Delete(outside, recursive: true);
         }
     }
+
+    [Fact]
+    public async Task ScavengesDeferredProfilesOnlyInsideTheKnownProbeRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "BaiduAcceptanceProbeTests", Guid.NewGuid().ToString("N"));
+        var outside = Path.Combine(Path.GetTempPath(), "BaiduAcceptanceProbeTests", Guid.NewGuid().ToString("N"));
+        try
+        {
+            var stale = Path.Combine(root, "acceptance-probe", "deferred", "stale");
+            Directory.CreateDirectory(stale);
+            Directory.CreateDirectory(outside);
+            var policy = new BaiduAcceptanceProbeProfilePathPolicy(root);
+
+            var lease = policy.Create(Guid.NewGuid());
+
+            Assert.StartsWith(Path.Combine(Path.GetFullPath(root), "acceptance-probe", "deferred"), lease.ProfilePath,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.False(Directory.Exists(stale));
+            Assert.True(Directory.Exists(outside));
+            await lease.DisposeAsync();
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            if (Directory.Exists(outside)) Directory.Delete(outside, recursive: true);
+        }
+    }
 }

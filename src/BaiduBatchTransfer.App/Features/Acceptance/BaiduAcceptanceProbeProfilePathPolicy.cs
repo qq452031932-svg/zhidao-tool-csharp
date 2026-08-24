@@ -34,20 +34,21 @@ public sealed class BaiduAcceptanceProbeProfileLease(string profilePath, Func<Ta
 public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBaiduAcceptanceProbeProfilePathPolicy
 {
     private readonly string rootDirectory = Path.Combine(Path.GetFullPath(dataRoot), "acceptance-probe");
+    private readonly string deferredRoot = Path.Combine(Path.GetFullPath(dataRoot), "acceptance-probe", "deferred");
 
     public BaiduAcceptanceProbeProfileLease Create(Guid accountId)
     {
         if (accountId == Guid.Empty) throw new ArgumentException("An account ID is required.", nameof(accountId));
-        Directory.CreateDirectory(rootDirectory);
+        Directory.CreateDirectory(deferredRoot);
         ScavengeQuarantine();
-        var profilePath = Path.Combine(rootDirectory, Guid.NewGuid().ToString("N"));
+        var profilePath = Path.Combine(deferredRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(profilePath);
         return new(profilePath, () => DeleteIsolatedProfileAsync(profilePath));
     }
 
     private async Task<BaiduAcceptanceProbeCleanupOutcome> DeleteIsolatedProfileAsync(string profilePath)
     {
-        var relativePath = Path.GetRelativePath(rootDirectory, profilePath);
+        var relativePath = Path.GetRelativePath(deferredRoot, profilePath);
         if (relativePath.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relativePath))
             return BaiduAcceptanceProbeCleanupOutcome.Deferred;
         for (var attempt = 0; attempt < 3; attempt++)
@@ -75,10 +76,16 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBa
     private void ScavengeQuarantine()
     {
         var quarantineRoot = Path.Combine(rootDirectory, "quarantine");
-        if (!Directory.Exists(quarantineRoot)) return;
-        foreach (var candidate in Directory.EnumerateDirectories(quarantineRoot).Take(8))
+        ScavengeRoot(deferredRoot);
+        ScavengeRoot(quarantineRoot);
+    }
+
+    private static void ScavengeRoot(string root)
+    {
+        if (!Directory.Exists(root)) return;
+        foreach (var candidate in Directory.EnumerateDirectories(root).Take(8))
         {
-            var relative = Path.GetRelativePath(quarantineRoot, candidate);
+            var relative = Path.GetRelativePath(root, candidate);
             if (relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative)) continue;
             try { Directory.Delete(candidate, recursive: true); }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }

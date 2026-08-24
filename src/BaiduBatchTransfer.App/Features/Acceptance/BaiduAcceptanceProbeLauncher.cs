@@ -52,7 +52,8 @@ public sealed class BaiduAcceptanceProbeLauncher(
     IBaiduAcceptanceProbeAccountSelector accountSelector,
     IBaiduAcceptanceProbeProfilePathPolicy profilePathPolicy,
     IBaiduAcceptanceProbeOutputStore outputStore,
-    IBaiduAcceptanceProbePresenter presenter) : IBaiduAcceptanceProbeLauncher
+    IBaiduAcceptanceProbePresenter presenter,
+    IBaiduAcceptanceProbeDeferredCleanupRegistry deferredCleanupRegistry) : IBaiduAcceptanceProbeLauncher
 {
     public async Task<BaiduAcceptanceProbeLaunchResult> OpenAsync(
         BaiduAcceptanceProbeLaunchOptions options,
@@ -103,8 +104,9 @@ public sealed class BaiduAcceptanceProbeLauncher(
             var cleanup = await CleanupResultAsync(profileLease).ConfigureAwait(false);
             return new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ", cleanup);
         }
-        catch (BaiduAcceptanceProbeTeardownDeferredException)
+        catch (BaiduAcceptanceProbeTeardownDeferredException exception)
         {
+            if (profileLease is not null) deferredCleanupRegistry.Register(profileLease, exception.EventualClose);
             profileLease?.MarkCleanupDeferred();
             if (cancellationToken.IsCancellationRequested)
                 cancellationToken.ThrowIfCancellationRequested();
@@ -138,7 +140,7 @@ public interface IBaiduAcceptanceProbeUiDispatcher
 public interface IBaiduAcceptanceProbeWindow
 {
     void Show();
-    void RequestClose();
+    Task RequestCloseAsync(CancellationToken cancellationToken = default);
     Task WaitForInitializationAsync(CancellationToken cancellationToken = default);
     Task WaitForClosedAsync(CancellationToken cancellationToken = default);
 }
@@ -148,8 +150,11 @@ public interface IBaiduAcceptanceProbeWindowFactory
     IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath);
 }
 
-internal sealed class BaiduAcceptanceProbeTeardownDeferredException(Exception? innerException = null)
-    : Exception("The isolated probe browser did not close in time.", innerException);
+internal sealed class BaiduAcceptanceProbeTeardownDeferredException(Task eventualClose, Exception? innerException = null)
+    : Exception("The isolated probe browser did not close in time.", innerException)
+{
+    public Task EventualClose { get; } = eventualClose ?? throw new ArgumentNullException(nameof(eventualClose));
+}
 
 public sealed class BaiduAcceptanceProbePresenter : IBaiduAcceptanceProbePresenter
 {
@@ -164,7 +169,7 @@ public sealed class BaiduAcceptanceProbePresenter : IBaiduAcceptanceProbePresent
     {
         this.dispatcher = dispatcher;
         this.windowFactory = windowFactory;
-        this.closeTimeout = closeTimeout ?? TimeSpan.FromSeconds(5);
+        this.closeTimeout = closeTimeout ?? BaiduAcceptanceProbeTeardownTiming.PresenterReportingTimeout;
     }
 
     public async Task ShowAsync(
@@ -180,11 +185,12 @@ public sealed class BaiduAcceptanceProbePresenter : IBaiduAcceptanceProbePresent
             window.Show();
         }, cancellationToken).ConfigureAwait(false);
         var shownWindow = window ?? throw new InvalidOperationException("现场验收窗口未创建。");
+        var eventualClose = shownWindow.WaitForClosedAsync();
         ExceptionDispatchInfo? completionFailure = null;
         try
         {
             await shownWindow.WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
-            await shownWindow.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
+            await eventualClose.WaitAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
         catch (Exception exception)
@@ -192,21 +198,22 @@ public sealed class BaiduAcceptanceProbePresenter : IBaiduAcceptanceProbePresent
             completionFailure = ExceptionDispatchInfo.Capture(exception);
         }
 
-        try { shownWindow.RequestClose(); }
+        using var closeRequest = new CancellationTokenSource(BaiduAcceptanceProbeTeardownTiming.CloseRequestTimeout);
+        try { await shownWindow.RequestCloseAsync(closeRequest.Token).ConfigureAwait(false); }
         catch (Exception) { }
 
         using var cleanupWait = new CancellationTokenSource(closeTimeout);
         try
         {
-            await shownWindow.WaitForClosedAsync(cleanupWait.Token).ConfigureAwait(false);
+            await eventualClose.WaitAsync(cleanupWait.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cleanupWait.IsCancellationRequested)
         {
-            throw new BaiduAcceptanceProbeTeardownDeferredException(completionFailure.SourceException);
+            throw new BaiduAcceptanceProbeTeardownDeferredException(eventualClose, completionFailure.SourceException);
         }
         catch (Exception)
         {
-            throw new BaiduAcceptanceProbeTeardownDeferredException(completionFailure.SourceException);
+            throw new BaiduAcceptanceProbeTeardownDeferredException(eventualClose, completionFailure.SourceException);
         }
 
         completionFailure.Throw();

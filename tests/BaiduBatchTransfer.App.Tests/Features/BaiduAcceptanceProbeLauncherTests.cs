@@ -136,9 +136,10 @@ public sealed class BaiduAcceptanceProbeLauncherTests
 
         await window.InitializationStarted.Task;
         cancellation.Cancel();
-        await Task.Yield();
+        await window.CloseRequestStarted.Task;
         Assert.False(launch.IsCompleted);
         Assert.False(profiles.LeaseDisposed);
+        Assert.True(window.CloseRequested);
 
         window.Close();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => launch);
@@ -158,10 +159,32 @@ public sealed class BaiduAcceptanceProbeLauncherTests
 
         await window.InitializationStarted.Task;
         cancellation.Cancel();
+        await window.CloseRequestStarted.Task;
+        Assert.True(window.CloseRequested);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => launch);
         Assert.False(profiles.LeaseDisposed);
         Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Deferred, profiles.Lease!.CleanupOutcome);
+    }
+
+    [Fact]
+    public async Task DeferredTeardownRetainsTheProfileLeaseUntilTheWindowEventuallyCloses()
+    {
+        var window = new DeferredCloseFailingProbeWindow();
+        var profiles = new RecordingProfilePathPolicy();
+        var presenter = new BaiduAcceptanceProbePresenter(
+            new InlineProbeDispatcher(), new DeferredCloseFactory(window), TimeSpan.FromMilliseconds(10));
+        var launcher = Launcher([Account()], presenter, profiles: profiles);
+
+        var result = await launcher.OpenAsync(EnabledOptions());
+
+        Assert.False(result.Started);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Deferred, result.CleanupOutcome);
+        Assert.False(profiles.LeaseDisposed);
+
+        window.Close();
+        await Task.Delay(50);
+        Assert.True(profiles.LeaseDisposed);
     }
 
     private static BaiduAcceptanceProbeLaunchOptions EnabledOptions() =>
@@ -173,7 +196,8 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         IBaiduAcceptanceProbeOutputStore? outputStore = null,
         IBaiduAcceptanceProbeProfilePathPolicy? profiles = null) =>
         new(new FakeUnitOfWorkFactory(accounts), new BaiduAcceptanceProbeAccountSelector(),
-            profiles ?? new RecordingProfilePathPolicy(), outputStore ?? new AvailableOutputStore(), presenter);
+            profiles ?? new RecordingProfilePathPolicy(), outputStore ?? new AvailableOutputStore(), presenter,
+            new BaiduAcceptanceProbeDeferredCleanupRegistry());
 
     private static AccountRecord Account() => new(
         Guid.NewGuid(), "private-user", "private-name", [1], "C:\\safe\\profile", "WebView2", "Active",
@@ -247,7 +271,7 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         public bool WasShown { get; private set; }
         public void Show() => WasShown = true;
-        public void RequestClose() { }
+        public Task RequestCloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("private initialization failure"));
         public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
@@ -262,7 +286,7 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public void Show() { }
-        public void RequestClose() { }
+        public Task RequestCloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("private initialization failure"));
         public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => closed.Task;
@@ -274,12 +298,40 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) => window;
     }
 
+    private sealed class DeferredCloseFactory(DeferredCloseFailingProbeWindow window) : IBaiduAcceptanceProbeWindowFactory
+    {
+        public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) => window;
+    }
+
+    private sealed class DeferredCloseFailingProbeWindow : IBaiduAcceptanceProbeWindow
+    {
+        private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void Show() { }
+        public bool CloseRequested { get; private set; }
+        public Task RequestCloseAsync(CancellationToken cancellationToken = default)
+        {
+            CloseRequested = true;
+            return Task.CompletedTask;
+        }
+        public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
+            Task.FromException(new InvalidOperationException("private initialization failure"));
+        public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => closed.Task.WaitAsync(cancellationToken);
+        public void Close() => closed.TrySetResult();
+    }
+
     private sealed class CancellationPendingProbeWindow : IBaiduAcceptanceProbeWindow
     {
         private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource InitializationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CloseRequestStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public void Show() { }
-        public void RequestClose() { }
+        public bool CloseRequested { get; private set; }
+        public Task RequestCloseAsync(CancellationToken cancellationToken = default)
+        {
+            CloseRequested = true;
+            CloseRequestStarted.TrySetResult();
+            return Task.CompletedTask;
+        }
         public async Task WaitForInitializationAsync(CancellationToken cancellationToken = default)
         {
             InitializationStarted.TrySetResult();

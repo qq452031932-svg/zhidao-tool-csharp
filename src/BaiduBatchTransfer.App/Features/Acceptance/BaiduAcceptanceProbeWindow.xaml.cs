@@ -291,7 +291,11 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
         initialization.Task.WaitAsync(cancellationToken);
 
-    public void RequestClose() => Dispatcher.Invoke(() => { allowClose = true; Close(); });
+    public async Task RequestCloseAsync(CancellationToken cancellationToken = default)
+    {
+        var close = Dispatcher.InvokeAsync(() => { allowClose = true; Close(); }).Task;
+        await close.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     public Task WaitForClosedAsync(CancellationToken cancellationToken = default) =>
         closed.Task.WaitAsync(cancellationToken);
@@ -309,9 +313,9 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
         try
         {
             UnsubscribeNetworkObservation();
-            await observations.StopAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
+            await observations.StopAsync(BaiduAcceptanceProbeTeardownTiming.ObservationStopTimeout).ConfigureAwait(true);
             var lifecycle = new BaiduAcceptanceProbeBrowserLifecycle(
-                browserProcessId ?? uint.MaxValue, () => Browser.Dispose(), TimeSpan.FromSeconds(5));
+                browserProcessId ?? uint.MaxValue, () => Browser.Dispose(), BaiduAcceptanceProbeTeardownTiming.BrowserExitTimeout);
             if (environment is not null)
             {
                 exited = (_, eventArgs) =>
