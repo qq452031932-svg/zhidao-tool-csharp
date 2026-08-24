@@ -23,19 +23,32 @@ public sealed class WebView2ProfileCloser : IWebViewProfileCloser
     public async Task CloseAsync(Guid accountId, CancellationToken cancellationToken)
     {
         Registration? registration;
+        Task close;
         lock (gate)
         {
-            if (!registrations.Remove(accountId, out registration)) return;
-            registration.Detach();
+            if (!registrations.TryGetValue(accountId, out registration)) return;
+            close = registration.BeginClose(cancellationToken);
         }
-        await registration.CloseAsync(cancellationToken).ConfigureAwait(false);
+        try { await close.ConfigureAwait(false); }
+        finally { CompleteClose(registration); }
     }
 
     private void Unregister(Registration registration)
     {
         lock (gate)
+            if (!registration.IsClosing &&
+                registrations.GetValueOrDefault(registration.AccountId) == registration)
+                registrations.Remove(registration.AccountId);
+    }
+
+    private void CompleteClose(Registration registration)
+    {
+        lock (gate)
+        {
             if (registrations.GetValueOrDefault(registration.AccountId) == registration)
                 registrations.Remove(registration.AccountId);
+            registration.Detach();
+        }
     }
 
     private sealed class Registration(
@@ -44,8 +57,11 @@ public sealed class WebView2ProfileCloser : IWebViewProfileCloser
         Func<CancellationToken, Task> closeAsync) : IDisposable
     {
         private WebView2ProfileCloser? owner = owner;
+        private Task? closeTask;
         public Guid AccountId { get; } = accountId;
-        public Task CloseAsync(CancellationToken cancellationToken) => closeAsync(cancellationToken);
+        public bool IsClosing => closeTask is not null;
+        public Task BeginClose(CancellationToken cancellationToken) =>
+            closeTask ??= closeAsync(cancellationToken);
         public void Detach() => Interlocked.Exchange(ref owner, null);
         public void Dispose() => Interlocked.Exchange(ref owner, null)?.Unregister(this);
     }

@@ -252,27 +252,31 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                 }
                 else
                 {
-                    var interrupted = await context.InterruptAsync(CancellationToken.None).ConfigureAwait(false);
-                    if (session.UserClosed.IsCancellationRequested || profileCloseRequested.IsCancellationRequested)
+                    if (session.UserClosed.IsCancellationRequested)
                     {
+                        var interrupted = await context.InterruptAsync(CancellationToken.None).ConfigureAwait(false);
                         completion = new(
                             VisibleWebAutomationDisposition.Skipped,
                             default,
                             interrupted.PersistentState);
                     }
-                    else if (sessionTimeout.IsCancellationRequested)
+                    else
                     {
-                        completionException = new TimeoutException(
-                            "可见浏览器操作等待超时，当前项目已安全停止。",
-                            exception);
+                        await context.PersistInterruptionAsync(CancellationToken.None).ConfigureAwait(false);
+                        if (sessionTimeout.IsCancellationRequested)
+                        {
+                            completionException = new TimeoutException(
+                                "可见浏览器操作等待超时，当前项目已安全停止。",
+                                exception);
+                        }
+                        else completionException = exception;
                     }
-                    else completionException = exception;
                 }
             }
             catch (Exception exception)
             {
                 completionException = exception;
-                await context.InterruptAsync(CancellationToken.None).ConfigureAwait(false);
+                await context.PersistInterruptionAsync(CancellationToken.None).ConfigureAwait(false);
             }
         }
         catch (Exception exception)
@@ -521,14 +525,14 @@ public sealed class VisibleWebAutomationContext
         if (!Enum.IsDefined(reason)) throw new ArgumentOutOfRangeException(nameof(reason));
         if (Interlocked.Exchange(ref handoffInProgress, 1) != 0)
             throw new InvalidOperationException("当前操作已经在等待人工处理。");
-        TrackPersistentStage(resumeStage, sanitizedObservationFingerprint);
-        var handoff = await coordinator.EnterAsync(
-            Identity,
-            resumeStage,
-            sanitizedObservationFingerprint,
-            cancellationToken).ConfigureAwait(false);
         try
         {
+            TrackPersistentStage(resumeStage, sanitizedObservationFingerprint);
+            var handoff = await coordinator.EnterAsync(
+                Identity,
+                resumeStage,
+                sanitizedObservationFingerprint,
+                cancellationToken).ConfigureAwait(false);
             await AwaitUserChoiceAsync(handoff, reason, cancellationToken).ConfigureAwait(false);
         }
         finally { Volatile.Write(ref handoffInProgress, 0); }
@@ -568,7 +572,7 @@ public sealed class VisibleWebAutomationContext
                 () => session.WaitForHandoffChoiceAsync(cancellationToken),
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (session.UserClosed.IsCancellationRequested)
         {
             var interrupted = await coordinator.ResolveAsync(
                 Identity,
@@ -605,6 +609,17 @@ public sealed class VisibleWebAutomationContext
             cancellationToken).ConfigureAwait(false);
         if (result.Resolution != UserHandoffResolution.Stale) currentStage = result.PersistentState;
         return result;
+    }
+
+    internal async Task PersistInterruptionAsync(CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref active, 1, 1) == 0) return;
+        var persisted = await coordinator.PersistInterruptionAsync(
+            Identity,
+            currentStage,
+            observationFingerprint,
+            cancellationToken).ConfigureAwait(false);
+        currentStage = persisted;
     }
 
     internal void Deactivate() => Interlocked.Exchange(ref active, 0);

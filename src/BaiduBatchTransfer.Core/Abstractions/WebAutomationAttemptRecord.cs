@@ -167,8 +167,7 @@ public sealed record WebAutomationAttemptRecord
 
     private static bool RequiresBaseline(WebAutomationAttemptState state) => state is
         WebAutomationAttemptState.BaselinePersisted or WebAutomationAttemptState.Submitting or
-        WebAutomationAttemptState.ResultPending or WebAutomationAttemptState.Succeeded or
-        WebAutomationAttemptState.NeedsDecision;
+        WebAutomationAttemptState.ResultPending or WebAutomationAttemptState.Succeeded;
 
     public static bool CanResumeStage(WebAutomationAttemptState state) => state is
         WebAutomationAttemptState.Preparing or WebAutomationAttemptState.BaselinePersisted or

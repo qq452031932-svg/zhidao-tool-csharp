@@ -166,6 +166,35 @@ public sealed class UserHandoffCoordinator
         }
     }
 
+    public async Task<WebAutomationAttemptState> PersistInterruptionAsync(
+        WebAutomationRequestIdentity identity,
+        WebAutomationAttemptState resumeStage,
+        string? observationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        identity.Validate();
+        if (!WebAutomationAttemptRecord.CanResumeStage(resumeStage))
+            throw new ArgumentOutOfRangeException(nameof(resumeStage));
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+
+        var current = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("浏览器操作的持久记录不存在。");
+        if (current.OwnerKind != identity.OwnerKind)
+            throw new InvalidOperationException("浏览器操作的持久记录与当前请求不一致。");
+        if (current.State == WebAutomationAttemptState.UserHandoff &&
+            current.ResumeStage == resumeStage)
+        {
+            return WebAutomationAttemptState.UserHandoff;
+        }
+        if (current.State != resumeStage)
+            throw new InvalidOperationException("浏览器操作阶段已经变化，无法保存安全中断状态。");
+
+        await EnterAsync(identity, resumeStage, observationFingerprint, cancellationToken)
+            .ConfigureAwait(false);
+        return WebAutomationAttemptState.UserHandoff;
+    }
+
     private Task<WebAutomationAttemptRecord?> LoadExactAsync(
         WebAutomationRequestIdentity identity,
         CancellationToken cancellationToken) =>

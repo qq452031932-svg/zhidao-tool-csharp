@@ -22,6 +22,8 @@ public partial class BaiduLoginWindow : Window
     private readonly BaiduLoginAutoCaptureCoordinator captureCoordinator = new();
     private readonly BaiduLoginSettlingGate settlingGate = new(TimeSpan.FromSeconds(3));
     private readonly CancellationTokenSource lifetime = new();
+    private readonly TaskCompletionSource profilePreparationStopped =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly DispatcherTimer pollTimer = new() { Interval = TimeSpan.FromMilliseconds(700) };
     private IDisposable? profileRegistration;
     private AccountProfileOwnership? ownership;
@@ -61,13 +63,18 @@ public partial class BaiduLoginWindow : Window
     {
         try
         {
-            var profilePath = await profileBootstrapper
-                .PrepareAsync(accountId, ownershipToken, lifetime.Token)
-                .ConfigureAwait(true);
+            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
+
+            string profilePath;
+            try
+            {
+                profilePath = await profileBootstrapper
+                    .PrepareAsync(accountId, ownershipToken, lifetime.Token)
+                    .ConfigureAwait(true);
+            }
+            finally { profilePreparationStopped.TrySetResult(); }
             profilePrepared = true;
             lifetime.Token.ThrowIfCancellationRequested();
-
-            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
 
             var environment = await CoreWebView2Environment
                 .CreateAsync(userDataFolder: profilePath)
@@ -219,11 +226,13 @@ public partial class BaiduLoginWindow : Window
     private async Task CloseBrowserAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        lifetime.Cancel();
         await Dispatcher.InvokeAsync(() =>
         {
             pollTimer.Stop();
             Browser.Dispose();
         });
+        await profilePreparationStopped.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private void CloseAfterRegistration()

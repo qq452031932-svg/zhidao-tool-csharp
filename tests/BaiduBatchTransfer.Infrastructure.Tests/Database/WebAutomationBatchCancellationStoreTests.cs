@@ -162,6 +162,82 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task WebPreparingCannotOverrideTransferSubmissionEvidence()
+    {
+        var graph = await CreateTransferGraphAsync(attemptCount: 2);
+        await ExecuteAsync(graph.Factory, """
+            UPDATE TransferOperations
+            SET Status='Submitting',SubmitState='Submitting',ConfirmationDescriptorJson='{}',
+                AdapterRequestId='request-evidence',SubmitStartedAt=$now
+            WHERE Id=$id;
+            """, graph.OperationId, graph.Now);
+        var attempts = new SqliteWebAutomationAttemptStore(graph.Factory);
+        Assert.True(await attempts.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
+        var handoff = await EnterHandoffAsync(
+            attempts, graph, 2, WebAutomationAttemptState.Preparing);
+
+        Assert.Equal(WebAutomationBatchCancellationDisposition.Cancelled,
+            await new SqliteWebAutomationBatchCancellationStore(graph.Factory).CancelAsync(
+                graph.OperationId, graph.BatchId, graph.AccountId, 2,
+                WebAutomationOwnerKind.Transfer, handoff.Revision, handoff.ResumeStage!.Value,
+                graph.Now.AddMinutes(1)));
+
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision,
+            (await attempts.GetAsync(graph.OperationId, graph.AccountId, 2))!.State);
+        Assert.Equal("request-evidence", await ScalarTextAsync(
+            graph.Factory, "SELECT AdapterRequestId FROM TransferOperations WHERE Id=$id;", graph.OperationId));
+    }
+
+    [Fact]
+    public async Task WebPreparingCannotOverrideTransferShareSubmissionEvidence()
+    {
+        var graph = await CreateTransferGraphAsync(attemptCount: 2);
+        var shareOperationId = Guid.NewGuid();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,
+                  FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+                VALUES($batch,1,1,'Random',NULL,'Ask','settings-fp',$now);
+                INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,
+                  PlannedTransferCount,PlannedShareCount,ShareEnabled,CreatedShareOperationCount)
+                VALUES($batch,$account,1,'output',1,1,1,0);
+                INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+                  Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
+                  AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,SubmitStartedAt,CreatedAt,UpdatedAt)
+                SELECT $share,operation.Id,operation.ResourceItemId,operation.BatchJobId,operation.AssignedAccountId,1,
+                  'Submitting','exact-fp','settings-fp',1,'{}','share-request','Unknown',1,1,$now,$now,$now
+                FROM TransferOperations operation WHERE operation.Id=$transfer;
+                """;
+            command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$share", shareOperationId.ToString("D"));
+            command.Parameters.AddWithValue("$transfer", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+            await command.ExecuteNonQueryAsync();
+        }
+        var attempts = new SqliteWebAutomationAttemptStore(graph.Factory);
+        Assert.True(await attempts.BeginAsync(WebAutomationAttemptRecord.Create(
+            shareOperationId, graph.AccountId, 1, WebAutomationOwnerKind.TransferShare, graph.Now)));
+        var shareGraph = graph with { OperationId = shareOperationId };
+        var handoff = await EnterHandoffAsync(
+            attempts, shareGraph, 1, WebAutomationAttemptState.Preparing);
+
+        Assert.Equal(WebAutomationBatchCancellationDisposition.Cancelled,
+            await new SqliteWebAutomationBatchCancellationStore(graph.Factory).CancelAsync(
+                shareOperationId, graph.BatchId, graph.AccountId, 1,
+                WebAutomationOwnerKind.TransferShare, handoff.Revision, handoff.ResumeStage!.Value,
+                graph.Now.AddMinutes(1)));
+
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision,
+            (await attempts.GetAsync(shareOperationId, graph.AccountId, 1))!.State);
+        Assert.Equal("share-request", await ScalarTextAsync(
+            graph.Factory, "SELECT AdapterRequestId FROM ShareOperations WHERE Id=$id;", shareOperationId));
+    }
+
+    [Fact]
     public async Task StandaloneCancellationStopsOnlyDefinitelyUnsubmittedWork()
     {
         var graph = await CreateStandaloneGraphAsync();
@@ -222,6 +298,34 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
             (await attempts.GetAsync(graph.OperationId, graph.AccountId, 1))!.State);
     }
 
+    [Fact]
+    public async Task WebPreparingCannotOverrideStandaloneResultEvidence()
+    {
+        var graph = await CreateStandaloneGraphAsync();
+        await ExecuteAsync(graph.Factory, """
+            UPDATE StandaloneShareOperations
+            SET Status='ResultPending',SubmissionState='ResultPending',
+                BaselineFingerprint='baseline-evidence',BaselineShareCount=1,BaselineCompletedAt=$now
+            WHERE Id=$id;
+            """, graph.OperationId, graph.Now);
+        var attempts = new SqliteWebAutomationAttemptStore(graph.Factory);
+        Assert.True(await attempts.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.StandaloneShare, graph.Now)));
+        var handoff = await EnterHandoffAsync(
+            attempts, graph, 1, WebAutomationAttemptState.Preparing);
+
+        Assert.Equal(WebAutomationBatchCancellationDisposition.Cancelled,
+            await new SqliteWebAutomationBatchCancellationStore(graph.Factory).CancelAsync(
+                graph.OperationId, graph.BatchId, graph.AccountId, 1,
+                WebAutomationOwnerKind.StandaloneShare, handoff.Revision, handoff.ResumeStage!.Value,
+                graph.Now.AddMinutes(1)));
+
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision,
+            (await attempts.GetAsync(graph.OperationId, graph.AccountId, 1))!.State);
+        Assert.Equal("ResultPending", await ScalarTextAsync(
+            graph.Factory, "SELECT Status FROM StandaloneShareOperations WHERE Id=$id;", graph.OperationId));
+    }
+
     private async Task<Graph> CreateTransferGraphAsync(int attemptCount)
     {
         Directory.CreateDirectory(root);
@@ -250,7 +354,7 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
               NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
               OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
             VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Automatic','Preparing',$attempt,
-              'transfer-fp','PreparingToSubmit','Reserved',$now,$now);
+              'transfer-fp','NotPrepared','Reserved',$now,$now);
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
@@ -285,7 +389,7 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
               ParentPath,ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
               LeaseGeneration,Revision,CreatedAt,UpdatedAt)
             VALUES($operation,$batch,$account,1,'item','File','/','exact-fp',1,'Preparing',
-              'Prepared','Unknown',1,0,$now,$now);
+              'NotStarted','Unknown',1,0,$now,$now);
             INSERT INTO StandaloneShareRemoteItems(OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
             VALUES($operation,0,'remote-id',X'01','item');
             """;

@@ -79,6 +79,60 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task HandoffEnterFailureResetsGuardSoSameContextCanRetry()
+    {
+        await using var fixture = CreateFixture();
+        fixture.Store.FailNextAdvance = true;
+        var completion = fixture.Queue.EnqueueAsync(fixture.Request(async (_, context, token) =>
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => context.RequestUserHandoffAsync(
+                WebAutomationAttemptState.Preparing,
+                WebAutomationHandoffReason.Verification,
+                fixture.Fingerprint,
+                token));
+            await context.RequestUserHandoffAsync(
+                WebAutomationAttemptState.Preparing,
+                WebAutomationHandoffReason.Verification,
+                fixture.Fingerprint,
+                token);
+            return 1;
+        }));
+        var session = await fixture.Factory.WaitForSessionAsync(0);
+        await session.HandoffShown.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        session.Decide(WebAutomationUserChoice.Resume);
+
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, (await completion).Disposition);
+    }
+
+    [Fact]
+    public async Task HandoffEnterStoreExceptionResetsGuardSoSameContextCanRetry()
+    {
+        await using var fixture = CreateFixture();
+        fixture.Store.ThrowNextAdvance = true;
+        var completion = fixture.Queue.EnqueueAsync(fixture.Request(async (_, context, token) =>
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => context.RequestUserHandoffAsync(
+                WebAutomationAttemptState.Preparing,
+                WebAutomationHandoffReason.Verification,
+                fixture.Fingerprint,
+                token));
+            await context.RequestUserHandoffAsync(
+                WebAutomationAttemptState.Preparing,
+                WebAutomationHandoffReason.Verification,
+                fixture.Fingerprint,
+                token);
+            return 1;
+        }));
+        var session = await fixture.Factory.WaitForSessionAsync(0);
+        await session.HandoffShown.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        session.Decide(WebAutomationUserChoice.Resume);
+
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, (await completion).Disposition);
+    }
+
+    [Fact]
     public async Task ExistingTerminalGenerationCannotRunTheCallbackAgain()
     {
         await using var fixture = CreateFixture();
@@ -351,17 +405,23 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     public async Task ProfileCloseRequestCancelsActiveCallbackBeforeLeaseIsReleased()
     {
         await using var fixture = CreateFixture();
-        var active = fixture.Queue.EnqueueAsync(fixture.Request(async (_, _, token) =>
+        var request = fixture.Request(async (_, _, token) =>
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, token);
             return 1;
-        }));
+        });
+        var active = fixture.Queue.EnqueueAsync(request);
         var session = await fixture.Factory.WaitForSessionAsync(0);
 
         await fixture.ProfileCloser.CloseAsync(fixture.DefaultAccount, CancellationToken.None);
-        var result = await active.WaitAsync(TimeSpan.FromSeconds(2));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            active.WaitAsync(TimeSpan.FromSeconds(2)));
 
-        Assert.Equal(VisibleWebAutomationDisposition.Skipped, result.Disposition);
+        Assert.Equal(WebAutomationAttemptState.UserHandoff,
+            (await fixture.Store.GetAsync(
+                request.Identity.OperationId,
+                request.Identity.AccountId,
+                request.Identity.Generation))!.State);
         Assert.True(session.CloseCalls > 0);
     }
 
@@ -394,11 +454,17 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     public async Task HandlerExceptionClosesWindowAndDoesNotBlockFollowingItem()
     {
         await using var fixture = CreateFixture();
-        var failed = fixture.Queue.EnqueueAsync(fixture.Request<int>((_, _, _) =>
-            throw new InvalidOperationException("synthetic failure")));
+        var request = fixture.Request<int>((_, _, _) =>
+            throw new InvalidOperationException("synthetic failure"));
+        var failed = fixture.Queue.EnqueueAsync(request);
         var next = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => Task.FromResult(2)));
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => failed);
+        Assert.Equal(WebAutomationAttemptState.UserHandoff,
+            (await fixture.Store.GetAsync(
+                request.Identity.OperationId,
+                request.Identity.AccountId,
+                request.Identity.Generation))!.State);
         Assert.Equal(2, (await next).Value);
         Assert.All(fixture.Factory.Sessions, session => Assert.True(session.CloseCalls > 0));
     }
@@ -409,11 +475,17 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         await using var fixture = CreateFixture(actionStopTimeout: TimeSpan.FromMilliseconds(30));
         var late = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var cancellation = new CancellationTokenSource();
-        var active = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => late.Task), cancellation.Token);
+        var request = fixture.Request((_, _, _) => late.Task);
+        var active = fixture.Queue.EnqueueAsync(request, cancellation.Token);
         var session = await fixture.Factory.WaitForSessionAsync(0);
 
         cancellation.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => active);
+        Assert.Equal(WebAutomationAttemptState.UserHandoff,
+            (await fixture.Store.GetAsync(
+                request.Identity.OperationId,
+                request.Identity.AccountId,
+                request.Identity.Generation))!.State);
         Assert.True(session.CloseCalls > 0);
         late.SetException(new InvalidOperationException("late synthetic fault"));
         await Task.Delay(50);
@@ -424,11 +496,17 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     {
         await using var fixture = CreateFixture(sessionTimeout: TimeSpan.FromMilliseconds(40));
         var never = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var timedOut = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => never.Task));
+        var request = fixture.Request((_, _, _) => never.Task);
+        var timedOut = fixture.Queue.EnqueueAsync(request);
         var next = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => Task.FromResult(2)));
         var session = await fixture.Factory.WaitForSessionAsync(0);
 
         await Assert.ThrowsAsync<TimeoutException>(() => timedOut);
+        Assert.Equal(WebAutomationAttemptState.UserHandoff,
+            (await fixture.Store.GetAsync(
+                request.Identity.OperationId,
+                request.Identity.AccountId,
+                request.Identity.Generation))!.State);
         Assert.True(session.CloseCalls > 0);
         Assert.Equal(2, (await next).Value);
         Assert.Equal(1, fixture.Factory.MaximumConcurrentSessions);
@@ -486,7 +564,8 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     {
         var fixture = CreateFixture();
         var never = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var active = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => never.Task));
+        var request = fixture.Request((_, _, _) => never.Task);
+        var active = fixture.Queue.EnqueueAsync(request);
         var pending = fixture.Queue.EnqueueAsync(fixture.Request((_, _, _) => Task.FromResult(2)));
         var session = await fixture.Factory.WaitForSessionAsync(0);
 
@@ -494,6 +573,11 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => active);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+        Assert.Equal(WebAutomationAttemptState.UserHandoff,
+            (await fixture.Store.GetAsync(
+                request.Identity.OperationId,
+                request.Identity.AccountId,
+                request.Identity.Generation))!.State);
         Assert.True(session.CloseCalls > 0);
         Assert.Equal(1, fixture.Factory.CreatedCount);
     }
@@ -544,17 +628,21 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
-    public void LoginAcquiresTheSharedProfileLeaseBeforeCreatingWebViewEnvironment()
+    public void LoginAcquiresTheSharedProfileLeaseBeforePreparingOrCreatingWebViewEnvironment()
     {
         var source = File.ReadAllText(Path.Combine(
             FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Accounts",
             "BaiduLoginWindow.xaml.cs"));
 
         var lease = source.IndexOf("profileCloser.Register", StringComparison.Ordinal);
+        var prepare = source.IndexOf(".PrepareAsync", StringComparison.Ordinal);
         var environment = source.IndexOf("CoreWebView2Environment", StringComparison.Ordinal);
         Assert.True(lease >= 0);
+        Assert.True(prepare >= 0);
         Assert.True(environment >= 0);
+        Assert.True(lease < prepare, "账号登录必须先独占 profile，再准备目录。");
         Assert.True(lease < environment, "账号登录必须先独占 profile，再创建 WebView2 环境。");
+        Assert.Contains("profilePreparationStopped.Task.WaitAsync", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -668,13 +756,14 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             Guid? accountId = null)
         {
             var account = accountId ?? DefaultAccount;
-            return new(
-                new WebAutomationRequestIdentity(
+            var identity = new WebAutomationRequestIdentity(
                     Guid.NewGuid(),
                     Guid.NewGuid(),
                     account,
                     Interlocked.Increment(ref sequence),
-                    WebAutomationOwnerKind.Transfer),
+                    WebAutomationOwnerKind.Transfer);
+            return new(
+                identity,
                 PathPolicy.GetAccountProfilePath(account),
                 Navigation(new Uri("https://pan.baidu.com/disk/main")),
                 action);
@@ -910,6 +999,8 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     {
         private readonly Dictionary<(Guid, Guid, int), WebAutomationAttemptRecord> records = [];
         private readonly object gate = new();
+        public bool FailNextAdvance { get; set; }
+        public bool ThrowNextAdvance { get; set; }
 
         public void Seed(WebAutomationAttemptRecord record)
         {
@@ -933,6 +1024,16 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         {
             lock (gate)
             {
+                if (ThrowNextAdvance)
+                {
+                    ThrowNextAdvance = false;
+                    throw new InvalidOperationException("synthetic store failure");
+                }
+                if (FailNextAdvance)
+                {
+                    FailNextAdvance = false;
+                    return Task.FromResult(false);
+                }
                 var key = (operationId, accountId, generation);
                 if (!records.TryGetValue(key, out var current) || current.State != expectedState || current.Revision != expectedRevision)
                     return Task.FromResult(false);

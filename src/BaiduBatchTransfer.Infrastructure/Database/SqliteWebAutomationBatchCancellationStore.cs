@@ -235,7 +235,7 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
               AND SubmissionState IN ('NotStarted','Prepared','DefinitelyNotAccepted');
             """, batchId, updated, cancellationToken);
 
-    private static Task ResolveAttemptsAsync(
+    private static async Task ResolveAttemptsAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         Guid batchId,
@@ -243,30 +243,88 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
         string updated,
         CancellationToken cancellationToken)
     {
-        var ownership = ownerKind switch
+        if (ownerKind is WebAutomationOwnerKind.Transfer or WebAutomationOwnerKind.TransferShare)
         {
-            WebAutomationOwnerKind.Transfer or WebAutomationOwnerKind.TransferShare => """
-                (attempt.OwnerKind='Transfer' AND EXISTS(
-                    SELECT 1 FROM TransferOperations operation
-                    WHERE operation.Id=attempt.OperationId AND operation.BatchJobId=$batch))
-                OR (attempt.OwnerKind='TransferShare' AND EXISTS(
-                    SELECT 1 FROM ShareOperations operation
-                    WHERE operation.Id=attempt.OperationId AND operation.BatchJobId=$batch))
-                """,
-            WebAutomationOwnerKind.StandaloneShare => "attempt.OwnerKind='StandaloneShare' AND EXISTS(SELECT 1 FROM StandaloneShareOperations operation WHERE operation.Id=attempt.OperationId AND operation.BatchId=$batch)",
-            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
-        };
-        return ExecuteAsync(connection, transaction, $"""
+            await ExecuteAsync(connection, transaction, """
+                UPDATE WebAutomationAttempts AS attempt
+                SET State=CASE WHEN
+                      (attempt.State IN ('Preparing','BaselinePersisted')
+                        OR (attempt.State='UserHandoff' AND attempt.ResumeStage IN ('Preparing','BaselinePersisted')))
+                      AND EXISTS(
+                        SELECT 1 FROM TransferOperations operation
+                        WHERE operation.Id=attempt.OperationId AND operation.BatchJobId=$batch
+                          AND operation.AssignedAccountId=attempt.AccountId
+                          AND operation.AttemptCount=attempt.Generation
+                          AND operation.Status IN ('Waiting','Reserved','Preparing','Cancelled')
+                          AND operation.SubmitState='NotPrepared'
+                          AND operation.ConfirmationDescriptorJson IS NULL
+                          AND operation.AdapterRequestId IS NULL
+                          AND operation.RemoteItemIdsJson IS NULL
+                          AND operation.SubmitStartedAt IS NULL
+                          AND operation.DailyCountedAt IS NULL)
+                    THEN 'DefinitelyNotSubmitted' ELSE 'NeedsDecision' END,
+                    ResumeStage=NULL,IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
+                WHERE attempt.OwnerKind='Transfer'
+                  AND EXISTS(SELECT 1 FROM TransferOperations owner
+                    WHERE owner.Id=attempt.OperationId AND owner.BatchJobId=$batch)
+                  AND attempt.State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff');
+                """, batchId, updated, cancellationToken).ConfigureAwait(false);
+            await ExecuteAsync(connection, transaction, """
+                UPDATE WebAutomationAttempts AS attempt
+                SET State=CASE WHEN
+                      (attempt.State IN ('Preparing','BaselinePersisted')
+                        OR (attempt.State='UserHandoff' AND attempt.ResumeStage IN ('Preparing','BaselinePersisted')))
+                      AND EXISTS(
+                        SELECT 1 FROM ShareOperations operation
+                        WHERE operation.Id=attempt.OperationId AND operation.BatchJobId=$batch
+                          AND operation.AccountId=attempt.AccountId
+                          AND operation.Generation=attempt.Generation
+                          AND operation.Status IN ('WaitingTransfer','WaitingShare','Reserved','Preparing','Cancelled')
+                          AND operation.RequestDescriptorJson IS NULL
+                          AND operation.AdapterRequestId IS NULL
+                          AND operation.SubmitStartedAt IS NULL
+                          AND operation.BaselineGeneration IS NULL
+                          AND operation.BaselineFingerprint IS NULL
+                          AND operation.BaselineCompletedAt IS NULL
+                          AND operation.BaselineShareCount=0
+                          AND operation.AttemptCount=0
+                          AND NOT EXISTS(SELECT 1 FROM BaiduShareResults result
+                            WHERE result.ShareOperationId=operation.Id))
+                    THEN 'DefinitelyNotSubmitted' ELSE 'NeedsDecision' END,
+                    ResumeStage=NULL,IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
+                WHERE attempt.OwnerKind='TransferShare'
+                  AND EXISTS(SELECT 1 FROM ShareOperations owner
+                    WHERE owner.Id=attempt.OperationId AND owner.BatchJobId=$batch)
+                  AND attempt.State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff');
+                """, batchId, updated, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        if (ownerKind != WebAutomationOwnerKind.StandaloneShare)
+            throw new ArgumentOutOfRangeException(nameof(ownerKind));
+        await ExecuteAsync(connection, transaction, """
             UPDATE WebAutomationAttempts AS attempt
-            SET State=CASE
-                  WHEN State IN ('Submitting','ResultPending')
-                    OR (State='UserHandoff' AND ResumeStage IN ('Submitting','ResultPending'))
-                    THEN 'NeedsDecision'
-                  ELSE 'DefinitelyNotSubmitted' END,
+            SET State=CASE WHEN
+                  (attempt.State IN ('Preparing','BaselinePersisted')
+                    OR (attempt.State='UserHandoff' AND attempt.ResumeStage IN ('Preparing','BaselinePersisted')))
+                  AND EXISTS(
+                    SELECT 1 FROM StandaloneShareOperations operation
+                    WHERE operation.Id=attempt.OperationId AND operation.BatchId=$batch
+                      AND operation.AccountId=attempt.AccountId
+                      AND operation.Generation=attempt.Generation
+                      AND operation.Status IN ('Queued','Reserved','Preparing','Cancelled')
+                      AND operation.SubmissionState='NotStarted'
+                      AND operation.BaselineFingerprint IS NULL
+                      AND operation.BaselineShareCount IS NULL
+                      AND operation.BaselineCompletedAt IS NULL
+                      AND NOT EXISTS(SELECT 1 FROM StandaloneShareResults result
+                        WHERE result.OperationId=operation.Id AND result.Generation=operation.Generation))
+                THEN 'DefinitelyNotSubmitted' ELSE 'NeedsDecision' END,
                 ResumeStage=NULL,IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
-            WHERE ({ownership})
-              AND State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff');
-            """, batchId, updated, cancellationToken);
+            WHERE attempt.OwnerKind='StandaloneShare'
+              AND EXISTS(SELECT 1 FROM StandaloneShareOperations owner
+                WHERE owner.Id=attempt.OperationId AND owner.BatchId=$batch)
+              AND attempt.State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff');
+            """, batchId, updated, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ExecuteAsync(

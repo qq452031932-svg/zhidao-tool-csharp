@@ -45,6 +45,76 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
         Assert.Equal(1, closeCount);
     }
 
+    [Fact]
+    public async Task ClosingProfileKeepsLeaseUntilCloseCallbackCompletes()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = closer.Register(accountId, async _ =>
+        {
+            entered.TrySetResult();
+            await release.Task;
+        });
+
+        var closing = closer.CloseAsync(accountId, CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Throws<InvalidOperationException>(() => closer.Register(accountId, _ => Task.CompletedTask));
+        release.TrySetResult();
+        await closing;
+        using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
+    }
+
+    [Fact]
+    public async Task DuplicateCloseAwaitsTheSameCallbackExactlyOnce()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var closeCount = 0;
+        using var registration = closer.Register(accountId, async _ =>
+        {
+            Interlocked.Increment(ref closeCount);
+            entered.TrySetResult();
+            await release.Task;
+        });
+
+        var first = closer.CloseAsync(accountId, CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var duplicate = closer.CloseAsync(accountId, CancellationToken.None);
+        Assert.False(duplicate.IsCompleted);
+
+        release.TrySetResult();
+        await Task.WhenAll(first, duplicate);
+        Assert.Equal(1, closeCount);
+    }
+
+    [Fact]
+    public async Task FailedCloseStillFencesReopenUntilCallbackHasFinishedThenCleansUp()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = closer.Register(accountId, async _ =>
+        {
+            entered.TrySetResult();
+            await release.Task;
+            throw new InvalidOperationException("synthetic close failure");
+        });
+
+        var closing = closer.CloseAsync(accountId, CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Throws<InvalidOperationException>(() => closer.Register(accountId, _ => Task.CompletedTask));
+
+        release.TrySetResult();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => closing);
+        using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);
