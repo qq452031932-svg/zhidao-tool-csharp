@@ -38,8 +38,10 @@ public partial class App : System.Windows.Application
             {
                 var probe = await host.Services.GetRequiredService<IBaiduAcceptanceProbeLauncher>()
                     .OpenAsync(probeOptions).ConfigureAwait(true);
-                if (!probe.Started || probe.SafeMessage == BaiduAcceptanceProbeResultCodes.CleanupDeferred)
+                if (!probe.Started)
                     MessageBox.Show(probe.SafeMessage, "百度现场验收", MessageBoxButton.OK, MessageBoxImage.Information);
+                else if (probe.CleanupOutcome == BaiduAcceptanceProbeCleanupOutcome.Deferred)
+                    MessageBox.Show("验收窗口已关闭，但隔离浏览器目录尚待清理。", "百度现场验收", MessageBoxButton.OK, MessageBoxImage.Information);
             }
 #endif
         }

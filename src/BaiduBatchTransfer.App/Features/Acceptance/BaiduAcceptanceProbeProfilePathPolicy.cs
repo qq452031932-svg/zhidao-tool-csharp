@@ -7,22 +7,27 @@ public interface IBaiduAcceptanceProbeProfilePathPolicy
     BaiduAcceptanceProbeProfileLease Create(Guid accountId);
 }
 
-public enum BaiduAcceptanceProbeCleanupOutcome { Cleaned, Deferred }
+public enum BaiduAcceptanceProbeCleanupOutcome { NotRequired, Completed, Deferred }
 
 public sealed class BaiduAcceptanceProbeProfileLease(string profilePath, Func<Task<BaiduAcceptanceProbeCleanupOutcome>> release) : IAsyncDisposable
 {
     private Func<Task<BaiduAcceptanceProbeCleanupOutcome>>? release = release ?? throw new ArgumentNullException(nameof(release));
     public string ProfilePath { get; } = Path.GetFullPath(profilePath);
-    public BaiduAcceptanceProbeCleanupOutcome CleanupOutcome { get; private set; } = BaiduAcceptanceProbeCleanupOutcome.Cleaned;
+    public BaiduAcceptanceProbeCleanupOutcome CleanupOutcome { get; private set; } = BaiduAcceptanceProbeCleanupOutcome.Completed;
 
     public BaiduAcceptanceProbeProfileLease(string profilePath, Action release) : this(
         profilePath,
-        () => { release(); return Task.FromResult(BaiduAcceptanceProbeCleanupOutcome.Cleaned); }) { }
+        () => { release(); return Task.FromResult(BaiduAcceptanceProbeCleanupOutcome.Completed); }) { }
 
     public async ValueTask DisposeAsync()
     {
         var cleanup = Interlocked.Exchange(ref release, null);
         if (cleanup is not null) CleanupOutcome = await cleanup().ConfigureAwait(false);
+    }
+
+    public void MarkCleanupDeferred()
+    {
+        CleanupOutcome = BaiduAcceptanceProbeCleanupOutcome.Deferred;
     }
 }
 
@@ -50,7 +55,7 @@ public sealed class BaiduAcceptanceProbeProfilePathPolicy(string dataRoot) : IBa
             try
             {
                 if (Directory.Exists(profilePath)) Directory.Delete(profilePath, recursive: true);
-                return BaiduAcceptanceProbeCleanupOutcome.Cleaned;
+                return BaiduAcceptanceProbeCleanupOutcome.Completed;
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {

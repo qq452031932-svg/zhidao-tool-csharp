@@ -5,12 +5,9 @@ using BaiduBatchTransfer.Core.Abstractions;
 
 namespace BaiduBatchTransfer.App.Features.Acceptance;
 
-public sealed record BaiduAcceptanceProbeLaunchResult(bool Started, string SafeMessage);
-
-public static class BaiduAcceptanceProbeResultCodes
-{
-    public const string CleanupDeferred = "PROBE_CLEANUP_DEFERRED";
-}
+public sealed record BaiduAcceptanceProbeLaunchResult(
+    bool Started, string SafeMessage,
+    BaiduAcceptanceProbeCleanupOutcome CleanupOutcome = BaiduAcceptanceProbeCleanupOutcome.NotRequired);
 
 public sealed class BaiduAcceptanceProbeLaunchOptions(bool isDebugBuild, IReadOnlyList<string> arguments)
 {
@@ -74,9 +71,7 @@ public sealed class BaiduAcceptanceProbeLauncher(
             selection = accountSelector.Select(page.Items);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
+        { throw; }
         catch (Exception)
         {
             return new(false, "PROBE_ACCOUNT_LOOKUP_FAILED");
@@ -105,9 +100,15 @@ public sealed class BaiduAcceptanceProbeLauncher(
                 selection.AccountId.Value,
                 profileLease.ProfilePath,
                 cancellationToken).ConfigureAwait(false);
-            return await CleanupResultAsync(profileLease).ConfigureAwait(false) == BaiduAcceptanceProbeCleanupOutcome.Cleaned
-                ? new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ")
-                : new(true, BaiduAcceptanceProbeResultCodes.CleanupDeferred);
+            var cleanup = await CleanupResultAsync(profileLease).ConfigureAwait(false);
+            return new(true, "现场验收窗口已关闭。脱敏证据只有在用户明确保存后才会写入本机。 ", cleanup);
+        }
+        catch (BaiduAcceptanceProbeTeardownDeferredException)
+        {
+            profileLease?.MarkCleanupDeferred();
+            if (cancellationToken.IsCancellationRequested)
+                cancellationToken.ThrowIfCancellationRequested();
+            return new(false, "PROBE_PRESENTATION_FAILED", BaiduAcceptanceProbeCleanupOutcome.Deferred);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -137,6 +138,7 @@ public interface IBaiduAcceptanceProbeUiDispatcher
 public interface IBaiduAcceptanceProbeWindow
 {
     void Show();
+    void RequestClose();
     Task WaitForInitializationAsync(CancellationToken cancellationToken = default);
     Task WaitForClosedAsync(CancellationToken cancellationToken = default);
 }
@@ -146,10 +148,25 @@ public interface IBaiduAcceptanceProbeWindowFactory
     IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath);
 }
 
-public sealed class BaiduAcceptanceProbePresenter(
-    IBaiduAcceptanceProbeUiDispatcher dispatcher,
-    IBaiduAcceptanceProbeWindowFactory windowFactory) : IBaiduAcceptanceProbePresenter
+internal sealed class BaiduAcceptanceProbeTeardownDeferredException(Exception? innerException = null)
+    : Exception("The isolated probe browser did not close in time.", innerException);
+
+public sealed class BaiduAcceptanceProbePresenter : IBaiduAcceptanceProbePresenter
 {
+    private readonly IBaiduAcceptanceProbeUiDispatcher dispatcher;
+    private readonly IBaiduAcceptanceProbeWindowFactory windowFactory;
+    private readonly TimeSpan closeTimeout;
+
+    public BaiduAcceptanceProbePresenter(
+        IBaiduAcceptanceProbeUiDispatcher dispatcher,
+        IBaiduAcceptanceProbeWindowFactory windowFactory,
+        TimeSpan? closeTimeout = null)
+    {
+        this.dispatcher = dispatcher;
+        this.windowFactory = windowFactory;
+        this.closeTimeout = closeTimeout ?? TimeSpan.FromSeconds(5);
+    }
+
     public async Task ShowAsync(
         Guid accountId,
         string profilePath,
@@ -163,11 +180,36 @@ public sealed class BaiduAcceptanceProbePresenter(
             window.Show();
         }, cancellationToken).ConfigureAwait(false);
         var shownWindow = window ?? throw new InvalidOperationException("现场验收窗口未创建。");
-        ExceptionDispatchInfo? initializationFailure = null;
-        try { await shownWindow.WaitForInitializationAsync(cancellationToken).ConfigureAwait(false); }
-        catch (Exception exception) { initializationFailure = ExceptionDispatchInfo.Capture(exception); }
-        await shownWindow.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
-        initializationFailure?.Throw();
+        ExceptionDispatchInfo? completionFailure = null;
+        try
+        {
+            await shownWindow.WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
+            await shownWindow.WaitForClosedAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        catch (Exception exception)
+        {
+            completionFailure = ExceptionDispatchInfo.Capture(exception);
+        }
+
+        try { shownWindow.RequestClose(); }
+        catch (Exception) { }
+
+        using var cleanupWait = new CancellationTokenSource(closeTimeout);
+        try
+        {
+            await shownWindow.WaitForClosedAsync(cleanupWait.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cleanupWait.IsCancellationRequested)
+        {
+            throw new BaiduAcceptanceProbeTeardownDeferredException(completionFailure.SourceException);
+        }
+        catch (Exception)
+        {
+            throw new BaiduAcceptanceProbeTeardownDeferredException(completionFailure.SourceException);
+        }
+
+        completionFailure.Throw();
     }
 }
 

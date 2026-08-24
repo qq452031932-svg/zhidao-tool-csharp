@@ -20,6 +20,7 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         Assert.Equal(profiles.IsolatedProfilePath, presenter.ProfilePath);
         Assert.NotEqual(account.WebView2ProfileDirectory, presenter.ProfilePath);
         Assert.True(profiles.LeaseDisposed);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Completed, result.CleanupOutcome);
     }
 
     [Theory]
@@ -61,6 +62,7 @@ public sealed class BaiduAcceptanceProbeLauncherTests
 
         Assert.False(result.Started);
         Assert.Equal("PROBE_PRESENTATION_FAILED", result.SafeMessage);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.NotRequired, result.CleanupOutcome);
         Assert.DoesNotContain("secret", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -119,8 +121,47 @@ public sealed class BaiduAcceptanceProbeLauncherTests
         var result = await launcher.OpenAsync(EnabledOptions());
 
         Assert.True(result.Started);
-        Assert.Equal("PROBE_CLEANUP_DEFERRED", result.SafeMessage);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Deferred, result.CleanupOutcome);
         Assert.NotNull(presenter.AccountId);
+    }
+
+    [Fact]
+    public async Task CancellationWaitsForWindowTeardownBeforeCleaningTheIsolatedProfile()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var window = new CancellationPendingProbeWindow();
+        var profiles = new RecordingProfilePathPolicy();
+        var presenter = new BaiduAcceptanceProbePresenter(new InlineProbeDispatcher(), new CancellationPendingFactory(window));
+        var launch = Launcher([Account()], presenter, profiles: profiles).OpenAsync(EnabledOptions(), cancellation.Token);
+
+        await window.InitializationStarted.Task;
+        cancellation.Cancel();
+        await Task.Yield();
+        Assert.False(launch.IsCompleted);
+        Assert.False(profiles.LeaseDisposed);
+
+        window.Close();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => launch);
+        Assert.True(profiles.LeaseDisposed);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Completed, profiles.Lease!.CleanupOutcome);
+    }
+
+    [Fact]
+    public async Task CancellationWithUnclosedWindowDefersCleanupWithoutHangingOrReportingPresentationFailure()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var window = new CancellationPendingProbeWindow();
+        var profiles = new RecordingProfilePathPolicy();
+        var presenter = new BaiduAcceptanceProbePresenter(
+            new InlineProbeDispatcher(), new CancellationPendingFactory(window), TimeSpan.FromMilliseconds(10));
+        var launch = Launcher([Account()], presenter, profiles: profiles).OpenAsync(EnabledOptions(), cancellation.Token);
+
+        await window.InitializationStarted.Task;
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => launch);
+        Assert.False(profiles.LeaseDisposed);
+        Assert.Equal(BaiduAcceptanceProbeCleanupOutcome.Deferred, profiles.Lease!.CleanupOutcome);
     }
 
     private static BaiduAcceptanceProbeLaunchOptions EnabledOptions() =>
@@ -175,7 +216,8 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         public string IsolatedProfilePath { get; } = Path.Combine(Path.GetTempPath(), "isolated-probe-profile");
         public bool LeaseDisposed { get; private set; }
-        public BaiduAcceptanceProbeProfileLease Create(Guid accountId) =>
+        public BaiduAcceptanceProbeProfileLease? Lease { get; private set; }
+        public BaiduAcceptanceProbeProfileLease Create(Guid accountId) => Lease =
             new(IsolatedProfilePath, () => LeaseDisposed = true);
     }
 
@@ -205,6 +247,7 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         public bool WasShown { get; private set; }
         public void Show() => WasShown = true;
+        public void RequestClose() { }
         public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("private initialization failure"));
         public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
@@ -219,9 +262,30 @@ public sealed class BaiduAcceptanceProbeLauncherTests
     {
         private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public void Show() { }
+        public void RequestClose() { }
         public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
             Task.FromException(new InvalidOperationException("private initialization failure"));
         public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => closed.Task;
+        public void Close() => closed.TrySetResult();
+    }
+
+    private sealed class CancellationPendingFactory(CancellationPendingProbeWindow window) : IBaiduAcceptanceProbeWindowFactory
+    {
+        public IBaiduAcceptanceProbeWindow Create(Guid accountId, string profilePath) => window;
+    }
+
+    private sealed class CancellationPendingProbeWindow : IBaiduAcceptanceProbeWindow
+    {
+        private readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource InitializationStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void Show() { }
+        public void RequestClose() { }
+        public async Task WaitForInitializationAsync(CancellationToken cancellationToken = default)
+        {
+            InitializationStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        public Task WaitForClosedAsync(CancellationToken cancellationToken = default) => closed.Task.WaitAsync(cancellationToken);
         public void Close() => closed.TrySetResult();
     }
 

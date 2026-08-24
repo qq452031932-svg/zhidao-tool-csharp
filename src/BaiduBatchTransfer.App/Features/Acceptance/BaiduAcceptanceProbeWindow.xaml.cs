@@ -291,6 +291,8 @@ public partial class BaiduAcceptanceProbeWindow : Window, IBaiduAcceptanceProbeW
     public Task WaitForInitializationAsync(CancellationToken cancellationToken = default) =>
         initialization.Task.WaitAsync(cancellationToken);
 
+    public void RequestClose() => Dispatcher.Invoke(() => { allowClose = true; Close(); });
+
     public Task WaitForClosedAsync(CancellationToken cancellationToken = default) =>
         closed.Task.WaitAsync(cancellationToken);
 
