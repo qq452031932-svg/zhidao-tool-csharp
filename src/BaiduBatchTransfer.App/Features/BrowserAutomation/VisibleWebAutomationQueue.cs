@@ -186,10 +186,16 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                 queueScope.Token,
                 profileCloseRequested.Token);
             session = await dispatcher.InvokeAsync(
-                () => sessionFactory.CreateAsync(
-                    request.Identity,
-                    request.ProfilePath,
-                    profileScope.Token),
+                () => request.CandidateBinding is { } candidate
+                    ? sessionFactory is IBoundVisibleWebAutomationSessionFactory boundFactory
+                        ? boundFactory.CreateBoundAsync(
+                            request.Identity, request.ProfilePath, candidate, profileScope.Token)
+                        : Task.FromException<IVisibleWebAutomationSession>(
+                            new WebAutomationAuthorizationException(
+                                BaiduAutomationDenialReason.AcceptanceMissing,
+                                "Candidate session factory is unavailable."))
+                    : sessionFactory.CreateAsync(
+                        request.Identity, request.ProfilePath, profileScope.Token),
                 profileScope.Token).ConfigureAwait(false);
             context = new VisibleWebAutomationContext(
                 request.Identity,
@@ -338,6 +344,16 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
         ArgumentException.ThrowIfNullOrWhiteSpace(request.ProfilePath);
         ArgumentNullException.ThrowIfNull(request.Navigation);
         ArgumentNullException.ThrowIfNull(request.Action);
+        if (request.CandidateBinding is { } candidate)
+        {
+            try { candidate.Validate(request.Identity, request.Navigation); }
+            catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+            {
+                throw new WebAutomationAuthorizationException(
+                    BaiduAutomationDenialReason.AcceptanceMissing,
+                    "Candidate binding does not match this exact browser operation.");
+            }
+        }
         profilePathPolicy.EnsureSafeAccountPath(request.Identity.AccountId, request.ProfilePath);
         var expectedPath = profilePathPolicy.GetAccountProfilePath(request.Identity.AccountId);
         if (!string.Equals(request.ProfilePath, expectedPath, StringComparison.OrdinalIgnoreCase))

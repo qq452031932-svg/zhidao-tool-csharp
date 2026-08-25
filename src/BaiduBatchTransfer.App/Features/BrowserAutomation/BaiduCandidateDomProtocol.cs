@@ -106,3 +106,15 @@ public interface IBaiduCandidateActionAuthorizationSource
         BaiduCandidateDomRequest request,
         CancellationToken cancellationToken = default);
 }
+
+public interface IBaiduCandidateDomExecutor
+{
+    Task<BaiduCandidateDomResult> ObserveAsync(
+        BaiduCandidateDomRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<BaiduCandidateDomResult> MutateAsync(
+        BaiduCandidateDomRequest request,
+        BaiduCandidateDomObservation observation,
+        CancellationToken cancellationToken = default);
+}

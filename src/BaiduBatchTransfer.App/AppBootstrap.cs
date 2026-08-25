@@ -196,6 +196,8 @@ public static class AppBootstrap
         services.AddSingleton<AcceptanceWriteLeaseCoordinator>();
         services.AddSingleton<IAdapterWriteAuthorizationGate>(sp =>
             sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
+        services.AddSingleton<IBaiduCandidateActionAuthorizationSource>(sp =>
+            sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
         services.AddSingleton<IAcceptanceOperationEvidenceSink>(sp =>
             sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
         services.AddSingleton<ILocalResultExportObserver>(sp =>

@@ -1,7 +1,9 @@
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Extensions.DependencyInjection;
@@ -788,6 +790,148 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             host.Services.GetRequiredService<IWebAutomationBatchCancellationStore>());
     }
 
+    [Fact]
+    public async Task ExactCandidateBindingIsInjectedIntoFactoryBeforeCallback()
+    {
+        await using var fixture = CreateFixture();
+        var callbackStarted = false;
+        var ordinary = fixture.Request((_, _, _) =>
+        {
+            callbackStarted = true;
+            return Task.FromResult(1);
+        });
+        var identity = ordinary.Identity with { OwnerKind = WebAutomationOwnerKind.StandaloneShare };
+        var capability = new AdapterCapabilityVersion(
+            "BaiduShare", BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.SelectorVersion, "test-build");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability,
+            identity.AccountId,
+            identity.OperationId,
+            identity.Generation,
+            identity.BatchId,
+            AdapterWriteAction.PrepareShare);
+        var binding = new BaiduCandidateSessionBinding(
+            authorization,
+            new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ConsumedLease,
+                capability,
+                authorization.AccountId,
+                authorization.OperationId,
+                authorization.Generation,
+                authorization.BatchId,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddMinutes(5),
+                false,
+                null));
+        var navigation = ordinary.Navigation with
+        {
+            AcceptanceScope = new BaiduAcceptanceOperationScope(
+                capability.AdapterKind,
+                authorization.AccountId,
+                authorization.OperationId,
+                authorization.Generation,
+                authorization.BatchId),
+        };
+        var request = ordinary with
+        {
+            Identity = identity,
+            Navigation = navigation,
+            CandidateBinding = binding,
+        };
+
+        var result = await fixture.Queue.EnqueueAsync(request);
+
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, result.Disposition);
+        Assert.True(callbackStarted);
+        Assert.Same(binding, fixture.Factory.LastCandidateBinding);
+    }
+
+    [Fact]
+    public async Task CrossIdentityCandidateBindingIsRejectedBeforeSessionFactory()
+    {
+        await using var fixture = CreateFixture();
+        var ordinary = fixture.Request((_, _, _) => Task.FromResult(1));
+        var capability = new AdapterCapabilityVersion(
+            "BaiduShare", BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.SelectorVersion, "test-build");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability,
+            ordinary.Identity.AccountId,
+            Guid.NewGuid(),
+            ordinary.Identity.Generation,
+            ordinary.Identity.BatchId,
+            AdapterWriteAction.PrepareShare);
+        var request = ordinary with
+        {
+            CandidateBinding = new BaiduCandidateSessionBinding(
+                authorization,
+                new AdapterWriteAuthorizationBinding(
+                    AdapterWriteAuthorizationSource.ConsumedLease,
+                    capability,
+                    authorization.AccountId,
+                    authorization.OperationId,
+                    authorization.Generation,
+                    authorization.BatchId,
+                    DateTimeOffset.UtcNow,
+                    DateTimeOffset.UtcNow.AddMinutes(5),
+                    false,
+                    null)),
+        };
+
+        await Assert.ThrowsAsync<WebAutomationAuthorizationException>(() =>
+            fixture.Queue.EnqueueAsync(request));
+
+        Assert.Equal(0, fixture.Factory.CreatedCount);
+    }
+
+    [Fact]
+    public async Task ReplacedCandidateBootstrapActionIsRejectedBeforeSessionFactory()
+    {
+        await using var fixture = CreateFixture();
+        var ordinary = fixture.Request((_, _, _) => Task.FromResult(1));
+        var identity = ordinary.Identity with { OwnerKind = WebAutomationOwnerKind.StandaloneShare };
+        var capability = new AdapterCapabilityVersion(
+            "BaiduShare", BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.SelectorVersion, "test-build");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability,
+            identity.AccountId,
+            identity.OperationId,
+            identity.Generation,
+            identity.BatchId,
+            AdapterWriteAction.SubmitShare);
+        var binding = new BaiduCandidateSessionBinding(
+            authorization,
+            new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ConsumedLease,
+                capability,
+                authorization.AccountId,
+                authorization.OperationId,
+                authorization.Generation,
+                authorization.BatchId,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddMinutes(5),
+                false,
+                null));
+        var request = ordinary with
+        {
+            Identity = identity,
+            Navigation = ordinary.Navigation with
+            {
+                AcceptanceScope = new BaiduAcceptanceOperationScope(
+                    capability.AdapterKind,
+                    authorization.AccountId,
+                    authorization.OperationId,
+                    authorization.Generation,
+                    authorization.BatchId),
+            },
+            CandidateBinding = binding,
+        };
+
+        await Assert.ThrowsAsync<WebAutomationAuthorizationException>(() =>
+            fixture.Queue.EnqueueAsync(request));
+
+        Assert.Equal(0, fixture.Factory.CreatedCount);
+    }
+
     private QueueFixture CreateFixture(
         IWebAutomationNavigationAuthorizer? authorizer = null,
         TimeSpan? actionStopTimeout = null,
@@ -952,7 +1096,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     private sealed class RecordingSessionFactory(RecordingDispatcher dispatcher)
-        : IVisibleWebAutomationSessionFactory
+        : IBoundVisibleWebAutomationSessionFactory
     {
         private readonly List<RecordingSession> sessions = [];
         private int active;
@@ -962,6 +1106,17 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         public bool AllWindowCallsHadDispatcherAccess => sessions.All(x => x.AllCallsHadDispatcherAccess);
         public bool NextCloseNeverCompletes { get; set; }
         public bool NextShowNeverCompletes { get; set; }
+        public BaiduCandidateSessionBinding? LastCandidateBinding { get; private set; }
+
+        public Task<IVisibleWebAutomationSession> CreateBoundAsync(
+            WebAutomationRequestIdentity identity,
+            string profilePath,
+            BaiduCandidateSessionBinding binding,
+            CancellationToken cancellationToken = default)
+        {
+            LastCandidateBinding = binding;
+            return CreateAsync(identity, profilePath, cancellationToken);
+        }
 
         public Task<IVisibleWebAutomationSession> CreateAsync(
             WebAutomationRequestIdentity identity,

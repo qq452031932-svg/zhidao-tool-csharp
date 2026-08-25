@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
+using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.App.Services;
@@ -53,22 +54,83 @@ public sealed record VisibleWebAutomationRequest<T>
         WebAutomationRequestIdentity identity,
         string profilePath,
         BaiduNavigationAuthorizationRequest navigation,
-        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action,
+        BaiduCandidateSessionBinding? candidateBinding = null)
     {
         Identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
         ProfilePath = profilePath;
         Navigation = navigation ?? throw new ArgumentNullException(nameof(navigation));
         Action = action ?? throw new ArgumentNullException(nameof(action));
+        CandidateBinding = candidateBinding;
     }
 
     public WebAutomationRequestIdentity Identity { get; init; }
     public string ProfilePath { get; init; }
     public BaiduNavigationAuthorizationRequest Navigation { get; init; }
     public Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> Action { get; init; }
+    public BaiduCandidateSessionBinding? CandidateBinding { get; init; }
 
     public override string ToString() =>
         $"VisibleWebAutomationRequest {{ Identity = {Identity}, ProfilePath = [REDACTED], Navigation = [REDACTED], Action = [REDACTED] }}";
+}
+
+public sealed record BaiduCandidateSessionBinding(
+    AdapterWriteAuthorizationRequest Authorization,
+    AdapterWriteAuthorizationBinding Binding)
+{
+    public void Validate(
+        WebAutomationRequestIdentity identity,
+        BaiduNavigationAuthorizationRequest navigation)
+    {
+        ArgumentNullException.ThrowIfNull(navigation);
+        ValidateIdentity(identity);
+        var scope = navigation.AcceptanceScope;
+        if (scope is null ||
+            scope.AdapterKind != Binding.Capability.AdapterKind ||
+            scope.AccountId != Binding.AccountId || scope.OperationId != Binding.OperationId ||
+            scope.Generation != Binding.Generation || scope.BatchId != Binding.BatchId ||
+            navigation.ProtocolVersion != Binding.Capability.ProtocolVersion ||
+            navigation.SelectorVersion != Binding.Capability.SelectorVersion ||
+            navigation.ApplicationBuildVersion != Binding.Capability.BuildVersion)
+            throw new InvalidOperationException("Candidate session binding does not match its exact operation and capability.");
+    }
+
+    public void ValidateIdentity(WebAutomationRequestIdentity identity)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(Authorization);
+        ArgumentNullException.ThrowIfNull(Binding);
+        var ownerMatches = Binding.Capability.AdapterKind switch
+        {
+            "BaiduTransfer" => identity.OwnerKind == WebAutomationOwnerKind.Transfer,
+            "BaiduShare" => identity.OwnerKind is WebAutomationOwnerKind.TransferShare or
+                WebAutomationOwnerKind.StandaloneShare,
+            _ => false,
+        };
+        var bootstrapActionMatches = Binding.Capability.AdapterKind switch
+        {
+            "BaiduTransfer" => Authorization.Action == AdapterWriteAction.EnsureDirectory,
+            "BaiduShare" => Authorization.Action == AdapterWriteAction.PrepareShare,
+            _ => false,
+        };
+        if (!ownerMatches ||
+            !bootstrapActionMatches ||
+            identity.AccountId != Authorization.AccountId ||
+            identity.OperationId != Authorization.OperationId ||
+            identity.Generation != Authorization.Generation ||
+            identity.BatchId != Authorization.BatchId ||
+            Authorization.Capability != Binding.Capability ||
+            Authorization.AccountId != Binding.AccountId ||
+            Authorization.OperationId != Binding.OperationId ||
+            Authorization.Generation != Binding.Generation ||
+            Authorization.BatchId != Binding.BatchId ||
+            Authorization.IsRecovery != Binding.IsRecovery)
+            throw new InvalidOperationException("Candidate session binding does not match its exact operation identity.");
+    }
+
+    public override string ToString() =>
+        "BaiduCandidateSessionBinding { Identity = [REDACTED], Versions = [REDACTED], Source = [REDACTED] }";
 }
 
 public sealed record VisibleWebAutomationResult<T>(
@@ -121,6 +183,15 @@ public interface IVisibleWebAutomationSessionFactory
     Task<IVisibleWebAutomationSession> CreateAsync(
         WebAutomationRequestIdentity identity,
         string profilePath,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IBoundVisibleWebAutomationSessionFactory : IVisibleWebAutomationSessionFactory
+{
+    Task<IVisibleWebAutomationSession> CreateBoundAsync(
+        WebAutomationRequestIdentity identity,
+        string profilePath,
+        BaiduCandidateSessionBinding binding,
         CancellationToken cancellationToken = default);
 }
 

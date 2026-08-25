@@ -108,6 +108,11 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
         Assert.IsType<AcceptanceWriteLeaseCoordinator>(
             host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>());
+        Assert.Same(
+            host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>(),
+            host.Services.GetRequiredService<IBaiduCandidateActionAuthorizationSource>());
+        Assert.IsAssignableFrom<IBoundVisibleWebAutomationSessionFactory>(
+            host.Services.GetRequiredService<IVisibleWebAutomationSessionFactory>());
         Assert.IsType<SqliteAdapterCapabilityStore>(
             host.Services.GetRequiredService<IAdapterCapabilityStore>());
         Assert.NotNull(host.Services.GetRequiredService<

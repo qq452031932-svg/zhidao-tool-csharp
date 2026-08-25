@@ -419,7 +419,19 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.OwnerKind);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        return new(identity, profilePath, Navigation(context), action);
+        var candidate = context.AuthorizationBinding is not { } binding
+            ? null
+            : new BaiduCandidateSessionBinding(
+                new AdapterWriteAuthorizationRequest(
+                    binding.Capability,
+                    context.AccountId,
+                    context.OperationId,
+                    context.Generation,
+                    context.BatchId,
+                    AdapterWriteAction.PrepareShare,
+                    context.IsRecovery),
+                binding);
+        return new(identity, profilePath, Navigation(context), action, candidate);
     }
 
     private async Task<BaiduAdapterResult<T>> ResumeWithoutActionAsync<T>(

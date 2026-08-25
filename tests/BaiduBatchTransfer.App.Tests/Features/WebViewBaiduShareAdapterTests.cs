@@ -61,6 +61,37 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     [Fact]
+    public async Task BoundPreparePassesTheSameImmutableAuthorizationToBrokerRequest()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare);
+        var capability = new AdapterCapabilityVersion(
+            "BaiduShare", BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.SelectorVersion, "build-share-a");
+        var binding = new AdapterWriteAuthorizationBinding(
+            AdapterWriteAuthorizationSource.ConsumedLease,
+            capability,
+            accountId,
+            context.OperationId,
+            context.Generation,
+            context.BatchId,
+            Now,
+            Now.AddMinutes(5),
+            false,
+            null);
+        context = context with { AuthorizationBinding = binding };
+        var attempts = new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null));
+        var broker = new CallbackBroker(attempts, new ShareSession(Listing(ExistingEntry())));
+        var adapter = Adapter(accountId, broker, attempts, new AcceptanceStore());
+
+        var result = await adapter.PreparePermanentShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Same(binding, broker.CandidateBinding!.Binding);
+        Assert.Equal(AdapterWriteAction.PrepareShare, broker.CandidateBinding.Authorization.Action);
+    }
+
+    [Fact]
     public async Task MismatchedAccountOrExactItemsIsRejectedBeforeQueueing()
     {
         var accountId = Guid.NewGuid();
@@ -576,6 +607,7 @@ public sealed class WebViewBaiduShareAdapterTests
     {
         public WebAutomationRequestIdentity? Identity { get; private set; }
         public string? ProfilePath { get; private set; }
+        public BaiduCandidateSessionBinding? CandidateBinding { get; private set; }
 
         public async Task<VisibleWebAutomationResult<T>> EnqueueAsync<T>(
             VisibleWebAutomationRequest<T> request,
@@ -583,6 +615,7 @@ public sealed class WebViewBaiduShareAdapterTests
         {
             Identity = request.Identity;
             ProfilePath = request.ProfilePath;
+            CandidateBinding = request.CandidateBinding;
             var initialStage = attempts.Current.State;
             if (initialStage == WebAutomationAttemptState.UserHandoff)
             {

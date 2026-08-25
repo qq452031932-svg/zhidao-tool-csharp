@@ -8,7 +8,7 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebView2CandidateDomExecutor(
     IBaiduCandidateDomScriptHost host,
-    IBaiduCandidateActionAuthorizationSource authorizationSource)
+    IBaiduCandidateActionAuthorizationSource authorizationSource) : IBaiduCandidateDomExecutor
 {
     private static readonly HashSet<string> ResponseFields = new(StringComparer.Ordinal)
     {
