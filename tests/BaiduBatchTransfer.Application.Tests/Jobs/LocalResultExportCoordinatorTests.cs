@@ -67,6 +67,24 @@ public sealed class LocalResultExportCoordinatorTests
     }
 
     [Fact]
+    public async Task AlreadySucceededReverifiesExactPublishedEvidenceBeforeNotifyingObserver()
+    {
+        var observer = new CountingObserver();
+        var graph = Fixture(observer: observer);
+
+        Assert.Equal(
+            LocalResultExportDisposition.Exported,
+            (await graph.Coordinator.ExportStandaloneAsync(graph.BatchId)).Disposition);
+        Assert.Equal(1, observer.CallCount);
+
+        var repeated = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
+
+        Assert.Equal(LocalResultExportDisposition.AlreadySucceeded, repeated.Disposition);
+        Assert.Equal(2, observer.CallCount);
+        Assert.Single(graph.Artifacts.PublishedEvidence);
+    }
+
+    [Fact]
     public async Task Recovery_ValidPublishedTargetCompletesWithoutRewriting()
     {
         var graph = Fixture(LocalResultArtifactState.Valid);

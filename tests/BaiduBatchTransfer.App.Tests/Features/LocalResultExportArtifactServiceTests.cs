@@ -57,7 +57,7 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
             Guid.Parse("22222222-2222-2222-2222-222222222222"),
             2,
             new string('a', 64));
-        var service = CreateService();
+        var service = CreateService(operation);
         await service.PublishAsync(
             Owner(expectedRows: 1), target,
             provenOperations: [operation]);
@@ -78,12 +78,14 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
     {
         Directory.CreateDirectory(root);
         const string target = "result.xlsx";
-        var service = CreateService();
+        var candidate = new LocalResultOperationEvidence(
+            "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1, new string('a', 64));
+        var service = CreateService(candidate);
         await service.PublishAsync(Owner(expectedRows: 1), target);
 
         var evidence = await service.GetVerifiedEvidenceAsync(
             Owner(expectedRows: 1), target,
-            [new("BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1)]);
+            [new(candidate.AdapterKind, candidate.AccountId, candidate.OperationId, candidate.Generation)]);
 
         Assert.Null(evidence);
     }
@@ -99,10 +101,12 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
                 output, standalone.GetExpectedLayout(),
                 Rows(new ReplacementWorkbookRow(1, [
                     "账号甲", "资源甲", "文件", "https://pan.baidu.com/s/result", "a1b2", "分享成功"])));
+        var operation = new LocalResultOperationEvidence(
+            "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1, new string('a', 64));
 
-        var evidence = await CreateService().GetVerifiedEvidenceAsync(
+        var evidence = await CreateService(operation).GetVerifiedEvidenceAsync(
             Owner(expectedRows: 1), target,
-            [new("BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1)]);
+            [new(operation.AdapterKind, operation.AccountId, operation.OperationId, operation.Generation)]);
 
         Assert.Null(evidence);
     }
@@ -114,7 +118,7 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
         const string target = "result.xlsx";
         var operation = new LocalResultOperationEvidence(
             "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1, new string('a', 64));
-        var service = CreateService();
+        var service = CreateService(operation);
         await service.PublishAsync(Owner(expectedRows: 1), target, provenOperations: [operation]);
         using (var document = SpreadsheetDocument.Open(Path.Combine(root, target), true))
         {
@@ -140,7 +144,7 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
         const string target = "result.xlsx";
         var operation = new LocalResultOperationEvidence(
             "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1, new string('a', 64));
-        var service = CreateService();
+        var service = CreateService(operation);
         await service.PublishAsync(Owner(expectedRows: 1), target, provenOperations: [operation]);
         using (var document = SpreadsheetDocument.Open(Path.Combine(root, target), true))
         {
@@ -159,7 +163,79 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
         Assert.Null(evidence);
     }
 
-    private LocalResultExportArtifactService CreateService()
+    [Fact]
+    public async Task ForgedWorkbookRowNotEqualToCurrentCanonicalRepositoryProofReturnsNoEvidence()
+    {
+        Directory.CreateDirectory(root);
+        const string target = "result.xlsx";
+        var workbookRow = new LocalResultOperationEvidence(
+            "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 2, new string('a', 64));
+        var currentProof = workbookRow with { ContentFingerprint = new string('b', 64) };
+        var service = CreateService(currentProof);
+        await service.PublishAsync(Owner(expectedRows: 1), target, provenOperations: [workbookRow]);
+
+        var evidence = await service.GetVerifiedEvidenceAsync(
+            Owner(expectedRows: 1), target,
+            [new(workbookRow.AdapterKind, workbookRow.AccountId,
+                workbookRow.OperationId, workbookRow.Generation)]);
+
+        Assert.Null(evidence);
+    }
+
+    [Fact]
+    public async Task MissingOrExtraCanonicalRepositoryProofReturnsNoEvidence()
+    {
+        Directory.CreateDirectory(root);
+        var workbookRow = new LocalResultOperationEvidence(
+            "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 2, new string('a', 64));
+        var extra = workbookRow with { OperationId = Guid.NewGuid() };
+        var extraProof = CreateService(workbookRow, extra);
+        await extraProof.PublishAsync(
+            Owner(expectedRows: 1), "extra.xlsx", provenOperations: [workbookRow]);
+        var missingProof = CreateService(workbookRow);
+        await missingProof.PublishAsync(
+            Owner(expectedRows: 1), "missing.xlsx", provenOperations: [workbookRow, extra]);
+
+        var extraEvidence = await extraProof.GetVerifiedEvidenceAsync(
+            Owner(expectedRows: 1), "extra.xlsx",
+            [new(workbookRow.AdapterKind, workbookRow.AccountId,
+                workbookRow.OperationId, workbookRow.Generation)]);
+        var missingEvidence = await missingProof.GetVerifiedEvidenceAsync(
+            Owner(expectedRows: 1), "missing.xlsx",
+            [
+                new(workbookRow.AdapterKind, workbookRow.AccountId,
+                    workbookRow.OperationId, workbookRow.Generation),
+                new(extra.AdapterKind, extra.AccountId, extra.OperationId, extra.Generation),
+            ]);
+
+        Assert.Null(extraEvidence);
+        Assert.Null(missingEvidence);
+    }
+
+    [Fact]
+    public async Task CanonicalRepositoryProofFailureReturnsNoEvidence()
+    {
+        Directory.CreateDirectory(root);
+        const string target = "result.xlsx";
+        var workbookRow = new LocalResultOperationEvidence(
+            "BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 2, new string('a', 64));
+        var service = CreateService(new ThrowingMembershipRepository());
+        await service.PublishAsync(Owner(expectedRows: 1), target, provenOperations: [workbookRow]);
+
+        var evidence = await service.GetVerifiedEvidenceAsync(
+            Owner(expectedRows: 1), target,
+            [new(workbookRow.AdapterKind, workbookRow.AccountId,
+                workbookRow.OperationId, workbookRow.Generation)]);
+
+        Assert.Null(evidence);
+    }
+
+    private LocalResultExportArtifactService CreateService(
+        params LocalResultOperationEvidence[] currentProof) =>
+        CreateService(new MembershipRepository(currentProof));
+
+    private LocalResultExportArtifactService CreateService(
+        ILocalResultExportOwnerRepository membershipRepository)
     {
         var standalone = new ExportStandaloneShareResultsService(new StandaloneRepository());
         var writer = new OpenXmlReplacementResultWriter();
@@ -168,7 +244,8 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
                 new UnusedBatchRepository(), new ReplacementWorkbookFileNameBuilder()),
             standalone,
             new OpenXmlReplacementWorkbookFilePublisher(writer),
-            new OpenXmlDownloadedWorkbookValidator());
+            new OpenXmlDownloadedWorkbookValidator(),
+            membershipRepository);
     }
 
     private LocalResultExportOwnerSnapshot Owner(long expectedRows) => new(
@@ -232,5 +309,39 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
             int pageSize,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
+    }
+
+    private sealed class MembershipRepository(IReadOnlyList<LocalResultOperationEvidence> proof) :
+        ILocalResultExportOwnerRepository
+    {
+        public Task<LocalResultExportOwnerSnapshot?> GetAsync(
+            LocalResultExportKey key,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task<Page<LocalResultExportOwnerSnapshot>> GetReadyPageAsync(
+            PageQuery query,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<LocalResultOperationEvidence>> GetProvenOperationEvidenceAsync(
+            LocalResultExportKey key,
+            IReadOnlyList<LocalResultOperationIdentity> candidates,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(proof);
+    }
+
+    private sealed class ThrowingMembershipRepository : ILocalResultExportOwnerRepository
+    {
+        public Task<LocalResultExportOwnerSnapshot?> GetAsync(
+            LocalResultExportKey key,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task<Page<LocalResultExportOwnerSnapshot>> GetReadyPageAsync(
+            PageQuery query,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task<IReadOnlyList<LocalResultOperationEvidence>> GetProvenOperationEvidenceAsync(
+            LocalResultExportKey key,
+            IReadOnlyList<LocalResultOperationIdentity> candidates,
+            CancellationToken cancellationToken = default) => throw new InvalidDataException("tampered lineage");
     }
 }

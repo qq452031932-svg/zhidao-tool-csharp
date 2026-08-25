@@ -16,7 +16,8 @@ public sealed class LocalResultExportArtifactService(
     ReplacementWorkbookExportService replacementExports,
     ExportStandaloneShareResultsService standaloneExports,
     IReplacementWorkbookFilePublisher publisher,
-    IDownloadedWorkbookValidator validator) : ILocalResultExportArtifactService
+    IDownloadedWorkbookValidator validator,
+    ILocalResultExportOwnerRepository membershipRepository) : ILocalResultExportArtifactService
 {
     private const int MaximumSuffix = 10_000;
     private readonly ReplacementWorkbookExportService replacementExports =
@@ -27,6 +28,8 @@ public sealed class LocalResultExportArtifactService(
         publisher ?? throw new ArgumentNullException(nameof(publisher));
     private readonly IDownloadedWorkbookValidator validator =
         validator ?? throw new ArgumentNullException(nameof(validator));
+    private readonly ILocalResultExportOwnerRepository membershipRepository =
+        membershipRepository ?? throw new ArgumentNullException(nameof(membershipRepository));
 
     public async Task<string> ChooseTargetFileNameAsync(
         LocalResultExportOwnerSnapshot owner,
@@ -132,6 +135,39 @@ public sealed class LocalResultExportArtifactService(
             LocalResultExportKind.StandaloneShareWorkbook => standaloneExports.GetExpectedLayout(),
             _ => throw new InvalidOperationException("This local export kind is not a summary workbook."),
         };
+        var layoutFingerprint = LayoutFingerprint(layout);
+        var exactCandidates = candidates.Distinct().ToArray();
+        if (exactCandidates.Length != candidates.Count || exactCandidates.Any(candidate =>
+                candidate.AdapterKind is not ("BaiduTransfer" or "BaiduShare") ||
+                candidate.AccountId == Guid.Empty || candidate.OperationId == Guid.Empty ||
+                candidate.Generation < 1)) return null;
+        IReadOnlyList<LocalResultOperationEvidence> currentProof;
+        try
+        {
+            currentProof = await membershipRepository.GetProvenOperationEvidenceAsync(
+                owner.Key, exactCandidates, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+        LocalResultWorkbookManifest canonicalProof;
+        try
+        {
+            canonicalProof = new(owner.Key, layoutFingerprint, currentProof);
+        }
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        var proofIdentities = canonicalProof.Operations.Select(operation => new LocalResultOperationIdentity(
+            operation.AdapterKind, operation.AccountId, operation.OperationId, operation.Generation)).ToHashSet();
+        if (proofIdentities.Count != exactCandidates.Length ||
+            !proofIdentities.SetEquals(exactCandidates)) return null;
         try
         {
             await using var stream = new FileStream(
@@ -144,14 +180,10 @@ public sealed class LocalResultExportArtifactService(
             if (HasExternalRelationships(document, new HashSet<Uri>()) ||
                 !HasExpectedShape(document, layout, owner.ExpectedRowCount, cancellationToken)) return null;
             var manifest = OpenXmlLocalResultWorkbookManifestCodec.TryRead(document);
-            var layoutFingerprint = LayoutFingerprint(layout);
             if (manifest is null || manifest.ExportKey != owner.Key ||
                 !string.Equals(manifest.LayoutFingerprint, layoutFingerprint, StringComparison.Ordinal)) return null;
-            var exactCandidates = candidates.ToHashSet();
-            var matches = manifest.Operations.Where(operation => exactCandidates.Contains(new(
-                operation.AdapterKind, operation.AccountId, operation.OperationId, operation.Generation))).ToArray();
-            if (matches.Length == 0) return null;
-            return new(owner.Key, matches, layoutFingerprint, artifactFingerprint);
+            if (!manifest.Operations.SequenceEqual(canonicalProof.Operations)) return null;
+            return new(owner.Key, manifest.Operations, layoutFingerprint, artifactFingerprint);
         }
         catch (OperationCanceledException)
         {
