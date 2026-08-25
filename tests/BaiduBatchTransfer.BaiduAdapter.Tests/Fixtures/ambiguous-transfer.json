@@ -1,0 +1,10 @@
+{
+  "expectedTopLevelCount": 1,
+  "baseline": ["fictional-baseline-a"],
+  "after": [
+    { "exactId": "fictional-baseline-a", "displayName": "旧资源" },
+    { "exactId": "fictional-candidate-a", "displayName": "候选甲" },
+    { "exactId": "fictional-candidate-b", "displayName": "候选乙" }
+  ],
+  "officialAccepted": true
+}

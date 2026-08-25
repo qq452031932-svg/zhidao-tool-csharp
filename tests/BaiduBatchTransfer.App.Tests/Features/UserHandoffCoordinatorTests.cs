@@ -6,6 +6,31 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 public sealed class UserHandoffCoordinatorTests
 {
     [Fact]
+    public async Task TransferFlowPersistsCompleteBaselineAndAdvancesExactStagesWithCas()
+    {
+        var fixture = new HandoffFixture(WebAutomationAttemptState.Preparing);
+        var baseline = WebAutomationBaseline.Create(["remote-b", "remote-a"]);
+
+        await fixture.Coordinator.PersistBaselineAsync(
+            fixture.Identity, baseline, fixture.Fingerprint);
+        await fixture.Coordinator.AdvanceStageAsync(
+            fixture.Identity,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationAttemptState.Submitting,
+            new string('b', 64));
+        await fixture.Coordinator.AdvanceStageAsync(
+            fixture.Identity,
+            WebAutomationAttemptState.Submitting,
+            WebAutomationAttemptState.ResultPending,
+            new string('c', 64));
+
+        Assert.Equal(WebAutomationAttemptState.ResultPending, fixture.Store.Current.State);
+        Assert.Equal(["remote-a", "remote-b"],
+            fixture.Store.Current.Baseline!.Items.Select(item => item.ExactId));
+        Assert.Equal(new string('c', 64), fixture.Store.Current.ObservationFingerprint);
+    }
+
+    [Fact]
     public async Task Resume_RestoresExactPersistentStageOnce()
     {
         var fixture = new HandoffFixture(WebAutomationAttemptState.BaselinePersisted);
@@ -291,8 +316,22 @@ public sealed class UserHandoffCoordinatorTests
         public Task<Page<WebAutomationAttemptRecord>> GetRecoveryPageAsync(PageQuery query, CancellationToken cancellationToken = default) =>
             Task.FromResult(new Page<WebAutomationAttemptRecord>([Current], 1, query.PageNumber, query.PageSize));
 
-        public Task<bool> TryPersistBaselineAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationBaseline baseline, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) =>
-            Task.FromResult(false);
+        public Task<bool> TryPersistBaselineAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationBaseline baseline, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                if (!Matches(operationId, accountId, generation) ||
+                    Current.State != WebAutomationAttemptState.Preparing ||
+                    Current.Revision != expectedRevision)
+                    return Task.FromResult(false);
+                Current = new(
+                    operationId, accountId, generation, Current.OwnerKind,
+                    WebAutomationAttemptState.BaselinePersisted, null, baseline,
+                    observationFingerprint, false, Current.Revision + 1,
+                    Current.CreatedAt, updatedAt);
+                return Task.FromResult(true);
+            }
+        }
 
         public Task<bool> TryAdvanceAsync(Guid operationId, Guid accountId, int generation, WebAutomationAttemptState expectedState, long expectedRevision, WebAutomationAttemptState nextState, string? observationFingerprint, bool isWaitingForUser, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {

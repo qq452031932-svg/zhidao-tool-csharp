@@ -48,7 +48,7 @@ public sealed class BaiduAdapterConcurrencyGate
 
 public sealed class CoordinatedBaiduNetdiskAdapter(
     IBaiduNetdiskAdapter inner,
-    BaiduAdapterConcurrencyGate gate) : IBaiduNetdiskAdapter
+    BaiduAdapterConcurrencyGate gate) : IOperationBoundBaiduNetdiskAdapter
 {
     private readonly IBaiduNetdiskAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
     private readonly BaiduAdapterConcurrencyGate gate = gate ?? throw new ArgumentNullException(nameof(gate));
@@ -73,6 +73,33 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
 
     public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(AccountSession session, TransferConfirmationQuery query, CancellationToken cancellationToken) =>
         RunAsync(session, token => inner.ConfirmTransferAsync(session, query, token), cancellationToken);
+
+    public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        ShareReference share,
+        RemoteDirectory destination,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
+                ? operationBound.SaveWholeShareForOperationAsync(
+                    context, session, share, destination, duplicatePolicy, token)
+                : inner.SaveWholeShareAsync(session, share, destination, duplicatePolicy, token),
+            cancellationToken);
+
+    public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        TransferConfirmationQuery query,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
+                ? operationBound.ConfirmExactTransferForOperationAsync(context, session, query, token)
+                : inner.ConfirmExactTransferAsync(session, query, token),
+            cancellationToken);
 
     private async Task<T> RunAsync<T>(AccountSession session, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
     {

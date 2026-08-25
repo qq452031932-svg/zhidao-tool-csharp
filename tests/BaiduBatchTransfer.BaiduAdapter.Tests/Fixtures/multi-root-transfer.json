@@ -1,0 +1,11 @@
+{
+  "expectedTopLevelCount": 3,
+  "baseline": ["fictional-baseline-a"],
+  "after": [
+    { "exactId": "fictional-baseline-a", "displayName": "旧资源" },
+    { "exactId": "fictional-multi-a", "displayName": "顶层甲" },
+    { "exactId": "fictional-multi-b", "displayName": "顶层乙" },
+    { "exactId": "fictional-multi-c", "displayName": "顶层丙" }
+  ],
+  "officialAccepted": true
+}

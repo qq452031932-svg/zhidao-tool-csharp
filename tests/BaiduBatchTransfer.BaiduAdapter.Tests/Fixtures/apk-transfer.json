@@ -1,0 +1,9 @@
+{
+  "expectedTopLevelCount": 1,
+  "baseline": ["fictional-baseline-a"],
+  "after": [
+    { "exactId": "fictional-baseline-a", "displayName": "旧资源" },
+    { "exactId": "fictional-apk-new", "displayName": "应用安装包" }
+  ],
+  "officialAccepted": true
+}

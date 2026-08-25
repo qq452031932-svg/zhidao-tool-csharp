@@ -16,7 +16,8 @@ public sealed record OperationExecutionSnapshot(
     string OperationFingerprint,
     bool RequiresExactShareEvidence = false,
     int AttemptCount = 0,
-    bool AttemptGenerationPrepared = false)
+    bool AttemptGenerationPrepared = false,
+    Guid BatchId = default)
 {
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
@@ -242,12 +243,25 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         BaiduAdapterResult<TransferReceipt> saveResult;
         try
         {
-            saveResult = await adapter.SaveWholeShareAsync(
-                session,
-                snapshot.Share,
-                directoryResult.Value!,
-                snapshot.DuplicatePolicy,
-                cancellationToken).ConfigureAwait(false);
+            saveResult = adapter is IOperationBoundBaiduNetdiskAdapter operationBound
+                ? await operationBound.SaveWholeShareForOperationAsync(
+                    new TransferOperationAutomationContext(
+                        snapshot.OperationId,
+                        snapshot.BatchId,
+                        snapshot.AccountId,
+                        attemptCount,
+                        snapshot.Share).Validate(),
+                    session,
+                    snapshot.Share,
+                    directoryResult.Value!,
+                    snapshot.DuplicatePolicy,
+                    cancellationToken).ConfigureAwait(false)
+                : await adapter.SaveWholeShareAsync(
+                    session,
+                    snapshot.Share,
+                    directoryResult.Value!,
+                    snapshot.DuplicatePolicy,
+                    cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {

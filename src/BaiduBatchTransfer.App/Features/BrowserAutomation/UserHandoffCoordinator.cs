@@ -88,6 +88,64 @@ public sealed class UserHandoffCoordinator
         return new(identity, resumeStage, checked(current.Revision + 1), observationFingerprint);
     }
 
+    public async Task PersistBaselineAsync(
+        WebAutomationRequestIdentity identity,
+        WebAutomationBaseline baseline,
+        string observationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(baseline);
+        identity.Validate();
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        var current = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("浏览器操作的持久记录不存在。");
+        if (current.OwnerKind != identity.OwnerKind || current.State != WebAutomationAttemptState.Preparing)
+            throw new InvalidOperationException("浏览器操作阶段已经变化，不能保存旧的基线。");
+        var changed = await store.TryPersistBaselineAsync(
+            identity.OperationId,
+            identity.AccountId,
+            identity.Generation,
+            current.Revision,
+            baseline,
+            observationFingerprint,
+            timeProvider.GetUtcNow(),
+            cancellationToken).ConfigureAwait(false);
+        if (!changed) throw new InvalidOperationException("浏览器操作阶段已经变化，基线未保存。");
+    }
+
+    public async Task AdvanceStageAsync(
+        WebAutomationRequestIdentity identity,
+        WebAutomationAttemptState expectedState,
+        WebAutomationAttemptState nextState,
+        string? observationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        identity.Validate();
+        if ((expectedState, nextState) is not
+            (WebAutomationAttemptState.BaselinePersisted, WebAutomationAttemptState.Submitting) and not
+            (WebAutomationAttemptState.Submitting, WebAutomationAttemptState.ResultPending))
+            throw new ArgumentException("The requested web automation stage transition is not allowed.", nameof(nextState));
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        var current = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("浏览器操作的持久记录不存在。");
+        if (current.OwnerKind != identity.OwnerKind || current.State != expectedState)
+            throw new InvalidOperationException("浏览器操作阶段已经变化，不能推进旧的阶段。");
+        var changed = await store.TryAdvanceAsync(
+            identity.OperationId,
+            identity.AccountId,
+            identity.Generation,
+            expectedState,
+            current.Revision,
+            nextState,
+            observationFingerprint,
+            false,
+            timeProvider.GetUtcNow(),
+            cancellationToken).ConfigureAwait(false);
+        if (!changed) throw new InvalidOperationException("浏览器操作阶段已经变化，阶段未推进。");
+    }
+
     public async Task<UserHandoffResult> ResolveAsync(
         WebAutomationRequestIdentity identity,
         UserHandoffLease handoff,

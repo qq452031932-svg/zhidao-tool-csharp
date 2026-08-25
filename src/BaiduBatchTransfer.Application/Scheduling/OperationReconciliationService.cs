@@ -11,7 +11,9 @@ public sealed record PendingReconciliationOperation(
     string ConfirmationDescriptorJson,
     string? AdapterRequestId,
     string? RemoteItemIdsJson,
-    bool RequiresExactShareEvidence = false)
+    bool RequiresExactShareEvidence = false,
+    Guid BatchId = default,
+    ShareReference? SourceShare = null)
 {
     public override string ToString() =>
         "PendingReconciliationOperation { EntityIds = [REDACTED], Confirmation = [REDACTED] }";
@@ -137,7 +139,26 @@ public sealed class OperationReconciliationService : ITransferResultReconciler
         BaiduAdapterResult<TransferConfirmationResult> result;
         try
         {
-            result = await adapter.ConfirmExactTransferAsync(session, query, cancellationToken).ConfigureAwait(false);
+            if (adapter is IOperationBoundBaiduNetdiskAdapter operationBound)
+            {
+                if (pending.BatchId == Guid.Empty || pending.SourceShare is null)
+                    return TransferConfirmation.Ambiguous;
+                result = await operationBound.ConfirmExactTransferForOperationAsync(
+                    new TransferOperationAutomationContext(
+                        pending.OperationId,
+                        pending.BatchId,
+                        pending.AccountId,
+                        pending.AttemptCount,
+                        pending.SourceShare).Validate(),
+                    session,
+                    query,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                result = await adapter.ConfirmExactTransferAsync(session, query, cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

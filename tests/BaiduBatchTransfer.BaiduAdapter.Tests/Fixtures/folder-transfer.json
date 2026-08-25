@@ -1,0 +1,9 @@
+{
+  "expectedTopLevelCount": 1,
+  "baseline": ["fictional-baseline-a"],
+  "after": [
+    { "exactId": "fictional-baseline-a", "displayName": "旧资源" },
+    { "exactId": "fictional-folder-new", "displayName": "转存文件夹" }
+  ],
+  "officialAccepted": true
+}

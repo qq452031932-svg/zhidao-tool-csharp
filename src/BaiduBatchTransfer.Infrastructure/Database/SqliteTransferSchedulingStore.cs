@@ -767,7 +767,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,o.AttemptCount,o.ConfirmationDescriptorJson,o.AdapterRequestId,o.RemoteItemIdsJson,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer') FROM TransferOperations o WHERE o.Id=$id AND o.Status='ResultPending' AND o.SubmitState='PendingConfirmation' AND o.TargetSlotState='Reserved' AND o.ConfirmationDescriptorJson IS NOT NULL;");
+            "SELECT o.Id,o.AssignedAccountId,o.AttemptCount,o.ConfirmationDescriptorJson,o.AdapterRequestId,o.RemoteItemIdsJson,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.BatchJobId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.Id=$id AND o.Status='ResultPending' AND o.SubmitState='PendingConfirmation' AND o.TargetSlotState='Reserved' AND o.ConfirmationDescriptorJson IS NOT NULL;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
@@ -778,7 +778,12 @@ public sealed class SqliteTransferSchedulingStore :
                 reader.GetString(3),
                 ReadString(reader, 4),
                 ReadString(reader, 5),
-                reader.GetInt64(6) != 0)
+                reader.GetInt64(6) != 0,
+                Guid.Parse(reader.GetString(7)),
+                new ShareReference(
+                    reader.GetString(8),
+                    reader.GetString(9),
+                    ReadString(reader, 10)))
             : null;
     }
 
@@ -926,7 +931,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
+            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState,o.BatchJobId FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
@@ -938,7 +943,8 @@ public sealed class SqliteTransferSchedulingStore :
                 new ShareReference(reader.GetString(2), reader.GetString(3), reader.IsDBNull(4) ? null : reader.GetString(4)),
                 new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
                 Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0,
-                attemptCount, string.Equals(reader.GetString(11), "PreparingToSubmit", StringComparison.Ordinal));
+                attemptCount, string.Equals(reader.GetString(11), "PreparingToSubmit", StringComparison.Ordinal),
+                Guid.Parse(reader.GetString(12)));
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
         {

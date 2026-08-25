@@ -143,6 +143,36 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
+    public async Task WebViewExactReconciliationReceivesAuthoritativeIdentityAndSourceShare()
+    {
+        var operation = PendingOperation() with
+        {
+            RequiresExactShareEvidence = true,
+            BatchId = Guid.NewGuid(),
+            SourceShare = new ShareReference("share", "https://pan.baidu.com/s/reconcile", "a1b2"),
+        };
+        var exact = new RemoteItemIdentitySet([new("remote-1", "资源")]);
+        var adapter = new OperationBoundConfirmationAdapter
+        {
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(exact)),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            new RecordingReconciliationStore(operation),
+            new FixedTimeProvider(Now));
+
+        await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(operation.OperationId, adapter.Context!.OperationId);
+        Assert.Equal(operation.BatchId, adapter.Context.BatchId);
+        Assert.Equal(operation.AccountId, adapter.Context.AccountId);
+        Assert.Equal(operation.AttemptCount, adapter.Context.Generation);
+        Assert.Equal(operation.SourceShare, adapter.Context.SourceShare);
+    }
+
+    [Fact]
     public async Task MultipleApproximateMatchesRemainAmbiguousAndNeverUseLegacyPresentSignal()
     {
         var operation = PendingOperation() with { RequiresExactShareEvidence = true };
@@ -878,7 +908,7 @@ public sealed class ReconciliationTests
         public Task RemoveAsync(string accountIdValue, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
-    private sealed class ConfirmationAdapter : IBaiduNetdiskAdapter
+    private class ConfirmationAdapter : IBaiduNetdiskAdapter
     {
         public BaiduAdapterResult<TransferConfirmation> Result { get; set; } =
             BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.Ambiguous);
@@ -924,6 +954,29 @@ public sealed class ReconciliationTests
         public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private sealed class OperationBoundConfirmationAdapter : ConfirmationAdapter, IOperationBoundBaiduNetdiskAdapter
+    {
+        public TransferOperationAutomationContext? Context { get; private set; }
+
+        public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            ShareReference share,
+            RemoteDirectory destination,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            TransferConfirmationQuery query,
+            CancellationToken cancellationToken)
+        {
+            Context = context;
+            return ConfirmExactTransferAsync(session, query, cancellationToken);
+        }
     }
 
     private sealed class LegacyOnlyConfirmationAdapter(BaiduAdapterResult<TransferConfirmation> result)

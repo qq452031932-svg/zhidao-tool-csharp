@@ -516,6 +516,40 @@ public sealed class VisibleWebAutomationContext
         observationFingerprint = sanitizedObservationFingerprint;
     }
 
+    public async Task PersistBaselineAsync(
+        WebAutomationBaseline baseline,
+        string sanitizedObservationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureActive();
+        await coordinator.PersistBaselineAsync(
+            Identity,
+            baseline,
+            sanitizedObservationFingerprint,
+            cancellationToken).ConfigureAwait(false);
+        currentStage = WebAutomationAttemptState.BaselinePersisted;
+        observationFingerprint = sanitizedObservationFingerprint;
+    }
+
+    public async Task AdvancePersistentStageAsync(
+        WebAutomationAttemptState expectedState,
+        WebAutomationAttemptState nextState,
+        string? sanitizedObservationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureActive();
+        if (currentStage != expectedState)
+            throw new InvalidOperationException("当前浏览器阶段与持久化推进请求不一致。");
+        await coordinator.AdvanceStageAsync(
+            Identity,
+            expectedState,
+            nextState,
+            sanitizedObservationFingerprint,
+            cancellationToken).ConfigureAwait(false);
+        currentStage = nextState;
+        observationFingerprint = sanitizedObservationFingerprint;
+    }
+
     public async Task RequestUserHandoffAsync(
         WebAutomationAttemptState resumeStage,
         WebAutomationHandoffReason reason,

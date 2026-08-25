@@ -158,6 +158,22 @@ public sealed class OperationExecutorTests
         Assert.DoesNotContain(store.Events, item => item.Name is "Identifiers" or "Succeeded");
     }
 
+    [Fact]
+    public async Task WebViewAdapterReceivesAuthoritativeOperationBatchAccountAndGeneration()
+    {
+        var snapshot = Snapshot(createFolderName: null) with { BatchId = Guid.NewGuid() };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new OperationBoundRecordingAdapter();
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal(snapshot.OperationId, adapter.Context!.OperationId);
+        Assert.Equal(snapshot.BatchId, adapter.Context.BatchId);
+        Assert.Equal(snapshot.AccountId, adapter.Context.AccountId);
+        Assert.Equal(1, adapter.Context.Generation);
+        Assert.Equal(snapshot.Share, adapter.Context.SourceShare);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -637,7 +653,7 @@ public sealed class OperationExecutorTests
         }
     }
 
-    private sealed class RecordingAdapter(List<string>? timeline = null) : IBaiduNetdiskAdapter
+    private class RecordingAdapter(List<string>? timeline = null) : IBaiduNetdiskAdapter
     {
         public Queue<BaiduAdapterResult<RemoteDirectory>> EnsureResults { get; init; } = [];
         public Exception? EnsureException { get; init; }
@@ -674,5 +690,28 @@ public sealed class OperationExecutorTests
         public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(AccountSession session, TransferConfirmationQuery query, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private sealed class OperationBoundRecordingAdapter : RecordingAdapter, IOperationBoundBaiduNetdiskAdapter
+    {
+        public TransferOperationAutomationContext? Context { get; private set; }
+
+        public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            ShareReference share,
+            RemoteDirectory destination,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken)
+        {
+            Context = context;
+            return SaveWholeShareAsync(session, share, destination, duplicatePolicy, cancellationToken);
+        }
+
+        public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            TransferConfirmationQuery query,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 }
