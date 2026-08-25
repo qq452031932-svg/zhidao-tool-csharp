@@ -708,14 +708,36 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             "BaiduLoginWindow.xaml.cs"));
 
         var lease = source.IndexOf("profileCloser.Register", StringComparison.Ordinal);
+        var closeGate = source.IndexOf("closeGate = new LoginWindowCloseGate", StringComparison.Ordinal);
         var prepare = source.IndexOf(".PrepareAsync", StringComparison.Ordinal);
         var environment = source.IndexOf("CoreWebView2Environment", StringComparison.Ordinal);
         Assert.True(lease >= 0);
         Assert.True(prepare >= 0);
         Assert.True(environment >= 0);
+        Assert.True(closeGate > lease, "只有成功取得本窗口的 profile 租约后才能创建关闭门。 ");
         Assert.True(lease < prepare, "账号登录必须先独占 profile，再准备目录。");
         Assert.True(lease < environment, "账号登录必须先独占 profile，再创建 WebView2 环境。");
         Assert.Contains("profilePreparationStopped.Task.WaitAsync", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LoginDirectWindowCloseIsDeferredUntilPreparationAndBrowserHaveStopped()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Accounts",
+            "BaiduLoginWindow.xaml.cs"));
+
+        var closing = source.IndexOf("private async void OnClosing", StringComparison.Ordinal);
+        var cancelClose = source.IndexOf("e.Cancel = true", closing, StringComparison.Ordinal);
+        var safeClose = source.IndexOf("closeGate.WaitForSafeCloseAsync", closing, StringComparison.Ordinal);
+        var allowClose = source.IndexOf("allowClose = true", safeClose, StringComparison.Ordinal);
+        var secondClose = source.IndexOf("Close();", allowClose, StringComparison.Ordinal);
+
+        Assert.True(closing >= 0);
+        Assert.True(cancelClose > closing, "用户直接关闭窗口时必须先取消本次同步关闭。 ");
+        Assert.True(safeClose > cancelClose, "必须等待 profile 准备和浏览器关闭确认。 ");
+        Assert.True(allowClose > safeClose);
+        Assert.True(secondClose > allowClose, "只能在安全关闭完成后再次关闭窗口。 ");
     }
 
     [Fact]

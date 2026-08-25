@@ -165,6 +165,30 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
         using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
     }
 
+    [Fact]
+    public async Task UserCloseWaitsForUnresponsivePreparationAndKeepsLoginAndDeletionFenced()
+    {
+        var closer = new WebView2ProfileCloser();
+        var accountId = Guid.NewGuid();
+        var preparationStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = closer.Register(accountId, async _ => await preparationStopped.Task);
+        var closeGate = new LoginWindowCloseGate(
+            preparationStopped.Task,
+            cancellationToken => closer.CloseAsync(accountId, cancellationToken));
+
+        var userClose = closeGate.WaitForSafeCloseAsync(CancellationToken.None);
+        var accountDeletion = closer.CloseAsync(accountId, CancellationToken.None);
+
+        Assert.False(userClose.IsCompleted);
+        Assert.False(accountDeletion.IsCompleted);
+        Assert.Throws<InvalidOperationException>(() =>
+            closer.Register(accountId, _ => Task.CompletedTask));
+
+        preparationStopped.TrySetResult();
+        await Task.WhenAll(userClose, accountDeletion);
+        using var reopened = closer.Register(accountId, _ => Task.CompletedTask);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);

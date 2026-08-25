@@ -16,6 +16,7 @@ public partial class BaiduLoginWindow : Window
     private readonly LoginProfileBootstrapper profileBootstrapper;
     private readonly AddAccountService addAccountService;
     private readonly WebView2ProfileCloser profileCloser;
+    private LoginWindowCloseGate? closeGate;
     private readonly WebViewCookieSessionBridge cookieBridge;
     private readonly BaiduLoginViewModel viewModel = new();
     private readonly BaiduLoginDomAutomationCoordinator domAutomation = new();
@@ -63,7 +64,15 @@ public partial class BaiduLoginWindow : Window
     {
         try
         {
-            profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync);
+            try { profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync); }
+            catch
+            {
+                profilePreparationStopped.TrySetResult();
+                throw;
+            }
+            closeGate = new LoginWindowCloseGate(
+                profilePreparationStopped.Task,
+                cancellationToken => profileCloser.CloseAsync(accountId, cancellationToken));
 
             string profilePath;
             try
@@ -96,7 +105,8 @@ public partial class BaiduLoginWindow : Window
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
-            await CleanupAfterCanceledInitializationAsync().ConfigureAwait(true);
+            if (!cleanupInProgress)
+                await CleanupAfterCanceledInitializationAsync().ConfigureAwait(true);
         }
         catch (Exception)
         {
@@ -237,30 +247,43 @@ public partial class BaiduLoginWindow : Window
 
     private void CloseAfterRegistration()
     {
-        allowClose = true;
         Close();
     }
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        if (allowClose || registrationCompleted)
+        if (allowClose)
         {
             lifetime.Cancel();
             return;
         }
 
-        lifetime.Cancel();
-        if (!profilePrepared || ownership is null) return;
         e.Cancel = true;
         if (cleanupInProgress) return;
         cleanupInProgress = true;
-        var cleanup = await addAccountService
-            .RetryProfileCleanupAsync(accountId, ownership, CancellationToken.None)
-            .ConfigureAwait(true);
-        if (cleanup == ProfileCleanupStatus.Pending)
+        lifetime.Cancel();
+        try
+        {
+            if (closeGate is not null)
+                await closeGate.WaitForSafeCloseAsync(CancellationToken.None).ConfigureAwait(true);
+            else
+                await profilePreparationStopped.Task.ConfigureAwait(true);
+            if (!registrationCompleted && profilePrepared && ownership is not null)
+            {
+                var cleanup = await addAccountService
+                    .RetryProfileCleanupAsync(accountId, ownership, CancellationToken.None)
+                    .ConfigureAwait(true);
+                if (cleanup == ProfileCleanupStatus.Pending)
+                    viewModel.ReportFailure(BaiduLoginUiText.CleanupPending);
+            }
+            allowClose = true;
+            Close();
+        }
+        catch (Exception)
+        {
+            cleanupInProgress = false;
             viewModel.ReportFailure(BaiduLoginUiText.CleanupPending);
-        allowClose = true;
-        Close();
+        }
     }
 
     private async Task CleanupAfterCanceledInitializationAsync()
