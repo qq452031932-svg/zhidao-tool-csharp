@@ -81,7 +81,11 @@ public sealed class SqliteRemoteSelectionSessionStore(
             command.CommandText = """
                 UPDATE RemoteSelectionSessions SET State=$state,Revision=Revision+1,UpdatedAt=$now
                 WHERE SessionId=$session AND WorkspaceDraftId=$draft AND AccountId=$account
-                  AND Generation=$generation AND State='Active' AND Revision=$revision;
+                  AND Generation=$generation AND State='Active' AND Revision=$revision
+                  AND ($state<>'Confirmed' OR EXISTS(
+                    SELECT 1 FROM Accounts account
+                    WHERE account.Id=$account AND account.Status='Active'
+                      AND account.IsEnabled=1 AND account.IsDeleted=0));
                 """;
             AddIdentity(command, sessionId, workspaceDraftId, accountId, generation);
             command.Parameters.AddWithValue("$state", terminalState.ToString());

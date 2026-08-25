@@ -312,6 +312,9 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                     OR EXISTS(SELECT 1 FROM BatchJobs batch
                                JOIN temp.AccountRemovalManifestTargetBatches relevant ON relevant.Id=batch.Id
                                WHERE batch.ImportSessionId=import.Id)))
+              +
+              (SELECT COUNT(*) FROM RemoteSelectionSessions selection
+                WHERE selection.AccountId=$account AND selection.State='Active')
               ;
             """, token, ("$account", Id(accountId))).ConfigureAwait(false);
         if (count != 0 || mode != AccountExitHistoryMode.RemoveTerminalHistory)

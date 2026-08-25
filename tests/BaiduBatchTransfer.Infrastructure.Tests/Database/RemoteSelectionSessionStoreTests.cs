@@ -44,6 +44,36 @@ public sealed class RemoteSelectionSessionStoreTests : IDisposable
             graph.Sessions.CreateAsync(graph.AccountId, graph.Now));
     }
 
+    [Theory]
+    [InlineData("Disabled", false)]
+    [InlineData("Deleted", true)]
+    public async Task ConfirmedCompletionRequiresTheExactAccountToRemainActiveButSafeTerminalizationDoesNot(
+        string status,
+        bool isDeleted)
+    {
+        var graph = await CreateAsync();
+        var session = await graph.Sessions.CreateAsync(graph.AccountId, graph.Now);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE Accounts SET Status=$status,IsDeleted=$deleted,IsEnabled=0 WHERE Id=$id;";
+            command.Parameters.AddWithValue("$status", status);
+            command.Parameters.AddWithValue("$deleted", isDeleted ? 1 : 0);
+            command.Parameters.AddWithValue("$id", graph.AccountId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        Assert.False(await graph.Sessions.TryCompleteAsync(
+            session.SessionId, session.WorkspaceDraftId, graph.AccountId, 1, 0,
+            RemoteSelectionSessionState.Confirmed, graph.Now.AddSeconds(1)));
+        Assert.Equal(RemoteSelectionSessionState.Active,
+            (await graph.Sessions.GetAsync(session.SessionId, session.WorkspaceDraftId,
+                graph.AccountId, 1))!.State);
+        Assert.True(await graph.Sessions.TryCompleteAsync(
+            session.SessionId, session.WorkspaceDraftId, graph.AccountId, 1, 0,
+            RemoteSelectionSessionState.NeedsDecision, graph.Now.AddSeconds(2)));
+    }
+
     [Fact]
     public async Task AccountDeletedAfterSessionCreationInvalidatesQueuedOwnershipAndAttemptStart()
     {

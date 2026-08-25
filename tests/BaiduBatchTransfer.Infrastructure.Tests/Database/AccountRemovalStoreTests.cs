@@ -524,6 +524,38 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ActiveRemoteSelectionBlocksRemovalAndCancelledSelectionIsRetainedAsHistory()
+    {
+        var (factory, store, _) = await CreateAsync();
+        var sessions = new SqliteRemoteSelectionSessionStore(factory);
+        var beforeSession = await store.PreviewAsync(
+            B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, beforeSession.Status);
+        var session = await sessions.CreateAsync(B, RemovedAt.AddMinutes(-1));
+
+        var blocked = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var blockedPreparation = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory,
+                beforeSession.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, blocked.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, blockedPreparation.Status);
+        Assert.True(await sessions.TryCompleteAsync(
+            session.SessionId, session.WorkspaceDraftId, B, session.Generation, session.Revision,
+            RemoteSelectionSessionState.Cancelled, RemovedAt));
+
+        var ready = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, ready.Status);
+        var prepared = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, ready.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, prepared.Status);
+        Assert.Equal(RemoteSelectionSessionState.Cancelled,
+            (await sessions.GetAsync(session.SessionId, session.WorkspaceDraftId,
+                B, session.Generation))!.State);
+    }
+
+    [Fact]
     public async Task PendingConfirmationOperationBlocksRemovalAndIsNeverDeleted()
     {
         var (factory, store, graph) = await CreateAsync(seedGraph: true);

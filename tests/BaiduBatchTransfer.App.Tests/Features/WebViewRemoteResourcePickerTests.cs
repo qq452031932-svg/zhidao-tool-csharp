@@ -173,6 +173,28 @@ public sealed class WebViewRemoteResourcePickerTests
     }
 
     [Fact]
+    public async Task AccountInvalidatedAfterBrowserReturnsCannotLeakSelectionsAndEndsNeedsDecision()
+    {
+        var session = Session(AccountA);
+        var sessions = new SessionStore(session)
+        {
+            CompletionResults = [false, true],
+            ReloadState = RemoteSelectionSessionState.Active,
+        };
+        var broker = new RecordingBroker([
+            new PickerSession(RemoteResourcePickerDecision.ConfirmSelection,
+                [Page(AccountA, "opaque", "资源")]),
+        ]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Picker(
+            broker, new RecordingProfilePolicy([AccountA]), sessions).PickAsync(AccountA));
+
+        Assert.Equal(
+            [RemoteSelectionSessionState.Confirmed, RemoteSelectionSessionState.NeedsDecision],
+            sessions.Completions);
+    }
+
+    [Fact]
     public async Task ProductionAuthorizationDenialIsTypedAndDurablyCancelledInsteadOfLookingEmpty()
     {
         var sessions = new SessionStore(Session(AccountA));
@@ -233,8 +255,10 @@ public sealed class WebViewRemoteResourcePickerTests
             .ToDictionary(group => group.Key, group => new Queue<RemoteSelectionSession>(group));
         public List<RemoteSelectionSessionState> Completions { get; } = [];
         public bool CompletionSucceeds { get; init; } = true;
+        public IReadOnlyList<bool>? CompletionResults { get; init; }
         public RemoteSelectionSessionState? ReloadState { get; init; }
         private RemoteSelectionSession? created;
+        private int completionIndex;
 
         public Task<RemoteSelectionSession> CreateAsync(Guid accountId, DateTimeOffset now,
             CancellationToken cancellationToken = default)
@@ -260,7 +284,10 @@ public sealed class WebViewRemoteResourcePickerTests
             CancellationToken cancellationToken = default)
         {
             Completions.Add(terminalState);
-            return Task.FromResult(CompletionSucceeds);
+            var result = CompletionResults is not null && completionIndex < CompletionResults.Count
+                ? CompletionResults[completionIndex++]
+                : CompletionSucceeds;
+            return Task.FromResult(result);
         }
 
         public Task<int> RecoverIncompleteAsync(DateTimeOffset now,
