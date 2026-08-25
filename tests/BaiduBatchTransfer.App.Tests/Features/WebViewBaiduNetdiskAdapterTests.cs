@@ -133,6 +133,36 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
+    public async Task BoundProductionSessionMapsUnavailableTransferFieldsToNotValidatedWithoutDomMutation()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.Preparing, null));
+        var identity = new WebAutomationRequestIdentity(
+            context.OperationId, context.BatchId, accountId, context.Generation,
+            WebAutomationOwnerKind.Transfer);
+        var executor = new DenyingCandidateExecutor();
+        await using var session = new WebView2AutomationSession(
+            identity, CandidateBinding(context), executor, CancellationToken.None);
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new CallbackBroker(attempts, session),
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(),
+            "build-a", attempts);
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Equal(0, executor.MutateCount);
+        Assert.Equal(WebAutomationAttemptState.Preparing, attempts.Current.State);
+    }
+
+    [Fact]
     public async Task AccountMismatchIsRejectedBeforeQueueing()
     {
         var accountId = Guid.NewGuid();
@@ -650,6 +680,30 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     private static RemoteItemIdentitySet AcceptedItems() =>
         new([new("fictional-new", "新资源")]);
 
+    private static BaiduCandidateSessionBinding CandidateBinding(
+        TransferOperationAutomationContext context)
+    {
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion, "build-a");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability, context.AccountId, context.OperationId, context.Generation,
+            context.BatchId, AdapterWriteAction.EnsureDirectory, context.IsRecovery);
+        return new(
+            authorization,
+            new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ConsumedLease,
+                capability,
+                context.AccountId,
+                context.OperationId,
+                context.Generation,
+                context.BatchId,
+                Now,
+                Now.AddMinutes(5),
+                context.IsRecovery,
+                null));
+    }
+
     private static AccountSession Session(Guid accountId) => new(
         accountId,
         "fictional-user",
@@ -713,6 +767,26 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         {
             Recovery.Add((request, exactEvidenceFingerprint));
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DenyingCandidateExecutor : IBaiduCandidateDomExecutor
+    {
+        public int MutateCount { get; private set; }
+
+        public Task<BaiduCandidateDomResult> ObserveAsync(
+            BaiduCandidateDomRequest request,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(BaiduCandidateDomResult.Denied(
+                BaiduAutomationDenialReason.FieldEvidenceNotValidated));
+
+        public Task<BaiduCandidateDomResult> MutateAsync(
+            BaiduCandidateDomRequest request,
+            BaiduCandidateDomObservation observation,
+            CancellationToken cancellationToken = default)
+        {
+            MutateCount++;
+            return Task.FromResult(BaiduCandidateDomResult.Success(observation));
         }
     }
 

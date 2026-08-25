@@ -32,6 +32,13 @@ public enum BaiduAutomationDenialReason
     CatalogNotValidated,
 }
 
+public class BaiduAutomationNotValidatedException(
+    BaiduAutomationDenialReason denialReason,
+    string message) : InvalidOperationException(message)
+{
+    public BaiduAutomationDenialReason DenialReason { get; } = denialReason;
+}
+
 public sealed record BaiduAutomationAcceptance(
     bool IsAccepted,
     string ProtocolVersion,

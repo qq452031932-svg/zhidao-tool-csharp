@@ -131,6 +131,55 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     [Fact]
+    public async Task BoundProductionSessionMapsUnavailableShareFieldsToNotValidatedWithoutDomMutation()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare);
+        var capability = new AdapterCapabilityVersion(
+            "BaiduShare", BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion, "build-share-a");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability, accountId, context.OperationId, context.Generation,
+            context.BatchId, AdapterWriteAction.PrepareShare);
+        var binding = new AdapterWriteAuthorizationBinding(
+            AdapterWriteAuthorizationSource.ConsumedLease,
+            capability,
+            accountId,
+            context.OperationId,
+            context.Generation,
+            context.BatchId,
+            Now,
+            Now.AddMinutes(5),
+            false,
+            null);
+        context = context with { AuthorizationBinding = binding };
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.Preparing, null));
+        var executor = new DenyingCandidateExecutor();
+        var candidate = new BaiduCandidateSessionBinding(authorization, binding);
+        await using var session = new WebView2AutomationSession(
+            new WebAutomationRequestIdentity(
+                context.OperationId, context.BatchId, accountId, context.Generation,
+                context.OwnerKind),
+            candidate,
+            executor,
+            CancellationToken.None);
+        var adapter = Adapter(
+            accountId, new CallbackBroker(attempts, session), attempts,
+            new AcceptanceStore());
+
+        var result = await adapter.PreparePermanentShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Equal(1, executor.ObserveCount);
+        Assert.Equal(0, executor.MutateCount);
+        Assert.Equal(WebAutomationAttemptState.Preparing, attempts.Current.State);
+    }
+
+    [Fact]
     public async Task SubmitRequiresAnExactBaselinePersistedAttempt()
     {
         var accountId = Guid.NewGuid();
@@ -584,6 +633,30 @@ public sealed class WebViewBaiduShareAdapterTests
         {
             Recovery.Add((request, exactEvidenceFingerprint));
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class DenyingCandidateExecutor : IBaiduCandidateDomExecutor
+    {
+        public int ObserveCount { get; private set; }
+        public int MutateCount { get; private set; }
+
+        public Task<BaiduCandidateDomResult> ObserveAsync(
+            BaiduCandidateDomRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            ObserveCount++;
+            return Task.FromResult(BaiduCandidateDomResult.Denied(
+                BaiduAutomationDenialReason.FieldEvidenceNotValidated));
+        }
+
+        public Task<BaiduCandidateDomResult> MutateAsync(
+            BaiduCandidateDomRequest request,
+            BaiduCandidateDomObservation observation,
+            CancellationToken cancellationToken = default)
+        {
+            MutateCount++;
+            return Task.FromResult(BaiduCandidateDomResult.Success(observation));
         }
     }
 

@@ -135,7 +135,29 @@ public sealed class TransferAutomationFlowTests
     {
         new TimeoutException("No official acceptance was observed."),
         new OperationCanceledException("The visible automation window was closed."),
+        new BaiduAutomationNotValidatedException(
+            BaiduAutomationDenialReason.FieldEvidenceNotValidated,
+            "The post-submit field protocol is not validated."),
     };
+
+    [Fact]
+    public async Task NotValidatedWhileMarkingSubmittingDoesNotBecomePendingOrCallSave()
+    {
+        var session = new FixtureSession(Load("folder-transfer.json"))
+        {
+            MarkSubmittingFailure = new BaiduAutomationNotValidatedException(
+                BaiduAutomationDenialReason.FieldEvidenceNotValidated,
+                "The submit boundary is not validated."),
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.DoesNotContain("submit", session.Events);
+    }
 
     [Fact]
     public async Task DisplayNameAndTimeSimilarityCannotConfirmAnIdentity()
@@ -286,6 +308,7 @@ public sealed class TransferAutomationFlowTests
         public List<string> Events { get; } = [];
         public WebAutomationBaseline? PersistedBaseline { get; private set; }
         public Exception? SaveFailure { get; init; }
+        public Exception? MarkSubmittingFailure { get; init; }
         public TransferOfficialAcceptance? AcceptanceOverride { get; init; }
         public TransferOfficialAcceptance OfficialAcceptance => new(
             scenario.OfficialAccepted
@@ -331,7 +354,9 @@ public sealed class TransferAutomationFlowTests
         public Task MarkSubmittingAsync(CancellationToken cancellationToken)
         {
             Events.Add("mark-submitting");
-            return Task.CompletedTask;
+            return MarkSubmittingFailure is null
+                ? Task.CompletedTask
+                : Task.FromException(MarkSubmittingFailure);
         }
 
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)

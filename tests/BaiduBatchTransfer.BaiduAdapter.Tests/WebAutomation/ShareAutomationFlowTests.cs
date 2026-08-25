@@ -292,6 +292,9 @@ public sealed class ShareAutomationFlowTests
     {
         new TimeoutException("No acceptance toast appeared."),
         new OperationCanceledException("The visible share window was closed."),
+        new BaiduAutomationNotValidatedException(
+            BaiduAutomationDenialReason.FieldEvidenceNotValidated,
+            "The post-submit field protocol is not validated."),
     };
 
     [Fact]

@@ -236,10 +236,7 @@ public sealed record WebAutomationBatchCancellationResult(
 
 public sealed class WebAutomationAuthorizationException(
     BaiduAutomationDenialReason denialReason,
-    string message) : InvalidOperationException(message)
-{
-    public BaiduAutomationDenialReason DenialReason { get; } = denialReason;
-}
+    string message) : BaiduAutomationNotValidatedException(denialReason, message);
 
 public sealed class ProductionWebAutomationNavigationAuthorizer(
     IAcceptanceNavigationAuthorizationSource? acceptanceSource = null) : IWebAutomationNavigationAuthorizer

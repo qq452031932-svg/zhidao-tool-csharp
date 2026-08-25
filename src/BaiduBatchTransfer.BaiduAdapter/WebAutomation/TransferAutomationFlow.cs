@@ -202,6 +202,10 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         {
             throw;
         }
+        catch (BaiduAutomationNotValidatedException)
+        {
+            return PreparationNotValidated();
+        }
         catch (Exception)
         {
             return PreparationFailed();
@@ -228,8 +232,8 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 await session.EnterExtractionCodeAsync(request.Share.ExtractionCode, cancellationToken)
                     .ConfigureAwait(false);
 
-            submitted = true;
             await session.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
+            submitted = true;
             var acceptance = await session.SaveWholeShareAsync(
                 request.Destination,
                 request.DuplicatePolicy,
@@ -263,6 +267,10 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (BaiduAutomationNotValidatedException) when (!submitted)
+        {
+            return DefinitelyNotValidated();
         }
         catch (Exception)
         {
@@ -349,9 +357,21 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
 
+    private static BaiduAdapterResult<TransferReceipt> DefinitelyNotValidated() =>
+        BaiduAdapterResult<TransferReceipt>.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
     private static BaiduAdapterResult<TransferAutomationPreparation> PreparationFailed() =>
         BaiduAdapterResult<TransferAutomationPreparation>.Failure(
             BaiduErrorKind.UnknownResponse,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
+    private static BaiduAdapterResult<TransferAutomationPreparation> PreparationNotValidated() =>
+        BaiduAdapterResult<TransferAutomationPreparation>.Failure(
+            BaiduErrorKind.NotValidated,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
 

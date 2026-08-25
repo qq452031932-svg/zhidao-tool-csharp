@@ -279,6 +279,10 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         {
             throw;
         }
+        catch (BaiduAutomationNotValidatedException)
+        {
+            return PreparationNotValidated();
+        }
         catch (Exception)
         {
             return PreparationFailed();
@@ -321,6 +325,10 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (BaiduAutomationNotValidatedException) when (!submitted)
+        {
+            return DefinitelyNotValidated();
         }
         catch (Exception)
         {
@@ -514,9 +522,21 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
 
+    private static BaiduAdapterResult<ShareCreationReceipt> DefinitelyNotValidated() =>
+        BaiduAdapterResult<ShareCreationReceipt>.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
     private static BaiduAdapterResult<ShareAutomationPreparation> PreparationFailed() =>
         BaiduAdapterResult<ShareAutomationPreparation>.Failure(
             BaiduErrorKind.UnknownResponse,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
+    private static BaiduAdapterResult<ShareAutomationPreparation> PreparationNotValidated() =>
+        BaiduAdapterResult<ShareAutomationPreparation>.Failure(
+            BaiduErrorKind.NotValidated,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
 
