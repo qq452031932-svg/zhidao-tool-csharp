@@ -71,6 +71,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         context.Validate();
         if (context.AccountId != session.LocalAccountId)
             throw new InvalidOperationException("The directory preparation identity does not match its account.");
+        if (!HasExactCandidateBinding(context))
+            return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
         var request = Request(
             context,
             OfficialFilesUri,
@@ -142,6 +144,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 var prepared = Prepared();
                 if (existing!.State != WebAutomationAttemptState.UserHandoff)
                     return prepared;
+                if (!HasExactCandidateBinding(context))
+                    return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
                 try
                 {
                     var resumed = await broker.EnqueueAsync(
@@ -163,6 +167,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             if (existing is not null && existingStage != WebAutomationAttemptState.Preparing)
                 return Unknown<TransferPreparationReceipt>(SubmissionAcceptance.Unknown);
         }
+        if (!HasExactCandidateBinding(context))
+            return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         var request = Request(
             context,
             share,
@@ -218,6 +224,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 attempt?.State == WebAutomationAttemptState.UserHandoff
                     ? SubmissionAcceptance.Unknown
                     : SubmissionAcceptance.DefinitelyNotAccepted);
+        if (!HasExactCandidateBinding(context))
+            return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         var baseline = attempt!.Baseline!;
         var request = Request(
             context,
@@ -433,8 +441,33 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             WebAutomationOwnerKind.Transfer);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        return new(identity, profilePath, Navigation(context, officialUri), action);
+        var candidate = context.AuthorizationBinding is not { } binding
+            ? null
+            : new BaiduCandidateSessionBinding(
+                new AdapterWriteAuthorizationRequest(
+                    binding.Capability,
+                    context.AccountId,
+                    context.OperationId,
+                    context.Generation,
+                    context.BatchId,
+                    AdapterWriteAction.EnsureDirectory,
+                    context.IsRecovery),
+                binding);
+        return new(identity, profilePath, Navigation(context, officialUri), action, candidate);
     }
+
+    private bool HasExactCandidateBinding(TransferOperationAutomationContext context) =>
+        context.AuthorizationBinding is { } binding &&
+        binding.Capability == new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            applicationBuildVersion) &&
+        binding.AccountId == context.AccountId &&
+        binding.OperationId == context.OperationId &&
+        binding.Generation == context.Generation &&
+        binding.BatchId == context.BatchId &&
+        binding.IsRecovery == context.IsRecovery;
 
     private static void ValidateOperationIdentity(
         TransferOperationAutomationContext context,

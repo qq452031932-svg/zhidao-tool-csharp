@@ -105,6 +105,14 @@ public interface IBaiduCandidateActionAuthorizationSource
     ValueTask<bool> IsAuthorizedAsync(
         BaiduCandidateDomRequest request,
         CancellationToken cancellationToken = default);
+
+    ValueTask<IBaiduCandidateMutationPermit?> TryAcquireMutationPermitAsync(
+        BaiduCandidateDomRequest request,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IBaiduCandidateMutationPermit : IAsyncDisposable
+{
 }
 
 public interface IBaiduCandidateDomExecutor

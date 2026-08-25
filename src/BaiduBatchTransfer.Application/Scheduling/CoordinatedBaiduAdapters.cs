@@ -17,6 +17,7 @@ public sealed record AdapterWriteAuthorizationRequest(
 public enum AdapterWriteAction
 {
     EnsureDirectory,
+    PrepareTransfer,
     SubmitTransfer,
     PrepareShare,
     SubmitShare,
@@ -56,6 +57,11 @@ public interface IAdapterWriteAuthorizationGate
         AdapterWriteAuthorizationBinding binding,
         CancellationToken cancellationToken = default) =>
         ValueTask.FromResult(false);
+
+    ValueTask ReleaseBindingAsync(
+        AdapterWriteAuthorizationBinding binding,
+        CancellationToken cancellationToken = default) =>
+        ValueTask.CompletedTask;
 }
 
 public sealed class BaiduAdapterConcurrencyGate
@@ -194,66 +200,119 @@ public class CoordinatedBaiduNetdiskAdapter : IBaiduNetdiskAdapter
         return await RunAsync(session, action, cancellationToken).ConfigureAwait(false);
     }
 
-    private static BaiduAdapterResult<T> NotValidated<T>() =>
+    protected static BaiduAdapterResult<T> NotValidated<T>() =>
         BaiduAdapterResult<T>.Failure(
             BaiduErrorKind.NotValidated,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
 }
 
 public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
     IOperationBoundBaiduNetdiskAdapter inner,
     BaiduAdapterConcurrencyGate gate,
     IAdapterWriteAuthorizationGate? writeGate = null,
-    AdapterCapabilityVersion? capability = null) : CoordinatedBaiduNetdiskAdapter(inner, gate, writeGate, capability), IOperationBoundBaiduNetdiskAdapter
+    AdapterCapabilityVersion? capability = null,
+    TimeProvider? timeProvider = null) : CoordinatedBaiduNetdiskAdapter(inner, gate, writeGate, capability), IOperationBoundBaiduNetdiskAdapter
 {
     private readonly IOperationBoundBaiduNetdiskAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
+    private readonly IAdapterWriteAuthorizationGate? transferWriteGate = writeGate;
+    private readonly AdapterCapabilityVersion? transferCapability = capability;
+    private readonly TimeProvider transferTimeProvider = timeProvider ?? TimeProvider.System;
+    private readonly ConcurrentDictionary<TransferBindingKey, AdapterWriteAuthorizationBinding> bindings = [];
 
-    public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+    public async Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         RemotePath path,
-        CancellationToken cancellationToken) =>
-        RunWriteAsync(
+        CancellationToken cancellationToken)
+    {
+        if (transferWriteGate is null)
+            return await RunAsync(
+                session,
+                token => inner.EnsureDirectoryForOperationAsync(context, session, path, token),
+                cancellationToken).ConfigureAwait(false);
+        await PruneExpiredBindingsAsync().ConfigureAwait(false);
+        context.Validate();
+        if (session.LocalAccountId != context.AccountId) return NotValidated<RemoteDirectory>();
+        var key = TransferBindingKey.From(context);
+        if (bindings.ContainsKey(key)) return NotValidated<RemoteDirectory>();
+        return await RunAsync(
             session,
-            context.OperationId,
-            context.Generation,
-            token => inner.EnsureDirectoryForOperationAsync(context, session, path, token),
-            cancellationToken,
-            context.BatchId,
-            AdapterWriteAction.EnsureDirectory,
-            context.IsRecovery);
+            async token =>
+            {
+                var request = WriteRequest(context, session, AdapterWriteAction.EnsureDirectory);
+                var binding = await transferWriteGate.TryCreateBindingAsync(request, token).ConfigureAwait(false);
+                if (binding is null || binding.ExpiresAtUtc <= transferTimeProvider.GetUtcNow() ||
+                    !bindings.TryAdd(key, binding))
+                {
+                    if (binding is not null)
+                        await transferWriteGate.ReleaseBindingAsync(binding, CancellationToken.None).ConfigureAwait(false);
+                    return NotValidated<RemoteDirectory>();
+                }
+                var keep = false;
+                try
+                {
+                    var result = await inner.EnsureDirectoryForOperationAsync(
+                        context with { AuthorizationBinding = binding }, session, path, token).ConfigureAwait(false);
+                    keep = result.IsSuccess;
+                    return result;
+                }
+                finally
+                {
+                    if (!keep) await RemoveBindingAsync(key, binding).ConfigureAwait(false);
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
 
-    public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
+    public async Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         ShareReference share,
         RemoteDirectory destination,
         DuplicatePolicy duplicatePolicy,
-        CancellationToken cancellationToken) =>
-        RunWriteAsync(
+        CancellationToken cancellationToken)
+    {
+        if (transferWriteGate is null)
+            return await RunAsync(
+                session,
+                token => inner.SaveWholeShareForOperationAsync(
+                    context, session, share, destination, duplicatePolicy, token),
+                cancellationToken).ConfigureAwait(false);
+        return await RunBoundStageAsync(
+            context,
             session,
-            context.OperationId,
-            context.Generation,
-            token => inner.SaveWholeShareForOperationAsync(
-                context, session, share, destination, duplicatePolicy, token),
-            cancellationToken,
-            context.BatchId,
             AdapterWriteAction.SubmitTransfer,
-            context.IsRecovery);
+            (bound, token) => inner.SaveWholeShareForOperationAsync(
+                bound, session, share, destination, duplicatePolicy, token),
+            removeAfter: true,
+            cancellationToken).ConfigureAwait(false);
+    }
 
-    public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+    public async Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         ShareReference share,
         RemoteDirectory destination,
         DuplicatePolicy duplicatePolicy,
-        CancellationToken cancellationToken) =>
-        RunAsync(
+        CancellationToken cancellationToken)
+    {
+        if (transferWriteGate is null)
+            return await RunAsync(
+                session,
+                token => inner.PrepareWholeShareForOperationAsync(
+                    context, session, share, destination, duplicatePolicy, token),
+                cancellationToken).ConfigureAwait(false);
+        return await RunBoundStageAsync(
+            context,
             session,
-            token => inner.PrepareWholeShareForOperationAsync(
-                context, session, share, destination, duplicatePolicy, token),
-            cancellationToken);
+            AdapterWriteAction.PrepareTransfer,
+            (bound, token) => inner.PrepareWholeShareForOperationAsync(
+                bound, session, share, destination, duplicatePolicy, token),
+            removeAfter: false,
+            cancellationToken).ConfigureAwait(false);
+    }
 
     public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
         TransferOperationAutomationContext context,
@@ -264,6 +323,83 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
             session,
             token => inner.ConfirmExactTransferForOperationAsync(context, session, query, token),
             cancellationToken);
+
+    private async Task<BaiduAdapterResult<T>> RunBoundStageAsync<T>(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        AdapterWriteAction action,
+        Func<TransferOperationAutomationContext, CancellationToken, Task<BaiduAdapterResult<T>>> innerAction,
+        bool removeAfter,
+        CancellationToken cancellationToken)
+    {
+        context.Validate();
+        await PruneExpiredBindingsAsync().ConfigureAwait(false);
+        if (session.LocalAccountId != context.AccountId) return NotValidated<T>();
+        var key = TransferBindingKey.From(context);
+        if (!bindings.TryGetValue(key, out var binding) ||
+            context.AuthorizationBinding is { } supplied && supplied != binding)
+            return NotValidated<T>();
+        var ownsStageTransition = false;
+        var keep = false;
+        try
+        {
+            return await RunAsync(
+                session,
+                async token =>
+                {
+                    var request = WriteRequest(context, session, action);
+                    if (!await transferWriteGate!.TryValidateBindingAsync(request, binding, token)
+                            .ConfigureAwait(false))
+                        return NotValidated<T>();
+                    ownsStageTransition = true;
+                    var result = await innerAction(
+                        context with { AuthorizationBinding = binding }, token).ConfigureAwait(false);
+                    keep = result.IsSuccess && !removeAfter;
+                    return result;
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (ownsStageTransition && !keep)
+                await RemoveBindingAsync(key, binding).ConfigureAwait(false);
+        }
+    }
+
+    private AdapterWriteAuthorizationRequest WriteRequest(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        AdapterWriteAction action) => new(
+        transferCapability!, session.LocalAccountId ?? Guid.Empty,
+        context.OperationId, context.Generation, context.BatchId, action, context.IsRecovery);
+
+    private async ValueTask RemoveBindingAsync(
+        TransferBindingKey key,
+        AdapterWriteAuthorizationBinding binding)
+    {
+        bindings.TryRemove(new KeyValuePair<TransferBindingKey, AdapterWriteAuthorizationBinding>(key, binding));
+        await transferWriteGate!.ReleaseBindingAsync(binding, CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async ValueTask PruneExpiredBindingsAsync()
+    {
+        var now = transferTimeProvider.GetUtcNow();
+        foreach (var pair in bindings)
+        {
+            if (pair.Value.ExpiresAtUtc > now || !bindings.TryRemove(pair)) continue;
+            await transferWriteGate!.ReleaseBindingAsync(pair.Value, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private readonly record struct TransferBindingKey(
+        Guid AccountId,
+        Guid OperationId,
+        int Generation,
+        Guid BatchId)
+    {
+        public static TransferBindingKey From(TransferOperationAutomationContext context) =>
+            new(context.AccountId, context.OperationId, context.Generation, context.BatchId);
+    }
 }
 
 public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
@@ -378,7 +514,8 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
         ShareOperationAutomationContext context,
         AccountSession session,
         Func<CancellationToken, Task<BaiduAdapterResult<T>>> action,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? onValidated = null)
     {
         if (writeGate is null)
             return await RunAsync(session, action, cancellationToken).ConfigureAwait(false);
@@ -392,6 +529,7 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
                 var request = WriteRequest(context, session, AdapterWriteAction.SubmitShare);
                 if (!await writeGate.TryValidateBindingAsync(request, binding, token).ConfigureAwait(false))
                     return NotValidated<T>();
+                onValidated?.Invoke();
                 return await action(token).ConfigureAwait(false);
             },
             cancellationToken).ConfigureAwait(false);
@@ -409,6 +547,11 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
             BaiduErrorKind.NotValidated,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
+    protected ValueTask ReleaseWriteBindingAsync(
+        AdapterWriteAuthorizationBinding binding,
+        CancellationToken cancellationToken = default) =>
+        writeGate?.ReleaseBindingAsync(binding, cancellationToken) ?? ValueTask.CompletedTask;
 }
 
 public sealed class CoordinatedOperationBoundBaiduShareAdapter(
@@ -427,6 +570,7 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
         CancellationToken cancellationToken)
     {
         var key = ShareBindingKey.From(context);
+        AdapterWriteAuthorizationBinding? createdBinding = null;
         var keepBinding = false;
         try
         {
@@ -436,14 +580,25 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
                 (boundContext, token) => inner.PreparePermanentShareForOperationAsync(
                     boundContext, session, request, token),
                 cancellationToken,
-                boundContext => bindings.TryAdd(key, boundContext.AuthorizationBinding!))
+                boundContext =>
+                {
+                    createdBinding = boundContext.AuthorizationBinding;
+                    return bindings.TryAdd(key, createdBinding!);
+                })
                 .ConfigureAwait(false);
             keepBinding = prepared.IsSuccess;
             return prepared;
         }
         finally
         {
-            if (!keepBinding) bindings.TryRemove(key, out _);
+            if (!keepBinding && createdBinding is { } failedBinding)
+            {
+                if (bindings.TryGetValue(key, out var storedBinding) &&
+                    ReferenceEquals(storedBinding, failedBinding))
+                    bindings.TryRemove(new KeyValuePair<ShareBindingKey, AdapterWriteAuthorizationBinding>(
+                        key, failedBinding));
+                await ReleaseWriteBindingAsync(failedBinding, CancellationToken.None).ConfigureAwait(false);
+            }
         }
     }
 
@@ -465,6 +620,7 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
             context.AuthorizationBinding is { } supplied && supplied != binding)
             return NotValidated<ShareCreationReceipt>();
         var boundContext = context with { AuthorizationBinding = binding };
+        var ownsStageTransition = false;
         try
         {
             return await RunBindingValidateAsync(
@@ -472,11 +628,14 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
                 session,
                 token => inner.SubmitPermanentShareForOperationAsync(
                     boundContext, session, request, token),
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                () => ownsStageTransition = true).ConfigureAwait(false);
         }
         finally
         {
-            bindings.TryRemove(key, out _);
+            if (ownsStageTransition && bindings.TryRemove(
+                    new KeyValuePair<ShareBindingKey, AdapterWriteAuthorizationBinding>(key, binding)))
+                await ReleaseWriteBindingAsync(binding, CancellationToken.None).ConfigureAwait(false);
         }
     }
 

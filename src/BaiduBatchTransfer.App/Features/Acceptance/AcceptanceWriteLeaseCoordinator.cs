@@ -28,7 +28,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, EvidenceState> evidence = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, string> completedEvidence = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, DateTimeOffset> navigationScopes = [];
-    private readonly HashSet<AdapterWriteAuthorizationBinding> validatedShareBindings = [];
+    private readonly HashSet<AcceptanceWriteLeaseIdentity> createdBindingIdentities = [];
+    private readonly Dictionary<AdapterWriteAuthorizationBinding, BindingState> bindingStates = [];
 
     public AcceptanceWriteLeaseCoordinator(
         AcceptanceWriteLeaseOptions options,
@@ -113,8 +114,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(request.Capability);
-        if (!string.Equals(request.Capability.AdapterKind, "BaiduShare", StringComparison.Ordinal) ||
-            request.Action != AdapterWriteAction.PrepareShare || !HasExactOperationIdentity(request) ||
+        var bootstrapAction = BootstrapAction(request.Capability.AdapterKind);
+        if (bootstrapAction is null || request.Action != bootstrapAction || !HasExactOperationIdentity(request) ||
             request.BatchId == Guid.Empty)
             return null;
 
@@ -126,7 +127,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         {
             var expires = accepted.AcceptedAt + FormalEvidenceLifetime;
             RegisterNavigationScope(request, expires);
-            return new AdapterWriteAuthorizationBinding(
+            var binding = new AdapterWriteAuthorizationBinding(
                 AdapterWriteAuthorizationSource.ExactFormalRecord,
                 request.Capability,
                 request.AccountId,
@@ -137,6 +138,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                 expires,
                 request.IsRecovery,
                 accepted.EvidenceHash);
+            return TryRegisterBinding(binding, bootstrapAction.Value) ? binding : null;
         }
 
         if (!options.IsEnabled || request.IsRecovery) return null;
@@ -155,7 +157,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
             if (!operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
                 expires <= timeProvider.GetUtcNow())
                 return null;
-            return new AdapterWriteAuthorizationBinding(
+            var binding = new AdapterWriteAuthorizationBinding(
                 AdapterWriteAuthorizationSource.ConsumedLease,
                 request.Capability,
                 request.AccountId,
@@ -166,6 +168,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                 expires,
                 request.IsRecovery,
                 null);
+            return TryRegisterBindingLocked(binding, bootstrapAction.Value) ? binding : null;
         }
     }
 
@@ -178,7 +181,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         ArgumentNullException.ThrowIfNull(binding);
         cancellationToken.ThrowIfCancellationRequested();
         var now = timeProvider.GetUtcNow();
-        if (request.Action != AdapterWriteAction.SubmitShare ||
+        if (!IsBindingStageAction(request.Capability.AdapterKind, request.Action) ||
             !BindingMatches(request, binding) || binding.ExpiresAtUtc <= now)
             return false;
 
@@ -190,15 +193,13 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
             var key = AcceptanceWriteLeaseIdentity.From(request);
             lock (sync)
             {
-                if (validatedShareBindings.Contains(binding) ||
-                    !operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
+                if (!operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
                     expires != binding.ExpiresAtUtc || expires <= now ||
                     !consumedLeaseOperations.TryGetValue(key, out var actions) ||
-                    !actions.Contains(AdapterWriteAction.PrepareShare) ||
-                    actions.Contains(AdapterWriteAction.SubmitShare))
+                    !actions.Contains(BootstrapAction(request.Capability.AdapterKind)!.Value) ||
+                    !TryAdvanceBindingLocked(binding, request.Action))
                     return false;
-                actions.Add(AdapterWriteAction.SubmitShare);
-                validatedShareBindings.Add(binding);
+                actions.Add(request.Action);
                 return true;
             }
         }
@@ -215,8 +216,83 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                 binding.FormalEvidenceFingerprint,
                 StringComparison.Ordinal))
             return false;
-        lock (sync) return validatedShareBindings.Add(binding);
+        lock (sync) return TryAdvanceBindingLocked(binding, request.Action);
     }
+
+    public async ValueTask ReleaseBindingAsync(
+        AdapterWriteAuthorizationBinding binding,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        Task? drained = null;
+        lock (sync)
+        {
+            if (!bindingStates.TryGetValue(binding, out var state)) return;
+            state.IsRevoking = true;
+            if (state.ActiveMutationPermits == 0)
+                bindingStates.Remove(binding);
+            else
+                drained = (state.Drained ??= new(
+                    TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+        if (drained is not null) await drained.ConfigureAwait(false);
+    }
+
+    private bool TryRegisterBinding(
+        AdapterWriteAuthorizationBinding binding,
+        AdapterWriteAction bootstrapAction)
+    {
+        lock (sync) return TryRegisterBindingLocked(binding, bootstrapAction);
+    }
+
+    private bool TryRegisterBindingLocked(
+        AdapterWriteAuthorizationBinding binding,
+        AdapterWriteAction bootstrapAction)
+    {
+        var identity = new AcceptanceWriteLeaseIdentity(
+            binding.Capability,
+            binding.AccountId,
+            binding.OperationId,
+            binding.Generation,
+            binding.BatchId);
+        if (!createdBindingIdentities.Add(identity)) return false;
+        bindingStates.Add(binding, new BindingState(bootstrapAction));
+        return true;
+    }
+
+    private bool TryAdvanceBindingLocked(
+        AdapterWriteAuthorizationBinding binding,
+        AdapterWriteAction requestedAction)
+    {
+        if (!bindingStates.TryGetValue(binding, out var state) || state.IsRevoking ||
+            state.ActiveMutationPermits != 0)
+            return false;
+        var expected = state.Stage switch
+        {
+            AdapterWriteAction.EnsureDirectory => AdapterWriteAction.PrepareTransfer,
+            AdapterWriteAction.PrepareTransfer => AdapterWriteAction.SubmitTransfer,
+            AdapterWriteAction.PrepareShare => AdapterWriteAction.SubmitShare,
+            _ => (AdapterWriteAction?)null,
+        };
+        if (expected != requestedAction) return false;
+        state.Stage = requestedAction;
+        return true;
+    }
+
+    private static AdapterWriteAction? BootstrapAction(string adapterKind) => adapterKind switch
+    {
+        "BaiduTransfer" => AdapterWriteAction.EnsureDirectory,
+        "BaiduShare" => AdapterWriteAction.PrepareShare,
+        _ => null,
+    };
+
+    private static bool IsBindingStageAction(string adapterKind, AdapterWriteAction action) =>
+        adapterKind switch
+        {
+            "BaiduTransfer" => action is AdapterWriteAction.PrepareTransfer or AdapterWriteAction.SubmitTransfer,
+            "BaiduShare" => action == AdapterWriteAction.SubmitShare,
+            _ => false,
+        };
 
     private async Task<AdapterCapabilityAcceptanceRecord?> GetFreshFormalAcceptanceAsync(
         AdapterWriteAuthorizationRequest request,
@@ -283,7 +359,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                        consumedLeaseOperations.TryGetValue(key, out var actions) &&
                        actions.Contains(authorization.Capability.AdapterKind == "BaiduShare"
                            ? AdapterWriteAction.PrepareShare
-                           : AdapterWriteAction.EnsureDirectory);
+                           : AdapterWriteAction.EnsureDirectory) &&
+                       IsCandidateActionAllowedForActiveStageLocked(binding, request.Action);
             }
         }
 
@@ -292,13 +369,117 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
             return false;
         var accepted = await GetFreshFormalAcceptanceAsync(authorization, now, cancellationToken)
             .ConfigureAwait(false);
-        return accepted is not null && accepted.AcceptedAt == binding.IssuedAtUtc &&
-               accepted.AcceptedAt + FormalEvidenceLifetime == binding.ExpiresAtUtc &&
-               string.Equals(
-                   accepted.EvidenceHash,
-                   binding.FormalEvidenceFingerprint,
-                   StringComparison.Ordinal);
+        if (accepted is null || accepted.AcceptedAt != binding.IssuedAtUtc ||
+            accepted.AcceptedAt + FormalEvidenceLifetime != binding.ExpiresAtUtc ||
+            !string.Equals(
+                accepted.EvidenceHash,
+                binding.FormalEvidenceFingerprint,
+                StringComparison.Ordinal))
+            return false;
+        lock (sync) return IsCandidateActionAllowedForActiveStageLocked(binding, request.Action);
     }
+
+    public async ValueTask<IBaiduCandidateMutationPermit?> TryAcquireMutationPermitAsync(
+        BaiduCandidateDomRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var authorization = request.Authorization;
+        var binding = request.Binding;
+        var now = timeProvider.GetUtcNow();
+        if (!IsCandidateActionAllowed(authorization.Capability.AdapterKind, request.Action) ||
+            !BindingMatches(authorization, binding) || binding.ExpiresAtUtc <= now)
+            return null;
+
+        if (binding.Source == AdapterWriteAuthorizationSource.ConsumedLease)
+        {
+            if (!options.IsEnabled || authorization.IsRecovery || binding.IsRecovery ||
+                binding.FormalEvidenceFingerprint is not null)
+                return null;
+            var key = AcceptanceWriteLeaseIdentity.From(authorization);
+            lock (sync)
+            {
+                now = timeProvider.GetUtcNow();
+                if (!operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
+                    expires != binding.ExpiresAtUtc || expires <= now ||
+                    !consumedLeaseOperations.TryGetValue(key, out var actions) ||
+                    !actions.Contains(BootstrapAction(authorization.Capability.AdapterKind)!.Value))
+                    return null;
+                return TryAcquireMutationPermitLocked(binding, request.Action);
+            }
+        }
+
+        if (binding.Source != AdapterWriteAuthorizationSource.ExactFormalRecord ||
+            string.IsNullOrWhiteSpace(binding.FormalEvidenceFingerprint))
+            return null;
+        var accepted = await GetFreshFormalAcceptanceAsync(authorization, now, cancellationToken)
+            .ConfigureAwait(false);
+        if (accepted is null || accepted.AcceptedAt != binding.IssuedAtUtc ||
+            accepted.AcceptedAt + FormalEvidenceLifetime != binding.ExpiresAtUtc ||
+            !string.Equals(
+                accepted.EvidenceHash,
+                binding.FormalEvidenceFingerprint,
+                StringComparison.Ordinal))
+            return null;
+        lock (sync)
+        {
+            if (binding.ExpiresAtUtc <= timeProvider.GetUtcNow()) return null;
+            return TryAcquireMutationPermitLocked(binding, request.Action);
+        }
+    }
+
+    private IBaiduCandidateMutationPermit? TryAcquireMutationPermitLocked(
+        AdapterWriteAuthorizationBinding binding,
+        BaiduAutomationAction action)
+    {
+        if (!bindingStates.TryGetValue(binding, out var state) || state.IsRevoking ||
+            !IsCandidateActionAllowedForStage(state.Stage, action))
+            return null;
+        state.ActiveMutationPermits++;
+        return new MutationPermit(this, binding);
+    }
+
+    private void ReleaseMutationPermit(AdapterWriteAuthorizationBinding binding)
+    {
+        TaskCompletionSource? drained = null;
+        lock (sync)
+        {
+            if (!bindingStates.TryGetValue(binding, out var state) || state.ActiveMutationPermits < 1)
+                return;
+            state.ActiveMutationPermits--;
+            if (state.ActiveMutationPermits == 0 && state.IsRevoking)
+            {
+                bindingStates.Remove(binding);
+                drained = state.Drained;
+            }
+        }
+        drained?.TrySetResult();
+    }
+
+    private bool IsCandidateActionAllowedForActiveStageLocked(
+        AdapterWriteAuthorizationBinding binding,
+        BaiduAutomationAction action) =>
+        bindingStates.TryGetValue(binding, out var state) && !state.IsRevoking &&
+        IsCandidateActionAllowedForStage(state.Stage, action);
+
+    private static bool IsCandidateActionAllowedForStage(
+        AdapterWriteAction stage,
+        BaiduAutomationAction action) => stage switch
+        {
+            AdapterWriteAction.PrepareTransfer => action is BaiduAutomationAction.SetExtractionCode or
+                BaiduAutomationAction.SelectExactItems or BaiduAutomationAction.ChooseDestination,
+            AdapterWriteAction.SubmitTransfer => action is BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.SetExtractionCode or BaiduAutomationAction.ChooseDestination or
+                BaiduAutomationAction.ClickSave,
+            AdapterWriteAction.PrepareShare => action is BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.ChoosePermanent or BaiduAutomationAction.SetExtractionCode,
+            AdapterWriteAction.SubmitShare => action is BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.ChoosePermanent or BaiduAutomationAction.SetExtractionCode or
+                BaiduAutomationAction.ClickShare or BaiduAutomationAction.CreateLink or
+                BaiduAutomationAction.ExportResult,
+            _ => false,
+        };
 
     private static bool IsCandidateActionAllowed(string adapterKind, BaiduAutomationAction action) =>
         adapterKind switch
@@ -556,6 +737,28 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
             },
             _ => false,
         };
+
+    private sealed class BindingState(AdapterWriteAction stage)
+    {
+        public AdapterWriteAction Stage { get; set; } = stage;
+        public bool IsRevoking { get; set; }
+        public int ActiveMutationPermits { get; set; }
+        public TaskCompletionSource? Drained { get; set; }
+    }
+
+    private sealed class MutationPermit(
+        AcceptanceWriteLeaseCoordinator owner,
+        AdapterWriteAuthorizationBinding binding) : IBaiduCandidateMutationPermit
+    {
+        private int disposed;
+
+        public ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0)
+                owner.ReleaseMutationPermit(binding);
+            return ValueTask.CompletedTask;
+        }
+    }
 
     private sealed record EvidenceState(
         bool Remote = false,

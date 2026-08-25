@@ -6,6 +6,8 @@ using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Infrastructure.Security;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -23,6 +25,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var profiles = new RecordingProfilePolicy(accountId);
         var context = new TransferOperationAutomationContext(
             operationId, batchId, accountId, 3, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, profiles, new TransferAutomationFlow(), "build-a",
             new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null)));
@@ -43,6 +46,28 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Equal(BaiduProtocolValidationStatus.NotValidated,
             broker.Navigation.FieldEvidenceValidationStatus);
         Assert.False(broker.Navigation.Acceptance.IsAccepted);
+        Assert.Same(context.AuthorizationBinding, broker.CandidateBinding!.Binding);
+        Assert.Equal(AdapterWriteAction.EnsureDirectory, broker.CandidateBinding.Authorization.Action);
+    }
+
+    [Fact]
+    public async Task UnboundTransferPreparationStopsBeforeBrokerSessionCreation()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a",
+            new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null)));
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Null(broker.Identity);
     }
 
     [Fact]
@@ -91,6 +116,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var attempts = new AttemptStore(Attempt(
             context, WebAutomationAttemptState.Preparing, null));
         var session = new ManualDirectorySession();
@@ -138,6 +164,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var attempts = new AttemptStore(Attempt(
             context, WebAutomationAttemptState.Preparing, null));
         var identity = new WebAutomationRequestIdentity(
@@ -160,6 +187,59 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
         Assert.Equal(0, executor.MutateCount);
         Assert.Equal(WebAutomationAttemptState.Preparing, attempts.Current.State);
+    }
+
+    [Fact]
+    public async Task RealQueueCreatesOnlyBoundProductionSessionAndKeepsUnavailableFieldsFailClosed()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        var candidate = CandidateBinding(context);
+        var boundContext = context with { AuthorizationBinding = candidate.Binding };
+        var attempts = new AttemptStore(Attempt(
+            boundContext, WebAutomationAttemptState.Preparing, null));
+        var executor = new DenyingCandidateExecutor();
+        var factory = new HeadlessProductionSessionFactory(executor);
+        var profileRoot = Path.Combine(Path.GetTempPath(), "bbt-transfer-binding", Guid.NewGuid().ToString("N"));
+        var profiles = new FileSystemAccountProfilePathPolicy(profileRoot);
+        Directory.CreateDirectory(profiles.GetAccountProfilePath(accountId));
+        var cancellation = new NoBatchCancellation();
+        await using var queue = new VisibleWebAutomationQueue(
+            factory,
+            new InlineDispatcher(),
+            profiles,
+            new WebView2ProfileCloser(),
+            new UserHandoffCoordinator(attempts, cancellation, new FixedTimeProvider(Now)),
+            cancellation,
+            new AlwaysBoundOwnershipStore(),
+            new ProductionWebAutomationNavigationAuthorizer(
+                new ExactNavigationSource(new(
+                    "BaiduTransfer", accountId, context.OperationId,
+                    context.Generation, context.BatchId))),
+            new VisibleWebAutomationQueueOptions
+            {
+                ActionStopTimeout = TimeSpan.FromSeconds(1),
+                SessionTimeout = TimeSpan.FromSeconds(5),
+                WindowCloseTimeout = TimeSpan.FromSeconds(1),
+            });
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), queue, profiles, new TransferAutomationFlow(),
+            "build-a", attempts);
+
+        var unbound = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+        var bound = await adapter.PrepareWholeShareForOperationAsync(
+            boundContext, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+
+        Assert.Equal(BaiduErrorKind.NotValidated, unbound.ErrorKind);
+        Assert.Equal(BaiduErrorKind.NotValidated, bound.ErrorKind);
+        Assert.Equal(1, factory.BoundCreatedCount);
+        Assert.Equal(0, factory.UnboundCreatedCount);
+        Assert.Same(candidate.Binding, factory.LastBinding!.Binding);
+        Assert.Equal(0, executor.MutateCount);
     }
 
     [Fact]
@@ -242,6 +322,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var attempts = new AttemptStore(Attempt(
             context,
             WebAutomationAttemptState.BaselinePersisted,
@@ -423,6 +504,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var attempts = new AttemptStore(Attempt(
             context,
             WebAutomationAttemptState.UserHandoff,
@@ -446,6 +528,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var baseline = WebAutomationBaseline.Create(["fictional-old"]);
         var attempts = new AttemptStore(Attempt(
             context,
@@ -528,6 +611,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        context = context with { AuthorizationBinding = CandidateBinding(context).Binding };
         var baseline = WebAutomationBaseline.Create(["fictional-old"]);
         var attempts = new AttemptStore(Attempt(
             context,
@@ -716,6 +800,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public WebAutomationRequestIdentity? Identity { get; private set; }
         public string? ProfilePath { get; private set; }
         public BaiduNavigationAuthorizationRequest? Navigation { get; private set; }
+        public BaiduCandidateSessionBinding? CandidateBinding { get; private set; }
 
         public Task<VisibleWebAutomationResult<T>> EnqueueAsync<T>(
             VisibleWebAutomationRequest<T> request,
@@ -724,6 +809,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             Identity = request.Identity;
             ProfilePath = request.ProfilePath;
             Navigation = request.Navigation;
+            CandidateBinding = request.CandidateBinding;
             if (ThrowAuthorization)
                 throw new WebAutomationAuthorizationException(
                     BaiduAutomationDenialReason.CatalogNotValidated,
@@ -814,7 +900,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 operationId == Current.OperationId && accountId == Current.AccountId && generation == Current.Generation
                     ? Current
                     : null);
-        public Task<bool> BeginAsync(WebAutomationAttemptRecord value, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> BeginAsync(WebAutomationAttemptRecord value, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
         public Task<Page<WebAutomationAttemptRecord>> GetRecoveryPageAsync(PageQuery query, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<bool> TryPersistBaselineAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationBaseline baseline, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<bool> TryAdvanceAsync(Guid operationId, Guid accountId, int generation, WebAutomationAttemptState expectedState, long expectedRevision, WebAutomationAttemptState nextState, string? observationFingerprint, bool isWaitingForUser, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
@@ -1003,6 +1090,54 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     {
         public Task<T> InvokeAsync<T>(Func<Task<T>> action, CancellationToken cancellationToken = default) => action();
         public Task InvokeAsync(Func<Task> action, CancellationToken cancellationToken = default) => action();
+    }
+
+    private sealed class HeadlessProductionSessionFactory(IBaiduCandidateDomExecutor executor)
+        : IBoundVisibleWebAutomationSessionFactory
+    {
+        public int BoundCreatedCount { get; private set; }
+        public int UnboundCreatedCount { get; private set; }
+        public BaiduCandidateSessionBinding? LastBinding { get; private set; }
+
+        public Task<IVisibleWebAutomationSession> CreateBoundAsync(
+            WebAutomationRequestIdentity identity,
+            string profilePath,
+            BaiduCandidateSessionBinding binding,
+            CancellationToken cancellationToken = default)
+        {
+            binding.ValidateIdentity(identity);
+            BoundCreatedCount++;
+            LastBinding = binding;
+            return Task.FromResult<IVisibleWebAutomationSession>(
+                new WebView2AutomationSession(identity, binding, executor, CancellationToken.None));
+        }
+
+        public Task<IVisibleWebAutomationSession> CreateAsync(
+            WebAutomationRequestIdentity identity,
+            string profilePath,
+            CancellationToken cancellationToken = default)
+        {
+            UnboundCreatedCount++;
+            throw new InvalidOperationException("An unbound production session must not be created.");
+        }
+    }
+
+    private sealed class ExactNavigationSource(BaiduAcceptanceOperationScope expected)
+        : IAcceptanceNavigationAuthorizationSource
+    {
+        public bool IsAuthorized(BaiduNavigationAuthorizationRequest request) =>
+            request.AcceptanceScope == expected;
+    }
+
+    private sealed class AlwaysBoundOwnershipStore : IWebAutomationRequestOwnershipStore
+    {
+        public Task<bool> IsBoundAsync(
+            Guid operationId,
+            Guid batchId,
+            Guid accountId,
+            int generation,
+            WebAutomationOwnerKind ownerKind,
+            CancellationToken cancellationToken = default) => Task.FromResult(true);
     }
 
     private sealed class NoBatchCancellation : IWebAutomationBatchCancellation

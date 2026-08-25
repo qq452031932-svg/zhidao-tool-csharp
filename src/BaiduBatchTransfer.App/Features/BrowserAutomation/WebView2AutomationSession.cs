@@ -110,10 +110,14 @@ public sealed class WebView2AutomationSession :
     public async Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (window is null) throw new InvalidOperationException("A headless test session cannot show a window.");
         if (Volatile.Read(ref closed) != 0) throw new ObjectDisposedException(nameof(WebView2AutomationSession));
         var decision = BaiduNavigationPolicy.Evaluate(initialUri);
         if (!decision.IsAllowed) throw new InvalidOperationException(decision.SafeMessage);
+        if (window is null)
+        {
+            currentOfficialUri = initialUri;
+            return;
+        }
 
         window.Show();
         var environment = await CoreWebView2Environment

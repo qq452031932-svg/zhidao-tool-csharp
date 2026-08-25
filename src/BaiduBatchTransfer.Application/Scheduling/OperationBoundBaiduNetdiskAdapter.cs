@@ -9,7 +9,8 @@ public sealed record TransferOperationAutomationContext(
     Guid AccountId,
     int Generation,
     ShareReference SourceShare,
-    bool IsRecovery = false)
+    bool IsRecovery = false,
+    AdapterWriteAuthorizationBinding? AuthorizationBinding = null)
 {
     public TransferOperationAutomationContext Validate()
     {

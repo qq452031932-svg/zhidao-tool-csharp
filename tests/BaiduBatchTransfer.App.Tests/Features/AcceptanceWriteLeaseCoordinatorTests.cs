@@ -133,6 +133,105 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task TemporaryTransferBindingRequiresExactEnsurePrepareSubmitSequence()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+        var prepare = ensure with { Action = AdapterWriteAction.PrepareTransfer };
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+
+        Assert.False(await coordinator.TryValidateBindingAsync(submit, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with { OperationId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with { AccountId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with { Generation = prepare.Generation + 1 }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with { BatchId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with
+            {
+                Capability = new AdapterCapabilityVersion(
+                    prepare.Capability.AdapterKind,
+                    prepare.Capability.ProtocolVersion,
+                    prepare.Capability.SelectorVersion,
+                    "other-build"),
+            }, binding));
+        Assert.True(await coordinator.TryValidateBindingAsync(prepare, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(prepare, binding));
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(submit, binding));
+        Assert.Null(await coordinator.TryCreateBindingAsync(ensure));
+    }
+
+    [Fact]
+    public async Task TransferBindingRejectsExpiredTemporaryRecoveryAndAllowsExactFormalRecovery()
+    {
+        var clock = new MutableTimeProvider(Now);
+        var temporary = Coordinator(true, ["--webview-acceptance"], clock);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(temporary.TryCreateLease(ensure, Confirmed()));
+        var expired = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await temporary.TryCreateBindingAsync(ensure));
+        clock.Advance(TimeSpan.FromMinutes(6));
+        Assert.False(await temporary.TryValidateBindingAsync(
+            ensure with { Action = AdapterWriteAction.PrepareTransfer }, expired));
+        Assert.Null(await temporary.TryCreateBindingAsync(
+            ensure with { OperationId = Guid.NewGuid(), IsRecovery = true }));
+
+        var store = new MemoryCapabilityStore();
+        store.Records.Add(new(
+            ensure.Capability.AdapterKind,
+            ensure.Capability.ProtocolVersion,
+            ensure.Capability.SelectorVersion,
+            ensure.Capability.BuildVersion,
+            Now,
+            Hash));
+        var formal = Coordinator(false, [], store: store);
+        foreach (var isRecovery in new[] { false, true })
+        {
+            var operation = ensure with { OperationId = Guid.NewGuid(), IsRecovery = isRecovery };
+            var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+                await formal.TryCreateBindingAsync(operation));
+            Assert.Equal(AdapterWriteAuthorizationSource.ExactFormalRecord, binding.Source);
+            Assert.True(await formal.TryValidateBindingAsync(
+                operation with { Action = AdapterWriteAction.PrepareTransfer }, binding));
+            Assert.True(await formal.TryValidateBindingAsync(
+                operation with { Action = AdapterWriteAction.SubmitTransfer }, binding));
+        }
+    }
+
+    [Fact]
+    public async Task ReleasedFormalTransferBindingCannotBeReissuedForTheSameExactIdentity()
+    {
+        var store = new MemoryCapabilityStore();
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        store.Records.Add(new(
+            ensure.Capability.AdapterKind,
+            ensure.Capability.ProtocolVersion,
+            ensure.Capability.SelectorVersion,
+            ensure.Capability.BuildVersion,
+            Now,
+            Hash));
+        var coordinator = Coordinator(false, [], store: store);
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+
+        await coordinator.ReleaseBindingAsync(binding);
+
+        Assert.Null(await coordinator.TryCreateBindingAsync(ensure));
+        Assert.NotNull(await coordinator.TryCreateBindingAsync(
+            ensure with { OperationId = Guid.NewGuid() }));
+        Assert.NotNull(await coordinator.TryCreateBindingAsync(
+            ensure with { Generation = ensure.Generation + 1 }));
+    }
+
+    [Fact]
     public async Task TemporaryShareBindingCannotSwitchToFormalRecordAfterOriginalExpiry()
     {
         var clock = new MutableTimeProvider(Now);

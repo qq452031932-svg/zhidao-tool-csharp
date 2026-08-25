@@ -80,7 +80,9 @@ public sealed class WebView2CandidateDomExecutor(
         cancellationToken.ThrowIfCancellationRequested();
         if (!Matches(request, observation))
             return BaiduCandidateDomResult.Denied(BaiduAutomationDenialReason.ObservationNotValidated);
-        if (!await authorizationSource.IsAuthorizedAsync(request, cancellationToken).ConfigureAwait(false))
+        await using var permit = await authorizationSource
+            .TryAcquireMutationPermitAsync(request, cancellationToken).ConfigureAwait(false);
+        if (permit is null)
             return BaiduCandidateDomResult.Denied(BaiduAutomationDenialReason.AcceptanceMissing);
         cancellationToken.ThrowIfCancellationRequested();
         var arguments = SerializeArguments(request, observation.ObservationToken);
