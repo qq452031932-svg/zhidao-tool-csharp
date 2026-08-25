@@ -10,7 +10,8 @@ public sealed record ShareOperationAutomationContext(
     int Generation,
     WebAutomationOwnerKind OwnerKind,
     RemoteItemIdentitySet ExactRemoteItems,
-    bool IsRecovery = false)
+    bool IsRecovery = false,
+    AdapterWriteAuthorizationBinding? AuthorizationBinding = null)
 {
     public ShareOperationAutomationContext Validate()
     {

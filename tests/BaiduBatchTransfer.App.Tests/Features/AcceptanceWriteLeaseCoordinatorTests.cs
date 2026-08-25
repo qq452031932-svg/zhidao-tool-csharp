@@ -94,6 +94,145 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task TemporaryShareBindingIsCreatedOnceAndSubmitOnlyRevalidatesExactIdentity()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var prepare = Request() with
+        {
+            Capability = new("BaiduShare", "protocol-v1", "selector-v1", "build-1"),
+            Action = AdapterWriteAction.PrepareShare,
+        };
+        Assert.True(coordinator.TryCreateLease(prepare, Confirmed()));
+
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(prepare));
+
+        Assert.Equal(AdapterWriteAuthorizationSource.ConsumedLease, binding.Source);
+        Assert.Equal(prepare.OperationId, binding.OperationId);
+        var submit = prepare with { Action = AdapterWriteAction.SubmitShare };
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            submit with { OperationId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            submit with { AccountId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            submit with { Generation = submit.Generation + 1 }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            submit with { BatchId = Guid.NewGuid() }, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            submit with
+            {
+                Capability = new AdapterCapabilityVersion(
+                    submit.Capability.AdapterKind,
+                    submit.Capability.ProtocolVersion,
+                    "other-selector",
+                    submit.Capability.BuildVersion),
+            }, binding));
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        Assert.False(await coordinator.TryValidateBindingAsync(submit, binding));
+        Assert.Null(await coordinator.TryCreateBindingAsync(prepare));
+    }
+
+    [Fact]
+    public async Task TemporaryShareBindingCannotSwitchToFormalRecordAfterOriginalExpiry()
+    {
+        var clock = new MutableTimeProvider(Now);
+        var store = new MemoryCapabilityStore();
+        var coordinator = Coordinator(true, ["--webview-acceptance"], clock, store);
+        var prepare = Request() with
+        {
+            Capability = new("BaiduShare", "protocol-v1", "selector-v1", "build-1"),
+            Action = AdapterWriteAction.PrepareShare,
+        };
+        Assert.True(coordinator.TryCreateLease(prepare, Confirmed()));
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(prepare));
+
+        clock.Advance(TimeSpan.FromMinutes(6));
+        store.Records.Add(new(
+            prepare.Capability.AdapterKind,
+            prepare.Capability.ProtocolVersion,
+            prepare.Capability.SelectorVersion,
+            prepare.Capability.BuildVersion,
+            clock.GetUtcNow(),
+            Hash));
+
+        Assert.False(await coordinator.TryValidateBindingAsync(
+            prepare with { Action = AdapterWriteAction.SubmitShare }, binding));
+    }
+
+    [Fact]
+    public async Task ExactFormalShareBindingAllowsOrdinaryAndRecoveryWithoutLeaseConsumption()
+    {
+        var store = new MemoryCapabilityStore();
+        var prepare = Request() with
+        {
+            Capability = new("BaiduShare", "protocol-v1", "selector-v1", "build-1"),
+            Action = AdapterWriteAction.PrepareShare,
+        };
+        store.Records.Add(new(
+            prepare.Capability.AdapterKind,
+            prepare.Capability.ProtocolVersion,
+            prepare.Capability.SelectorVersion,
+            prepare.Capability.BuildVersion,
+            Now,
+            Hash));
+        var coordinator = Coordinator(false, [], store: store);
+
+        foreach (var isRecovery in new[] { false, true })
+        {
+            var request = prepare with
+            {
+                OperationId = Guid.NewGuid(),
+                IsRecovery = isRecovery,
+            };
+            var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+                await coordinator.TryCreateBindingAsync(request));
+            Assert.Equal(AdapterWriteAuthorizationSource.ExactFormalRecord, binding.Source);
+            Assert.Equal(Now + AcceptanceWriteLeaseCoordinator.FormalEvidenceLifetime, binding.ExpiresAtUtc);
+            Assert.True(await coordinator.TryValidateBindingAsync(
+                request with { Action = AdapterWriteAction.SubmitShare }, binding));
+        }
+    }
+
+    [Fact]
+    public async Task TemporaryShareBindingRejectsRecoveryAndFormalBindingRejectsChangedRecord()
+    {
+        var temporary = Coordinator(true, ["--webview-acceptance"]);
+        var recoveryPrepare = Request() with
+        {
+            Capability = new("BaiduShare", "protocol-v1", "selector-v1", "build-1"),
+            Action = AdapterWriteAction.PrepareShare,
+            IsRecovery = true,
+        };
+        Assert.True(temporary.TryCreateLease(recoveryPrepare, Confirmed()));
+        Assert.Null(await temporary.TryCreateBindingAsync(recoveryPrepare));
+
+        var store = new MemoryCapabilityStore();
+        var ordinary = recoveryPrepare with { IsRecovery = false };
+        store.Records.Add(new(
+            ordinary.Capability.AdapterKind,
+            ordinary.Capability.ProtocolVersion,
+            ordinary.Capability.SelectorVersion,
+            ordinary.Capability.BuildVersion,
+            Now,
+            Hash));
+        var formal = Coordinator(false, [], store: store);
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await formal.TryCreateBindingAsync(ordinary));
+        store.Records.Clear();
+        store.Records.Add(new(
+            ordinary.Capability.AdapterKind,
+            ordinary.Capability.ProtocolVersion,
+            ordinary.Capability.SelectorVersion,
+            ordinary.Capability.BuildVersion,
+            Now.AddMinutes(1),
+            HashB));
+
+        Assert.False(await formal.TryValidateBindingAsync(
+            ordinary with { Action = AdapterWriteAction.SubmitShare }, binding));
+    }
+
+    [Fact]
     public async Task FormalAcceptanceRequiresAllEvidenceAndSecondConfirmation()
     {
         var store = new MemoryCapabilityStore();

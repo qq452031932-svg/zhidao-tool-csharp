@@ -28,6 +28,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, EvidenceState> evidence = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, string> completedEvidence = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, DateTimeOffset> navigationScopes = [];
+    private readonly HashSet<AdapterWriteAuthorizationBinding> validatedShareBindings = [];
 
     public AcceptanceWriteLeaseCoordinator(
         AcceptanceWriteLeaseOptions options,
@@ -105,6 +106,156 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         if (!TryCreateLease(request, new(true, true, true))) return false;
         return TryConsume(request, timeProvider.GetUtcNow());
     }
+
+    public async ValueTask<AdapterWriteAuthorizationBinding?> TryCreateBindingAsync(
+        AdapterWriteAuthorizationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(request.Capability);
+        if (!string.Equals(request.Capability.AdapterKind, "BaiduShare", StringComparison.Ordinal) ||
+            request.Action != AdapterWriteAction.PrepareShare || !HasExactOperationIdentity(request) ||
+            request.BatchId == Guid.Empty)
+            return null;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var now = timeProvider.GetUtcNow();
+        var accepted = await GetFreshFormalAcceptanceAsync(request, now, cancellationToken)
+            .ConfigureAwait(false);
+        if (accepted is not null)
+        {
+            var expires = accepted.AcceptedAt + FormalEvidenceLifetime;
+            RegisterNavigationScope(request, expires);
+            return new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ExactFormalRecord,
+                request.Capability,
+                request.AccountId,
+                request.OperationId,
+                request.Generation,
+                request.BatchId,
+                accepted.AcceptedAt,
+                expires,
+                request.IsRecovery,
+                accepted.EvidenceHash);
+        }
+
+        if (!options.IsEnabled || request.IsRecovery) return null;
+        if (!TryConsume(request, now))
+        {
+            if (presenter is null ||
+                !await presenter.PresentAsync(request, cancellationToken).ConfigureAwait(false) ||
+                !TryCreateLease(request, new(true, true, true)) ||
+                !TryConsume(request, timeProvider.GetUtcNow()))
+                return null;
+        }
+
+        var key = AcceptanceWriteLeaseIdentity.From(request);
+        lock (sync)
+        {
+            if (!operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
+                expires <= timeProvider.GetUtcNow())
+                return null;
+            return new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ConsumedLease,
+                request.Capability,
+                request.AccountId,
+                request.OperationId,
+                request.Generation,
+                request.BatchId,
+                now,
+                expires,
+                request.IsRecovery,
+                null);
+        }
+    }
+
+    public async ValueTask<bool> TryValidateBindingAsync(
+        AdapterWriteAuthorizationRequest request,
+        AdapterWriteAuthorizationBinding binding,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(binding);
+        cancellationToken.ThrowIfCancellationRequested();
+        var now = timeProvider.GetUtcNow();
+        if (request.Action != AdapterWriteAction.SubmitShare ||
+            !BindingMatches(request, binding) || binding.ExpiresAtUtc <= now)
+            return false;
+
+        if (binding.Source == AdapterWriteAuthorizationSource.ConsumedLease)
+        {
+            if (!options.IsEnabled || request.IsRecovery || binding.IsRecovery ||
+                binding.FormalEvidenceFingerprint is not null)
+                return false;
+            var key = AcceptanceWriteLeaseIdentity.From(request);
+            lock (sync)
+            {
+                if (validatedShareBindings.Contains(binding) ||
+                    !operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
+                    expires != binding.ExpiresAtUtc || expires <= now ||
+                    !consumedLeaseOperations.TryGetValue(key, out var actions) ||
+                    !actions.Contains(AdapterWriteAction.PrepareShare) ||
+                    actions.Contains(AdapterWriteAction.SubmitShare))
+                    return false;
+                actions.Add(AdapterWriteAction.SubmitShare);
+                validatedShareBindings.Add(binding);
+                return true;
+            }
+        }
+
+        if (binding.Source != AdapterWriteAuthorizationSource.ExactFormalRecord ||
+            string.IsNullOrWhiteSpace(binding.FormalEvidenceFingerprint))
+            return false;
+        var accepted = await GetFreshFormalAcceptanceAsync(request, now, cancellationToken)
+            .ConfigureAwait(false);
+        if (accepted is null || accepted.AcceptedAt != binding.IssuedAtUtc ||
+            accepted.AcceptedAt + FormalEvidenceLifetime != binding.ExpiresAtUtc ||
+            !string.Equals(
+                accepted.EvidenceHash,
+                binding.FormalEvidenceFingerprint,
+                StringComparison.Ordinal))
+            return false;
+        lock (sync) return validatedShareBindings.Add(binding);
+    }
+
+    private async Task<AdapterCapabilityAcceptanceRecord?> GetFreshFormalAcceptanceAsync(
+        AdapterWriteAuthorizationRequest request,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var accepted = await store.GetAsync(
+                request.Capability.AdapterKind,
+                request.Capability.ProtocolVersion,
+                request.Capability.SelectorVersion,
+                request.Capability.BuildVersion,
+                cancellationToken).ConfigureAwait(false);
+            return accepted is not null && accepted.AcceptedAt <= now &&
+                   now - accepted.AcceptedAt <= FormalEvidenceLifetime
+                ? accepted
+                : null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool BindingMatches(
+        AdapterWriteAuthorizationRequest request,
+        AdapterWriteAuthorizationBinding binding) =>
+        Equals(request.Capability, binding.Capability) &&
+        request.AccountId == binding.AccountId &&
+        request.OperationId == binding.OperationId &&
+        request.Generation == binding.Generation &&
+        request.BatchId == binding.BatchId &&
+        request.IsRecovery == binding.IsRecovery &&
+        binding.IssuedAtUtc < binding.ExpiresAtUtc;
 
     private bool TryConsume(AdapterWriteAuthorizationRequest request, DateTimeOffset now)
     {

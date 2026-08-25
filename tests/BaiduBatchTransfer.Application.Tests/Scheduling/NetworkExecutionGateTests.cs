@@ -111,6 +111,72 @@ public sealed class NetworkExecutionGateTests
         Assert.Equal(0, inner.WriteCount);
     }
 
+    [Fact]
+    public async Task SharePreparationObtainsAndInjectsImmutableAuthorizationBeforeInnerAdapter()
+    {
+        var inner = new CountingOperationBoundShareAdapter();
+        var capability = new AdapterCapabilityVersion("BaiduShare", "p1", "s1", "b1");
+        var gate = new BindingWriteGate(capability);
+        var wrapped = Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(
+            CoordinatedBaiduShareAdapter.Wrap(
+                inner, new BaiduAdapterConcurrencyGate(), gate, capability));
+        var accountId = Guid.NewGuid();
+        var items = new RemoteItemIdentitySet([new("remote-1", "item")]);
+        var context = new ShareOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
+            WebAutomationOwnerKind.StandaloneShare, items);
+        var session = new AccountSession(
+            accountId, "baidu-user",
+            [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
+            DateTimeOffset.UtcNow);
+
+        var prepared = await wrapped.PreparePermanentShareForOperationAsync(
+            context, session, new PermanentShareRequest(items), CancellationToken.None);
+
+        Assert.True(prepared.IsSuccess);
+        Assert.Equal(AdapterWriteAction.PrepareShare, gate.CreatedFor!.Action);
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(inner.PreparedContext!.AuthorizationBinding);
+        Assert.Equal(AdapterWriteAuthorizationSource.ConsumedLease, binding.Source);
+        Assert.Equal(context.OperationId, binding.OperationId);
+        Assert.Equal(capability, binding.Capability);
+        Assert.True(gate.BindingCreatedBeforeInner);
+
+        var submitted = await wrapped.SubmitPermanentShareForOperationAsync(
+            context, session, new PermanentShareRequest(items), CancellationToken.None);
+
+        Assert.True(submitted.IsSuccess);
+        Assert.Equal(AdapterWriteAction.SubmitShare, gate.ValidatedFor!.Action);
+        Assert.Same(binding, gate.ValidatedBinding);
+        Assert.Equal(1, gate.CreateCount);
+    }
+
+    [Fact]
+    public async Task DeniedSharePreparationDoesNotReachInnerAdapter()
+    {
+        var inner = new CountingOperationBoundShareAdapter();
+        var capability = new AdapterCapabilityVersion("BaiduShare", "p1", "s1", "b1");
+        var wrapped = Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(
+            CoordinatedBaiduShareAdapter.Wrap(
+                inner, new BaiduAdapterConcurrencyGate(), new RejectingWriteGate(), capability));
+        var accountId = Guid.NewGuid();
+        var items = new RemoteItemIdentitySet([new("remote-1", "item")]);
+        var context = new ShareOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
+            WebAutomationOwnerKind.StandaloneShare, items);
+
+        var result = await wrapped.PreparePermanentShareForOperationAsync(
+            context,
+            new AccountSession(
+                accountId, "baidu-user",
+                [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
+                DateTimeOffset.UtcNow),
+            new PermanentShareRequest(items),
+            CancellationToken.None);
+
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(0, inner.PrepareCount);
+    }
+
     private sealed class RejectingWriteGate : IAdapterWriteAuthorizationGate
     {
         public ValueTask<bool> TryAuthorizeAsync(
@@ -124,6 +190,48 @@ public sealed class NetworkExecutionGateTests
         public ValueTask<bool> TryAuthorizeAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default)
         {
             Seen = request;
+            return ValueTask.FromResult(true);
+        }
+    }
+
+    private sealed class BindingWriteGate(AdapterCapabilityVersion capability) : IAdapterWriteAuthorizationGate
+    {
+        public int CreateCount { get; private set; }
+        public AdapterWriteAuthorizationRequest? CreatedFor { get; private set; }
+        public AdapterWriteAuthorizationRequest? ValidatedFor { get; private set; }
+        public AdapterWriteAuthorizationBinding? ValidatedBinding { get; private set; }
+        public bool BindingCreatedBeforeInner { get; private set; }
+
+        public ValueTask<bool> TryAuthorizeAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default) =>
+            ValueTask.FromResult(false);
+
+        public ValueTask<AdapterWriteAuthorizationBinding?> TryCreateBindingAsync(
+            AdapterWriteAuthorizationRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            CreateCount++;
+            CreatedFor = request;
+            BindingCreatedBeforeInner = true;
+            return ValueTask.FromResult<AdapterWriteAuthorizationBinding?>(new(
+                AdapterWriteAuthorizationSource.ConsumedLease,
+                capability,
+                request.AccountId,
+                request.OperationId,
+                request.Generation,
+                request.BatchId,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddMinutes(5),
+                request.IsRecovery,
+                null));
+        }
+
+        public ValueTask<bool> TryValidateBindingAsync(
+            AdapterWriteAuthorizationRequest request,
+            AdapterWriteAuthorizationBinding binding,
+            CancellationToken cancellationToken = default)
+        {
+            ValidatedFor = request;
+            ValidatedBinding = binding;
             return ValueTask.FromResult(true);
         }
     }
@@ -159,14 +267,27 @@ public sealed class NetworkExecutionGateTests
     private sealed class CountingOperationBoundShareAdapter : IOperationBoundBaiduShareAdapter
     {
         public int WriteCount { get; private set; }
+        public int PrepareCount { get; private set; }
+        public ShareOperationAutomationContext? PreparedContext { get; private set; }
 
         public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken)
         {
             WriteCount++;
-            throw new InvalidOperationException("The denied write reached the inner adapter.");
+            return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(new(
+                DateTimeOffset.UtcNow,
+                "request-id",
+                request,
+                "share-id",
+                "https://pan.baidu.com/s/share-id",
+                new(true, true, ShareExtractionCodeBehavior.Random, "a1b2"))));
         }
 
-        public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken)
+        {
+            PrepareCount++;
+            PreparedContext = context;
+            return Task.FromResult(BaiduAdapterResult<SharePreparationReceipt>.Success(SharePreparationReceipt.Ready));
+        }
         public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken) => throw new NotSupportedException();

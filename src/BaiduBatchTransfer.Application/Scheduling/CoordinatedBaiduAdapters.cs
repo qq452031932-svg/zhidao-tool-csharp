@@ -18,14 +18,44 @@ public enum AdapterWriteAction
 {
     EnsureDirectory,
     SubmitTransfer,
+    PrepareShare,
     SubmitShare,
 }
+
+public enum AdapterWriteAuthorizationSource
+{
+    ConsumedLease,
+    ExactFormalRecord,
+}
+
+public sealed record AdapterWriteAuthorizationBinding(
+    AdapterWriteAuthorizationSource Source,
+    AdapterCapabilityVersion Capability,
+    Guid AccountId,
+    Guid OperationId,
+    int Generation,
+    Guid BatchId,
+    DateTimeOffset IssuedAtUtc,
+    DateTimeOffset ExpiresAtUtc,
+    bool IsRecovery,
+    string? FormalEvidenceFingerprint);
 
 public interface IAdapterWriteAuthorizationGate
 {
     ValueTask<bool> TryAuthorizeAsync(
         AdapterWriteAuthorizationRequest request,
         CancellationToken cancellationToken = default);
+
+    ValueTask<AdapterWriteAuthorizationBinding?> TryCreateBindingAsync(
+        AdapterWriteAuthorizationRequest request,
+        CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult<AdapterWriteAuthorizationBinding?>(null);
+
+    ValueTask<bool> TryValidateBindingAsync(
+        AdapterWriteAuthorizationRequest request,
+        AdapterWriteAuthorizationBinding binding,
+        CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult(false);
 }
 
 public sealed class BaiduAdapterConcurrencyGate
@@ -242,6 +272,7 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
     private readonly BaiduAdapterConcurrencyGate gate;
     private readonly IAdapterWriteAuthorizationGate? writeGate;
     private readonly AdapterCapabilityVersion? capability;
+    protected bool HasWriteGate => writeGate is not null;
 
     public CoordinatedBaiduShareAdapter(
         IBaiduShareAdapter inner,
@@ -318,6 +349,66 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
         }
         return await RunAsync(session, action, cancellationToken).ConfigureAwait(false);
     }
+
+    protected async Task<BaiduAdapterResult<T>> RunBindingCreateAsync<T>(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        Func<ShareOperationAutomationContext, CancellationToken, Task<BaiduAdapterResult<T>>> action,
+        CancellationToken cancellationToken,
+        Func<ShareOperationAutomationContext, bool>? bind = null)
+    {
+        if (writeGate is null)
+            return await RunAsync(session, token => action(context, token), cancellationToken).ConfigureAwait(false);
+        return await RunAsync(
+            session,
+            async token =>
+            {
+                if (session.LocalAccountId != context.AccountId) return NotValidated<T>();
+                var request = WriteRequest(context, session, AdapterWriteAction.PrepareShare);
+                var binding = await writeGate.TryCreateBindingAsync(request, token).ConfigureAwait(false);
+                if (binding is null) return NotValidated<T>();
+                var boundContext = context with { AuthorizationBinding = binding };
+                if (bind is not null && !bind(boundContext)) return NotValidated<T>();
+                return await action(boundContext, token).ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    protected async Task<BaiduAdapterResult<T>> RunBindingValidateAsync<T>(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        Func<CancellationToken, Task<BaiduAdapterResult<T>>> action,
+        CancellationToken cancellationToken)
+    {
+        if (writeGate is null)
+            return await RunAsync(session, action, cancellationToken).ConfigureAwait(false);
+        return await RunAsync(
+            session,
+            async token =>
+            {
+                if (session.LocalAccountId != context.AccountId ||
+                    context.AuthorizationBinding is not { } binding)
+                    return NotValidated<T>();
+                var request = WriteRequest(context, session, AdapterWriteAction.SubmitShare);
+                if (!await writeGate.TryValidateBindingAsync(request, binding, token).ConfigureAwait(false))
+                    return NotValidated<T>();
+                return await action(token).ConfigureAwait(false);
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private AdapterWriteAuthorizationRequest WriteRequest(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        AdapterWriteAction action) => new(
+        capability!, session.LocalAccountId ?? Guid.Empty, context.OperationId, context.Generation,
+        context.BatchId, action, context.IsRecovery);
+
+    protected static BaiduAdapterResult<T> NotValidated<T>() =>
+        BaiduAdapterResult<T>.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
 }
 
 public sealed class CoordinatedOperationBoundBaiduShareAdapter(
@@ -327,31 +418,67 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
     AdapterCapabilityVersion? capability = null) : CoordinatedBaiduShareAdapter(inner, gate, writeGate, capability), IOperationBoundBaiduShareAdapter
 {
     private readonly IOperationBoundBaiduShareAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
+    private readonly ConcurrentDictionary<ShareBindingKey, AdapterWriteAuthorizationBinding> bindings = [];
 
-    public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(
+    public async Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(
         ShareOperationAutomationContext context,
         AccountSession session,
         PermanentShareRequest request,
-        CancellationToken cancellationToken) =>
-        RunAsync(
-            session,
-            token => inner.PreparePermanentShareForOperationAsync(context, session, request, token),
-            cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var key = ShareBindingKey.From(context);
+        var keepBinding = false;
+        try
+        {
+            var prepared = await RunBindingCreateAsync(
+                context,
+                session,
+                (boundContext, token) => inner.PreparePermanentShareForOperationAsync(
+                    boundContext, session, request, token),
+                cancellationToken,
+                boundContext => bindings.TryAdd(key, boundContext.AuthorizationBinding!))
+                .ConfigureAwait(false);
+            keepBinding = prepared.IsSuccess;
+            return prepared;
+        }
+        finally
+        {
+            if (!keepBinding) bindings.TryRemove(key, out _);
+        }
+    }
 
-    public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(
+    public async Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(
         ShareOperationAutomationContext context,
         AccountSession session,
         PermanentShareRequest request,
-        CancellationToken cancellationToken) =>
-        RunWriteAsync(
-            session,
-            context.OperationId,
-            context.Generation,
-            token => inner.SubmitPermanentShareForOperationAsync(context, session, request, token),
-            cancellationToken,
-            context.BatchId,
-            AdapterWriteAction.SubmitShare,
-            context.IsRecovery);
+        CancellationToken cancellationToken)
+    {
+        if (!HasWriteGate)
+            return await RunBindingValidateAsync(
+                context,
+                session,
+                token => inner.SubmitPermanentShareForOperationAsync(
+                    context, session, request, token),
+                cancellationToken).ConfigureAwait(false);
+        var key = ShareBindingKey.From(context);
+        if (!bindings.TryGetValue(key, out var binding) ||
+            context.AuthorizationBinding is { } supplied && supplied != binding)
+            return NotValidated<ShareCreationReceipt>();
+        var boundContext = context with { AuthorizationBinding = binding };
+        try
+        {
+            return await RunBindingValidateAsync(
+                boundContext,
+                session,
+                token => inner.SubmitPermanentShareForOperationAsync(
+                    boundContext, session, request, token),
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            bindings.TryRemove(key, out _);
+        }
+    }
 
     public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(
         ShareOperationAutomationContext context,
@@ -362,4 +489,14 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
             session,
             token => inner.ConfirmExactShareForOperationAsync(context, session, request, token),
             cancellationToken);
+
+    private readonly record struct ShareBindingKey(
+        Guid AccountId,
+        Guid OperationId,
+        int Generation,
+        Guid BatchId)
+    {
+        public static ShareBindingKey From(ShareOperationAutomationContext context) =>
+            new(context.AccountId, context.OperationId, context.Generation, context.BatchId);
+    }
 }
