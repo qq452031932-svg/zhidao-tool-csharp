@@ -5,6 +5,7 @@ using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Shares;
+using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
@@ -15,6 +16,7 @@ using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Excel;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
@@ -72,6 +74,15 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<ILocalResultDestinationStore>());
         Assert.IsType<SqliteLocalResultExportStore>(
             host.Services.GetRequiredService<ILocalResultExportStore>());
+        Assert.IsType<SqliteLocalResultExportOwnerRepository>(
+            host.Services.GetRequiredService<ILocalResultExportOwnerRepository>());
+        Assert.IsType<LocalResultExportArtifactService>(
+            host.Services.GetRequiredService<ILocalResultExportArtifactService>());
+        Assert.IsType<LocalResultExportCoordinator>(
+            host.Services.GetRequiredService<ILocalResultExportCoordinator>());
+        Assert.Contains(
+            host.Services.GetServices<IHostedService>(),
+            service => service is LocalResultExportHostedService);
         Assert.IsType<SqliteWebAutomationAttemptStore>(
             host.Services.GetRequiredService<IWebAutomationAttemptStore>());
         Assert.IsType<WebViewRemoteResourcePicker>(
@@ -80,6 +91,12 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IRemoteSelectionSessionStore>());
         Assert.IsType<SqliteStandaloneShareStore>(
             host.Services.GetRequiredService<IStandaloneShareStore>());
+        Assert.Same(
+            host.Services.GetRequiredService<IStandaloneShareStore>(),
+            host.Services.GetRequiredService<IStandaloneShareResultProjectionRepository>());
+        Assert.IsType<ShareOfficialResultDestinationResolver>(
+            host.Services.GetRequiredService<IShareOfficialResultDestinationResolver>());
+        Assert.NotNull(host.Services.GetRequiredService<ExportStandaloneShareResultsService>());
         Assert.Same(
             host.Services.GetRequiredService<IStandaloneShareStore>(),
             host.Services.GetRequiredService<IStandaloneShareExecutionStore>());

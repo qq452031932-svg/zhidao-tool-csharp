@@ -253,6 +253,9 @@
                                 <Button Padding="12,5" Content="暂停" Command="{Binding PauseCommand}" />
                                 <Button Margin="8,0,0,0" Padding="12,5" Content="继续" Command="{Binding ResumeCommand}" />
                                 <Button Margin="8,0,0,0" Padding="12,5" Content="重试失败项" Command="{Binding RetryFailedCommand}" />
+                                <Button Margin="8,0,0,0" Padding="12,5" Content="保存结果"
+                                        Command="{Binding SaveResultsCommand}"
+                                        AutomationProperties.Name="保存分享结果" />
                             </StackPanel>
                         </StackPanel>
                     </Grid>

@@ -5,6 +5,8 @@ using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Infrastructure.Excel;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -196,6 +198,63 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     [Fact]
+    public async Task OperationBoundExactConfirmationDownloadsBeforeSucceededUsingTheResolvedDirectory()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare);
+        var baseline = WebAutomationBaseline.Create(["share-existing"]);
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.ResultPending, baseline, Request().RemoteItems));
+        var exactListing = Listing(ExistingEntry(), AcceptedEntry());
+        var automation = new ShareSession(exactListing, exactListing);
+        var identity = new WebAutomationRequestIdentity(
+            context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind);
+        automation.EnableExport(identity, await ValidWorkbookAsync());
+        using var output = new TemporaryDirectory();
+        var adapter = Adapter(
+            accountId,
+            new CallbackBroker(attempts, automation),
+            attempts,
+            new AcceptanceStore(Acceptance()),
+            resultDestination: new FixedResultDestination(output.Path));
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(["read-list", "export-result"], automation.Events);
+        Assert.True(File.Exists(Path.Combine(
+            output.Path, "官方导出明细", WebViewDownloadCoordinator.BuildOfficialFileName(identity))));
+    }
+
+    [Fact]
+    public async Task ConfiguredOfficialExportWithoutAuthoritativeDestinationStaysResultPending()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.TransferShare);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["share-existing"]),
+            Request().RemoteItems));
+        var automation = new ShareSession(Listing(ExistingEntry(), AcceptedEntry()));
+        var adapter = Adapter(
+            accountId,
+            new CallbackBroker(attempts, automation),
+            attempts,
+            new AcceptanceStore(Acceptance()),
+            resultDestination: new MissingResultDestination());
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
+        Assert.Empty(automation.Events);
+    }
+
+    [Fact]
     public async Task AmbiguousRecoveryStaysResultPendingWithoutClicking()
     {
         var accountId = Guid.NewGuid();
@@ -232,7 +291,8 @@ public sealed class WebViewBaiduShareAdapterTests
             context, WebAutomationAttemptState.Submitting,
             WebAutomationBaseline.Create(["share-existing"])));
         var evidence = new AcceptanceStore(attempts: attempts);
-        var automation = new ShareSession(Listing(ExistingEntry(), AcceptedEntry()));
+        var exactListing = Listing(ExistingEntry(), AcceptedEntry());
+        var automation = new ShareSession(exactListing, exactListing);
         var adapter = Adapter(accountId, new CallbackBroker(attempts, automation), attempts, evidence);
 
         var result = await adapter.ConfirmExactShareForOperationAsync(
@@ -242,7 +302,7 @@ public sealed class WebViewBaiduShareAdapterTests
         Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
         Assert.Equal(Request().RemoteItems, attempts.Current.AcceptedRemoteItems);
         Assert.NotNull(await evidence.GetAsync(context, CancellationToken.None));
-        Assert.Equal(["read-list"], automation.Events);
+        Assert.Equal(["read-list", "read-list"], automation.Events);
         Assert.Equal(0, automation.SubmitCount);
     }
 
@@ -303,7 +363,8 @@ public sealed class WebViewBaiduShareAdapterTests
         IVisibleWebAutomationBroker broker,
         IWebAutomationAttemptStore? attempts = null,
         IShareAutomationAcceptanceEvidenceStore? evidence = null,
-        IAccountProfilePathPolicy? profiles = null) =>
+        IAccountProfilePathPolicy? profiles = null,
+        IShareOfficialResultDestinationResolver? resultDestination = null) =>
         new(
             new ReadOnlyShareAdapter(),
             broker,
@@ -311,7 +372,8 @@ public sealed class WebViewBaiduShareAdapterTests
             new ShareAutomationFlow(new FixedTimeProvider(Now)),
             "build-share-a",
             attempts,
-            evidence);
+            evidence,
+            resultDestination);
 
     private static ShareOperationAutomationContext Context(
         Guid accountId,
@@ -435,18 +497,30 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     private sealed class ShareSession(params ShareOfficialListing[] listings)
-        : IVisibleWebAutomationSession, IShareAutomationSession
+        : IVisibleWebAutomationSession, IShareAutomationSession, IShareResultExportSession, IWebViewDownloadEventSource
     {
         private readonly Queue<ShareOfficialListing> listings = new(listings);
+        private WebViewDownloadEventRouter? downloadRouter;
+        private byte[]? exportBytes;
 
         public List<string> Events { get; } = [];
         public int SubmitCount { get; private set; }
         public CancellationToken UserClosed => CancellationToken.None;
+        public WebAutomationRequestIdentity Identity => downloadRouter?.Identity
+            ?? throw new InvalidOperationException("Export was not enabled for this fake session.");
         public Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ShowHandoffAsync(WebAutomationHandoffPrompt prompt, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task<WebAutomationUserChoice> WaitForHandoffChoiceAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public IDisposable Subscribe(Action<IWebViewDownloadOperation> onDownloadStarting) =>
+            (downloadRouter ?? throw new InvalidOperationException("Export was not enabled.")).Subscribe(onDownloadStarting);
+
+        public void EnableExport(WebAutomationRequestIdentity identity, byte[] workbook)
+        {
+            downloadRouter = new WebViewDownloadEventRouter(identity);
+            exportBytes = workbook;
+        }
 
         public Task SelectExactRemoteItemsAsSingleGroupAsync(RemoteItemIdentitySet remoteItems, CancellationToken cancellationToken) =>
             Record("select-group");
@@ -475,11 +549,76 @@ public sealed class WebViewBaiduShareAdapterTests
         public Task PersistOfficialAcceptanceAsync(ShareOfficialAcceptance acceptance, CancellationToken cancellationToken) =>
             Record("persist-acceptance");
 
+        public Task ExportOfficialResultAsync(CancellationToken cancellationToken)
+        {
+            Events.Add("export-result");
+            var operation = new FakeDownloadOperation();
+            (downloadRouter ?? throw new InvalidOperationException("Export was not enabled.")).Route(operation);
+            operation.Complete(exportBytes ?? throw new InvalidOperationException("Export bytes were not configured."));
+            return Task.CompletedTask;
+        }
+
         private Task Record(string name)
         {
             Events.Add(name);
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class FakeDownloadOperation : IWebViewDownloadOperation
+    {
+        private readonly TaskCompletionSource<WebViewDownloadCompletionState> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private string? destination;
+        public string SuggestedFileName => "untrusted.xlsx";
+        public void SetDestinationPath(string path) => destination = path;
+        public Task<WebViewDownloadCompletionState> WaitForCompletionAsync(CancellationToken cancellationToken) =>
+            completion.Task.WaitAsync(cancellationToken);
+        public void Cancel() => completion.TrySetResult(WebViewDownloadCompletionState.Cancelled);
+        public void Complete(byte[] bytes)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(destination!)!);
+            File.WriteAllBytes(destination!, bytes);
+            completion.TrySetResult(WebViewDownloadCompletionState.Completed);
+        }
+    }
+
+    private sealed class FixedResultDestination(string path) : IShareOfficialResultDestinationResolver
+    {
+        public Task<string?> ResolveAsync(
+            ShareOperationAutomationContext context,
+            CancellationToken cancellationToken = default) => Task.FromResult<string?>(path);
+    }
+
+    private sealed class MissingResultDestination : IShareOfficialResultDestinationResolver
+    {
+        public Task<string?> ResolveAsync(
+            ShareOperationAutomationContext context,
+            CancellationToken cancellationToken = default) => Task.FromResult<string?>(null);
+    }
+
+    private static async Task<byte[]> ValidWorkbookAsync()
+    {
+        await using var stream = new MemoryStream();
+        await new OpenXmlReplacementResultWriter().WriteAsync(
+            stream, new ReplacementWorkbookLayout(["测试"]), Rows(new ReplacementWorkbookRow(1, ["内容"])));
+        return stream.ToArray();
+    }
+
+    private static async IAsyncEnumerable<ReplacementWorkbookRow> Rows(params ReplacementWorkbookRow[] rows)
+    {
+        foreach (var row in rows) { yield return row; await Task.Yield(); }
+    }
+
+    private sealed class TemporaryDirectory : IDisposable
+    {
+        public TemporaryDirectory()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"share-download-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(Path);
+        }
+        public string Path { get; }
+        public void Dispose() { if (Directory.Exists(Path)) Directory.Delete(Path, true); }
     }
 
     private sealed class VisibleOnlySession : IVisibleWebAutomationSession

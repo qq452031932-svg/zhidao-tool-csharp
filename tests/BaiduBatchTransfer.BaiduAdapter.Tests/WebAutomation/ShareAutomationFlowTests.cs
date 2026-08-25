@@ -98,6 +98,27 @@ public sealed class ShareAutomationFlowTests
     }
 
     [Fact]
+    public async Task SubmitAndExportClicksExportOnlyAfterAcceptanceAndExactConfirmation()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().SubmitAndExportAsync(
+            session,
+            request,
+            WebAutomationBaseline.Create(["share-existing"]),
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            ["select-group", "configure", "mark-submitting", "submit", "persist-acceptance", "read-list", "export-result"],
+            session.Events);
+        Assert.Equal(1, session.SubmitCount);
+        Assert.Equal(1, session.ExportCount);
+    }
+
+    [Fact]
     public async Task RecoveryConfirmsUniqueExactAdditionWithoutClicking()
     {
         var request = Request("remote-a", "remote-b");
@@ -118,6 +139,47 @@ public sealed class ShareAutomationFlowTests
         Assert.Equal(["read-list"], session.Events);
         Assert.Equal(0, session.SubmitCount);
         Assert.Null(session.PersistedAcceptance);
+    }
+
+    [Fact]
+    public async Task ExactConfirmationExportsOnlyAfterTheStableUniqueResultIsObserved()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().ConfirmExactAndExportAsync(
+            session,
+            request,
+            WebAutomationBaseline.Create(["share-existing"]),
+            session.Acceptance,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["read-list", "export-result"], session.Events);
+        Assert.Equal(1, session.ExportCount);
+    }
+
+    [Fact]
+    public async Task ExportFailureAfterExactConfirmationReturnsPendingWithoutCreatingAnotherShare()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request) with
+        {
+            ExportFailure = new IOException("download closed"),
+        };
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().ConfirmExactAndExportAsync(
+            session,
+            request,
+            WebAutomationBaseline.Create(["share-existing"]),
+            session.Acceptance,
+            CancellationToken.None);
+
+        AssertPending(result);
+        Assert.Equal(["read-list", "export-result"], session.Events);
+        Assert.Equal(0, session.SubmitCount);
     }
 
     [Fact]
@@ -452,7 +514,7 @@ public sealed class ShareAutomationFlowTests
         Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
     }
 
-    private sealed record FixtureSession : IShareAutomationSession
+    private sealed record FixtureSession : IShareAutomationSession, IShareResultExportSession
     {
         private int readCount;
 
@@ -464,7 +526,9 @@ public sealed class ShareAutomationFlowTests
         public required ShareOfficialAcceptance Acceptance { get; init; }
         public Exception? SubmitFailure { get; init; }
         public Exception? ReadFailure { get; init; }
+        public Exception? ExportFailure { get; init; }
         public int SubmitCount { get; private set; }
+        public int ExportCount { get; private set; }
         public WebAutomationBaseline? PersistedBaseline { get; private set; }
         public ShareOfficialAcceptance? PersistedAcceptance { get; private set; }
 
@@ -528,6 +592,15 @@ public sealed class ShareAutomationFlowTests
             Events.Add("persist-acceptance");
             PersistedAcceptance = acceptance;
             return Task.CompletedTask;
+        }
+
+        public Task ExportOfficialResultAsync(CancellationToken cancellationToken)
+        {
+            Events.Add("export-result");
+            ExportCount++;
+            return ExportFailure is null
+                ? Task.CompletedTask
+                : Task.FromException(ExportFailure);
         }
     }
 

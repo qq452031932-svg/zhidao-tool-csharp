@@ -33,6 +33,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
     private readonly string applicationBuildVersion;
     private readonly IWebAutomationAttemptStore? attemptStore;
     private readonly IShareAutomationAcceptanceEvidenceStore? acceptanceStore;
+    private readonly IShareOfficialResultDestinationResolver? resultDestination;
 
     public WebViewBaiduShareAdapter(
         IBaiduShareAdapter readOnlyAdapter,
@@ -41,7 +42,8 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         ShareAutomationFlow flow,
         string applicationBuildVersion,
         IWebAutomationAttemptStore? attemptStore = null,
-        IShareAutomationAcceptanceEvidenceStore? acceptanceStore = null)
+        IShareAutomationAcceptanceEvidenceStore? acceptanceStore = null,
+        IShareOfficialResultDestinationResolver? resultDestination = null)
     {
         this.readOnlyAdapter = readOnlyAdapter ?? throw new ArgumentNullException(nameof(readOnlyAdapter));
         this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
@@ -51,6 +53,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         this.applicationBuildVersion = applicationBuildVersion.Trim();
         this.attemptStore = attemptStore;
         this.acceptanceStore = acceptanceStore;
+        this.resultDestination = resultDestination;
     }
 
     public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
@@ -151,15 +154,15 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             {
                 if (visibleSession is not IShareAutomationSession automationSession)
                     return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
-                var result = await flow.SubmitAsync(
-                    new PersistentShareAutomationSession(
-                        automationSession,
-                        visibleContext,
-                        context,
-                        acceptanceStore),
-                    request,
-                    baseline,
-                    token).ConfigureAwait(false);
+                var persistent = new PersistentShareAutomationSession(
+                    automationSession, visibleContext, context, acceptanceStore);
+                var exporting = await TryEnableExportAsync(
+                    visibleSession, persistent, context, token).ConfigureAwait(false);
+                if (resultDestination is not null && exporting is null)
+                    return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+                var result = exporting is null
+                    ? await flow.SubmitAsync(persistent, request, baseline, token).ConfigureAwait(false)
+                    : await flow.SubmitAndExportAsync(exporting, request, baseline, token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
         VisibleWebAutomationResult<BaiduAdapterResult<ShareCreationReceipt>> result;
@@ -220,12 +223,17 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             {
                 if (visibleSession is not IShareAutomationSession automationSession)
                     return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
-                var result = await flow.ConfirmExactAsync(
-                    automationSession,
-                    request,
-                    attempt!.Baseline!,
-                    acceptedEvidence!,
-                    token).ConfigureAwait(false);
+                var persistent = new PersistentShareAutomationSession(
+                    automationSession, visibleContext, context, acceptanceStore);
+                var exporting = await TryEnableExportAsync(
+                    visibleSession, persistent, context, token).ConfigureAwait(false);
+                if (resultDestination is not null && exporting is null)
+                    return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                var result = exporting is null
+                    ? await flow.ConfirmExactAsync(
+                        persistent, request, attempt!.Baseline!, acceptedEvidence!, token).ConfigureAwait(false)
+                    : await flow.ConfirmExactAndExportAsync(
+                        exporting, request, attempt!.Baseline!, acceptedEvidence!, token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
         try
@@ -265,8 +273,18 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                     return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
                 visibleContext.TrackPersistentStage(
                     WebAutomationAttemptState.ResultPending, persistedAcceptance.ObservationFingerprint);
-                return await MarkSucceededAfterExactAsync(
-                    Receipt(request, persistedAcceptance), visibleContext, token).ConfigureAwait(false);
+                var persistent = new PersistentShareAutomationSession(
+                    automationSession, visibleContext, context, acceptanceStore);
+                var exporting = await TryEnableExportAsync(
+                    visibleSession, persistent, context, token).ConfigureAwait(false);
+                if (resultDestination is not null && exporting is null)
+                    return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                var exact = exporting is null
+                    ? await flow.ConfirmExactAsync(
+                        persistent, request, attempt.Baseline!, persistedAcceptance, token).ConfigureAwait(false)
+                    : await flow.ConfirmExactAndExportAsync(
+                        exporting, request, attempt.Baseline!, persistedAcceptance, token).ConfigureAwait(false);
+                return await MarkSucceededAfterExactAsync(exact, visibleContext, token).ConfigureAwait(false);
             });
         try
         {
@@ -289,6 +307,26 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+
+    private async Task<IShareResultExportSession?> TryEnableExportAsync(
+        IVisibleWebAutomationSession visibleSession,
+        PersistentShareAutomationSession persistent,
+        ShareOperationAutomationContext context,
+        CancellationToken cancellationToken)
+    {
+        if (resultDestination is null) return null;
+        if (visibleSession is not IShareResultExportSession exportAction ||
+            visibleSession is not IWebViewDownloadEventSource downloadSource)
+            return null;
+        var destination = await resultDestination.ResolveAsync(context, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(destination)) return null;
+        return persistent.EnableExport(
+            exportAction,
+            new WebViewDownloadCoordinator(downloadSource),
+            destination,
+            new WebAutomationRequestIdentity(
+                context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind));
+    }
 
     private BaiduNavigationAuthorizationRequest Navigation() => new(
         BaiduAutomationAction.OpenOfficialUri,
@@ -453,8 +491,25 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         IShareAutomationSession inner,
         VisibleWebAutomationContext visibleContext,
         ShareOperationAutomationContext operationContext,
-        IShareAutomationAcceptanceEvidenceStore? acceptanceStore) : IShareAutomationSession
+        IShareAutomationAcceptanceEvidenceStore? acceptanceStore) : IShareResultExportSession
     {
+        private IShareResultExportSession? exportAction;
+        private WebViewDownloadCoordinator? downloadCoordinator;
+        private string? resultDirectory;
+        private WebAutomationRequestIdentity? downloadIdentity;
+
+        public PersistentShareAutomationSession EnableExport(
+            IShareResultExportSession action,
+            WebViewDownloadCoordinator coordinator,
+            string destination,
+            WebAutomationRequestIdentity identity)
+        {
+            exportAction = action ?? throw new ArgumentNullException(nameof(action));
+            downloadCoordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
+            resultDirectory = LocalResultDirectoryReference.Normalize(destination, nameof(destination));
+            downloadIdentity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+            return this;
+        }
         public Task SelectExactRemoteItemsAsSingleGroupAsync(RemoteItemIdentitySet remoteItems, CancellationToken cancellationToken) =>
             inner.SelectExactRemoteItemsAsSingleGroupAsync(remoteItems, cancellationToken);
 
@@ -499,6 +554,17 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                 acceptance.ObservationFingerprint,
                 cancellationToken).ConfigureAwait(false);
             await inner.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
+        }
+
+        public Task ExportOfficialResultAsync(CancellationToken cancellationToken)
+        {
+            if (exportAction is null || downloadCoordinator is null || resultDirectory is null || downloadIdentity is null)
+                throw new InvalidOperationException("Official share-result export is unavailable.");
+            return downloadCoordinator.CaptureAsync(
+                downloadIdentity,
+                resultDirectory,
+                exportAction.ExportOfficialResultAsync,
+                cancellationToken);
         }
     }
 }

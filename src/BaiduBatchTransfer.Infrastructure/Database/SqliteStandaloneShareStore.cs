@@ -1,10 +1,13 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Application.Jobs;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) : IStandaloneShareExecutionStore
+public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) :
+    IStandaloneShareExecutionStore,
+    IStandaloneShareResultProjectionRepository
 {
     private const int MaximumOperationsPerBatch = 10_000;
     private readonly SqliteConnectionFactory factory = factory ?? throw new ArgumentNullException(nameof(factory));
@@ -85,6 +88,65 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         ValidateBatchId(batchId);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         return await LoadOperationsAsync(connection, null, batchId, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<StandaloneShareResultProjectionPage> GetPageAsync(
+        Guid batchId,
+        int afterSequenceNumber,
+        int pageSize,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateBatchId(batchId);
+        if (afterSequenceNumber < 0) throw new ArgumentOutOfRangeException(nameof(afterSequenceNumber));
+        if (pageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(pageSize));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using (var exists = connection.CreateCommand())
+        {
+            exists.CommandText = "SELECT COUNT(*) FROM StandaloneShareBatches WHERE Id=$batch;";
+            exists.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+            if (Convert.ToInt64(await exists.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) != 1)
+                throw new InvalidOperationException("The standalone share batch is unavailable.");
+        }
+
+        var items = new List<StandaloneShareResultProjection>(pageSize + 1);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT operation.Id,operation.SequenceNumber,account.DisplayName,operation.DisplayName,
+                   operation.ResourceKind,operation.Status,
+                   CASE WHEN operation.Status='Succeeded' THEN result.ShareUrl END,
+                   CASE WHEN operation.Status='Succeeded' THEN result.ExtractionCode END,
+                   operation.LastErrorCode,
+                   CASE WHEN operation.Status='Succeeded' AND result.Id IS NULL THEN 1 ELSE 0 END
+            FROM StandaloneShareOperations operation
+            JOIN Accounts account ON account.Id=operation.AccountId
+            LEFT JOIN StandaloneShareResults result
+              ON result.OperationId=operation.Id AND result.Generation=operation.Generation
+            WHERE operation.BatchId=$batch AND operation.SequenceNumber>$after
+            ORDER BY operation.SequenceNumber,operation.Id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+        command.Parameters.AddWithValue("$after", afterSequenceNumber);
+        command.Parameters.AddWithValue("$limit", checked(pageSize + 1));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (reader.GetInt64(9) != 0)
+                throw new InvalidDataException("A successful standalone share operation has no exact current result.");
+            items.Add(new(
+                Guid.Parse(reader.GetString(0)),
+                reader.GetInt32(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                Enum.Parse<RemoteResourceKind>(reader.GetString(4), ignoreCase: false),
+                Enum.Parse<StandaloneShareOperationStatus>(reader.GetString(5), ignoreCase: false),
+                reader.IsDBNull(6) ? null : reader.GetString(6),
+                reader.IsDBNull(7) ? null : reader.GetString(7),
+                reader.IsDBNull(8) ? null : reader.GetString(8)));
+        }
+        var hasMore = items.Count > pageSize;
+        if (hasMore) items.RemoveAt(items.Count - 1);
+        return new(items, hasMore ? items[^1].SequenceNumber : null);
     }
 
     public async Task<StandaloneShareBatchSnapshot?> GetBatchSnapshotAsync(

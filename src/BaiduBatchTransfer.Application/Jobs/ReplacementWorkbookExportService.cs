@@ -35,25 +35,7 @@ public sealed class ReplacementWorkbookExportService(
         var accounts = definition.Accounts.OrderBy(account => account.OutputOrdinal).ToArray();
         ValidateDefinition(originalColumns, accounts);
 
-        var resultLayout = new ResultColumnLayoutBuilder().Build(
-            originalColumns.Select(column => (string?)column.Header).ToArray(),
-            accounts.Select(account => new BatchWorkloadAccountInput(
-                account.AccountId,
-                account.OutputOrdinal,
-                account.DisplayName,
-                BatchAccountSelectionDecision.Selected,
-                account.ShareEnabled,
-                DistributionCount: 1)).ToArray());
-        var headers = resultLayout.SourceHeaders
-            .Append(resultLayout.ResolvedTitleHeader)
-            .Append(resultLayout.OriginalShareUrlHeader)
-            .Concat(resultLayout.Accounts.SelectMany(account => new[]
-            {
-                account.ShareUrlHeader,
-                account.ExtractionCodeHeader,
-                account.ShareStatusHeader,
-            }));
-        var layout = new ReplacementWorkbookLayout(headers);
+        var layout = BuildLayout(originalColumns, accounts);
 
         long exportedRows = 0;
         await writer.WriteAsync(
@@ -87,10 +69,84 @@ public sealed class ReplacementWorkbookExportService(
 
         var definition = await repository.GetDefinitionAsync(request.BatchJobId, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        return await ExportToDirectoryCoreAsync(
+            request, destinationDirectory,
+            fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow()),
+            definition, publisher, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<string> GetSuggestedFileNameAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        var definition = await repository.GetDefinitionAsync(batchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        return fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow());
+    }
+
+    public async Task<ReplacementWorkbookLayout> GetExpectedLayoutAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        if (batchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(batchJobId));
+        var definition = await repository.GetDefinitionAsync(batchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        var originalColumns = definition.OriginalColumns.OrderBy(column => column.ColumnOrdinal).ToArray();
+        var accounts = definition.Accounts.OrderBy(account => account.OutputOrdinal).ToArray();
+        ValidateDefinition(originalColumns, accounts);
+        return BuildLayout(originalColumns, accounts);
+    }
+
+    public async Task<ReplacementWorkbookFilePublishReceipt> ExportToDirectoryAsync(
+        ReplacementWorkbookExportRequest request,
+        string destinationDirectory,
+        string exactTargetFileName,
+        IReplacementWorkbookFilePublisher publisher,
+        IProgress<long>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationDirectory);
+        LocalResultExportValidation.SafeFileName(exactTargetFileName, nameof(exactTargetFileName));
+        ArgumentNullException.ThrowIfNull(publisher);
+        if (request.BatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(request));
+        if (request.PageSize is < 1 or > 1_000) throw new ArgumentOutOfRangeException(nameof(request.PageSize));
+        var definition = await repository.GetDefinitionAsync(request.BatchJobId, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The batch result projection is unavailable.");
+        return await ExportToDirectoryCoreAsync(
+            request, destinationDirectory, exactTargetFileName, definition,
+            publisher, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ReplacementWorkbookFilePublishReceipt> ExportToDirectoryCoreAsync(
+        ReplacementWorkbookExportRequest request,
+        string destinationDirectory,
+        string targetFileName,
+        BatchResultProjectionDefinition definition,
+        IReplacementWorkbookFilePublisher publisher,
+        IProgress<long>? progress,
+        CancellationToken cancellationToken)
+    {
         var originalColumns = definition.OriginalColumns.OrderBy(column => column.ColumnOrdinal).ToArray();
         var accounts = definition.Accounts.OrderBy(account => account.OutputOrdinal).ToArray();
         ValidateDefinition(originalColumns, accounts);
 
+        var layout = BuildLayout(originalColumns, accounts);
+
+        return await publisher.PublishAsync(
+            destinationDirectory,
+            targetFileName,
+            layout,
+            StreamRowsAsync(request, originalColumns, accounts,
+                count => progress?.Report(count), cancellationToken),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static ReplacementWorkbookLayout BuildLayout(
+        IReadOnlyList<BatchResultOriginalColumn> originalColumns,
+        IReadOnlyList<BatchResultProjectionAccount> accounts)
+    {
         var resultLayout = new ResultColumnLayoutBuilder().Build(
             originalColumns.Select(column => (string?)column.Header).ToArray(),
             accounts.Select(account => new BatchWorkloadAccountInput(
@@ -105,19 +161,13 @@ public sealed class ReplacementWorkbookExportService(
             .Append(resultLayout.OriginalShareUrlHeader)
             .Concat(resultLayout.Accounts.SelectMany(account => new[]
             {
+                account.ActualTransferAccountHeader,
+                account.TransferStatusHeader,
                 account.ShareUrlHeader,
                 account.ExtractionCodeHeader,
                 account.ShareStatusHeader,
             }));
-        var layout = new ReplacementWorkbookLayout(headers);
-
-        return await publisher.PublishAsync(
-            destinationDirectory,
-            fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow()),
-            layout,
-            StreamRowsAsync(request, originalColumns, accounts,
-                count => progress?.Report(count), cancellationToken),
-            cancellationToken).ConfigureAwait(false);
+        return new ReplacementWorkbookLayout(headers);
     }
 
     private async IAsyncEnumerable<ReplacementWorkbookRow> StreamRowsAsync(
@@ -127,7 +177,7 @@ public sealed class ReplacementWorkbookExportService(
         Action<long> report,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var projectedCellsPerResource = checked(originalColumns.Count + 2 + accounts.Count * 3);
+        var projectedCellsPerResource = checked(originalColumns.Count + 2 + accounts.Count * 5);
         var boundedPageSize = Math.Min(
             request.PageSize,
             Math.Max(1, MaximumProjectedCellsPerPage / projectedCellsPerResource));
@@ -176,7 +226,7 @@ public sealed class ReplacementWorkbookExportService(
             resource.OriginalValues.Select(value => value.ColumnOrdinal).Distinct().Count() != resource.OriginalValues.Count)
             throw new InvalidOperationException("The original result values do not match the column definition.");
         var originalValues = resource.OriginalValues.ToDictionary(value => value.ColumnOrdinal, value => value.Text);
-        var cells = new List<string?>(checked(originalColumns.Count + 2 + accounts.Count * 3));
+        var cells = new List<string?>(checked(originalColumns.Count + 2 + accounts.Count * 5));
         cells.AddRange(originalColumns.Select(column => originalValues[column.ColumnOrdinal]));
         cells.Add(resource.ResolvedTitle);
         cells.Add(resource.OriginalShareUrl);
@@ -188,20 +238,24 @@ public sealed class ReplacementWorkbookExportService(
                 cells.Add(string.Empty);
                 cells.Add(string.Empty);
                 cells.Add(string.Empty);
+                cells.Add(string.Empty);
+                cells.Add(string.Empty);
                 continue;
             }
+            cells.Add(account.DisplayName);
+            cells.Add(StableTransferStatus(outcome.TransferStatus));
             if (!account.ShareEnabled)
             {
                 cells.Add(string.Empty);
                 cells.Add(string.Empty);
-                cells.Add("未启用分享");
+                cells.Add(string.Empty);
                 continue;
             }
 
             var result = ProjectOutcome(outcome);
             cells.Add(result.ExposesShareResult ? outcome.ShareUrl ?? string.Empty : string.Empty);
             cells.Add(result.ExposesShareResult ? outcome.ExtractionCode ?? string.Empty : string.Empty);
-            cells.Add(result.StableStatus);
+            cells.Add(outcome.TransferStatus == "Succeeded" ? result.StableStatus : string.Empty);
         }
 
         return new(resource.CandidateSequence, cells);
@@ -229,6 +283,18 @@ public sealed class ReplacementWorkbookExportService(
             _ => throw new InvalidOperationException("The transfer result status is invalid."),
         };
     }
+
+    private static string StableTransferStatus(string status) => status switch
+    {
+        "Failed" => "转存失败",
+        "Paused" => "转存暂停",
+        "ResultPending" => "转存结果待确认",
+        "Waiting" => "等待转存",
+        "Reserved" or "Preparing" or "Submitting" => "转存处理中",
+        "Cancelled" => "转存已取消",
+        "Succeeded" => "转存成功",
+        _ => throw new InvalidOperationException("The transfer result status is invalid."),
+    };
 
     private static string StableShareStatus(ShareOperationStatus status) => status switch
     {

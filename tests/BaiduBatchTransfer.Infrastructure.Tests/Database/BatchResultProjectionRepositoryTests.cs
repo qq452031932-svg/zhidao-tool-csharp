@@ -298,6 +298,7 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
             {
                 "", "源表链接原文",
                 "持久化的缺失标题回填 等 2 项", "https://pan.baidu.com/s/original",
+                "账号甲", "转存成功",
                 "https://pan.baidu.com/s/replacement", "r4nd", "分享成功",
             },
             rows[0].Elements<Cell>().Select(cell => cell.InlineString!.Text!.Text));

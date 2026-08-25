@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using System.Collections;
@@ -730,6 +731,47 @@ public sealed class ShareWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task SaveResults_UsesSelectedTerminalBatchAndItsPersistedDestination()
+    {
+        var store = new FakeStore();
+        var exports = new FakeLocalResultExports();
+        var vm = Fixture(store: store, exports: exports);
+        var batch = store.SeedBatch(StandaloneShareBatchStatus.CompletedWithFailures);
+        vm.SelectedBatch = batch;
+
+        await vm.SaveResultsAsync();
+
+        Assert.Equal([batch.Id], exports.BatchIds);
+        Assert.Equal("分享结果已保存。", vm.StatusMessage);
+        Assert.True(vm.CanSaveResults);
+    }
+
+    [Fact]
+    public async Task SaveResults_IsDisabledUntilSelectedBatchIsTerminal()
+    {
+        var store = new FakeStore();
+        var exports = new FakeLocalResultExports();
+        var vm = Fixture(store: store, exports: exports);
+        vm.SelectedBatch = store.SeedBatch(StandaloneShareBatchStatus.Active);
+
+        await vm.SaveResultsAsync();
+
+        Assert.False(vm.CanSaveResults);
+        Assert.Empty(exports.BatchIds);
+    }
+
+    [Fact]
+    public void ShareWorkspace_ExposesAccessibleSaveResultsAction()
+    {
+        var xaml = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml"));
+
+        Assert.Contains("Content=\"保存结果\"", xaml);
+        Assert.Contains("Command=\"{Binding SaveResultsCommand}\"", xaml);
+        Assert.Contains("AutomationProperties.Name=\"保存分享结果\"", xaml);
+    }
+
+    [Fact]
     public void ShareWorkspace_ShowsProgressInSimpleChineseAndExposesAccessibleNames()
     {
         var xaml = File.ReadAllText(Path.Combine(
@@ -748,7 +790,8 @@ public sealed class ShareWorkspaceViewModelTests
         FakePicker? picker = null,
         IResultSaveDialog? resultDialog = null,
         ShareAccountOption? activeAccount = null,
-        int historyPageSize = 20)
+        int historyPageSize = 20,
+        ILocalResultExportCoordinator? exports = null)
     {
         var vm = new ShareWorkspaceViewModel(
             [AccountA, AccountB],
@@ -756,7 +799,8 @@ public sealed class ShareWorkspaceViewModelTests
             store ?? new FakeStore(),
             resultDialog ?? new FakeResultDialog(null),
             TimeProvider.System,
-            historyPageSize);
+            historyPageSize,
+            localResultExports: exports);
         vm.ActiveAccount = activeAccount;
         return vm;
     }
@@ -829,6 +873,24 @@ public sealed class ShareWorkspaceViewModelTests
     {
         public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
+    }
+
+    private sealed class FakeLocalResultExports : ILocalResultExportCoordinator
+    {
+        public List<Guid> BatchIds { get; } = [];
+
+        public Task<LocalResultExportOutcome> ExportStandaloneAsync(
+            Guid batchId, CancellationToken cancellationToken = default)
+        {
+            BatchIds.Add(batchId);
+            return Task.FromResult(new LocalResultExportOutcome(LocalResultExportDisposition.Exported, "results.xlsx"));
+        }
+
+        public Task<LocalResultExportOutcome> ExportTransferAsync(
+            Guid batchId, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<int> RecoverAsync(CancellationToken cancellationToken = default) => Task.FromResult(0);
     }
 
     private sealed class FakeStore : IStandaloneShareStore

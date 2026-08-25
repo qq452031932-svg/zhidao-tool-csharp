@@ -250,7 +250,7 @@ public sealed class CreateBatchServiceTests
     {
         var builder = new ResultColumnLayoutBuilder();
         var accounts = new[] { WorkloadAccount(0, 1), WorkloadAccount(1, 1) };
-        var source = Enumerable.Range(0, 16_376).Select(index => $"原始列{index}").ToArray();
+        var source = Enumerable.Range(0, 16_372).Select(index => $"原始列{index}").ToArray();
 
         var layout = builder.Build(source, accounts);
 
@@ -260,7 +260,7 @@ public sealed class CreateBatchServiceTests
         var collision = builder.Build(
             ["转存结果_解析后标题", "转存结果_原分享链接"],
             [new(Guid.NewGuid(), 0, "同名", BatchAccountSelectionDecision.Selected, true, 1), new(Guid.NewGuid(), 1, "同名", BatchAccountSelectionDecision.Selected, true, 1)]);
-        Assert.Equal(10, collision.ColumnCount);
+        Assert.Equal(14, collision.ColumnCount);
         Assert.Equal("转存结果_解析后标题（系统2）", collision.ResolvedTitleHeader);
         Assert.Equal("转存结果_原分享链接（系统2）", collision.OriginalShareUrlHeader);
         Assert.Equal(["同名（1）", "同名（2）"], collision.Accounts.Select(x => x.OutputLabel));
@@ -322,7 +322,8 @@ public sealed class CreateBatchServiceTests
         var layout = new ResultColumnLayoutBuilder().Build([], accounts);
         var allHeaders = layout.Accounts.SelectMany(account => new[]
         {
-            account.OutputLabel, account.ShareUrlHeader, account.ExtractionCodeHeader, account.ShareStatusHeader,
+            account.OutputLabel, account.ActualTransferAccountHeader, account.TransferStatusHeader,
+            account.ShareUrlHeader, account.ExtractionCodeHeader, account.ShareStatusHeader,
         }).ToArray();
 
         Assert.Equal(["账号1", "账号2", "账号3", "账号4", "双向文本", "账号6"], layout.Accounts.Select(x => x.OutputLabel));

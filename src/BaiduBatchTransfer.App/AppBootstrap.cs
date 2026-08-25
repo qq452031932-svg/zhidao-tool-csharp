@@ -8,6 +8,7 @@ using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
+using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Imports;
@@ -131,6 +132,8 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteStandaloneShareStore>());
         services.AddSingleton<IStandaloneShareExecutionStore>(sp =>
             sp.GetRequiredService<SqliteStandaloneShareStore>());
+        services.AddSingleton<IStandaloneShareResultProjectionRepository>(sp =>
+            sp.GetRequiredService<SqliteStandaloneShareStore>());
         services.AddSingleton<SqliteWebAutomationAttemptStore>();
         services.AddSingleton<IWebAutomationAttemptStore>(sp =>
             sp.GetRequiredService<SqliteWebAutomationAttemptStore>());
@@ -154,8 +157,20 @@ public static class AppBootstrap
             sp.GetRequiredService<SqliteBatchResultProjectionRepository>());
         services.AddSingleton<ReplacementWorkbookFileNameBuilder>();
         services.AddSingleton<ReplacementWorkbookExportService>();
+        services.AddSingleton<ExportStandaloneShareResultsService>();
         services.AddSingleton<IReplacementWorkbookWriter, OpenXmlReplacementResultWriter>();
         services.AddSingleton<IReplacementWorkbookFilePublisher, OpenXmlReplacementWorkbookFilePublisher>();
+        services.AddSingleton<IDownloadedWorkbookValidator, OpenXmlDownloadedWorkbookValidator>();
+        services.AddSingleton<SqliteLocalResultExportOwnerRepository>();
+        services.AddSingleton<ILocalResultExportOwnerRepository>(sp =>
+            sp.GetRequiredService<SqliteLocalResultExportOwnerRepository>());
+        services.AddSingleton<ILocalResultExportArtifactService, LocalResultExportArtifactService>();
+        services.AddSingleton<LocalResultExportCoordinator>();
+        services.AddSingleton<ILocalResultExportCoordinator>(sp =>
+            sp.GetRequiredService<LocalResultExportCoordinator>());
+        services.AddSingleton<LocalResultExportHostedService>();
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<LocalResultExportHostedService>());
 
         services.AddSingleton<BaiduSessionIdentityClient>();
         services.AddSingleton<LiveBaiduNetdiskAdapter>();
@@ -196,6 +211,7 @@ public static class AppBootstrap
         services.AddSingleton<SqliteShareAutomationAcceptanceEvidenceStore>();
         services.AddSingleton<IShareAutomationAcceptanceEvidenceStore>(sp =>
             sp.GetRequiredService<SqliteShareAutomationAcceptanceEvidenceStore>());
+        services.AddSingleton<IShareOfficialResultDestinationResolver, ShareOfficialResultDestinationResolver>();
         services.AddSingleton<WebViewBaiduShareAdapter>(sp => new WebViewBaiduShareAdapter(
             sp.GetRequiredService<LiveBaiduShareAdapter>(),
             sp.GetRequiredService<IVisibleWebAutomationBroker>(),
@@ -203,7 +219,8 @@ public static class AppBootstrap
             sp.GetRequiredService<ShareAutomationFlow>(),
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
-            sp.GetRequiredService<IShareAutomationAcceptanceEvidenceStore>()));
+            sp.GetRequiredService<IShareAutomationAcceptanceEvidenceStore>(),
+            sp.GetRequiredService<IShareOfficialResultDestinationResolver>()));
         services.AddSingleton<IBaiduShareAdapter>(sp => CoordinatedBaiduShareAdapter.Wrap(
             sp.GetRequiredService<WebViewBaiduShareAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
@@ -271,6 +288,7 @@ public static class AppBootstrap
         services.AddSingleton(sp => new StartupRecoveryRunner(
             sp.GetRequiredService<StartupRecoveryService>(),
             sp.GetRequiredService<IRemoteSelectionSessionStore>(),
+            sp.GetRequiredService<ILocalResultExportCoordinator>(),
             TimeProvider.System));
         services.AddSingleton<IAppRecoveryRunner>(sp =>
             sp.GetRequiredService<StartupRecoveryRunner>());
@@ -453,6 +471,7 @@ public sealed class AppShellFactory(
     IRemoteResourcePicker remoteResourcePicker,
     IStandaloneShareStore standaloneShareStore,
     CreateStandaloneShareBatchService standaloneShareBatchService,
+    ILocalResultExportCoordinator localResultExports,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -549,7 +568,8 @@ public sealed class AppShellFactory(
             remoteResourcePicker,
             standaloneShareStore,
             resultSaveDialog,
-            batchService: standaloneShareBatchService);
+            batchService: standaloneShareBatchService,
+            localResultExports: localResultExports);
         var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,

@@ -56,7 +56,9 @@ public sealed class ReplacementWorkbookExportTests
         {
             "原标题", "链接原文", "关键词",
             "转存结果_解析后标题", "转存结果_原分享链接",
+            "转存结果_账号A_实际转存账号", "转存结果_账号A_转存状态",
             "转存结果_账号A_新分享链接", "转存结果_账号A_提取码", "转存结果_账号A_分享状态",
+            "转存结果_账号B_实际转存账号", "转存结果_账号B_转存状态",
             "转存结果_账号B_新分享链接", "转存结果_账号B_提取码", "转存结果_账号B_分享状态",
         }, writer.Layout!.Headers.ToArray());
         var row = Assert.Single(writer.Rows);
@@ -65,14 +67,14 @@ public sealed class ReplacementWorkbookExportTests
         {
             "用户标题", "含链接的原始文案", "教程",
             "用户标题", "https://pan.baidu.com/s/original",
-            "https://pan.baidu.com/s/replacement", "a1b2", "分享成功",
-            "", "", "未启用分享",
+            "账号A", "转存成功", "https://pan.baidu.com/s/replacement", "a1b2", "分享成功",
+            "账号B", "转存成功", "", "", "",
         }, row.TextCells.ToArray());
         Assert.Equal([(0L, 100)], repository.ProjectionPageRequests);
     }
 
     [Fact]
-    public async Task DistributionAccountWithoutOutcomeLeavesItsThreeCellsBlank()
+    public async Task DistributionAccountWithoutOutcomeLeavesItsFiveCellsBlank()
     {
         var writer = await ExportSingleRowAsync(
             OriginalDefinition(shareEnabled: true),
@@ -80,7 +82,7 @@ public sealed class ReplacementWorkbookExportTests
             []);
 
         Assert.Equal(
-            new[] { "标题", "原值", "标题", "原链接", "", "", "" },
+            new[] { "标题", "原值", "标题", "原链接", "", "", "", "", "" },
             Assert.Single(writer.Rows).TextCells.ToArray());
     }
 
@@ -110,14 +112,14 @@ public sealed class ReplacementWorkbookExportTests
             new[]
             {
                 "标题", "原值", "标题", "原链接",
-                "https://new/1", "a111", "分享成功",
-                "https://new/2", "b222", "复用已有分享",
+                "账号一", "转存成功", "https://new/1", "a111", "分享成功",
+                "账号二", "转存成功", "https://new/2", "b222", "复用已有分享",
             },
             Assert.Single(writer.Rows).TextCells.ToArray());
     }
 
     [Fact]
-    public async Task ShareDisabledAccountWithoutTransferOutcomeStillLeavesItsThreeCellsBlank()
+    public async Task ShareDisabledAccountWithoutTransferOutcomeStillLeavesItsFiveCellsBlank()
     {
         var writer = await ExportSingleRowAsync(
             OriginalDefinition(shareEnabled: false),
@@ -125,7 +127,7 @@ public sealed class ReplacementWorkbookExportTests
             []);
 
         Assert.Equal(
-            new[] { "标题", "原值", "标题", "原链接", "", "", "" },
+            new[] { "标题", "原值", "标题", "原链接", "", "", "", "", "" },
             Assert.Single(writer.Rows).TextCells.ToArray());
     }
 
@@ -147,7 +149,7 @@ public sealed class ReplacementWorkbookExportTests
             {
                 "", "源表中的链接原文",
                 "网盘内首项名称 等 3 项", "原链接",
-                "", "", "未启用分享",
+                "账号A", "转存失败", "", "", "",
             },
             Assert.Single(writer.Rows).TextCells.ToArray());
     }
@@ -190,9 +192,37 @@ public sealed class ReplacementWorkbookExportTests
 
         var cells = Assert.Single(writer.Rows).TextCells;
         Assert.Equal(new[] { "标题", "原值", "标题", "原链接" }, cells[..4].ToArray());
-        Assert.Equal(exposesShareResult ? "https://pan.baidu.com/s/new" : "", cells[4]);
-        Assert.Equal(exposesShareResult ? "a1b2" : "", cells[5]);
-        Assert.Equal(expectedStatus, cells[6]);
+        Assert.Equal("账号A", cells[4]);
+        Assert.Equal(transferStatus switch
+        {
+            "Failed" => "转存失败",
+            "Paused" => "转存暂停",
+            "ResultPending" => "转存结果待确认",
+            "Succeeded" => "转存成功",
+            _ => throw new InvalidOperationException(),
+        }, cells[5]);
+        Assert.Equal(exposesShareResult ? "https://pan.baidu.com/s/new" : "", cells[6]);
+        Assert.Equal(exposesShareResult ? "a1b2" : "", cells[7]);
+        Assert.Equal(transferStatus == "Succeeded" ? expectedStatus : "", cells[8]);
+    }
+
+    [Fact]
+    public void ResultLayoutUsesFiveColumnsPerParticipatingAccount()
+    {
+        var accounts = new[]
+        {
+            new BatchWorkloadAccountInput(Guid.NewGuid(), 1, "账号A", BatchAccountSelectionDecision.Selected, true, 1),
+            new BatchWorkloadAccountInput(Guid.NewGuid(), 2, "账号B", BatchAccountSelectionDecision.Selected, false, 1),
+        };
+
+        var layout = new ResultColumnLayoutBuilder().Build(["原列1", "原列2"], accounts);
+
+        Assert.Equal(layout.SourceHeaders.Length + 2 + accounts.Length * 5, layout.ColumnCount);
+        Assert.All(layout.Accounts, account =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(account.ActualTransferAccountHeader));
+            Assert.False(string.IsNullOrWhiteSpace(account.TransferStatusHeader));
+        });
     }
 
     [Theory]
@@ -332,7 +362,7 @@ public sealed class ReplacementWorkbookExportTests
             Stream.Null,
             new CapturingReplacementWriter());
 
-        Assert.Equal([(0L, 3)], repository.ProjectionPageRequests);
+        Assert.Equal([(0L, 1)], repository.ProjectionPageRequests);
     }
 
     [Fact]

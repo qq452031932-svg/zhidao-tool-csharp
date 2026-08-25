@@ -1,6 +1,8 @@
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using Microsoft.Web.WebView2.Core;
+using System.IO;
+using System.Windows.Threading;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -21,11 +23,15 @@ public sealed class WebView2AutomationSessionFactory : IVisibleWebAutomationSess
     }
 }
 
-public sealed class WebView2AutomationSession : IVisibleWebAutomationSession, IRemoteResourcePickerSession
+public sealed class WebView2AutomationSession :
+    IVisibleWebAutomationSession,
+    IRemoteResourcePickerSession,
+    IWebViewDownloadEventSource
 {
     private readonly WebAutomationRequestIdentity identity;
     private readonly string profilePath;
     private readonly WebAutomationWindow window;
+    private readonly WebViewDownloadEventRouter downloadRouter;
     private CoreWebView2? core;
     private int closed;
 
@@ -38,9 +44,14 @@ public sealed class WebView2AutomationSession : IVisibleWebAutomationSession, IR
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
         this.profilePath = profilePath;
         this.window = window ?? throw new ArgumentNullException(nameof(window));
+        downloadRouter = new WebViewDownloadEventRouter(this.identity);
     }
 
     public CancellationToken UserClosed => window.UserClosed;
+    public WebAutomationRequestIdentity Identity => identity;
+
+    public IDisposable Subscribe(Action<IWebViewDownloadOperation> onDownloadStarting) =>
+        downloadRouter.Subscribe(onDownloadStarting);
 
     public async Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default)
     {
@@ -139,10 +150,12 @@ public sealed class WebView2AutomationSession : IVisibleWebAutomationSession, IR
         e.Handled = true;
     }
 
-    private static void OnDownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
+    private void OnDownloadStarting(object? sender, CoreWebView2DownloadStartingEventArgs e)
     {
-        e.Cancel = true;
         e.Handled = true;
+        var operation = new CoreWebViewDownloadOperation(e, window.Dispatcher);
+        try { downloadRouter.Route(operation); }
+        catch { operation.Cancel(); }
     }
 
     private static void OnPermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs e)
@@ -159,5 +172,66 @@ public sealed class WebView2AutomationSession : IVisibleWebAutomationSession, IR
         core.DownloadStarting -= OnDownloadStarting;
         core.PermissionRequested -= OnPermissionRequested;
         core = null;
+    }
+
+    private sealed class CoreWebViewDownloadOperation : IWebViewDownloadOperation
+    {
+        private readonly CoreWebView2DownloadStartingEventArgs starting;
+        private readonly CoreWebView2DownloadOperation operation;
+        private readonly Dispatcher dispatcher;
+        private readonly TaskCompletionSource<WebViewDownloadCompletionState> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int terminal;
+
+        public CoreWebViewDownloadOperation(
+            CoreWebView2DownloadStartingEventArgs starting,
+            Dispatcher dispatcher)
+        {
+            this.starting = starting ?? throw new ArgumentNullException(nameof(starting));
+            operation = starting.DownloadOperation;
+            this.dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+            operation.StateChanged += OnStateChanged;
+            ObserveState();
+        }
+
+        public string SuggestedFileName => Path.GetFileName(starting.ResultFilePath);
+
+        public void SetDestinationPath(string path)
+        {
+            if (!dispatcher.CheckAccess())
+                throw new InvalidOperationException("下载路径必须在浏览器线程设置。");
+            starting.ResultFilePath = path;
+        }
+
+        public Task<WebViewDownloadCompletionState> WaitForCompletionAsync(CancellationToken cancellationToken) =>
+            completion.Task.WaitAsync(cancellationToken);
+
+        public void Cancel()
+        {
+            if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished) return;
+            if (dispatcher.CheckAccess()) CancelCore();
+            else dispatcher.BeginInvoke(DispatcherPriority.Send, new Action(CancelCore));
+        }
+
+        private void CancelCore()
+        {
+            try { operation.Cancel(); }
+            catch (InvalidOperationException) { }
+        }
+
+        private void OnStateChanged(object? sender, object e) => ObserveState();
+
+        private void ObserveState()
+        {
+            var state = operation.State switch
+            {
+                CoreWebView2DownloadState.Completed => WebViewDownloadCompletionState.Completed,
+                CoreWebView2DownloadState.Interrupted => WebViewDownloadCompletionState.Interrupted,
+                _ => (WebViewDownloadCompletionState?)null,
+            };
+            if (state is null || Interlocked.Exchange(ref terminal, 1) != 0) return;
+            operation.StateChanged -= OnStateChanged;
+            completion.TrySetResult(state.Value);
+        }
     }
 }

@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Infrastructure.Database;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
@@ -169,6 +170,38 @@ public sealed class LocalResultExportStoreTests : IDisposable
             LocalResultOwnerKind.TransferBatch, Guid.NewGuid(), LocalResultExportKind.ReplacementWorkbook,
             1, unsafeName, DateTimeOffset.UtcNow));
         Assert.DoesNotContain(unsafeName, error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task OwnerProjection_OnlyDiscoversTerminalBatchWithPersistedDestination()
+    {
+        var graph = await CreateAsync();
+        var owners = new SqliteLocalResultExportOwnerRepository(graph.Factory);
+        var key = new LocalResultExportKey(
+            LocalResultOwnerKind.TransferBatch, graph.BatchId,
+            LocalResultExportKind.ReplacementWorkbook, 1);
+
+        Assert.Null(await owners.GetAsync(key));
+        await new SqliteLocalResultDestinationStore(graph.Factory).SetAsync(
+            LocalResultDestinationRecord.Create(graph.BatchId, @"C:\Results", graph.Now));
+        var queued = await owners.GetAsync(key);
+        Assert.NotNull(queued);
+        Assert.False(queued.IsTerminal);
+        Assert.Empty((await owners.GetReadyPageAsync(new PageQuery(1, 10))).Items);
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE BatchJobs SET Status='Completed',CompletedAt=$now WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.BatchId.ToString("D"));
+            command.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var ready = Assert.Single((await owners.GetReadyPageAsync(new PageQuery(1, 10))).Items);
+        Assert.Equal(key, ready.Key);
+        Assert.True(ready.IsTerminal);
+        Assert.Equal(@"C:\Results", ready.DestinationDirectory);
     }
 
     private async Task<Graph> CreateAsync()

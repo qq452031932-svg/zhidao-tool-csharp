@@ -50,6 +50,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private readonly IResultSaveDialog resultDialog;
     private readonly TimeProvider timeProvider;
     private readonly CreateStandaloneShareBatchService? batchService;
+    private readonly ILocalResultExportCoordinator? localResultExports;
     private readonly int historyPageSize;
     private readonly CancellationTokenSource lifetime = new();
     private readonly ObservableCollection<ShareSelectionGroup> selectionGroups = [];
@@ -76,7 +77,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         IResultSaveDialog resultDialog,
         TimeProvider? timeProvider = null,
         int historyPageSize = 20,
-        CreateStandaloneShareBatchService? batchService = null)
+        CreateStandaloneShareBatchService? batchService = null,
+        ILocalResultExportCoordinator? localResultExports = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
         this.resourcePicker = resourcePicker ?? throw new ArgumentNullException(nameof(resourcePicker));
@@ -84,6 +86,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         this.resultDialog = resultDialog ?? throw new ArgumentNullException(nameof(resultDialog));
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.batchService = batchService;
+        this.localResultExports = localResultExports;
         if (historyPageSize is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(historyPageSize));
         this.historyPageSize = historyPageSize;
 
@@ -113,6 +116,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         PauseCommand = new AsyncRelayCommand(PauseAsync, () => CanPause);
         ResumeCommand = new AsyncRelayCommand(ResumeAsync, () => CanResume);
         RetryFailedCommand = new AsyncRelayCommand(RetryFailedAsync, () => CanRetryFailed);
+        SaveResultsCommand = new AsyncRelayCommand(SaveResultsAsync, () => CanSaveResults);
         PreviousHistoryPageCommand = new AsyncRelayCommand(
             PreviousHistoryPageAsync, () => CanLoadPreviousHistoryPage);
         NextHistoryPageCommand = new AsyncRelayCommand(
@@ -252,6 +256,9 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public bool CanRetryFailed => CanUseBatchControls &&
         SelectedOperation is { CanSafelyRetry: true } operation &&
         operation.BatchId == SelectedBatch!.Id;
+    public bool CanSaveResults => !IsClosed && !IsBusy && localResultExports is not null &&
+        SelectedBatch?.Status is StandaloneShareBatchStatus.Completed or
+            StandaloneShareBatchStatus.CompletedWithFailures;
     public int HistoryPageNumber => historyPageNumber;
     public string HistoryPageText => $"第 {HistoryPageNumber} 页";
     public bool CanLoadPreviousHistoryPage => CanSelectHistory && HistoryPageNumber > 1;
@@ -267,6 +274,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand PauseCommand { get; }
     public IAsyncRelayCommand ResumeCommand { get; }
     public IAsyncRelayCommand RetryFailedCommand { get; }
+    public IAsyncRelayCommand SaveResultsCommand { get; }
     public IAsyncRelayCommand PreviousHistoryPageCommand { get; }
     public IAsyncRelayCommand NextHistoryPageCommand { get; }
 
@@ -619,6 +627,42 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
 
+    public async Task SaveResultsAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanSaveResults || SelectedBatch is not { } batch || localResultExports is null) return;
+        var requestGeneration = Volatile.Read(ref batchSelectionGeneration);
+        using var operation = CreateOperation(cancellationToken);
+        IsBusy = true;
+        try
+        {
+            var result = await localResultExports.ExportStandaloneAsync(batch.Id, operation.Token)
+                .ConfigureAwait(true);
+            if (!IsBatchRequestCurrent(batch.Id, requestGeneration)) return;
+            StatusMessage = result.Disposition switch
+            {
+                LocalResultExportDisposition.Exported or LocalResultExportDisposition.AlreadySucceeded =>
+                    "分享结果已保存。",
+                LocalResultExportDisposition.Busy => "分享结果正在保存，请稍后查看。",
+                LocalResultExportDisposition.NotReady => "任务尚未完成，暂时不能保存结果。",
+                LocalResultExportDisposition.Conflict => "保存状态已变化，请稍后重试。",
+                _ => "保存结果失败，请稍后重试。",
+            };
+        }
+        catch (OperationCanceledException) when (operation.IsCancellationRequested)
+        {
+            if (!IsClosed) StatusMessage = "已取消保存结果。";
+        }
+        catch (Exception)
+        {
+            if (IsBatchRequestCurrent(batch.Id, requestGeneration))
+                StatusMessage = "保存结果失败，请稍后重试。";
+        }
+        finally
+        {
+            if (!IsClosed) IsBusy = false;
+        }
+    }
+
     public void Close()
     {
         if (isClosed) return;
@@ -850,6 +894,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanResume));
         OnPropertyChanged(nameof(CanRetryFailed));
+        OnPropertyChanged(nameof(CanSaveResults));
         OnPropertyChanged(nameof(CanLoadPreviousHistoryPage));
         OnPropertyChanged(nameof(CanLoadNextHistoryPage));
         PickResourcesCommand?.NotifyCanExecuteChanged();
@@ -861,6 +906,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         PauseCommand?.NotifyCanExecuteChanged();
         ResumeCommand?.NotifyCanExecuteChanged();
         RetryFailedCommand?.NotifyCanExecuteChanged();
+        SaveResultsCommand?.NotifyCanExecuteChanged();
         PreviousHistoryPageCommand?.NotifyCanExecuteChanged();
         NextHistoryPageCommand?.NotifyCanExecuteChanged();
     }

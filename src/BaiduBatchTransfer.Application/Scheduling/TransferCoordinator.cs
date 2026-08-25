@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using BaiduBatchTransfer.Application.Jobs;
 
 namespace BaiduBatchTransfer.Application.Scheduling;
 
@@ -46,6 +47,7 @@ public sealed class TransferCoordinator
     private readonly NetworkExecutionGate networkGate;
     private readonly IShareCoordinatorWorkSource? shareWork;
     private readonly TimeProvider timeProvider;
+    private readonly ILocalResultExportCoordinator? localResultExports;
     private readonly SemaphoreSlim singleCycle = new(1, 1);
 
     public TransferCoordinator(
@@ -53,13 +55,15 @@ public sealed class TransferCoordinator
         ITransferOperationExecutor executor,
         NetworkExecutionGate networkGate,
         IShareCoordinatorWorkSource? shareWork = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ILocalResultExportCoordinator? localResultExports = null)
     {
         this.allocation = allocation ?? throw new ArgumentNullException(nameof(allocation));
         this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
         this.networkGate = networkGate ?? throw new ArgumentNullException(nameof(networkGate));
         this.shareWork = shareWork;
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.localResultExports = localResultExports;
     }
 
     public async Task<int> RunCycleAsync(CancellationToken cancellationToken = default)
@@ -134,7 +138,22 @@ public sealed class TransferCoordinator
 
             await Task.WhenAll(ConsumeAsync(), ConsumeAsync()).ConfigureAwait(false);
             if (scheduled == 0 && state.ActiveNetworkOperationCount == 0 && state.BusyAccountIds.Count == 0 && networkGate.CanAcquireNewWork)
+            {
                 await allocation.TryFinalizeExhaustedBatchAsync(batchId.Value, cancellationToken).ConfigureAwait(false);
+                if (localResultExports is not null)
+                {
+                    try
+                    {
+                        await localResultExports.ExportTransferAsync(batchId.Value, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                    catch
+                    {
+                        // Export is independently durable and retried by startup recovery.
+                    }
+                }
+            }
             return scheduled;
         }
         finally

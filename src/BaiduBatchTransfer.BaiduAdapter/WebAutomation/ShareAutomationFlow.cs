@@ -205,6 +205,11 @@ public interface IShareAutomationSession
         CancellationToken cancellationToken);
 }
 
+public interface IShareResultExportSession : IShareAutomationSession
+{
+    Task ExportOfficialResultAsync(CancellationToken cancellationToken);
+}
+
 public sealed record ShareAutomationPreparation(WebAutomationBaseline Baseline)
 {
     public ShareAutomationPreparation Validate()
@@ -323,6 +328,17 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         }
     }
 
+    public async Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitAndExportAsync(
+        IShareResultExportSession session,
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var result = await SubmitAsync(session, request, baseline, cancellationToken).ConfigureAwait(false);
+        return await ExportAfterExactAsync(session, result, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactAsync(
         IShareAutomationSession session,
         PermanentShareRequest request,
@@ -342,6 +358,40 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
                 .ReadCompleteStableOfficialShareListAsync(cancellationToken)
                 .ConfigureAwait(false);
             return ConfirmFromListing(request, baseline, acceptedEvidence, current);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return ResultPending();
+        }
+    }
+
+    public async Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactAndExportAsync(
+        IShareResultExportSession session,
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        ShareOfficialAcceptance acceptedEvidence,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var result = await ConfirmExactAsync(
+            session, request, baseline, acceptedEvidence, cancellationToken).ConfigureAwait(false);
+        return await ExportAfterExactAsync(session, result, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BaiduAdapterResult<ShareCreationReceipt>> ExportAfterExactAsync(
+        IShareResultExportSession session,
+        BaiduAdapterResult<ShareCreationReceipt> result,
+        CancellationToken cancellationToken)
+    {
+        if (!result.IsSuccess) return result;
+        try
+        {
+            await session.ExportOfficialResultAsync(cancellationToken).ConfigureAwait(false);
+            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

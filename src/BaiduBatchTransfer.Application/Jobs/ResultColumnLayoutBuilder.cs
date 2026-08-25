@@ -10,6 +10,8 @@ public sealed record ResultAccountColumnLayout(
     Guid AccountId,
     int OutputOrdinal,
     string OutputLabel,
+    string ActualTransferAccountHeader,
+    string TransferStatusHeader,
     string ShareUrlHeader,
     string ExtractionCodeHeader,
     string ShareStatusHeader)
@@ -38,7 +40,7 @@ public sealed class ResultColumnLayout
     public string ResolvedTitleHeader { get; }
     public string OriginalShareUrlHeader { get; }
     public ImmutableArray<ResultAccountColumnLayout> Accounts { get; }
-    public int ColumnCount => checked(SourceHeaders.Length + 2 + Accounts.Length * 3);
+    public int ColumnCount => checked(SourceHeaders.Length + 2 + Accounts.Length * 5);
     public string Fingerprint { get; }
 
     public override string ToString() =>
@@ -64,7 +66,7 @@ public sealed partial class ResultColumnLayoutBuilder
             .ToArray();
         if (selected.Length == 0)
             throw new BatchDraftValidationException("请至少选择一个输出账号。");
-        var required = checked((long)sourceHeaders.Count + 2L + 3L * selected.Length);
+        var required = checked((long)sourceHeaders.Count + 2L + 5L * selected.Length);
         if (required > ExcelMaximumColumnCount)
             throw new BatchDraftValidationException("结果列数超过 Excel 的 16,384 列限制，请减少原始列或参与账号。");
 
@@ -82,12 +84,14 @@ public sealed partial class ResultColumnLayoutBuilder
                 selected[index].AccountId,
                 index + 1,
                 label,
+                UniqueSystemHeader($"转存结果_{label}_实际转存账号", used),
+                UniqueSystemHeader($"转存结果_{label}_转存状态", used),
                 UniqueSystemHeader($"转存结果_{label}_新分享链接", used),
                 UniqueSystemHeader($"转存结果_{label}_提取码", used),
                 UniqueSystemHeader($"转存结果_{label}_分享状态", used)));
         }
 
-        using var canonical = new CanonicalHashWriter("result-column-layout-v1");
+        using var canonical = new CanonicalHashWriter("result-column-layout-v2");
         canonical.BeginCollection("source-headers", sourceHeaders.Count);
         foreach (var header in sourceHeaders) canonical.WriteString("source-header", header);
         canonical.WriteString("resolved-title-header", resolved);
@@ -95,10 +99,12 @@ public sealed partial class ResultColumnLayoutBuilder
         canonical.BeginCollection("accounts", output.Count);
         foreach (var account in output)
         {
-            canonical.BeginObject("account", 6);
+            canonical.BeginObject("account", 8);
             canonical.WriteGuid("account-id", account.AccountId);
             canonical.WriteInt32("output-ordinal", account.OutputOrdinal);
             canonical.WriteString("output-label", account.OutputLabel);
+            canonical.WriteString("actual-transfer-account-header", account.ActualTransferAccountHeader);
+            canonical.WriteString("transfer-status-header", account.TransferStatusHeader);
             canonical.WriteString("share-url-header", account.ShareUrlHeader);
             canonical.WriteString("extraction-code-header", account.ExtractionCodeHeader);
             canonical.WriteString("share-status-header", account.ShareStatusHeader);

@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Infrastructure.Database;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
@@ -10,6 +11,55 @@ public sealed class StandaloneShareStoreTests : IDisposable
     // operation and one exact remote-item row; no TransferOperation is fabricated and the existing
     // transfer-triggered ShareOperations foreign-key boundary remains untouched.
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-standalone-share-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task ResultProjectionIsAStableKeysetAndUsesOnlyExactCurrentGenerationEvidence()
+    {
+        var graph = await CreateAsync();
+        var receipt = await graph.Store.CreateOrGetBatchAsync(Envelope(graph, 3, graph.Now));
+        var operations = receipt.Operations.OrderBy(item => item.SequenceNumber).ToArray();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var transaction = connection.BeginTransaction())
+        {
+            await using (var update = connection.CreateCommand())
+            {
+                update.Transaction = transaction;
+                update.CommandText = "UPDATE StandaloneShareOperations SET Status=CASE SequenceNumber WHEN 1 THEN 'Succeeded' WHEN 2 THEN 'ResultPending' ELSE 'Failed' END, SubmissionState=CASE SequenceNumber WHEN 1 THEN 'Completed' WHEN 2 THEN 'ResultPending' ELSE 'DefinitelyNotAccepted' END, LastErrorCode=CASE SequenceNumber WHEN 3 THEN 'SHARE_FAILED' END WHERE BatchId=$batch;";
+                update.Parameters.AddWithValue("$batch", receipt.Batch.Id.ToString("D"));
+                await update.ExecuteNonQueryAsync();
+            }
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandText = "INSERT INTO StandaloneShareResults(Id,OperationId,BatchId,AccountId,Generation,ExactItemSetFingerprint,SettingsFingerprint,ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,AcceptedAt,CreatedAt) VALUES($id,$operation,$batch,$account,$generation,$items,$settings,'share-1','https://pan.baidu.com/s/result','a1b2',1,1,$now,$now);";
+                insert.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("D"));
+                insert.Parameters.AddWithValue("$operation", operations[0].Id.ToString("D"));
+                insert.Parameters.AddWithValue("$batch", receipt.Batch.Id.ToString("D"));
+                insert.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+                insert.Parameters.AddWithValue("$generation", operations[0].Generation);
+                insert.Parameters.AddWithValue("$items", operations[0].ExactRemoteItems.Fingerprint);
+                insert.Parameters.AddWithValue("$settings", operations[0].SettingsFingerprint);
+                insert.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+                await insert.ExecuteNonQueryAsync();
+            }
+            await transaction.CommitAsync();
+        }
+
+        IStandaloneShareResultProjectionRepository projection = new SqliteStandaloneShareStore(graph.Factory);
+        var first = await projection.GetPageAsync(receipt.Batch.Id, 0, 2);
+        var second = await projection.GetPageAsync(receipt.Batch.Id, first.NextSequenceNumber!.Value, 2);
+
+        Assert.Equal([1, 2], first.Items.Select(item => item.SequenceNumber));
+        Assert.Equal(2, first.NextSequenceNumber);
+        Assert.Equal("account", first.Items[0].AccountDisplayName);
+        Assert.Equal("https://pan.baidu.com/s/result", first.Items[0].ShareUrl);
+        Assert.Equal("a1b2", first.Items[0].ExtractionCode);
+        Assert.Null(first.Items[1].ShareUrl);
+        var failed = Assert.Single(second.Items);
+        Assert.Equal(3, failed.SequenceNumber);
+        Assert.Equal("SHARE_FAILED", failed.StableErrorCode);
+        Assert.Null(second.NextSequenceNumber);
+    }
 
     [Fact]
     public async Task CreateOrGetIsCommitThenErrorSafeAndEverySelectionHasExactlyOneOperation()

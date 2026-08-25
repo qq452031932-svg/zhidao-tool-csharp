@@ -13,6 +13,7 @@ public sealed class StandaloneShareCoordinator :
     private readonly TimeProvider timeProvider;
     private readonly TimeSpan leaseDuration;
     private readonly TimeSpan rescanInterval;
+    private readonly ILocalResultExportCoordinator? localResultExports;
     private readonly Channel<Guid> batches = Channel.CreateUnbounded<Guid>(new()
     {
         SingleReader = true,
@@ -32,13 +33,15 @@ public sealed class StandaloneShareCoordinator :
         IStandaloneShareOperationRunner runner,
         TimeProvider? timeProvider = null,
         TimeSpan? leaseDuration = null,
-        TimeSpan? rescanInterval = null)
+        TimeSpan? rescanInterval = null,
+        ILocalResultExportCoordinator? localResultExports = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.runner = runner ?? throw new ArgumentNullException(nameof(runner));
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.leaseDuration = leaseDuration ?? TimeSpan.FromMinutes(30);
         this.rescanInterval = rescanInterval ?? TimeSpan.FromMinutes(1);
+        this.localResultExports = localResultExports;
         if (this.leaseDuration <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(leaseDuration));
         if (this.rescanInterval <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(rescanInterval));
     }
@@ -136,7 +139,23 @@ public sealed class StandaloneShareCoordinator :
             now = timeProvider.GetUtcNow();
             var lease = await store.TryLeaseNextAsync(
                 batchId, Guid.NewGuid(), now, now.Add(leaseDuration), cancellationToken).ConfigureAwait(false);
-            if (lease is null) return;
+            if (lease is null)
+            {
+                if (localResultExports is not null)
+                {
+                    try
+                    {
+                        await localResultExports.ExportStandaloneAsync(batchId, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                    catch
+                    {
+                        // Export is independently durable and retried by startup recovery.
+                    }
+                }
+                return;
+            }
             await runner.ExecuteAsync(lease, cancellationToken).ConfigureAwait(false);
         }
     }

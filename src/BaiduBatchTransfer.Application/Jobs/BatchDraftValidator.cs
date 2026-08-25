@@ -652,10 +652,12 @@ internal static class BatchConfirmationTokens
         writer.BeginCollection("output-accounts", layout.Accounts.Length);
         foreach (var account in layout.Accounts)
         {
-            writer.BeginObject("output-account", 6);
+            writer.BeginObject("output-account", 8);
             writer.WriteGuid("account-id", account.AccountId);
             writer.WriteInt32("output-ordinal", account.OutputOrdinal);
             writer.WriteString("output-label", account.OutputLabel);
+            writer.WriteString("actual-transfer-account-header", account.ActualTransferAccountHeader);
+            writer.WriteString("transfer-status-header", account.TransferStatusHeader);
             writer.WriteString("share-url-header", account.ShareUrlHeader);
             writer.WriteString("extraction-code-header", account.ExtractionCodeHeader);
             writer.WriteString("share-status-header", account.ShareStatusHeader);
