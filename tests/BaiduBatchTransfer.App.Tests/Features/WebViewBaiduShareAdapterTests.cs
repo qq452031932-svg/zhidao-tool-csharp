@@ -257,6 +257,27 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     [Fact]
+    public async Task AcceptanceTelemetryFailureCannotChangePersistedExactShareResult()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare) with { IsRecovery = true };
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["share-existing"]),
+            Request().RemoteItems));
+        var adapter = Adapter(
+            accountId, new RecordingBroker(), attempts, new AcceptanceStore(Acceptance()),
+            acceptanceEvidence: new ThrowingEvidenceSink());
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.True(result.Value!.IsFinalAcceptance);
+    }
+
+    [Fact]
     public async Task OperationBoundExactConfirmationDownloadsBeforeSucceededUsingTheResolvedDirectory()
     {
         var accountId = Guid.NewGuid();
@@ -533,6 +554,21 @@ public sealed class WebViewBaiduShareAdapterTests
             Recovery.Add((request, exactEvidenceFingerprint));
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingEvidenceSink : IAcceptanceOperationEvidenceSink
+    {
+        public Task RecordRemoteResultAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("simulated acceptance presenter failure");
+
+        public Task RecordRecoveryAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("simulated acceptance presenter failure");
     }
 
     private sealed class CallbackBroker(AttemptStore attempts, IVisibleWebAutomationSession session)

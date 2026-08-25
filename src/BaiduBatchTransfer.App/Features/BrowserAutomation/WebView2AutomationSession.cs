@@ -3,6 +3,9 @@ using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using Microsoft.Web.WebView2.Core;
 using System.IO;
 using System.Windows.Threading;
+using System.Security.Cryptography;
+using System.Text;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -25,6 +28,7 @@ public sealed class WebView2AutomationSessionFactory : IVisibleWebAutomationSess
 
 public sealed class WebView2AutomationSession :
     IVisibleWebAutomationSession,
+    IAcceptanceDirectoryPreparationSession,
     IRemoteResourcePickerSession,
     IWebViewDownloadEventSource
 {
@@ -101,6 +105,24 @@ public sealed class WebView2AutomationSession :
             window.ShowResourcePickerActions();
             return window.WaitForResourcePickerDecisionAsync(cancellationToken);
         }).Task.Unwrap();
+    }
+
+    public async Task<AcceptanceDirectoryPreparationEvidence?> ConfirmDirectoryPreparedAsync(
+        WebAutomationRequestIdentity requestIdentity,
+        RemotePath requestedPath,
+        CancellationToken cancellationToken = default)
+    {
+        if (requestIdentity != identity)
+            throw new InvalidOperationException("目录确认请求不属于当前窗口。");
+        var confirmed = await window.Dispatcher.InvokeAsync(() =>
+        {
+            window.ShowDirectoryPreparationActions(requestedPath);
+            return window.WaitForDirectoryPreparationDecisionAsync(cancellationToken);
+        }).Task.Unwrap().ConfigureAwait(true);
+        if (!confirmed) return null;
+        var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"manual-directory|{identity.OperationId:D}|{identity.Generation}|{requestedPath.Value}")));
+        return new(new RemoteDirectory(requestedPath.Value, requestedPath), fingerprint);
     }
 
     public Task<RemoteResourceSelectionPage> ReadSelectionPageAsync(

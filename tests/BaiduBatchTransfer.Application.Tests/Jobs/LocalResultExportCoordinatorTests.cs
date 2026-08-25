@@ -26,7 +26,8 @@ public sealed class LocalResultExportCoordinatorTests
     [Fact]
     public async Task AcceptanceObserverFailure_DoesNotChangeDurableExportOutcome()
     {
-        var graph = Fixture(observer: new ThrowingObserver());
+        var observer = new ThrowingObserver();
+        var graph = Fixture(observer: observer);
 
         var first = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
         var second = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
@@ -34,6 +35,21 @@ public sealed class LocalResultExportCoordinatorTests
         Assert.Equal(LocalResultExportDisposition.Exported, first.Disposition);
         Assert.Equal(LocalResultExportDisposition.AlreadySucceeded, second.Disposition);
         Assert.Equal(LocalResultExportStatus.Succeeded, graph.Store.Record!.Status);
+        Assert.Equal(2, observer.CallCount);
+    }
+
+    [Fact]
+    public async Task ExportWithoutWorkbookMembershipProofDoesNotNotifyAcceptanceObserver()
+    {
+        var observer = new CountingObserver();
+        var graph = Fixture(observer: observer);
+        graph.Artifacts.ProvidesVerifiedEvidence = false;
+
+        var result = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
+
+        Assert.Equal(LocalResultExportDisposition.Exported, result.Disposition);
+        Assert.Equal(LocalResultExportStatus.Succeeded, graph.Store.Record!.Status);
+        Assert.Equal(0, observer.CallCount);
     }
 
     [Fact]
@@ -217,6 +233,7 @@ public sealed class LocalResultExportCoordinatorTests
             return Task.FromResult(new Page<LocalResultExportOwnerSnapshot>(
                 items, items.Length, query.PageNumber, query.PageSize));
         }
+
     }
 
     private sealed class FakeArtifacts(List<string> events) : ILocalResultExportArtifactService
@@ -229,6 +246,7 @@ public sealed class LocalResultExportCoordinatorTests
         public TaskCompletionSource ReleasePublish { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string? PublishedTarget { get; private set; }
+        public bool ProvidesVerifiedEvidence { get; set; } = true;
 
         public Task<string> ChooseTargetFileNameAsync(
             LocalResultExportOwnerSnapshot owner, CancellationToken cancellationToken = default)
@@ -256,6 +274,22 @@ public sealed class LocalResultExportCoordinatorTests
             PublishedTarget = targetFileName;
             return new LocalResultArtifactPublishReceipt(targetFileName, 1);
         }
+
+        public Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
+            LocalResultExportOwnerSnapshot owner,
+            string targetFileName,
+            IReadOnlyList<LocalResultOperationIdentity> candidates,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(ProvidesVerifiedEvidence
+                ? new LocalResultExportCompletedEvidence(
+                owner.Key,
+                candidates.Select(candidate => new LocalResultOperationEvidence(
+                    candidate.AdapterKind, candidate.AccountId, candidate.OperationId,
+                    candidate.Generation,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).ToArray(),
+                "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+                : null);
     }
 
     private sealed class FakeStore(List<string> events) : ILocalResultExportStore
@@ -400,9 +434,32 @@ public sealed class LocalResultExportCoordinatorTests
 
     private sealed class ThrowingObserver : ILocalResultExportObserver
     {
+        public int CallCount { get; private set; }
+        public IReadOnlyList<LocalResultOperationIdentity> GetTrackedOperations(LocalResultExportKey exportKey) =>
+            [new("BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1)];
+
         public Task OnLocalResultExportCompletedAsync(
-            LocalResultExportKey key,
-            CancellationToken cancellationToken = default) =>
+            LocalResultExportCompletedEvidence evidence,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
             throw new InvalidOperationException("simulated acceptance telemetry failure");
+        }
+    }
+
+    private sealed class CountingObserver : ILocalResultExportObserver
+    {
+        public int CallCount { get; private set; }
+
+        public IReadOnlyList<LocalResultOperationIdentity> GetTrackedOperations(LocalResultExportKey exportKey) =>
+            [new("BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1)];
+
+        public Task OnLocalResultExportCompletedAsync(
+            LocalResultExportCompletedEvidence evidence,
+            CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.CompletedTask;
+        }
     }
 }

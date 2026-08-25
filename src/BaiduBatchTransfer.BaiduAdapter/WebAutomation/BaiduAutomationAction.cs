@@ -61,11 +61,19 @@ public sealed record BaiduNavigationAuthorizationRequest(
     string SelectorVersion,
     string ApplicationBuildVersion,
     BaiduAutomationAcceptance Acceptance,
-    BaiduProtocolValidationStatus FieldEvidenceValidationStatus)
+    BaiduProtocolValidationStatus FieldEvidenceValidationStatus,
+    BaiduAcceptanceOperationScope? AcceptanceScope = null)
 {
     public override string ToString() =>
         $"BaiduNavigationAuthorizationRequest {{ Action = {Action}, OfficialUri = [REDACTED], ProtocolVersion = [REDACTED], SelectorVersion = [REDACTED], ApplicationBuildVersion = [REDACTED], Acceptance = {Acceptance}, FieldEvidenceValidationStatus = {FieldEvidenceValidationStatus} }}";
 }
+
+public sealed record BaiduAcceptanceOperationScope(
+    string AdapterKind,
+    Guid AccountId,
+    Guid OperationId,
+    int Generation,
+    Guid BatchId);
 
 public readonly record struct BaiduAutomationDecision(
     bool IsAllowed,

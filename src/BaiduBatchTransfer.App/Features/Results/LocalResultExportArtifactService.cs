@@ -95,6 +95,23 @@ public sealed class LocalResultExportArtifactService(
         return new(finalName, receipt.ExportedRows);
     }
 
+    public Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
+        LocalResultExportOwnerSnapshot owner,
+        string targetFileName,
+        IReadOnlyList<LocalResultOperationIdentity> candidates,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(candidates);
+        LocalResultExportValidation.SafeFileName(targetFileName, nameof(targetFileName));
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // The current workbook format does not embed operation id/generation metadata.
+        // A database lookup plus an independently computed file hash cannot prove
+        // workbook membership, so formal acceptance remains deliberately unavailable.
+        return Task.FromResult<LocalResultExportCompletedEvidence?>(null);
+    }
+
     private static string ResolveExactPath(string directory, string fileName)
     {
         var normalizedDirectory = NormalizeDirectory(directory);

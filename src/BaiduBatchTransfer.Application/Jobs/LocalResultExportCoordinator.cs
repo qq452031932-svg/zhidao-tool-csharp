@@ -89,6 +89,13 @@ public interface ILocalResultExportArtifactService
         LocalResultExportOwnerSnapshot owner,
         string targetFileName,
         CancellationToken cancellationToken = default);
+
+    Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
+        LocalResultExportOwnerSnapshot owner,
+        string targetFileName,
+        IReadOnlyList<LocalResultOperationIdentity> candidates,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<LocalResultExportCompletedEvidence?>(null);
 }
 
 public interface ILocalResultExportCoordinator
@@ -106,10 +113,30 @@ public interface ILocalResultExportCoordinator
 
 public interface ILocalResultExportObserver
 {
+    IReadOnlyList<LocalResultOperationIdentity> GetTrackedOperations(LocalResultExportKey exportKey) => [];
+
     Task OnLocalResultExportCompletedAsync(
-        LocalResultExportKey exportKey,
+        LocalResultExportCompletedEvidence evidence,
         CancellationToken cancellationToken = default);
 }
+public sealed record LocalResultOperationIdentity(
+    string AdapterKind,
+    Guid AccountId,
+    Guid OperationId,
+    int Generation);
+
+public sealed record LocalResultOperationEvidence(
+    string AdapterKind,
+    Guid AccountId,
+    Guid OperationId,
+    int Generation,
+    string ContentFingerprint);
+
+public sealed record LocalResultExportCompletedEvidence(
+    LocalResultExportKey ExportKey,
+    IReadOnlyList<LocalResultOperationEvidence> Operations,
+    string LayoutFingerprint,
+    string ArtifactFingerprint);
 
 public sealed class LocalResultExportCoordinator(
     ILocalResultExportStore store,
@@ -203,7 +230,9 @@ public sealed class LocalResultExportCoordinator(
         var existing = await store.GetAsync(key, cancellationToken).ConfigureAwait(false);
         if (existing?.Status == LocalResultExportStatus.Succeeded)
         {
-            await NotifyObserverSafelyAsync(key).ConfigureAwait(false);
+            var owner = await owners.GetAsync(key, cancellationToken).ConfigureAwait(false);
+            if (owner is not null && existing.FinalFileName is not null)
+                await NotifyObserverSafelyAsync(owner, existing.FinalFileName).ConfigureAwait(false);
             return new(LocalResultExportDisposition.AlreadySucceeded, existing.FinalFileName);
         }
 
@@ -271,7 +300,7 @@ public sealed class LocalResultExportCoordinator(
                 lease.Revision, lease.LeaseExpiresAt, finalFileName, timeProvider.GetUtcNow(),
                 CancellationToken.None).ConfigureAwait(false);
             if (!completed) return new(LocalResultExportDisposition.Conflict);
-            await NotifyObserverSafelyAsync(lease.Key).ConfigureAwait(false);
+            await NotifyObserverSafelyAsync(owner, finalFileName).ConfigureAwait(false);
             return new(LocalResultExportDisposition.Exported, finalFileName);
         }
         catch (OperationCanceledException)
@@ -285,12 +314,23 @@ public sealed class LocalResultExportCoordinator(
         }
     }
 
-    private async Task NotifyObserverSafelyAsync(LocalResultExportKey key)
+    private async Task NotifyObserverSafelyAsync(
+        LocalResultExportOwnerSnapshot owner,
+        string finalFileName)
     {
         if (observer is null) return;
         try
         {
-            await observer.OnLocalResultExportCompletedAsync(key, CancellationToken.None).ConfigureAwait(false);
+            var candidates = observer.GetTrackedOperations(owner.Key);
+            if (candidates.Count == 0) return;
+            // Only the artifact service can prove that these exact operation identities
+            // are present in this exact published workbook. Database state and a file hash
+            // gathered independently are deliberately insufficient (TOCTOU fail-closed).
+            var evidence = await artifacts.GetVerifiedEvidenceAsync(
+                owner, finalFileName, candidates, CancellationToken.None).ConfigureAwait(false);
+            if (evidence is null || evidence.ExportKey != owner.Key) return;
+            await observer.OnLocalResultExportCompletedAsync(evidence, CancellationToken.None)
+                .ConfigureAwait(false);
         }
         catch
         {

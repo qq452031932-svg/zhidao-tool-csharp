@@ -9,6 +9,7 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdapter
 {
+    private static readonly Uri OfficialFilesUri = new("https://pan.baidu.com/disk/main");
     private readonly IBaiduNetdiskAdapter readOnlyAdapter;
     private readonly IVisibleWebAutomationBroker broker;
     private readonly IAccountProfilePathPolicy profilePaths;
@@ -57,6 +58,47 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         RemotePath path,
         CancellationToken cancellationToken) =>
         readOnlyAdapter.EnsureDirectoryAsync(session, path, cancellationToken);
+
+    public async Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        RemotePath path,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(path);
+        context.Validate();
+        if (context.AccountId != session.LocalAccountId)
+            throw new InvalidOperationException("The directory preparation identity does not match its account.");
+        var request = Request(
+            context,
+            OfficialFilesUri,
+            async (visibleSession, visibleContext, token) =>
+            {
+                if (visibleSession is not IAcceptanceDirectoryPreparationSession manual)
+                    return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+                var evidence = await manual.ConfirmDirectoryPreparedAsync(
+                    visibleContext.Identity, path, token).ConfigureAwait(false);
+                if (evidence is null || evidence.Directory.Path != path ||
+                    evidence.ObservationFingerprint is not { Length: 64 })
+                    return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+                return BaiduAdapterResult<RemoteDirectory>.Success(
+                    evidence.Directory,
+                    SubmissionAcceptance.DefinitelyNotAccepted);
+            });
+        try
+        {
+            var result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false);
+            return result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
+                ? result.Value
+                : NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+        catch (WebAutomationAuthorizationException)
+        {
+            return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+    }
 
     public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(
         AccountSession session,
@@ -200,10 +242,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         if (result.Disposition is VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null)
         {
             if (result.Value is { IsSuccess: true, Value.ExactRemoteItems: not null } exact && acceptanceEvidence is not null)
-                await acceptanceEvidence.RecordRemoteResultAsync(
+                await RecordAcceptanceEvidenceSafelyAsync(
                     EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
                     exact.Value!.ExactRemoteItems.Fingerprint,
-                    cancellationToken).ConfigureAwait(false);
+                    recovery: false).ConfigureAwait(false);
             return result.Value;
         }
         return Unknown<TransferReceipt>(
@@ -240,10 +282,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         {
             if (acceptanceEvidence is not null)
             {
-                await acceptanceEvidence.RecordRemoteResultAsync(
+                await RecordAcceptanceEvidenceSafelyAsync(
                     EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
                     attempt.AcceptedRemoteItems.Fingerprint,
-                    cancellationToken).ConfigureAwait(false);
+                    recovery: false).ConfigureAwait(false);
             }
             return BaiduAdapterResult<TransferConfirmationResult>.Success(
                 TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
@@ -309,14 +351,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             return UnknownConfirmation();
         if (result.Value is { IsSuccess: true, Value.State: TransferConfirmationState.ExactPresent } && acceptanceEvidence is not null)
         {
-            await acceptanceEvidence.RecordRemoteResultAsync(
+            await RecordAcceptanceEvidenceSafelyAsync(
                 EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
                 acceptedRemoteItems.Fingerprint,
-                cancellationToken).ConfigureAwait(false);
-            await acceptanceEvidence.RecordRecoveryAsync(
-                EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
-                acceptedRemoteItems.Fingerprint,
-                cancellationToken).ConfigureAwait(false);
+                recovery: true).ConfigureAwait(false);
         }
         return result.Value;
     }
@@ -336,7 +374,29 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             action,
             context.IsRecovery);
 
-    private BaiduNavigationAuthorizationRequest Navigation(Uri officialUri) => new(
+    private async Task RecordAcceptanceEvidenceSafelyAsync(
+        AdapterWriteAuthorizationRequest request,
+        string fingerprint,
+        bool recovery)
+    {
+        if (acceptanceEvidence is null) return;
+        try
+        {
+            await acceptanceEvidence.RecordRemoteResultAsync(
+                request, fingerprint, CancellationToken.None).ConfigureAwait(false);
+            if (recovery)
+                await acceptanceEvidence.RecordRecoveryAsync(
+                    request, fingerprint, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Acceptance telemetry follows the persisted exact result and cannot change it.
+        }
+    }
+
+    private BaiduNavigationAuthorizationRequest Navigation(
+        TransferOperationAutomationContext context,
+        Uri officialUri) => new(
         BaiduAutomationAction.OpenOfficialUri,
         officialUri,
         BaiduSelectorCatalog.ProtocolVersion,
@@ -347,11 +407,22 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             BaiduSelectorCatalog.ProtocolVersion,
             BaiduSelectorCatalog.SelectorVersion,
             applicationBuildVersion),
-        BaiduProtocolValidationStatus.NotValidated);
+        BaiduProtocolValidationStatus.NotValidated,
+        new BaiduAcceptanceOperationScope(
+            "BaiduTransfer", context.AccountId, context.OperationId,
+            context.Generation, context.BatchId));
 
     private VisibleWebAutomationRequest<T> Request<T>(
         TransferOperationAutomationContext context,
         ShareReference share,
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+    {
+        return Request(context, new Uri(share.OriginalUrl), action);
+    }
+
+    private VisibleWebAutomationRequest<T> Request<T>(
+        TransferOperationAutomationContext context,
+        Uri officialUri,
         Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
     {
         var identity = new WebAutomationRequestIdentity(
@@ -362,7 +433,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             WebAutomationOwnerKind.Transfer);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        return new(identity, profilePath, Navigation(new Uri(share.OriginalUrl)), action);
+        return new(identity, profilePath, Navigation(context, officialUri), action);
     }
 
     private static void ValidateOperationIdentity(

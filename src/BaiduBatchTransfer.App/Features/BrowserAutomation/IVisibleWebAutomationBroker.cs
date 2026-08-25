@@ -1,5 +1,7 @@
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.App.Services;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -102,6 +104,18 @@ public interface IVisibleWebAutomationSession : IAsyncDisposable
     Task CloseAsync(CancellationToken cancellationToken = default);
 }
 
+public sealed record AcceptanceDirectoryPreparationEvidence(
+    RemoteDirectory Directory,
+    string ObservationFingerprint);
+
+public interface IAcceptanceDirectoryPreparationSession
+{
+    Task<AcceptanceDirectoryPreparationEvidence?> ConfirmDirectoryPreparedAsync(
+        WebAutomationRequestIdentity identity,
+        RemotePath requestedPath,
+        CancellationToken cancellationToken = default);
+}
+
 public interface IVisibleWebAutomationSessionFactory
 {
     Task<IVisibleWebAutomationSession> CreateAsync(
@@ -119,6 +133,11 @@ public interface IWebAutomationUiDispatcher
 public interface IWebAutomationNavigationAuthorizer
 {
     BaiduAutomationDecision Authorize(BaiduNavigationAuthorizationRequest request);
+}
+
+public interface IAcceptanceNavigationAuthorizationSource
+{
+    bool IsAuthorized(BaiduNavigationAuthorizationRequest request);
 }
 
 public interface IWebAutomationBatchCancellation
@@ -151,10 +170,19 @@ public sealed class WebAutomationAuthorizationException(
     public BaiduAutomationDenialReason DenialReason { get; } = denialReason;
 }
 
-public sealed class ProductionWebAutomationNavigationAuthorizer : IWebAutomationNavigationAuthorizer
+public sealed class ProductionWebAutomationNavigationAuthorizer(
+    IAcceptanceNavigationAuthorizationSource? acceptanceSource = null) : IWebAutomationNavigationAuthorizer
 {
-    public BaiduAutomationDecision Authorize(BaiduNavigationAuthorizationRequest request) =>
-        BaiduSelectorCatalog.Production.AuthorizeNavigation(request);
+    public BaiduAutomationDecision Authorize(BaiduNavigationAuthorizationRequest request)
+    {
+        var production = BaiduSelectorCatalog.Production.AuthorizeNavigation(request);
+        if (production.IsAllowed) return production;
+        if (request.Action is BaiduAutomationAction.OpenOfficialUri &&
+            BaiduNavigationPolicy.Evaluate(request.OfficialUri).IsAllowed &&
+            acceptanceSource?.IsAuthorized(request) == true)
+            return BaiduAutomationDecision.Allowed();
+        return production;
+    }
 }
 
 public sealed record VisibleWebAutomationQueueOptions

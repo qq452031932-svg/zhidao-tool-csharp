@@ -86,6 +86,29 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
+    public async Task OperationBoundDirectoryPreparationRequiresTypedVisibleUserEvidence()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.Preparing, null));
+        var session = new ManualDirectorySession();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new CallbackBroker(attempts, session),
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(),
+            "build-a", attempts);
+        var path = new RemotePath("/acceptance-target");
+
+        var result = await adapter.EnsureDirectoryForOperationAsync(
+            context, Session(accountId), path, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(path, result.Value!.Path);
+        Assert.Equal(1, session.ConfirmationCount);
+    }
+
+    [Fact]
     public async Task ProductionAuthorizationDenialIsDefinitelyNotAcceptedInsteadOfUnknownSubmission()
     {
         var accountId = Guid.NewGuid();
@@ -340,6 +363,28 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Null(broker.Identity);
         Assert.Single(evidence.Remote);
         Assert.Empty(evidence.Recovery);
+    }
+
+    [Fact]
+    public async Task AcceptanceTelemetryFailureCannotChangePersistedExactTransferResult()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new RecordingBroker(), new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts, new ThrowingEvidenceSink());
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(AcceptedItems(), result.Value!.RemoteItems);
     }
 
     [Fact]
@@ -671,6 +716,21 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         }
     }
 
+    private sealed class ThrowingEvidenceSink : IAcceptanceOperationEvidenceSink
+    {
+        public Task RecordRemoteResultAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("simulated acceptance presenter failure");
+
+        public Task RecordRecoveryAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("simulated acceptance presenter failure");
+    }
+
     private sealed class AttemptStore(WebAutomationAttemptRecord attempt) : IWebAutomationAttemptStore
     {
         public WebAutomationAttemptRecord Current { get; private set; } = attempt;
@@ -752,7 +812,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public Task<bool> TryResolveUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, WebAutomationAttemptState terminalState, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
-    private sealed class CallbackBroker(AttemptStore attempts, AutomationSession session) : IVisibleWebAutomationBroker
+    private sealed class CallbackBroker(AttemptStore attempts, IVisibleWebAutomationSession session) : IVisibleWebAutomationBroker
     {
         public int EnqueueCount { get; private set; }
 
@@ -794,6 +854,31 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             var value = await request.Action(session, context, cancellationToken);
             return new(VisibleWebAutomationDisposition.ActionCompleted, value, context.CurrentStage);
         }
+    }
+
+    private sealed class ManualDirectorySession :
+        IVisibleWebAutomationSession,
+        IAcceptanceDirectoryPreparationSession
+    {
+        public int ConfirmationCount { get; private set; }
+        public CancellationToken UserClosed => CancellationToken.None;
+
+        public Task<AcceptanceDirectoryPreparationEvidence?> ConfirmDirectoryPreparedAsync(
+            WebAutomationRequestIdentity identity,
+            RemotePath requestedPath,
+            CancellationToken cancellationToken = default)
+        {
+            ConfirmationCount++;
+            return Task.FromResult<AcceptanceDirectoryPreparationEvidence?>(new(
+                new RemoteDirectory(requestedPath.Value, requestedPath),
+                new string('e', 64)));
+        }
+
+        public Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task ShowHandoffAsync(WebAutomationHandoffPrompt prompt, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<WebAutomationUserChoice> WaitForHandoffChoiceAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class AutomationSession : IVisibleWebAutomationSession, ITransferAutomationSession

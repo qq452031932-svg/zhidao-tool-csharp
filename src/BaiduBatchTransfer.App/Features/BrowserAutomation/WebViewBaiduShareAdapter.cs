@@ -182,8 +182,9 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         if (result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null)
         {
             if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
-                await acceptanceEvidence.RecordRemoteResultAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await RecordAcceptanceEvidenceSafelyAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint,
+                    recovery: false).ConfigureAwait(false);
             return result.Value;
         }
         return Unknown<ShareCreationReceipt>(
@@ -227,8 +228,9 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         {
             if (acceptanceEvidence is not null)
             {
-                await acceptanceEvidence.RecordRemoteResultAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await RecordAcceptanceEvidenceSafelyAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint,
+                    recovery: false).ConfigureAwait(false);
             }
             return Receipt(request, acceptedEvidence!);
         }
@@ -259,10 +261,9 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                 return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
             if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
             {
-                await acceptanceEvidence.RecordRemoteResultAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
-                await acceptanceEvidence.RecordRecoveryAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await RecordAcceptanceEvidenceSafelyAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint,
+                    recovery: true).ConfigureAwait(false);
             }
             return result.Value;
         }
@@ -316,10 +317,9 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                 return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
             if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
             {
-                await acceptanceEvidence.RecordRemoteResultAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
-                await acceptanceEvidence.RecordRecoveryAsync(
-                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await RecordAcceptanceEvidenceSafelyAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint,
+                    recovery: true).ConfigureAwait(false);
             }
             return result.Value;
         }
@@ -337,6 +337,26 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+
+    private async Task RecordAcceptanceEvidenceSafelyAsync(
+        AdapterWriteAuthorizationRequest request,
+        string fingerprint,
+        bool recovery)
+    {
+        if (acceptanceEvidence is null) return;
+        try
+        {
+            await acceptanceEvidence.RecordRemoteResultAsync(
+                request, fingerprint, CancellationToken.None).ConfigureAwait(false);
+            if (recovery)
+                await acceptanceEvidence.RecordRecoveryAsync(
+                    request, fingerprint, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Acceptance telemetry follows the persisted exact result and cannot change it.
+        }
+    }
 
     private AdapterWriteAuthorizationRequest EvidenceRequest(ShareOperationAutomationContext context) => new(
         new AdapterCapabilityVersion(
@@ -371,7 +391,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                 context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind));
     }
 
-    private BaiduNavigationAuthorizationRequest Navigation() => new(
+    private BaiduNavigationAuthorizationRequest Navigation(ShareOperationAutomationContext context) => new(
         BaiduAutomationAction.OpenOfficialUri,
         OfficialFilesUri,
         BaiduSelectorCatalog.ProtocolVersion,
@@ -382,7 +402,10 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             BaiduSelectorCatalog.ProtocolVersion,
             BaiduSelectorCatalog.SelectorVersion,
             applicationBuildVersion),
-        BaiduProtocolValidationStatus.NotValidated);
+        BaiduProtocolValidationStatus.NotValidated,
+        new BaiduAcceptanceOperationScope(
+            "BaiduShare", context.AccountId, context.OperationId,
+            context.Generation, context.BatchId));
 
     private VisibleWebAutomationRequest<T> Request<T>(
         ShareOperationAutomationContext context,
@@ -396,7 +419,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.OwnerKind);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        return new(identity, profilePath, Navigation(), action);
+        return new(identity, profilePath, Navigation(context), action);
     }
 
     private async Task<BaiduAdapterResult<T>> ResumeWithoutActionAsync<T>(

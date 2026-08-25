@@ -232,7 +232,9 @@ public static class AppBootstrap
             sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
         services.AddSingleton<WebView2ProfileCloser>();
         services.AddSingleton<IWebViewProfileCloser>(sp => sp.GetRequiredService<WebView2ProfileCloser>());
-        services.AddSingleton<IWebAutomationNavigationAuthorizer, ProductionWebAutomationNavigationAuthorizer>();
+        services.AddSingleton<IWebAutomationNavigationAuthorizer>(sp =>
+            new ProductionWebAutomationNavigationAuthorizer(
+                sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>()));
         services.AddSingleton<SqliteWebAutomationBatchCancellationStore>();
         services.AddSingleton<IWebAutomationBatchCancellationStore>(sp =>
             sp.GetRequiredService<SqliteWebAutomationBatchCancellationStore>());

@@ -1,6 +1,8 @@
 using BaiduBatchTransfer.App.Features.Acceptance;
+using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
@@ -59,6 +61,22 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task ChainedTransferStagesCannotExtendTheOriginalOperationAuthorization()
+    {
+        var clock = new MutableTimeProvider(Now);
+        var coordinator = Coordinator(true, ["--webview-acceptance"], clock);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(ensure));
+
+        clock.Advance(TimeSpan.FromMinutes(6));
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+
+        Assert.False(await coordinator.TryAuthorizeAsync(submit));
+        Assert.False(coordinator.IsAuthorized(Navigation(submit)));
+    }
+
+    [Fact]
     public async Task FormalAcceptanceRequiresAllEvidenceAndSecondConfirmation()
     {
         var store = new MemoryCapabilityStore();
@@ -71,11 +89,7 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
         await coordinator.RecordRemoteResultAsync(request, "remote-A");
         await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
-        await coordinator.OnLocalResultExportCompletedAsync(new(
-            LocalResultOwnerKind.TransferBatch,
-            request.BatchId,
-            LocalResultExportKind.ReplacementWorkbook,
-            1));
+        await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
         Assert.Equal(1, presenter.EnableCount);
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: false));
         Assert.True(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
@@ -96,15 +110,48 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
 
         await coordinator.RecordRemoteResultAsync(request, "remote-A");
         await coordinator.RecordRecoveryAsync(request, "remote-A");
+        await coordinator.RecordRemoteResultAsync(request with { IsRecovery = true }, "remote-B");
         await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-B");
-        await coordinator.OnLocalResultExportCompletedAsync(new(
-            LocalResultOwnerKind.TransferBatch,
-            request.BatchId,
-            LocalResultExportKind.ReplacementWorkbook,
-            1));
+        await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
 
         Assert.Equal(0, presenter.EnableCount);
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+    }
+
+    [Fact]
+    public async Task SameBatchExportForAnotherOperationCannotCompleteCandidateEvidence()
+    {
+        var presenter = new RecordingPresenter();
+        var coordinator = Coordinator(true, ["--webview-acceptance"], presenter: presenter);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+        await coordinator.RecordRemoteResultAsync(request, "remote-A");
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+
+        await coordinator.OnLocalResultExportCompletedAsync(
+            ExportEvidence(request, operationId: Guid.NewGuid()));
+
+        Assert.Equal(0, presenter.EnableCount);
+        Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+    }
+
+    [Fact]
+    public async Task ThrowingFormalAcceptancePresenterCannotEraseCapturedEvidence()
+    {
+        var store = new MemoryCapabilityStore();
+        var coordinator = Coordinator(
+            true, ["--webview-acceptance"], store: store, presenter: new ThrowingPresenter());
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+        await coordinator.RecordRemoteResultAsync(request, "remote-A");
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+
+        await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
+
+        Assert.True(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+        Assert.Single(store.Records);
     }
 
     [Fact]
@@ -122,6 +169,76 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
             Capability = new("BaiduTransfer", "protocol-v1", "selector-v2", "build-1"),
         }));
     }
+
+    [Fact]
+    public async Task ExactConsumedDebugLeaseAuthorizesOnlyItsOfficialCandidateNavigation()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+        var authorizer = new ProductionWebAutomationNavigationAuthorizer(coordinator);
+
+        var exact = Navigation(request);
+
+        Assert.True(authorizer.Authorize(exact).IsAllowed);
+        Assert.False(authorizer.Authorize(exact with
+        {
+            AcceptanceScope = exact.AcceptanceScope! with { OperationId = Guid.NewGuid() },
+        }).IsAllowed);
+        Assert.False(authorizer.Authorize(exact with
+        {
+            OfficialUri = new Uri("https://example.com/"),
+        }).IsAllowed);
+    }
+
+    [Fact]
+    public async Task FreshFormalAcceptanceAlsoCreatesExactOrdinaryNavigationScope()
+    {
+        var store = new MemoryCapabilityStore();
+        var request = Request();
+        store.Records.Add(new(
+            request.Capability.AdapterKind,
+            request.Capability.ProtocolVersion,
+            request.Capability.SelectorVersion,
+            request.Capability.BuildVersion,
+            Now,
+            Hash));
+        var coordinator = Coordinator(false, [], store: store);
+
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+
+        var authorizer = new ProductionWebAutomationNavigationAuthorizer(coordinator);
+        Assert.True(authorizer.Authorize(Navigation(request)).IsAllowed);
+        Assert.False(authorizer.Authorize(Navigation(request with
+        {
+            Capability = new AdapterCapabilityVersion(
+                request.Capability.AdapterKind,
+                request.Capability.ProtocolVersion,
+                "different",
+                request.Capability.BuildVersion),
+        })).IsAllowed);
+    }
+
+    private static BaiduNavigationAuthorizationRequest Navigation(
+        AdapterWriteAuthorizationRequest request) => new(
+        BaiduAutomationAction.OpenOfficialUri,
+        new Uri("https://pan.baidu.com/disk/main"),
+        request.Capability.ProtocolVersion,
+        request.Capability.SelectorVersion,
+        request.Capability.BuildVersion,
+        new BaiduAutomationAcceptance(
+            false,
+            request.Capability.ProtocolVersion,
+            request.Capability.SelectorVersion,
+            request.Capability.BuildVersion),
+        BaiduProtocolValidationStatus.NotValidated,
+        new BaiduAcceptanceOperationScope(
+            request.Capability.AdapterKind,
+            request.AccountId,
+            request.OperationId,
+            request.Generation,
+            request.BatchId));
 
     private static AcceptanceWriteLeaseCoordinator Coordinator(
         bool debug,
@@ -142,6 +259,22 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Guid.Parse("33333333-3333-3333-3333-333333333333"));
 
     private static AcceptanceWriteLeaseConfirmation Confirmed() => new(true, true, true);
+    private static LocalResultExportCompletedEvidence ExportEvidence(
+        AdapterWriteAuthorizationRequest request,
+        Guid? operationId = null) => new(
+        new LocalResultExportKey(
+            LocalResultOwnerKind.TransferBatch,
+            request.BatchId,
+            LocalResultExportKind.ReplacementWorkbook,
+            1),
+        [new LocalResultOperationEvidence(
+            request.Capability.AdapterKind,
+            request.AccountId,
+            operationId ?? request.OperationId,
+            request.Generation,
+            Hash)],
+        Hash,
+        Hash);
     private const string Hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     private sealed class MemoryCapabilityStore : IAdapterCapabilityStore
@@ -177,6 +310,15 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
             EnableCount++;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingPresenter : IAcceptanceWriteLeasePresenter
+    {
+        public Task<bool> PresentAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
+
+        public Task EnableFormalAcceptanceAsync(AdapterWriteAuthorizationRequest request, string evidenceHash, CancellationToken cancellationToken = default) =>
+            Task.FromException(new OperationCanceledException("simulated presenter cancellation"));
     }
 
     private sealed class MutableTimeProvider(DateTimeOffset now) : TimeProvider

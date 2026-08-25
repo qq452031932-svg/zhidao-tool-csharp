@@ -511,6 +511,32 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task ExactAcceptanceScopeMayOpenOnlyItsOfficialVisibleSession()
+    {
+        var source = new MatchingAcceptanceSource();
+        await using var fixture = CreateFixture(
+            authorizer: new ProductionWebAutomationNavigationAuthorizer(source));
+        var request = fixture.Request((_, _, _) => Task.FromResult(1));
+        var scope = new BaiduAcceptanceOperationScope(
+            "BaiduTransfer",
+            request.Identity.AccountId,
+            request.Identity.OperationId,
+            request.Identity.Generation,
+            request.Identity.BatchId);
+        source.Expected = scope;
+        request = request with
+        {
+            Navigation = request.Navigation with { AcceptanceScope = scope },
+        };
+
+        var result = await fixture.Queue.EnqueueAsync(request);
+
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, result.Disposition);
+        Assert.Equal(1, fixture.Factory.CreatedCount);
+        Assert.True(fixture.Factory.Sessions[0].AllCallsHadDispatcherAccess);
+    }
+
+    [Fact]
     public async Task UnsafeNavigationIsRejectedEvenWhenTestAuthorizerAllowsIt()
     {
         await using var fixture = CreateFixture();
@@ -656,7 +682,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
-    public void ProductionWindowIsVisibleAccessibleAndOffersOnlyTheThreeSafeChoices()
+    public void ProductionWindowIsVisibleAccessibleAndOffersOnlyExplicitSafeChoices()
     {
         var directory = Path.Combine(
             FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "BrowserAutomation");
@@ -665,8 +691,10 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         Assert.Contains("已处理，继续", xaml, StringComparison.Ordinal);
         Assert.Contains("跳过此项", xaml, StringComparison.Ordinal);
         Assert.Contains("取消批次", xaml, StringComparison.Ordinal);
-        Assert.Equal(5, xaml.Split("<Button ", StringSplitOptions.None).Length - 1);
-        Assert.Equal(5, Regex.Matches(
+        Assert.Contains("已确认目标目录", xaml, StringComparison.Ordinal);
+        Assert.Contains("取消目录准备", xaml, StringComparison.Ordinal);
+        Assert.Equal(7, xaml.Split("<Button ", StringSplitOptions.None).Length - 1);
+        Assert.Equal(7, Regex.Matches(
             xaml,
             "<Button[^>]+AutomationProperties.Name=",
             RegexOptions.Singleline).Count);
@@ -891,6 +919,14 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     {
         public BaiduAutomationDecision Authorize(BaiduNavigationAuthorizationRequest request) =>
             BaiduAutomationDecision.Allowed();
+    }
+
+    private sealed class MatchingAcceptanceSource : IAcceptanceNavigationAuthorizationSource
+    {
+        public BaiduAcceptanceOperationScope? Expected { get; set; }
+
+        public bool IsAuthorized(BaiduNavigationAuthorizationRequest request) =>
+            request.AcceptanceScope == Expected;
     }
 
     private sealed class RecordingDispatcher : IWebAutomationUiDispatcher
