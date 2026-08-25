@@ -141,12 +141,29 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
             cancellationToken);
 }
 
-public sealed class CoordinatedBaiduShareAdapter(
-    IBaiduShareAdapter inner,
-    BaiduAdapterConcurrencyGate gate) : IBaiduShareAdapter
+public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
 {
-    private readonly IBaiduShareAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
-    private readonly BaiduAdapterConcurrencyGate gate = gate ?? throw new ArgumentNullException(nameof(gate));
+    private readonly IBaiduShareAdapter inner;
+    private readonly BaiduAdapterConcurrencyGate gate;
+
+    public CoordinatedBaiduShareAdapter(
+        IBaiduShareAdapter inner,
+        BaiduAdapterConcurrencyGate gate)
+    {
+        this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        this.gate = gate ?? throw new ArgumentNullException(nameof(gate));
+    }
+
+    public static IBaiduShareAdapter Wrap(
+        IBaiduShareAdapter inner,
+        BaiduAdapterConcurrencyGate gate)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentNullException.ThrowIfNull(gate);
+        return inner is IOperationBoundBaiduShareAdapter operationBound
+            ? new CoordinatedOperationBoundBaiduShareAdapter(operationBound, gate)
+            : new CoordinatedBaiduShareAdapter(inner, gate);
+    }
 
     public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) =>
         RunAsync(session, token => inner.CreatePermanentShareAsync(session, request, token), cancellationToken);
@@ -154,9 +171,46 @@ public sealed class CoordinatedBaiduShareAdapter(
     public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken) =>
         RunAsync(session, token => inner.ListSharesAsync(session, cursor, token), cancellationToken);
 
-    private async Task<T> RunAsync<T>(AccountSession session, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
+    protected async Task<T> RunAsync<T>(AccountSession session, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
     {
         await using var lease = await gate.AcquireAsync(session, cancellationToken).ConfigureAwait(false);
         return await action(cancellationToken).ConfigureAwait(false);
     }
+}
+
+public sealed class CoordinatedOperationBoundBaiduShareAdapter(
+    IOperationBoundBaiduShareAdapter inner,
+    BaiduAdapterConcurrencyGate gate) : CoordinatedBaiduShareAdapter(inner, gate), IOperationBoundBaiduShareAdapter
+{
+    private readonly IOperationBoundBaiduShareAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+    public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        PermanentShareRequest request,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner.PreparePermanentShareForOperationAsync(context, session, request, token),
+            cancellationToken);
+
+    public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        PermanentShareRequest request,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner.SubmitPermanentShareForOperationAsync(context, session, request, token),
+            cancellationToken);
+
+    public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        PermanentShareRequest request,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner.ConfirmExactShareForOperationAsync(context, session, request, token),
+            cancellationToken);
 }
