@@ -205,6 +205,15 @@ public interface IShareAutomationSession
         CancellationToken cancellationToken);
 }
 
+public sealed record ShareAutomationPreparation(WebAutomationBaseline Baseline)
+{
+    public ShareAutomationPreparation Validate()
+    {
+        ArgumentNullException.ThrowIfNull(Baseline);
+        return this;
+    }
+}
+
 public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
 {
     private readonly TimeProvider timeProvider = timeProvider ?? TimeProvider.System;
@@ -217,7 +226,28 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(request);
 
-        var submitted = false;
+        var preparation = await PrepareAsync(session, request, cancellationToken).ConfigureAwait(false);
+        if (!preparation.IsSuccess)
+        {
+            return BaiduAdapterResult<ShareCreationReceipt>.Failure(
+                preparation.ErrorKind!.Value,
+                adapterDiagnostic: null,
+                preparation.RetryAfter,
+                preparation.SubmissionAcceptance);
+        }
+
+        return await SubmitAsync(session, request, preparation.Value!.Baseline, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    public async Task<BaiduAdapterResult<ShareAutomationPreparation>> PrepareAsync(
+        IShareAutomationSession session,
+        PermanentShareRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(request);
+
         try
         {
             await session.SelectExactRemoteItemsAsSingleGroupAsync(request.RemoteItems, cancellationToken)
@@ -227,13 +257,43 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
             var baselineListing = await session
                 .ReadCompleteStableOfficialShareListAsync(cancellationToken)
                 .ConfigureAwait(false);
-            if (!IsStableComplete(baselineListing)) return DefinitelyNotAccepted();
+            if (!IsStableComplete(baselineListing)) return PreparationFailed();
 
             var baseline = WebAutomationBaseline.Create(baselineListing.Shares.Select(share => share.ShareId));
             await session.PersistBaselineAsync(
                 baseline,
                 baselineListing.ObservationFingerprint,
                 cancellationToken).ConfigureAwait(false);
+            return BaiduAdapterResult<ShareAutomationPreparation>.Success(
+                new ShareAutomationPreparation(baseline),
+                SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return PreparationFailed();
+        }
+    }
+
+    public async Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitAsync(
+        IShareAutomationSession session,
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(baseline);
+
+        var submitted = false;
+        try
+        {
+            await session.SelectExactRemoteItemsAsSingleGroupAsync(request.RemoteItems, cancellationToken)
+                .ConfigureAwait(false);
+            await session.ConfigurePermanentShareAsync(request, cancellationToken).ConfigureAwait(false);
 
             await session.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
             submitted = true;
@@ -249,25 +309,7 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
             var current = await session
                 .ReadCompleteStableOfficialShareListAsync(cancellationToken)
                 .ConfigureAwait(false);
-            if (!IsStableComplete(current)) return ResultPending();
-
-            var currentIds = current.Shares.Select(share => share.ShareId).ToHashSet(StringComparer.Ordinal);
-            if (baseline.Items.Any(item => !currentIds.Contains(item.ExactId))) return ResultPending();
-
-            var baselineIds = baseline.Items.Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
-            var added = current.Shares.Where(share => !baselineIds.Contains(share.ShareId)).ToArray();
-            if (added.Length != 1 || !ExactlyMatchesAcceptedShare(added[0], acceptance))
-                return ResultPending();
-
-            return BaiduAdapterResult<ShareCreationReceipt>.Success(
-                new ShareCreationReceipt(
-                    timeProvider.GetUtcNow(),
-                    acceptance.AdapterRequestId!,
-                    request,
-                    acceptance.ShareId!,
-                    acceptance.ShareUrl!,
-                    acceptance.EffectiveSettings!),
-                SubmissionAcceptance.Unknown);
+            return ConfirmFromListing(request, baseline, acceptance, current);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -276,6 +318,36 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         catch (Exception)
         {
             return submitted ? ResultPending() : DefinitelyNotAccepted();
+        }
+    }
+
+    public async Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactAsync(
+        IShareAutomationSession session,
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        ShareOfficialAcceptance acceptedEvidence,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(baseline);
+        ArgumentNullException.ThrowIfNull(acceptedEvidence);
+        if (!AcceptanceMatchesRequest(acceptedEvidence, request)) return ResultPending();
+
+        try
+        {
+            var current = await session
+                .ReadCompleteStableOfficialShareListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            return ConfirmFromListing(request, baseline, acceptedEvidence, current);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return ResultPending();
         }
     }
 
@@ -311,8 +383,41 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         left.ExtractionCodeBehavior == right.ExtractionCodeBehavior &&
         string.Equals(left.ExtractionCode, right.ExtractionCode, StringComparison.Ordinal);
 
+    private BaiduAdapterResult<ShareCreationReceipt> ConfirmFromListing(
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        ShareOfficialAcceptance acceptance,
+        ShareOfficialListing current)
+    {
+        if (!IsStableComplete(current)) return ResultPending();
+
+        var currentIds = current.Shares.Select(share => share.ShareId).ToHashSet(StringComparer.Ordinal);
+        if (baseline.Items.Any(item => !currentIds.Contains(item.ExactId))) return ResultPending();
+
+        var baselineIds = baseline.Items.Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
+        var added = current.Shares.Where(share => !baselineIds.Contains(share.ShareId)).ToArray();
+        if (added.Length != 1 || !ExactlyMatchesAcceptedShare(added[0], acceptance))
+            return ResultPending();
+
+        return BaiduAdapterResult<ShareCreationReceipt>.Success(
+            new ShareCreationReceipt(
+                timeProvider.GetUtcNow(),
+                acceptance.AdapterRequestId!,
+                request,
+                acceptance.ShareId!,
+                acceptance.ShareUrl!,
+                acceptance.EffectiveSettings!),
+            SubmissionAcceptance.Unknown);
+    }
+
     private static BaiduAdapterResult<ShareCreationReceipt> DefinitelyNotAccepted() =>
         BaiduAdapterResult<ShareCreationReceipt>.Failure(
+            BaiduErrorKind.UnknownResponse,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);
+
+    private static BaiduAdapterResult<ShareAutomationPreparation> PreparationFailed() =>
+        BaiduAdapterResult<ShareAutomationPreparation>.Failure(
             BaiduErrorKind.UnknownResponse,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted);

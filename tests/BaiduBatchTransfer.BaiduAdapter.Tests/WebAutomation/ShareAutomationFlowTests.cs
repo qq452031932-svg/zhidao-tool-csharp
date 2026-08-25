@@ -17,15 +17,129 @@ public sealed class ShareAutomationFlowTests
         var result = await Flow().ExecuteAsync(session, request, CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Single(session.SelectedGroups);
-        Assert.Equal(request.RemoteItems, session.SelectedGroups[0]);
-        Assert.Single(session.ConfiguredRequests);
-        Assert.True(session.ConfiguredRequests[0].IsPermanent);
-        Assert.True(session.ConfiguredRequests[0].IsAccessUnlimited);
+        Assert.Equal(2, session.SelectedGroups.Count);
+        Assert.All(session.SelectedGroups, group => Assert.Equal(request.RemoteItems, group));
+        Assert.Equal(2, session.ConfiguredRequests.Count);
+        Assert.All(session.ConfiguredRequests, configured => Assert.True(configured.IsPermanent));
+        Assert.All(session.ConfiguredRequests, configured => Assert.True(configured.IsAccessUnlimited));
         Assert.Equal(1, session.SubmitCount);
         Assert.Equal(
-            ["select-group", "configure", "read-list", "persist-baseline", "mark-submitting", "submit", "persist-acceptance", "read-list"],
+            ["select-group", "configure", "read-list", "persist-baseline", "select-group", "configure", "mark-submitting", "submit", "persist-acceptance", "read-list"],
             session.Events);
+    }
+
+    [Fact]
+    public async Task PreparePersistsBaselineWithoutCrossingSubmissionBoundary()
+    {
+        var request = Request("remote-a", "remote-b");
+        var session = SuccessfulSession(request);
+
+        var result = await Flow().PrepareAsync(session, request, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["select-group", "configure", "read-list", "persist-baseline"], session.Events);
+        Assert.Equal(["share-existing"], result.Value!.Baseline.Items.Select(item => item.ExactId));
+        Assert.Equal(0, session.SubmitCount);
+        Assert.DoesNotContain("mark-submitting", session.Events);
+        Assert.DoesNotContain("persist-acceptance", session.Events);
+    }
+
+    [Fact]
+    public async Task PrepareCrashReturnsDefinitelyNotAcceptedWithoutClicking()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request) with
+        {
+            ReadFailure = new InvalidOperationException("The baseline window crashed."),
+        };
+
+        var result = await Flow().PrepareAsync(session, request, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Equal(0, session.SubmitCount);
+        Assert.DoesNotContain("mark-submitting", session.Events);
+    }
+
+    [Fact]
+    public async Task PrepareCancellationPropagatesWithoutClicking()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Flow().PrepareAsync(session, request, cancellation.Token));
+
+        Assert.Equal(0, session.SubmitCount);
+        Assert.DoesNotContain("mark-submitting", session.Events);
+    }
+
+    [Fact]
+    public async Task SubmitUsesPassedBaselineAndMarksSubmittingImmediatelyBeforeSingleClick()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        var preparation = await Flow().PrepareAsync(session, request, CancellationToken.None);
+        session.Events.Clear();
+
+        var result = await Flow().SubmitAsync(
+            session,
+            request,
+            preparation.Value!.Baseline,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            ["select-group", "configure", "mark-submitting", "submit", "persist-acceptance", "read-list"],
+            session.Events);
+        Assert.Equal(1, session.SubmitCount);
+    }
+
+    [Fact]
+    public async Task RecoveryConfirmsUniqueExactAdditionWithoutClicking()
+    {
+        var request = Request("remote-a", "remote-b");
+        var session = SuccessfulSession(request);
+        var baseline = WebAutomationBaseline.Create(["share-existing"]);
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().ConfirmExactAsync(
+            session,
+            request,
+            baseline,
+            session.Acceptance,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("share-new", result.Value!.ShareId);
+        Assert.Equal(["read-list"], session.Events);
+        Assert.Equal(0, session.SubmitCount);
+        Assert.Null(session.PersistedAcceptance);
+    }
+
+    [Fact]
+    public async Task RecoveryLeavesMultipleAdditionsAmbiguousWithoutClicking()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        var baseline = WebAutomationBaseline.Create(["share-existing"]);
+        session.BaselineListing = Listing(
+            ExistingEntry(),
+            AcceptedEntry(request),
+            Entry("share-unrelated", Request("remote-x"), "X9y8"));
+
+        var result = await Flow().ConfirmExactAsync(
+            session,
+            request,
+            baseline,
+            session.Acceptance,
+            CancellationToken.None);
+
+        AssertPending(result);
+        Assert.Equal(["read-list"], session.Events);
+        Assert.Equal(0, session.SubmitCount);
     }
 
     [Fact]
@@ -52,7 +166,7 @@ public sealed class ShareAutomationFlowTests
         var result = await Flow().ExecuteAsync(session, request, CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal("A1b2", Assert.Single(session.ConfiguredRequests).FixedExtractionCode);
+        Assert.All(session.ConfiguredRequests, configured => Assert.Equal("A1b2", configured.FixedExtractionCode));
         Assert.Equal("A1b2", result.Value!.ExtractionCode);
         Assert.Equal(ShareExtractionCodeBehavior.Fixed, result.Value.EffectiveSettings.ExtractionCodeBehavior);
         Assert.Equal(ShareSettingsMatchStatus.Matched, result.Value.SettingsMatchStatus);
@@ -291,6 +405,7 @@ public sealed class ShareAutomationFlowTests
         public required ShareOfficialListing CurrentListing { get; set; }
         public required ShareOfficialAcceptance Acceptance { get; init; }
         public Exception? SubmitFailure { get; init; }
+        public Exception? ReadFailure { get; init; }
         public int SubmitCount { get; private set; }
         public WebAutomationBaseline? PersistedBaseline { get; private set; }
         public ShareOfficialAcceptance? PersistedAcceptance { get; private set; }
@@ -317,6 +432,9 @@ public sealed class ShareAutomationFlowTests
             CancellationToken cancellationToken)
         {
             Events.Add("read-list");
+            cancellationToken.ThrowIfCancellationRequested();
+            if (ReadFailure is not null)
+                return Task.FromException<ShareOfficialListing>(ReadFailure);
             return Task.FromResult(readCount++ == 0 ? BaselineListing : CurrentListing);
         }
 
