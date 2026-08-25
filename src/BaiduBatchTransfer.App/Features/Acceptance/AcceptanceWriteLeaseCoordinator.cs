@@ -11,7 +11,7 @@ namespace BaiduBatchTransfer.App.Features.Acceptance;
 
 public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorizationGate,
     IAcceptanceOperationEvidenceSink, ILocalResultExportObserver,
-    IAcceptanceNavigationAuthorizationSource
+    IAcceptanceNavigationAuthorizationSource, IBaiduCandidateActionAuthorizationSource
 {
     public static readonly TimeSpan LeaseLifetime = TimeSpan.FromMinutes(5);
     public static readonly TimeSpan FormalEvidenceLifetime = TimeSpan.FromDays(30);
@@ -256,6 +256,62 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         request.BatchId == binding.BatchId &&
         request.IsRecovery == binding.IsRecovery &&
         binding.IssuedAtUtc < binding.ExpiresAtUtc;
+
+    public async ValueTask<bool> IsAuthorizedAsync(
+        BaiduCandidateDomRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var authorization = request.Authorization;
+        var binding = request.Binding;
+        var now = timeProvider.GetUtcNow();
+        if (!IsCandidateActionAllowed(authorization.Capability.AdapterKind, request.Action) ||
+            !BindingMatches(authorization, binding) || binding.ExpiresAtUtc <= now)
+            return false;
+
+        if (binding.Source == AdapterWriteAuthorizationSource.ConsumedLease)
+        {
+            if (!options.IsEnabled || authorization.IsRecovery || binding.IsRecovery ||
+                binding.FormalEvidenceFingerprint is not null)
+                return false;
+            var key = AcceptanceWriteLeaseIdentity.From(authorization);
+            lock (sync)
+            {
+                return operationAuthorizationExpiries.TryGetValue(key, out var expires) &&
+                       expires == binding.ExpiresAtUtc && expires > now &&
+                       consumedLeaseOperations.TryGetValue(key, out var actions) &&
+                       actions.Contains(authorization.Capability.AdapterKind == "BaiduShare"
+                           ? AdapterWriteAction.PrepareShare
+                           : AdapterWriteAction.EnsureDirectory);
+            }
+        }
+
+        if (binding.Source != AdapterWriteAuthorizationSource.ExactFormalRecord ||
+            string.IsNullOrWhiteSpace(binding.FormalEvidenceFingerprint))
+            return false;
+        var accepted = await GetFreshFormalAcceptanceAsync(authorization, now, cancellationToken)
+            .ConfigureAwait(false);
+        return accepted is not null && accepted.AcceptedAt == binding.IssuedAtUtc &&
+               accepted.AcceptedAt + FormalEvidenceLifetime == binding.ExpiresAtUtc &&
+               string.Equals(
+                   accepted.EvidenceHash,
+                   binding.FormalEvidenceFingerprint,
+                   StringComparison.Ordinal);
+    }
+
+    private static bool IsCandidateActionAllowed(string adapterKind, BaiduAutomationAction action) =>
+        adapterKind switch
+        {
+            "BaiduTransfer" => action is BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.ClickSave or BaiduAutomationAction.ChooseDestination or
+                BaiduAutomationAction.SetExtractionCode,
+            "BaiduShare" => action is BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.ClickShare or BaiduAutomationAction.ChoosePermanent or
+                BaiduAutomationAction.SetExtractionCode or BaiduAutomationAction.CreateLink or
+                BaiduAutomationAction.ExportResult,
+            _ => false,
+        };
 
     private bool TryConsume(AdapterWriteAuthorizationRequest request, DateTimeOffset now)
     {
