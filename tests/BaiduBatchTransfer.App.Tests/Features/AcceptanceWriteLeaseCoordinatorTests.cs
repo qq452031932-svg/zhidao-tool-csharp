@@ -61,6 +61,23 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public void ExpiredUnconsumedLeaseCannotBeReissuedForTheSameExactIdentity()
+    {
+        var clock = new MutableTimeProvider(Now);
+        var coordinator = Coordinator(true, ["--webview-acceptance"], clock);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+
+        clock.Advance(TimeSpan.FromMinutes(6));
+
+        Assert.False(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(coordinator.TryCreateLease(
+            request with { OperationId = Guid.NewGuid() }, Confirmed()));
+        Assert.True(coordinator.TryCreateLease(
+            request with { Generation = request.Generation + 1 }, Confirmed()));
+    }
+
+    [Fact]
     public async Task ChainedTransferStagesCannotExtendTheOriginalOperationAuthorization()
     {
         var clock = new MutableTimeProvider(Now);

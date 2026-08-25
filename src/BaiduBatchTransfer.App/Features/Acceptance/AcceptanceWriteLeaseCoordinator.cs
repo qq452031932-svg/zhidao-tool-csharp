@@ -22,6 +22,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     private readonly TimeProvider timeProvider;
     private readonly IAcceptanceWriteLeasePresenter? presenter;
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, AcceptanceWriteLease> leases = [];
+    private readonly HashSet<AcceptanceWriteLeaseIdentity> createdLeaseIdentities = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, HashSet<AdapterWriteAction>> consumedLeaseOperations = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, DateTimeOffset> operationAuthorizationExpiries = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, EvidenceState> evidence = [];
@@ -55,8 +56,10 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         lock (sync)
         {
             RemoveExpiredLeases(now);
-            if (leases.ContainsKey(key) || consumedLeaseOperations.ContainsKey(key) || completedEvidence.ContainsKey(key))
+            if (createdLeaseIdentities.Contains(key) || consumedLeaseOperations.ContainsKey(key) ||
+                completedEvidence.ContainsKey(key))
                 return false;
+            createdLeaseIdentities.Add(key);
             leases[key] = new AcceptanceWriteLease(request, now + LeaseLifetime);
             return true;
         }
