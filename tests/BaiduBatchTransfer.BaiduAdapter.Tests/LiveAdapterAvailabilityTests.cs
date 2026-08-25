@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.BaiduAdapter.Http;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 namespace BaiduBatchTransfer.BaiduAdapter.Tests;
 
@@ -14,6 +15,9 @@ public sealed class LiveAdapterAvailabilityTests
         Assert.False(capability.TransferValidated);
         Assert.False(capability.ShareValidated);
         Assert.Equal("百度转存和分享能力尚未通过现场验收。", capability.SafeReason);
+        Assert.Equal(BaiduProtocolValidationStatus.NotValidated, BaiduSelectorCatalog.Production.ValidationStatus);
+        Assert.All(BaiduSelectorCatalog.Production.Definitions,
+            definition => Assert.Empty(definition.ExecutableLocators));
     }
 
     [Fact]

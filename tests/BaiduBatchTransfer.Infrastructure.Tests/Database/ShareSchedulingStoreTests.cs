@@ -1717,16 +1717,16 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         var graph = await CreateGraphAsync(includeShareSettings: false);
         var store = new SqliteAdapterCapabilityStore(graph.Factory);
         var acceptance = new AdapterCapabilityAcceptanceRecord(
-            "BaiduShare", "2026-08", "8.0.0", graph.Now, new string('A', 64));
+            "BaiduShare", "2026-08", "selectors-1", "8.0.0", graph.Now, new string('A', 64));
 
         await store.AcceptAsync(acceptance);
 
-        Assert.Equal(acceptance, await store.GetAsync("BaiduShare", "2026-08", "8.0.0"));
-        Assert.Null(await store.GetAsync("BaiduShare", "2026-09", "8.0.0"));
+        Assert.Equal(acceptance, await store.GetAsync("BaiduShare", "2026-08", "selectors-1", "8.0.0"));
+        Assert.Null(await store.GetAsync("BaiduShare", "2026-08", "selectors-2", "8.0.0"));
         await using var connection = await graph.Factory.OpenConnectionAsync();
         var columns = await ColumnsAsync(connection, "AdapterCapabilityAcceptances");
         Assert.Equal(
-            new[] { "AdapterKind", "ProtocolVersion", "AdapterBuildVersion", "AcceptedAt", "EvidenceHash" },
+            new[] { "AdapterKind", "ProtocolVersion", "SelectorVersion", "AdapterBuildVersion", "AcceptedAt", "EvidenceHash" },
             columns);
     }
 

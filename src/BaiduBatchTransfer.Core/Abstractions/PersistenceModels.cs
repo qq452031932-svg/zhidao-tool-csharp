@@ -476,12 +476,13 @@ public sealed record ShareResultKeysetQuery(Guid BatchJobId, int PageSize, Share
 public sealed record AdapterCapabilityAcceptanceRecord(
     string AdapterKind,
     string ProtocolVersion,
+    string SelectorVersion,
     string AdapterBuildVersion,
     DateTimeOffset AcceptedAt,
     string EvidenceHash)
 {
     public override string ToString() =>
-        $"AdapterCapabilityAcceptanceRecord {{ AdapterKind = {AdapterKind}, ProtocolVersion = {ProtocolVersion}, AdapterBuildVersion = {AdapterBuildVersion}, AcceptedAt = {AcceptedAt:O}, EvidenceHash = [REDACTED] }}";
+        $"AdapterCapabilityAcceptanceRecord {{ AdapterKind = {AdapterKind}, Versions = [REDACTED], AcceptedAt = {AcceptedAt:O}, EvidenceHash = [REDACTED] }}";
 }
 
 public sealed record AccountAllocationRecord(

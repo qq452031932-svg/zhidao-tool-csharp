@@ -1,0 +1,30 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.Acceptance.AcceptanceConfirmationWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="真实写操作现场验收" Width="560" Height="390"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Text="仅允许一笔可丢弃测试操作" />
+        <StackPanel Grid.Row="1" Margin="0,20,0,20">
+            <CheckBox x:Name="DisposableResourceCheck" Margin="0,7"
+                      Content="这是可丢弃的测试资源" />
+            <CheckBox x:Name="RealOperationConsentCheck" Margin="0,7"
+                      Content="我同意本次真实转存或分享操作" />
+            <CheckBox x:Name="SingleUseCheck" Margin="0,7"
+                      Content="我理解授权只绑定当前账号、操作、版本和代次，且只能使用一次" />
+            <TextBlock x:Name="StatusText" Margin="0,18,0,0" TextWrapping="Wrap"
+                       Text="尚未创建一次性写租约。" />
+        </StackPanel>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="取消" MinWidth="90" Click="OnCancel" />
+            <Button Content="创建本次租约" MinWidth="130" Margin="10,0,0,0" Click="OnCreateLease" />
+            <Button x:Name="AcceptVersionButton" Content="接受此版本" MinWidth="120"
+                    Margin="10,0,0,0" IsEnabled="False" Click="OnAcceptVersion" />
+        </StackPanel>
+    </Grid>
+</Window>

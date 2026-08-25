@@ -197,7 +197,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             new BaiduShareResultRecord(markerId, markerId, markerId, markerId, markerId, marker, marker, 1,
                 marker, marker, marker, true, true, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch),
             new ShareResultCursor(4, 1, markerId),
-            new AdapterCapabilityAcceptanceRecord("BaiduShare", "v1", "build", DateTimeOffset.UnixEpoch, marker),
+            new AdapterCapabilityAcceptanceRecord("BaiduShare", "v1", "selectors-v1", "build", DateTimeOffset.UnixEpoch, marker),
         };
 
         foreach (var value in values)
@@ -266,6 +266,26 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(resource, Assert.Single((await read.Jobs.GetResourcesPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(operation, Assert.Single((await read.Jobs.GetOperationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(allocation, Assert.Single((await read.Jobs.GetAllocationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
+    }
+
+    [Fact]
+    public async Task AdapterCapabilityAcceptanceRequiresTheExactSelectorAndBuildVersion()
+    {
+        var factory = await CreateFactoryAsync();
+        var store = new SqliteAdapterCapabilityStore(factory);
+        var accepted = new AdapterCapabilityAcceptanceRecord(
+            "BaiduTransfer", "protocol-v1", "selectors-v1", "build-1",
+            DateTimeOffset.UnixEpoch,
+            new string('A', 64));
+
+        await store.AcceptAsync(accepted);
+
+        Assert.Equal(accepted, await store.GetAsync(
+            "BaiduTransfer", "protocol-v1", "selectors-v1", "build-1"));
+        Assert.Null(await store.GetAsync(
+            "BaiduTransfer", "protocol-v1", "selectors-v2", "build-1"));
+        Assert.Null(await store.GetAsync(
+            "BaiduTransfer", "protocol-v1", "selectors-v1", "build-2"));
     }
 
     [Fact]

@@ -24,7 +24,7 @@ public partial class App : System.Windows.Application
         var dataRoot = StartupDataRootSelector.Resolve(
             e.Args,
             Path.Combine(localData, "BaiduBatchTransfer"));
-        host = AppBootstrap.CreateHost(dataRoot);
+        host = AppBootstrap.CreateHost(dataRoot, e.Args);
         try
         {
             var startup = await host.Services.GetRequiredService<AppStartupController>()

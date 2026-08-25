@@ -6,6 +6,7 @@ using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Results;
+using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
@@ -30,9 +31,9 @@ public sealed class AppBootstrapTests : IDisposable
     {
         using var host = AppBootstrap.CreateHost(root);
 
-        var transferAdapter = Assert.IsType<CoordinatedBaiduNetdiskAdapter>(
+        var transferAdapter = Assert.IsType<CoordinatedOperationBoundBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
-        Assert.IsNotAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(transferAdapter);
+        Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(transferAdapter);
         var shareAdapter = Assert.IsType<CoordinatedOperationBoundBaiduShareAdapter>(
             host.Services.GetRequiredService<IBaiduShareAdapter>());
         Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(shareAdapter);
@@ -104,6 +105,28 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
         Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
+        Assert.IsType<AcceptanceWriteLeaseCoordinator>(
+            host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>());
+        Assert.IsType<SqliteAdapterCapabilityStore>(
+            host.Services.GetRequiredService<IAdapterCapabilityStore>());
+        Assert.NotNull(host.Services.GetRequiredService<
+            Func<AdapterWriteAuthorizationRequest, AcceptanceConfirmationWindow>>());
+    }
+
+    [Fact]
+    public void ExplicitAcceptanceSwitchIsPassedOnlyToTheInMemoryWriteLeaseCoordinator()
+    {
+        using var host = AppBootstrap.CreateHost(
+            root,
+            [AcceptanceWriteLeaseOptions.Switch]);
+
+        var options = host.Services.GetRequiredService<AcceptanceWriteLeaseOptions>();
+
+#if DEBUG
+        Assert.True(options.IsEnabled);
+#else
+        Assert.False(options.IsEnabled);
+#endif
     }
 
     [Fact]

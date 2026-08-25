@@ -18,6 +18,7 @@ using BaiduBatchTransfer.BaiduAdapter.Authentication;
 using BaiduBatchTransfer.BaiduAdapter.Http;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Database.Repositories;
 using BaiduBatchTransfer.Infrastructure.Excel;
@@ -57,19 +58,30 @@ public sealed record AppDataPaths
 public static class AppBootstrap
 {
     public static IHost CreateHost(string dataRoot, Action<IServiceCollection>? configure = null)
+        => CreateHost(dataRoot, Array.Empty<string>(), configure);
+
+    public static IHost CreateHost(
+        string dataRoot,
+        IReadOnlyList<string> startupArguments,
+        Action<IServiceCollection>? configure = null)
     {
+        ArgumentNullException.ThrowIfNull(startupArguments);
         var paths = new AppDataPaths(dataRoot);
         return Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
             {
-                ConfigureServices(services, paths);
+                ConfigureServices(services, paths, startupArguments);
                 configure?.Invoke(services);
             })
             .Build();
     }
 
-    internal static void ConfigureServices(IServiceCollection services, AppDataPaths paths)
+    internal static void ConfigureServices(
+        IServiceCollection services,
+        AppDataPaths paths,
+        IReadOnlyList<string>? startupArguments = null)
     {
+        startupArguments ??= Array.Empty<string>();
         services.AddSingleton(paths);
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
@@ -176,9 +188,34 @@ public static class AppBootstrap
         services.AddSingleton<LiveBaiduNetdiskAdapter>();
         services.AddSingleton<LiveBaiduShareAdapter>();
         services.AddSingleton<BaiduAdapterConcurrencyGate>();
-        services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
+        services.AddSingleton<SqliteAdapterCapabilityStore>();
+        services.AddSingleton<IAdapterCapabilityStore>(sp =>
+            sp.GetRequiredService<SqliteAdapterCapabilityStore>());
+        services.AddSingleton(AcceptanceWriteLeaseOptions.FromStartup(startupArguments));
+        services.AddSingleton<AcceptanceWriteLeaseCoordinator>();
+        services.AddSingleton<IAdapterWriteAuthorizationGate>(sp =>
+            sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
+        services.AddTransient<Func<AdapterWriteAuthorizationRequest, AcceptanceConfirmationWindow>>(sp =>
+            request => new AcceptanceConfirmationWindow(
+                sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>(), request));
+        services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<TransferAutomationFlow>();
+        services.AddSingleton<WebViewBaiduNetdiskAdapter>(sp => new WebViewBaiduNetdiskAdapter(
             sp.GetRequiredService<LiveBaiduNetdiskAdapter>(),
-            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
+            sp.GetRequiredService<IVisibleWebAutomationBroker>(),
+            sp.GetRequiredService<IAccountProfilePathPolicy>(),
+            sp.GetRequiredService<TransferAutomationFlow>(),
+            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
+            sp.GetRequiredService<IWebAutomationAttemptStore>()));
+        services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
+            sp.GetRequiredService<WebViewBaiduNetdiskAdapter>(),
+            sp.GetRequiredService<BaiduAdapterConcurrencyGate>(),
+            sp.GetRequiredService<IAdapterWriteAuthorizationGate>(),
+            new AdapterCapabilityVersion(
+                "BaiduTransfer",
+                BaiduSelectorCatalog.ProtocolVersion,
+                BaiduSelectorCatalog.SelectorVersion,
+                Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0")));
         services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
@@ -223,7 +260,13 @@ public static class AppBootstrap
             sp.GetRequiredService<IShareOfficialResultDestinationResolver>()));
         services.AddSingleton<IBaiduShareAdapter>(sp => CoordinatedBaiduShareAdapter.Wrap(
             sp.GetRequiredService<WebViewBaiduShareAdapter>(),
-            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
+            sp.GetRequiredService<BaiduAdapterConcurrencyGate>(),
+            sp.GetRequiredService<IAdapterWriteAuthorizationGate>(),
+            new AdapterCapabilityVersion(
+                "BaiduShare",
+                BaiduSelectorCatalog.ProtocolVersion,
+                BaiduSelectorCatalog.SelectorVersion,
+                Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0")));
         services.AddSingleton<ShareSubmissionEngine>();
         services.AddSingleton<StandaloneShareOperationExecutor>();
         services.AddSingleton<IStandaloneShareOperationRunner>(sp =>

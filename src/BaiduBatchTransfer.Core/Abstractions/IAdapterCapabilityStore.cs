@@ -6,6 +6,7 @@ public interface IAdapterCapabilityStore
     Task<AdapterCapabilityAcceptanceRecord?> GetAsync(
         string adapterKind,
         string protocolVersion,
+        string selectorVersion,
         string adapterBuildVersion,
         CancellationToken cancellationToken = default);
 }
