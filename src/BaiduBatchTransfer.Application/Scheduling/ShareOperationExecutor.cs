@@ -7,7 +7,6 @@ namespace BaiduBatchTransfer.Application.Scheduling;
 
 public sealed class ShareOperationExecutor
 {
-    private const int MaximumDiscoveryPages = 10_000;
     private static readonly TimeSpan ReconciliationDelay = TimeSpan.FromMinutes(1);
     private readonly IBaiduShareAdapter adapter;
     private readonly IBaiduSessionStore sessionStore;
@@ -15,7 +14,7 @@ public sealed class ShareOperationExecutor
     private readonly RetryPolicy retryPolicy;
     private readonly IAsyncDelay delay;
     private readonly TimeProvider timeProvider;
-    private readonly ShareReconciliationPolicy reconciliation = new();
+    private readonly ShareSubmissionEngine submissionEngine;
 
     public ShareOperationExecutor(
         IBaiduShareAdapter adapter,
@@ -23,7 +22,8 @@ public sealed class ShareOperationExecutor
         IShareExecutionStore store,
         RetryPolicy retryPolicy,
         IAsyncDelay delay,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ShareSubmissionEngine? submissionEngine = null)
     {
         this.adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         this.sessionStore = sessionStore ?? throw new ArgumentNullException(nameof(sessionStore));
@@ -31,6 +31,7 @@ public sealed class ShareOperationExecutor
         this.retryPolicy = retryPolicy ?? throw new ArgumentNullException(nameof(retryPolicy));
         this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.submissionEngine = submissionEngine ?? new ShareSubmissionEngine();
     }
 
     public async Task<ShareExecutionResult> ExecuteAsync(
@@ -60,12 +61,23 @@ public sealed class ShareOperationExecutor
                 timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
             return Stale();
 
-        var discovery = await DiscoverExactMatchesAsync(operation, session, request, cancellationToken).ConfigureAwait(false);
+        var discovery = await submissionEngine.DiscoverAsync(
+            adapter, session, request, retryPolicy, delay, cancellationToken).ConfigureAwait(false);
         if (!discovery.IsSuccess)
         {
-            if (discovery.PauseReason is { } reason)
-                return await PauseAsync(operation, reason, cancellationToken).ConfigureAwait(false);
-            return await FailAsync(operation, discovery.ErrorCode!, discovery.SafeMessage!, cancellationToken).ConfigureAwait(false);
+            if (IsAccountPausingFailure(discovery.ErrorKind!.Value))
+                return await PauseAsync(operation, PauseReason(discovery.ErrorKind.Value), cancellationToken).ConfigureAwait(false);
+            return await FailAsync(
+                operation, discovery.ErrorKind.Value.ToString(), discovery.SafeMessage!, cancellationToken).ConfigureAwait(false);
+        }
+
+        foreach (var chunk in discovery.Value!.ExactMatches.Chunk(500))
+        {
+            var records = chunk.Select(value => new ShareDiscoveryBaselineRecord(
+                operation.Id, value.ShareId, operation.Generation, value.ShareUrl, value.ExtractionCode,
+                value.IsPermanent, value.IsAccessUnlimited)).ToArray();
+            await store.AppendDiscoveryBaselinePageAsync(
+                operation.Id, operation.LeaseGeneration, records, cancellationToken).ConfigureAwait(false);
         }
 
         var evidence = await ReadBaselineEvidenceAsync(context, request, cancellationToken).ConfigureAwait(false);
@@ -74,86 +86,87 @@ public sealed class ShareOperationExecutor
                 evidence.Fingerprint, evidence.Count, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
             return Stale();
 
-        switch (context.ExistingShareDecision)
+        var existing = submissionEngine.ResolveExistingShare(
+            context.ExistingShareDecision, request, evidence.Matches, context.ConfirmedExistingShare,
+            requireExistingForReuse: true);
+        switch (existing.Action)
         {
-            case ExistingShareDecision.Cancel:
+            case ExistingShareAction.Cancel:
                 return await PauseAsync(operation, SharePauseReason.CancelledByUser, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Reuse when evidence.ConfirmedMatch is not null:
-                return await ReuseAsync(context, evidence.ConfirmedMatch, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Reuse when context.ConfirmedExistingShare is not null:
-                return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Reuse when evidence.FirstCompatible is not null:
-                return await ReuseAsync(context, evidence.FirstCompatible, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Reuse when evidence.Count > 0:
+            case ExistingShareAction.Reuse:
+                return await ReuseAsync(context, existing.ReusableShare!, cancellationToken).ConfigureAwait(false);
+            case ExistingShareAction.Incompatible:
                 return await PauseAsync(operation, SharePauseReason.IncompatibleExistingShare, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Reuse:
+            case ExistingShareAction.RequiresDecision:
                 return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
-            case ExistingShareDecision.Regenerate:
-                break;
-            case null when evidence.Count > 0:
-                return await PauseAsync(operation, SharePauseReason.AwaitingExistingShareDecision, cancellationToken).ConfigureAwait(false);
-            case null:
+            case ExistingShareAction.SubmitNew:
                 break;
             default:
                 throw new InvalidOperationException("The persisted existing-share decision is invalid.");
         }
 
-        var submittedAt = timeProvider.GetUtcNow();
-        var descriptor = CreateDescriptor(operation, submittedAt);
-        if (!await store.TryMarkSubmittingAsync(
-                operation.Id, operation.Generation, operation.LeaseGeneration,
-                descriptor, submittedAt, cancellationToken).ConfigureAwait(false))
-            return Stale();
-
-        var completedRetries = 0;
-        while (true)
-        {
-            if (completedRetries > 0)
-            {
-                var expectedAttempt = checked(operation.AttemptCount + completedRetries);
-                if (!await store.TryBeginSubmissionAttemptAsync(
+        ShareOperationAutomationContext? automationContext = null;
+        if (adapter is IOperationBoundBaiduShareAdapter operationBound)
+            automationContext = new ShareOperationAutomationContext(
+                operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
+                WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems).Validate();
+        var submission = await submissionEngine.ExecuteSubmissionAsync(
+            request,
+            new ShareSubmissionPorts(
+                token => adapter is IOperationBoundBaiduShareAdapter bound
+                    ? bound.PreparePermanentShareForOperationAsync(automationContext!, session, request, token)
+                    : Task.FromResult(BaiduAdapterResult<SharePreparationReceipt>.Success(
+                        SharePreparationReceipt.Ready, SubmissionAcceptance.DefinitelyNotAccepted)),
+                token =>
+                {
+                    var submittedAt = timeProvider.GetUtcNow();
+                    var descriptor = CreateDescriptor(operation, submittedAt);
+                    return store.TryMarkSubmittingAsync(
                         operation.Id, operation.Generation, operation.LeaseGeneration,
-                        expectedAttempt, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
-                    return Stale();
-            }
-            BaiduAdapterResult<ShareCreationReceipt> result;
-            try
-            {
-                result = await adapter.CreatePermanentShareAsync(session, request, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                await MarkPendingAsync(operation, CancellationToken.None).ConfigureAwait(false);
-                throw;
-            }
-            catch (Exception)
-            {
-                return await MarkPendingAsync(operation, CancellationToken.None).ConfigureAwait(false);
-            }
-
-            if (result.IsSuccess)
-                return await AcceptReceiptAsync(context, request, result.Value!, cancellationToken).ConfigureAwait(false);
-
-            if (result.SubmissionAcceptance != SubmissionAcceptance.DefinitelyNotAccepted)
-                return await MarkPendingAsync(operation, cancellationToken).ConfigureAwait(false);
-
-            var expectedCompletedAttempt = checked(operation.AttemptCount + completedRetries + 1);
-            if (!await store.TryRecordDefinitelyNotAcceptedRetryAsync(
+                        descriptor, submittedAt, token);
+                },
+                (completedRetries, token) => store.TryBeginSubmissionAttemptAsync(
                     operation.Id, operation.Generation, operation.LeaseGeneration,
-                    expectedCompletedAttempt, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
-                return Stale();
+                    checked(operation.AttemptCount + completedRetries), timeProvider.GetUtcNow(), token),
+                token => adapter is IOperationBoundBaiduShareAdapter bound
+                    ? bound.SubmitPermanentShareForOperationAsync(automationContext!, session, request, token)
+                    : adapter.CreatePermanentShareAsync(session, request, token),
+                (completedAttempts, token) => store.TryRecordDefinitelyNotAcceptedRetryAsync(
+                    operation.Id, operation.Generation, operation.LeaseGeneration,
+                    checked(operation.AttemptCount + completedAttempts), timeProvider.GetUtcNow(), token),
+                token =>
+                {
+                    var now = timeProvider.GetUtcNow();
+                    return store.TryMarkResultPendingAsync(
+                        operation.Id, operation.Generation, operation.LeaseGeneration,
+                        now + ReconciliationDelay, now, token);
+                }),
+            retryPolicy,
+            delay,
+            cancellationToken).ConfigureAwait(false);
 
-            var decision = retryPolicy.Decide(result.ErrorKind!.Value, completedRetries, result.RetryAfter);
-            if (!decision.ShouldRetry)
-            {
-                if (IsAccountPausingFailure(result.ErrorKind.Value))
-                    return await PauseAsync(operation, PauseReason(result.ErrorKind.Value), cancellationToken).ConfigureAwait(false);
-                return await FailAsync(operation, result.ErrorKind.Value.ToString(), result.SafeMessage!, cancellationToken).ConfigureAwait(false);
-            }
-
-            completedRetries++;
-            await delay.DelayAsync(decision.Delay, cancellationToken).ConfigureAwait(false);
+        if (submission.Disposition == ShareSubmissionDisposition.Stale) return Stale();
+        if (submission.Disposition == ShareSubmissionDisposition.Accepted)
+            return await AcceptReceiptAsync(context, request, submission.Receipt!, cancellationToken).ConfigureAwait(false);
+        if (submission.Disposition == ShareSubmissionDisposition.ResultPending)
+            return new(ShareExecutionDisposition.ResultPending, "分享结果待确认");
+        if (submission.Disposition == ShareSubmissionDisposition.PreparationFailed)
+        {
+            if (submission.ErrorKind is { } preparationError && IsAccountPausingFailure(preparationError))
+                return await PauseAsync(operation, PauseReason(preparationError), cancellationToken).ConfigureAwait(false);
+            return await FailAsync(
+                operation,
+                submission.ErrorKind?.ToString() ?? "UnknownResponse",
+                submission.SafeMessage ?? "The service returned an unrecognized response.",
+                cancellationToken).ConfigureAwait(false);
         }
+        if (submission.ErrorKind is { } error && IsAccountPausingFailure(error))
+            return await PauseAsync(operation, PauseReason(error), cancellationToken).ConfigureAwait(false);
+        return await FailAsync(
+            operation,
+            submission.ErrorKind?.ToString() ?? "UnknownResponse",
+            submission.SafeMessage ?? "The service returned an unrecognized response.",
+            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<ShareExecutionResult> AcceptReceiptAsync(
@@ -168,16 +181,13 @@ public sealed class ShareOperationExecutor
                 receipt.AdapterRequestId, timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
             return Stale();
 
-        if (receipt.Request.RemoteItems != request.RemoteItems ||
-            receipt.Request.UsesRandomExtractionCode != request.UsesRandomExtractionCode ||
-            !string.Equals(receipt.Request.FixedExtractionCode, request.FixedExtractionCode, StringComparison.Ordinal) ||
-            !receipt.IsFinalAcceptance || string.IsNullOrWhiteSpace(receipt.ExtractionCode))
+        if (!submissionEngine.IsExactAcceptedReceipt(request, receipt))
             return await MarkPendingAsync(operation, cancellationToken).ConfigureAwait(false);
 
         var now = timeProvider.GetUtcNow();
         var accepted = await store.AcceptResultAsync(
             operation.Id, ShareOperationStatus.Submitting, operation.LeaseGeneration,
-            Result(context, receipt.ShareId, receipt.ShareUrl, receipt.ExtractionCode, receipt.SubmittedAtUtc, now),
+            Result(context, receipt.ShareId, receipt.ShareUrl, receipt.ExtractionCode!, receipt.SubmittedAtUtc, now),
             now, cancellationToken).ConfigureAwait(false);
         return accepted
             ? new(ShareExecutionDisposition.Succeeded, "分享成功")
@@ -215,57 +225,6 @@ public sealed class ShareOperationExecutor
             shareId, shareUrl, extractionCode, true, true, sharedAt, updatedAt);
     }
 
-    private async Task<DiscoveryResult> DiscoverExactMatchesAsync(
-        ShareOperationRecord operation,
-        AccountSession session,
-        PermanentShareRequest request,
-        CancellationToken cancellationToken)
-    {
-        var cursor = (string?)null;
-        var seenCursors = new HashSet<string>(StringComparer.Ordinal);
-        for (var pageNumber = 0; pageNumber < MaximumDiscoveryPages; pageNumber++)
-        {
-            BaiduAdapterResult<BaiduSharePage> page;
-            var completedRetries = 0;
-            while (true)
-            {
-                try
-                {
-                    page = await adapter.ListSharesAsync(session, cursor, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                catch (Exception)
-                {
-                    return DiscoveryResult.Failure("UnknownResponse", "The service returned an unrecognized response.");
-                }
-                if (page.IsSuccess) break;
-                var retry = retryPolicy.Decide(page.ErrorKind!.Value, completedRetries, page.RetryAfter);
-                if (!retry.ShouldRetry)
-                {
-                    return IsAccountPausingFailure(page.ErrorKind.Value)
-                        ? DiscoveryResult.Paused(PauseReason(page.ErrorKind.Value))
-                        : DiscoveryResult.Failure(page.ErrorKind.Value.ToString(), page.SafeMessage!);
-                }
-                completedRetries++;
-                await delay.DelayAsync(retry.Delay, cancellationToken).ConfigureAwait(false);
-            }
-
-            var matches = page.Value!.Items.Where(value => value.RemoteItems == request.RemoteItems)
-                .Select(value => new ShareDiscoveryBaselineRecord(
-                    operation.Id,value.ShareId,operation.Generation,value.ShareUrl,value.ExtractionCode,
-                    value.IsPermanent,value.IsAccessUnlimited)).ToArray();
-            if (matches.Length > 0)
-                await store.AppendDiscoveryBaselinePageAsync(
-                    operation.Id,operation.LeaseGeneration,matches,cancellationToken).ConfigureAwait(false);
-            var next = page.Value.NextCursor;
-            if (next is null) return DiscoveryResult.Success();
-            if (string.IsNullOrWhiteSpace(next) || !seenCursors.Add(next))
-                return DiscoveryResult.Failure("InvalidCursor", "The service returned an unrecognized response.");
-            cursor = next;
-        }
-        return DiscoveryResult.Failure("PageLimit", "The service returned an unrecognized response.");
-    }
-
     private async Task<BaselineEvidence> ReadBaselineEvidenceAsync(
         ShareExecutionContext context,
         PermanentShareRequest request,
@@ -275,8 +234,7 @@ public sealed class ShareOperationExecutor
         ShareReconciliationPolicy.Append(hash,"share-baseline-v1");
         string? cursor=null;
         var count=0;
-        BaiduShareRecord? firstCompatible=null;
-        BaiduShareRecord? confirmedMatch=null;
+        var matches = new List<BaiduShareRecord>();
         do
         {
             var page=await store.GetDiscoveryBaselineKeysetPageAsync(
@@ -291,14 +249,12 @@ public sealed class ShareOperationExecutor
                 ShareReconciliationPolicy.Append(hash,entry.ExtractionCode);
                 var share=new BaiduShareRecord(entry.ShareId,context.ExactRemoteItems,entry.ShareUrl,entry.ExtractionCode,
                     entry.IsPermanent.Value,entry.IsAccessUnlimited.Value);
-                if(firstCompatible is null&&reconciliation.IsCompatible(share,request))firstCompatible=share;
-                if(context.ConfirmedExistingShare is { } confirmed&&SameShare(share,confirmed)&&
-                   reconciliation.IsCompatible(share,request))confirmedMatch=share;
+                matches.Add(share);
                 count++;
             }
             cursor=page.NextCursor;
         }while(cursor is not null);
-        return new(Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(),count,firstCompatible,confirmedMatch);
+        return new(Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant(),count,matches);
     }
 
     private async Task<ShareExecutionResult> MarkPendingAsync(
@@ -383,13 +339,6 @@ public sealed class ShareOperationExecutor
             SubmittedAtUtc = submittedAt.ToUniversalTime(),
         });
 
-    private static bool SameShare(BaiduShareRecord left, BaiduShareRecord right) =>
-        string.Equals(left.ShareId,right.ShareId,StringComparison.Ordinal) &&
-        left.RemoteItems == right.RemoteItems &&
-        string.Equals(left.ShareUrl,right.ShareUrl,StringComparison.Ordinal) &&
-        string.Equals(left.ExtractionCode,right.ExtractionCode,StringComparison.Ordinal) &&
-        left.IsPermanent == right.IsPermanent && left.IsAccessUnlimited == right.IsAccessUnlimited;
-
     private static SharePauseReason PauseReason(BaiduErrorKind errorKind) => errorKind switch
     {
         BaiduErrorKind.ExpiredLogin => SharePauseReason.AccountSessionUnavailable,
@@ -413,17 +362,6 @@ public sealed class ShareOperationExecutor
 
     private static ShareExecutionResult Stale() => new(ShareExecutionDisposition.Stale, "分享任务状态已变化");
 
-    private sealed record DiscoveryResult(
-        bool IsSuccess,
-        SharePauseReason? PauseReason,
-        string? ErrorCode,
-        string? SafeMessage)
-    {
-        public static DiscoveryResult Success() => new(true, null, null, null);
-        public static DiscoveryResult Paused(SharePauseReason reason) => new(false, reason, null, null);
-        public static DiscoveryResult Failure(string code, string message) => new(false, null, code, message);
-    }
-
     private sealed record BaselineEvidence(
-        string Fingerprint,int Count,BaiduShareRecord? FirstCompatible,BaiduShareRecord? ConfirmedMatch);
+        string Fingerprint,int Count,IReadOnlyList<BaiduShareRecord> Matches);
 }

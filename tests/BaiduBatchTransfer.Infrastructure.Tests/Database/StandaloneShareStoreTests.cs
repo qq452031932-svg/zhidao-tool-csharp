@@ -69,6 +69,58 @@ public sealed class StandaloneShareStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task FixedExtractionSettingsRoundTripAndRemainTheAuthoritativeResultFingerprint()
+    {
+        var graph = await CreateAsync();
+        var batchId = Guid.NewGuid();
+        var batch = StandaloneShareBatchRecord.Create(
+            batchId, Path.Combine(graph.Root, $"results-{batchId:N}"), 1, graph.Now);
+        var operation = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), batchId,
+            new OwnedRemoteSelection(
+                graph.AccountId,
+                new RemoteItemIdentitySet([new RemoteItemIdentity("remote-fixed", "item")]),
+                "item", RemoteResourceKind.File, new RemotePath("/apps")),
+            1, graph.Now, ShareExtractionCodeBehavior.Fixed, "A1b2");
+
+        await graph.Store.CreateOrGetBatchAsync(
+            StandaloneSharePendingBatchEnvelope.Create(batch, [operation]));
+        var restored = Assert.Single(await new SqliteStandaloneShareStore(graph.Factory)
+            .GetOperationsAsync(batchId));
+
+        Assert.Equal(ShareExtractionCodeBehavior.Fixed, restored.ExtractionCodeBehavior);
+        Assert.Equal("A1b2", restored.FixedExtractionCode);
+        Assert.Equal(operation.SettingsFingerprint, restored.SettingsFingerprint);
+    }
+
+    [Theory]
+    [InlineData(ExistingShareDecision.Reuse)]
+    [InlineData(ExistingShareDecision.Regenerate)]
+    [InlineData(ExistingShareDecision.Cancel)]
+    public async Task ExistingShareDecisionRoundTripsAfterDatabaseReopen(
+        ExistingShareDecision decision)
+    {
+        var graph = await CreateAsync();
+        var batchId = Guid.NewGuid();
+        var batch = StandaloneShareBatchRecord.Create(
+            batchId, Path.Combine(graph.Root, $"results-{batchId:N}"), 1, graph.Now);
+        var operation = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), batchId,
+            new OwnedRemoteSelection(
+                graph.AccountId,
+                new RemoteItemIdentitySet([new RemoteItemIdentity("remote-policy", "item")]),
+                "item", RemoteResourceKind.File, new RemotePath("/apps")),
+            1, graph.Now, ShareExtractionCodeBehavior.Random, null, decision);
+
+        await graph.Store.CreateOrGetBatchAsync(
+            StandaloneSharePendingBatchEnvelope.Create(batch, [operation]));
+        var restored = Assert.Single(await new SqliteStandaloneShareStore(graph.Factory)
+            .GetOperationsAsync(batchId));
+
+        Assert.Equal(decision, restored.ExistingShareDecision);
+    }
+
+    [Fact]
     public async Task StoreRejectsAnUnsafePersistedResultDirectoryWithoutEchoingIt()
     {
         var graph = await CreateAsync();
@@ -165,6 +217,53 @@ public sealed class StandaloneShareStoreTests : IDisposable
             prepared.Id, prepared.BatchId, prepared.AccountId, prepared.Generation, lease.LeaseGeneration,
             lease.LeaseOwnerId,
             prepared.Revision, graph.Now.AddSeconds(3)));
+        var submitting = Assert.Single(await graph.Store.GetOperationsAsync(receipt.Batch.Id));
+        Assert.Equal(StandaloneShareOperationStatus.Submitting, submitting.Status);
+        Assert.Equal(StandaloneShareSubmissionState.Prepared, submitting.SubmissionState);
+        Assert.Equal(SubmissionAcceptance.Unknown, submitting.SubmissionAcceptance);
+    }
+
+    [Fact]
+    public async Task DefinitelyNotAcceptedAttemptIsDurableAndExpiredLeaseRecoversToSafeNewGeneration()
+    {
+        var graph = await CreateAsync();
+        var receipt = await graph.Store.CreateOrGetBatchAsync(Envelope(graph, 1, graph.Now));
+        var owner = Guid.NewGuid();
+        var lease = (await graph.Store.TryLeaseNextAsync(
+            receipt.Batch.Id, owner, graph.Now.AddSeconds(1), graph.Now.AddSeconds(10)))!;
+        Assert.True(await graph.Store.TryCompleteBaselineAsync(
+            lease.OperationId, lease.BatchId, lease.AccountId, lease.Generation,
+            lease.LeaseGeneration, lease.LeaseOwnerId, lease.Revision,
+            ["existing-share"], WebAutomationBaseline.Create(["existing-share"]).Fingerprint,
+            graph.Now.AddSeconds(2)));
+        var prepared = Assert.Single((await graph.Store.GetBatchSnapshotAsync(receipt.Batch.Id))!.Operations);
+        Assert.True(await graph.Store.TryMarkSubmittingAsync(
+            prepared.Id, prepared.BatchId, prepared.AccountId, prepared.Generation,
+            prepared.LeaseGeneration, prepared.LeaseOwnerId!.Value, prepared.Revision,
+            graph.Now.AddSeconds(3)));
+        var submitting = Assert.Single((await graph.Store.GetBatchSnapshotAsync(receipt.Batch.Id))!.Operations);
+
+        Assert.True(await graph.Store.TryRecordDefinitelyNotAcceptedAttemptAsync(
+            submitting.Id, submitting.BatchId, submitting.AccountId, submitting.Generation,
+            submitting.LeaseGeneration, submitting.LeaseOwnerId!.Value, submitting.Revision,
+            1, graph.Now.AddSeconds(4)));
+        var durable = Assert.Single((await graph.Store.GetBatchSnapshotAsync(receipt.Batch.Id))!.Operations);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, durable.SubmissionAcceptance);
+        Assert.Equal(1, durable.AttemptCount);
+        Assert.False(await graph.Store.TryRecordDefinitelyNotAcceptedAttemptAsync(
+            durable.Id, durable.BatchId, durable.AccountId, durable.Generation,
+            durable.LeaseGeneration, durable.LeaseOwnerId!.Value, durable.Revision,
+            2, graph.Now.AddSeconds(5)));
+
+        Assert.Equal(1, await graph.Store.RecoverExpiredLeasesAsync(graph.Now.AddSeconds(11), 10));
+        var recovered = Assert.Single((await graph.Store.GetBatchSnapshotAsync(receipt.Batch.Id))!.Operations);
+        Assert.Equal(StandaloneShareOperationStatus.Queued, recovered.Status);
+        Assert.Equal(StandaloneShareSubmissionState.NotStarted, recovered.SubmissionState);
+        Assert.Equal(SubmissionAcceptance.Unknown, recovered.SubmissionAcceptance);
+        Assert.Equal(submitting.Generation + 1, recovered.Generation);
+        Assert.Equal(0, recovered.AttemptCount);
+        Assert.Null(recovered.BaselineFingerprint);
+        Assert.Null(recovered.LeaseOwnerId);
     }
 
     [Fact]
@@ -182,7 +281,7 @@ public sealed class StandaloneShareStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ResultPendingAcceptsOnlyCurrentAccountGenerationAndStoresOneRedactedResult()
+    public async Task SubmittingAcceptsOnlyCurrentIdentityAndSettingsFingerprintAndStoresOneRedactedResult()
     {
         var graph = await CreateAsync();
         var receipt = await graph.Store.CreateOrGetBatchAsync(Envelope(graph, 1, graph.Now));
@@ -198,25 +297,23 @@ public sealed class StandaloneShareStoreTests : IDisposable
             lease.LeaseOwnerId,
             prepared.Revision, graph.Now.AddSeconds(3)));
         var submitting = (await graph.Store.GetOperationsAsync(receipt.Batch.Id)).Single();
-        Assert.True(await graph.Store.TryMarkResultPendingAsync(
-            submitting.Id, submitting.BatchId, submitting.AccountId, submitting.Generation, lease.LeaseGeneration,
-            lease.LeaseOwnerId,
-            submitting.Revision, graph.Now.AddSeconds(4)));
-        var pending = (await graph.Store.GetOperationsAsync(receipt.Batch.Id)).Single();
         var result = new StandaloneShareResultRecord(
-            Guid.NewGuid(), pending.Id, pending.BatchId, pending.AccountId, pending.Generation,
-            pending.ExactRemoteItems.Fingerprint, Fingerprint('c'), "share-id",
+            Guid.NewGuid(), submitting.Id, submitting.BatchId, submitting.AccountId, submitting.Generation,
+            submitting.ExactRemoteItems.Fingerprint, submitting.SettingsFingerprint, "share-id",
             "https://pan.baidu.com/s/private", "a1b2", true, true,
             graph.Now.AddSeconds(5), graph.Now.AddSeconds(5));
 
         Assert.False(await graph.Store.TryAcceptResultAsync(
-            result with { AccountId = Guid.NewGuid() }, lease.LeaseGeneration, lease.LeaseOwnerId, pending.Revision,
+            result with { AccountId = Guid.NewGuid() }, lease.LeaseGeneration, lease.LeaseOwnerId, submitting.Revision,
             graph.Now.AddSeconds(5)));
-        Assert.True(await graph.Store.TryAcceptResultAsync(
-            result, lease.LeaseGeneration, lease.LeaseOwnerId, pending.Revision, graph.Now.AddSeconds(5)));
         Assert.False(await graph.Store.TryAcceptResultAsync(
-            result, lease.LeaseGeneration, lease.LeaseOwnerId, pending.Revision, graph.Now.AddSeconds(6)));
-        var restored = await graph.Store.GetResultAsync(pending.Id, pending.Generation);
+            result with { SettingsFingerprint = Fingerprint('c') }, lease.LeaseGeneration, lease.LeaseOwnerId,
+            submitting.Revision, graph.Now.AddSeconds(5)));
+        Assert.True(await graph.Store.TryAcceptResultAsync(
+            result, lease.LeaseGeneration, lease.LeaseOwnerId, submitting.Revision, graph.Now.AddSeconds(5)));
+        Assert.False(await graph.Store.TryAcceptResultAsync(
+            result, lease.LeaseGeneration, lease.LeaseOwnerId, submitting.Revision, graph.Now.AddSeconds(6)));
+        var restored = await graph.Store.GetResultAsync(submitting.Id, submitting.Generation);
         Assert.NotNull(restored);
         Assert.DoesNotContain(restored.ShareUrl, restored.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(restored.ExtractionCode, restored.ToString(), StringComparison.Ordinal);
@@ -315,7 +412,34 @@ public sealed class StandaloneShareStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task ExpiredResultPendingLeaseStaysPendingAndCanBeClaimedAfterReopen()
+    public async Task ExplicitOfficialRejectionAfterClickIsTheOnlySubmittingStateThatCanBeSafelyRetried()
+    {
+        var graph = await CreateAsync();
+        var receipt = await graph.Store.CreateOrGetBatchAsync(Envelope(graph, 1, graph.Now));
+        var owner = Guid.NewGuid();
+        var lease = (await graph.Store.TryLeaseNextAsync(
+            receipt.Batch.Id, owner, graph.Now.AddSeconds(1), graph.Now.AddMinutes(1)))!;
+        Assert.True(await graph.Store.TryCompleteBaselineAsync(
+            lease.OperationId, lease.BatchId, lease.AccountId, lease.Generation,
+            lease.LeaseGeneration, owner, lease.Revision, [], Fingerprint('4'), graph.Now.AddSeconds(2)));
+        var prepared = Assert.Single(await graph.Store.GetOperationsAsync(receipt.Batch.Id));
+        Assert.True(await graph.Store.TryMarkSubmittingAsync(
+            prepared.Id, prepared.BatchId, prepared.AccountId, prepared.Generation,
+            prepared.LeaseGeneration, owner, prepared.Revision, graph.Now.AddSeconds(3)));
+        var submitting = Assert.Single(await graph.Store.GetOperationsAsync(receipt.Batch.Id));
+
+        Assert.True(await graph.Store.TryFailAsync(
+            submitting.Id, submitting.BatchId, submitting.AccountId, submitting.Generation,
+            submitting.LeaseGeneration, owner, submitting.Revision,
+            SubmissionAcceptance.DefinitelyNotAccepted, "OFFICIAL_REJECTION", graph.Now.AddSeconds(4)));
+
+        var rejected = Assert.Single(await graph.Store.GetOperationsAsync(receipt.Batch.Id));
+        Assert.True(rejected.CanSafelyRetry);
+        Assert.Equal(StandaloneShareSubmissionState.DefinitelyNotAccepted, rejected.SubmissionState);
+    }
+
+    [Fact]
+    public async Task ResultPendingReleasesExecutionLeaseAndCanBeClaimedAfterReopen()
     {
         var graph = await CreateAsync();
         var receipt = await graph.Store.CreateOrGetBatchAsync(Envelope(graph, 1, graph.Now));
@@ -335,11 +459,18 @@ public sealed class StandaloneShareStoreTests : IDisposable
             submitting.LeaseGeneration, owner, submitting.Revision, graph.Now.AddSeconds(4)));
 
         var reopened = new SqliteStandaloneShareStore(graph.Factory);
-        Assert.Equal(1, await reopened.RecoverExpiredLeasesAsync(graph.Now.AddSeconds(6), 10));
+        Assert.Equal(0, await reopened.RecoverExpiredLeasesAsync(graph.Now.AddSeconds(6), 10));
         var recovered = Assert.Single(await reopened.GetOperationsAsync(receipt.Batch.Id));
         Assert.Equal(StandaloneShareOperationStatus.ResultPending, recovered.Status);
+        var reconciliationLease = await reopened.TryClaimReconciliationAsync(
+            receipt.Batch.Id, Guid.NewGuid(), graph.Now.AddSeconds(7), graph.Now.AddSeconds(12));
+        Assert.NotNull(reconciliationLease);
+        Assert.True(await reopened.TryReleaseReconciliationAsync(
+            reconciliationLease!.OperationId, reconciliationLease.BatchId, reconciliationLease.AccountId,
+            reconciliationLease.Generation, reconciliationLease.LeaseGeneration,
+            reconciliationLease.LeaseOwnerId, reconciliationLease.Revision, graph.Now.AddSeconds(8)));
         Assert.NotNull(await reopened.TryClaimReconciliationAsync(
-            receipt.Batch.Id, Guid.NewGuid(), graph.Now.AddSeconds(7), graph.Now.AddSeconds(12)));
+            receipt.Batch.Id, Guid.NewGuid(), graph.Now.AddSeconds(9), graph.Now.AddSeconds(14)));
     }
 
     [Fact]

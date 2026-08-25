@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace BaiduBatchTransfer.App.Features.Jobs;

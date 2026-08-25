@@ -224,7 +224,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
               AND State=$expected AND Revision=$revision AND UpdatedAt<=$updated
               AND ($requiresBaseline=0 OR BaselinePersistedAt IS NOT NULL)
-              AND ($requiresAcceptance=0 OR OwnerKind<>'Transfer' OR
+              AND ($requiresAcceptance=0 OR OwnerKind NOT IN ('Transfer','TransferShare','StandaloneShare') OR
                    (AcceptanceFingerprint IS NOT NULL AND AcceptancePersistedAt IS NOT NULL AND AcceptedItemCount>0));
             """;
         AddIdentity(command, operationId, accountId, generation);
@@ -262,7 +262,10 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         await using var transaction = connection.BeginTransaction(deferred: false);
         var current = await LoadAsync(connection, transaction, operationId, accountId, generation, cancellationToken)
             .ConfigureAwait(false);
-        if (current is null || current.OwnerKind != WebAutomationOwnerKind.Transfer ||
+        if (current is null || current.OwnerKind is not (
+                WebAutomationOwnerKind.Transfer or
+                WebAutomationOwnerKind.TransferShare or
+                WebAutomationOwnerKind.StandaloneShare) ||
             current.State != WebAutomationAttemptState.Submitting ||
             current.Revision != expectedRevision || updatedAt < current.UpdatedAt)
         {
@@ -295,7 +298,8 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                 AcceptancePersistedAt=$updated,ObservationFingerprint=$observation,
                 IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
             WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
-              AND State='Submitting' AND Revision=$revision AND OwnerKind='Transfer';
+              AND State='Submitting' AND Revision=$revision
+              AND OwnerKind IN ('Transfer','TransferShare','StandaloneShare');
             """;
         AddIdentity(update, operationId, accountId, generation);
         update.Parameters.AddWithValue("$fingerprint", acceptedRemoteItems.Fingerprint);

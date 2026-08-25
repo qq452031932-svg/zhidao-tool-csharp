@@ -152,7 +152,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
 
         await recovery.RestoreAsync(candidate.Path);
 
-        Assert.Equal(12, DatabaseMigrator.LatestVersion);
+        Assert.Equal(13, DatabaseMigrator.LatestVersion);
         await using var verify = await factory.OpenConnectionAsync();
         await using var versionCommand = verify.CreateCommand();
         versionCommand.CommandText = "SELECT MAX(Version), COUNT(*) FROM SchemaVersions WHERE Version=$version;";

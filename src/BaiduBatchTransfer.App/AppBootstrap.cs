@@ -164,9 +164,6 @@ public static class AppBootstrap
         services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
             sp.GetRequiredService<LiveBaiduNetdiskAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
-        services.AddSingleton<IBaiduShareAdapter>(sp => new CoordinatedBaiduShareAdapter(
-            sp.GetRequiredService<LiveBaiduShareAdapter>(),
-            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
         services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
@@ -195,6 +192,30 @@ public static class AppBootstrap
         services.AddSingleton<VisibleWebAutomationQueue>();
         services.AddSingleton<IVisibleWebAutomationBroker>(sp =>
             sp.GetRequiredService<VisibleWebAutomationQueue>());
+        services.AddSingleton<ShareAutomationFlow>();
+        services.AddSingleton<SqliteShareAutomationAcceptanceEvidenceStore>();
+        services.AddSingleton<IShareAutomationAcceptanceEvidenceStore>(sp =>
+            sp.GetRequiredService<SqliteShareAutomationAcceptanceEvidenceStore>());
+        services.AddSingleton<WebViewBaiduShareAdapter>(sp => new WebViewBaiduShareAdapter(
+            sp.GetRequiredService<LiveBaiduShareAdapter>(),
+            sp.GetRequiredService<IVisibleWebAutomationBroker>(),
+            sp.GetRequiredService<IAccountProfilePathPolicy>(),
+            sp.GetRequiredService<ShareAutomationFlow>(),
+            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
+            sp.GetRequiredService<IWebAutomationAttemptStore>(),
+            sp.GetRequiredService<IShareAutomationAcceptanceEvidenceStore>()));
+        services.AddSingleton<IBaiduShareAdapter>(sp => CoordinatedBaiduShareAdapter.Wrap(
+            sp.GetRequiredService<WebViewBaiduShareAdapter>(),
+            sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
+        services.AddSingleton<ShareSubmissionEngine>();
+        services.AddSingleton<StandaloneShareOperationExecutor>();
+        services.AddSingleton<IStandaloneShareOperationRunner>(sp =>
+            sp.GetRequiredService<StandaloneShareOperationExecutor>());
+        services.AddSingleton<StandaloneShareCoordinator>();
+        services.AddSingleton<IStandaloneShareBatchNotifications>(sp =>
+            sp.GetRequiredService<StandaloneShareCoordinator>());
+        services.AddSingleton<CreateStandaloneShareBatchService>();
+        services.AddSingleton<IHostedService, StandaloneShareCoordinatorHostedService>();
         services.AddSingleton<RemoteResourcePickerFlow>();
         services.AddSingleton<IRemoteResourcePicker>(sp => new WebViewRemoteResourcePicker(
             sp.GetRequiredService<IVisibleWebAutomationBroker>(),
@@ -431,6 +452,7 @@ public sealed class AppShellFactory(
     ITransferResultDestinationSink resultDestinationSink,
     IRemoteResourcePicker remoteResourcePicker,
     IStandaloneShareStore standaloneShareStore,
+    CreateStandaloneShareBatchService standaloneShareBatchService,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -526,7 +548,8 @@ public sealed class AppShellFactory(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
             remoteResourcePicker,
             standaloneShareStore,
-            resultSaveDialog);
+            resultSaveDialog,
+            batchService: standaloneShareBatchService);
         var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,

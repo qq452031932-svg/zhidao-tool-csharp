@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 

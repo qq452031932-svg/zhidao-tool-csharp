@@ -6,6 +6,7 @@ namespace BaiduBatchTransfer.Application.Scheduling;
 public enum ShareReconciliationDisposition
 {
     Accepted,
+    DefinitelyNotAccepted,
     ResultPending,
     Ambiguous,
     RequiresUser,
@@ -30,6 +31,17 @@ public sealed record ShareReconciliationResult(
 }
 
 public readonly record struct ShareReconciliationWriteSnapshot(
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset? NextReconcileAt);
+
+public readonly record struct ShareReconciliationFailureSnapshot(
+    Guid BatchJobId,
+    Guid ResourceItemId,
+    Guid AccountId,
+    int OutputOrdinal,
+    string ExactItemSetFingerprint,
+    string SettingsFingerprint,
+    int AttemptCount,
     DateTimeOffset UpdatedAt,
     DateTimeOffset? NextReconcileAt);
 
@@ -64,6 +76,9 @@ public interface IShareReconciliationStore
         Guid operationId, int generation, long leaseGeneration, ShareReconciliationWriteSnapshot expected,
         ShareReconciliationIssue issue, DateTimeOffset? observedSessionCapturedAtUtc,
         DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
+    Task<bool> TryFailDefinitelyNotAcceptedAsync(
+        Guid operationId, int generation, long leaseGeneration, ShareReconciliationFailureSnapshot expected,
+        DateTimeOffset updatedAt, CancellationToken cancellationToken = default);
 }
 
 public interface IShareResultReconciler
@@ -82,6 +97,7 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
     private readonly IAsyncDelay delay;
     private readonly ShareReconciliationOptions options;
     private readonly TimeProvider timeProvider;
+    private readonly ShareSubmissionEngine submissionEngine;
 
     public ShareOperationReconciliationService(
         IBaiduShareAdapter adapter,
@@ -89,7 +105,8 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
         IShareReconciliationStore store,
         IAsyncDelay delay,
         ShareReconciliationOptions? options = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ShareSubmissionEngine? submissionEngine = null)
     {
         this.adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         this.sessionStore = sessionStore ?? throw new ArgumentNullException(nameof(sessionStore));
@@ -98,6 +115,7 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
         this.options = options ?? ShareReconciliationOptions.Default;
         this.options.Validate();
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.submissionEngine = submissionEngine ?? new ShareSubmissionEngine();
     }
 
     public async Task<ShareReconciliationResult> ReconcileAsync(
@@ -115,6 +133,10 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
         if (session is null)
             return await KeepPendingAsync(context, ShareReconciliationIssue.AccountSessionUnavailable,
                 ShareReconciliationDisposition.RequiresUser, "等待账号登录", cancellationToken).ConfigureAwait(false);
+
+        if (adapter is IOperationBoundBaiduShareAdapter operationBound)
+            return await ReconcileOperationBoundAsync(context, session, operationBound, cancellationToken)
+                .ConfigureAwait(false);
 
         var baseline = await LoadBaselineAsync(operationId, cancellationToken).ConfigureAwait(false);
         for (var poll = 0; poll < options.MaximumPolls; poll++)
@@ -172,6 +194,70 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
 
         return await KeepPendingAsync(context, ShareReconciliationIssue.ReconcileTimeout,
             ShareReconciliationDisposition.ResultPending, "分享结果待确认", cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ShareReconciliationResult> ReconcileOperationBoundAsync(
+        ShareExecutionContext context,
+        AccountSession session,
+        IOperationBoundBaiduShareAdapter operationBound,
+        CancellationToken cancellationToken)
+    {
+        var operation = context.Operation;
+        var request = string.Equals(context.Settings.ExtractionCodeMode, "Random", StringComparison.Ordinal)
+            ? new PermanentShareRequest(context.ExactRemoteItems)
+            : new PermanentShareRequest(context.ExactRemoteItems, context.Settings.FixedExtractionCode);
+        var automationContext = new ShareOperationAutomationContext(
+            operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
+            WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems).Validate();
+        BaiduAdapterResult<ShareCreationReceipt> confirmation;
+        try
+        {
+            confirmation = await operationBound.ConfirmExactShareForOperationAsync(
+                automationContext, session, request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch
+        {
+            return await KeepPendingAsync(context, ShareReconciliationIssue.ListingUnavailable,
+                ShareReconciliationDisposition.ResultPending, "分享结果待确认", CancellationToken.None).ConfigureAwait(false);
+        }
+
+        var evaluated = submissionEngine.EvaluateConfirmation(request, confirmation);
+        if (evaluated.Disposition != ShareSubmissionDisposition.Accepted)
+        {
+            if (evaluated.Disposition == ShareSubmissionDisposition.DefinitelyNotAccepted)
+                return await FailDefinitelyNotAcceptedAsync(context, cancellationToken).ConfigureAwait(false);
+            if (evaluated.ErrorKind == BaiduErrorKind.ExpiredLogin)
+                return await KeepPendingAsync(context, ShareReconciliationIssue.AccountSessionUnavailable,
+                    ShareReconciliationDisposition.RequiresUser, "等待账号登录", cancellationToken,
+                    session.CapturedAtUtc).ConfigureAwait(false);
+            if (evaluated.ErrorKind == BaiduErrorKind.VerificationRequired)
+                return await KeepPendingAsync(context, ShareReconciliationIssue.AccountVerificationRequired,
+                    ShareReconciliationDisposition.RequiresUser, "账号需要安全验证", cancellationToken,
+                    session.CapturedAtUtc).ConfigureAwait(false);
+            return await KeepPendingAsync(context, ShareReconciliationIssue.ListingUnavailable,
+                ShareReconciliationDisposition.ResultPending, "分享结果待确认", cancellationToken).ConfigureAwait(false);
+        }
+        return await AcceptReceiptAsync(context, evaluated.Receipt!, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<ShareReconciliationResult> AcceptReceiptAsync(
+        ShareExecutionContext context,
+        ShareCreationReceipt receipt,
+        CancellationToken cancellationToken)
+    {
+        var operation = context.Operation;
+        var now = timeProvider.GetUtcNow();
+        var result = new BaiduShareResultRecord(
+            Guid.NewGuid(), operation.Id, operation.BatchJobId, operation.ResourceItemId, operation.AccountId,
+            operation.ExactItemSetFingerprint, operation.SettingsFingerprint, operation.Generation,
+            receipt.ShareId, receipt.ShareUrl, receipt.ExtractionCode!, true, true, receipt.SubmittedAtUtc, now);
+        var accepted = await store.TryAcceptAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration, Snapshot(operation), result, now,
+            cancellationToken).ConfigureAwait(false);
+        return accepted
+            ? new(ShareReconciliationDisposition.Accepted, "分享成功")
+            : new(ShareReconciliationDisposition.Stale, "任务状态已变化");
     }
 
     private async Task<HashSet<string>> LoadBaselineAsync(Guid operationId, CancellationToken cancellationToken)
@@ -233,6 +319,23 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
             now.Add(options.RetryDelay), now, cancellationToken).ConfigureAwait(false);
         return changed
             ? new(disposition, stableStatus)
+            : new(ShareReconciliationDisposition.Stale, "任务状态已变化");
+    }
+
+    private async Task<ShareReconciliationResult> FailDefinitelyNotAcceptedAsync(
+        ShareExecutionContext context,
+        CancellationToken cancellationToken)
+    {
+        var operation = context.Operation;
+        var now = timeProvider.GetUtcNow();
+        var changed = await store.TryFailDefinitelyNotAcceptedAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration,
+            new(operation.BatchJobId, operation.ResourceItemId, operation.AccountId, operation.OutputOrdinal,
+                operation.ExactItemSetFingerprint, operation.SettingsFingerprint, operation.AttemptCount,
+                operation.UpdatedAt, operation.NextReconcileAt),
+            now, cancellationToken).ConfigureAwait(false);
+        return changed
+            ? new(ShareReconciliationDisposition.DefinitelyNotAccepted, "分享未被接受，可安全重试")
             : new(ShareReconciliationDisposition.Stale, "任务状态已变化");
     }
 

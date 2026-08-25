@@ -174,6 +174,7 @@ public sealed class JobResultActions(
     private static JobResultActionDisposition Map(ShareReconciliationDisposition disposition) => disposition switch
     {
         ShareReconciliationDisposition.Accepted => JobResultActionDisposition.ConfirmedPresent,
+        ShareReconciliationDisposition.DefinitelyNotAccepted => JobResultActionDisposition.ConfirmedAbsent,
         ShareReconciliationDisposition.ResultPending => JobResultActionDisposition.ResultPending,
         ShareReconciliationDisposition.Ambiguous => JobResultActionDisposition.Ambiguous,
         ShareReconciliationDisposition.RequiresUser => JobResultActionDisposition.RequiresUser,

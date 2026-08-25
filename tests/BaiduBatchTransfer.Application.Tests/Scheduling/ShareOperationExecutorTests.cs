@@ -10,6 +10,56 @@ public sealed class ShareOperationExecutorTests
     private static readonly Guid AccountId = Guid.Parse("10000000-0000-0000-0000-000000000001");
 
     [Fact]
+    public async Task OperationBoundTransferSharePreparesBeforeBusinessBoundaryAndUsesOneGroupedSubmit()
+    {
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-1", "folder"),
+            new RemoteItemIdentity("remote-2", "app.apk")]);
+        var settings = RandomSettings();
+        var operation = new ShareOperationRecord(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), AccountId, 1,
+            "Reserved", exact.Fingerprint, settings.SettingsFingerprint, 1, null, null, "Unknown", 0,
+            Now.AddMinutes(2), null, null, null, null, Now, Now, 7);
+        settings = settings with { BatchJobId = operation.BatchJobId };
+        var store = new RecordingStore(new ShareExecutionContext(
+            operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
+        var adapter = new OperationBoundRecordingAdapter(exact);
+        var executor = new ShareOperationExecutor(
+            adapter, new MemorySessionStore(), store, RetryPolicy.Default,
+            new RecordingDelay(), new FrozenTimeProvider(Now));
+
+        var result = await executor.ExecuteAsync(Lease(operation));
+
+        Assert.Equal(ShareExecutionDisposition.Succeeded, result.Disposition);
+        Assert.Equal(["prepare", "submit"], adapter.Calls);
+        Assert.Equal(2, Assert.Single(adapter.Requests).RemoteItems.Count);
+    }
+
+    [Fact]
+    public async Task OperationBoundPrepareFailureBeforeBusinessBoundaryFailsSafelyWithoutSubmit()
+    {
+        var exact = ExactItems();
+        var settings = RandomSettings();
+        var operation = new ShareOperationRecord(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), AccountId, 1,
+            "Reserved", exact.Fingerprint, settings.SettingsFingerprint, 1, null, null, "Unknown", 0,
+            Now.AddMinutes(2), null, null, null, null, Now, Now, 7);
+        settings = settings with { BatchJobId = operation.BatchJobId };
+        var store = new RecordingStore(new ShareExecutionContext(
+            operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
+        var adapter = new OperationBoundRecordingAdapter(exact, prepareFails: true);
+        var executor = new ShareOperationExecutor(
+            adapter, new MemorySessionStore(), store, RetryPolicy.Default,
+            new RecordingDelay(), new FrozenTimeProvider(Now));
+
+        var result = await executor.ExecuteAsync(Lease(operation));
+
+        Assert.Equal(ShareExecutionDisposition.Failed, result.Disposition);
+        Assert.Equal(["prepare"], adapter.Calls);
+        Assert.False(store.ResultPending);
+    }
+
+    [Fact]
     public async Task RandomAndFixedModesAlwaysRequestPermanentUnlimitedShares()
     {
         var random = Harness(RandomSettings());
@@ -552,6 +602,36 @@ public sealed class ShareOperationExecutorTests
             ListRequests.Add(cursor);
             return Task.FromResult(BaiduAdapterResult<BaiduSharePage>.Success(new(existing, null)));
         }
+    }
+
+    private sealed class OperationBoundRecordingAdapter(
+        RemoteItemIdentitySet exact,
+        bool prepareFails = false) : IOperationBoundBaiduShareAdapter
+    {
+        public List<string> Calls { get; } = [];
+        public List<PermanentShareRequest> Requests { get; } = [];
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<BaiduSharePage>.Success(new([], null)));
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Bound transfer sharing must not use the legacy write method.");
+        public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken)
+        {
+            Assert.Equal(exact.Fingerprint, context.ExactRemoteItems.Fingerprint);
+            Calls.Add("prepare");
+            if (prepareFails)
+                return Task.FromResult(BaiduAdapterResult<SharePreparationReceipt>.Failure(
+                    BaiduErrorKind.UnknownResponse, adapterDiagnostic: null,
+                    submissionAcceptance: SubmissionAcceptance.Unknown));
+            return Task.FromResult(BaiduAdapterResult<SharePreparationReceipt>.Success(SharePreparationReceipt.Ready, SubmissionAcceptance.DefinitelyNotAccepted));
+        }
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken)
+        {
+            Calls.Add("submit"); Requests.Add(request);
+            return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(new(
+                Now, "adapter", request, "new-share", "https://pan.baidu.com/s/new-share",
+                new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Random, "r4Nd"))));
+        }
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class MemorySessionStore : IBaiduSessionStore

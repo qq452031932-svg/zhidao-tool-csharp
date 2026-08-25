@@ -100,7 +100,11 @@ public sealed record StandaloneShareOperationRecord
         StandaloneShareSubmissionState submissionState,
         long revision,
         DateTimeOffset createdAt,
-        DateTimeOffset updatedAt)
+        DateTimeOffset updatedAt,
+        ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
+        string? fixedExtractionCode = null,
+        ExistingShareDecision existingShareDecision = ExistingShareDecision.Reuse,
+        int attemptCount = 0)
     {
         if (id == Guid.Empty) throw new ArgumentException("An operation id is required.", nameof(id));
         if (batchId == Guid.Empty) throw new ArgumentException("A batch id is required.", nameof(batchId));
@@ -117,6 +121,17 @@ public sealed record StandaloneShareOperationRecord
         if (!Enum.IsDefined(submissionState)) throw new ArgumentOutOfRangeException(nameof(submissionState));
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         if (updatedAt < createdAt) throw new ArgumentOutOfRangeException(nameof(updatedAt));
+        if (extractionCodeBehavior is not (
+                ShareExtractionCodeBehavior.Random or ShareExtractionCodeBehavior.Fixed))
+            throw new ArgumentOutOfRangeException(nameof(extractionCodeBehavior));
+        if (extractionCodeBehavior == ShareExtractionCodeBehavior.Random && fixedExtractionCode is not null)
+            throw new ArgumentException("Random extraction-code mode cannot contain a fixed code.", nameof(fixedExtractionCode));
+        if (extractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
+            !PermanentShareRequest.IsValidFixedExtractionCode(fixedExtractionCode))
+            throw new ArgumentException("A fixed extraction code must contain exactly four ASCII letters or digits.", nameof(fixedExtractionCode));
+        if (!Enum.IsDefined(existingShareDecision))
+            throw new ArgumentOutOfRangeException(nameof(existingShareDecision));
+        if (attemptCount < 0) throw new ArgumentOutOfRangeException(nameof(attemptCount));
 
         Id = id;
         BatchId = batchId;
@@ -132,6 +147,12 @@ public sealed record StandaloneShareOperationRecord
         Revision = revision;
         CreatedAt = createdAt;
         UpdatedAt = updatedAt;
+        ExtractionCodeBehavior = extractionCodeBehavior;
+        FixedExtractionCode = fixedExtractionCode?.Trim();
+        SettingsFingerprint = ShareSettingsFingerprint.Compute(
+            true, true, extractionCodeBehavior, FixedExtractionCode);
+        ExistingShareDecision = existingShareDecision;
+        AttemptCount = attemptCount;
     }
 
     public Guid Id { get; }
@@ -148,6 +169,11 @@ public sealed record StandaloneShareOperationRecord
     public long Revision { get; }
     public DateTimeOffset CreatedAt { get; }
     public DateTimeOffset UpdatedAt { get; }
+    public ShareExtractionCodeBehavior ExtractionCodeBehavior { get; }
+    public string? FixedExtractionCode { get; }
+    public string SettingsFingerprint { get; }
+    public ExistingShareDecision ExistingShareDecision { get; }
+    public int AttemptCount { get; }
     public SubmissionAcceptance SubmissionAcceptance { get; init; } =
         BaiduBatchTransfer.Core.Domain.SubmissionAcceptance.Unknown;
     public string? BaselineFingerprint { get; init; }
@@ -167,7 +193,10 @@ public sealed record StandaloneShareOperationRecord
         Guid batchId,
         OwnedRemoteSelection selection,
         int sequenceNumber,
-        DateTimeOffset createdAt)
+        DateTimeOffset createdAt,
+        ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
+        string? fixedExtractionCode = null,
+        ExistingShareDecision existingShareDecision = ExistingShareDecision.Reuse)
     {
         ArgumentNullException.ThrowIfNull(selection);
         return new(
@@ -184,11 +213,14 @@ public sealed record StandaloneShareOperationRecord
             StandaloneShareSubmissionState.NotStarted,
             0,
             createdAt,
-            createdAt);
+            createdAt,
+            extractionCodeBehavior,
+            fixedExtractionCode,
+            existingShareDecision);
     }
 
     public override string ToString() =>
-        $"StandaloneShareOperationRecord {{ Id = {Id}, BatchId = {BatchId}, AccountId = {AccountId}, SequenceNumber = {SequenceNumber}, Generation = {Generation}, Status = {Status}, SubmissionState = {SubmissionState}, SubmissionAcceptance = {SubmissionAcceptance}, ExactItems = [REDACTED], Baseline = [REDACTED], Lease = [REDACTED], Error = [REDACTED], DisplayName = [REDACTED], ParentPath = [REDACTED] }}";
+        $"StandaloneShareOperationRecord {{ Id = {Id}, BatchId = {BatchId}, AccountId = {AccountId}, SequenceNumber = {SequenceNumber}, Generation = {Generation}, Status = {Status}, SubmissionState = {SubmissionState}, SubmissionAcceptance = {SubmissionAcceptance}, AttemptCount = {AttemptCount}, ExtractionCodeBehavior = {ExtractionCodeBehavior}, Settings = [REDACTED], ExactItems = [REDACTED], Baseline = [REDACTED], Lease = [REDACTED], Error = [REDACTED], DisplayName = [REDACTED], ParentPath = [REDACTED] }}";
 }
 
 public sealed record StandaloneShareOperationLease(
@@ -335,6 +367,8 @@ public sealed record StandaloneSharePendingBatchEnvelope
                 writer.Write(operation.DisplayName);
                 writer.Write((int)operation.Kind);
                 writer.Write(operation.ParentPath.Value);
+                writer.Write(operation.SettingsFingerprint);
+                writer.Write((int)operation.ExistingShareDecision);
             }
         }
         return Convert.ToHexString(SHA256.HashData(stream.ToArray())).ToLowerInvariant();

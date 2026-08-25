@@ -3,13 +3,6 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Scheduling;
 
-public enum ExistingShareDecision
-{
-    Reuse,
-    Regenerate,
-    Cancel,
-}
-
 public enum SharePauseReason
 {
     AwaitingExistingShareDecision,

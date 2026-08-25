@@ -214,6 +214,8 @@ public sealed record ShareAutomationPreparation(WebAutomationBaseline Baseline)
     }
 }
 
+public sealed record RecoveredShareAcceptance(ShareOfficialAcceptance Acceptance);
+
 public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
 {
     private readonly TimeProvider timeProvider = timeProvider ?? TimeProvider.System;
@@ -303,8 +305,8 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
             if (acceptance.Status != ShareOfficialAcceptanceStatus.Accepted)
                 return ResultPending();
 
-            await session.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
             if (!AcceptanceMatchesRequest(acceptance, request)) return ResultPending();
+            await session.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
 
             var current = await session
                 .ReadCompleteStableOfficialShareListAsync(cancellationToken)
@@ -351,6 +353,40 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
         }
     }
 
+    public async Task<BaiduAdapterResult<RecoveredShareAcceptance>> RecoverWithoutAcceptanceAsync(
+        IShareAutomationSession session,
+        PermanentShareRequest request,
+        WebAutomationBaseline baseline,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(baseline);
+        try
+        {
+            var current = await session.ReadCompleteStableOfficialShareListAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!IsStableComplete(current)) return RecoveryPending();
+            var currentIds = current.Shares.Select(share => share.ShareId).ToHashSet(StringComparer.Ordinal);
+            if (baseline.Items.Any(item => !currentIds.Contains(item.ExactId))) return RecoveryPending();
+            var baselineIds = baseline.Items.Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
+            var added = current.Shares.Where(share => !baselineIds.Contains(share.ShareId)).ToArray();
+            if (added.Length != 1 || !EntryMatchesRequest(added[0], request)) return RecoveryPending();
+            var candidate = added[0];
+            var acceptance = ShareOfficialAcceptance.Accepted(
+                candidate.ShareId,
+                candidate.ShareId,
+                candidate.ShareUrl,
+                candidate.ExactRemoteItems,
+                candidate.EffectiveSettings,
+                current.ObservationFingerprint);
+            return BaiduAdapterResult<RecoveredShareAcceptance>.Success(
+                new RecoveredShareAcceptance(acceptance), SubmissionAcceptance.Unknown);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return RecoveryPending(); }
+    }
+
     private static bool IsStableComplete(ShareOfficialListing listing) =>
         listing is { IsComplete: true, IsStable: true };
 
@@ -368,6 +404,18 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
             return settings.ExtractionCodeBehavior == ShareExtractionCodeBehavior.Random;
         return settings.ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
                string.Equals(settings.ExtractionCode, request.FixedExtractionCode, StringComparison.Ordinal);
+    }
+
+    private static bool EntryMatchesRequest(ShareOfficialListEntry entry, PermanentShareRequest request)
+    {
+        if (entry.ExactRemoteItems != request.RemoteItems ||
+            entry.EffectiveSettings.IsPermanent != true ||
+            entry.EffectiveSettings.IsAccessUnlimited != true)
+            return false;
+        return request.UsesRandomExtractionCode
+            ? entry.EffectiveSettings.ExtractionCodeBehavior == ShareExtractionCodeBehavior.Random
+            : entry.EffectiveSettings.ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed &&
+              string.Equals(entry.EffectiveSettings.ExtractionCode, request.FixedExtractionCode, StringComparison.Ordinal);
     }
 
     private static bool ExactlyMatchesAcceptedShare(
@@ -424,6 +472,12 @@ public sealed class ShareAutomationFlow(TimeProvider? timeProvider = null)
 
     private static BaiduAdapterResult<ShareCreationReceipt> ResultPending() =>
         BaiduAdapterResult<ShareCreationReceipt>.Failure(
+            BaiduErrorKind.UnknownResponse,
+            adapterDiagnostic: null,
+            submissionAcceptance: SubmissionAcceptance.Unknown);
+
+    private static BaiduAdapterResult<RecoveredShareAcceptance> RecoveryPending() =>
+        BaiduAdapterResult<RecoveredShareAcceptance>.Failure(
             BaiduErrorKind.UnknownResponse,
             adapterDiagnostic: null,
             submissionAcceptance: SubmissionAcceptance.Unknown);

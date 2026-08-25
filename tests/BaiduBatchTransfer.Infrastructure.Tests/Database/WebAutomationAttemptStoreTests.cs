@@ -71,6 +71,44 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Assert.DoesNotContain("DisplayName", names);
     }
 
+    [Theory]
+    [InlineData(WebAutomationOwnerKind.TransferShare)]
+    [InlineData(WebAutomationOwnerKind.StandaloneShare)]
+    public async Task ShareOwnersPersistExactAcceptanceBeforeSucceededTransition(
+        WebAutomationOwnerKind ownerKind)
+    {
+        var graph = await CreateAsync();
+        var operationId = ownerKind == WebAutomationOwnerKind.TransferShare
+            ? graph.ShareOperationId
+            : graph.StandaloneOperationId;
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            operationId, graph.AccountId, 1, ownerKind, graph.Now)));
+        Assert.True(await graph.Store.TryPersistBaselineAsync(
+            operationId, graph.AccountId, 1, 0,
+            ExactBaseline("existing-share"), Fingerprint('d'), graph.Now.AddSeconds(1)));
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            operationId, graph.AccountId, 1,
+            WebAutomationAttemptState.BaselinePersisted, 1,
+            WebAutomationAttemptState.Submitting, Fingerprint('e'), false, graph.Now.AddSeconds(2)));
+        Assert.False(await graph.Store.TryAdvanceAsync(
+            operationId, graph.AccountId, 1,
+            WebAutomationAttemptState.ResultPending, 2,
+            WebAutomationAttemptState.Succeeded, null, false, graph.Now.AddSeconds(3)));
+
+        var accepted = new RemoteItemIdentitySet([new("exact-share-target", null)]);
+        Assert.True(await graph.Store.TryPersistOfficialAcceptanceAsync(
+            operationId, graph.AccountId, 1, 2,
+            accepted, Fingerprint('f'), graph.Now.AddSeconds(3)));
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            operationId, graph.AccountId, 1,
+            WebAutomationAttemptState.ResultPending, 3,
+            WebAutomationAttemptState.Succeeded, null, false, graph.Now.AddSeconds(4)));
+
+        var restored = await graph.Store.GetAsync(operationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, restored!.State);
+        Assert.Equal(accepted, restored.AcceptedRemoteItems);
+    }
+
     [Fact]
     public async Task OfficialAcceptancePartialWriteFailureRollsBackWholeExactSetAndStage()
     {

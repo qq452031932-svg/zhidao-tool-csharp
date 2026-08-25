@@ -90,6 +90,27 @@
             <Border Grid.Row="2" Margin="0,14,0,0" Padding="18" Background="White" CornerRadius="10">
                 <StackPanel>
                     <TextBlock Text="2. 选择结果保存位置并开始" FontSize="18" FontWeight="SemiBold" />
+                    <StackPanel Margin="0,12,0,0" Orientation="Horizontal">
+                        <CheckBox VerticalAlignment="Center"
+                                  Content="使用固定提取码"
+                                  IsChecked="{Binding UseFixedExtractionCode}"
+                                  IsEnabled="{Binding CanEditSelection}"
+                                  AutomationProperties.Name="使用固定提取码" />
+                        <TextBox Width="100" Margin="12,0,0,0" Padding="7,5" MaxLength="4"
+                                 Text="{Binding FixedExtractionCode, UpdateSourceTrigger=PropertyChanged}"
+                                 IsEnabled="{Binding UseFixedExtractionCode}"
+                                 AutomationProperties.Name="四位固定提取码" />
+                        <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#52606D"
+                                   Text="不勾选时自动生成随机提取码" />
+                    </StackPanel>
+                    <StackPanel Margin="0,10,0,0" Orientation="Horizontal">
+                        <TextBlock Width="120" VerticalAlignment="Center" Text="已有分享处理" />
+                        <ComboBox MinWidth="230"
+                                  ItemsSource="{Binding ExistingShareDecisionOptions}"
+                                  SelectedItem="{Binding SelectedExistingShareDecision}"
+                                  IsEnabled="{Binding CanEditSelection}"
+                                  AutomationProperties.Name="已有分享处理方式" />
+                    </StackPanel>
                     <Grid Margin="0,12,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
@@ -162,6 +183,17 @@
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
+                            <StackPanel Margin="0,8,0,0" Orientation="Horizontal">
+                                <Button Padding="10,4" Content="上一页"
+                                        Command="{Binding PreviousHistoryPageCommand}"
+                                        AutomationProperties.Name="上一页分享任务" />
+                                <TextBlock Margin="10,0" VerticalAlignment="Center"
+                                           Text="{Binding HistoryPageText}"
+                                           AutomationProperties.Name="分享任务历史页码" />
+                                <Button Padding="10,4" Content="下一页"
+                                        Command="{Binding NextHistoryPageCommand}"
+                                        AutomationProperties.Name="下一页分享任务" />
+                            </StackPanel>
                             <Button Margin="0,8,0,0" Padding="12,5" Content="查看所选任务"
                                     Command="{Binding LoadSelectedBatchCommand}" />
                         </StackPanel>

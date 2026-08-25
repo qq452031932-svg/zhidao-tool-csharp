@@ -42,6 +42,30 @@ public interface IStandaloneShareExecutionStore : IStandaloneShareStore
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
 
+    Task<bool> TryRecordDefinitelyNotAcceptedAttemptAsync(
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        int completedAttemptCount,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryBeginSubmissionRetryAsync(
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        int completedAttemptCount,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default);
+
     Task<bool> TryMarkResultPendingAsync(
         Guid operationId,
         Guid batchId,
@@ -74,6 +98,14 @@ public interface IStandaloneShareExecutionStore : IStandaloneShareStore
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
 
+    Task<bool> TryReuseExistingResultAsync(
+        StandaloneShareResultRecord result,
+        long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default);
+
     Task<StandaloneShareResultRecord?> GetResultAsync(
         Guid operationId,
         int generation,
@@ -89,5 +121,16 @@ public interface IStandaloneShareExecutionStore : IStandaloneShareStore
         Guid leaseOwnerId,
         DateTimeOffset now,
         DateTimeOffset leaseExpiresAt,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryReleaseReconciliationAsync(
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        long expectedLeaseGeneration,
+        Guid expectedLeaseOwnerId,
+        long expectedRevision,
+        DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
 }

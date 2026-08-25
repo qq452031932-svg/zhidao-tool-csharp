@@ -31,8 +31,12 @@ public sealed class AppBootstrapTests : IDisposable
         var transferAdapter = Assert.IsType<CoordinatedBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
         Assert.IsNotAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(transferAdapter);
-        Assert.IsType<CoordinatedBaiduShareAdapter>(
+        var shareAdapter = Assert.IsType<CoordinatedOperationBoundBaiduShareAdapter>(
             host.Services.GetRequiredService<IBaiduShareAdapter>());
+        Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(shareAdapter);
+        Assert.NotNull(host.Services.GetRequiredService<WebViewBaiduShareAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<StandaloneShareCoordinator>());
+        Assert.NotNull(host.Services.GetRequiredService<CreateStandaloneShareBatchService>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduAdapterConcurrencyGate>());

@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -8,6 +9,11 @@ using CommunityToolkit.Mvvm.Input;
 namespace BaiduBatchTransfer.App.Features.Shares;
 
 public sealed record ShareAccountOption(Guid AccountId, string DisplayName)
+{
+    public override string ToString() => DisplayName;
+}
+
+public sealed record ShareExistingDecisionOption(ExistingShareDecision Decision, string DisplayName)
 {
     public override string ToString() => DisplayName;
 }
@@ -43,6 +49,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private readonly IStandaloneShareStore store;
     private readonly IResultSaveDialog resultDialog;
     private readonly TimeProvider timeProvider;
+    private readonly CreateStandaloneShareBatchService? batchService;
     private readonly int historyPageSize;
     private readonly CancellationTokenSource lifetime = new();
     private readonly ObservableCollection<ShareSelectionGroup> selectionGroups = [];
@@ -56,6 +63,11 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     private bool isClosed;
     private long batchSelectionGeneration;
     private long operationSelectionGeneration;
+    private bool useFixedExtractionCode;
+    private string? fixedExtractionCode;
+    private ShareExistingDecisionOption existingShareDecision;
+    private int historyPageNumber = 1;
+    private long historyTotalCount;
 
     public ShareWorkspaceViewModel(
         IReadOnlyList<ShareAccountOption> accounts,
@@ -63,17 +75,26 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         IStandaloneShareStore store,
         IResultSaveDialog resultDialog,
         TimeProvider? timeProvider = null,
-        int historyPageSize = 20)
+        int historyPageSize = 20,
+        CreateStandaloneShareBatchService? batchService = null)
     {
         ArgumentNullException.ThrowIfNull(accounts);
         this.resourcePicker = resourcePicker ?? throw new ArgumentNullException(nameof(resourcePicker));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.resultDialog = resultDialog ?? throw new ArgumentNullException(nameof(resultDialog));
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.batchService = batchService;
         if (historyPageSize is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(historyPageSize));
         this.historyPageSize = historyPageSize;
 
         Accounts = [];
+        ExistingShareDecisionOptions =
+        [
+            new(ExistingShareDecision.Reuse, "复用完全匹配的已有分享"),
+            new(ExistingShareDecision.Regenerate, "重新生成分享"),
+            new(ExistingShareDecision.Cancel, "遇到已有分享则取消"),
+        ];
+        existingShareDecision = ExistingShareDecisionOptions[0];
         SelectionGroups = new ReadOnlyObservableCollection<ShareSelectionGroup>(selectionGroups);
         Batches = [];
         Operations = [];
@@ -92,9 +113,14 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         PauseCommand = new AsyncRelayCommand(PauseAsync, () => CanPause);
         ResumeCommand = new AsyncRelayCommand(ResumeAsync, () => CanResume);
         RetryFailedCommand = new AsyncRelayCommand(RetryFailedAsync, () => CanRetryFailed);
+        PreviousHistoryPageCommand = new AsyncRelayCommand(
+            PreviousHistoryPageAsync, () => CanLoadPreviousHistoryPage);
+        NextHistoryPageCommand = new AsyncRelayCommand(
+            NextHistoryPageAsync, () => CanLoadNextHistoryPage);
     }
 
     public ObservableCollection<ShareAccountOption> Accounts { get; }
+    public IReadOnlyList<ShareExistingDecisionOption> ExistingShareDecisionOptions { get; }
     public ReadOnlyObservableCollection<ShareSelectionGroup> SelectionGroups { get; }
     public ObservableCollection<StandaloneShareBatchRecord> Batches { get; }
     public ObservableCollection<StandaloneShareOperationRecord> Operations { get; }
@@ -124,6 +150,45 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
                 throw new InvalidOperationException("请先确认上一次是否已创建，再修改内容。");
             if (!SetProperty(ref resultDirectory, normalized)) return;
             NotifyCommandState();
+        }
+    }
+
+    public bool UseFixedExtractionCode
+    {
+        get => useFixedExtractionCode;
+        set
+        {
+            if (pendingBatch is not null && useFixedExtractionCode != value)
+                throw new InvalidOperationException("请先确认上一次是否已创建，再修改内容。");
+            if (!SetProperty(ref useFixedExtractionCode, value)) return;
+            NotifyCommandState();
+        }
+    }
+
+    public string? FixedExtractionCode
+    {
+        get => fixedExtractionCode;
+        set
+        {
+            var normalized = string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+            if (pendingBatch is not null && !string.Equals(fixedExtractionCode, normalized, StringComparison.Ordinal))
+                throw new InvalidOperationException("请先确认上一次是否已创建，再修改内容。");
+            if (!SetProperty(ref fixedExtractionCode, normalized)) return;
+            NotifyCommandState();
+        }
+    }
+
+    public ShareExistingDecisionOption SelectedExistingShareDecision
+    {
+        get => existingShareDecision;
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            var canonical = ExistingShareDecisionOptions.SingleOrDefault(item => item.Decision == value.Decision)
+                ?? throw new InvalidOperationException("不支持这个已有分享处理方式。");
+            if (pendingBatch is not null && existingShareDecision.Decision != canonical.Decision)
+                throw new InvalidOperationException("请先确认上一次是否已创建，再修改内容。");
+            SetProperty(ref existingShareDecision, canonical);
         }
     }
 
@@ -177,6 +242,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public bool CanStart => !IsClosed && !IsBusy && (pendingBatch is not null ||
         (ActiveAccount is not null && SelectedResourceCount > 0 &&
          !string.IsNullOrWhiteSpace(ResultDirectory) &&
+         (!UseFixedExtractionCode || PermanentShareRequest.IsValidFixedExtractionCode(FixedExtractionCode)) &&
          SelectionGroups.All(group => Accounts.Any(account => account.AccountId == group.AccountId))));
     public bool CanUseBatchControls => !IsClosed && !IsBusy && SelectedBatch is not null;
     public bool CanPause => CanUseBatchControls &&
@@ -186,6 +252,11 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public bool CanRetryFailed => CanUseBatchControls &&
         SelectedOperation is { CanSafelyRetry: true } operation &&
         operation.BatchId == SelectedBatch!.Id;
+    public int HistoryPageNumber => historyPageNumber;
+    public string HistoryPageText => $"第 {HistoryPageNumber} 页";
+    public bool CanLoadPreviousHistoryPage => CanSelectHistory && HistoryPageNumber > 1;
+    public bool CanLoadNextHistoryPage => CanSelectHistory &&
+        (long)HistoryPageNumber * historyPageSize < historyTotalCount;
 
     public IAsyncRelayCommand PickResourcesCommand { get; }
     public IAsyncRelayCommand ChooseResultDirectoryCommand { get; }
@@ -196,6 +267,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand PauseCommand { get; }
     public IAsyncRelayCommand ResumeCommand { get; }
     public IAsyncRelayCommand RetryFailedCommand { get; }
+    public IAsyncRelayCommand PreviousHistoryPageCommand { get; }
+    public IAsyncRelayCommand NextHistoryPageCommand { get; }
 
     public void ReloadAccounts(IReadOnlyList<ShareAccountOption> accounts)
     {
@@ -307,12 +380,24 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
 
             var now = timeProvider.GetUtcNow();
             var batchId = Guid.NewGuid();
-            var batch = StandaloneShareBatchRecord.Create(batchId, ResultDirectory!, selections.Length, now);
-            var shareOperations = selections
-                .Select((selection, index) => StandaloneShareOperationRecord.Create(
-                    Guid.NewGuid(), batchId, selection, index + 1, now))
-                .ToArray();
-            envelope = StandaloneSharePendingBatchEnvelope.Create(batch, shareOperations);
+            var operationIds = selections.Select(_ => Guid.NewGuid()).ToArray();
+            var behavior = UseFixedExtractionCode
+                ? ShareExtractionCodeBehavior.Fixed
+                : ShareExtractionCodeBehavior.Random;
+            envelope = batchService?.BuildDraft(
+                batchId, operationIds, ResultDirectory!, selections, behavior,
+                UseFixedExtractionCode ? FixedExtractionCode : null, now,
+                SelectedExistingShareDecision.Decision);
+            if (envelope is null)
+            {
+                var batch = StandaloneShareBatchRecord.Create(batchId, ResultDirectory!, selections.Length, now);
+                var shareOperations = selections.Select((selection, index) =>
+                    StandaloneShareOperationRecord.Create(
+                        operationIds[index], batchId, selection, index + 1, now, behavior,
+                        UseFixedExtractionCode ? FixedExtractionCode : null,
+                        SelectedExistingShareDecision.Decision)).ToArray();
+                envelope = StandaloneSharePendingBatchEnvelope.Create(batch, shareOperations);
+            }
             pendingBatch = envelope;
             NotifyPendingBatchState();
         }
@@ -321,10 +406,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         IsBusy = true;
         try
         {
-            var receipt = await store.GetBatchCreationAsync(
-                    envelope.Batch.Id, envelope.DraftFingerprint, operation.Token)
-                .ConfigureAwait(true);
-            if (receipt is null)
+            StandaloneShareBatchCreationReceipt? receipt;
+            if (batchService is not null)
             {
                 var allowedAccountIds = Accounts.Select(account => account.AccountId).ToHashSet();
                 if (envelope.Operations.Any(item => !allowedAccountIds.Contains(item.AccountId)))
@@ -332,9 +415,25 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
                     StatusMessage = "所选账号当前不可用，请先检查账号。";
                     return;
                 }
-                receipt = await store.CreateOrGetBatchAsync(envelope, operation.Token).ConfigureAwait(true);
+                receipt = await batchService.CreateAsync(envelope, operation.Token).ConfigureAwait(true);
             }
-            ApplyCreationReceipt(envelope, receipt);
+            else
+            {
+                receipt = await store.GetBatchCreationAsync(
+                        envelope.Batch.Id, envelope.DraftFingerprint, operation.Token)
+                    .ConfigureAwait(true);
+                if (receipt is null)
+                {
+                    var allowedAccountIds = Accounts.Select(account => account.AccountId).ToHashSet();
+                    if (envelope.Operations.Any(item => !allowedAccountIds.Contains(item.AccountId)))
+                    {
+                        StatusMessage = "所选账号当前不可用，请先检查账号。";
+                        return;
+                    }
+                    receipt = await store.CreateOrGetBatchAsync(envelope, operation.Token).ConfigureAwait(true);
+                }
+            }
+            await ApplyCreationReceiptAsync(envelope, receipt).ConfigureAwait(true);
         }
         catch (OperationCanceledException) when (operation.IsCancellationRequested)
         {
@@ -350,15 +449,29 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         }
     }
 
-    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    public Task InitializeAsync(CancellationToken cancellationToken = default) =>
+        LoadHistoryPageAsync(1, cancellationToken);
+
+    public Task PreviousHistoryPageAsync(CancellationToken cancellationToken = default) =>
+        !CanLoadPreviousHistoryPage
+            ? Task.CompletedTask
+            : LoadHistoryPageAsync(HistoryPageNumber - 1, cancellationToken);
+
+    public Task NextHistoryPageAsync(CancellationToken cancellationToken = default) =>
+        !CanLoadNextHistoryPage
+            ? Task.CompletedTask
+            : LoadHistoryPageAsync(HistoryPageNumber + 1, cancellationToken);
+
+    private async Task LoadHistoryPageAsync(int pageNumber, CancellationToken cancellationToken)
     {
         if (IsClosed || IsBusy) return;
+        if (pageNumber < 1) throw new ArgumentOutOfRangeException(nameof(pageNumber));
         var requestGeneration = Volatile.Read(ref batchSelectionGeneration);
         using var operation = CreateOperation(cancellationToken);
         IsBusy = true;
         try
         {
-            var page = await store.GetBatchesAsync(new PageQuery(1, historyPageSize), operation.Token)
+            var page = await store.GetBatchesAsync(new PageQuery(pageNumber, historyPageSize), operation.Token)
                 .ConfigureAwait(true);
             operation.Token.ThrowIfCancellationRequested();
             if (!IsHistoryRequestCurrent(requestGeneration)) return;
@@ -370,6 +483,10 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             if (!IsHistoryRequestCurrent(requestGeneration)) return;
             Batches.Clear();
             foreach (var batch in page.Items.Take(historyPageSize)) Batches.Add(batch);
+            historyPageNumber = page.PageNumber;
+            historyTotalCount = page.TotalCount;
+            OnPropertyChanged(nameof(HistoryPageNumber));
+            OnPropertyChanged(nameof(HistoryPageText));
             if (snapshot is not null)
             {
                 UpdateBatchInHistory(snapshot.Batch);
@@ -383,6 +500,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
                 ReplaceOperations([]);
                 StatusMessage = "尚未开始分享。";
             }
+            NotifyCommandState();
         }
         catch (OperationCanceledException) when (operation.IsCancellationRequested) { }
         catch (Exception)
@@ -408,7 +526,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
                 .ConfigureAwait(true);
             if (receipt is not null)
             {
-                ApplyCreationReceipt(envelope, receipt);
+                await ApplyCreationReceiptAsync(envelope, receipt).ConfigureAwait(true);
                 return;
             }
 
@@ -443,7 +561,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             (batch, token) => store.TryResumeBatchAsync(
                 batch.Id, batch.Revision, timeProvider.GetUtcNow(), token),
             "分享任务已继续。",
-            cancellationToken);
+            cancellationToken,
+            notifyExecution: true);
 
     public async Task RetryFailedAsync(CancellationToken cancellationToken = default)
     {
@@ -463,7 +582,22 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
                 operation.Token).ConfigureAwait(true);
             if (!IsOperationRequestCurrent(
                     targetBatchId, failed.Id, batchGeneration, selectedOperationGeneration)) return;
-            if (result.Value is not null) ReplaceOperation(result.Value);
+            if (result.Disposition == StandaloneShareMutationDisposition.Applied)
+            {
+                var snapshot = await store.GetBatchSnapshotAsync(targetBatchId, operation.Token).ConfigureAwait(true);
+                if (!IsOperationRequestCurrent(
+                        targetBatchId, failed.Id, batchGeneration, selectedOperationGeneration)) return;
+                if (snapshot is null)
+                {
+                    StatusMessage = "记录已变化，请刷新后再试。";
+                    return;
+                }
+                UpdateBatchInHistory(snapshot.Batch);
+                SelectedBatch = snapshot.Batch;
+                ReplaceOperations(snapshot.Operations);
+                batchService?.NotifyExistingBatch(targetBatchId);
+            }
+            else if (result.Value is not null) ReplaceOperation(result.Value);
             StatusMessage = result.Disposition switch
             {
                 StandaloneShareMutationDisposition.Applied => "失败项已安全重新排队。",
@@ -537,7 +671,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         Func<StandaloneShareBatchRecord, CancellationToken,
             Task<StandaloneShareMutationResult<StandaloneShareBatchRecord>>> change,
         string successMessage,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool notifyExecution = false)
     {
         if (SelectedBatch is not { } batch) return;
         var requestGeneration = Volatile.Read(ref batchSelectionGeneration);
@@ -548,6 +683,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             var result = await change(batch, operation.Token).ConfigureAwait(true);
             if (!IsBatchRequestCurrent(batch.Id, requestGeneration)) return;
             if (result.Value is not null) InsertOrReplaceBatch(result.Value, insertAtFront: false);
+            if (notifyExecution && result.Disposition == StandaloneShareMutationDisposition.Applied)
+                batchService?.NotifyExistingBatch(batch.Id);
             StatusMessage = result.Disposition switch
             {
                 StandaloneShareMutationDisposition.Applied => successMessage,
@@ -672,7 +809,7 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         NotifyCommandState();
     }
 
-    private void ApplyCreationReceipt(
+    private async Task ApplyCreationReceiptAsync(
         StandaloneSharePendingBatchEnvelope expected,
         StandaloneShareBatchCreationReceipt receipt)
     {
@@ -682,9 +819,20 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
             throw new InvalidOperationException("The batch creation receipt does not match the pending draft.");
         }
 
+        var page = await store.GetBatchesAsync(
+            new PageQuery(1, historyPageSize), CancellationToken.None).ConfigureAwait(true);
+        var authoritativeBatch = page.Items.FirstOrDefault(item => item.Id == receipt.Batch.Id)
+            ?? throw new InvalidOperationException("The created batch is missing from the newest history page.");
+
         pendingBatch = null;
         selectionGroups.Clear();
-        InsertOrReplaceBatch(receipt.Batch, insertAtFront: true);
+        Batches.Clear();
+        foreach (var batch in page.Items.Take(historyPageSize)) Batches.Add(batch);
+        historyPageNumber = page.PageNumber;
+        historyTotalCount = page.TotalCount;
+        OnPropertyChanged(nameof(HistoryPageNumber));
+        OnPropertyChanged(nameof(HistoryPageText));
+        SelectedBatch = authoritativeBatch;
         ReplaceOperations(receipt.Operations);
         StatusMessage = "分享任务已加入队列。";
         NotifySelectionState();
@@ -702,6 +850,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanResume));
         OnPropertyChanged(nameof(CanRetryFailed));
+        OnPropertyChanged(nameof(CanLoadPreviousHistoryPage));
+        OnPropertyChanged(nameof(CanLoadNextHistoryPage));
         PickResourcesCommand?.NotifyCanExecuteChanged();
         ChooseResultDirectoryCommand?.NotifyCanExecuteChanged();
         StartCommand?.NotifyCanExecuteChanged();
@@ -711,6 +861,8 @@ public sealed class ShareWorkspaceViewModel : ObservableObject, IDisposable
         PauseCommand?.NotifyCanExecuteChanged();
         ResumeCommand?.NotifyCanExecuteChanged();
         RetryFailedCommand?.NotifyCanExecuteChanged();
+        PreviousHistoryPageCommand?.NotifyCanExecuteChanged();
+        NextHistoryPageCommand?.NotifyCanExecuteChanged();
     }
 }
 

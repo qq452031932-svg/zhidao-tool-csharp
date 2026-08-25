@@ -150,6 +150,48 @@ public sealed class ShareWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task Start_PersistsFixedExtractionCodeSettingsForEveryIndependentOperation()
+    {
+        var store = new FakeStore();
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.Add(Selection(AccountA, "a-2"));
+        vm.ResultDirectory = @"C:\分享结果";
+        vm.UseFixedExtractionCode = true;
+        vm.FixedExtractionCode = "A1b2";
+
+        await vm.StartAsync();
+
+        var created = Assert.Single(store.Created);
+        Assert.All(created.Operations, operation =>
+        {
+            Assert.Equal(ShareExtractionCodeBehavior.Fixed, operation.ExtractionCodeBehavior);
+            Assert.Equal("A1b2", operation.FixedExtractionCode);
+        });
+    }
+
+    [Theory]
+    [InlineData(ExistingShareDecision.Reuse)]
+    [InlineData(ExistingShareDecision.Regenerate)]
+    [InlineData(ExistingShareDecision.Cancel)]
+    public async Task Start_PersistsSelectedExistingShareDecisionForEveryOperation(
+        ExistingShareDecision decision)
+    {
+        var store = new FakeStore();
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.Add(Selection(AccountA, "a-2"));
+        vm.ResultDirectory = @"C:\分享结果";
+        vm.SelectedExistingShareDecision = Assert.Single(
+            vm.ExistingShareDecisionOptions, option => option.Decision == decision);
+
+        await vm.StartAsync();
+
+        Assert.All(Assert.Single(store.Created).Operations,
+            operation => Assert.Equal(decision, operation.ExistingShareDecision));
+    }
+
+    [Fact]
     public async Task Initialize_LoadsBoundedHistoryAndCurrentOperations()
     {
         var store = new FakeStore();
@@ -165,6 +207,88 @@ public sealed class ShareWorkspaceViewModelTests
         Assert.DoesNotContain(vm.Batches, item => item.Id == oldest.Id);
         Assert.Equal(newest.Id, vm.SelectedBatch?.Id);
         Assert.All(vm.Operations, item => Assert.Equal(newest.Id, item.BatchId));
+    }
+
+    [Fact]
+    public async Task HistoryPaginationLoadsDatabasePagesAndDisablesCommandsAtBoundaries()
+    {
+        var store = new FakeStore();
+        for (var minutes = 5; minutes >= 1; minutes--)
+            store.SeedBatch(StandaloneShareBatchStatus.Completed, createdMinutesAgo: minutes);
+        var vm = Fixture(store: store, historyPageSize: 2);
+
+        await vm.InitializeAsync();
+        Assert.Equal(1, vm.HistoryPageNumber);
+        Assert.False(vm.CanLoadPreviousHistoryPage);
+        Assert.True(vm.CanLoadNextHistoryPage);
+
+        await vm.NextHistoryPageCommand.ExecuteAsync(null);
+        Assert.Equal(2, vm.HistoryPageNumber);
+        Assert.Equal("第 2 页", vm.HistoryPageText);
+        Assert.True(vm.CanLoadPreviousHistoryPage);
+        Assert.True(vm.CanLoadNextHistoryPage);
+        Assert.Equal(2, vm.Batches.Count);
+
+        await vm.NextHistoryPageCommand.ExecuteAsync(null);
+        Assert.Equal(3, vm.HistoryPageNumber);
+        Assert.False(vm.CanLoadNextHistoryPage);
+        Assert.Single(vm.Batches);
+
+        await vm.PreviousHistoryPageCommand.ExecuteAsync(null);
+        Assert.Equal(2, vm.HistoryPageNumber);
+        Assert.Equal([1, 2, 3, 2], store.HistoryQueries.Select(query => query.PageNumber));
+    }
+
+    [Fact]
+    public async Task HistoryPageSurvivesBatchSwitchAndRetryWhileExplicitRefreshReturnsToNewestPage()
+    {
+        var store = new FakeStore();
+        for (var minutes = 5; minutes >= 1; minutes--)
+            store.SeedBatch(StandaloneShareBatchStatus.CompletedWithFailures, createdMinutesAgo: minutes);
+        var vm = Fixture(store: store, historyPageSize: 2);
+        await vm.InitializeAsync();
+        await vm.NextHistoryPageAsync();
+        Assert.Equal(2, vm.HistoryPageNumber);
+
+        var pageBatch = vm.Batches[1];
+        vm.SelectedBatch = pageBatch;
+        await vm.LoadSelectedBatchAsync();
+        Assert.Equal(2, vm.HistoryPageNumber);
+        var safe = store.ReplaceOnlyOperation(pageBatch.Id, operation => RebuildOperation(
+            operation,
+            StandaloneShareOperationStatus.Failed,
+            StandaloneShareSubmissionState.DefinitelyNotAccepted));
+        vm.SelectedOperation = safe;
+
+        await vm.RetryFailedAsync();
+
+        Assert.Equal(2, vm.HistoryPageNumber);
+        Assert.Equal(pageBatch.Id, vm.SelectedBatch!.Id);
+        await vm.InitializeAsync();
+        Assert.Equal(1, vm.HistoryPageNumber);
+        Assert.Equal([1, 2, 1], store.HistoryQueries.Select(query => query.PageNumber));
+    }
+
+    [Fact]
+    public async Task CreatingFromAnOlderHistoryPageReloadsTheAuthoritativeNewestDatabasePage()
+    {
+        var store = new FakeStore();
+        for (var minutes = 4; minutes >= 1; minutes--)
+            store.SeedBatch(StandaloneShareBatchStatus.Completed, createdMinutesAgo: minutes);
+        var vm = Fixture(store: store, activeAccount: AccountA, historyPageSize: 2);
+        await vm.InitializeAsync();
+        await vm.NextHistoryPageAsync();
+        Assert.Equal(2, vm.HistoryPageNumber);
+        vm.Add(Selection(AccountA, "new-share"));
+        vm.ResultDirectory = @"C:\分享结果";
+
+        await vm.StartAsync();
+
+        var created = Assert.Single(store.Created).Batch;
+        Assert.Equal(1, vm.HistoryPageNumber);
+        Assert.Equal(created.Id, vm.SelectedBatch!.Id);
+        Assert.Equal(created.Id, vm.Batches[0].Id);
+        Assert.Equal([1, 2, 1], store.HistoryQueries.Select(query => query.PageNumber));
     }
 
     [Fact]
@@ -188,7 +312,7 @@ public sealed class ShareWorkspaceViewModelTests
     public async Task Retry_IsEnabledOnlyForStoreProjectedSafeFailureAndUsesGenerationFence()
     {
         var store = new FakeStore();
-        var batch = store.SeedBatch(StandaloneShareBatchStatus.Active);
+        var batch = store.SeedBatch(StandaloneShareBatchStatus.CompletedWithFailures);
         var safe = store.ReplaceOnlyOperation(batch.Id, operation => RebuildOperation(
             operation,
             StandaloneShareOperationStatus.Failed,
@@ -204,6 +328,8 @@ public sealed class ShareWorkspaceViewModelTests
         Assert.Equal((safe.Id, safe.Generation, safe.Revision), call);
         Assert.Equal(StandaloneShareOperationStatus.Queued, vm.SelectedOperation?.Status);
         Assert.Equal(safe.Generation + 1, vm.SelectedOperation?.Generation);
+        Assert.Equal(StandaloneShareBatchStatus.Queued, vm.SelectedBatch?.Status);
+        Assert.True(vm.CanPause);
     }
 
     [Fact]
@@ -728,6 +854,7 @@ public sealed class ShareWorkspaceViewModelTests
         public List<(Guid BatchId, long Revision)> PauseCalls { get; } = [];
         public List<(Guid BatchId, long Revision)> ResumeCalls { get; } = [];
         public List<(Guid OperationId, int Generation, long Revision)> RetryCalls { get; } = [];
+        public List<PageQuery> HistoryQueries { get; } = [];
 
         public Task<StandaloneShareBatchCreationReceipt> CreateOrGetBatchAsync(
             StandaloneSharePendingBatchEnvelope envelope,
@@ -782,6 +909,7 @@ public sealed class ShareWorkspaceViewModelTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             query.Validate();
+            HistoryQueries.Add(query);
             var ordered = batches.OrderByDescending(item => item.CreatedAt).ToArray();
             if (BeforeGetBatches is not null)
             {
@@ -894,6 +1022,14 @@ public sealed class ShareWorkspaceViewModelTests
                 pair.item.Generation + 1,
                 pair.item.Revision + 1);
             operations[pair.Key][pair.index] = updated;
+            var batchIndex = batches.FindIndex(item => item.Id == pair.Key);
+            if (batchIndex >= 0 && batches[batchIndex].Status == StandaloneShareBatchStatus.CompletedWithFailures)
+            {
+                var batch = batches[batchIndex];
+                batches[batchIndex] = new StandaloneShareBatchRecord(
+                    batch.Id, batch.ResultDirectoryReference, StandaloneShareBatchStatus.Queued,
+                    batch.OperationCount, batch.Revision + 1, batch.CreatedAt, updatedAt);
+            }
             return new StandaloneShareMutationResult<StandaloneShareOperationRecord>(
                 StandaloneShareMutationDisposition.Applied, updated);
         }

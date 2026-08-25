@@ -15,6 +15,11 @@ public interface IShareAutomationAcceptanceEvidenceStore
     Task<ShareOfficialAcceptance?> GetAsync(
         ShareOperationAutomationContext context,
         CancellationToken cancellationToken = default);
+
+    Task<bool> TryPersistRecoveredAsync(
+        ShareOperationAutomationContext context,
+        ShareOfficialAcceptance acceptance,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
@@ -187,6 +192,9 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
 
         var attempt = await LoadAttemptAsync(context, cancellationToken).ConfigureAwait(false);
         var stage = EffectiveRecoverableStage(attempt, context);
+        if (stage == WebAutomationAttemptState.Submitting)
+            return await RecoverWithoutAcceptanceAsync(
+                context, session, request, attempt!, cancellationToken).ConfigureAwait(false);
         if (stage == WebAutomationAttemptState.BaselinePersisted)
         {
             var absent = Unknown<ShareCreationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
@@ -219,6 +227,46 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
                     acceptedEvidence!,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
+            });
+        try
+        {
+            var result = await broker.EnqueueAsync(automationRequest, cancellationToken).ConfigureAwait(false);
+            return result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
+                ? result.Value
+                : Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+        }
+        catch (WebAutomationAuthorizationException)
+        {
+            return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+        }
+    }
+
+    private async Task<BaiduAdapterResult<ShareCreationReceipt>> RecoverWithoutAcceptanceAsync(
+        ShareOperationAutomationContext context,
+        AccountSession session,
+        PermanentShareRequest request,
+        WebAutomationAttemptRecord attempt,
+        CancellationToken cancellationToken)
+    {
+        var automationRequest = Request(
+            context,
+            async (visibleSession, visibleContext, token) =>
+            {
+                if (visibleSession is not IShareAutomationSession automationSession)
+                    return NotValidated<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                var recovered = await flow.RecoverWithoutAcceptanceAsync(
+                    automationSession, request, attempt.Baseline!, token).ConfigureAwait(false);
+                if (!recovered.IsSuccess) return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                var acceptance = recovered.Value!.Acceptance;
+                if (!await acceptanceStore!.TryPersistRecoveredAsync(context, acceptance, token).ConfigureAwait(false))
+                    return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                var persistedAcceptance = await acceptanceStore.GetAsync(context, token).ConfigureAwait(false);
+                if (persistedAcceptance is null)
+                    return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+                visibleContext.TrackPersistentStage(
+                    WebAutomationAttemptState.ResultPending, persistedAcceptance.ObservationFingerprint);
+                return await MarkSucceededAfterExactAsync(
+                    Receipt(request, persistedAcceptance), visibleContext, token).ConfigureAwait(false);
             });
         try
         {
@@ -317,6 +365,8 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             WebAutomationAttemptState.Preparing
                 when attempt.Baseline is null && attempt.AcceptedRemoteItems is null => stage,
             WebAutomationAttemptState.BaselinePersisted
+                when attempt.Baseline is not null && attempt.AcceptedRemoteItems is null => stage,
+            WebAutomationAttemptState.Submitting
                 when attempt.Baseline is not null && attempt.AcceptedRemoteItems is null => stage,
             WebAutomationAttemptState.ResultPending
                 when attempt.Baseline is not null && attempt.AcceptedRemoteItems == context.ExactRemoteItems => stage,

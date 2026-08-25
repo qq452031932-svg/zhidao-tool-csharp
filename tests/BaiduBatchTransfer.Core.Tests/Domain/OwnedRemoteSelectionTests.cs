@@ -107,9 +107,37 @@ public sealed class OwnedRemoteSelectionTests
         Assert.Equal(1, operation.Generation);
         Assert.Equal(StandaloneShareOperationStatus.Queued, operation.Status);
         Assert.Equal(StandaloneShareSubmissionState.NotStarted, operation.SubmissionState);
+        Assert.Equal(ShareExtractionCodeBehavior.Random, operation.ExtractionCodeBehavior);
+        Assert.Null(operation.FixedExtractionCode);
+        Assert.Equal(
+            ShareSettingsFingerprint.Compute(true, true, ShareExtractionCodeBehavior.Random, null),
+            operation.SettingsFingerprint);
         Assert.DoesNotContain(
             typeof(StandaloneShareOperationRecord).GetProperties(),
             property => property.Name == "TransferOperationId");
+    }
+
+    [Fact]
+    public void StandaloneOperation_FixedExtractionSettingsAreDurableAndPartOfDraftIdentity()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var batchId = Guid.NewGuid();
+        var batch = StandaloneShareBatchRecord.Create(
+            batchId, Path.Combine(Path.GetTempPath(), $"results-{batchId:N}"), 1, now);
+        var random = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), batchId, Selection(AccountId, "remote-settings"), 1, now);
+        var fixedCode = StandaloneShareOperationRecord.Create(
+            random.Id, batchId, Selection(AccountId, "remote-settings"), 1, now,
+            ShareExtractionCodeBehavior.Fixed, "A1b2");
+
+        Assert.Equal(ShareExtractionCodeBehavior.Fixed, fixedCode.ExtractionCodeBehavior);
+        Assert.Equal("A1b2", fixedCode.FixedExtractionCode);
+        Assert.Equal(
+            ShareSettingsFingerprint.Compute(true, true, ShareExtractionCodeBehavior.Fixed, "A1b2"),
+            fixedCode.SettingsFingerprint);
+        Assert.NotEqual(
+            StandaloneSharePendingBatchEnvelope.Create(batch, [random]).DraftFingerprint,
+            StandaloneSharePendingBatchEnvelope.Create(batch, [fixedCode]).DraftFingerprint);
     }
 
     [Fact]

@@ -21,6 +21,62 @@ public sealed class ShareReconciliationTests
     }
 
     [Fact]
+    public async Task OperationBoundRecoveryUsesExactConfirmAndNeverFallsBackToLegacyListing()
+    {
+        var exact = new RemoteItemIdentitySet([new("remote-1", "display")]);
+        var operation = new ShareOperationRecord(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+            "ResultPending", exact.Fingerprint,
+            ShareSettingsFingerprint.Compute(true, true, ShareExtractionCodeBehavior.Random, null),
+            1, "{}", "request", "Unknown", 1, null, Now.AddMinutes(-1), Now,
+            null, null, Now.AddMinutes(-2), Now, 4);
+        var settings = new BatchShareSettingsRecord(
+            operation.BatchJobId, true, true, "Random", null, "Regenerate", Now,
+            operation.SettingsFingerprint);
+        var store = new RecordingStore(new(operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
+        var adapter = new BoundReconciliationAdapter();
+        var service = new ShareOperationReconciliationService(
+            adapter, new MemorySessionStore(operation.AccountId), store, new RecordingDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FrozenTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.Accepted, result.Disposition);
+        Assert.Equal(1, adapter.ConfirmCalls);
+        Assert.Equal(0, adapter.ListCalls);
+    }
+
+    [Fact]
+    public async Task OperationBoundExplicitRejectionFailsSafelyInsteadOfRemainingPending()
+    {
+        var exact = new RemoteItemIdentitySet([new("remote-1", "display")]);
+        var operation = new ShareOperationRecord(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+            "ResultPending", exact.Fingerprint,
+            ShareSettingsFingerprint.Compute(true, true, ShareExtractionCodeBehavior.Random, null),
+            3, "{}", "request", "Unknown", 2, null, Now.AddMinutes(-1), Now,
+            null, null, Now.AddMinutes(-2), Now, 7);
+        var settings = new BatchShareSettingsRecord(
+            operation.BatchJobId, true, true, "Random", null, "Regenerate", Now,
+            operation.SettingsFingerprint);
+        var store = new RecordingStore(new(operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
+        var adapter = new BoundReconciliationAdapter(SubmissionAcceptance.DefinitelyNotAccepted);
+        var service = new ShareOperationReconciliationService(
+            adapter, new MemorySessionStore(operation.AccountId), store, new RecordingDelay(),
+            new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
+            new FrozenTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.DefinitelyNotAccepted, result.Disposition);
+        Assert.True(store.FailedDefinitelyNotAccepted);
+        Assert.Null(store.PendingIssue);
+        Assert.Equal(1, adapter.ConfirmCalls);
+        Assert.Equal(0, adapter.ListCalls);
+    }
+
+    [Fact]
     public async Task ZeroMatchesAtBoundedTimeoutRemainsPendingWithoutCreate()
     {
         var harness = Harness([Page(Old()), Page(Old())], maximumPolls: 2);
@@ -180,6 +236,7 @@ public sealed class ShareReconciliationTests
         public List<ShareDiscoveryBaselineRecord> Baseline { get; } = [];
         public BaiduShareResultRecord? Accepted { get; private set; }
         public ShareReconciliationIssue? PendingIssue { get; private set; }
+        public bool FailedDefinitelyNotAccepted { get; private set; }
 
         public Task<ShareExecutionContext?> LoadPendingAsync(Guid operationId, CancellationToken cancellationToken = default) =>
             Task.FromResult<ShareExecutionContext?>(context);
@@ -205,6 +262,12 @@ public sealed class ShareReconciliationTests
             PendingIssue = issue;
             return Task.FromResult(true);
         }
+
+        public Task<bool> TryFailDefinitelyNotAcceptedAsync(Guid operationId, int generation, long leaseGeneration, ShareReconciliationFailureSnapshot expected, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            FailedDefinitelyNotAccepted = true;
+            return Task.FromResult(true);
+        }
     }
 
     private sealed class RecordingAdapter(
@@ -227,6 +290,29 @@ public sealed class ShareReconciliationTests
         {
             CreateCalls++;
             throw new InvalidOperationException("Reconciliation must not create a share.");
+        }
+    }
+
+    private sealed class BoundReconciliationAdapter(
+        SubmissionAcceptance acceptance = SubmissionAcceptance.Unknown) : IOperationBoundBaiduShareAdapter
+    {
+        public int ConfirmCalls { get; private set; }
+        public int ListCalls { get; private set; }
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken)
+        { ListCalls++; throw new InvalidOperationException("Bound recovery must not use legacy listing."); }
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken)
+        {
+            ConfirmCalls++;
+            if (acceptance == SubmissionAcceptance.DefinitelyNotAccepted)
+                return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Failure(
+                    BaiduErrorKind.UnknownResponse, adapterDiagnostic: null,
+                    submissionAcceptance: acceptance));
+            return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(new(
+                Now, "adapter", request, "new-share", "https://pan.baidu.com/s/new-share",
+                new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Random, "r4nd"))));
         }
     }
 
@@ -300,6 +386,14 @@ public sealed class ShareReconciliationTests
             ShareReconciliationIssue issue,
             DateTimeOffset? observedSessionCapturedAtUtc,
             DateTimeOffset nextReconcileAt,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) => Task.FromResult(true);
+
+        public Task<bool> TryFailDefinitelyNotAcceptedAsync(
+            Guid operationId,
+            int generation,
+            long leaseGeneration,
+            ShareReconciliationFailureSnapshot expected,
             DateTimeOffset updatedAt,
             CancellationToken cancellationToken = default) => Task.FromResult(true);
     }

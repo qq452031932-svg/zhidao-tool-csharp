@@ -1652,6 +1652,59 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         return changed;
     }
 
+    public async Task<bool> TryFailDefinitelyNotAcceptedAsync(
+        Guid operationId,
+        int generation,
+        long leaseGeneration,
+        ShareReconciliationFailureSnapshot expected,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (operationId == Guid.Empty || expected.BatchJobId == Guid.Empty ||
+            expected.ResourceItemId == Guid.Empty || expected.AccountId == Guid.Empty)
+            throw new ArgumentException("An exact share reconciliation identity is required.");
+        if (generation < 0 || leaseGeneration < 0 || expected.OutputOrdinal < 1 || expected.AttemptCount < 1)
+            throw new ArgumentOutOfRangeException(nameof(generation));
+        ArgumentException.ThrowIfNullOrWhiteSpace(expected.ExactItemSetFingerprint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(expected.SettingsFingerprint);
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            await using var command = Command(connection, transaction, """
+                UPDATE ShareOperations SET Status='Failed',SubmissionAcceptance='DefinitelyNotAccepted',
+                  LeaseExpiresAt=NULL,NextReconcileAt=NULL,LastErrorCode='OfficialRejection',
+                  LastErrorMessage='分享未被接受，可安全重试',UpdatedAt=$updated
+                WHERE Id=$id AND Status='ResultPending' AND BatchJobId=$batch AND ResourceItemId=$resource
+                  AND AccountId=$account AND OutputOrdinal=$output AND Generation=$generation
+                  AND LeaseGeneration=$leaseGeneration AND ExactItemSetFingerprint=$items
+                  AND SettingsFingerprint=$settings AND AttemptCount=$attempt
+                  AND SubmissionAcceptance='Unknown' AND RequestDescriptorJson IS NOT NULL
+                  AND SubmitStartedAt IS NOT NULL AND UpdatedAt=$expectedUpdated
+                  AND NextReconcileAt IS $expectedNext
+                  AND EXISTS(SELECT 1 FROM BatchShareSettings settings
+                    WHERE settings.BatchJobId=ShareOperations.BatchJobId
+                      AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint);
+                """);
+            Add(command, "$updated", Time(updatedAt)); Add(command, "$id", Id(operationId));
+            Add(command, "$batch", Id(expected.BatchJobId)); Add(command, "$resource", Id(expected.ResourceItemId));
+            Add(command, "$account", Id(expected.AccountId)); Add(command, "$output", expected.OutputOrdinal);
+            Add(command, "$generation", generation); Add(command, "$leaseGeneration", leaseGeneration);
+            Add(command, "$items", expected.ExactItemSetFingerprint); Add(command, "$settings", expected.SettingsFingerprint);
+            Add(command, "$attempt", expected.AttemptCount); Add(command, "$expectedUpdated", Time(expected.UpdatedAt));
+            Add(command, "$expectedNext", expected.NextReconcileAt is { } next ? Time(next) : null);
+            var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return changed;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     public async Task<ShareLeaseRecoveryResult> RecoverInterruptedShareOperationsAsync(
         DateTimeOffset recoveredAt,
         CancellationToken cancellationToken = default) =>

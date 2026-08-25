@@ -223,6 +223,55 @@ public sealed class WebViewBaiduShareAdapterTests
         Assert.Equal(0, automation.SubmitCount);
     }
 
+    [Fact]
+    public async Task CloseBeforeAcceptanceRecoversUniqueExactAdditionAndPersistsEvidenceWithoutClicking()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare);
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.Submitting,
+            WebAutomationBaseline.Create(["share-existing"])));
+        var evidence = new AcceptanceStore(attempts: attempts);
+        var automation = new ShareSession(Listing(ExistingEntry(), AcceptedEntry()));
+        var adapter = Adapter(accountId, new CallbackBroker(attempts, automation), attempts, evidence);
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(Request().RemoteItems, attempts.Current.AcceptedRemoteItems);
+        Assert.NotNull(await evidence.GetAsync(context, CancellationToken.None));
+        Assert.Equal(["read-list"], automation.Events);
+        Assert.Equal(0, automation.SubmitCount);
+    }
+
+    [Fact]
+    public async Task CloseBeforeAcceptanceWithMultipleNewSharesRemainsUnknownWithoutReconstruction()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.TransferShare);
+        var attempts = new AttemptStore(Attempt(
+            context, WebAutomationAttemptState.Submitting,
+            WebAutomationBaseline.Create(["share-existing"])));
+        var evidence = new AcceptanceStore(attempts: attempts);
+        var automation = new ShareSession(Listing(
+            ExistingEntry(), AcceptedEntry(),
+            new ShareOfficialListEntry(
+                "share-other", "https://pan.baidu.com/s/share-other",
+                new RemoteItemIdentitySet([new("unrelated", "unrelated")]), Settings())));
+        var adapter = Adapter(accountId, new CallbackBroker(attempts, automation), attempts, evidence);
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.Equal(WebAutomationAttemptState.Submitting, attempts.Current.State);
+        Assert.Null(await evidence.GetAsync(context, CancellationToken.None));
+        Assert.Equal(0, automation.SubmitCount);
+    }
+
     [Theory]
     [InlineData(WebAutomationAttemptState.UserHandoff, WebAutomationAttemptState.Submitting)]
     [InlineData(WebAutomationAttemptState.Submitting, null)]
@@ -236,7 +285,7 @@ public sealed class WebViewBaiduShareAdapterTests
             context,
             state,
             WebAutomationBaseline.Create(["share-existing"]),
-            null,
+            Request("wrong-item").RemoteItems,
             resumeStage));
         var broker = new RecordingBroker();
         var adapter = Adapter(accountId, broker, attempts, new AcceptanceStore());
@@ -443,7 +492,9 @@ public sealed class WebViewBaiduShareAdapterTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    private sealed class AcceptanceStore(ShareOfficialAcceptance? initial = null)
+    private sealed class AcceptanceStore(
+        ShareOfficialAcceptance? initial = null,
+        AttemptStore? attempts = null)
         : IShareAutomationAcceptanceEvidenceStore
     {
         private ShareOfficialAcceptance? value = initial;
@@ -461,6 +512,20 @@ public sealed class WebViewBaiduShareAdapterTests
             ShareOperationAutomationContext context,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(value);
+
+        public async Task<bool> TryPersistRecoveredAsync(
+            ShareOperationAutomationContext context,
+            ShareOfficialAcceptance acceptance,
+            CancellationToken cancellationToken = default)
+        {
+            if (attempts is null) return false;
+            var changed = await attempts.TryPersistOfficialAcceptanceAsync(
+                context.OperationId, context.AccountId, context.Generation,
+                attempts.Current.Revision, acceptance.ExactRemoteItems!,
+                acceptance.ObservationFingerprint, Now, cancellationToken);
+            if (changed) value = acceptance;
+            return changed;
+        }
     }
 
     private sealed class AttemptStore(WebAutomationAttemptRecord attempt) : IWebAutomationAttemptStore

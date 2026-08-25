@@ -1143,6 +1143,44 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.Equal(graph.SecondAccountId, work.AccountId);
     }
 
+    [Fact]
+    public async Task ExplicitRejectionReconciliationUsesExactSnapshotAndPreservesSubmissionEvidence()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+        await PrepareResultPendingAsync(store, graph);
+        var context = Assert.IsType<ShareExecutionContext>(await store.LoadPendingAsync(graph.ShareOperationId));
+        var operation = context.Operation;
+        var snapshot = new ShareReconciliationFailureSnapshot(
+            operation.BatchJobId, operation.ResourceItemId, operation.AccountId, operation.OutputOrdinal,
+            operation.ExactItemSetFingerprint, operation.SettingsFingerprint, operation.AttemptCount,
+            operation.UpdatedAt, operation.NextReconcileAt);
+
+        Assert.False(await store.TryFailDefinitelyNotAcceptedAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration,
+            snapshot with { AttemptCount = snapshot.AttemptCount + 1 }, graph.Now.AddMinutes(1)));
+        Assert.False(await store.TryFailDefinitelyNotAcceptedAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration,
+            snapshot with { SettingsFingerprint = "wrong-settings" }, graph.Now.AddMinutes(1)));
+        Assert.True(await store.TryFailDefinitelyNotAcceptedAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration,
+            snapshot, graph.Now.AddMinutes(1)));
+        Assert.False(await store.TryFailDefinitelyNotAcceptedAsync(
+            operation.Id, operation.Generation, operation.LeaseGeneration,
+            snapshot, graph.Now.AddMinutes(2)));
+
+        Assert.Equal("Failed", await ScalarAsync<string>(graph.Factory,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("DefinitelyNotAccepted", await ScalarAsync<string>(graph.Factory,
+            "SELECT SubmissionAcceptance FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("{\"safe\":true}", await ScalarAsync<string>(graph.Factory,
+            "SELECT RequestDescriptorJson FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal("OfficialRejection", await ScalarAsync<string>(graph.Factory,
+            "SELECT LastErrorCode FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+        Assert.Equal(1L, await ScalarAsync<long>(graph.Factory,
+            "SELECT LeaseExpiresAt IS NULL FROM ShareOperations WHERE Id=$id;", graph.ShareOperationId));
+    }
+
     [Theory]
     [InlineData(BaiduErrorKind.ExpiredLogin, "AccountSessionUnavailable", "等待账号登录后继续确认分享结果")]
     [InlineData(BaiduErrorKind.VerificationRequired, "AccountVerificationRequired", "账号完成安全验证后继续确认分享结果")]
@@ -2009,6 +2047,13 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             if (call == 1) firstKeepCompleted.TrySetResult();
             return changed;
         }
+
+        public Task<bool> TryFailDefinitelyNotAcceptedAsync(
+            Guid operationId, int generation, long leaseGeneration,
+            ShareReconciliationFailureSnapshot expected, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) =>
+            inner.TryFailDefinitelyNotAcceptedAsync(
+                operationId, generation, leaseGeneration, expected, updatedAt, cancellationToken);
     }
 
     private sealed class RefreshAccountBeforeKeepStore(
@@ -2062,6 +2107,13 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 operationId, generation, leaseGeneration, expected, issue, observedSessionCapturedAtUtc,
                 nextReconcileAt, updatedAt, cancellationToken);
         }
+
+        public Task<bool> TryFailDefinitelyNotAcceptedAsync(
+            Guid operationId, int generation, long leaseGeneration,
+            ShareReconciliationFailureSnapshot expected, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) =>
+            inner.TryFailDefinitelyNotAcceptedAsync(
+                operationId, generation, leaseGeneration, expected, updatedAt, cancellationToken);
     }
 
     private sealed class AcceptFirstReconciliationStore(SqliteShareSchedulingStore inner) : IShareReconciliationStore
@@ -2104,6 +2156,13 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 operationId, generation, leaseGeneration, expected, issue, observedSessionCapturedAtUtc,
                 nextReconcileAt, updatedAt, cancellationToken);
         }
+
+        public Task<bool> TryFailDefinitelyNotAcceptedAsync(
+            Guid operationId, int generation, long leaseGeneration,
+            ShareReconciliationFailureSnapshot expected, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) =>
+            inner.TryFailDefinitelyNotAcceptedAsync(
+                operationId, generation, leaseGeneration, expected, updatedAt, cancellationToken);
     }
 
     private sealed class RestartReconciliationSessionStore(Guid accountId, DateTimeOffset now) : IBaiduSessionStore

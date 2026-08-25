@@ -103,6 +103,7 @@ public sealed class ShareAutomationFlowTests
         var request = Request("remote-a", "remote-b");
         var session = SuccessfulSession(request);
         var baseline = WebAutomationBaseline.Create(["share-existing"]);
+        // ConfirmExact reads only the post-submit listing; the fake's first read must therefore be current.
         session.BaselineListing = session.CurrentListing;
 
         var result = await Flow().ConfirmExactAsync(
@@ -137,7 +138,45 @@ public sealed class ShareAutomationFlowTests
             session.Acceptance,
             CancellationToken.None);
 
-        AssertPending(result);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.Equal(["read-list"], session.Events);
+        Assert.Equal(0, session.SubmitCount);
+    }
+
+    [Fact]
+    public async Task RecoveryWithoutAcceptanceFindsUniqueExactStableAdditionWithoutClicking()
+    {
+        var request = Request("remote-a", "remote-b");
+        var session = SuccessfulSession(request);
+        var baseline = WebAutomationBaseline.Create(["share-existing"]);
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().RecoverWithoutAcceptanceAsync(
+            session, request, baseline, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("share-new", result.Value!.Acceptance.ShareId);
+        Assert.Equal(request.RemoteItems, result.Value.Acceptance.ExactRemoteItems);
+        Assert.Equal(["read-list"], session.Events);
+        Assert.Equal(0, session.SubmitCount);
+    }
+
+    [Fact]
+    public async Task RecoveryWithoutAcceptanceRejectsMultipleAdditionsWithoutClicking()
+    {
+        var request = Request("remote-a");
+        var session = SuccessfulSession(request);
+        session.CurrentListing = Listing(
+            ExistingEntry(), AcceptedEntry(request),
+            Entry("share-unrelated", Request("remote-x"), "X9y8"));
+        session.BaselineListing = session.CurrentListing;
+
+        var result = await Flow().RecoverWithoutAcceptanceAsync(
+            session, request, WebAutomationBaseline.Create(["share-existing"]), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
         Assert.Equal(["read-list"], session.Events);
         Assert.Equal(0, session.SubmitCount);
     }
@@ -224,6 +263,25 @@ public sealed class ShareAutomationFlowTests
         Assert.False(result.IsSuccess);
         Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
         Assert.Null(session.PersistedAcceptance);
+    }
+
+    [Fact]
+    public async Task AcceptedEvidenceWithMismatchedRequestSettingsIsNotPersisted()
+    {
+        var request = RequestWithFixedCode("A1b2", "remote-a");
+        var session = SuccessfulSession(request, extractionCode: "A1b2") with
+        {
+            Acceptance = ShareOfficialAcceptance.Accepted(
+                "request-1", "share-new", "https://pan.baidu.com/s/share-new", request.RemoteItems,
+                new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Fixed, "Z9y8"),
+                Fingerprint('d')),
+        };
+
+        var result = await Flow().ExecuteAsync(session, request, CancellationToken.None);
+
+        AssertPending(result);
+        Assert.Null(session.PersistedAcceptance);
+        Assert.Equal(1, session.Events.Count(value => value == "read-list"));
     }
 
     [Fact]
