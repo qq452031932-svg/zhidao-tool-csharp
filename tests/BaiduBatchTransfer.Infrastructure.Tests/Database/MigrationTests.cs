@@ -44,6 +44,7 @@ public sealed class MigrationTests : IDisposable
             "StandaloneShareResults", "BatchResultDestinations", "LocalResultExports",
             "WebAutomationAttempts", "WebAutomationAttemptRemoteItems",
             "WebAutomationAttemptAcceptedRemoteItems",
+            "RemoteSelectionSessions",
         });
 
         var attemptColumns = await ColumnsAsync(upgraded, "WebAutomationAttempts");
@@ -88,7 +89,72 @@ public sealed class MigrationTests : IDisposable
 
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.Equal(1L, await ScalarAsync<long>(
-            upgraded, "SELECT COUNT(*) FROM SchemaVersions WHERE Version=11;"));
+            upgraded, "SELECT COUNT(*) FROM SchemaVersions WHERE Version=$version;",
+            ("$version", DatabaseMigrator.LatestVersion)));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
+    }
+
+    [Fact]
+    public async Task VersionElevenUpgradePreservesPopulatedBaselineAndAcceptedItemEvidence()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v11-to-v12.db");
+        var operationId = Guid.NewGuid().ToString("D");
+        var accountId = Guid.NewGuid().ToString("D");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 11; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
+                  BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,
+                  CreatedAt,UpdatedAt,AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
+                VALUES($operation,$account,1,'Transfer','ResultPending',NULL,$observation,
+                  $baseline,1,'2026-08-25T00:00:01Z',0,3,'2026-08-25T00:00:00Z',
+                  '2026-08-25T00:00:03Z',$acceptance,1,'2026-08-25T00:00:02Z');
+                INSERT INTO WebAutomationAttemptRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'baseline-id',X'01');
+                INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'accepted-id',X'02');
+                """,
+                ("$operation", operationId), ("$account", accountId),
+                ("$observation", new string('c', 64)),
+                ("$baseline", new string('a', 64)),
+                ("$acceptance", new string('b', 64)));
+            Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 11)).IsValid);
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "v11-backups")), "new")
+            .MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal("ResultPending", await ScalarAsync<string>(upgraded,
+            "SELECT State FROM WebAutomationAttempts WHERE OperationId=$operation;",
+            ("$operation", operationId)));
+        Assert.Equal(new string('a', 64), await ScalarAsync<string>(upgraded,
+            "SELECT BaselineFingerprint FROM WebAutomationAttempts WHERE OperationId=$operation;",
+            ("$operation", operationId)));
+        Assert.Equal(new string('b', 64), await ScalarAsync<string>(upgraded,
+            "SELECT AcceptanceFingerprint FROM WebAutomationAttempts WHERE OperationId=$operation;",
+            ("$operation", operationId)));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM WebAutomationAttemptRemoteItems WHERE OperationId=$operation AND RemoteItemId='baseline-id';",
+            ("$operation", operationId)));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems WHERE OperationId=$operation AND RemoteItemId='accepted-id';",
+            ("$operation", operationId)));
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
             upgraded, DatabaseMigrator.LatestVersion)).IsValid);
     }
@@ -507,7 +573,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(11, DatabaseMigrator.LatestVersion);
+        Assert.Equal(12, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -556,7 +622,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(11, DatabaseMigrator.LatestVersion);
+        Assert.Equal(12, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));

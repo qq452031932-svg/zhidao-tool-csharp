@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Abstractions;
 
 namespace BaiduBatchTransfer.App;
 
@@ -9,7 +10,10 @@ public interface IAppRecoveryRunner
     Task RecoverAsync(CancellationToken cancellationToken);
 }
 
-public sealed class StartupRecoveryRunner(StartupRecoveryService recoveryService) : IAppRecoveryRunner
+public sealed class StartupRecoveryRunner(
+    StartupRecoveryService recoveryService,
+    IRemoteSelectionSessionStore remoteSelectionSessions,
+    TimeProvider timeProvider) : IAppRecoveryRunner
 {
     public bool IsAvailable => true;
     public string UnavailableMessage => string.Empty;
@@ -18,6 +22,8 @@ public sealed class StartupRecoveryRunner(StartupRecoveryService recoveryService
         var result = await recoveryService.RecoverAsync(cancellationToken).ConfigureAwait(false);
         if (!result.CoordinatorMayStart)
             throw new InvalidOperationException("启动恢复未允许调度器运行。");
+        await remoteSelectionSessions.RecoverIncompleteAsync(
+            timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false);
     }
 }
 

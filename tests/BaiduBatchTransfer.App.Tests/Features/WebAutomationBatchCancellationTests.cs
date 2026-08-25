@@ -77,6 +77,27 @@ public sealed class WebAutomationBatchCancellationTests : IDisposable
     }
 
     [Fact]
+    public async Task RemoteSelectionCancellationHasItsOwnBucketFromTransferWithSameBatchId()
+    {
+        var identity = Identity(WebAutomationOwnerKind.RemoteSelection);
+        using var service = new WebAutomationBatchCancellation(
+            new RecordingStore(),
+            new RecordingAttemptStore(identity, WebAutomationAttemptState.DefinitelyNotSubmitted),
+            TimeProvider.System);
+        var transferSignals = 0;
+        var selectionSignals = 0;
+        using var transfer = service.Register(
+            identity.BatchId, WebAutomationOwnerKind.Transfer, () => transferSignals++);
+        using var selection = service.Register(
+            identity.BatchId, WebAutomationOwnerKind.RemoteSelection, () => selectionSignals++);
+
+        await service.CancelAsync(identity, 1, WebAutomationAttemptState.Preparing);
+
+        Assert.Equal(0, transferSignals);
+        Assert.Equal(1, selectionSignals);
+    }
+
+    [Fact]
     public async Task PreparingWebStageWithBusinessSubmissionEvidenceReturnsCommittedNeedsDecision()
     {
         Directory.CreateDirectory(root);
@@ -138,8 +159,9 @@ public sealed class WebAutomationBatchCancellationTests : IDisposable
             (await attempts.GetAsync(identity.OperationId, identity.AccountId, identity.Generation))!.State);
     }
 
-    private static WebAutomationRequestIdentity Identity() => new(
-        Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1, WebAutomationOwnerKind.Transfer);
+    private static WebAutomationRequestIdentity Identity(
+        WebAutomationOwnerKind ownerKind = WebAutomationOwnerKind.Transfer) => new(
+        Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1, ownerKind);
 
     private enum StoreBehavior
     {

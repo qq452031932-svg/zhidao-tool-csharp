@@ -10,6 +10,7 @@ public enum WebAutomationOwnerKind
     Transfer,
     TransferShare,
     StandaloneShare,
+    RemoteSelection,
 }
 
 public enum WebAutomationAttemptState

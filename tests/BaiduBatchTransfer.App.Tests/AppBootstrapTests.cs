@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Accounts;
+using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Transfers;
@@ -69,8 +70,10 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<ILocalResultExportStore>());
         Assert.IsType<SqliteWebAutomationAttemptStore>(
             host.Services.GetRequiredService<IWebAutomationAttemptStore>());
-        Assert.IsType<UnavailableRemoteResourcePicker>(
+        Assert.IsType<WebViewRemoteResourcePicker>(
             host.Services.GetRequiredService<IRemoteResourcePicker>());
+        Assert.IsType<SqliteRemoteSelectionSessionStore>(
+            host.Services.GetRequiredService<IRemoteSelectionSessionStore>());
         Assert.IsType<SqliteStandaloneShareStore>(
             host.Services.GetRequiredService<IStandaloneShareStore>());
         Assert.Same(

@@ -97,9 +97,12 @@ public sealed class WebAutomationBatchCancellation(
     }
 
     private static WebAutomationOwnerKind Normalize(WebAutomationOwnerKind ownerKind) =>
-        ownerKind == WebAutomationOwnerKind.StandaloneShare
-            ? WebAutomationOwnerKind.StandaloneShare
-            : WebAutomationOwnerKind.Transfer;
+        ownerKind switch
+        {
+            WebAutomationOwnerKind.StandaloneShare => WebAutomationOwnerKind.StandaloneShare,
+            WebAutomationOwnerKind.RemoteSelection => WebAutomationOwnerKind.RemoteSelection,
+            _ => WebAutomationOwnerKind.Transfer,
+        };
 
     private void ThrowIfDisposed() =>
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);

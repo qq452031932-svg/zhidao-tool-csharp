@@ -36,6 +36,14 @@ public sealed class SqliteWebAutomationRequestOwnershipStore(
                 SELECT COUNT(*) FROM StandaloneShareOperations
                 WHERE Id=$operation AND BatchId=$batch AND AccountId=$account AND Generation=$generation;
                 """,
+            WebAutomationOwnerKind.RemoteSelection => """
+                SELECT COUNT(*) FROM RemoteSelectionSessions selection
+                JOIN Accounts account ON account.Id=selection.AccountId
+                WHERE selection.SessionId=$operation AND selection.WorkspaceDraftId=$batch
+                  AND selection.AccountId=$account AND selection.Generation=$generation
+                  AND selection.State='Active' AND account.Status='Active'
+                  AND account.IsDeleted=0 AND account.IsEnabled=1;
+                """,
             _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
         };
         command.Parameters.AddWithValue("$operation", operationId.ToString("D"));

@@ -39,6 +39,12 @@
                     <Button Content="取消批次" MinWidth="106" Margin="10,0,0,0" Click="OnCancelBatch"
                             AutomationProperties.Name="取消批次" />
                 </StackPanel>
+                <StackPanel x:Name="PickerActions" Grid.Column="1" Orientation="Horizontal" Visibility="Collapsed">
+                    <Button Content="确认选择" MinWidth="106" Click="OnConfirmSelection"
+                            AutomationProperties.Name="确认选择" />
+                    <Button Content="取消选择" MinWidth="106" Margin="10,0,0,0" Click="OnCancelSelection"
+                            AutomationProperties.Name="取消选择" />
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

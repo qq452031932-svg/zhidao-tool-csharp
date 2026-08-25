@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -7,6 +8,7 @@ public partial class WebAutomationWindow : Window
 {
     private readonly CancellationTokenSource userClosed = new();
     private TaskCompletionSource<WebAutomationUserChoice>? handoffChoice;
+    private TaskCompletionSource<RemoteResourcePickerDecision>? pickerChoice;
     private bool programmaticClose;
     private bool isClosed;
 
@@ -27,6 +29,7 @@ public partial class WebAutomationWindow : Window
         if (handoffChoice is { Task.IsCompleted: false })
             throw new InvalidOperationException("窗口已经在等待人工处理。");
         StatusText.Text = prompt.SafeMessage;
+        PickerActions.Visibility = Visibility.Collapsed;
         HandoffActions.Visibility = Visibility.Visible;
         handoffChoice = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
@@ -36,6 +39,24 @@ public partial class WebAutomationWindow : Window
     {
         var current = handoffChoice ??
             throw new InvalidOperationException("窗口尚未进入人工处理状态。");
+        return current.Task.WaitAsync(cancellationToken);
+    }
+
+    internal void ShowResourcePickerActions()
+    {
+        if (pickerChoice is { Task.IsCompleted: false }) return;
+        HandoffActions.Visibility = Visibility.Collapsed;
+        PickerActions.Visibility = Visibility.Visible;
+        StatusText.Text = "请在页面中浏览并勾选资源，确认无误后点击“确认选择”。";
+        pickerChoice = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Activate();
+    }
+
+    internal Task<RemoteResourcePickerDecision> WaitForResourcePickerDecisionAsync(
+        CancellationToken cancellationToken)
+    {
+        var current = pickerChoice ??
+            throw new InvalidOperationException("窗口尚未进入资源选择状态。");
         return current.Task.WaitAsync(cancellationToken);
     }
 
@@ -54,6 +75,12 @@ public partial class WebAutomationWindow : Window
     private void OnCancelBatch(object sender, RoutedEventArgs e) =>
         CompleteChoice(WebAutomationUserChoice.CancelBatch);
 
+    private void OnConfirmSelection(object sender, RoutedEventArgs e) =>
+        CompletePickerChoice(RemoteResourcePickerDecision.ConfirmSelection);
+
+    private void OnCancelSelection(object sender, RoutedEventArgs e) =>
+        CompletePickerChoice(RemoteResourcePickerDecision.Cancel);
+
     private void CompleteChoice(WebAutomationUserChoice choice)
     {
         HandoffActions.Visibility = Visibility.Collapsed;
@@ -63,10 +90,20 @@ public partial class WebAutomationWindow : Window
         handoffChoice?.TrySetResult(choice);
     }
 
+    private void CompletePickerChoice(RemoteResourcePickerDecision choice)
+    {
+        PickerActions.Visibility = Visibility.Collapsed;
+        StatusText.Text = choice == RemoteResourcePickerDecision.ConfirmSelection
+            ? "正在核对所选资源的精确标识……"
+            : "正在取消资源选择……";
+        pickerChoice?.TrySetResult(choice);
+    }
+
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (programmaticClose) return;
         handoffChoice?.TrySetResult(WebAutomationUserChoice.WindowClosed);
+        pickerChoice?.TrySetResult(RemoteResourcePickerDecision.WindowClosed);
         userClosed.Cancel();
     }
 
@@ -74,6 +111,7 @@ public partial class WebAutomationWindow : Window
     {
         isClosed = true;
         handoffChoice?.TrySetResult(WebAutomationUserChoice.WindowClosed);
+        pickerChoice?.TrySetResult(RemoteResourcePickerDecision.WindowClosed);
         userClosed.Cancel();
     }
 }

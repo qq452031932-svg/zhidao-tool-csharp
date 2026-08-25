@@ -63,7 +63,7 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
         if (ownerKind == WebAutomationOwnerKind.StandaloneShare)
             await CancelStandaloneWorkAsync(connection, transaction, batchId, updated, cancellationToken)
                 .ConfigureAwait(false);
-        else
+        else if (ownerKind is WebAutomationOwnerKind.Transfer or WebAutomationOwnerKind.TransferShare)
             await CancelTransferWorkAsync(connection, transaction, batchId, updated, cancellationToken)
                 .ConfigureAwait(false);
         await ResolveAttemptsAsync(connection, transaction, batchId, ownerKind, updated, cancellationToken)
@@ -81,9 +81,14 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
         if (!Enum.IsDefined(ownerKind)) throw new ArgumentOutOfRangeException(nameof(ownerKind));
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = ownerKind == WebAutomationOwnerKind.StandaloneShare
-            ? "SELECT COUNT(*) FROM StandaloneShareBatches WHERE Id=$batch AND Status='Cancelled';"
-            : "SELECT COUNT(*) FROM BatchJobs WHERE Id=$batch AND Status='Cancelled';";
+        command.CommandText = ownerKind switch
+        {
+            WebAutomationOwnerKind.StandaloneShare =>
+                "SELECT COUNT(*) FROM StandaloneShareBatches WHERE Id=$batch AND Status='Cancelled';",
+            WebAutomationOwnerKind.RemoteSelection =>
+                "SELECT COUNT(*) FROM RemoteSelectionSessions WHERE WorkspaceDraftId=$batch AND State='Cancelled';",
+            _ => "SELECT COUNT(*) FROM BatchJobs WHERE Id=$batch AND Status='Cancelled';",
+        };
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
@@ -117,6 +122,11 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
                 WHERE Id=$operation AND BatchId=$batch AND AccountId=$account
                   AND Generation=$generation;
                 """,
+            WebAutomationOwnerKind.RemoteSelection => """
+                SELECT COUNT(*) FROM RemoteSelectionSessions
+                WHERE SessionId=$operation AND WorkspaceDraftId=$batch AND AccountId=$account
+                  AND Generation=$generation;
+                """,
             _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
         };
         AddIdentity(command, operationId, batchId, accountId, generation);
@@ -132,9 +142,14 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = ownerKind == WebAutomationOwnerKind.StandaloneShare
-            ? "SELECT Status FROM StandaloneShareBatches WHERE Id=$batch;"
-            : "SELECT Status FROM BatchJobs WHERE Id=$batch;";
+        command.CommandText = ownerKind switch
+        {
+            WebAutomationOwnerKind.StandaloneShare =>
+                "SELECT Status FROM StandaloneShareBatches WHERE Id=$batch;",
+            WebAutomationOwnerKind.RemoteSelection =>
+                "SELECT State FROM RemoteSelectionSessions WHERE WorkspaceDraftId=$batch;",
+            _ => "SELECT Status FROM BatchJobs WHERE Id=$batch;",
+        };
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
     }
@@ -177,16 +192,23 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = ownerKind == WebAutomationOwnerKind.StandaloneShare
-            ? """
+        command.CommandText = ownerKind switch
+        {
+            WebAutomationOwnerKind.StandaloneShare => """
                 UPDATE StandaloneShareBatches
                 SET Status='Cancelled',Revision=Revision+1,UpdatedAt=$updated
                 WHERE Id=$batch AND Status IN ('Queued','Active','Paused');
-                """
-            : """
+                """,
+            WebAutomationOwnerKind.RemoteSelection => """
+                UPDATE RemoteSelectionSessions
+                SET State='Cancelled',Revision=Revision+1,UpdatedAt=$updated
+                WHERE WorkspaceDraftId=$batch AND State='Active';
+                """,
+            _ => """
                 UPDATE BatchJobs SET Status='Cancelled',CompletedAt=$updated
                 WHERE Id=$batch AND Status IN ('Queued','Active','Paused','AwaitingCandidates','PausedReady');
-                """;
+                """,
+        };
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         command.Parameters.AddWithValue("$updated", updated);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -299,6 +321,23 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
                 """, batchId, updated, cancellationToken).ConfigureAwait(false);
             return;
         }
+        if (ownerKind == WebAutomationOwnerKind.RemoteSelection)
+        {
+            await ExecuteAsync(connection, transaction, """
+                UPDATE WebAutomationAttempts AS attempt
+                SET State='DefinitelyNotSubmitted',ResumeStage=NULL,IsWaitingForUser=0,
+                    Revision=Revision+1,UpdatedAt=$updated
+                WHERE attempt.OwnerKind='RemoteSelection'
+                  AND EXISTS(SELECT 1 FROM RemoteSelectionSessions owner
+                    WHERE owner.SessionId=attempt.OperationId
+                      AND owner.WorkspaceDraftId=$batch
+                      AND owner.AccountId=attempt.AccountId
+                      AND owner.Generation=attempt.Generation
+                      AND owner.State='Cancelled')
+                  AND attempt.State IN ('Preparing','BaselinePersisted','Submitting','ResultPending','UserHandoff');
+                """, batchId, updated, cancellationToken).ConfigureAwait(false);
+            return;
+        }
         if (ownerKind != WebAutomationOwnerKind.StandaloneShare)
             throw new ArgumentOutOfRangeException(nameof(ownerKind));
         await ExecuteAsync(connection, transaction, """
@@ -346,9 +385,12 @@ public sealed class SqliteWebAutomationBatchCancellationStore(
     private static bool IsTerminal(string? status, WebAutomationOwnerKind ownerKind)
     {
         if (status is null) return true;
-        return ownerKind == WebAutomationOwnerKind.StandaloneShare
-            ? status is "Completed" or "CompletedWithFailures"
-            : status is "Completed" or "CompletedWithShortfall";
+        return ownerKind switch
+        {
+            WebAutomationOwnerKind.StandaloneShare => status is "Completed" or "CompletedWithFailures",
+            WebAutomationOwnerKind.RemoteSelection => status is "Confirmed" or "NeedsDecision",
+            _ => status is "Completed" or "CompletedWithShortfall",
+        };
     }
 
     private static void AddIdentity(

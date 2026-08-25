@@ -665,8 +665,8 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         Assert.Contains("已处理，继续", xaml, StringComparison.Ordinal);
         Assert.Contains("跳过此项", xaml, StringComparison.Ordinal);
         Assert.Contains("取消批次", xaml, StringComparison.Ordinal);
-        Assert.Equal(3, xaml.Split("<Button ", StringSplitOptions.None).Length - 1);
-        Assert.Equal(3, Regex.Matches(
+        Assert.Equal(5, xaml.Split("<Button ", StringSplitOptions.None).Length - 1);
+        Assert.Equal(5, Regex.Matches(
             xaml,
             "<Button[^>]+AutomationProperties.Name=",
             RegexOptions.Singleline).Count);
@@ -1067,9 +1067,12 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         }
 
         private static (Guid, WebAutomationOwnerKind) Key(Guid batchId, WebAutomationOwnerKind ownerKind) =>
-            (batchId, ownerKind == WebAutomationOwnerKind.StandaloneShare
-                ? WebAutomationOwnerKind.StandaloneShare
-                : WebAutomationOwnerKind.Transfer);
+            (batchId, ownerKind switch
+            {
+                WebAutomationOwnerKind.StandaloneShare => WebAutomationOwnerKind.StandaloneShare,
+                WebAutomationOwnerKind.RemoteSelection => WebAutomationOwnerKind.RemoteSelection,
+                _ => WebAutomationOwnerKind.Transfer,
+            });
     }
 
     private sealed class RecordingOwnershipStore : IWebAutomationRequestOwnershipStore

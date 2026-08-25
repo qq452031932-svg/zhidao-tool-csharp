@@ -15,6 +15,7 @@ using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.Authentication;
 using BaiduBatchTransfer.BaiduAdapter.Http;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Database.Repositories;
@@ -125,7 +126,6 @@ public static class AppBootstrap
         services.AddSingleton<BatchStatisticsQuery>();
         services.AddSingleton<BatchHistoryQuery>();
         services.AddSingleton<IWorkspaceBatchHistorySource, WorkspaceBatchHistorySource>();
-        services.AddSingleton<IRemoteResourcePicker, UnavailableRemoteResourcePicker>();
         services.AddSingleton<SqliteStandaloneShareStore>();
         services.AddSingleton<IStandaloneShareStore>(sp =>
             sp.GetRequiredService<SqliteStandaloneShareStore>());
@@ -134,6 +134,9 @@ public static class AppBootstrap
         services.AddSingleton<SqliteWebAutomationAttemptStore>();
         services.AddSingleton<IWebAutomationAttemptStore>(sp =>
             sp.GetRequiredService<SqliteWebAutomationAttemptStore>());
+        services.AddSingleton<SqliteRemoteSelectionSessionStore>();
+        services.AddSingleton<IRemoteSelectionSessionStore>(sp =>
+            sp.GetRequiredService<SqliteRemoteSelectionSessionStore>());
         services.AddSingleton<SqliteWebAutomationRequestOwnershipStore>();
         services.AddSingleton<IWebAutomationRequestOwnershipStore>(sp =>
             sp.GetRequiredService<SqliteWebAutomationRequestOwnershipStore>());
@@ -192,6 +195,14 @@ public static class AppBootstrap
         services.AddSingleton<VisibleWebAutomationQueue>();
         services.AddSingleton<IVisibleWebAutomationBroker>(sp =>
             sp.GetRequiredService<VisibleWebAutomationQueue>());
+        services.AddSingleton<RemoteResourcePickerFlow>();
+        services.AddSingleton<IRemoteResourcePicker>(sp => new WebViewRemoteResourcePicker(
+            sp.GetRequiredService<IVisibleWebAutomationBroker>(),
+            sp.GetRequiredService<IAccountProfilePathPolicy>(),
+            sp.GetRequiredService<IRemoteSelectionSessionStore>(),
+            sp.GetRequiredService<RemoteResourcePickerFlow>(),
+            TimeProvider.System,
+            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"));
         services.AddSingleton<FileSystemWebViewProfileStore>();
         services.AddSingleton<IWebViewProfileStore>(sp => sp.GetRequiredService<FileSystemWebViewProfileStore>());
         services.AddSingleton<LoginProfileBootstrapper>();
@@ -236,7 +247,12 @@ public static class AppBootstrap
         services.AddSingleton<IExistingShareDecisionApplication, ExistingShareDecisionApplication>();
         services.AddSingleton<IExistingShareDecisionInteraction, ExistingShareDecisionInteraction>();
         services.AddSingleton<AppRuntimeState>();
-        services.AddSingleton<IAppRecoveryRunner, StartupRecoveryRunner>();
+        services.AddSingleton(sp => new StartupRecoveryRunner(
+            sp.GetRequiredService<StartupRecoveryService>(),
+            sp.GetRequiredService<IRemoteSelectionSessionStore>(),
+            TimeProvider.System));
+        services.AddSingleton<IAppRecoveryRunner>(sp =>
+            sp.GetRequiredService<StartupRecoveryRunner>());
         services.AddSingleton<AppStartupController>();
         services.AddSingleton<IUiDispatcher, WpfUiDispatcher>();
         services.AddSingleton<IExcelFileDialog, WpfExcelFileDialog>();

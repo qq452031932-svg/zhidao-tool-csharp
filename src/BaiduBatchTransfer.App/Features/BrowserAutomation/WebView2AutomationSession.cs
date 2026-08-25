@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using Microsoft.Web.WebView2.Core;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
@@ -20,7 +21,7 @@ public sealed class WebView2AutomationSessionFactory : IVisibleWebAutomationSess
     }
 }
 
-public sealed class WebView2AutomationSession : IVisibleWebAutomationSession
+public sealed class WebView2AutomationSession : IVisibleWebAutomationSession, IRemoteResourcePickerSession
 {
     private readonly WebAutomationRequestIdentity identity;
     private readonly string profilePath;
@@ -79,6 +80,28 @@ public sealed class WebView2AutomationSession : IVisibleWebAutomationSession
     public Task<WebAutomationUserChoice> WaitForHandoffChoiceAsync(
         CancellationToken cancellationToken = default) =>
         window.WaitForHandoffChoiceAsync(cancellationToken);
+
+    public Task<RemoteResourcePickerDecision> WaitForApplicationDecisionAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return window.Dispatcher.InvokeAsync(() =>
+        {
+            window.ShowResourcePickerActions();
+            return window.WaitForResourcePickerDecisionAsync(cancellationToken);
+        }).Task.Unwrap();
+    }
+
+    public Task<RemoteResourceSelectionPage> ReadSelectionPageAsync(
+        string? pageToken,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromException<RemoteResourceSelectionPage>(
+            new WebAutomationAuthorizationException(
+                BaiduAutomationDenialReason.CatalogNotValidated,
+                "资源选择定位协议尚未通过现场验证，未读取网页内容。"));
+    }
 
     public Task CloseAsync(CancellationToken cancellationToken = default)
     {
