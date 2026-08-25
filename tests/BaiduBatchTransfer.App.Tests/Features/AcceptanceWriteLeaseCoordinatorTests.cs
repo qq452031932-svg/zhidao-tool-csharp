@@ -104,8 +104,8 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Assert.True(await coordinator.TryAuthorizeAsync(request));
 
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
-        await coordinator.RecordRemoteResultAsync(request, "remote-A");
-        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, Hash);
         await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
         Assert.Equal(1, presenter.EnableCount);
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: false));
@@ -125,10 +125,10 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Assert.True(coordinator.TryCreateLease(request, Confirmed()));
         Assert.True(await coordinator.TryAuthorizeAsync(request));
 
-        await coordinator.RecordRemoteResultAsync(request, "remote-A");
-        await coordinator.RecordRecoveryAsync(request, "remote-A");
-        await coordinator.RecordRemoteResultAsync(request with { IsRecovery = true }, "remote-B");
-        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-B");
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request, Hash);
+        await coordinator.RecordRemoteResultAsync(request with { IsRecovery = true }, HashB);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, HashB);
         await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
 
         Assert.Equal(0, presenter.EnableCount);
@@ -143,11 +143,29 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         var request = Request();
         Assert.True(coordinator.TryCreateLease(request, Confirmed()));
         Assert.True(await coordinator.TryAuthorizeAsync(request));
-        await coordinator.RecordRemoteResultAsync(request, "remote-A");
-        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, Hash);
 
         await coordinator.OnLocalResultExportCompletedAsync(
             ExportEvidence(request, operationId: Guid.NewGuid()));
+
+        Assert.Equal(0, presenter.EnableCount);
+        Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+    }
+
+    [Fact]
+    public async Task WorkbookContentFingerprintMustEqualTheCapturedRemoteFingerprint()
+    {
+        var presenter = new RecordingPresenter();
+        var coordinator = Coordinator(true, ["--webview-acceptance"], presenter: presenter);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, Hash);
+
+        await coordinator.OnLocalResultExportCompletedAsync(
+            ExportEvidence(request, contentFingerprint: HashB));
 
         Assert.Equal(0, presenter.EnableCount);
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
@@ -162,8 +180,8 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         var request = Request();
         Assert.True(coordinator.TryCreateLease(request, Confirmed()));
         Assert.True(await coordinator.TryAuthorizeAsync(request));
-        await coordinator.RecordRemoteResultAsync(request, "remote-A");
-        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, Hash);
 
         await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
 
@@ -278,7 +296,8 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     private static AcceptanceWriteLeaseConfirmation Confirmed() => new(true, true, true);
     private static LocalResultExportCompletedEvidence ExportEvidence(
         AdapterWriteAuthorizationRequest request,
-        Guid? operationId = null) => new(
+        Guid? operationId = null,
+        string? contentFingerprint = null) => new(
         new LocalResultExportKey(
             LocalResultOwnerKind.TransferBatch,
             request.BatchId,
@@ -289,10 +308,11 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
             request.AccountId,
             operationId ?? request.OperationId,
             request.Generation,
-            Hash)],
+            contentFingerprint ?? Hash)],
         Hash,
         Hash);
-    private const string Hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    private const string Hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string HashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     private sealed class MemoryCapabilityStore : IAdapterCapabilityStore
     {

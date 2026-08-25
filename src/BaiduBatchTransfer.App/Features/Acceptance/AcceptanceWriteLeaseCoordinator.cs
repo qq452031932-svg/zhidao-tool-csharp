@@ -246,8 +246,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     {
         ArgumentNullException.ThrowIfNull(exportEvidence);
         var exportKey = exportEvidence.ExportKey;
-        if (!IsUpperSha256(exportEvidence.LayoutFingerprint) ||
-            !IsUpperSha256(exportEvidence.ArtifactFingerprint)) return;
+        if (!LocalResultWorkbookManifest.IsFingerprint(exportEvidence.LayoutFingerprint) ||
+            !LocalResultWorkbookManifest.IsFingerprint(exportEvidence.ArtifactFingerprint)) return;
         AcceptanceWriteLeaseIdentity[] matches;
         lock (sync)
         {
@@ -258,7 +258,11 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                     operation.AccountId == key.AccountId &&
                     operation.OperationId == key.OperationId &&
                     operation.Generation == key.Generation &&
-                    IsUpperSha256(operation.ContentFingerprint))).ToArray();
+                    LocalResultWorkbookManifest.IsFingerprint(operation.ContentFingerprint) &&
+                    evidence.TryGetValue(key, out var state) && !state.RemoteMismatch &&
+                    string.Equals(
+                        operation.ContentFingerprint, state.RemoteFingerprint,
+                        StringComparison.Ordinal))).ToArray();
         }
         foreach (var key in matches)
         {
@@ -323,10 +327,6 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
 
     private static string Hash(string value) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
-
-    private static bool IsUpperSha256(string value) =>
-        value is { Length: 64 } && value.All(character =>
-            character is >= '0' and <= '9' or >= 'A' and <= 'F');
 
     private static bool MatchesExportEvidence(
         AcceptanceWriteLeaseIdentity lease,

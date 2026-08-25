@@ -6,6 +6,9 @@ using BaiduBatchTransfer.Infrastructure.Excel;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
+using System.Security.Cryptography;
+using System.Text;
+using System.Xml;
 
 namespace BaiduBatchTransfer.App.Features.Results;
 
@@ -70,21 +73,35 @@ public sealed class LocalResultExportArtifactService(
     public async Task<LocalResultArtifactPublishReceipt> PublishAsync(
         LocalResultExportOwnerSnapshot owner,
         string targetFileName,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<LocalResultOperationEvidence>? provenOperations = null)
     {
         ArgumentNullException.ThrowIfNull(owner);
         LocalResultExportValidation.SafeFileName(targetFileName, nameof(targetFileName));
+        var layout = owner.Key.ExportKind switch
+        {
+            LocalResultExportKind.ReplacementWorkbook =>
+                await replacementExports.GetExpectedLayoutAsync(owner.Key.OwnerId, cancellationToken)
+                    .ConfigureAwait(false),
+            LocalResultExportKind.StandaloneShareWorkbook => standaloneExports.GetExpectedLayout(),
+            _ => throw new InvalidOperationException("This local export kind is not a summary workbook."),
+        };
+        var manifest = new LocalResultWorkbookManifest(
+            owner.Key,
+            LayoutFingerprint(layout),
+            provenOperations ?? []);
         var receipt = owner.Key.ExportKind switch
         {
             LocalResultExportKind.ReplacementWorkbook =>
                 await replacementExports.ExportToDirectoryAsync(
                     new ReplacementWorkbookExportRequest(owner.Key.OwnerId),
                     owner.DestinationDirectory, targetFileName, publisher,
-                    cancellationToken: cancellationToken).ConfigureAwait(false),
+                    cancellationToken: cancellationToken,
+                    manifest: manifest).ConfigureAwait(false),
             LocalResultExportKind.StandaloneShareWorkbook =>
                 await standaloneExports.ExportToDirectoryAsync(
-                    new StandaloneShareResultExportRequest(owner.Key.OwnerId),
-                    owner.DestinationDirectory, targetFileName, publisher, cancellationToken)
+                    new StandaloneShareResultExportRequest(owner.Key.OwnerId), owner.DestinationDirectory,
+                    targetFileName, publisher, cancellationToken, manifest)
                     .ConfigureAwait(false),
             _ => throw new InvalidOperationException("This local export kind is not a summary workbook."),
         };
@@ -95,7 +112,7 @@ public sealed class LocalResultExportArtifactService(
         return new(finalName, receipt.ExportedRows);
     }
 
-    public Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
+    public async Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
         LocalResultExportOwnerSnapshot owner,
         string targetFileName,
         IReadOnlyList<LocalResultOperationIdentity> candidates,
@@ -103,13 +120,63 @@ public sealed class LocalResultExportArtifactService(
     {
         ArgumentNullException.ThrowIfNull(owner);
         ArgumentNullException.ThrowIfNull(candidates);
-        LocalResultExportValidation.SafeFileName(targetFileName, nameof(targetFileName));
+        var path = ResolveExactPath(owner.DestinationDirectory,
+            LocalResultExportValidation.SafeFileName(targetFileName, nameof(targetFileName)));
         cancellationToken.ThrowIfCancellationRequested();
+        if (candidates.Count == 0 || !File.Exists(path)) return null;
+        var layout = owner.Key.ExportKind switch
+        {
+            LocalResultExportKind.ReplacementWorkbook =>
+                await replacementExports.GetExpectedLayoutAsync(owner.Key.OwnerId, cancellationToken)
+                    .ConfigureAwait(false),
+            LocalResultExportKind.StandaloneShareWorkbook => standaloneExports.GetExpectedLayout(),
+            _ => throw new InvalidOperationException("This local export kind is not a summary workbook."),
+        };
+        try
+        {
+            await using var stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                bufferSize: 64 * 1024, useAsync: true);
+            var artifactFingerprint = Convert.ToHexString(
+                await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false)).ToLowerInvariant();
+            stream.Position = 0;
+            using var document = SpreadsheetDocument.Open(stream, false, new OpenSettings { AutoSave = false });
+            if (HasExternalRelationships(document, new HashSet<Uri>()) ||
+                !HasExpectedShape(document, layout, owner.ExpectedRowCount, cancellationToken)) return null;
+            var manifest = OpenXmlLocalResultWorkbookManifestCodec.TryRead(document);
+            var layoutFingerprint = LayoutFingerprint(layout);
+            if (manifest is null || manifest.ExportKey != owner.Key ||
+                !string.Equals(manifest.LayoutFingerprint, layoutFingerprint, StringComparison.Ordinal)) return null;
+            var exactCandidates = candidates.ToHashSet();
+            var matches = manifest.Operations.Where(operation => exactCandidates.Contains(new(
+                operation.AdapterKind, operation.AccountId, operation.OperationId, operation.Generation))).ToArray();
+            if (matches.Length == 0) return null;
+            return new(owner.Key, matches, layoutFingerprint, artifactFingerprint);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or
+                                      OpenXmlPackageException or InvalidDataException or FormatException or
+                                      XmlException or KeyNotFoundException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
 
-        // The current workbook format does not embed operation id/generation metadata.
-        // A database lookup plus an independently computed file hash cannot prove
-        // workbook membership, so formal acceptance remains deliberately unavailable.
-        return Task.FromResult<LocalResultExportCompletedEvidence?>(null);
+    private static string LayoutFingerprint(ReplacementWorkbookLayout layout) =>
+        Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(string.Join("\u001F", layout.Headers)))).ToLowerInvariant();
+
+    private static bool HasExternalRelationships(
+        OpenXmlPartContainer part,
+        HashSet<Uri> visitedParts)
+    {
+        if (part.ExternalRelationships.Any() || part.HyperlinkRelationships.Any()) return true;
+        return part.Parts.Any(child =>
+            visitedParts.Add(child.OpenXmlPart.Uri) &&
+            HasExternalRelationships(child.OpenXmlPart, visitedParts));
     }
 
     private static string ResolveExactPath(string directory, string fileName)
@@ -134,12 +201,42 @@ public sealed class LocalResultExportArtifactService(
         try
         {
             using var document = SpreadsheetDocument.Open(path, false, new OpenSettings { AutoSave = false });
+            return HasExpectedShape(document, layout, expectedRowCount, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is OpenXmlPackageException or InvalidDataException or IOException or
+                                      FormatException or XmlException or KeyNotFoundException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasExpectedShape(
+        SpreadsheetDocument document,
+        ReplacementWorkbookLayout layout,
+        long expectedRowCount,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
             var workbookPart = document.WorkbookPart;
             var sheets = workbookPart?.Workbook?.Sheets?.Elements<Sheet>().ToArray();
             if (workbookPart is null || sheets is null || sheets.Length == 0) return false;
+            var publicSheets = sheets.Where(sheet => !string.Equals(
+                sheet.Name?.Value, LocalResultWorkbookManifest.SheetName, StringComparison.Ordinal)).ToArray();
+            if (publicSheets.Length == 0) return false;
+            for (var sheetIndex = 0; sheetIndex < publicSheets.Length; sheetIndex++)
+            {
+                var expectedName = sheetIndex == 0 ? "替换结果" : $"替换结果 {sheetIndex + 1}";
+                if (!string.Equals(publicSheets[sheetIndex].Name?.Value, expectedName, StringComparison.Ordinal))
+                    return false;
+            }
             var expectedHeaders = layout.Headers.Select(ExcelTextSanitizer.Sanitize).ToArray();
             long dataRows = 0;
-            foreach (var sheet in sheets)
+            foreach (var sheet in publicSheets)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (sheet.Id?.Value is not { Length: > 0 } relationshipId ||
@@ -180,7 +277,8 @@ public sealed class LocalResultExportArtifactService(
         {
             throw;
         }
-        catch (Exception error) when (error is OpenXmlPackageException or InvalidDataException or IOException or FormatException)
+        catch (Exception error) when (error is OpenXmlPackageException or InvalidDataException or IOException or
+                                      FormatException or XmlException or KeyNotFoundException or InvalidOperationException)
         {
             return false;
         }

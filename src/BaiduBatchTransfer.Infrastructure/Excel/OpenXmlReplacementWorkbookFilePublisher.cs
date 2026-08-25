@@ -38,7 +38,28 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
         string finalFileName,
         ReplacementWorkbookLayout layout,
         IAsyncEnumerable<ReplacementWorkbookRow> rows,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await PublishCoreAsync(
+            destinationDirectory, finalFileName, layout, rows, null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<ReplacementWorkbookFilePublishReceipt> PublishWithManifestAsync(
+        string destinationDirectory,
+        string finalFileName,
+        ReplacementWorkbookLayout layout,
+        IAsyncEnumerable<ReplacementWorkbookRow> rows,
+        LocalResultWorkbookManifest manifest,
+        CancellationToken cancellationToken = default) =>
+        await PublishCoreAsync(
+            destinationDirectory, finalFileName, layout, rows,
+            manifest ?? throw new ArgumentNullException(nameof(manifest)), cancellationToken).ConfigureAwait(false);
+
+    private async Task<ReplacementWorkbookFilePublishReceipt> PublishCoreAsync(
+        string destinationDirectory,
+        string finalFileName,
+        ReplacementWorkbookLayout layout,
+        IAsyncEnumerable<ReplacementWorkbookRow> rows,
+        LocalResultWorkbookManifest? manifest,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(layout);
         ArgumentNullException.ThrowIfNull(rows);
@@ -61,7 +82,12 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
                 output.Flush(flushToDisk: true);
             }
 
-            var validation = ValidateWorkbook(paths.TemporaryPath, layout, cancellationToken);
+            if (manifest is not null)
+            {
+                using var document = SpreadsheetDocument.Open(paths.TemporaryPath, true);
+                OpenXmlLocalResultWorkbookManifestCodec.Add(document, manifest);
+            }
+            var validation = ValidateWorkbook(paths.TemporaryPath, layout, manifest, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
@@ -153,6 +179,7 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
     private static WorkbookValidation ValidateWorkbook(
         string path,
         ReplacementWorkbookLayout layout,
+        LocalResultWorkbookManifest? expectedManifest,
         CancellationToken cancellationToken)
     {
         try
@@ -169,14 +196,24 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
                 ?? throw new InvalidDataException("Missing sheets.");
             if (sheets.Length == 0 || workbookPart.WorksheetParts.Count() != sheets.Length)
                 throw new InvalidDataException("Invalid worksheet layout.");
+            var actualManifest = OpenXmlLocalResultWorkbookManifestCodec.TryRead(document);
+            if (expectedManifest is null && sheets.Any(sheet =>
+                    string.Equals(sheet.Name?.Value, LocalResultWorkbookManifest.SheetName, StringComparison.Ordinal) ||
+                    sheet.State?.Value == SheetStateValues.VeryHidden))
+                throw new InvalidDataException("Unexpected local result manifest.");
+            if (!ManifestEquals(expectedManifest, actualManifest))
+                throw new InvalidDataException("Invalid local result manifest.");
+            var resultSheets = sheets.Where(sheet =>
+                !string.Equals(sheet.Name?.Value, LocalResultWorkbookManifest.SheetName, StringComparison.Ordinal)).ToArray();
+            if (resultSheets.Length == 0) throw new InvalidDataException("Missing result sheets.");
 
             var expectedHeaders = layout.Headers.Select(ExcelTextSanitizer.Sanitize).ToArray();
             var relationshipIds = new HashSet<string>(StringComparer.Ordinal);
             long exportedRows = 0;
-            for (var sheetIndex = 0; sheetIndex < sheets.Length; sheetIndex++)
+            for (var sheetIndex = 0; sheetIndex < resultSheets.Length; sheetIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var sheet = sheets[sheetIndex];
+                var sheet = resultSheets[sheetIndex];
                 var relationshipId = sheet.Id?.Value;
                 if (string.IsNullOrEmpty(relationshipId) || !relationshipIds.Add(relationshipId) ||
                     workbookPart.GetPartById(relationshipId) is not WorksheetPart worksheetPart)
@@ -189,7 +226,7 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
                 exportedRows = checked(exportedRows + rowCount - 1);
             }
 
-            return new(exportedRows, sheets.Length);
+            return new(exportedRows, resultSheets.Length);
         }
         catch (OperationCanceledException)
         {
@@ -202,6 +239,15 @@ public sealed class OpenXmlReplacementWorkbookFilePublisher(
                 "The generated replacement workbook failed validation.");
         }
     }
+
+    private static bool ManifestEquals(
+        LocalResultWorkbookManifest? expected,
+        LocalResultWorkbookManifest? actual) =>
+        expected is null
+            ? actual is null
+            : actual is not null && expected.ExportKey == actual.ExportKey &&
+              string.Equals(expected.LayoutFingerprint, actual.LayoutFingerprint, StringComparison.Ordinal) &&
+              expected.Operations.SequenceEqual(actual.Operations);
 
     private static long ValidateWorksheet(
         WorksheetPart worksheetPart,

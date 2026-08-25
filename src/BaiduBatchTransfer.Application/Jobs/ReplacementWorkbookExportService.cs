@@ -72,7 +72,7 @@ public sealed class ReplacementWorkbookExportService(
         return await ExportToDirectoryCoreAsync(
             request, destinationDirectory,
             fileNameBuilder.Build(definition.SourceFileName, timeProvider.GetUtcNow()),
-            definition, publisher, progress, cancellationToken).ConfigureAwait(false);
+            definition, publisher, progress, cancellationToken, manifest: null).ConfigureAwait(false);
     }
 
     public async Task<string> GetSuggestedFileNameAsync(
@@ -104,7 +104,8 @@ public sealed class ReplacementWorkbookExportService(
         string exactTargetFileName,
         IReplacementWorkbookFilePublisher publisher,
         IProgress<long>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        LocalResultWorkbookManifest? manifest = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationDirectory);
@@ -116,7 +117,7 @@ public sealed class ReplacementWorkbookExportService(
             ?? throw new InvalidOperationException("The batch result projection is unavailable.");
         return await ExportToDirectoryCoreAsync(
             request, destinationDirectory, exactTargetFileName, definition,
-            publisher, progress, cancellationToken).ConfigureAwait(false);
+            publisher, progress, cancellationToken, manifest).ConfigureAwait(false);
     }
 
     private async Task<ReplacementWorkbookFilePublishReceipt> ExportToDirectoryCoreAsync(
@@ -126,7 +127,8 @@ public sealed class ReplacementWorkbookExportService(
         BatchResultProjectionDefinition definition,
         IReplacementWorkbookFilePublisher publisher,
         IProgress<long>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        LocalResultWorkbookManifest? manifest)
     {
         var originalColumns = definition.OriginalColumns.OrderBy(column => column.ColumnOrdinal).ToArray();
         var accounts = definition.Accounts.OrderBy(account => account.OutputOrdinal).ToArray();
@@ -134,6 +136,15 @@ public sealed class ReplacementWorkbookExportService(
 
         var layout = BuildLayout(originalColumns, accounts);
 
+        if (manifest is not null)
+            return await publisher.PublishWithManifestAsync(
+                destinationDirectory,
+                targetFileName,
+                layout,
+                StreamRowsAsync(request, originalColumns, accounts,
+                    count => progress?.Report(count), cancellationToken),
+                manifest,
+                cancellationToken).ConfigureAwait(false);
         return await publisher.PublishAsync(
             destinationDirectory,
             targetFileName,

@@ -67,4 +67,13 @@ public interface IReplacementWorkbookFilePublisher
         ReplacementWorkbookLayout layout,
         IAsyncEnumerable<ReplacementWorkbookRow> rows,
         CancellationToken cancellationToken = default);
+
+    Task<ReplacementWorkbookFilePublishReceipt> PublishWithManifestAsync(
+        string destinationDirectory,
+        string finalFileName,
+        ReplacementWorkbookLayout layout,
+        IAsyncEnumerable<ReplacementWorkbookRow> rows,
+        LocalResultWorkbookManifest manifest,
+        CancellationToken cancellationToken = default) =>
+        PublishAsync(destinationDirectory, finalFileName, layout, rows, cancellationToken);
 }

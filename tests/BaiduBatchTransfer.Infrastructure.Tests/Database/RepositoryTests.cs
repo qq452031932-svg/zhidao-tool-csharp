@@ -289,6 +289,120 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     }
 
     [Fact]
+    public async Task LocalResultEvidenceRepositoryRejectsUnprovenExactCandidates()
+    {
+        var factory = await CreateFactoryAsync();
+        var repository = new SqliteLocalResultExportOwnerRepository(factory);
+        var batchId = Guid.NewGuid();
+
+        var evidence = await repository.GetProvenOperationEvidenceAsync(
+            new(LocalResultOwnerKind.TransferBatch, batchId,
+                LocalResultExportKind.ReplacementWorkbook, 1),
+            [
+                new("BaiduTransfer", Guid.NewGuid(), Guid.NewGuid(), 1),
+                new("BaiduShare", Guid.NewGuid(), Guid.NewGuid(), 1),
+            ]);
+
+        Assert.Empty(evidence);
+    }
+
+    [Fact]
+    public async Task LocalResultEvidenceRepositoryProvesAllThreeCanonicalSuccessLineages()
+    {
+        var factory = await CreateFactoryAsync();
+        var transferBatch = Guid.NewGuid();
+        var standaloneBatch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var transfer = Guid.NewGuid();
+        var transferShare = Guid.NewGuid();
+        var standaloneShare = Guid.NewGuid();
+        var fingerprint = new RemoteItemIdentitySet([new("exact-remote", "safe")]).Fingerprint;
+        await SeedLocalResultEvidenceAsync(
+            factory, transferBatch, standaloneBatch, account,
+            transfer, transferShare, standaloneShare, fingerprint);
+        var repository = new SqliteLocalResultExportOwnerRepository(factory);
+
+        var replacement = await repository.GetProvenOperationEvidenceAsync(
+            new(LocalResultOwnerKind.TransferBatch, transferBatch,
+                LocalResultExportKind.ReplacementWorkbook, 1),
+            [
+                new("BaiduShare", account, transferShare, 2),
+                new("BaiduTransfer", account, transfer, 2),
+            ]);
+        var standalone = await repository.GetProvenOperationEvidenceAsync(
+            new(LocalResultOwnerKind.StandaloneShareBatch, standaloneBatch,
+                LocalResultExportKind.StandaloneShareWorkbook, 1),
+            [new("BaiduShare", account, standaloneShare, 2)]);
+
+        Assert.Equal(["BaiduShare", "BaiduTransfer"], replacement.Select(item => item.AdapterKind));
+        Assert.All(replacement, item => Assert.Equal(fingerprint, item.ContentFingerprint));
+        Assert.Equal(fingerprint, Assert.Single(standalone).ContentFingerprint);
+    }
+
+    [Fact]
+    public async Task LocalResultEvidenceRepositoryRejectsTamperedCanonicalSortKey()
+    {
+        var factory = await CreateFactoryAsync();
+        var transferBatch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var transfer = Guid.NewGuid();
+        var fingerprint = new RemoteItemIdentitySet([new("exact-remote", "safe")]).Fingerprint;
+        await SeedLocalResultEvidenceAsync(
+            factory, transferBatch, Guid.NewGuid(), account,
+            transfer, Guid.NewGuid(), Guid.NewGuid(), fingerprint);
+        await using (var connection = await factory.OpenConnectionAsync())
+        await using (var tamper = connection.CreateCommand())
+        {
+            tamper.CommandText = """
+                UPDATE WebAutomationAttemptAcceptedRemoteItems
+                SET CanonicalSortKey=X'00'
+                WHERE OperationId=$operation;
+                """;
+            tamper.Parameters.AddWithValue("$operation", transfer.ToString("D"));
+            Assert.Equal(1, await tamper.ExecuteNonQueryAsync());
+        }
+
+        var evidence = await new SqliteLocalResultExportOwnerRepository(factory)
+            .GetProvenOperationEvidenceAsync(
+                new(LocalResultOwnerKind.TransferBatch, transferBatch,
+                    LocalResultExportKind.ReplacementWorkbook, 1),
+                [new("BaiduTransfer", account, transfer, 2)]);
+
+        Assert.Empty(evidence);
+    }
+
+    [Fact]
+    public async Task LocalResultEvidenceRepositoryRejectsTransferResultIdsOutsideAcceptedLineage()
+    {
+        var factory = await CreateFactoryAsync();
+        var transferBatch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var transfer = Guid.NewGuid();
+        var fingerprint = new RemoteItemIdentitySet([new("exact-remote", "safe")]).Fingerprint;
+        await SeedLocalResultEvidenceAsync(
+            factory, transferBatch, Guid.NewGuid(), account,
+            transfer, Guid.NewGuid(), Guid.NewGuid(), fingerprint);
+        await using (var connection = await factory.OpenConnectionAsync())
+        await using (var tamper = connection.CreateCommand())
+        {
+            tamper.CommandText = """
+                UPDATE TransferOperations SET RemoteItemIdsJson='["different-remote"]'
+                WHERE Id=$operation;
+                """;
+            tamper.Parameters.AddWithValue("$operation", transfer.ToString("D"));
+            Assert.Equal(1, await tamper.ExecuteNonQueryAsync());
+        }
+
+        var evidence = await new SqliteLocalResultExportOwnerRepository(factory)
+            .GetProvenOperationEvidenceAsync(
+                new(LocalResultOwnerKind.TransferBatch, transferBatch,
+                    LocalResultExportKind.ReplacementWorkbook, 1),
+                [new("BaiduTransfer", account, transfer, 2)]);
+
+        Assert.Empty(evidence);
+    }
+
+    [Fact]
     public async Task RecentBatchHistoryIsDurableNewestFirstAndBounded()
     {
         var factory = await CreateFactoryAsync();
@@ -980,6 +1094,83 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"));
         await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         return factory;
+    }
+
+    private static async Task SeedLocalResultEvidenceAsync(
+        SqliteConnectionFactory factory,
+        Guid transferBatch,
+        Guid standaloneBatch,
+        Guid account,
+        Guid transfer,
+        Guid transferShare,
+        Guid standaloneShare,
+        string fingerprint)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            PRAGMA foreign_keys=OFF;
+            DROP TRIGGER TR_ShareOperations_RequireEnabledPlannedOutput;
+
+            INSERT INTO TransferOperations(
+              Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+              CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+              OperationFingerprint,ConfirmationDescriptorJson,RemoteItemIdsJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+            VALUES($transfer,$resource,$transferBatch,1,1,'/','/','',$account,'Rule','Succeeded',
+              'NewTransfer',2,'operation','{}','["exact-remote"]','ResultReceived','Fulfilled',$now,$now);
+
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
+            VALUES($transferShare,$transfer,$resource,$transferBatch,$account,1,'Succeeded',
+              $fingerprint,'settings',2,'Unknown',$now,$now);
+            INSERT INTO BaiduShareResults(
+              Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,
+              IsAccepted,IsCurrent,SharedAt,UpdatedAt)
+            VALUES($transferShareResult,$transferShare,$transferBatch,$resource,$account,1,1,
+              $fingerprint,'settings',2,'share-transfer','https://pan.baidu.com/s/transfer','code',1,1,$now,$now);
+
+            INSERT INTO StandaloneShareOperations(
+              Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,
+              ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
+              SettingsFingerprint,CreatedAt,UpdatedAt)
+            VALUES($standaloneShare,$standaloneBatch,$account,1,'safe','File','/',
+              $fingerprint,2,'Succeeded','Completed','Unknown','standalone-settings',$now,$now);
+            INSERT INTO StandaloneShareResults(
+              Id,OperationId,BatchId,AccountId,Generation,ExactItemSetFingerprint,SettingsFingerprint,
+              ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,AcceptedAt,CreatedAt)
+            VALUES($standaloneResult,$standaloneShare,$standaloneBatch,$account,2,$fingerprint,
+              'standalone-settings','share-standalone','https://pan.baidu.com/s/standalone','code',1,1,$now,$now);
+
+            INSERT INTO WebAutomationAttempts(
+              OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,BaselineItemCount,
+              BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
+              AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
+            VALUES
+              ($transfer,$account,2,'Transfer','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now),
+              ($transferShare,$account,2,'TransferShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now),
+              ($standaloneShare,$account,2,'StandaloneShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now);
+            INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
+              OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+            VALUES
+              ($transfer,$account,2,0,'exact-remote',$sort),
+              ($transferShare,$account,2,0,'exact-remote',$sort),
+              ($standaloneShare,$account,2,0,'exact-remote',$sort);
+            """;
+        command.Parameters.AddWithValue("$transfer", transfer.ToString("D"));
+        command.Parameters.AddWithValue("$transferShare", transferShare.ToString("D"));
+        command.Parameters.AddWithValue("$standaloneShare", standaloneShare.ToString("D"));
+        command.Parameters.AddWithValue("$transferShareResult", Guid.NewGuid().ToString("D"));
+        command.Parameters.AddWithValue("$standaloneResult", Guid.NewGuid().ToString("D"));
+        command.Parameters.AddWithValue("$resource", Guid.NewGuid().ToString("D"));
+        command.Parameters.AddWithValue("$transferBatch", transferBatch.ToString("D"));
+        command.Parameters.AddWithValue("$standaloneBatch", standaloneBatch.ToString("D"));
+        command.Parameters.AddWithValue("$account", account.ToString("D"));
+        command.Parameters.AddWithValue("$fingerprint", fingerprint);
+        command.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey("exact-remote"));
+        command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync();
     }
 
     private async Task<ShareInsertGraph> CreateShareInsertGraphAsync(

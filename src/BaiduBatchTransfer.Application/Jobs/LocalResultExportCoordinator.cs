@@ -72,6 +72,12 @@ public interface ILocalResultExportOwnerRepository
     Task<Page<LocalResultExportOwnerSnapshot>> GetReadyPageAsync(
         PageQuery query,
         CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<LocalResultOperationEvidence>> GetProvenOperationEvidenceAsync(
+        LocalResultExportKey key,
+        IReadOnlyList<LocalResultOperationIdentity> candidates,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<LocalResultOperationEvidence>>([]);
 }
 
 public interface ILocalResultExportArtifactService
@@ -88,7 +94,8 @@ public interface ILocalResultExportArtifactService
     Task<LocalResultArtifactPublishReceipt> PublishAsync(
         LocalResultExportOwnerSnapshot owner,
         string targetFileName,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<LocalResultOperationEvidence>? provenOperations = null);
 
     Task<LocalResultExportCompletedEvidence?> GetVerifiedEvidenceAsync(
         LocalResultExportOwnerSnapshot owner,
@@ -287,8 +294,9 @@ public sealed class LocalResultExportCoordinator(
             var finalFileName = record.TargetFileName;
             if (state == LocalResultArtifactState.Missing)
             {
+                var provenOperations = await GetProvenOperationsSafelyAsync(owner).ConfigureAwait(false);
                 var receipt = await artifacts.PublishAsync(
-                    owner, record.TargetFileName, cancellationToken).ConfigureAwait(false);
+                    owner, record.TargetFileName, cancellationToken, provenOperations).ConfigureAwait(false);
                 if (!string.Equals(receipt.FinalFileName, record.TargetFileName, StringComparison.Ordinal))
                     return await FailAsync(lease, "RESULT_IDENTITY_MISMATCH", CancellationToken.None)
                         .ConfigureAwait(false);
@@ -335,6 +343,24 @@ public sealed class LocalResultExportCoordinator(
         catch
         {
             // Acceptance telemetry is best-effort after durable export success.
+        }
+    }
+
+    private async Task<IReadOnlyList<LocalResultOperationEvidence>> GetProvenOperationsSafelyAsync(
+        LocalResultExportOwnerSnapshot owner)
+    {
+        if (observer is null) return [];
+        try
+        {
+            var candidates = observer.GetTrackedOperations(owner.Key);
+            if (candidates.Count == 0) return [];
+            return await owners.GetProvenOperationEvidenceAsync(
+                owner.Key, candidates, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Acceptance membership is optional telemetry; the business export still publishes.
+            return [];
         }
     }
 

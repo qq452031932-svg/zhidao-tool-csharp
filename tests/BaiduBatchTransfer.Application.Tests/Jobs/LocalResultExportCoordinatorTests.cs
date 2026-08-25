@@ -43,13 +43,27 @@ public sealed class LocalResultExportCoordinatorTests
     {
         var observer = new CountingObserver();
         var graph = Fixture(observer: observer);
-        graph.Artifacts.ProvidesVerifiedEvidence = false;
+        graph.Owners.ProvesCandidates = false;
 
         var result = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
 
         Assert.Equal(LocalResultExportDisposition.Exported, result.Disposition);
         Assert.Equal(LocalResultExportStatus.Succeeded, graph.Store.Record!.Status);
         Assert.Equal(0, observer.CallCount);
+        Assert.Empty(graph.Artifacts.PublishedEvidence);
+    }
+
+    [Fact]
+    public async Task RepositoryProofIsCapturedInThePublishedArtifactBeforeAcceptanceNotification()
+    {
+        var observer = new CountingObserver();
+        var graph = Fixture(observer: observer);
+
+        var result = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
+
+        Assert.Equal(LocalResultExportDisposition.Exported, result.Disposition);
+        Assert.Single(graph.Artifacts.PublishedEvidence);
+        Assert.Equal(1, observer.CallCount);
     }
 
     [Fact]
@@ -212,6 +226,7 @@ public sealed class LocalResultExportCoordinatorTests
     private sealed class FakeOwners(Guid batchId) : ILocalResultExportOwnerRepository
     {
         public bool IsTerminal { get; set; } = true;
+        public bool ProvesCandidates { get; set; } = true;
 
         public Task<LocalResultExportOwnerSnapshot?> GetAsync(
             LocalResultExportKey key, CancellationToken cancellationToken = default) =>
@@ -234,6 +249,16 @@ public sealed class LocalResultExportCoordinatorTests
                 items, items.Length, query.PageNumber, query.PageSize));
         }
 
+        public Task<IReadOnlyList<LocalResultOperationEvidence>> GetProvenOperationEvidenceAsync(
+            LocalResultExportKey key,
+            IReadOnlyList<LocalResultOperationIdentity> candidates,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<LocalResultOperationEvidence>>(ProvesCandidates
+                ? candidates.Select(candidate => new LocalResultOperationEvidence(
+                    candidate.AdapterKind, candidate.AccountId, candidate.OperationId,
+                    candidate.Generation, new string('a', 64))).ToArray()
+                : []);
+
     }
 
     private sealed class FakeArtifacts(List<string> events) : ILocalResultExportArtifactService
@@ -246,7 +271,7 @@ public sealed class LocalResultExportCoordinatorTests
         public TaskCompletionSource ReleasePublish { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string? PublishedTarget { get; private set; }
-        public bool ProvidesVerifiedEvidence { get; set; } = true;
+        public IReadOnlyList<LocalResultOperationEvidence> PublishedEvidence { get; private set; } = [];
 
         public Task<string> ChooseTargetFileNameAsync(
             LocalResultExportOwnerSnapshot owner, CancellationToken cancellationToken = default)
@@ -265,13 +290,15 @@ public sealed class LocalResultExportCoordinatorTests
 
         public async Task<LocalResultArtifactPublishReceipt> PublishAsync(
             LocalResultExportOwnerSnapshot owner, string targetFileName,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            IReadOnlyList<LocalResultOperationEvidence>? provenOperations = null)
         {
             events.Add("publish");
             if (PublishError is not null) throw PublishError;
             PublishStarted.TrySetResult();
             if (BlockPublish) await ReleasePublish.Task.WaitAsync(cancellationToken);
             PublishedTarget = targetFileName;
+            PublishedEvidence = provenOperations?.ToArray() ?? [];
             return new LocalResultArtifactPublishReceipt(targetFileName, 1);
         }
 
@@ -280,15 +307,12 @@ public sealed class LocalResultExportCoordinatorTests
             string targetFileName,
             IReadOnlyList<LocalResultOperationIdentity> candidates,
             CancellationToken cancellationToken = default) =>
-            Task.FromResult(ProvidesVerifiedEvidence
+            Task.FromResult(PublishedEvidence.Count > 0
                 ? new LocalResultExportCompletedEvidence(
                 owner.Key,
-                candidates.Select(candidate => new LocalResultOperationEvidence(
-                    candidate.AdapterKind, candidate.AccountId, candidate.OperationId,
-                    candidate.Generation,
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).ToArray(),
-                "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-                "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+                PublishedEvidence,
+                new string('b', 64),
+                new string('c', 64))
                 : null);
     }
 

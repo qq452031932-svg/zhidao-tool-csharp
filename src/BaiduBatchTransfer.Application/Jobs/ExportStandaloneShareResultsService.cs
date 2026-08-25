@@ -55,12 +55,21 @@ public sealed class ExportStandaloneShareResultsService(
         string destinationDirectory,
         string exactTargetFileName,
         IReplacementWorkbookFilePublisher publisher,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        LocalResultWorkbookManifest? manifest = null)
     {
         Validate(request);
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationDirectory);
         LocalResultExportValidation.SafeFileName(exactTargetFileName, nameof(exactTargetFileName));
         ArgumentNullException.ThrowIfNull(publisher);
+        if (manifest is not null)
+            return await publisher.PublishWithManifestAsync(
+                destinationDirectory,
+                exactTargetFileName,
+                Layout,
+                Rows(request, _ => { }, cancellationToken),
+                manifest,
+                cancellationToken).ConfigureAwait(false);
         return await publisher.PublishAsync(
             destinationDirectory,
             exactTargetFileName,

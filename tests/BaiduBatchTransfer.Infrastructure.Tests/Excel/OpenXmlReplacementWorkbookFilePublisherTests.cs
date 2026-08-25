@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Excel;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
@@ -43,6 +44,66 @@ public sealed class OpenXmlReplacementWorkbookFilePublisherTests
         Assert.Equal(2, receipt.SheetCount);
         Assert.DoesNotContain(directory.Path, receipt.ToString(), StringComparison.Ordinal);
         AssertNoTemporaryFiles(directory.Path);
+    }
+
+    [Fact]
+    public async Task ManifestIsAtomicallyPublishedAsTheOnlyVeryHiddenMetadataSheet()
+    {
+        using var directory = new TemporaryDirectory();
+        var operation = new LocalResultOperationEvidence(
+            "BaiduTransfer",
+            Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            Guid.Parse("22222222-2222-2222-2222-222222222222"),
+            3,
+            new string('a', 64));
+        var manifest = new LocalResultWorkbookManifest(
+            new LocalResultExportKey(
+                LocalResultOwnerKind.TransferBatch,
+                Guid.Parse("33333333-3333-3333-3333-333333333333"),
+                LocalResultExportKind.ReplacementWorkbook,
+                1),
+            new string('b', 64),
+            [operation]);
+
+        await new OpenXmlReplacementWorkbookFilePublisher(
+                new OpenXmlReplacementResultWriter())
+            .PublishWithManifestAsync(
+                directory.Path,
+                "result.xlsx",
+                Layout,
+                Rows(new ReplacementWorkbookRow(1, ["1a", "1b"])),
+                manifest);
+
+        using var document = SpreadsheetDocument.Open(
+            Path.Combine(directory.Path, "result.xlsx"), false);
+        var workbookPart = Assert.IsType<WorkbookPart>(document.WorkbookPart);
+        var workbook = Assert.IsType<Workbook>(workbookPart.Workbook);
+        var sheets = Assert.IsType<Sheets>(workbook.Sheets).Elements<Sheet>().ToArray();
+        var metadata = Assert.Single(
+            sheets, sheet => sheet.Name == LocalResultWorkbookManifest.SheetName);
+        Assert.Equal(SheetStateValues.VeryHidden, metadata.State?.Value);
+        Assert.Single(sheets, sheet => sheet.State?.Value == SheetStateValues.VeryHidden);
+    }
+
+    [Fact]
+    public void ManifestRejectsDuplicateIdentityAndNonCanonicalFingerprint()
+    {
+        var key = new LocalResultExportKey(
+            LocalResultOwnerKind.TransferBatch,
+            Guid.Parse("33333333-3333-3333-3333-333333333333"),
+            LocalResultExportKind.ReplacementWorkbook,
+            1);
+        var operation = new LocalResultOperationEvidence(
+            "BaiduTransfer",
+            Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            Guid.Parse("22222222-2222-2222-2222-222222222222"),
+            3,
+            new string('a', 64));
+
+        Assert.Throws<ArgumentException>(() => new LocalResultWorkbookManifest(
+            key, new string('b', 64), [operation, operation with { ContentFingerprint = new string('c', 64) }]));
+        Assert.Throws<ArgumentException>(() => new LocalResultWorkbookManifest(
+            key, new string('B', 64), [operation]));
     }
 
     [Fact]
