@@ -92,9 +92,28 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 cancellationToken).ConfigureAwait(false);
             var existingStage = EffectiveRecoverableStage(existing);
             if (existingStage == WebAutomationAttemptState.BaselinePersisted)
-                return BaiduAdapterResult<TransferPreparationReceipt>.Success(
-                    TransferPreparationReceipt.Ready,
-                    SubmissionAcceptance.DefinitelyNotAccepted);
+            {
+                var prepared = Prepared();
+                if (existing!.State != WebAutomationAttemptState.UserHandoff)
+                    return prepared;
+                try
+                {
+                    var resumed = await broker.EnqueueAsync(
+                        Request(
+                            context,
+                            share,
+                            (_, _, _) => Task.FromResult(prepared)),
+                        cancellationToken).ConfigureAwait(false);
+                    return resumed.Disposition is VisibleWebAutomationDisposition.ActionCompleted &&
+                           resumed.Value is not null
+                        ? resumed.Value
+                        : Unknown<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+                }
+                catch (WebAutomationAuthorizationException)
+                {
+                    return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+                }
+            }
             if (existing is not null && existingStage != WebAutomationAttemptState.Preparing)
                 return Unknown<TransferPreparationReceipt>(SubmissionAcceptance.Unknown);
         }
@@ -210,7 +229,31 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             return BaiduAdapterResult<TransferConfirmationResult>.Success(
                 TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
                 SubmissionAcceptance.Unknown);
-        if (EffectiveRecoverableStage(attempt) != WebAutomationAttemptState.ResultPending)
+        var effectiveStage = EffectiveRecoverableStage(attempt);
+        if (effectiveStage == WebAutomationAttemptState.BaselinePersisted)
+        {
+            var absent = DefinitelyNotSubmittedConfirmation();
+            if (attempt!.State != WebAutomationAttemptState.UserHandoff)
+                return absent;
+            try
+            {
+                var resumed = await broker.EnqueueAsync(
+                    Request(
+                        context,
+                        context.SourceShare,
+                        (_, _, _) => Task.FromResult(absent)),
+                    cancellationToken).ConfigureAwait(false);
+                return resumed.Disposition is VisibleWebAutomationDisposition.ActionCompleted &&
+                       resumed.Value is not null
+                    ? resumed.Value
+                    : UnknownConfirmation();
+            }
+            catch (WebAutomationAuthorizationException)
+            {
+                return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
+            }
+        }
+        if (effectiveStage != WebAutomationAttemptState.ResultPending)
             return UnknownConfirmation();
         var baseline = attempt!.Baseline!;
         var acceptedRemoteItems = attempt.AcceptedRemoteItems!;
@@ -352,6 +395,16 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             BaiduErrorKind.NotValidated,
             adapterDiagnostic: null,
             submissionAcceptance: acceptance);
+
+    private static BaiduAdapterResult<TransferPreparationReceipt> Prepared() =>
+        BaiduAdapterResult<TransferPreparationReceipt>.Success(
+            TransferPreparationReceipt.Ready,
+            SubmissionAcceptance.DefinitelyNotAccepted);
+
+    private static BaiduAdapterResult<TransferConfirmationResult> DefinitelyNotSubmittedConfirmation() =>
+        BaiduAdapterResult<TransferConfirmationResult>.Success(
+            TransferConfirmationResult.Absent,
+            SubmissionAcceptance.DefinitelyNotAccepted);
 
     private static BaiduAdapterResult<T> Unknown<T>(SubmissionAcceptance acceptance) =>
         BaiduAdapterResult<T>.Failure(

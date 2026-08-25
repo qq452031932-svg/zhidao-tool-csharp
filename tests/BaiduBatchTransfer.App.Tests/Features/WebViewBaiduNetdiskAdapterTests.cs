@@ -412,6 +412,127 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Null(broker.Identity);
     }
 
+    [Fact]
+    public async Task BaselinePersistedUserHandoffPrepareResumesBeforeReadyAndReusesBaselineForSubmit()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var baseline = WebAutomationBaseline.Create(["fictional-old"]);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            baseline,
+            resumeStage: WebAutomationAttemptState.BaselinePersisted));
+        var session = new AutomationSession();
+        var broker = new CallbackBroker(attempts, session);
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var prepared = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(prepared.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.BaselinePersisted, attempts.Current.State);
+        Assert.Equal(1, broker.EnqueueCount);
+        Assert.Empty(session.Events);
+
+        var saved = await adapter.SaveWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(saved.IsSuccess);
+        Assert.Equal(2, broker.EnqueueCount);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(baseline, attempts.Current.Baseline);
+        Assert.DoesNotContain("open-destination", session.Events);
+        Assert.Contains("mark-submitting", session.Events);
+        Assert.Contains("submit", session.Events);
+    }
+
+    [Fact]
+    public async Task BaselinePersistedAttemptProvesNoSubmissionDuringReconciliation()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationBaseline.Create(["fictional-old"])));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.Absent, result.Value!.State);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Null(broker.Identity);
+    }
+
+    [Fact]
+    public async Task BaselinePersistedUserHandoffMustResumeBeforeProvingNoSubmission()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            resumeStage: WebAutomationAttemptState.BaselinePersisted));
+        var session = new AutomationSession();
+        var broker = new CallbackBroker(attempts, session);
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.Absent, result.Value!.State);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Equal(1, broker.EnqueueCount);
+        Assert.Equal(WebAutomationAttemptState.BaselinePersisted, attempts.Current.State);
+        Assert.Empty(session.Events);
+    }
+
+    [Theory]
+    [InlineData(WebAutomationAttemptState.Submitting, false, null)]
+    [InlineData(WebAutomationAttemptState.UserHandoff, false, WebAutomationAttemptState.Submitting)]
+    [InlineData(WebAutomationAttemptState.BaselinePersisted, true, null)]
+    public async Task UncertainOrInconsistentAttemptCannotBeDeclaredNotSubmitted(
+        WebAutomationAttemptState state,
+        bool includeAcceptedEvidence,
+        WebAutomationAttemptState? resumeStage)
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            state,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            includeAcceptedEvidence ? AcceptedItems() : null,
+            resumeStage));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.Null(broker.Identity);
+    }
+
     private static ShareReference Share() =>
         new("fictional-share", "https://pan.baidu.com/s/fictional", "1111");
 
@@ -574,10 +695,13 @@ public sealed class WebViewBaiduNetdiskAdapterTests
 
     private sealed class CallbackBroker(AttemptStore attempts, AutomationSession session) : IVisibleWebAutomationBroker
     {
+        public int EnqueueCount { get; private set; }
+
         public async Task<VisibleWebAutomationResult<T>> EnqueueAsync<T>(
             VisibleWebAutomationRequest<T> request,
             CancellationToken cancellationToken = default)
         {
+            EnqueueCount++;
             var initialStage = attempts.Current.State;
             if (initialStage == WebAutomationAttemptState.UserHandoff)
             {
@@ -615,6 +739,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
 
     private sealed class AutomationSession : IVisibleWebAutomationSession, ITransferAutomationSession
     {
+        public List<string> Events { get; } = [];
         public IReadOnlyList<RemoteItemIdentity> CurrentItems { get; init; } =
             [new("fictional-old", "旧资源"), new("fictional-new", "新资源")];
         public bool CancelListingRead { get; init; }
@@ -625,15 +750,19 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
-            Task.FromResult(new TransferSourceListing(1, new string('b', 64)));
+            Record("open-share", new TransferSourceListing(1, new string('b', 64)));
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
-            Task.FromResult(new TransferDirectoryListing(true, true, [new("fictional-old", "旧资源")], new string('c', 64)));
+            Record("open-destination", new TransferDirectoryListing(true, true, [new("fictional-old", "旧资源")], new string('c', 64)));
         public Task PersistBaselineAsync(WebAutomationBaseline baseline, string observationFingerprint, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task MarkSubmittingAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task MarkSubmittingAsync(CancellationToken cancellationToken)
+        {
+            Events.Add("mark-submitting");
+            return Task.CompletedTask;
+        }
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
-            Task.FromResult(Acceptance());
+            Record("submit", Acceptance());
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
             CancelListingRead
@@ -644,6 +773,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             "fictional-request",
             new RemoteItemIdentitySet([new("fictional-new", "新资源")]),
             new string('e', 64));
+
+        private Task<T> Record<T>(string name, T value)
+        {
+            Events.Add(name);
+            return Task.FromResult(value);
+        }
     }
 
     private sealed class InlineDispatcher : IWebAutomationUiDispatcher

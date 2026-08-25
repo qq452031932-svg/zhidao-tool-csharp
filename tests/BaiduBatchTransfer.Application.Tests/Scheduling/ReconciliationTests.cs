@@ -426,7 +426,7 @@ public sealed class ReconciliationTests
         var data = await SeedPendingShareAsync(db, "预检标题");
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var service = new OperationReconciliationService(
-            new ConfirmationAdapter
+            new OperationBoundConfirmationAdapter
             {
                 ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
                     TransferConfirmationResult.Absent,
