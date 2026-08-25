@@ -220,6 +220,48 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             return;
         }
 
+        TransferOperationAutomationContext? automationContext = null;
+        if (adapter is IOperationBoundBaiduNetdiskAdapter operationBoundAdapter)
+        {
+            automationContext = new TransferOperationAutomationContext(
+                snapshot.OperationId,
+                snapshot.BatchId,
+                snapshot.AccountId,
+                attemptCount,
+                snapshot.Share).Validate();
+            BaiduAdapterResult<TransferPreparationReceipt> preparation;
+            try
+            {
+                preparation = await operationBoundAdapter.PrepareWholeShareForOperationAsync(
+                    automationContext,
+                    session,
+                    snapshot.Share,
+                    directoryResult.Value!,
+                    snapshot.DuplicatePolicy,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return;
+            }
+            if (!preparation.IsSuccess)
+            {
+                var error = preparation.ErrorKind!.Value;
+                if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+                    await PauseAccountBeforeSubmissionAsync(
+                        snapshot.OperationId, error, session.CapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
+                else if (IsAccountPausingFailure(error))
+                    await FailAndPauseAccountAsync(snapshot.OperationId, error, attemptCount, cancellationToken).ConfigureAwait(false);
+                else
+                    await FailAsync(snapshot.OperationId, error, false, attemptCount, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+        }
+
         now = timeProvider.GetUtcNow();
         var descriptor = SerializeDescriptor(snapshot, completePath, now);
         var boundary = await dailyLimit.PersistFirstSubmissionAsync(
@@ -245,12 +287,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         {
             saveResult = adapter is IOperationBoundBaiduNetdiskAdapter operationBound
                 ? await operationBound.SaveWholeShareForOperationAsync(
-                    new TransferOperationAutomationContext(
-                        snapshot.OperationId,
-                        snapshot.BatchId,
-                        snapshot.AccountId,
-                        attemptCount,
-                        snapshot.Share).Validate(),
+                    automationContext!,
                     session,
                     snapshot.Share,
                     directoryResult.Value!,

@@ -120,7 +120,8 @@ public sealed class DatabaseRecoveryTests : IDisposable
         await using var verify = await factory.OpenConnectionAsync();
         await using var versionCommand = verify.CreateCommand();
         versionCommand.CommandText = "SELECT MAX(Version) FROM SchemaVersions;";
-        Assert.Equal(8L, Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
+        Assert.Equal((long)DatabaseMigrator.LatestVersion,
+            Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
         await using var indexCommand = verify.CreateCommand();
         indexCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='IX_ExecutionLogs_Account_Id';";
         Assert.Equal(1L, Convert.ToInt64(await indexCommand.ExecuteScalarAsync()));
@@ -151,7 +152,7 @@ public sealed class DatabaseRecoveryTests : IDisposable
 
         await recovery.RestoreAsync(candidate.Path);
 
-        Assert.Equal(9, DatabaseMigrator.LatestVersion);
+        Assert.Equal(11, DatabaseMigrator.LatestVersion);
         await using var verify = await factory.OpenConnectionAsync();
         await using var versionCommand = verify.CreateCommand();
         versionCommand.CommandText = "SELECT MAX(Version), COUNT(*) FROM SchemaVersions WHERE Version=$version;";

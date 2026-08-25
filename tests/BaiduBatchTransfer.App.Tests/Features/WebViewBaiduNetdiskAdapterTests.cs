@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Reflection;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
@@ -12,19 +13,20 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     private static readonly DateTimeOffset Now = new(2026, 8, 25, 3, 0, 0, TimeSpan.Zero);
 
     [Fact]
-    public async Task OperationBoundSaveQueuesExactAuthoritativeIdentityAndCanonicalProfile()
+    public async Task OperationBoundPrepareQueuesExactAuthoritativeIdentityAndCanonicalProfile()
     {
         var accountId = Guid.NewGuid();
         var operationId = Guid.NewGuid();
         var batchId = Guid.NewGuid();
         var broker = new RecordingBroker();
         var profiles = new RecordingProfilePolicy(accountId);
-        var adapter = new WebViewBaiduNetdiskAdapter(
-            new ReadOnlyAdapter(), broker, profiles, new TransferAutomationFlow(), "build-a");
         var context = new TransferOperationAutomationContext(
             operationId, batchId, accountId, 3, Share());
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, profiles, new TransferAutomationFlow(), "build-a",
+            new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null)));
 
-        var result = await adapter.SaveWholeShareForOperationAsync(
+        var result = await adapter.PrepareWholeShareForOperationAsync(
             context,
             Session(accountId),
             Share(),
@@ -40,6 +42,28 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Equal(BaiduProtocolValidationStatus.NotValidated,
             broker.Navigation.FieldEvidenceValidationStatus);
         Assert.False(broker.Navigation.Acceptance.IsAccepted);
+    }
+
+    [Fact]
+    public async Task PreparedRetryReusesPersistedBaselineWithoutOpeningAnotherWindow()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationBaseline.Create(["fictional-old"])));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(broker.Identity);
     }
 
     [Fact]
@@ -71,7 +95,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share());
 
-        var result = await adapter.SaveWholeShareForOperationAsync(
+        var result = await adapter.PrepareWholeShareForOperationAsync(
             context,
             Session(accountId),
             Share(),
@@ -113,7 +137,11 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var context = new TransferOperationAutomationContext(
             Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
         var baseline = WebAutomationBaseline.Create(["fictional-old"]);
-        var attempts = new AttemptStore(Attempt(context, WebAutomationAttemptState.ResultPending, baseline));
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            baseline,
+            AcceptedItems()));
         var broker = new RecordingBroker();
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
@@ -154,6 +182,131 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Null(broker.Identity);
     }
 
+    [Fact]
+    public async Task ActiveExactTransferAdvancesPersistentWebAttemptToSucceeded()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationBaseline.Create(["fictional-old"])));
+        var broker = new CallbackBroker(attempts, new AutomationSession());
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.SaveWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(["fictional-new"],
+            attempts.Current.AcceptedRemoteItems!.Items.Select(item => item.ExactId));
+    }
+
+    [Fact]
+    public async Task RecoveryExactTransferAdvancesPersistentWebAttemptToSucceeded()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        var broker = new CallbackBroker(attempts, new AutomationSession());
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+    }
+
+    [Fact]
+    public async Task RecoveryWithoutAcceptedTargetInListingStaysResultPending()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        var broker = new CallbackBroker(
+            attempts,
+            new AutomationSession { CurrentItems = [new("fictional-old", "旧资源")] });
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
+    }
+
+    [Fact]
+    public async Task RecoveryCancellationDoesNotMutateResultPendingAttempt()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var broker = new CallbackBroker(
+            attempts,
+            new AutomationSession { CancelListingRead = true });
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            adapter.ConfirmExactTransferForOperationAsync(
+                context, Session(accountId), Query(), cancelled.Token));
+
+        Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
+    }
+
+    [Fact]
+    public async Task SucceededAttemptReturnsPersistedExactEvidenceWithoutOpeningRecoveryWindow()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(AcceptedItems(), result.Value!.RemoteItems);
+        Assert.Null(broker.Identity);
+    }
+
     private static ShareReference Share() =>
         new("fictional-share", "https://pan.baidu.com/s/fictional", "1111");
 
@@ -171,7 +324,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     private static WebAutomationAttemptRecord Attempt(
         TransferOperationAutomationContext context,
         WebAutomationAttemptState state,
-        WebAutomationBaseline? baseline) => new(
+        WebAutomationBaseline? baseline,
+        RemoteItemIdentitySet? acceptedRemoteItems = null) => new(
             context.OperationId,
             context.AccountId,
             context.Generation,
@@ -183,7 +337,11 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             false,
             2,
             Now.AddMinutes(-2),
-            Now.AddMinutes(-1));
+            Now.AddMinutes(-1),
+            acceptedRemoteItems);
+
+    private static RemoteItemIdentitySet AcceptedItems() =>
+        new([new("fictional-new", "新资源")]);
 
     private static AccountSession Session(Guid accountId) => new(
         accountId,
@@ -209,13 +367,15 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 throw new WebAutomationAuthorizationException(
                     BaiduAutomationDenialReason.CatalogNotValidated,
                     "synthetic authorization denial");
-            object value = typeof(T) == typeof(BaiduAdapterResult<TransferReceipt>)
-                ? BaiduAdapterResult<TransferReceipt>.Success(
+            object value = typeof(T) == typeof(BaiduAdapterResult<TransferPreparationReceipt>)
+                ? BaiduAdapterResult<TransferPreparationReceipt>.Success(TransferPreparationReceipt.Ready)
+                : typeof(T) == typeof(BaiduAdapterResult<TransferReceipt>)
+                    ? BaiduAdapterResult<TransferReceipt>.Success(
                     TransferReceipt.WithExactEvidence(
                         Now,
                         "fictional-request",
                         new RemoteItemIdentitySet([new("fictional-new", "新资源")])))
-                : BaiduAdapterResult<TransferConfirmationResult>.Success(
+                    : BaiduAdapterResult<TransferConfirmationResult>.Success(
                     TransferConfirmationResult.ExactPresent(
                         new RemoteItemIdentitySet([new("fictional-new", "新资源")]))) ;
             return Task.FromResult(new VisibleWebAutomationResult<T>(
@@ -227,17 +387,140 @@ public sealed class WebViewBaiduNetdiskAdapterTests
 
     private sealed class AttemptStore(WebAutomationAttemptRecord attempt) : IWebAutomationAttemptStore
     {
+        public WebAutomationAttemptRecord Current { get; private set; } = attempt;
+
         public Task<WebAutomationAttemptRecord?> GetAsync(Guid operationId, Guid accountId, int generation, CancellationToken cancellationToken = default) =>
             Task.FromResult<WebAutomationAttemptRecord?>(
-                operationId == attempt.OperationId && accountId == attempt.AccountId && generation == attempt.Generation
-                    ? attempt
+                operationId == Current.OperationId && accountId == Current.AccountId && generation == Current.Generation
+                    ? Current
                     : null);
         public Task<bool> BeginAsync(WebAutomationAttemptRecord value, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<Page<WebAutomationAttemptRecord>> GetRecoveryPageAsync(PageQuery query, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<bool> TryPersistBaselineAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationBaseline baseline, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<bool> TryAdvanceAsync(Guid operationId, Guid accountId, int generation, WebAutomationAttemptState expectedState, long expectedRevision, WebAutomationAttemptState nextState, string? observationFingerprint, bool isWaitingForUser, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> TryAdvanceAsync(Guid operationId, Guid accountId, int generation, WebAutomationAttemptState expectedState, long expectedRevision, WebAutomationAttemptState nextState, string? observationFingerprint, bool isWaitingForUser, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || expectedState != Current.State ||
+                expectedRevision != Current.Revision)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId,
+                Current.AccountId,
+                Current.Generation,
+                Current.OwnerKind,
+                nextState,
+                null,
+                Current.Baseline,
+                observationFingerprint ?? Current.ObservationFingerprint,
+                isWaitingForUser,
+                checked(Current.Revision + 1),
+                Current.CreatedAt,
+                updatedAt,
+                Current.AcceptedRemoteItems);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryPersistOfficialAcceptanceAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, RemoteItemIdentitySet acceptedRemoteItems, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.Submitting ||
+                expectedRevision != Current.Revision)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId,
+                Current.AccountId,
+                Current.Generation,
+                Current.OwnerKind,
+                WebAutomationAttemptState.ResultPending,
+                null,
+                Current.Baseline,
+                observationFingerprint,
+                false,
+                checked(Current.Revision + 1),
+                Current.CreatedAt,
+                updatedAt,
+                acceptedRemoteItems);
+            return Task.FromResult(true);
+        }
         public Task<bool> TryResumeFromUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<bool> TryResolveUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, WebAutomationAttemptState terminalState, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class CallbackBroker(AttemptStore attempts, AutomationSession session) : IVisibleWebAutomationBroker
+    {
+        public async Task<VisibleWebAutomationResult<T>> EnqueueAsync<T>(
+            VisibleWebAutomationRequest<T> request,
+            CancellationToken cancellationToken = default)
+        {
+            var dispatcher = new InlineDispatcher();
+            var coordinator = new UserHandoffCoordinator(attempts, new NoBatchCancellation(), new FixedTimeProvider(Now));
+            var context = (VisibleWebAutomationContext)Activator.CreateInstance(
+                typeof(VisibleWebAutomationContext),
+                BindingFlags.Instance | BindingFlags.NonPublic,
+                binder: null,
+                [
+                    request.Identity,
+                    session,
+                    dispatcher,
+                    coordinator,
+                    attempts.Current.State,
+                    attempts.Current.ObservationFingerprint,
+                ],
+                culture: null)!;
+            var value = await request.Action(session, context, cancellationToken);
+            return new(VisibleWebAutomationDisposition.ActionCompleted, value, context.CurrentStage);
+        }
+    }
+
+    private sealed class AutomationSession : IVisibleWebAutomationSession, ITransferAutomationSession
+    {
+        public IReadOnlyList<RemoteItemIdentity> CurrentItems { get; init; } =
+            [new("fictional-old", "旧资源"), new("fictional-new", "新资源")];
+        public bool CancelListingRead { get; init; }
+        public CancellationToken UserClosed => CancellationToken.None;
+        public Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task ShowHandoffAsync(WebAutomationHandoffPrompt prompt, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<WebAutomationUserChoice> WaitForHandoffChoiceAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
+            Task.FromResult(new TransferSourceListing(1, new string('b', 64)));
+        public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
+            Task.FromResult(new TransferDirectoryListing(true, true, [new("fictional-old", "旧资源")], new string('c', 64)));
+        public Task PersistBaselineAsync(WebAutomationBaseline baseline, string observationFingerprint, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task MarkSubmittingAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
+            Task.FromResult(Acceptance());
+        public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
+            CancelListingRead
+                ? Task.FromException<TransferDirectoryListing>(new OperationCanceledException(cancellationToken))
+                : Task.FromResult(new TransferDirectoryListing(true, true, CurrentItems, new string('d', 64)));
+        private static TransferOfficialAcceptance Acceptance() => new(
+            true,
+            "fictional-request",
+            new RemoteItemIdentitySet([new("fictional-new", "新资源")]),
+            new string('e', 64));
+    }
+
+    private sealed class InlineDispatcher : IWebAutomationUiDispatcher
+    {
+        public Task<T> InvokeAsync<T>(Func<Task<T>> action, CancellationToken cancellationToken = default) => action();
+        public Task InvokeAsync(Func<Task> action, CancellationToken cancellationToken = default) => action();
+    }
+
+    private sealed class NoBatchCancellation : IWebAutomationBatchCancellation
+    {
+        public Task<WebAutomationBatchCancellationResult> CancelAsync(WebAutomationRequestIdentity identity, long expectedAttemptRevision, WebAutomationAttemptState expectedResumeStage, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> IsCancelledAsync(Guid batchId, WebAutomationOwnerKind ownerKind, CancellationToken cancellationToken = default) => Task.FromResult(false);
+        public IDisposable Register(Guid batchId, WebAutomationOwnerKind ownerKind, Action cancellationRequested) => new NoopDisposable();
+        private sealed class NoopDisposable : IDisposable { public void Dispose() { } }
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => value;
     }
 
     private sealed class RecordingProfilePolicy(Guid accountId) : IAccountProfilePathPolicy

@@ -7,5 +7,6 @@
     { "exactId": "fictional-multi-b", "displayName": "顶层乙" },
     { "exactId": "fictional-multi-c", "displayName": "顶层丙" }
   ],
-  "officialAccepted": true
+  "officialAccepted": true,
+  "officialRemoteIds": ["fictional-multi-a", "fictional-multi-b", "fictional-multi-c"]
 }

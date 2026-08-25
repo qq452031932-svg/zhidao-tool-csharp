@@ -74,6 +74,68 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         CancellationToken cancellationToken) =>
         readOnlyAdapter.ConfirmTransferAsync(session, query, cancellationToken);
 
+    public async Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        ShareReference share,
+        RemoteDirectory destination,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken)
+    {
+        ValidateOperationIdentity(context, session, share);
+        if (attemptStore is not null)
+        {
+            var existing = await attemptStore.GetAsync(
+                context.OperationId,
+                context.AccountId,
+                context.Generation,
+                cancellationToken).ConfigureAwait(false);
+            if (existing is
+                {
+                    OwnerKind: WebAutomationOwnerKind.Transfer,
+                    State: WebAutomationAttemptState.BaselinePersisted,
+                    Baseline: not null,
+                })
+                return BaiduAdapterResult<TransferPreparationReceipt>.Success(
+                    TransferPreparationReceipt.Ready,
+                    SubmissionAcceptance.DefinitelyNotAccepted);
+            if (existing is not null && existing.State != WebAutomationAttemptState.Preparing)
+                return Unknown<TransferPreparationReceipt>(SubmissionAcceptance.Unknown);
+        }
+        var request = Request(
+            context,
+            share,
+            async (visibleSession, visibleContext, token) =>
+            {
+                if (visibleSession is not ITransferAutomationSession automationSession)
+                    return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+                var result = await flow.PrepareAsync(
+                    new PersistentTransferAutomationSession(automationSession, visibleContext),
+                    new TransferAutomationRequest(share, destination, duplicatePolicy),
+                    token).ConfigureAwait(false);
+                return result.IsSuccess
+                    ? BaiduAdapterResult<TransferPreparationReceipt>.Success(
+                        TransferPreparationReceipt.Ready,
+                        SubmissionAcceptance.DefinitelyNotAccepted)
+                    : BaiduAdapterResult<TransferPreparationReceipt>.Failure(
+                        result.ErrorKind!.Value,
+                        adapterDiagnostic: null,
+                        result.RetryAfter,
+                        result.SubmissionAcceptance);
+            });
+        try
+        {
+            var result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false);
+            if (result.Disposition is VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null)
+                return result.Value;
+            return Unknown<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+        catch (WebAutomationAuthorizationException)
+        {
+            return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+    }
+
     public async Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
@@ -82,34 +144,34 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         DuplicatePolicy duplicatePolicy,
         CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(context);
-        ArgumentNullException.ThrowIfNull(session);
-        ArgumentNullException.ThrowIfNull(share);
+        ValidateOperationIdentity(context, session, share);
         ArgumentNullException.ThrowIfNull(destination);
-        context.Validate();
-        if (context.AccountId != session.LocalAccountId || context.SourceShare != share)
-            throw new InvalidOperationException("The transfer automation identity does not match its account or source share.");
-
-        var identity = new WebAutomationRequestIdentity(
+        if (attemptStore is null) return Unknown<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        var attempt = await attemptStore.GetAsync(
             context.OperationId,
-            context.BatchId,
             context.AccountId,
             context.Generation,
-            WebAutomationOwnerKind.Transfer);
-        var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
-        profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        var request = new VisibleWebAutomationRequest<BaiduAdapterResult<TransferReceipt>>(
-            identity,
-            profilePath,
-            Navigation(new Uri(share.OriginalUrl)),
+            cancellationToken).ConfigureAwait(false);
+        if (attempt is not
+            {
+                OwnerKind: WebAutomationOwnerKind.Transfer,
+                State: WebAutomationAttemptState.BaselinePersisted,
+                Baseline: not null,
+            })
+            return Unknown<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        var request = Request(
+            context,
+            share,
             async (visibleSession, visibleContext, token) =>
             {
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
-                return await flow.ExecuteAsync(
+                var result = await flow.SubmitAsync(
                     new PersistentTransferAutomationSession(automationSession, visibleContext),
                     new TransferAutomationRequest(share, destination, duplicatePolicy),
+                    attempt.Baseline,
                     token).ConfigureAwait(false);
+                return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
         VisibleWebAutomationResult<BaiduAdapterResult<TransferReceipt>> result;
         try { result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false); }
@@ -144,37 +206,44 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+        if (attempt is
+            {
+                OwnerKind: WebAutomationOwnerKind.Transfer,
+                State: WebAutomationAttemptState.Succeeded,
+                AcceptedRemoteItems: not null,
+            })
+            return BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
+                SubmissionAcceptance.Unknown);
         if (attempt is not
             {
                 OwnerKind: WebAutomationOwnerKind.Transfer,
                 State: WebAutomationAttemptState.ResultPending,
                 Baseline: not null,
+                AcceptedRemoteItems: not null,
             })
             return UnknownConfirmation();
 
-        var identity = new WebAutomationRequestIdentity(
-            context.OperationId,
-            context.BatchId,
-            context.AccountId,
-            context.Generation,
-            WebAutomationOwnerKind.Transfer);
-        var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
-        profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
-        var request = new VisibleWebAutomationRequest<BaiduAdapterResult<TransferConfirmationResult>>(
-            identity,
-            profilePath,
-            Navigation(new Uri(context.SourceShare.OriginalUrl)),
-            async (visibleSession, _, token) =>
+        var request = Request(
+            context,
+            context.SourceShare,
+            async (visibleSession, visibleContext, token) =>
             {
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
-                return await flow.ConfirmExactAsync(
+                var officialAcceptance = new TransferOfficialAcceptance(
+                    true,
+                    adapterRequestId: null,
+                    attempt.AcceptedRemoteItems,
+                    attempt.ObservationFingerprint ?? attempt.AcceptedRemoteItems.Fingerprint);
+                var result = await flow.ConfirmExactAsync(
                     automationSession,
                     context.SourceShare,
                     new RemoteDirectory(query.TargetPath.Value, query.TargetPath),
                     attempt.Baseline,
-                    officialAcceptancePersisted: true,
+                    officialAcceptance,
                     token).ConfigureAwait(false);
+                return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
         VisibleWebAutomationResult<BaiduAdapterResult<TransferConfirmationResult>> result;
         try { result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false); }
@@ -199,6 +268,73 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             BaiduSelectorCatalog.SelectorVersion,
             applicationBuildVersion),
         BaiduProtocolValidationStatus.NotValidated);
+
+    private VisibleWebAutomationRequest<T> Request<T>(
+        TransferOperationAutomationContext context,
+        ShareReference share,
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+    {
+        var identity = new WebAutomationRequestIdentity(
+            context.OperationId,
+            context.BatchId,
+            context.AccountId,
+            context.Generation,
+            WebAutomationOwnerKind.Transfer);
+        var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
+        profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
+        return new(identity, profilePath, Navigation(new Uri(share.OriginalUrl)), action);
+    }
+
+    private static void ValidateOperationIdentity(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        ShareReference share)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(share);
+        context.Validate();
+        if (context.AccountId != session.LocalAccountId || context.SourceShare != share)
+            throw new InvalidOperationException("The transfer automation identity does not match its account or source share.");
+    }
+
+    private static async Task<BaiduAdapterResult<TransferReceipt>> MarkSucceededAfterExactAsync(
+        BaiduAdapterResult<TransferReceipt> result,
+        VisibleWebAutomationContext context,
+        CancellationToken cancellationToken)
+    {
+        if (!result.IsSuccess || result.Value!.ExactRemoteItems is null) return result;
+        try
+        {
+            await context.AdvancePersistentStageAsync(
+                WebAutomationAttemptState.ResultPending,
+                WebAutomationAttemptState.Succeeded,
+                null,
+                cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception) { return Unknown<TransferReceipt>(SubmissionAcceptance.Unknown); }
+    }
+
+    private static async Task<BaiduAdapterResult<TransferConfirmationResult>> MarkSucceededAfterExactAsync(
+        BaiduAdapterResult<TransferConfirmationResult> result,
+        VisibleWebAutomationContext context,
+        CancellationToken cancellationToken)
+    {
+        if (!result.IsSuccess || result.Value!.State != TransferConfirmationState.ExactPresent) return result;
+        try
+        {
+            await context.AdvancePersistentStageAsync(
+                WebAutomationAttemptState.ResultPending,
+                WebAutomationAttemptState.Succeeded,
+                null,
+                cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception) { return UnknownConfirmation(); }
+    }
 
     private static BaiduAdapterResult<T> NotValidated<T>(SubmissionAcceptance acceptance) =>
         BaiduAdapterResult<T>.Failure(
@@ -255,9 +391,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
 
         public async Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken)
         {
-            await context.AdvancePersistentStageAsync(
-                WebAutomationAttemptState.Submitting,
-                WebAutomationAttemptState.ResultPending,
+            if (!acceptance.IsAccepted || acceptance.ExactRemoteItems is null)
+                throw new InvalidOperationException("Official acceptance did not include exact remote identities.");
+            await context.PersistOfficialAcceptanceAsync(
+                acceptance.ExactRemoteItems,
                 acceptance.ObservationFingerprint,
                 cancellationToken).ConfigureAwait(false);
             await inner.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);

@@ -3,6 +3,7 @@ using System.IO;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -547,6 +548,23 @@ public sealed class VisibleWebAutomationContext
             sanitizedObservationFingerprint,
             cancellationToken).ConfigureAwait(false);
         currentStage = nextState;
+        observationFingerprint = sanitizedObservationFingerprint;
+    }
+
+    public async Task PersistOfficialAcceptanceAsync(
+        RemoteItemIdentitySet acceptedRemoteItems,
+        string sanitizedObservationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureActive();
+        if (currentStage != WebAutomationAttemptState.Submitting)
+            throw new InvalidOperationException("当前浏览器阶段不能保存官方接受证据。");
+        await coordinator.PersistOfficialAcceptanceAsync(
+            Identity,
+            acceptedRemoteItems,
+            sanitizedObservationFingerprint,
+            cancellationToken).ConfigureAwait(false);
+        currentStage = WebAutomationAttemptState.ResultPending;
         observationFingerprint = sanitizedObservationFingerprint;
     }
 

@@ -24,8 +24,23 @@ public sealed record TransferOperationAutomationContext(
         "TransferOperationAutomationContext { Identity = [REDACTED], SourceShare = [REDACTED] }";
 }
 
+public sealed record TransferPreparationReceipt
+{
+    private TransferPreparationReceipt() { }
+
+    public static TransferPreparationReceipt Ready { get; } = new();
+}
+
 public interface IOperationBoundBaiduNetdiskAdapter : IBaiduNetdiskAdapter
 {
+    Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        ShareReference share,
+        RemoteDirectory destination,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken);
+
     Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,

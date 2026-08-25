@@ -27,7 +27,41 @@ public sealed class TransferAutomationFlowTests
             result.Value.ExactRemoteItems.Items.Select(item => item.ExactId));
         Assert.Equal(scenario.Baseline.Order(StringComparer.Ordinal), session.PersistedBaseline!.Items.Select(x => x.ExactId));
         Assert.Equal(
-            ["open-share", "enter-code", "open-destination", "persist-baseline", "return-share", "mark-submitting", "submit", "persist-acceptance", "reopen-destination"],
+            ["open-share", "enter-code", "open-destination", "persist-baseline", "open-share", "enter-code", "mark-submitting", "submit", "persist-acceptance", "reopen-destination"],
+            session.Events);
+    }
+
+    [Fact]
+    public async Task PreparePersistsCompleteBaselineWithoutEnteringSubmission()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario);
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+
+        var result = await flow.PrepareAsync(session, Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["open-share", "enter-code", "open-destination", "persist-baseline"], session.Events);
+        Assert.DoesNotContain("mark-submitting", session.Events);
+        Assert.DoesNotContain("submit", session.Events);
+    }
+
+    [Fact]
+    public async Task SubmitUsesPersistedBaselineAndMarksSubmittingImmediatelyBeforeClick()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario);
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+
+        var result = await flow.SubmitAsync(
+            session,
+            Request(),
+            WebAutomationBaseline.Create(scenario.Baseline),
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            ["open-share", "enter-code", "mark-submitting", "submit", "persist-acceptance", "reopen-destination"],
             session.Events);
     }
 
@@ -66,6 +100,70 @@ public sealed class TransferAutomationFlowTests
     }
 
     [Fact]
+    public async Task ConcurrentUnrelatedAdditionCannotStandInForSkippedSourceItem()
+    {
+        var scenario = Load("folder-transfer.json") with
+        {
+            After =
+            [
+                new FixtureItem("fictional-baseline-a", "旧资源"),
+                new FixtureItem("fictional-unrelated-apk", "同名.apk"),
+            ],
+            OfficialRemoteIds = [],
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(new FixtureSession(scenario), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+    }
+
+    [Fact]
+    public async Task ConcurrentUnrelatedAdditionAlongsideAcceptedItemRemainsAmbiguous()
+    {
+        var scenario = Load("folder-transfer.json") with
+        {
+            After =
+            [
+                new FixtureItem("fictional-baseline-a", "旧资源"),
+                new FixtureItem("fictional-accepted-folder", "目标文件夹"),
+                new FixtureItem("fictional-unrelated-apk", "另一设备新增.apk"),
+            ],
+            OfficialRemoteIds = ["fictional-accepted-folder"],
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(new FixtureSession(scenario), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+    }
+
+    [Fact]
+    public async Task DeletedBaselineItemPlusNewItemsCannotConfirmTransfer()
+    {
+        var scenario = Load("multi-root-transfer.json") with
+        {
+            Baseline = ["fictional-baseline-a", "fictional-baseline-b"],
+            After =
+            [
+                new FixtureItem("fictional-baseline-a", "旧资源"),
+                new FixtureItem("fictional-target-a", "目标A"),
+                new FixtureItem("fictional-target-b", "目标B"),
+                new FixtureItem("fictional-target-c", "目标C"),
+            ],
+            OfficialRemoteIds = ["fictional-target-a", "fictional-target-b", "fictional-target-c"],
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(new FixtureSession(scenario), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+    }
+
+    [Fact]
     public async Task RecoveryUsesPersistedOfficialAcceptanceAndFullBaselineForExactDifference()
     {
         var scenario = Load("multi-root-transfer.json");
@@ -78,7 +176,7 @@ public sealed class TransferAutomationFlowTests
             Share(),
             Destination(),
             baseline,
-            officialAcceptancePersisted: true,
+            session.OfficialAcceptance,
             CancellationToken.None);
 
         Assert.True(result.IsSuccess);
@@ -98,7 +196,7 @@ public sealed class TransferAutomationFlowTests
             Share(),
             Destination(),
             WebAutomationBaseline.Create(scenario.Baseline),
-            officialAcceptancePersisted: false,
+            new TransferOfficialAcceptance(false, null, null, Fingerprint('d')),
             CancellationToken.None);
 
         Assert.True(result.IsSuccess);
@@ -124,6 +222,13 @@ public sealed class TransferAutomationFlowTests
     {
         public List<string> Events { get; } = [];
         public WebAutomationBaseline? PersistedBaseline { get; private set; }
+        public TransferOfficialAcceptance OfficialAcceptance => new(
+            scenario.OfficialAccepted,
+            "fictional-request",
+            scenario.OfficialRemoteIds is null
+                ? null
+                : new RemoteItemIdentitySet(scenario.OfficialRemoteIds.Select(id => new RemoteItemIdentity(id, id))),
+            Fingerprint('d'));
 
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken)
         {
@@ -165,10 +270,7 @@ public sealed class TransferAutomationFlowTests
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)
         {
             Events.Add("submit");
-            return Task.FromResult(new TransferOfficialAcceptance(
-                scenario.OfficialAccepted,
-                "fictional-request",
-                Fingerprint('d')));
+            return Task.FromResult(OfficialAcceptance);
         }
 
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken)
@@ -191,7 +293,8 @@ public sealed class TransferAutomationFlowTests
         int ExpectedTopLevelCount,
         string[] Baseline,
         FixtureItem[] After,
-        bool OfficialAccepted);
+        bool OfficialAccepted,
+        string[]? OfficialRemoteIds);
 
     private sealed record FixtureItem(string ExactId, string DisplayName);
 

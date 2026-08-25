@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -125,7 +126,8 @@ public sealed class UserHandoffCoordinator
         identity.Validate();
         if ((expectedState, nextState) is not
             (WebAutomationAttemptState.BaselinePersisted, WebAutomationAttemptState.Submitting) and not
-            (WebAutomationAttemptState.Submitting, WebAutomationAttemptState.ResultPending))
+            (WebAutomationAttemptState.Submitting, WebAutomationAttemptState.ResultPending) and not
+            (WebAutomationAttemptState.ResultPending, WebAutomationAttemptState.Succeeded))
             throw new ArgumentException("The requested web automation stage transition is not allowed.", nameof(nextState));
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
         var current = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false)
@@ -144,6 +146,32 @@ public sealed class UserHandoffCoordinator
             timeProvider.GetUtcNow(),
             cancellationToken).ConfigureAwait(false);
         if (!changed) throw new InvalidOperationException("浏览器操作阶段已经变化，阶段未推进。");
+    }
+
+    public async Task PersistOfficialAcceptanceAsync(
+        WebAutomationRequestIdentity identity,
+        RemoteItemIdentitySet acceptedRemoteItems,
+        string observationFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(acceptedRemoteItems);
+        identity.Validate();
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        var current = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("浏览器操作的持久记录不存在。");
+        if (current.OwnerKind != identity.OwnerKind || current.State != WebAutomationAttemptState.Submitting)
+            throw new InvalidOperationException("浏览器操作阶段已经变化，不能保存旧的官方接受证据。");
+        var changed = await store.TryPersistOfficialAcceptanceAsync(
+            identity.OperationId,
+            identity.AccountId,
+            identity.Generation,
+            current.Revision,
+            acceptedRemoteItems,
+            observationFingerprint,
+            timeProvider.GetUtcNow(),
+            cancellationToken).ConfigureAwait(false);
+        if (!changed) throw new InvalidOperationException("浏览器操作阶段已经变化，官方接受证据未保存。");
     }
 
     public async Task<UserHandoffResult> ResolveAsync(

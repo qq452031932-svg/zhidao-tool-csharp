@@ -91,7 +91,8 @@ public sealed record WebAutomationAttemptRecord
         bool isWaitingForUser,
         long revision,
         DateTimeOffset createdAt,
-        DateTimeOffset updatedAt)
+        DateTimeOffset updatedAt,
+        RemoteItemIdentitySet? acceptedRemoteItems = null)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
@@ -130,6 +131,7 @@ public sealed record WebAutomationAttemptRecord
         Revision = revision;
         CreatedAt = createdAt;
         UpdatedAt = updatedAt;
+        AcceptedRemoteItems = acceptedRemoteItems;
     }
 
     public Guid OperationId { get; }
@@ -145,6 +147,7 @@ public sealed record WebAutomationAttemptRecord
     public long Revision { get; }
     public DateTimeOffset CreatedAt { get; }
     public DateTimeOffset UpdatedAt { get; }
+    public RemoteItemIdentitySet? AcceptedRemoteItems { get; }
 
     public static WebAutomationAttemptRecord Create(
         Guid operationId,
@@ -156,7 +159,7 @@ public sealed record WebAutomationAttemptRecord
             null, null, null, false, 0, createdAt, createdAt);
 
     public override string ToString() =>
-        $"WebAutomationAttemptRecord {{ OperationId = {OperationId}, AccountId = {AccountId}, Generation = {Generation}, OwnerKind = {OwnerKind}, State = {State}, ResumeStage = {ResumeStage}, Baseline = [REDACTED], Observation = [REDACTED], IsWaitingForUser = {IsWaitingForUser}, Revision = {Revision} }}";
+        $"WebAutomationAttemptRecord {{ OperationId = {OperationId}, AccountId = {AccountId}, Generation = {Generation}, OwnerKind = {OwnerKind}, State = {State}, ResumeStage = {ResumeStage}, Baseline = [REDACTED], AcceptedRemoteItems = [REDACTED], Observation = [REDACTED], IsWaitingForUser = {IsWaitingForUser}, Revision = {Revision} }}";
 
     public static void ValidateFingerprint(string? value, string parameterName)
     {

@@ -89,6 +89,21 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
                 : inner.SaveWholeShareAsync(session, share, destination, duplicatePolicy, token),
             cancellationToken);
 
+    public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        ShareReference share,
+        RemoteDirectory destination,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken) =>
+        RunAsync(
+            session,
+            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
+                ? operationBound.PrepareWholeShareForOperationAsync(
+                    context, session, share, destination, duplicatePolicy, token)
+                : Task.FromResult(BaiduAdapterResult<TransferPreparationReceipt>.Success(TransferPreparationReceipt.Ready)),
+            cancellationToken);
+
     public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,

@@ -6,5 +6,6 @@
     { "exactId": "fictional-candidate-a", "displayName": "候选甲" },
     { "exactId": "fictional-candidate-b", "displayName": "候选乙" }
   ],
-  "officialAccepted": true
+  "officialAccepted": true,
+  "officialRemoteIds": ["fictional-candidate-a"]
 }

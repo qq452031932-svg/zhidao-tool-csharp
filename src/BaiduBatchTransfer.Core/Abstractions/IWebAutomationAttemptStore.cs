@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IWebAutomationAttemptStore
@@ -37,6 +39,17 @@ public interface IWebAutomationAttemptStore
         bool isWaitingForUser,
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default);
+
+    Task<bool> TryPersistOfficialAcceptanceAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        RemoteItemIdentitySet acceptedRemoteItems,
+        string observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("The attempt store does not support official acceptance evidence.");
 
     Task<bool> TryResumeFromUserHandoffAsync(
         Guid operationId,

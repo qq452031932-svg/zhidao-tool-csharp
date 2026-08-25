@@ -33,14 +33,17 @@ public sealed class MigrationTests : IDisposable
             "new").MigrateAsync();
 
         await using var upgraded = await factory.OpenConnectionAsync();
-        Assert.Equal(10L, await ScalarAsync<long>(upgraded, "SELECT MAX(Version) FROM SchemaVersions;"));
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 10)).IsValid);
+        Assert.Equal((long)DatabaseMigrator.LatestVersion,
+            await ScalarAsync<long>(upgraded, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         var tables = await NamesAsync(upgraded, "table");
         Assert.Subset(new HashSet<string>(tables), new HashSet<string>
         {
             "StandaloneShareBatches", "StandaloneShareOperations", "StandaloneShareRemoteItems",
             "StandaloneShareResults", "BatchResultDestinations", "LocalResultExports",
             "WebAutomationAttempts", "WebAutomationAttemptRemoteItems",
+            "WebAutomationAttemptAcceptedRemoteItems",
         });
 
         var attemptColumns = await ColumnsAsync(upgraded, "WebAutomationAttempts");
@@ -85,8 +88,9 @@ public sealed class MigrationTests : IDisposable
 
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.Equal(1L, await ScalarAsync<long>(
-            upgraded, "SELECT COUNT(*) FROM SchemaVersions WHERE Version=10;"));
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 10)).IsValid);
+            upgraded, "SELECT COUNT(*) FROM SchemaVersions WHERE Version=11;"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
     }
 
     [Fact]
@@ -503,7 +507,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(10, DatabaseMigrator.LatestVersion);
+        Assert.Equal(11, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -552,7 +556,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(10, DatabaseMigrator.LatestVersion);
+        Assert.Equal(11, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));

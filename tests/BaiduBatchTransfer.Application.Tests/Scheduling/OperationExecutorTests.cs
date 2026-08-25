@@ -174,6 +174,42 @@ public sealed class OperationExecutorTests
         Assert.Equal(snapshot.Share, adapter.Context.SourceShare);
     }
 
+    [Fact]
+    public async Task OperationBoundAdapterPersistsBaselineBeforeBusinessSubmissionBoundary()
+    {
+        var snapshot = Snapshot(createFolderName: null) with { BatchId = Guid.NewGuid() };
+        var timeline = new List<string>();
+        var store = new RecordingExecutionStore(snapshot, timeline);
+        var adapter = new OperationBoundRecordingAdapter(timeline);
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal(
+            ["Preparing", "PrepareWebBaseline", "Boundary", "Save", "Identifiers", "Succeeded"],
+            timeline);
+        Assert.Equal(1, adapter.PrepareCalls);
+        Assert.Equal(1, adapter.SaveCalls);
+    }
+
+    [Fact]
+    public async Task CancellationDuringWebBaselinePreparationNeverCrossesBusinessSubmissionBoundary()
+    {
+        var snapshot = Snapshot(createFolderName: null) with { BatchId = Guid.NewGuid() };
+        var store = new RecordingExecutionStore(snapshot);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var adapter = new OperationBoundRecordingAdapter
+        {
+            PrepareException = new OperationCanceledException(cancelled.Token),
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Executor(store, adapter).ExecuteAsync(snapshot.OperationId, cancelled.Token));
+
+        Assert.DoesNotContain(store.Events, item => item.Name == "Boundary");
+        Assert.Equal(0, adapter.SaveCalls);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -694,7 +730,29 @@ public sealed class OperationExecutorTests
 
     private sealed class OperationBoundRecordingAdapter : RecordingAdapter, IOperationBoundBaiduNetdiskAdapter
     {
+        private readonly List<string>? preparationTimeline;
+
+        public OperationBoundRecordingAdapter(List<string>? timeline = null) : base(timeline) =>
+            preparationTimeline = timeline;
+
         public TransferOperationAutomationContext? Context { get; private set; }
+        public Exception? PrepareException { get; init; }
+        public int PrepareCalls { get; private set; }
+
+        public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            ShareReference share,
+            RemoteDirectory destination,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken)
+        {
+            PrepareCalls++;
+            Context = context;
+            preparationTimeline?.Add("PrepareWebBaseline");
+            if (PrepareException is not null) throw PrepareException;
+            return Task.FromResult(BaiduAdapterResult<TransferPreparationReceipt>.Success(TransferPreparationReceipt.Ready));
+        }
 
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
             TransferOperationAutomationContext context,

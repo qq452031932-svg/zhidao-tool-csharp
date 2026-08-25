@@ -94,7 +94,7 @@ public sealed class OperationReconciliationService : ITransferResultReconciler
             .ConfigureAwait(false);
         if (session is null) return TransferConfirmation.Ambiguous;
 
-        if (!pending.RequiresExactShareEvidence)
+        if (!pending.RequiresExactShareEvidence && adapter is not IOperationBoundBaiduNetdiskAdapter)
         {
             BaiduAdapterResult<TransferConfirmation> legacyResult;
             try

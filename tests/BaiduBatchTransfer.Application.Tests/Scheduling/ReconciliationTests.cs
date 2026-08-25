@@ -173,6 +173,35 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
+    public async Task TransferOnlyBatchStillUsesOperationBoundExactRecovery()
+    {
+        var operation = PendingOperation() with
+        {
+            RequiresExactShareEvidence = false,
+            BatchId = Guid.NewGuid(),
+            SourceShare = new ShareReference("share", "https://pan.baidu.com/s/transfer-only", "a1b2"),
+        };
+        var exact = new RemoteItemIdentitySet([new("remote-transfer-only", "纯转存资源")]);
+        var store = new RecordingReconciliationStore(operation);
+        var adapter = new OperationBoundConfirmationAdapter
+        {
+            ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(exact)),
+        };
+        var service = new OperationReconciliationService(
+            adapter,
+            new SessionStore(operation.AccountId),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedPresent, result);
+        Assert.NotNull(adapter.Context);
+        Assert.Same(exact, store.ExactRemoteItems);
+    }
+
+    [Fact]
     public async Task MultipleApproximateMatchesRemainAmbiguousAndNeverUseLegacyPresentSignal()
     {
         var operation = PendingOperation() with { RequiresExactShareEvidence = true };
@@ -959,6 +988,15 @@ public sealed class ReconciliationTests
     private sealed class OperationBoundConfirmationAdapter : ConfirmationAdapter, IOperationBoundBaiduNetdiskAdapter
     {
         public TransferOperationAutomationContext? Context { get; private set; }
+
+        public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            ShareReference share,
+            RemoteDirectory destination,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(BaiduAdapterResult<TransferPreparationReceipt>.Success(TransferPreparationReceipt.Ready));
 
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
             TransferOperationAutomationContext context,

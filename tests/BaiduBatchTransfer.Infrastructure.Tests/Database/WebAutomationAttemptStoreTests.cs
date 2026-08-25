@@ -24,13 +24,98 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
             graph.OperationId, graph.AccountId, 2, 0,
             ExactBaseline("before-2", "before-1"), Fingerprint('a'), graph.Now.AddSeconds(1)));
 
-        var restored = await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 2);
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 2);
 
         Assert.NotNull(restored);
         Assert.Equal(WebAutomationAttemptState.BaselinePersisted, restored.State);
         Assert.Equal(
             new[] { "before-1", "before-2" },
             restored.BaselineRemoteItems.Select(item => item.ExactId).Order());
+    }
+
+    [Fact]
+    public async Task OfficialAcceptanceRoundTripsExactTargetIdsBeforeSucceededTransition()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.True(await graph.Store.TryPersistBaselineAsync(
+            graph.OperationId, graph.AccountId, 2, 0,
+            ExactBaseline("before"), Fingerprint('a'), graph.Now.AddSeconds(1)));
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, 2,
+            WebAutomationAttemptState.BaselinePersisted, 1,
+            WebAutomationAttemptState.Submitting, Fingerprint('b'), false, graph.Now.AddSeconds(2)));
+        var accepted = new RemoteItemIdentitySet([
+            new("target-2", "显示名不应持久化"),
+            new("target-1", "另一个显示名"),
+        ]);
+
+        Assert.True(await graph.Store.TryPersistOfficialAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 2, 2,
+            accepted, Fingerprint('c'), graph.Now.AddSeconds(3)));
+
+        var restored = await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 2);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, restored!.State);
+        Assert.Equal(accepted, restored.AcceptedRemoteItems);
+        Assert.Equal(["target-1", "target-2"],
+            restored.AcceptedRemoteItems!.Items.Select(item => item.ExactId));
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var columns = connection.CreateCommand();
+        columns.CommandText = "PRAGMA table_info(WebAutomationAttemptAcceptedRemoteItems);";
+        var names = new List<string>();
+        await using var reader = await columns.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) names.Add(reader.GetString(1));
+        Assert.DoesNotContain("DisplayName", names);
+    }
+
+    [Fact]
+    public async Task OfficialAcceptancePartialWriteFailureRollsBackWholeExactSetAndStage()
+    {
+        var graph = await CreateSubmittingAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var trigger = connection.CreateCommand())
+        {
+            trigger.CommandText = """
+                CREATE TRIGGER RejectSecondAcceptedItem
+                BEFORE INSERT ON WebAutomationAttemptAcceptedRemoteItems
+                WHEN NEW.ItemOrdinal=1
+                BEGIN SELECT RAISE(ABORT,'synthetic acceptance failure'); END;
+                """;
+            await trigger.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAnyAsync<Exception>(() => graph.Store.TryPersistOfficialAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 2, 2,
+            new RemoteItemIdentitySet([new("target-1", null), new("target-2", null)]),
+            Fingerprint('c'), graph.Now.AddSeconds(3)));
+
+        var restored = await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 2);
+        Assert.Equal(WebAutomationAttemptState.Submitting, restored!.State);
+        Assert.Null(restored.AcceptedRemoteItems);
+        Assert.Equal(0L, await ScalarAsync(graph.Factory,
+            "SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems;"));
+    }
+
+    [Fact]
+    public async Task OfficialAcceptanceRejectsWrongIdentityAndStaleGenerationWithoutWritingEvidence()
+    {
+        var graph = await CreateSubmittingAttemptAsync();
+        var accepted = new RemoteItemIdentitySet([new("target", null)]);
+
+        Assert.False(await graph.Store.TryPersistOfficialAcceptanceAsync(
+            Guid.NewGuid(), graph.AccountId, 2, 2, accepted, Fingerprint('c'), graph.Now.AddSeconds(3)));
+        Assert.False(await graph.Store.TryPersistOfficialAcceptanceAsync(
+            graph.OperationId, graph.OtherAccountId, 2, 2, accepted, Fingerprint('c'), graph.Now.AddSeconds(3)));
+        Assert.False(await graph.Store.TryPersistOfficialAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, 2, accepted, Fingerprint('c'), graph.Now.AddSeconds(3)));
+
+        Assert.Equal(0L, await ScalarAsync(graph.Factory,
+            "SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems;"));
+        Assert.Equal(WebAutomationAttemptState.Submitting,
+            (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 2))!.State);
     }
 
     [Fact]
@@ -409,6 +494,22 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         command.Parameters.AddWithValue("$generation", generation);
         command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
         await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task<Graph> CreateSubmittingAttemptAsync()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 2);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.True(await graph.Store.TryPersistBaselineAsync(
+            graph.OperationId, graph.AccountId, 2, 0,
+            ExactBaseline("before"), Fingerprint('a'), graph.Now.AddSeconds(1)));
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, 2,
+            WebAutomationAttemptState.BaselinePersisted, 1,
+            WebAutomationAttemptState.Submitting, Fingerprint('b'), false, graph.Now.AddSeconds(2)));
+        return graph;
     }
 
     private async Task<Graph> CreateAsync(
