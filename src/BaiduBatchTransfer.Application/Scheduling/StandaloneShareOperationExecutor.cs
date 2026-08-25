@@ -184,7 +184,7 @@ public sealed class StandaloneShareOperationExecutor(
         var request = Request(operation);
         var context = new ShareOperationAutomationContext(
             operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems).Validate();
+            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems, IsRecovery: true).Validate();
         BaiduAdapterResult<ShareCreationReceipt> confirmation;
         try
         {

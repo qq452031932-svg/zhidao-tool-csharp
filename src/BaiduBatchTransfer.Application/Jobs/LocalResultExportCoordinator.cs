@@ -104,18 +104,27 @@ public interface ILocalResultExportCoordinator
     Task<int> RecoverAsync(CancellationToken cancellationToken = default);
 }
 
+public interface ILocalResultExportObserver
+{
+    Task OnLocalResultExportCompletedAsync(
+        LocalResultExportKey exportKey,
+        CancellationToken cancellationToken = default);
+}
+
 public sealed class LocalResultExportCoordinator(
     ILocalResultExportStore store,
     ILocalResultExportOwnerRepository owners,
     ILocalResultExportArtifactService artifacts,
     TimeProvider? timeProvider = null,
-    TimeSpan? leaseDuration = null) : ILocalResultExportCoordinator
+    TimeSpan? leaseDuration = null,
+    ILocalResultExportObserver? observer = null) : ILocalResultExportCoordinator
 {
     private readonly ILocalResultExportStore store = store ?? throw new ArgumentNullException(nameof(store));
     private readonly ILocalResultExportOwnerRepository owners = owners ?? throw new ArgumentNullException(nameof(owners));
     private readonly ILocalResultExportArtifactService artifacts = artifacts ?? throw new ArgumentNullException(nameof(artifacts));
     private readonly TimeProvider timeProvider = timeProvider ?? TimeProvider.System;
     private readonly TimeSpan leaseDuration = ValidateLeaseDuration(leaseDuration ?? TimeSpan.FromMinutes(5));
+    private readonly ILocalResultExportObserver? observer = observer;
     private readonly SemaphoreSlim processGate = new(1, 1);
 
     public async Task<LocalResultExportOutcome> ExportStandaloneAsync(
@@ -193,7 +202,10 @@ public sealed class LocalResultExportCoordinator(
         await RecoverExpiredLeasesAsync(cancellationToken).ConfigureAwait(false);
         var existing = await store.GetAsync(key, cancellationToken).ConfigureAwait(false);
         if (existing?.Status == LocalResultExportStatus.Succeeded)
+        {
+            await NotifyObserverSafelyAsync(key).ConfigureAwait(false);
             return new(LocalResultExportDisposition.AlreadySucceeded, existing.FinalFileName);
+        }
 
         if (existing is null)
         {
@@ -258,9 +270,9 @@ public sealed class LocalResultExportCoordinator(
                 lease.ExportId, lease.Key.Generation, lease.LeaseGeneration, lease.LeaseOwnerId,
                 lease.Revision, lease.LeaseExpiresAt, finalFileName, timeProvider.GetUtcNow(),
                 CancellationToken.None).ConfigureAwait(false);
-            return completed
-                ? new(LocalResultExportDisposition.Exported, finalFileName)
-                : new(LocalResultExportDisposition.Conflict);
+            if (!completed) return new(LocalResultExportDisposition.Conflict);
+            await NotifyObserverSafelyAsync(lease.Key).ConfigureAwait(false);
+            return new(LocalResultExportDisposition.Exported, finalFileName);
         }
         catch (OperationCanceledException)
         {
@@ -270,6 +282,19 @@ public sealed class LocalResultExportCoordinator(
         catch
         {
             return await FailAsync(lease, "EXPORT_FAILED", CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private async Task NotifyObserverSafelyAsync(LocalResultExportKey key)
+    {
+        if (observer is null) return;
+        try
+        {
+            await observer.OnLocalResultExportCompletedAsync(key, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Acceptance telemetry is best-effort after durable export success.
         }
     }
 

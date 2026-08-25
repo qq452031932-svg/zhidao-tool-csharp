@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Reflection;
+using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
@@ -198,6 +199,64 @@ public sealed class WebViewBaiduShareAdapterTests
     }
 
     [Fact]
+    public async Task ShareRecoveryFeedsExactStandaloneOperationEvidenceWithoutClicking()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare) with { IsRecovery = true };
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["share-existing"]),
+            Request().RemoteItems));
+        var automation = new ShareSession(Listing(ExistingEntry(), AcceptedEntry()));
+        var sink = new RecordingEvidenceSink();
+        var adapter = Adapter(
+            accountId,
+            new CallbackBroker(attempts, automation),
+            attempts,
+            new AcceptanceStore(Acceptance()),
+            acceptanceEvidence: sink);
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(0, automation.SubmitCount);
+        var remote = Assert.Single(sink.Remote);
+        var recovery = Assert.Single(sink.Recovery);
+        Assert.Equal(context.OperationId, remote.Request.OperationId);
+        Assert.Equal(context.BatchId, remote.Request.BatchId);
+        Assert.Equal("BaiduShare", remote.Request.Capability.AdapterKind);
+        Assert.True(recovery.Request.IsRecovery);
+        Assert.Equal(remote.Fingerprint, recovery.Fingerprint);
+    }
+
+    [Fact]
+    public async Task PersistedSucceededShareDoesNotFabricateRecoveryEvidence()
+    {
+        var accountId = Guid.NewGuid();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare) with { IsRecovery = true };
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["share-existing"]),
+            Request().RemoteItems));
+        var sink = new RecordingEvidenceSink();
+        var broker = new RecordingBroker();
+        var adapter = Adapter(
+            accountId, broker, attempts, new AcceptanceStore(Acceptance()),
+            acceptanceEvidence: sink);
+
+        var result = await adapter.ConfirmExactShareForOperationAsync(
+            context, Session(accountId), Request(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(broker.Identity);
+        Assert.Single(sink.Remote);
+        Assert.Empty(sink.Recovery);
+    }
+
+    [Fact]
     public async Task OperationBoundExactConfirmationDownloadsBeforeSucceededUsingTheResolvedDirectory()
     {
         var accountId = Guid.NewGuid();
@@ -364,7 +423,8 @@ public sealed class WebViewBaiduShareAdapterTests
         IWebAutomationAttemptStore? attempts = null,
         IShareAutomationAcceptanceEvidenceStore? evidence = null,
         IAccountProfilePathPolicy? profiles = null,
-        IShareOfficialResultDestinationResolver? resultDestination = null) =>
+        IShareOfficialResultDestinationResolver? resultDestination = null,
+        IAcceptanceOperationEvidenceSink? acceptanceEvidence = null) =>
         new(
             new ReadOnlyShareAdapter(),
             broker,
@@ -373,7 +433,8 @@ public sealed class WebViewBaiduShareAdapterTests
             "build-share-a",
             attempts,
             evidence,
-            resultDestination);
+            resultDestination,
+            acceptanceEvidence);
 
     private static ShareOperationAutomationContext Context(
         Guid accountId,
@@ -447,6 +508,30 @@ public sealed class WebViewBaiduShareAdapterTests
         {
             Identity = request.Identity;
             throw new InvalidOperationException("This broker only records unexpected queueing.");
+        }
+    }
+
+    private sealed class RecordingEvidenceSink : IAcceptanceOperationEvidenceSink
+    {
+        public List<(AdapterWriteAuthorizationRequest Request, string Fingerprint)> Remote { get; } = [];
+        public List<(AdapterWriteAuthorizationRequest Request, string Fingerprint)> Recovery { get; } = [];
+
+        public Task RecordRemoteResultAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            Remote.Add((request, exactEvidenceFingerprint));
+            return Task.CompletedTask;
+        }
+
+        public Task RecordRecoveryAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            Recovery.Add((request, exactEvidenceFingerprint));
+            return Task.CompletedTask;
         }
     }
 

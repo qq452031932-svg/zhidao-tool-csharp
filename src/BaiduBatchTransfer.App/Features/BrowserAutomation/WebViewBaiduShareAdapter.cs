@@ -2,6 +2,7 @@ using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.App.Features.Acceptance;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -34,6 +35,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
     private readonly IWebAutomationAttemptStore? attemptStore;
     private readonly IShareAutomationAcceptanceEvidenceStore? acceptanceStore;
     private readonly IShareOfficialResultDestinationResolver? resultDestination;
+    private readonly IAcceptanceOperationEvidenceSink? acceptanceEvidence;
 
     public WebViewBaiduShareAdapter(
         IBaiduShareAdapter readOnlyAdapter,
@@ -43,7 +45,8 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         string applicationBuildVersion,
         IWebAutomationAttemptStore? attemptStore = null,
         IShareAutomationAcceptanceEvidenceStore? acceptanceStore = null,
-        IShareOfficialResultDestinationResolver? resultDestination = null)
+        IShareOfficialResultDestinationResolver? resultDestination = null,
+        IAcceptanceOperationEvidenceSink? acceptanceEvidence = null)
     {
         this.readOnlyAdapter = readOnlyAdapter ?? throw new ArgumentNullException(nameof(readOnlyAdapter));
         this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
@@ -54,6 +57,7 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         this.attemptStore = attemptStore;
         this.acceptanceStore = acceptanceStore;
         this.resultDestination = resultDestination;
+        this.acceptanceEvidence = acceptanceEvidence;
     }
 
     public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
@@ -176,7 +180,12 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         }
 
         if (result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null)
+        {
+            if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
             return result.Value;
+        }
         return Unknown<ShareCreationReceipt>(
             result.PersistentState == WebAutomationAttemptState.DefinitelyNotSubmitted
                 ? SubmissionAcceptance.DefinitelyNotAccepted
@@ -215,7 +224,14 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         if (!EvidenceMatchesAttempt(acceptedEvidence, attempt!, request))
             return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
         if (stage == WebAutomationAttemptState.Succeeded)
+        {
+            if (acceptanceEvidence is not null)
+            {
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+            }
             return Receipt(request, acceptedEvidence!);
+        }
 
         var automationRequest = Request(
             context,
@@ -239,9 +255,16 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         try
         {
             var result = await broker.EnqueueAsync(automationRequest, cancellationToken).ConfigureAwait(false);
-            return result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
-                ? result.Value
-                : Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+            if (result.Disposition != VisibleWebAutomationDisposition.ActionCompleted || result.Value is null)
+                return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+            if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
+            {
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await acceptanceEvidence.RecordRecoveryAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+            }
+            return result.Value;
         }
         catch (WebAutomationAuthorizationException)
         {
@@ -289,9 +312,16 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         try
         {
             var result = await broker.EnqueueAsync(automationRequest, cancellationToken).ConfigureAwait(false);
-            return result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
-                ? result.Value
-                : Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+            if (result.Disposition != VisibleWebAutomationDisposition.ActionCompleted || result.Value is null)
+                return Unknown<ShareCreationReceipt>(SubmissionAcceptance.Unknown);
+            if (result.Value is { IsSuccess: true, Value.IsFinalAcceptance: true } && acceptanceEvidence is not null)
+            {
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+                await acceptanceEvidence.RecordRecoveryAsync(
+                    EvidenceRequest(context), request.RemoteItems.Fingerprint, cancellationToken).ConfigureAwait(false);
+            }
+            return result.Value;
         }
         catch (WebAutomationAuthorizationException)
         {
@@ -307,6 +337,19 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+
+    private AdapterWriteAuthorizationRequest EvidenceRequest(ShareOperationAutomationContext context) => new(
+        new AdapterCapabilityVersion(
+            "BaiduShare",
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            applicationBuildVersion),
+        context.AccountId,
+        context.OperationId,
+        context.Generation,
+        context.BatchId,
+        AdapterWriteAction.SubmitShare,
+        context.IsRecovery);
 
     private async Task<IShareResultExportSession?> TryEnableExportAsync(
         IVisibleWebAutomationSession visibleSession,

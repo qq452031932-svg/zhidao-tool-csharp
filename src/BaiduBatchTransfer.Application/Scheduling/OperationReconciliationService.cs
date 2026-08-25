@@ -149,7 +149,8 @@ public sealed class OperationReconciliationService : ITransferResultReconciler
                         pending.BatchId,
                         pending.AccountId,
                         pending.AttemptCount,
-                        pending.SourceShare).Validate(),
+                        pending.SourceShare,
+                        IsRecovery: true).Validate(),
                     session,
                     query,
                     cancellationToken).ConfigureAwait(false);

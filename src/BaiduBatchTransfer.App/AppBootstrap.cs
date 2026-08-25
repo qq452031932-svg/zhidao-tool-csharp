@@ -192,8 +192,13 @@ public static class AppBootstrap
         services.AddSingleton<IAdapterCapabilityStore>(sp =>
             sp.GetRequiredService<SqliteAdapterCapabilityStore>());
         services.AddSingleton(AcceptanceWriteLeaseOptions.FromStartup(startupArguments));
+        services.AddSingleton<IAcceptanceWriteLeasePresenter, AcceptanceWriteLeasePresenter>();
         services.AddSingleton<AcceptanceWriteLeaseCoordinator>();
         services.AddSingleton<IAdapterWriteAuthorizationGate>(sp =>
+            sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
+        services.AddSingleton<IAcceptanceOperationEvidenceSink>(sp =>
+            sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
+        services.AddSingleton<ILocalResultExportObserver>(sp =>
             sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>());
         services.AddTransient<Func<AdapterWriteAuthorizationRequest, AcceptanceConfirmationWindow>>(sp =>
             request => new AcceptanceConfirmationWindow(
@@ -206,7 +211,8 @@ public static class AppBootstrap
             sp.GetRequiredService<IAccountProfilePathPolicy>(),
             sp.GetRequiredService<TransferAutomationFlow>(),
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
-            sp.GetRequiredService<IWebAutomationAttemptStore>()));
+            sp.GetRequiredService<IWebAutomationAttemptStore>(),
+            sp.GetRequiredService<IAcceptanceOperationEvidenceSink>()));
         services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
             sp.GetRequiredService<WebViewBaiduNetdiskAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>(),
@@ -257,7 +263,8 @@ public static class AppBootstrap
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
             sp.GetRequiredService<IShareAutomationAcceptanceEvidenceStore>(),
-            sp.GetRequiredService<IShareOfficialResultDestinationResolver>()));
+            sp.GetRequiredService<IShareOfficialResultDestinationResolver>(),
+            sp.GetRequiredService<IAcceptanceOperationEvidenceSink>()));
         services.AddSingleton<IBaiduShareAdapter>(sp => CoordinatedBaiduShareAdapter.Wrap(
             sp.GetRequiredService<WebViewBaiduShareAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>(),

@@ -9,7 +9,8 @@ public sealed record ShareOperationAutomationContext(
     Guid AccountId,
     int Generation,
     WebAutomationOwnerKind OwnerKind,
-    RemoteItemIdentitySet ExactRemoteItems)
+    RemoteItemIdentitySet ExactRemoteItems,
+    bool IsRecovery = false)
 {
     public ShareOperationAutomationContext Validate()
     {

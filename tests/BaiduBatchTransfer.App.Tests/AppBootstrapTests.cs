@@ -17,6 +17,7 @@ using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Excel;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using System.Runtime.CompilerServices;
 
@@ -127,6 +128,73 @@ public sealed class AppBootstrapTests : IDisposable
 #else
         Assert.False(options.IsEnabled);
 #endif
+    }
+
+    [Fact]
+    public async Task ProductionGatePresentsExactWriteAndReachesInnerOnlyAfterExplicitConfirmation()
+    {
+        var presenter = new RecordingAcceptancePresenter(confirmed: true);
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch], services =>
+        {
+            services.RemoveAll<IAcceptanceWriteLeasePresenter>();
+            services.AddSingleton<IAcceptanceWriteLeasePresenter>(presenter);
+        });
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var capability = new AdapterCapabilityVersion("BaiduShare", "p1", "s1", "b1");
+        var inner = new AcceptanceShareAdapter();
+        var wrapped = Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(
+            CoordinatedBaiduShareAdapter.Wrap(
+                inner,
+                new BaiduAdapterConcurrencyGate(),
+                host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>(),
+                capability));
+        var accountId = Guid.NewGuid();
+        var items = new RemoteItemIdentitySet([new("remote-1", "item")]);
+        var context = new ShareOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
+            WebAutomationOwnerKind.StandaloneShare, items);
+        var session = new AccountSession(
+            accountId, "baidu-user",
+            [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
+            DateTimeOffset.UtcNow);
+
+        var result = await wrapped.SubmitPermanentShareForOperationAsync(
+            context, session, new PermanentShareRequest(items), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(1, presenter.PresentCount);
+        Assert.Equal(context.OperationId, presenter.Seen!.OperationId);
+        Assert.Equal(context.AccountId, presenter.Seen.AccountId);
+        Assert.Equal(context.Generation, presenter.Seen.Generation);
+        Assert.Equal(1, inner.SubmitCount);
+    }
+
+    [Fact]
+    public async Task ProductionGateNeverPresentsInNormalModeOrForRecovery()
+    {
+        var presenter = new RecordingAcceptancePresenter(confirmed: true);
+        using var normal = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<IAcceptanceWriteLeasePresenter>();
+            services.AddSingleton<IAcceptanceWriteLeasePresenter>(presenter);
+        });
+        await normal.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var gate = normal.Services.GetRequiredService<IAdapterWriteAuthorizationGate>();
+        var capability = new AdapterCapabilityVersion("BaiduShare", "p1", "s1", "b1");
+        var identity = new AdapterWriteAuthorizationRequest(
+            capability, Guid.NewGuid(), Guid.NewGuid(), 1, Guid.NewGuid(), AdapterWriteAction.SubmitShare);
+
+        Assert.False(await gate.TryAuthorizeAsync(identity));
+        Assert.Equal(0, presenter.PresentCount);
+
+        var recoveryPresenter = new RecordingAcceptancePresenter(confirmed: true);
+        var recoveryGate = new AcceptanceWriteLeaseCoordinator(
+            new AcceptanceWriteLeaseOptions(true, [AcceptanceWriteLeaseOptions.Switch]),
+            normal.Services.GetRequiredService<IAdapterCapabilityStore>(),
+            TimeProvider.System,
+            recoveryPresenter);
+        Assert.False(await recoveryGate.TryAuthorizeAsync(identity with { IsRecovery = true }));
+        Assert.Equal(0, recoveryPresenter.PresentCount);
     }
 
     [Fact]
@@ -438,5 +506,51 @@ public sealed class AppBootstrapTests : IDisposable
             item.Action();
             item.Completion.TrySetResult();
         }
+    }
+
+    private sealed class RecordingAcceptancePresenter(bool confirmed) : IAcceptanceWriteLeasePresenter
+    {
+        public int PresentCount { get; private set; }
+        public AdapterWriteAuthorizationRequest? Seen { get; private set; }
+        public int EnableCount { get; private set; }
+
+        public Task<bool> PresentAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default)
+        {
+            PresentCount++;
+            Seen = request;
+            return Task.FromResult(confirmed);
+        }
+
+        public Task EnableFormalAcceptanceAsync(AdapterWriteAuthorizationRequest request, string evidenceHash, CancellationToken cancellationToken = default)
+        {
+            EnableCount++;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class AcceptanceShareAdapter : IOperationBoundBaiduShareAdapter
+    {
+        public int SubmitCount { get; private set; }
+
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> SubmitPermanentShareForOperationAsync(
+            ShareOperationAutomationContext context,
+            AccountSession session,
+            PermanentShareRequest request,
+            CancellationToken cancellationToken)
+        {
+            SubmitCount++;
+            return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(new ShareCreationReceipt(
+                DateTimeOffset.UtcNow,
+                "request-1",
+                request,
+                "share-1",
+                "https://pan.baidu.com/s/share-1",
+                new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Random, "a1b2"))));
+        }
+
+        public Task<BaiduAdapterResult<SharePreparationReceipt>> PreparePermanentShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 }

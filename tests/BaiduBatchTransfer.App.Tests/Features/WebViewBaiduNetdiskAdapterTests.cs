@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Reflection;
+using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
@@ -231,6 +232,37 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
+    public async Task RecoveryFeedsExactOperationBoundEvidenceWithoutAnotherWrite()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.ResultPending,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems()));
+        var evidence = new RecordingEvidenceSink();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new CallbackBroker(attempts, new AutomationSession()),
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a",
+            attempts, evidence);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var remote = Assert.Single(evidence.Remote);
+        var recovery = Assert.Single(evidence.Recovery);
+        Assert.Equal(context.OperationId, remote.Request.OperationId);
+        Assert.Equal(context.BatchId, remote.Request.BatchId);
+        Assert.Equal(context.Generation, remote.Request.Generation);
+        Assert.Equal("BaiduTransfer", remote.Request.Capability.AdapterKind);
+        Assert.True(recovery.Request.IsRecovery);
+        Assert.Equal(remote.Fingerprint, recovery.Fingerprint);
+    }
+
+    [Fact]
     public async Task RecoveryWithoutAcceptedTargetInListingStaysResultPending()
     {
         var accountId = Guid.NewGuid();
@@ -288,16 +320,17 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     {
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
-            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
         var attempts = new AttemptStore(Attempt(
             context,
             WebAutomationAttemptState.Succeeded,
             WebAutomationBaseline.Create(["fictional-old"]),
             AcceptedItems()));
         var broker = new RecordingBroker();
+        var evidence = new RecordingEvidenceSink();
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
-            new TransferAutomationFlow(), "build-a", attempts);
+            new TransferAutomationFlow(), "build-a", attempts, evidence);
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context, Session(accountId), Query(), CancellationToken.None);
@@ -305,6 +338,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.True(result.IsSuccess);
         Assert.Equal(AcceptedItems(), result.Value!.RemoteItems);
         Assert.Null(broker.Identity);
+        Assert.Single(evidence.Remote);
+        Assert.Empty(evidence.Recovery);
     }
 
     [Fact]
@@ -609,6 +644,30 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 VisibleWebAutomationDisposition.ActionCompleted,
                 (T)value,
                 WebAutomationAttemptState.Succeeded));
+        }
+    }
+
+    private sealed class RecordingEvidenceSink : IAcceptanceOperationEvidenceSink
+    {
+        public List<(AdapterWriteAuthorizationRequest Request, string Fingerprint)> Remote { get; } = [];
+        public List<(AdapterWriteAuthorizationRequest Request, string Fingerprint)> Recovery { get; } = [];
+
+        public Task RecordRemoteResultAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            Remote.Add((request, exactEvidenceFingerprint));
+            return Task.CompletedTask;
+        }
+
+        public Task RecordRecoveryAsync(
+            AdapterWriteAuthorizationRequest request,
+            string exactEvidenceFingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            Recovery.Add((request, exactEvidenceFingerprint));
+            return Task.CompletedTask;
         }
     }
 

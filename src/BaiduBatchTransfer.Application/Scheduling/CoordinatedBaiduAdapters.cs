@@ -9,7 +9,17 @@ public sealed record AdapterWriteAuthorizationRequest(
     AdapterCapabilityVersion Capability,
     Guid AccountId,
     Guid OperationId,
-    int Generation);
+    int Generation,
+    Guid BatchId = default,
+    AdapterWriteAction Action = AdapterWriteAction.SubmitTransfer,
+    bool IsRecovery = false);
+
+public enum AdapterWriteAction
+{
+    EnsureDirectory,
+    SubmitTransfer,
+    SubmitShare,
+}
 
 public interface IAdapterWriteAuthorizationGate
 {
@@ -138,12 +148,16 @@ public class CoordinatedBaiduNetdiskAdapter : IBaiduNetdiskAdapter
         Guid operationId,
         int generation,
         Func<CancellationToken, Task<BaiduAdapterResult<T>>> action,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Guid batchId = default,
+        AdapterWriteAction writeAction = AdapterWriteAction.SubmitTransfer,
+        bool isRecovery = false)
     {
         if (writeGate is not null)
         {
             var request = new AdapterWriteAuthorizationRequest(
-                capability!, session.LocalAccountId ?? Guid.Empty, operationId, generation);
+                capability!, session.LocalAccountId ?? Guid.Empty, operationId, generation,
+                batchId, writeAction, isRecovery);
             if (!await writeGate.TryAuthorizeAsync(request, cancellationToken).ConfigureAwait(false))
                 return NotValidated<T>();
         }
@@ -165,6 +179,21 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
 {
     private readonly IOperationBoundBaiduNetdiskAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
 
+    public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        RemotePath path,
+        CancellationToken cancellationToken) =>
+        RunWriteAsync(
+            session,
+            context.OperationId,
+            context.Generation,
+            token => inner.EnsureDirectoryForOperationAsync(context, session, path, token),
+            cancellationToken,
+            context.BatchId,
+            AdapterWriteAction.EnsureDirectory,
+            context.IsRecovery);
+
     public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
@@ -178,7 +207,10 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
             context.Generation,
             token => inner.SaveWholeShareForOperationAsync(
                 context, session, share, destination, duplicatePolicy, token),
-            cancellationToken);
+            cancellationToken,
+            context.BatchId,
+            AdapterWriteAction.SubmitTransfer,
+            context.IsRecovery);
 
     public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
@@ -268,12 +300,16 @@ public class CoordinatedBaiduShareAdapter : IBaiduShareAdapter
         Guid operationId,
         int generation,
         Func<CancellationToken, Task<BaiduAdapterResult<T>>> action,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Guid batchId = default,
+        AdapterWriteAction writeAction = AdapterWriteAction.SubmitShare,
+        bool isRecovery = false)
     {
         if (writeGate is not null)
         {
             var request = new AdapterWriteAuthorizationRequest(
-                capability!, session.LocalAccountId ?? Guid.Empty, operationId, generation);
+                capability!, session.LocalAccountId ?? Guid.Empty, operationId, generation,
+                batchId, writeAction, isRecovery);
             if (!await writeGate.TryAuthorizeAsync(request, cancellationToken).ConfigureAwait(false))
                 return BaiduAdapterResult<T>.Failure(
                     BaiduErrorKind.NotValidated,
@@ -312,7 +348,10 @@ public sealed class CoordinatedOperationBoundBaiduShareAdapter(
             context.OperationId,
             context.Generation,
             token => inner.SubmitPermanentShareForOperationAsync(context, session, request, token),
-            cancellationToken);
+            cancellationToken,
+            context.BatchId,
+            AdapterWriteAction.SubmitShare,
+            context.IsRecovery);
 
     public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(
         ShareOperationAutomationContext context,

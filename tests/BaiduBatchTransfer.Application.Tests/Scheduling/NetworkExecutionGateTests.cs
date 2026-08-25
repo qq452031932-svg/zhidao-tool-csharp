@@ -52,6 +52,35 @@ public sealed class NetworkExecutionGateTests
     }
 
     [Fact]
+    public async Task OperationBoundDirectoryWriteUsesExactOperationIdentity()
+    {
+        var inner = new CountingOperationBoundTransferAdapter();
+        var gate = new ExactRequestWriteGate();
+        var wrapped = Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(
+            CoordinatedBaiduNetdiskAdapter.Wrap(
+                inner,
+                new BaiduAdapterConcurrencyGate(),
+                gate,
+                new AdapterCapabilityVersion("BaiduTransfer", "p1", "s1", "b1")));
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 3,
+            new ShareReference("share", "https://pan.baidu.com/s/share", null));
+        var session = new AccountSession(
+            accountId, "baidu-user",
+            [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
+            DateTimeOffset.UtcNow);
+
+        await wrapped.EnsureDirectoryForOperationAsync(
+            context, session, new RemotePath("/target"), CancellationToken.None);
+
+        Assert.Equal(context.OperationId, gate.Seen!.OperationId);
+        Assert.Equal(context.Generation, gate.Seen.Generation);
+        Assert.Equal(accountId, gate.Seen.AccountId);
+        Assert.Equal(1, inner.DirectoryWriteCount);
+    }
+
+    [Fact]
     public async Task UnacceptedOperationBoundShareWriteDoesNotReachInnerAdapter()
     {
         var inner = new CountingOperationBoundShareAdapter();
@@ -89,9 +118,26 @@ public sealed class NetworkExecutionGateTests
             CancellationToken cancellationToken = default) => ValueTask.FromResult(false);
     }
 
+    private sealed class ExactRequestWriteGate : IAdapterWriteAuthorizationGate
+    {
+        public AdapterWriteAuthorizationRequest? Seen { get; private set; }
+        public ValueTask<bool> TryAuthorizeAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default)
+        {
+            Seen = request;
+            return ValueTask.FromResult(true);
+        }
+    }
+
     private sealed class CountingOperationBoundTransferAdapter : IOperationBoundBaiduNetdiskAdapter
     {
         public int WriteCount { get; private set; }
+        public int DirectoryWriteCount { get; private set; }
+
+        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(TransferOperationAutomationContext context, AccountSession session, RemotePath path, CancellationToken cancellationToken)
+        {
+            DirectoryWriteCount++;
+            return Task.FromResult(BaiduAdapterResult<RemoteDirectory>.Success(new RemoteDirectory("target", path)));
+        }
 
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(TransferOperationAutomationContext context, AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)
         {

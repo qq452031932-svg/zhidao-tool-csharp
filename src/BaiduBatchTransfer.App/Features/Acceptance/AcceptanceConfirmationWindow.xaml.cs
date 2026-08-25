@@ -7,6 +7,7 @@ public partial class AcceptanceConfirmationWindow : Window
 {
     private readonly AcceptanceWriteLeaseCoordinator coordinator;
     private readonly AdapterWriteAuthorizationRequest request;
+    private readonly TaskCompletionSource<bool> leaseDecision = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public AcceptanceConfirmationWindow(
         AcceptanceWriteLeaseCoordinator coordinator,
@@ -15,20 +16,13 @@ public partial class AcceptanceConfirmationWindow : Window
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.request = request ?? throw new ArgumentNullException(nameof(request));
         InitializeComponent();
+        Closed += (_, _) => leaseDecision.TrySetResult(false);
     }
 
-    public bool EnableVersionAcceptance(
-        bool remoteResultVerified,
-        bool recoveryVerified,
-        bool localExportVerified,
-        string evidenceHash)
+    public bool EnableVersionAcceptance(string evidenceHash)
     {
-        var enabled = coordinator.RecordCompletedEvidence(
-            request,
-            remoteResultVerified,
-            recoveryVerified,
-            localExportVerified,
-            evidenceHash);
+        var enabled = evidenceHash is { Length: 64 } && evidenceHash.All(character =>
+            character is >= '0' and <= '9' or >= 'A' and <= 'F');
         AcceptVersionButton.IsEnabled = enabled;
         StatusText.Text = enabled
             ? "远端结果、恢复证据和本机导出均已通过；可二次确认接受当前版本。"
@@ -36,15 +30,18 @@ public partial class AcceptanceConfirmationWindow : Window
         return enabled;
     }
 
+    public Task<bool> WaitForLeaseDecisionAsync(CancellationToken cancellationToken = default) =>
+        leaseDecision.Task.WaitAsync(cancellationToken);
+
     private void OnCreateLease(object sender, RoutedEventArgs e)
     {
-        var created = coordinator.TryCreateLease(request, new(
-            DisposableResourceCheck.IsChecked == true,
-            RealOperationConsentCheck.IsChecked == true,
-            SingleUseCheck.IsChecked == true));
+        var created = DisposableResourceCheck.IsChecked == true &&
+            RealOperationConsentCheck.IsChecked == true &&
+            SingleUseCheck.IsChecked == true;
         StatusText.Text = created
             ? "一次性租约已创建，仅当前操作可消费。"
-            : "未创建租约：请确认处于 Debug 验收模式并逐项勾选。";
+            : "未确认：请逐项勾选。";
+        if (created) leaseDecision.TrySetResult(true);
     }
 
     private async void OnAcceptVersion(object sender, RoutedEventArgs e)
@@ -67,5 +64,9 @@ public partial class AcceptanceConfirmationWindow : Window
         }
     }
 
-    private void OnCancel(object sender, RoutedEventArgs e) => Close();
+    private void OnCancel(object sender, RoutedEventArgs e)
+    {
+        leaseDecision.TrySetResult(false);
+        Close();
+    }
 }

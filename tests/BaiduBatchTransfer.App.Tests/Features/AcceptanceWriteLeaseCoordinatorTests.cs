@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
@@ -34,6 +35,17 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task ConsumedRequestCanNeverReceiveAReplacementLease()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+
+        Assert.False(coordinator.TryCreateLease(request, Confirmed()));
+    }
+
+    [Fact]
     public async Task ExpiredLeaseFailsClosed()
     {
         var clock = new MutableTimeProvider(Now);
@@ -50,27 +62,49 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     public async Task FormalAcceptanceRequiresAllEvidenceAndSecondConfirmation()
     {
         var store = new MemoryCapabilityStore();
-        var coordinator = Coordinator(true, ["--webview-acceptance"], store: store);
+        var presenter = new RecordingPresenter();
+        var coordinator = Coordinator(true, ["--webview-acceptance"], store: store, presenter: presenter);
         var request = Request();
         Assert.True(coordinator.TryCreateLease(request, Confirmed()));
         Assert.True(await coordinator.TryAuthorizeAsync(request));
 
-        Assert.False(coordinator.RecordCompletedEvidence(request, true, false, true, Hash));
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
-        Assert.True(coordinator.RecordCompletedEvidence(request, true, true, true, Hash));
+        await coordinator.RecordRemoteResultAsync(request, "remote-A");
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-A");
+        await coordinator.OnLocalResultExportCompletedAsync(new(
+            LocalResultOwnerKind.TransferBatch,
+            request.BatchId,
+            LocalResultExportKind.ReplacementWorkbook,
+            1));
+        Assert.Equal(1, presenter.EnableCount);
         Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: false));
         Assert.True(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+        Assert.False(coordinator.TryCreateLease(request, Confirmed()));
 
         var saved = Assert.Single(store.Records);
         Assert.Equal(request.Capability.SelectorVersion, saved.SelectorVersion);
     }
 
     [Fact]
-    public void EvidenceCannotBeAttachedToAnOperationThatDidNotConsumeALease()
+    public async Task MismatchedOrNonRecoveryEvidenceCannotEnableFormalAcceptance()
     {
-        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var presenter = new RecordingPresenter();
+        var coordinator = Coordinator(true, ["--webview-acceptance"], presenter: presenter);
+        var request = Request();
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
 
-        Assert.False(coordinator.RecordCompletedEvidence(Request(), true, true, true, Hash));
+        await coordinator.RecordRemoteResultAsync(request, "remote-A");
+        await coordinator.RecordRecoveryAsync(request, "remote-A");
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, "remote-B");
+        await coordinator.OnLocalResultExportCompletedAsync(new(
+            LocalResultOwnerKind.TransferBatch,
+            request.BatchId,
+            LocalResultExportKind.ReplacementWorkbook,
+            1));
+
+        Assert.Equal(0, presenter.EnableCount);
+        Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
     }
 
     [Fact]
@@ -93,16 +127,19 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         bool debug,
         IReadOnlyList<string> args,
         TimeProvider? clock = null,
-        MemoryCapabilityStore? store = null) => new(
+        MemoryCapabilityStore? store = null,
+        IAcceptanceWriteLeasePresenter? presenter = null) => new(
             new AcceptanceWriteLeaseOptions(debug, args),
             store ?? new MemoryCapabilityStore(),
-            clock ?? new MutableTimeProvider(Now));
+            clock ?? new MutableTimeProvider(Now),
+            presenter);
 
     private static AdapterWriteAuthorizationRequest Request() => new(
         new AdapterCapabilityVersion("BaiduTransfer", "protocol-v1", "selector-v1", "build-1"),
         Guid.Parse("11111111-1111-1111-1111-111111111111"),
         Guid.Parse("22222222-2222-2222-2222-222222222222"),
-        1);
+        1,
+        Guid.Parse("33333333-3333-3333-3333-333333333333"));
 
     private static AcceptanceWriteLeaseConfirmation Confirmed() => new(true, true, true);
     private const string Hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -129,6 +166,17 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
                 value.ProtocolVersion == protocolVersion &&
                 value.SelectorVersion == selectorVersion &&
                 value.AdapterBuildVersion == adapterBuildVersion));
+    }
+
+    private sealed class RecordingPresenter : IAcceptanceWriteLeasePresenter
+    {
+        public int EnableCount { get; private set; }
+        public Task<bool> PresentAsync(AdapterWriteAuthorizationRequest request, CancellationToken cancellationToken = default) => Task.FromResult(false);
+        public Task EnableFormalAcceptanceAsync(AdapterWriteAuthorizationRequest request, string evidenceHash, CancellationToken cancellationToken = default)
+        {
+            EnableCount++;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class MutableTimeProvider(DateTimeOffset now) : TimeProvider

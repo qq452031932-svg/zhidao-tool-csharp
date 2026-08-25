@@ -208,7 +208,7 @@ public sealed class ShareOperationReconciliationService : IShareResultReconciler
             : new PermanentShareRequest(context.ExactRemoteItems, context.Settings.FixedExtractionCode);
         var automationContext = new ShareOperationAutomationContext(
             operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
-            WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems).Validate();
+            WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems, IsRecovery: true).Validate();
         BaiduAdapterResult<ShareCreationReceipt> confirmation;
         try
         {

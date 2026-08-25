@@ -24,6 +24,19 @@ public sealed class LocalResultExportCoordinatorTests
     }
 
     [Fact]
+    public async Task AcceptanceObserverFailure_DoesNotChangeDurableExportOutcome()
+    {
+        var graph = Fixture(observer: new ThrowingObserver());
+
+        var first = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
+        var second = await graph.Coordinator.ExportStandaloneAsync(graph.BatchId);
+
+        Assert.Equal(LocalResultExportDisposition.Exported, first.Disposition);
+        Assert.Equal(LocalResultExportDisposition.AlreadySucceeded, second.Disposition);
+        Assert.Equal(LocalResultExportStatus.Succeeded, graph.Store.Record!.Status);
+    }
+
+    [Fact]
     public async Task Recovery_ValidPublishedTargetCompletesWithoutRewriting()
     {
         var graph = Fixture(LocalResultArtifactState.Valid);
@@ -157,7 +170,9 @@ public sealed class LocalResultExportCoordinatorTests
         Assert.Equal(LocalResultExportStatus.Succeeded, graph.Store.Record!.Status);
     }
 
-    private static Graph Fixture(LocalResultArtifactState state = LocalResultArtifactState.Missing)
+    private static Graph Fixture(
+        LocalResultArtifactState state = LocalResultArtifactState.Missing,
+        ILocalResultExportObserver? observer = null)
     {
         var batchId = Guid.NewGuid();
         var events = new List<string>();
@@ -166,7 +181,7 @@ public sealed class LocalResultExportCoordinatorTests
         var artifacts = new FakeArtifacts(events) { State = state };
         var coordinator = new LocalResultExportCoordinator(
             store, owners, artifacts,
-            new FixedTimeProvider(Now), TimeSpan.FromMinutes(5));
+            new FixedTimeProvider(Now), TimeSpan.FromMinutes(5), observer: observer);
         return new(batchId, coordinator, store, owners, artifacts, events);
     }
 
@@ -381,5 +396,13 @@ public sealed class LocalResultExportCoordinatorTests
     private sealed class FixedTimeProvider(DateTimeOffset value) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => value;
+    }
+
+    private sealed class ThrowingObserver : ILocalResultExportObserver
+    {
+        public Task OnLocalResultExportCompletedAsync(
+            LocalResultExportKey key,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("simulated acceptance telemetry failure");
     }
 }

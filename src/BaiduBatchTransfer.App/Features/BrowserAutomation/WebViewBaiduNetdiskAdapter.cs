@@ -3,6 +3,7 @@ using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.App.Features.Acceptance;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
@@ -14,6 +15,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
     private readonly TransferAutomationFlow flow;
     private readonly string applicationBuildVersion;
     private readonly IWebAutomationAttemptStore? attemptStore;
+    private readonly IAcceptanceOperationEvidenceSink? acceptanceEvidence;
 
     public WebViewBaiduNetdiskAdapter(
         IBaiduNetdiskAdapter readOnlyAdapter,
@@ -21,7 +23,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         IAccountProfilePathPolicy profilePaths,
         TransferAutomationFlow flow,
         string applicationBuildVersion,
-        IWebAutomationAttemptStore? attemptStore = null)
+        IWebAutomationAttemptStore? attemptStore = null,
+        IAcceptanceOperationEvidenceSink? acceptanceEvidence = null)
     {
         this.readOnlyAdapter = readOnlyAdapter ?? throw new ArgumentNullException(nameof(readOnlyAdapter));
         this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
@@ -30,6 +33,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         ArgumentException.ThrowIfNullOrWhiteSpace(applicationBuildVersion);
         this.applicationBuildVersion = applicationBuildVersion.Trim();
         this.attemptStore = attemptStore;
+        this.acceptanceEvidence = acceptanceEvidence;
     }
 
     public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(
@@ -194,7 +198,14 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         }
         if (result.Disposition is VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null)
+        {
+            if (result.Value is { IsSuccess: true, Value.ExactRemoteItems: not null } exact && acceptanceEvidence is not null)
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
+                    exact.Value!.ExactRemoteItems.Fingerprint,
+                    cancellationToken).ConfigureAwait(false);
             return result.Value;
+        }
         return Unknown<TransferReceipt>(
             result.PersistentState is WebAutomationAttemptState.DefinitelyNotSubmitted
                 ? SubmissionAcceptance.DefinitelyNotAccepted
@@ -226,9 +237,18 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 State: WebAutomationAttemptState.Succeeded,
                 AcceptedRemoteItems: not null,
             })
+        {
+            if (acceptanceEvidence is not null)
+            {
+                await acceptanceEvidence.RecordRemoteResultAsync(
+                    EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
+                    attempt.AcceptedRemoteItems.Fingerprint,
+                    cancellationToken).ConfigureAwait(false);
+            }
             return BaiduAdapterResult<TransferConfirmationResult>.Success(
                 TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
                 SubmissionAcceptance.Unknown);
+        }
         var effectiveStage = EffectiveRecoverableStage(attempt);
         if (effectiveStage == WebAutomationAttemptState.BaselinePersisted)
         {
@@ -285,10 +305,36 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         {
             return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
         }
-        return result.Disposition is VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
-            ? result.Value
-            : UnknownConfirmation();
+        if (result.Disposition is not VisibleWebAutomationDisposition.ActionCompleted || result.Value is null)
+            return UnknownConfirmation();
+        if (result.Value is { IsSuccess: true, Value.State: TransferConfirmationState.ExactPresent } && acceptanceEvidence is not null)
+        {
+            await acceptanceEvidence.RecordRemoteResultAsync(
+                EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
+                acceptedRemoteItems.Fingerprint,
+                cancellationToken).ConfigureAwait(false);
+            await acceptanceEvidence.RecordRecoveryAsync(
+                EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
+                acceptedRemoteItems.Fingerprint,
+                cancellationToken).ConfigureAwait(false);
+        }
+        return result.Value;
     }
+
+    private AdapterWriteAuthorizationRequest EvidenceRequest(
+        TransferOperationAutomationContext context,
+        AdapterWriteAction action) => new(
+            new AdapterCapabilityVersion(
+                "BaiduTransfer",
+                BaiduSelectorCatalog.ProtocolVersion,
+                BaiduSelectorCatalog.SelectorVersion,
+                applicationBuildVersion),
+            context.AccountId,
+            context.OperationId,
+            context.Generation,
+            context.BatchId,
+            action,
+            context.IsRecovery);
 
     private BaiduNavigationAuthorizationRequest Navigation(Uri officialUri) => new(
         BaiduAutomationAction.OpenOfficialUri,

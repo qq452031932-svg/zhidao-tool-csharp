@@ -183,6 +183,15 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         var attemptCount = snapshot.AttemptGenerationPrepared
             ? snapshot.AttemptCount
             : checked(snapshot.AttemptCount + 1);
+        var automationContext = adapter is IOperationBoundBaiduNetdiskAdapter
+            ? new TransferOperationAutomationContext(
+                snapshot.OperationId,
+                snapshot.BatchId,
+                snapshot.AccountId,
+                attemptCount,
+                snapshot.Share,
+                IsRecovery: snapshot.AttemptGenerationPrepared).Validate()
+            : null;
         RemotePath completePath;
         try
         {
@@ -198,7 +207,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         BaiduAdapterResult<RemoteDirectory> directoryResult;
         try
         {
-            directoryResult = await EnsureWithRetryAsync(session, completePath, cancellationToken).ConfigureAwait(false);
+            directoryResult = await EnsureWithRetryAsync(
+                automationContext, session, completePath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
@@ -220,20 +230,13 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             return;
         }
 
-        TransferOperationAutomationContext? automationContext = null;
         if (adapter is IOperationBoundBaiduNetdiskAdapter operationBoundAdapter)
         {
-            automationContext = new TransferOperationAutomationContext(
-                snapshot.OperationId,
-                snapshot.BatchId,
-                snapshot.AccountId,
-                attemptCount,
-                snapshot.Share).Validate();
             BaiduAdapterResult<TransferPreparationReceipt> preparation;
             try
             {
                 preparation = await operationBoundAdapter.PrepareWholeShareForOperationAsync(
-                    automationContext,
+                    automationContext!,
                     session,
                     snapshot.Share,
                     directoryResult.Value!,
@@ -389,6 +392,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
     }
 
     private async Task<BaiduAdapterResult<RemoteDirectory>> EnsureWithRetryAsync(
+        TransferOperationAutomationContext? context,
         AccountSession session,
         RemotePath path,
         CancellationToken cancellationToken)
@@ -396,7 +400,10 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         var completedRetries = 0;
         while (true)
         {
-            var result = await adapter.EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
+            var result = context is not null && adapter is IOperationBoundBaiduNetdiskAdapter operationBound
+                ? await operationBound.EnsureDirectoryForOperationAsync(
+                    context, session, path, cancellationToken).ConfigureAwait(false)
+                : await adapter.EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
             if (result.IsSuccess) return result;
             var decision = retryPolicy.Decide(result.ErrorKind!.Value, completedRetries, result.RetryAfter);
             if (!decision.ShouldRetry) return result;

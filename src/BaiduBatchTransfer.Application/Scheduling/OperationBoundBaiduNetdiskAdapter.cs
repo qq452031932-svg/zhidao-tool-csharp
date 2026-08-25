@@ -8,7 +8,8 @@ public sealed record TransferOperationAutomationContext(
     Guid BatchId,
     Guid AccountId,
     int Generation,
-    ShareReference SourceShare)
+    ShareReference SourceShare,
+    bool IsRecovery = false)
 {
     public TransferOperationAutomationContext Validate()
     {
@@ -33,6 +34,13 @@ public sealed record TransferPreparationReceipt
 
 public interface IOperationBoundBaiduNetdiskAdapter : IBaiduNetdiskAdapter
 {
+    Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+        TransferOperationAutomationContext context,
+        AccountSession session,
+        RemotePath path,
+        CancellationToken cancellationToken) =>
+        EnsureDirectoryAsync(session, path, cancellationToken);
+
     Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
