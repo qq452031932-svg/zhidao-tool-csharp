@@ -90,16 +90,12 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 context.AccountId,
                 context.Generation,
                 cancellationToken).ConfigureAwait(false);
-            if (existing is
-                {
-                    OwnerKind: WebAutomationOwnerKind.Transfer,
-                    State: WebAutomationAttemptState.BaselinePersisted,
-                    Baseline: not null,
-                })
+            var existingStage = EffectiveRecoverableStage(existing);
+            if (existingStage == WebAutomationAttemptState.BaselinePersisted)
                 return BaiduAdapterResult<TransferPreparationReceipt>.Success(
                     TransferPreparationReceipt.Ready,
                     SubmissionAcceptance.DefinitelyNotAccepted);
-            if (existing is not null && existing.State != WebAutomationAttemptState.Preparing)
+            if (existing is not null && existingStage != WebAutomationAttemptState.Preparing)
                 return Unknown<TransferPreparationReceipt>(SubmissionAcceptance.Unknown);
         }
         var request = Request(
@@ -152,13 +148,12 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
-        if (attempt is not
-            {
-                OwnerKind: WebAutomationOwnerKind.Transfer,
-                State: WebAutomationAttemptState.BaselinePersisted,
-                Baseline: not null,
-            })
-            return Unknown<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        if (EffectiveRecoverableStage(attempt) != WebAutomationAttemptState.BaselinePersisted)
+            return Unknown<TransferReceipt>(
+                attempt?.State == WebAutomationAttemptState.UserHandoff
+                    ? SubmissionAcceptance.Unknown
+                    : SubmissionAcceptance.DefinitelyNotAccepted);
+        var baseline = attempt!.Baseline!;
         var request = Request(
             context,
             share,
@@ -169,7 +164,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 var result = await flow.SubmitAsync(
                     new PersistentTransferAutomationSession(automationSession, visibleContext),
                     new TransferAutomationRequest(share, destination, duplicatePolicy),
-                    attempt.Baseline,
+                    baseline,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
@@ -215,14 +210,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             return BaiduAdapterResult<TransferConfirmationResult>.Success(
                 TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
                 SubmissionAcceptance.Unknown);
-        if (attempt is not
-            {
-                OwnerKind: WebAutomationOwnerKind.Transfer,
-                State: WebAutomationAttemptState.ResultPending,
-                Baseline: not null,
-                AcceptedRemoteItems: not null,
-            })
+        if (EffectiveRecoverableStage(attempt) != WebAutomationAttemptState.ResultPending)
             return UnknownConfirmation();
+        var baseline = attempt!.Baseline!;
+        var acceptedRemoteItems = attempt.AcceptedRemoteItems!;
 
         var request = Request(
             context,
@@ -232,15 +223,15 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
                 var officialAcceptance = new TransferOfficialAcceptance(
-                    true,
+                    TransferOfficialAcceptanceStatus.Accepted,
                     adapterRequestId: null,
-                    attempt.AcceptedRemoteItems,
-                    attempt.ObservationFingerprint ?? attempt.AcceptedRemoteItems.Fingerprint);
+                    acceptedRemoteItems,
+                    attempt.ObservationFingerprint ?? acceptedRemoteItems.Fingerprint);
                 var result = await flow.ConfirmExactAsync(
                     automationSession,
                     context.SourceShare,
                     new RemoteDirectory(query.TargetPath.Value, query.TargetPath),
-                    attempt.Baseline,
+                    baseline,
                     officialAcceptance,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
@@ -296,6 +287,26 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         context.Validate();
         if (context.AccountId != session.LocalAccountId || context.SourceShare != share)
             throw new InvalidOperationException("The transfer automation identity does not match its account or source share.");
+    }
+
+    private static WebAutomationAttemptState? EffectiveRecoverableStage(
+        WebAutomationAttemptRecord? attempt)
+    {
+        if (attempt is null || attempt.OwnerKind != WebAutomationOwnerKind.Transfer)
+            return null;
+        var stage = attempt.State == WebAutomationAttemptState.UserHandoff
+            ? attempt.ResumeStage
+            : attempt.State;
+        return stage switch
+        {
+            WebAutomationAttemptState.Preparing
+                when attempt.Baseline is null && attempt.AcceptedRemoteItems is null => stage,
+            WebAutomationAttemptState.BaselinePersisted
+                when attempt.Baseline is not null && attempt.AcceptedRemoteItems is null => stage,
+            WebAutomationAttemptState.ResultPending
+                when attempt.Baseline is not null && attempt.AcceptedRemoteItems is not null => stage,
+            _ => null,
+        };
     }
 
     private static async Task<BaiduAdapterResult<TransferReceipt>> MarkSucceededAfterExactAsync(

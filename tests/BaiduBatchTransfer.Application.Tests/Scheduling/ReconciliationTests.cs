@@ -231,11 +231,12 @@ public sealed class ReconciliationTests
     {
         var operation = PendingOperation() with { RequiresExactShareEvidence = false };
         var store = new RecordingReconciliationStore(operation);
-        var adapter = new ConfirmationAdapter
+        var legacy = new ConfirmationAdapter
         {
             Result = BaiduAdapterResult<TransferConfirmation>.Success(TransferConfirmation.ConfirmedPresent),
             ExactResult = BaiduAdapterResult<TransferConfirmationResult>.Success(TransferConfirmationResult.Ambiguous),
         };
+        var adapter = CoordinatedBaiduNetdiskAdapter.Wrap(legacy, new BaiduAdapterConcurrencyGate());
         var service = new OperationReconciliationService(
             adapter,
             new SessionStore(operation.AccountId),
@@ -247,6 +248,20 @@ public sealed class ReconciliationTests
         Assert.Equal(TransferConfirmation.ConfirmedPresent, result);
         Assert.True(store.Present);
         Assert.Null(store.ExactRemoteItems);
+    }
+
+    [Fact]
+    public void CoordinatedWrapperAdvertisesOnlyTheInnerAdapterCapability()
+    {
+        var gate = new BaiduAdapterConcurrencyGate();
+
+        var legacy = CoordinatedBaiduNetdiskAdapter.Wrap(new ConfirmationAdapter(), gate);
+        var operationBound = CoordinatedBaiduNetdiskAdapter.Wrap(
+            new OperationBoundConfirmationAdapter(),
+            gate);
+
+        Assert.IsNotAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(legacy);
+        Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(operationBound);
     }
 
     [Fact]

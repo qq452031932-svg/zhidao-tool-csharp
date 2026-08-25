@@ -27,8 +27,9 @@ public sealed class AppBootstrapTests : IDisposable
     {
         using var host = AppBootstrap.CreateHost(root);
 
-        Assert.IsType<CoordinatedBaiduNetdiskAdapter>(
+        var transferAdapter = Assert.IsType<CoordinatedBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
+        Assert.IsNotAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(transferAdapter);
         Assert.IsType<CoordinatedBaiduShareAdapter>(
             host.Services.GetRequiredService<IBaiduShareAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>());

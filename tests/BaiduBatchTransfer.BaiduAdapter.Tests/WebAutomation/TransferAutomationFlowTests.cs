@@ -79,6 +79,65 @@ public sealed class TransferAutomationFlowTests
     }
 
     [Fact]
+    public async Task UnobservedOfficialAcceptanceAfterClickReturnsResultPending()
+    {
+        var session = new FixtureSession(Load("folder-transfer.json"))
+        {
+            AcceptanceOverride = new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.Unobserved,
+                null,
+                null,
+                Fingerprint('d')),
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.DoesNotContain("persist-acceptance", session.Events);
+    }
+
+    [Fact]
+    public async Task ExplicitOfficialRejectionAfterClickIsDefinitelyNotAccepted()
+    {
+        var session = new FixtureSession(Load("folder-transfer.json"))
+        {
+            AcceptanceOverride = new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.ExplicitlyRejected,
+                null,
+                null,
+                Fingerprint('d')),
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.DoesNotContain("persist-acceptance", session.Events);
+    }
+
+    [Theory]
+    [MemberData(nameof(PostClickUnobservedFailures))]
+    public async Task PostClickTimeoutOrWindowCloseReturnsResultPending(Exception failure)
+    {
+        var session = new FixtureSession(Load("folder-transfer.json")) { SaveFailure = failure };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+    }
+
+    public static TheoryData<Exception> PostClickUnobservedFailures => new()
+    {
+        new TimeoutException("No official acceptance was observed."),
+        new OperationCanceledException("The visible automation window was closed."),
+    };
+
+    [Fact]
     public async Task DisplayNameAndTimeSimilarityCannotConfirmAnIdentity()
     {
         var scenario = Load("folder-transfer.json") with
@@ -196,7 +255,11 @@ public sealed class TransferAutomationFlowTests
             Share(),
             Destination(),
             WebAutomationBaseline.Create(scenario.Baseline),
-            new TransferOfficialAcceptance(false, null, null, Fingerprint('d')),
+            new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.Unobserved,
+                null,
+                null,
+                Fingerprint('d')),
             CancellationToken.None);
 
         Assert.True(result.IsSuccess);
@@ -222,8 +285,12 @@ public sealed class TransferAutomationFlowTests
     {
         public List<string> Events { get; } = [];
         public WebAutomationBaseline? PersistedBaseline { get; private set; }
+        public Exception? SaveFailure { get; init; }
+        public TransferOfficialAcceptance? AcceptanceOverride { get; init; }
         public TransferOfficialAcceptance OfficialAcceptance => new(
-            scenario.OfficialAccepted,
+            scenario.OfficialAccepted
+                ? TransferOfficialAcceptanceStatus.Accepted
+                : TransferOfficialAcceptanceStatus.Unobserved,
             "fictional-request",
             scenario.OfficialRemoteIds is null
                 ? null
@@ -270,7 +337,9 @@ public sealed class TransferAutomationFlowTests
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)
         {
             Events.Add("submit");
-            return Task.FromResult(OfficialAcceptance);
+            return SaveFailure is null
+                ? Task.FromResult(AcceptanceOverride ?? OfficialAcceptance)
+                : Task.FromException<TransferOfficialAcceptance>(SaveFailure);
         }
 
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken)

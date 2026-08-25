@@ -307,6 +307,111 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Null(broker.Identity);
     }
 
+    [Fact]
+    public async Task PreparingUserHandoffCanBeRequeuedAfterRestart()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            null,
+            resumeStage: WebAutomationAttemptState.Preparing));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(context.OperationId, broker.Identity!.OperationId);
+    }
+
+    [Fact]
+    public async Task BaselinePersistedUserHandoffResumesSubmitWithoutLosingBaseline()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var baseline = WebAutomationBaseline.Create(["fictional-old"]);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            baseline,
+            resumeStage: WebAutomationAttemptState.BaselinePersisted));
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new CallbackBroker(attempts, new AutomationSession()),
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.SaveWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(baseline, attempts.Current.Baseline);
+        Assert.Equal(AcceptedItems(), attempts.Current.AcceptedRemoteItems);
+    }
+
+    [Fact]
+    public async Task ResultPendingUserHandoffResumesExactRecoveryAndSucceeds()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var baseline = WebAutomationBaseline.Create(["fictional-old"]);
+        var accepted = AcceptedItems();
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            baseline,
+            accepted,
+            WebAutomationAttemptState.ResultPending));
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new CallbackBroker(attempts, new AutomationSession()),
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(baseline, attempts.Current.Baseline);
+        Assert.Equal(accepted, attempts.Current.AcceptedRemoteItems);
+    }
+
+    [Theory]
+    [InlineData(WebAutomationAttemptState.BaselinePersisted, true)]
+    [InlineData(WebAutomationAttemptState.Submitting, false)]
+    public async Task UserHandoffResumeStageOrEvidenceMismatchFailsClosed(
+        WebAutomationAttemptState resumeStage,
+        bool includeAcceptedEvidence)
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.UserHandoff,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            includeAcceptedEvidence ? AcceptedItems() : null,
+            resumeStage));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.SaveWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.Null(broker.Identity);
+    }
+
     private static ShareReference Share() =>
         new("fictional-share", "https://pan.baidu.com/s/fictional", "1111");
 
@@ -325,16 +430,17 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         TransferOperationAutomationContext context,
         WebAutomationAttemptState state,
         WebAutomationBaseline? baseline,
-        RemoteItemIdentitySet? acceptedRemoteItems = null) => new(
+        RemoteItemIdentitySet? acceptedRemoteItems = null,
+        WebAutomationAttemptState? resumeStage = null) => new(
             context.OperationId,
             context.AccountId,
             context.Generation,
             WebAutomationOwnerKind.Transfer,
             state,
-            null,
+            resumeStage,
             baseline,
             new string('a', 64),
-            false,
+            state == WebAutomationAttemptState.UserHandoff,
             2,
             Now.AddMinutes(-2),
             Now.AddMinutes(-1),
@@ -441,7 +547,28 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 acceptedRemoteItems);
             return Task.FromResult(true);
         }
-        public Task<bool> TryResumeFromUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> TryResumeFromUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.UserHandoff ||
+                Current.ResumeStage != resumeStage || expectedRevision != Current.Revision)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId,
+                Current.AccountId,
+                Current.Generation,
+                Current.OwnerKind,
+                resumeStage,
+                null,
+                Current.Baseline,
+                observationFingerprint ?? Current.ObservationFingerprint,
+                false,
+                checked(Current.Revision + 1),
+                Current.CreatedAt,
+                updatedAt,
+                Current.AcceptedRemoteItems);
+            return Task.FromResult(true);
+        }
         public Task<bool> TryResolveUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, WebAutomationAttemptState terminalState, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
@@ -451,6 +578,21 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             VisibleWebAutomationRequest<T> request,
             CancellationToken cancellationToken = default)
         {
+            var initialStage = attempts.Current.State;
+            if (initialStage == WebAutomationAttemptState.UserHandoff)
+            {
+                initialStage = attempts.Current.ResumeStage!.Value;
+                var resumed = await attempts.TryResumeFromUserHandoffAsync(
+                    request.Identity.OperationId,
+                    request.Identity.AccountId,
+                    request.Identity.Generation,
+                    attempts.Current.Revision,
+                    initialStage,
+                    attempts.Current.ObservationFingerprint,
+                    Now,
+                    cancellationToken);
+                if (!resumed) throw new InvalidOperationException("Synthetic handoff resume failed.");
+            }
             var dispatcher = new InlineDispatcher();
             var coordinator = new UserHandoffCoordinator(attempts, new NoBatchCancellation(), new FixedTimeProvider(Now));
             var context = (VisibleWebAutomationContext)Activator.CreateInstance(
@@ -462,7 +604,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                     session,
                     dispatcher,
                     coordinator,
-                    attempts.Current.State,
+                    initialStage,
                     attempts.Current.ObservationFingerprint,
                 ],
                 culture: null)!;
@@ -498,7 +640,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 ? Task.FromException<TransferDirectoryListing>(new OperationCanceledException(cancellationToken))
                 : Task.FromResult(new TransferDirectoryListing(true, true, CurrentItems, new string('d', 64)));
         private static TransferOfficialAcceptance Acceptance() => new(
-            true,
+            TransferOfficialAcceptanceStatus.Accepted,
             "fictional-request",
             new RemoteItemIdentitySet([new("fictional-new", "新资源")]),
             new string('e', 64));

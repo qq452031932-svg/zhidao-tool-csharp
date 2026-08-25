@@ -68,28 +68,37 @@ public sealed record TransferDirectoryListing
         $"TransferDirectoryListing {{ IsComplete = {IsComplete}, IsStable = {IsStable}, ItemCount = {TopLevelItems.Count}, ObservationFingerprint = [REDACTED], Items = [REDACTED] }}";
 }
 
+public enum TransferOfficialAcceptanceStatus
+{
+    Accepted = 0,
+    ExplicitlyRejected = 1,
+    Unobserved = 2,
+}
+
 public sealed record TransferOfficialAcceptance
 {
     public TransferOfficialAcceptance(
-        bool isAccepted,
+        TransferOfficialAcceptanceStatus status,
         string? adapterRequestId,
         RemoteItemIdentitySet? exactRemoteItems,
         string observationFingerprint)
     {
+        if (!Enum.IsDefined(status)) throw new ArgumentOutOfRangeException(nameof(status));
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
-        IsAccepted = isAccepted;
+        Status = status;
         AdapterRequestId = string.IsNullOrWhiteSpace(adapterRequestId) ? null : adapterRequestId.Trim();
         ExactRemoteItems = exactRemoteItems;
         ObservationFingerprint = observationFingerprint;
     }
 
-    public bool IsAccepted { get; }
+    public TransferOfficialAcceptanceStatus Status { get; }
+    public bool IsAccepted => Status == TransferOfficialAcceptanceStatus.Accepted;
     public string? AdapterRequestId { get; }
     public RemoteItemIdentitySet? ExactRemoteItems { get; }
     public string ObservationFingerprint { get; }
 
     public override string ToString() =>
-        $"TransferOfficialAcceptance {{ IsAccepted = {IsAccepted}, AdapterRequestId = [REDACTED], ExactRemoteItems = [REDACTED] }}";
+        $"TransferOfficialAcceptance {{ Status = {Status}, AdapterRequestId = [REDACTED], ExactRemoteItems = [REDACTED] }}";
 }
 
 public interface ITransferAutomationSession
@@ -225,7 +234,10 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 request.Destination,
                 request.DuplicatePolicy,
                 cancellationToken).ConfigureAwait(false);
-            if (!acceptance.IsAccepted) return DefinitelyNotAccepted();
+            if (acceptance.Status == TransferOfficialAcceptanceStatus.ExplicitlyRejected)
+                return DefinitelyNotAccepted();
+            if (acceptance.Status != TransferOfficialAcceptanceStatus.Accepted)
+                return ResultPending();
             await session.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
 
             var current = await session

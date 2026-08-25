@@ -46,12 +46,29 @@ public sealed class BaiduAdapterConcurrencyGate
     }
 }
 
-public sealed class CoordinatedBaiduNetdiskAdapter(
-    IBaiduNetdiskAdapter inner,
-    BaiduAdapterConcurrencyGate gate) : IOperationBoundBaiduNetdiskAdapter
+public class CoordinatedBaiduNetdiskAdapter : IBaiduNetdiskAdapter
 {
-    private readonly IBaiduNetdiskAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
-    private readonly BaiduAdapterConcurrencyGate gate = gate ?? throw new ArgumentNullException(nameof(gate));
+    private readonly IBaiduNetdiskAdapter inner;
+    private readonly BaiduAdapterConcurrencyGate gate;
+
+    protected CoordinatedBaiduNetdiskAdapter(
+        IBaiduNetdiskAdapter inner,
+        BaiduAdapterConcurrencyGate gate)
+    {
+        this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        this.gate = gate ?? throw new ArgumentNullException(nameof(gate));
+    }
+
+    public static IBaiduNetdiskAdapter Wrap(
+        IBaiduNetdiskAdapter inner,
+        BaiduAdapterConcurrencyGate gate)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentNullException.ThrowIfNull(gate);
+        return inner is IOperationBoundBaiduNetdiskAdapter operationBound
+            ? new CoordinatedOperationBoundBaiduNetdiskAdapter(operationBound, gate)
+            : new CoordinatedBaiduNetdiskAdapter(inner, gate);
+    }
 
     public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) =>
         RunAsync(session, token => inner.ValidateSessionAsync(session, token), cancellationToken);
@@ -74,6 +91,19 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
     public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(AccountSession session, TransferConfirmationQuery query, CancellationToken cancellationToken) =>
         RunAsync(session, token => inner.ConfirmTransferAsync(session, query, token), cancellationToken);
 
+    protected async Task<T> RunAsync<T>(AccountSession session, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
+    {
+        await using var lease = await gate.AcquireAsync(session, cancellationToken).ConfigureAwait(false);
+        return await action(cancellationToken).ConfigureAwait(false);
+    }
+}
+
+public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
+    IOperationBoundBaiduNetdiskAdapter inner,
+    BaiduAdapterConcurrencyGate gate) : CoordinatedBaiduNetdiskAdapter(inner, gate), IOperationBoundBaiduNetdiskAdapter
+{
+    private readonly IOperationBoundBaiduNetdiskAdapter inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
     public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
@@ -83,10 +113,8 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
         CancellationToken cancellationToken) =>
         RunAsync(
             session,
-            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
-                ? operationBound.SaveWholeShareForOperationAsync(
-                    context, session, share, destination, duplicatePolicy, token)
-                : inner.SaveWholeShareAsync(session, share, destination, duplicatePolicy, token),
+            token => inner.SaveWholeShareForOperationAsync(
+                context, session, share, destination, duplicatePolicy, token),
             cancellationToken);
 
     public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
@@ -98,10 +126,8 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
         CancellationToken cancellationToken) =>
         RunAsync(
             session,
-            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
-                ? operationBound.PrepareWholeShareForOperationAsync(
-                    context, session, share, destination, duplicatePolicy, token)
-                : Task.FromResult(BaiduAdapterResult<TransferPreparationReceipt>.Success(TransferPreparationReceipt.Ready)),
+            token => inner.PrepareWholeShareForOperationAsync(
+                context, session, share, destination, duplicatePolicy, token),
             cancellationToken);
 
     public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
@@ -111,16 +137,8 @@ public sealed class CoordinatedBaiduNetdiskAdapter(
         CancellationToken cancellationToken) =>
         RunAsync(
             session,
-            token => inner is IOperationBoundBaiduNetdiskAdapter operationBound
-                ? operationBound.ConfirmExactTransferForOperationAsync(context, session, query, token)
-                : inner.ConfirmExactTransferAsync(session, query, token),
+            token => inner.ConfirmExactTransferForOperationAsync(context, session, query, token),
             cancellationToken);
-
-    private async Task<T> RunAsync<T>(AccountSession session, Func<CancellationToken, Task<T>> action, CancellationToken cancellationToken)
-    {
-        await using var lease = await gate.AcquireAsync(session, cancellationToken).ConfigureAwait(false);
-        return await action(cancellationToken).ConfigureAwait(false);
-    }
 }
 
 public sealed class CoordinatedBaiduShareAdapter(

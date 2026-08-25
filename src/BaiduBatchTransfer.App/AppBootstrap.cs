@@ -158,7 +158,7 @@ public static class AppBootstrap
         services.AddSingleton<LiveBaiduNetdiskAdapter>();
         services.AddSingleton<LiveBaiduShareAdapter>();
         services.AddSingleton<BaiduAdapterConcurrencyGate>();
-        services.AddSingleton<IBaiduNetdiskAdapter>(sp => new CoordinatedBaiduNetdiskAdapter(
+        services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
             sp.GetRequiredService<LiveBaiduNetdiskAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>()));
         services.AddSingleton<IBaiduShareAdapter>(sp => new CoordinatedBaiduShareAdapter(
