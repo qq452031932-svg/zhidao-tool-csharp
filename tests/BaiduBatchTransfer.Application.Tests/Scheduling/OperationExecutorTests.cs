@@ -56,6 +56,24 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
+    public async Task PreparedFreshRetryGenerationIsNotPassedToAutomationAsRecovery()
+    {
+        var snapshot = Snapshot(createFolderName: null) with
+        {
+            BatchId = Guid.NewGuid(),
+            AttemptCount = 2,
+            AttemptGenerationPrepared = true,
+        };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new OperationBoundRecordingAdapter();
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.False(adapter.Context!.IsRecovery);
+        Assert.Equal(2, adapter.Context.Generation);
+    }
+
+    [Fact]
     public async Task DirectoryFailurePausesAccountWithoutCallingSaveOrCrossingSubmitBoundary()
     {
         var snapshot = Snapshot(createFolderName: "outer");

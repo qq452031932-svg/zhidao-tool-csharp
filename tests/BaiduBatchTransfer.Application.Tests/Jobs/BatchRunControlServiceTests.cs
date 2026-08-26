@@ -811,6 +811,57 @@ public sealed class BatchRunControlServiceTests
         Assert.Null(await restartedStore.TryReserveNextAsync(retryBatchId, Now.AddMinutes(2), Now.AddMinutes(7)));
     }
 
+    [Fact]
+    public async Task SafelyRequeuedGenerationIsPreparedButNotAutomationRecoveryWithoutExactAttempt()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1);
+        var operation = Operation(resource, accountId, 1,
+            status: "Failed", outcomeKind: "Failed", submitState: "NotPrepared", slotState: "Released",
+            errorCode: "TransientService", errorMessage: "The service is temporarily unavailable.");
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, failed: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await new RetryFailedTransferService(store, new FixedTimeProvider(Now.AddMinutes(1)))
+                .RetryAsync(operation.Id));
+        var snapshot = (await store.LoadOperationAsync(operation.Id))!;
+
+        Assert.True(snapshot.AttemptGenerationPrepared);
+        Assert.False(snapshot.IsAutomationRecovery);
+    }
+
+    [Fact]
+    public async Task ExactCurrentTransferAutomationAttemptIsLoadedAsAutomationRecovery()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1);
+        var operation = Operation(resource, accountId, 1,
+            status: "Failed", outcomeKind: "Failed", submitState: "NotPrepared", slotState: "Released",
+            errorCode: "TransientService", errorMessage: "The service is temporarily unavailable.");
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, failed: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        Assert.Equal(RetryFailedTransferDisposition.Requeued,
+            await new RetryFailedTransferService(store, new FixedTimeProvider(Now.AddMinutes(1)))
+                .RetryAsync(operation.Id));
+        var attemptStore = new SqliteWebAutomationAttemptStore(db.ConnectionFactory);
+        Assert.True(await attemptStore.BeginAsync(WebAutomationAttemptRecord.Create(
+            operation.Id, accountId, 1, WebAutomationOwnerKind.Transfer, Now.AddMinutes(2))));
+
+        var snapshot = (await store.LoadOperationAsync(operation.Id))!;
+
+        Assert.True(snapshot.AttemptGenerationPrepared);
+        Assert.True(snapshot.IsAutomationRecovery);
+    }
+
     private static AccountRecord Account(Guid id) =>
         AccountRecord.Create(id, $"baidu-{id:N}", "Account") with { DailyCountDateKey = "2026-08-19" };
 

@@ -17,7 +17,8 @@ public sealed record OperationExecutionSnapshot(
     bool RequiresExactShareEvidence = false,
     int AttemptCount = 0,
     bool AttemptGenerationPrepared = false,
-    Guid BatchId = default)
+    Guid BatchId = default,
+    bool IsAutomationRecovery = false)
 {
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
@@ -190,7 +191,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 snapshot.AccountId,
                 attemptCount,
                 snapshot.Share,
-                IsRecovery: snapshot.AttemptGenerationPrepared).Validate()
+                IsRecovery: snapshot.IsAutomationRecovery).Validate()
             : null;
         RemotePath completePath;
         try

@@ -931,7 +931,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState,o.BatchJobId FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
+            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState,o.BatchJobId,EXISTS(SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=o.Id AND attempt.AccountId=o.AssignedAccountId AND attempt.Generation=o.AttemptCount AND attempt.OwnerKind='Transfer') FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
@@ -944,7 +944,7 @@ public sealed class SqliteTransferSchedulingStore :
                 new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
                 Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0,
                 attemptCount, string.Equals(reader.GetString(11), "PreparingToSubmit", StringComparison.Ordinal),
-                Guid.Parse(reader.GetString(12)));
+                Guid.Parse(reader.GetString(12)), reader.GetInt64(13) != 0);
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
         {
