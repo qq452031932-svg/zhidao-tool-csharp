@@ -13,6 +13,50 @@ public sealed class StandaloneShareStoreTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-standalone-share-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task ManagedExecutionProfileRoundTripsAndIsReturnedByTheLease()
+    {
+        var graph = await CreateAsync();
+        var state = new SqliteManagedBrowserStateStore(graph.Factory);
+        var directory = Path.GetFullPath(Path.Combine(root, "managed-standalone-edge"));
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Edge, directory, Path.Combine(directory, "msedge.exe"),
+            "Microsoft Corporation", "Microsoft Edge", "managed-standalone-file");
+        await state.CreateInstallationAsync(installation, default);
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.InstallationId, graph.AccountId, "local-user",
+            BrowserFamily.Edge, "managed-standalone-profile", "managed-standalone-owner");
+        await state.CreateSessionAsync(session, default);
+        var snapshot = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Edge, session.ProfileId, installation.InstallationId, session.SessionId);
+        var batchId = Guid.NewGuid();
+        var batch = StandaloneShareBatchRecord.Create(
+            batchId, Path.Combine(graph.Root, $"results-{batchId:N}"), 1, graph.Now);
+        var operation = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), batchId,
+            new OwnedRemoteSelection(
+                graph.AccountId,
+                new RemoteItemIdentitySet([new RemoteItemIdentity("managed-remote", "item")]),
+                "item", RemoteResourceKind.File, new RemotePath("/apps")),
+            1, graph.Now, executionProfile: snapshot);
+
+        var receipt = await graph.Store.CreateOrGetBatchAsync(
+            StandaloneSharePendingBatchEnvelope.Create(batch, [operation]));
+        var restored = Assert.Single(receipt.Operations);
+        var lease = await graph.Store.TryLeaseNextAsync(
+            batchId, Guid.NewGuid(), graph.Now.AddSeconds(1), graph.Now.AddMinutes(1));
+
+        Assert.Same(snapshot, operation.ExecutionProfile);
+        Assert.Equal(snapshot.Engine, restored.ExecutionProfile.Engine);
+        Assert.Equal(snapshot.BrowserFamily, restored.ExecutionProfile.BrowserFamily);
+        Assert.Equal(snapshot.ProfileId, restored.ExecutionProfile.ProfileId);
+        Assert.Equal(snapshot.InstallationId, restored.ExecutionProfile.InstallationId);
+        Assert.Equal(snapshot.SessionId, restored.ExecutionProfile.SessionId);
+        Assert.NotNull(lease);
+        Assert.Equal(snapshot.Engine, lease.ExecutionProfile.Engine);
+        Assert.Equal(snapshot.SessionId, lease.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
     public async Task ResultProjectionIsAStableKeysetAndUsesOnlyExactCurrentGenerationEvidence()
     {
         var graph = await CreateAsync();

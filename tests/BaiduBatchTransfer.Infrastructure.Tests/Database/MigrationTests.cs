@@ -8,6 +8,280 @@ public sealed class MigrationTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-migration-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task VersionFifteenUpgradePreservesRowsAndBackfillsAccountSpecificLegacyExecutionSnapshots()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v15-to-v16.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 15)).IsValid);
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var migrator = new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "v16-backups")), "new");
+
+        await migrator.MigrateAsync();
+        await migrator.MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal(16L, await ScalarAsync<long>(upgraded, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM SchemaVersions WHERE Version=16;"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 16)).IsValid);
+
+        foreach (var table in new[]
+                 {
+                     "TransferOperations", "ShareOperations", "StandaloneShareOperations", "WebAutomationAttempts",
+                 })
+        {
+            var columns = await ColumnsAsync(upgraded, table);
+            Assert.Subset(new HashSet<string>(columns), new HashSet<string>
+            {
+                "ExecutionEngineVersion", "BrowserFamily", "ProfileId", "InstallationId", "SessionId",
+            });
+            Assert.Equal(0L, await ScalarAsync<long>(upgraded, $"""
+                SELECT COUNT(*) FROM {table}
+                WHERE ExecutionEngineVersion IS NULL OR BrowserFamily IS NULL OR ProfileId IS NULL;
+                """));
+        }
+
+        var accountOneProfile = LegacyProfileId(ids.AccountOne);
+        var accountTwoProfile = LegacyProfileId(ids.AccountTwo);
+        Assert.NotEqual(accountOneProfile, accountTwoProfile);
+        Assert.Equal(2L, await ScalarAsync<long>(upgraded, """
+            SELECT COUNT(*) FROM TransferOperations
+            WHERE ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+              AND ProfileId=$profile AND InstallationId IS NULL AND SessionId IS NULL;
+            """, ("$profile", accountOneProfile)));
+        Assert.Equal(2L, await ScalarAsync<long>(upgraded, """
+            SELECT COUNT(*) FROM ShareOperations
+            WHERE ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+              AND ProfileId=$profile AND InstallationId IS NULL AND SessionId IS NULL;
+            """, ("$profile", accountOneProfile)));
+        Assert.Equal(2L, await ScalarAsync<long>(upgraded, """
+            SELECT COUNT(*) FROM StandaloneShareOperations
+            WHERE ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+              AND ProfileId=$profile AND InstallationId IS NULL AND SessionId IS NULL;
+            """, ("$profile", accountTwoProfile)));
+        Assert.Equal(accountOneProfile, await ScalarAsync<string>(upgraded, """
+            SELECT ProfileId FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", ids.TransferWaiting.ToString("D")), ("$account", ids.AccountOne.ToString("D"))));
+        Assert.Equal(accountTwoProfile, await ScalarAsync<string>(upgraded, """
+            SELECT ProfileId FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", ids.StandaloneSucceeded.ToString("D")), ("$account", ids.AccountTwo.ToString("D"))));
+
+        Assert.Equal("Waiting", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM TransferOperations WHERE Id=$id;", ("$id", ids.TransferWaiting.ToString("D"))));
+        Assert.Equal("Succeeded", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM TransferOperations WHERE Id=$id;", ("$id", ids.TransferSucceeded.ToString("D"))));
+        Assert.Equal("WaitingTransfer", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", ("$id", ids.ShareWaiting.ToString("D"))));
+        Assert.Equal("Succeeded", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM ShareOperations WHERE Id=$id;", ("$id", ids.ShareSucceeded.ToString("D"))));
+        Assert.Equal("Queued", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM StandaloneShareOperations WHERE Id=$id;", ("$id", ids.StandaloneQueued.ToString("D"))));
+        Assert.Equal("Succeeded", await ScalarAsync<string>(upgraded,
+            "SELECT Status FROM StandaloneShareOperations WHERE Id=$id;", ("$id", ids.StandaloneSucceeded.ToString("D"))));
+
+        var tableNames = await NamesAsync(upgraded, "table");
+        Assert.Subset(new HashSet<string>(tableNames), new HashSet<string>
+        {
+            "BrowserInstallations", "ManagedBrowserSessions", "ManagedProfileCleanupManifests",
+            "ManagedBrowserRetentions",
+        });
+        var indexNames = await NamesAsync(upgraded, "index");
+        Assert.Contains("UX_BrowserInstallations_OneActive", indexNames);
+        Assert.Contains("UX_ManagedBrowserSessions_ActiveAccountFamily", indexNames);
+        Assert.Contains("IX_TransferOperations_Batch_AllocationOrdinal", indexNames);
+        Assert.Contains("IX_StandaloneShareOperations_Reconciliation", indexNames);
+        var triggerNames = await NamesAsync(upgraded, "trigger");
+        Assert.Contains("TR_TransferOperations_RemoveTerminalPendingShare", triggerNames);
+        Assert.Contains("TR_ShareOperations_RecordNextGeneration", triggerNames);
+
+        foreach (var table in new[]
+                 {
+                     "TransferOperations", "ShareOperations", "StandaloneShareOperations", "WebAutomationAttempts",
+                 })
+        {
+            var foreignKeys = await ForeignKeysAsync(upgraded, table);
+            Assert.Contains(foreignKeys, row => row.Table == "BrowserInstallations" && row.From == "InstallationId");
+            Assert.Contains(foreignKeys, row => row.Table == "ManagedBrowserSessions" && row.From == "SessionId");
+        }
+
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE TransferOperations
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome'
+            WHERE Id=$id;
+            """, ("$id", ids.TransferWaiting.ToString("D"))));
+        var installationId = Guid.NewGuid();
+        var accountOneSessionId = Guid.NewGuid();
+        var accountTwoSessionId = Guid.NewGuid();
+        await ExecuteAsync(upgraded, """
+            INSERT INTO BrowserInstallations(
+              InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,ProductName,
+              FileIdentity,State,CreatedAt,UpdatedAt)
+            VALUES($installation,'Chrome','C:\\managed','C:\\managed\\chrome.exe','publisher','product',
+              'migration-managed-file','Active','2026-08-01','2026-08-01');
+            INSERT INTO ManagedBrowserSessions(
+              SessionId,AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,ProfileOwnershipId,
+              State,CreatedAt,UpdatedAt)
+            VALUES($sessionOne,$accountOne,'uid-one',$installation,'Chrome','managed-one','owner-one',
+                     'Active','2026-08-01','2026-08-01'),
+                  ($sessionTwo,$accountTwo,'uid-two',$installation,'Chrome','managed-two','owner-two',
+                     'Active','2026-08-01','2026-08-01');
+            """,
+            ("$installation", installationId.ToString("D")),
+            ("$sessionOne", accountOneSessionId.ToString("D")),
+            ("$sessionTwo", accountTwoSessionId.ToString("D")),
+            ("$accountOne", ids.AccountOne.ToString("D")),
+            ("$accountTwo", ids.AccountTwo.ToString("D")));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE TransferOperations
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId='wrong-profile',
+                InstallationId=$installation,SessionId=$session
+            WHERE Id=$id;
+            """, ("$installation", installationId.ToString("D")),
+            ("$session", accountOneSessionId.ToString("D")), ("$id", ids.TransferWaiting.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE ShareOperations
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId='wrong-profile',
+                InstallationId=$installation,SessionId=$session
+            WHERE Id=$id;
+            """, ("$installation", installationId.ToString("D")),
+            ("$session", accountOneSessionId.ToString("D")), ("$id", ids.ShareWaiting.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE StandaloneShareOperations
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId='wrong-profile',
+                InstallationId=$installation,SessionId=$session
+            WHERE Id=$id;
+            """, ("$installation", installationId.ToString("D")),
+            ("$session", accountTwoSessionId.ToString("D")), ("$id", ids.StandaloneQueued.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId='wrong-profile',
+                InstallationId=$installation,SessionId=$session
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$installation", installationId.ToString("D")),
+            ("$session", accountOneSessionId.ToString("D")),
+            ("$operation", ids.TransferWaiting.ToString("D")), ("$account", ids.AccountOne.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task VersionSixteenCorruptIdentityRollsBackWithoutReplacingVersionFifteenRows()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v16-corrupt-identity.db");
+        var operationId = Guid.NewGuid().ToString("D");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await ExecuteAsync(connection, """
+                INSERT INTO Accounts(
+                  Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
+                  SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
+                VALUES('corrupt-account-id','uid','name','WebView2','Active',0,0,1,1,'2026-08-01',0);
+                INSERT INTO BatchJobs(
+                  Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,
+                  DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
+                VALUES('corrupt-job','fixture','Text','Distribution','TaskCount','ProportionalReduction',1,1,
+                  '/target','None','Skip','Immediate','Queued','2026-08-01T00:00:00Z',1);
+                INSERT INTO ResourceItems(
+                  Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,FolderCreationModeOverride,
+                  GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+                VALUES('corrupt-resource','corrupt-job',1,'https://example.invalid','share','None','Unknown',
+                  'Expanded','2026-08-01T00:00:00Z','2026-08-01T00:00:00Z');
+                INSERT INTO TransferOperations(
+                  Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                  CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,
+                  SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+                VALUES($operation,'corrupt-resource','corrupt-job',1,1,'/target','/target','',
+                  'corrupt-account-id','Fixture','Waiting',0,'fingerprint','NotPrepared','Unoccupied',
+                  '2026-08-01T00:00:00Z','2026-08-01T00:00:01Z');
+                """, ("$operation", operationId));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var error = await Record.ExceptionAsync(() => new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "corrupt-backups")), "new")
+            .MigrateAsync());
+
+        Assert.True(error is SqliteException or InvalidDataException, error?.ToString());
+        await using var live = await factory.OpenConnectionAsync();
+        Assert.Equal(15L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal("Waiting", await ScalarAsync<string>(live,
+            "SELECT Status FROM TransferOperations WHERE Id=$id;", ("$id", operationId)));
+        Assert.DoesNotContain("ExecutionEngineVersion", await ColumnsAsync(live, "TransferOperations"));
+        Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
+    }
+
+    [Fact]
+    public async Task VersionSixteenMismatchedAttemptOwnerRollsBackWithoutReplacingVersionFifteenRows()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v16-mismatched-attempt.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            await ExecuteAsync(connection, """
+                UPDATE WebAutomationAttempts SET AccountId=$wrongAccount
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """, ("$wrongAccount", ids.AccountTwo.ToString("D")),
+                ("$operation", ids.TransferWaiting.ToString("D")),
+                ("$account", ids.AccountOne.ToString("D")));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var error = await Record.ExceptionAsync(() => new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "mismatch-backups")), "new")
+            .MigrateAsync());
+
+        Assert.True(error is SqliteException or InvalidDataException, error?.ToString());
+        await using var live = await factory.OpenConnectionAsync();
+        Assert.Equal(15L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(ids.AccountTwo.ToString("D"), await ScalarAsync<string>(live, """
+            SELECT AccountId FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND Generation=1;
+            """, ("$operation", ids.TransferWaiting.ToString("D"))));
+        Assert.DoesNotContain("ExecutionEngineVersion", await ColumnsAsync(live, "WebAutomationAttempts"));
+        Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
+    }
+
+    [Fact]
     public async Task VersionFifteenAddsExactTransferEvidenceAndCrossGenerationDirectoryGuard()
     {
         Directory.CreateDirectory(root);
@@ -31,7 +305,7 @@ public sealed class MigrationTests : IDisposable
             "new").MigrateAsync();
 
         await using var upgraded = await factory.OpenConnectionAsync();
-        Assert.Equal(15L, await ScalarAsync<long>(upgraded,
+        Assert.Equal((long)DatabaseMigrator.LatestVersion, await ScalarAsync<long>(upgraded,
             "SELECT MAX(Version) FROM SchemaVersions;"));
         var tables = await NamesAsync(upgraded, "table");
         Assert.Contains("WebAutomationAttemptSourceItems", tables);
@@ -63,7 +337,8 @@ public sealed class MigrationTests : IDisposable
         Assert.Contains("OperationId, AccountId, ParentExactId, CanonicalSegment", indexSql, StringComparison.Ordinal);
         Assert.DoesNotContain("OriginGeneration", indexSql, StringComparison.Ordinal);
         Assert.Contains("State IN ('Intent','OutcomeUnknown')", indexSql, StringComparison.Ordinal);
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 15)).IsValid);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
     }
 
     [Fact]
@@ -195,7 +470,7 @@ public sealed class MigrationTests : IDisposable
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v11-to-v12.db");
         var operationId = Guid.NewGuid().ToString("D");
-        var accountId = Guid.NewGuid().ToString("D");
+        string accountId;
         await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
@@ -206,6 +481,17 @@ public sealed class MigrationTests : IDisposable
                     "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
                     ("$version", version));
             }
+            var parents = await SeedOperationParentsAsync(connection);
+            accountId = parents.Account;
+            await ExecuteAsync(connection, """
+                INSERT INTO TransferOperations(
+                  Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                  CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,
+                  SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+                VALUES($operation,$resource,$job,1,1,'/','/','',$account,'Fixture','Waiting',1,
+                  'v11-attempt-owner','NotPrepared','Unoccupied','2026-08-25T00:00:00Z','2026-08-25T00:00:00Z');
+                """, ("$operation", operationId), ("$resource", parents.Resource),
+                ("$job", parents.Job), ("$account", accountId));
             await ExecuteAsync(connection, """
                 INSERT INTO WebAutomationAttempts(
                   OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
@@ -667,7 +953,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(15, DatabaseMigrator.LatestVersion);
+        Assert.Equal(16, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -716,7 +1002,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(15, DatabaseMigrator.LatestVersion);
+        Assert.Equal(16, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));
@@ -921,6 +1207,149 @@ public sealed class MigrationTests : IDisposable
     {
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
     }
+
+    private static async Task SeedVersionFifteenSnapshotFixtureAsync(
+        SqliteConnection connection,
+        VersionFifteenSnapshotFixtureIds ids)
+    {
+        await ExecuteAsync(connection, """
+            INSERT INTO Accounts(
+              Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
+              SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
+            VALUES
+              ($accountOne,'uid-one','one','WebView2','Active',0,0,1,1,'2026-08-01',0),
+              ($accountTwo,'uid-two','two','WebView2','Active',0,0,2,1,'2026-08-01',0);
+
+            INSERT INTO BatchJobs(
+              Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,
+              DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder,
+              ShareOperationCount)
+            VALUES($job,'fixture','Text','Distribution','TaskCount','ProportionalReduction',2,2,
+              '/target','None','Skip','Immediate','Active','2026-08-01T00:00:00Z',1,2);
+
+            INSERT INTO ResourceItems(
+              Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,FolderCreationModeOverride,
+              GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES
+              ($resourceOne,$job,1,'https://example.invalid/one','share-one','None','Unknown','Expanded',
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z'),
+              ($resourceTwo,$job,2,'https://example.invalid/two','share-two','None','Unknown','Expanded',
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:00Z');
+
+            INSERT INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($job,1,1,'Random',NULL,'Reuse','settings-fixture','2026-08-01T00:00:00Z');
+
+            INSERT INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,
+              PlannedShareCount,ShareEnabled)
+            VALUES($job,$accountOne,1,'output',2,2,1);
+
+            INSERT INTO TransferOperations(
+              Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+              CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+              OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,
+              TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,
+              LeaseExpiresAt,CreatedAt,UpdatedAt)
+            VALUES
+              ($transferWaiting,$resourceOne,$job,1,1,'/target','/target','',$accountOne,'Fixture',
+                'Waiting',NULL,0,'transfer-waiting',NULL,NULL,NULL,'NotPrepared','Unoccupied',NULL,NULL,NULL,
+                NULL,NULL,NULL,'2026-08-01T00:00:00Z','2026-08-01T00:00:01Z'),
+              ($transferSucceeded,$resourceTwo,$job,2,2,'/target','/target','',$accountOne,'Fixture',
+                'Succeeded','NewTransfer',1,'transfer-succeeded','{}','request-two','[""remote-two""]',
+                'ResultReceived','Fulfilled','2026-08-01T00:00:02Z','2026-08-01T00:00:03Z',
+                '2026-08-01T00:00:04Z',NULL,NULL,NULL,'2026-08-01T00:00:00Z','2026-08-01T00:00:05Z');
+
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
+              SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
+              BaselineGeneration,BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LastErrorCode,
+              LastErrorMessage,CreatedAt,UpdatedAt)
+            VALUES
+              ($shareWaiting,$transferWaiting,$resourceOne,$job,$accountOne,1,'WaitingTransfer',NULL,
+                'settings-fixture',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:01Z'),
+              ($shareSucceeded,$transferSucceeded,$resourceTwo,$job,$accountOne,1,'Succeeded','exact-two',
+                'settings-fixture',1,'{}','share-request-two','Unknown',1,2,NULL,
+                '2026-08-01T00:00:04Z',NULL,NULL,NULL,0,NULL,NULL,NULL,
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:05Z');
+
+            INSERT INTO StandaloneShareBatches(
+              Id,DraftFingerprint,ResultDirectoryReference,Status,OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES($standaloneBatch,'draft-fixture','result-reference','Active',2,1,
+              '2026-08-01T00:00:00Z','2026-08-01T00:00:01Z');
+
+            INSERT INTO StandaloneShareOperations(
+              Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,
+              ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
+              BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,
+              LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt,ExtractionCodeMode,FixedExtractionCode,
+              ExistingShareDecision,SettingsFingerprint,RequestDescriptorJson,SubmitStartedAt,AdapterRequestId,
+              AttemptCount,NextReconcileAt,ReconciliationIssue)
+            VALUES
+              ($standaloneQueued,$standaloneBatch,$accountTwo,1,'queued','File','/','standalone-one',1,
+                'Queued','NotStarted','Unknown',NULL,NULL,NULL,0,NULL,NULL,NULL,0,
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:01Z','Random',NULL,'Reuse','settings-one',
+                NULL,NULL,NULL,0,NULL,NULL),
+              ($standaloneSucceeded,$standaloneBatch,$accountTwo,2,'succeeded','Folder','/','standalone-two',1,
+                'Succeeded','Completed','Unknown','baseline-two',1,'2026-08-01T00:00:03Z',2,NULL,NULL,NULL,4,
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:05Z','Random',NULL,'Reuse','settings-two',
+                '{}','2026-08-01T00:00:02Z','standalone-request',1,NULL,NULL);
+
+            INSERT INTO StandaloneShareRemoteItems(
+              OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
+            VALUES
+              ($standaloneQueued,0,'standalone-remote-one',X'01','queued'),
+              ($standaloneSucceeded,0,'standalone-remote-two',X'02','succeeded');
+
+            INSERT INTO WebAutomationAttempts(
+              OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
+              BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,
+              CreatedAt,UpdatedAt)
+            VALUES
+              ($transferWaiting,$accountOne,1,'Transfer','Preparing',NULL,NULL,NULL,0,NULL,0,0,
+                '2026-08-01T00:00:00Z','2026-08-01T00:00:01Z'),
+              ($standaloneSucceeded,$accountTwo,1,'StandaloneShare','Succeeded',NULL,$observation,$baseline,1,
+                '2026-08-01T00:00:03Z',0,4,'2026-08-01T00:00:00Z','2026-08-01T00:00:05Z');
+
+            INSERT INTO WebAutomationAttemptRemoteItems(
+              OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+            VALUES($standaloneSucceeded,$accountTwo,1,0,'attempt-baseline-two',X'03');
+            """,
+            ("$accountOne", ids.AccountOne.ToString("D")),
+            ("$accountTwo", ids.AccountTwo.ToString("D")),
+            ("$job", ids.Job.ToString("D")),
+            ("$resourceOne", ids.ResourceOne.ToString("D")),
+            ("$resourceTwo", ids.ResourceTwo.ToString("D")),
+            ("$transferWaiting", ids.TransferWaiting.ToString("D")),
+            ("$transferSucceeded", ids.TransferSucceeded.ToString("D")),
+            ("$shareWaiting", ids.ShareWaiting.ToString("D")),
+            ("$shareSucceeded", ids.ShareSucceeded.ToString("D")),
+            ("$standaloneBatch", ids.StandaloneBatch.ToString("D")),
+            ("$standaloneQueued", ids.StandaloneQueued.ToString("D")),
+            ("$standaloneSucceeded", ids.StandaloneSucceeded.ToString("D")),
+            ("$observation", new string('c', 64)),
+            ("$baseline", new string('b', 64)));
+    }
+
+    private static string LegacyProfileId(Guid accountId) =>
+        $"legacy-webview2-account-{accountId:N}";
+
+    private sealed record VersionFifteenSnapshotFixtureIds(
+        Guid AccountOne,
+        Guid AccountTwo,
+        Guid Job,
+        Guid ResourceOne,
+        Guid ResourceTwo,
+        Guid TransferWaiting,
+        Guid TransferSucceeded,
+        Guid ShareWaiting,
+        Guid ShareSucceeded,
+        Guid StandaloneBatch,
+        Guid StandaloneQueued,
+        Guid StandaloneSucceeded);
 
     private static async Task<(string Resource, string Job, string Account)> SeedOperationParentsAsync(SqliteConnection c)
     {

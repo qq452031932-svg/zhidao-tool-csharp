@@ -44,14 +44,17 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.CommandText = """
             INSERT INTO WebAutomationAttempts(
               OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
-              BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt)
-            VALUES($operation,$account,$generation,$owner,$state,NULL,NULL,NULL,0,NULL,0,0,$created,$updated);
+              BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$account,$generation,$owner,$state,NULL,NULL,NULL,0,NULL,0,0,$created,$updated,
+              $engine,$browserFamily,$profile,$installation,$session);
             """;
         AddIdentity(command, attempt.OperationId, attempt.AccountId, attempt.Generation);
         command.Parameters.AddWithValue("$owner", attempt.OwnerKind.ToString());
         command.Parameters.AddWithValue("$state", attempt.State.ToString());
         command.Parameters.AddWithValue("$created", attempt.CreatedAt.ToUniversalTime().ToString("O"));
         command.Parameters.AddWithValue("$updated", attempt.UpdatedAt.ToUniversalTime().ToString("O"));
+        AddExecutionProfile(command, attempt.ExecutionProfile);
         try
         {
             var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
@@ -900,6 +903,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         string? officialRequestId;
         string? transferMappingFingerprint;
         int transferMappingCount;
+        ExecutionProfileSnapshot executionProfile;
         bool waiting;
         long revision;
         DateTimeOffset created;
@@ -916,7 +920,8 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                        TargetExactId,TargetPath,TargetTotalCount,TargetReachedEnd,TargetIsStable,
                        TargetGenerationToken,TargetObservationFingerprint,
                        SubmissionSourceFingerprint,SubmissionTargetExactId,SubmissionTargetBaselineFingerprint,
-                       SubmissionMarkedAt,OfficialRequestId,TransferMappingFingerprint,TransferMappingCount
+                       SubmissionMarkedAt,OfficialRequestId,TransferMappingFingerprint,TransferMappingCount,
+                       ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
                 FROM WebAutomationAttempts
                 WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation;
                 """;
@@ -961,6 +966,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             officialRequestId = reader.IsDBNull(34) ? null : reader.GetString(34);
             transferMappingFingerprint = reader.IsDBNull(35) ? null : reader.GetString(35);
             transferMappingCount = reader.GetInt32(36);
+            executionProfile = SqliteExecutionProfileSnapshotCodec.Read(reader, 37);
         }
 
         TransferSourceEvidence? sourceEvidence = null;
@@ -1170,7 +1176,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             resumeStage is null ? null : Enum.Parse<WebAutomationAttemptState>(resumeStage),
             baseline, observation, waiting, revision, created, updated, acceptedRemoteItems,
             sourceEvidence, targetPreparationEvidence, submissionEvidence, officialRequestId,
-            transferIdentityMapping);
+            transferIdentityMapping, executionProfile);
     }
 
     private static void AddIdentity(SqliteCommand command, Guid operationId, Guid accountId, int generation)
@@ -1288,17 +1294,23 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         {
             WebAutomationOwnerKind.Transfer => """
                 SELECT COUNT(*) FROM TransferOperations
-                WHERE Id=$operation AND AssignedAccountId=$account AND AttemptCount=$generation;
+                WHERE Id=$operation AND AssignedAccountId=$account AND AttemptCount=$generation
+                  AND ExecutionEngineVersion=$engine AND BrowserFamily=$browserFamily AND ProfileId=$profile
+                  AND InstallationId IS $installation AND SessionId IS $session;
                 """,
             WebAutomationOwnerKind.TransferShare => """
                 SELECT COUNT(*) FROM ShareOperations share
                 JOIN TransferOperations transfer ON transfer.Id=share.TransferOperationId
                   AND transfer.AssignedAccountId=share.AccountId
-                WHERE share.Id=$operation AND share.AccountId=$account AND share.Generation=$generation;
+                WHERE share.Id=$operation AND share.AccountId=$account AND share.Generation=$generation
+                  AND share.ExecutionEngineVersion=$engine AND share.BrowserFamily=$browserFamily AND share.ProfileId=$profile
+                  AND share.InstallationId IS $installation AND share.SessionId IS $session;
                 """,
             WebAutomationOwnerKind.StandaloneShare => """
                 SELECT COUNT(*) FROM StandaloneShareOperations
-                WHERE Id=$operation AND AccountId=$account AND Generation=$generation;
+                WHERE Id=$operation AND AccountId=$account AND Generation=$generation
+                  AND ExecutionEngineVersion=$engine AND BrowserFamily=$browserFamily AND ProfileId=$profile
+                  AND InstallationId IS $installation AND SessionId IS $session;
                 """,
             WebAutomationOwnerKind.RemoteSelection => """
                 SELECT COUNT(*) FROM RemoteSelectionSessions selection
@@ -1310,7 +1322,19 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             _ => throw new ArgumentOutOfRangeException(nameof(attempt)),
         };
         AddIdentity(command, attempt.OperationId, attempt.AccountId, attempt.Generation);
+        AddExecutionProfile(command, attempt.ExecutionProfile);
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    private static void AddExecutionProfile(SqliteCommand command, ExecutionProfileSnapshot snapshot)
+    {
+        command.Parameters.AddWithValue("$engine", SqliteExecutionProfileSnapshotCodec.FormatEngine(snapshot.Engine));
+        command.Parameters.AddWithValue("$browserFamily", SqliteExecutionProfileSnapshotCodec.FormatFamily(snapshot.BrowserFamily));
+        command.Parameters.AddWithValue("$profile", snapshot.ProfileId);
+        command.Parameters.AddWithValue("$installation", snapshot.InstallationId is { } installationId
+            ? installationId.ToString("D") : DBNull.Value);
+        command.Parameters.AddWithValue("$session", snapshot.SessionId is { } sessionId
+            ? sessionId.ToString("D") : DBNull.Value);
     }
 
     private static void ValidateIdentity(Guid operationId, Guid accountId, int generation)

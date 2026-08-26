@@ -35,8 +35,12 @@ public sealed record WebAutomationRequestIdentity(
     Guid BatchId,
     Guid AccountId,
     int Generation,
-    WebAutomationOwnerKind OwnerKind)
+    WebAutomationOwnerKind OwnerKind,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public WebAutomationRequestIdentity Validate()
     {
         if (OperationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(OperationId));

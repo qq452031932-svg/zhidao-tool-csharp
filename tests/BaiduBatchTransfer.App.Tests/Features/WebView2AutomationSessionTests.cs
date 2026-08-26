@@ -243,6 +243,28 @@ public sealed class WebView2AutomationSessionTests
             CancellationToken.None));
     }
 
+    [Fact]
+    public void WebView2SessionRejectsManagedChromiumExecutionSnapshot()
+    {
+        var legacyIdentity = Identity();
+        var managedIdentity = legacyIdentity with
+        {
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Chrome,
+                "managed-profile",
+                Guid.Parse("44444444-4444-4444-4444-444444444444"),
+                Guid.Parse("55555555-5555-5555-5555-555555555555")),
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new WebView2AutomationSession(
+            managedIdentity,
+            Binding(legacyIdentity),
+            new RecordingCandidateExecutor(),
+            CancellationToken.None));
+
+        Assert.DoesNotContain("managed-profile", exception.Message, StringComparison.Ordinal);
+    }
+
     private static WebAutomationRequestIdentity Identity() => new(
         Guid.Parse("11111111-1111-1111-1111-111111111111"),
         Guid.Parse("22222222-2222-2222-2222-222222222222"),

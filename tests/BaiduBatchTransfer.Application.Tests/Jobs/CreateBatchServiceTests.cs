@@ -1121,6 +1121,9 @@ public sealed class CreateBatchServiceTests
         Assert.Equal(1_000, resources.Count);
         Assert.Equal(3_000, operations.Count);
         Assert.Equal(3_000, operations.Select(operation => operation.OperationFingerprint).Distinct().Count());
+        Assert.All(operations, operation => Assert.Equal(
+            ExecutionProfileSnapshot.LegacyForAccount(operation.AssignedAccountId),
+            operation.ExecutionProfile));
         Assert.Equal(accountIds, allocations.Select(allocation => allocation.AccountId));
         Assert.Equal(new[] { "/account-0", "/account-1", "/account-2" }, allocations.Select(allocation => allocation.DefaultTargetPath));
         Assert.All(allocations, allocation =>

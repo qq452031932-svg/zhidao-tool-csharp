@@ -10,8 +10,12 @@ public sealed record TransferOperationAutomationContext(
     int Generation,
     ShareReference SourceShare,
     bool IsRecovery = false,
-    AdapterWriteAuthorizationBinding? AuthorizationBinding = null)
+    AdapterWriteAuthorizationBinding? AuthorizationBinding = null,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public TransferOperationAutomationContext Validate()
     {
         if (OperationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(OperationId));

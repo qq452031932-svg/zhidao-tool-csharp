@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.Application.Scheduling;
 
 public sealed record CoordinatorState(
@@ -10,7 +12,12 @@ public sealed record ScheduledOperation(
     Guid BatchJobId,
     Guid AccountId,
     long AllocationOrdinal,
-    string AllocationSource);
+    string AllocationSource,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
+{
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+}
 
 public enum BatchExhaustionOutcome
 {

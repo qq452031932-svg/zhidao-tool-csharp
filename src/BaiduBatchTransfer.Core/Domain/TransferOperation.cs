@@ -8,7 +8,8 @@ public sealed class TransferOperation
         Guid batchJobId,
         Guid assignedAccountId,
         DateTimeOffset createdAt,
-        int attemptCount)
+        int attemptCount,
+        ExecutionProfileSnapshot? executionProfile)
     {
         if (attemptCount < 0)
         {
@@ -22,6 +23,7 @@ public sealed class TransferOperation
         Status = OperationStatus.Waiting;
         TargetSlotState = TargetSlotState.Unoccupied;
         AttemptCount = attemptCount;
+        ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(assignedAccountId);
         CreatedAt = createdAt;
         UpdatedAt = createdAt;
     }
@@ -39,6 +41,8 @@ public sealed class TransferOperation
     public TargetSlotState TargetSlotState { get; private set; }
 
     public int AttemptCount { get; private set; }
+
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
 
     public bool SubmissionMayHaveOccurred { get; private set; }
 
@@ -62,8 +66,9 @@ public sealed class TransferOperation
         Guid batchJobId,
         Guid assignedAccountId,
         DateTimeOffset createdAt,
-        int attemptCount = 0) =>
-        new(id, resourceItemId, batchJobId, assignedAccountId, createdAt, attemptCount);
+        int attemptCount = 0,
+        ExecutionProfileSnapshot? executionProfile = null) =>
+        new(id, resourceItemId, batchJobId, assignedAccountId, createdAt, attemptCount, executionProfile);
 
     public static TransferOperation CreateReserved(
         Guid id,
@@ -71,7 +76,8 @@ public sealed class TransferOperation
         Guid batchJobId,
         Guid assignedAccountId,
         DateTimeOffset reservedAt,
-        int attemptCount = 0)
+        int attemptCount = 0,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         var operation = new TransferOperation(
             id,
@@ -79,7 +85,8 @@ public sealed class TransferOperation
             batchJobId,
             assignedAccountId,
             reservedAt,
-            attemptCount);
+            attemptCount,
+            executionProfile);
         operation.ReserveTargetSlot(reservedAt);
         return operation;
     }

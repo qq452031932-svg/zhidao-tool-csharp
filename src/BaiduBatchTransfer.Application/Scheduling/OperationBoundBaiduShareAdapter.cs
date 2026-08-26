@@ -11,8 +11,12 @@ public sealed record ShareOperationAutomationContext(
     WebAutomationOwnerKind OwnerKind,
     RemoteItemIdentitySet ExactRemoteItems,
     bool IsRecovery = false,
-    AdapterWriteAuthorizationBinding? AuthorizationBinding = null)
+    AdapterWriteAuthorizationBinding? AuthorizationBinding = null,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public ShareOperationAutomationContext Validate()
     {
         if (OperationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(OperationId));

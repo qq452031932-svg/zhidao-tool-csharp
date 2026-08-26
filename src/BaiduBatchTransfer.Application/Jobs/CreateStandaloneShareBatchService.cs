@@ -38,7 +38,8 @@ public sealed class CreateStandaloneShareBatchService(
         var operations = selections.Select((selection, index) =>
             StandaloneShareOperationRecord.Create(
                 operationIds[index], batchId, selection, index + 1, createdAt,
-                extractionCodeBehavior, fixedExtractionCode, existingShareDecision)).ToArray();
+                extractionCodeBehavior, fixedExtractionCode, existingShareDecision,
+                ExecutionProfileSnapshot.LegacyForAccount(selection.AccountId))).ToArray();
         return StandaloneSharePendingBatchEnvelope.Create(batch, operations);
     }
 

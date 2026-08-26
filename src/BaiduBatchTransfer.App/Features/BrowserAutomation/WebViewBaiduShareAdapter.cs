@@ -388,7 +388,8 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             new WebViewDownloadCoordinator(downloadSource),
             destination,
             new WebAutomationRequestIdentity(
-                context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind));
+                context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind,
+                context.ExecutionProfile));
     }
 
     private BaiduNavigationAuthorizationRequest Navigation(ShareOperationAutomationContext context) => new(
@@ -416,7 +417,8 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
             context.BatchId,
             context.AccountId,
             context.Generation,
-            context.OwnerKind);
+            context.OwnerKind,
+            context.ExecutionProfile);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
         var candidate = context.AuthorizationBinding is not { } binding
@@ -464,8 +466,16 @@ public sealed class WebViewBaiduShareAdapter : IOperationBoundBaiduShareAdapter
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(request);
         context.Validate();
+        RequireWebView2ExecutionProfile(context.ExecutionProfile);
         if (context.AccountId != session.LocalAccountId || context.ExactRemoteItems != request.RemoteItems)
             throw new InvalidOperationException("The share automation identity does not match its account or exact remote items.");
+    }
+
+    private static void RequireWebView2ExecutionProfile(ExecutionProfileSnapshot snapshot)
+    {
+        if (snapshot.Engine != BaiduExecutionEngine.WebView2V1 ||
+            snapshot.BrowserFamily != BrowserFamily.LegacyWebView2)
+            throw new InvalidOperationException("The persisted execution engine is unavailable in this adapter.");
     }
 
     private static WebAutomationAttemptState? EffectiveRecoverableStage(

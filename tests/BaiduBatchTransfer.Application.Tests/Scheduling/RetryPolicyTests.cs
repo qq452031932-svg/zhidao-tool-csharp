@@ -1,10 +1,43 @@
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Tests.Scheduling;
 
 public sealed class RetryPolicyTests
 {
+    [Fact]
+    public void ExecutionProfileReselectionRequiresDefinitelyNotSubmittedWithNoSideEffectBoundary()
+    {
+        var original = ExecutionProfileSnapshot.Legacy("original-profile");
+        var current = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "current-profile", Guid.NewGuid(), Guid.NewGuid());
+        var safe = new ExecutionProfileReselectionEvidence(
+            WebAutomationAttemptState.DefinitelyNotSubmitted,
+            HasSourceEvidence: false,
+            HasDirectoryMutation: false,
+            HasShareMutation: false,
+            HasSubmittingEvidence: false,
+            HasResultPendingEvidence: false,
+            HasRemoteSideEffectEvidence: false);
+
+        Assert.Same(current, RetryPolicy.SelectExecutionProfileForNextGeneration(original, current, safe));
+
+        var blocked = new[]
+        {
+            safe with { PreviousAttemptState = WebAutomationAttemptState.Preparing },
+            safe with { HasSourceEvidence = true },
+            safe with { HasDirectoryMutation = true },
+            safe with { HasShareMutation = true },
+            safe with { HasSubmittingEvidence = true },
+            safe with { HasResultPendingEvidence = true },
+            safe with { HasRemoteSideEffectEvidence = true },
+        };
+        Assert.All(blocked, evidence => Assert.Same(
+            original,
+            RetryPolicy.SelectExecutionProfileForNextGeneration(original, current, evidence)));
+    }
+
     [Fact]
     public void TransientFailureAllowsExactlyThreeRetriesWithControlledBackoff()
     {

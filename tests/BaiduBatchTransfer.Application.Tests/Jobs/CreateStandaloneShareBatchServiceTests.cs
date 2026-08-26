@@ -30,6 +30,7 @@ public sealed class CreateStandaloneShareBatchServiceTests
             Assert.Single(operation.ExactRemoteItems.Items);
             Assert.Equal(ShareExtractionCodeBehavior.Fixed, operation.ExtractionCodeBehavior);
             Assert.Equal("A1b2", operation.FixedExtractionCode);
+            Assert.Equal(ExecutionProfileSnapshot.LegacyForAccount(account), operation.ExecutionProfile);
         });
         Assert.Equal(envelope.Batch.Id, Assert.Single(notifications.BatchIds));
     }

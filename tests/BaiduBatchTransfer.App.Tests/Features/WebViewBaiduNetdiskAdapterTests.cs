@@ -16,6 +16,29 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     private static readonly DateTimeOffset Now = new(2026, 8, 25, 3, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public async Task ManagedChromiumOperationIsRejectedBeforeWebViewAttemptOrBrokerWork()
+    {
+        var accountId = Guid.NewGuid();
+        var broker = new RecordingBroker();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1, Share(),
+            PersistedExecutionProfile: ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Chrome, "managed-profile", Guid.NewGuid(), Guid.NewGuid()));
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a",
+            new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null)));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            adapter.PrepareWholeShareForOperationAsync(
+                context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+                CancellationToken.None));
+
+        Assert.Null(broker.Identity);
+        Assert.DoesNotContain("managed-profile", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task OperationBoundPrepareQueuesExactAuthoritativeIdentityAndCanonicalProfile()
     {
         var accountId = Guid.NewGuid();
@@ -40,7 +63,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
 
         Assert.True(result.IsSuccess);
         Assert.Equal(new WebAutomationRequestIdentity(
-            operationId, batchId, accountId, 3, WebAutomationOwnerKind.Transfer), broker.Identity);
+            operationId, batchId, accountId, 3, WebAutomationOwnerKind.Transfer,
+            context.ExecutionProfile), broker.Identity);
         Assert.Equal(profiles.Path, broker.ProfilePath);
         Assert.Equal(new Uri(Share().OriginalUrl), broker.Navigation!.OfficialUri);
         Assert.Equal(BaiduProtocolValidationStatus.NotValidated,

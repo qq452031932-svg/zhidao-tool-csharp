@@ -12,6 +12,51 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-web-attempt-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task AttemptInheritsAndRoundTripsTheExactManagedParentSnapshot()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
+        var state = new SqliteManagedBrowserStateStore(graph.Factory);
+        var directory = Path.GetFullPath(Path.Combine(root, "managed-attempt-chrome"));
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+            "Google LLC", "Google Chrome", "managed-attempt-file");
+        await state.CreateInstallationAsync(installation, default);
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.InstallationId, graph.AccountId, "owner",
+            BrowserFamily.Chrome, "managed-attempt-profile", "managed-attempt-owner");
+        await state.CreateSessionAsync(session, default);
+        var snapshot = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, session.ProfileId, installation.InstallationId, session.SessionId);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE TransferOperations
+                SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId=$profile,
+                    InstallationId=$installation,SessionId=$session
+                WHERE Id=$operation;
+                """;
+            command.Parameters.AddWithValue("$profile", session.ProfileId);
+            command.Parameters.AddWithValue("$installation", installation.InstallationId.ToString("D"));
+            command.Parameters.AddWithValue("$session", session.SessionId.ToString("D"));
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now, snapshot)));
+        var restored = await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1);
+
+        Assert.NotNull(restored);
+        Assert.Equal(snapshot.Engine, restored.ExecutionProfile.Engine);
+        Assert.Equal(snapshot.BrowserFamily, restored.ExecutionProfile.BrowserFamily);
+        Assert.Equal(snapshot.ProfileId, restored.ExecutionProfile.ProfileId);
+        Assert.Equal(snapshot.InstallationId, restored.ExecutionProfile.InstallationId);
+        Assert.Equal(snapshot.SessionId, restored.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
     public async Task ExactTransferEvidenceRoundTripsThroughPreparedSubmittedAndAcceptedStages()
     {
         var graph = await CreateAsync();
@@ -736,6 +781,15 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
               'NotStarted','Unknown',0,0,$now,$now);
             INSERT INTO StandaloneShareRemoteItems(OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
             VALUES($standaloneOperation,0,'remote-id',X'01','item');
+            UPDATE TransferOperations
+            SET ProfileId='legacy-webview2-account-' || lower(replace(AssignedAccountId,'-',''))
+            WHERE Id=$operation;
+            UPDATE ShareOperations
+            SET ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
+            WHERE Id=$share;
+            UPDATE StandaloneShareOperations
+            SET ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
+            WHERE Id=$standaloneOperation;
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$other", otherAccountId.ToString("D"));

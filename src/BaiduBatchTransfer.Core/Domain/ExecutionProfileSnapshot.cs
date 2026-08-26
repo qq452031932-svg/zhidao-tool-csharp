@@ -1,6 +1,6 @@
 namespace BaiduBatchTransfer.Core.Domain;
 
-public sealed class ExecutionProfileSnapshot
+public sealed class ExecutionProfileSnapshot : IEquatable<ExecutionProfileSnapshot>
 {
     public ExecutionProfileSnapshot(
         BaiduExecutionEngine engine,
@@ -47,6 +47,13 @@ public sealed class ExecutionProfileSnapshot
     public static ExecutionProfileSnapshot Legacy(string profileId) =>
         new(BaiduExecutionEngine.WebView2V1, BrowserFamily.LegacyWebView2, profileId);
 
+    public static ExecutionProfileSnapshot LegacyForAccount(Guid accountId)
+    {
+        if (accountId == Guid.Empty)
+            throw new ArgumentException("An account ID is required.", nameof(accountId));
+        return Legacy($"legacy-webview2-account-{accountId:N}");
+    }
+
     public static ExecutionProfileSnapshot Managed(
         BrowserFamily browserFamily,
         string profileId,
@@ -57,6 +64,19 @@ public sealed class ExecutionProfileSnapshot
     public override string ToString() =>
         $"ExecutionProfileSnapshot {{ Engine = {Engine}, BrowserFamily = {BrowserFamily}, " +
         "ProfileId = [REDACTED], InstallationId = [REDACTED], SessionId = [REDACTED] }";
+
+    public bool Equals(ExecutionProfileSnapshot? other) =>
+        other is not null &&
+        Engine == other.Engine &&
+        BrowserFamily == other.BrowserFamily &&
+        string.Equals(ProfileId, other.ProfileId, StringComparison.Ordinal) &&
+        InstallationId == other.InstallationId &&
+        SessionId == other.SessionId;
+
+    public override bool Equals(object? obj) => Equals(obj as ExecutionProfileSnapshot);
+
+    public override int GetHashCode() =>
+        HashCode.Combine(Engine, BrowserFamily, ProfileId, InstallationId, SessionId);
 
     private static string RequireText(string value, string parameterName)
     {

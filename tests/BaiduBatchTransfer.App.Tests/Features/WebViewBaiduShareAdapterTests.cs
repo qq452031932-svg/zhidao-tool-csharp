@@ -16,6 +16,29 @@ public sealed class WebViewBaiduShareAdapterTests
     private static readonly DateTimeOffset Now = new(2026, 8, 25, 4, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public async Task ManagedChromiumOperationIsRejectedBeforeWebViewAttemptOrBrokerWork()
+    {
+        var accountId = Guid.NewGuid();
+        var broker = new RecordingBroker();
+        var context = Context(accountId, WebAutomationOwnerKind.StandaloneShare) with
+        {
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Edge, "managed-profile", Guid.NewGuid(), Guid.NewGuid()),
+        };
+        var adapter = Adapter(
+            accountId, broker,
+            new AttemptStore(Attempt(context, WebAutomationAttemptState.Preparing, null)),
+            new AcceptanceStore());
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            adapter.PreparePermanentShareForOperationAsync(
+                context, Session(accountId), Request(), CancellationToken.None));
+
+        Assert.Null(broker.Identity);
+        Assert.DoesNotContain("managed-profile", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task LegacyCreateFailsClosedWithoutOpeningAutomation()
     {
         var accountId = Guid.NewGuid();
@@ -51,7 +74,8 @@ public sealed class WebViewBaiduShareAdapterTests
 
         Assert.True(result.IsSuccess);
         Assert.Equal(new WebAutomationRequestIdentity(
-            context.OperationId, context.BatchId, accountId, context.Generation, ownerKind), broker.Identity);
+            context.OperationId, context.BatchId, accountId, context.Generation, ownerKind,
+            context.ExecutionProfile), broker.Identity);
         Assert.Equal(profiles.Path, broker.ProfilePath);
         Assert.Equal(WebAutomationAttemptState.BaselinePersisted, attempts.Current.State);
         Assert.Equal(["share-existing"], attempts.Current.Baseline!.Items.Select(item => item.ExactId));
@@ -368,7 +392,8 @@ public sealed class WebViewBaiduShareAdapterTests
         var exactListing = Listing(ExistingEntry(), AcceptedEntry());
         var automation = new ShareSession(exactListing, exactListing);
         var identity = new WebAutomationRequestIdentity(
-            context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind);
+            context.OperationId, context.BatchId, context.AccountId, context.Generation, context.OwnerKind,
+            context.ExecutionProfile);
         automation.EnableExport(identity, await ValidWorkbookAsync());
         using var output = new TemporaryDirectory();
         var adapter = Adapter(

@@ -11,6 +11,55 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-share-store-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task ReservationReturnsThePersistedManagedExecutionProfileSnapshot()
+    {
+        var graph = await CreateGraphAsync(includeShareSettings: true);
+        string uid;
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT BaiduUserId FROM Accounts WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.AccountId.ToString("D"));
+            uid = (string)(await command.ExecuteScalarAsync())!;
+        }
+        var state = new SqliteManagedBrowserStateStore(graph.Factory);
+        var directory = Path.GetFullPath(Path.Combine(root, "managed-share-chrome"));
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+            "Google LLC", "Google Chrome", "managed-share-file");
+        await state.CreateInstallationAsync(installation, default);
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.InstallationId, graph.AccountId, uid,
+            BrowserFamily.Chrome, "managed-share-profile", "managed-share-ownership");
+        await state.CreateSessionAsync(session, default);
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE ShareOperations
+                SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId=$profile,
+                    InstallationId=$installation,SessionId=$session
+                WHERE Id=$id;
+                """;
+            command.Parameters.AddWithValue("$profile", session.ProfileId);
+            command.Parameters.AddWithValue("$installation", installation.InstallationId.ToString("D"));
+            command.Parameters.AddWithValue("$session", session.SessionId.ToString("D"));
+            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var reserved = await new SqliteShareSchedulingStore(graph.Factory)
+            .TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2));
+
+        Assert.NotNull(reserved);
+        Assert.Equal(BaiduExecutionEngine.ManagedChromiumV1, reserved.ExecutionProfile.Engine);
+        Assert.Equal(BrowserFamily.Chrome, reserved.ExecutionProfile.BrowserFamily);
+        Assert.Equal(session.ProfileId, reserved.ExecutionProfile.ProfileId);
+        Assert.Equal(installation.InstallationId, reserved.ExecutionProfile.InstallationId);
+        Assert.Equal(session.SessionId, reserved.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
     public async Task FreshShareSchemaOmitsUnusedResourceOperationIndexes()
     {
         var graph=await CreateGraphAsync(includeShareSettings:true);

@@ -84,7 +84,8 @@ public sealed class StandaloneShareOperationExecutor(
 
         var context = new ShareOperationAutomationContext(
             operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems).Validate();
+            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems,
+            PersistedExecutionProfile: operation.ExecutionProfile).Validate();
         var submitted = await submissionEngine.ExecuteSubmissionAsync(
             request,
             new ShareSubmissionPorts(
@@ -184,7 +185,8 @@ public sealed class StandaloneShareOperationExecutor(
         var request = Request(operation);
         var context = new ShareOperationAutomationContext(
             operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems, IsRecovery: true).Validate();
+            WebAutomationOwnerKind.StandaloneShare, operation.ExactRemoteItems, IsRecovery: true,
+            PersistedExecutionProfile: operation.ExecutionProfile).Validate();
         BaiduAdapterResult<ShareCreationReceipt> confirmation;
         try
         {

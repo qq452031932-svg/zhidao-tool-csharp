@@ -314,7 +314,8 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             ?? throw new InvalidDataException("STANDALONE_SHARE_LEASE_MISSING");
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new(operation.Id, operation.BatchId, operation.AccountId, operation.Generation,
-            operation.LeaseGeneration, operation.LeaseOwnerId!.Value, operation.Revision, operation.LeaseExpiresAt!.Value);
+            operation.LeaseGeneration, operation.LeaseOwnerId!.Value, operation.Revision, operation.LeaseExpiresAt!.Value,
+            operation.ExecutionProfile);
     }
 
     public async Task<int> RecoverExpiredLeasesAsync(
@@ -472,7 +473,8 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             ?? throw new InvalidDataException("STANDALONE_SHARE_RECONCILIATION_LEASE_MISSING");
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new(claimed.Id, claimed.BatchId, claimed.AccountId, claimed.Generation,
-            claimed.LeaseGeneration, claimed.LeaseOwnerId!.Value, claimed.Revision, claimed.LeaseExpiresAt!.Value);
+            claimed.LeaseGeneration, claimed.LeaseOwnerId!.Value, claimed.Revision, claimed.LeaseExpiresAt!.Value,
+            claimed.ExecutionProfile);
     }
 
     public async Task<bool> TryReleaseReconciliationAsync(
@@ -981,9 +983,11 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
                   Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,ExactItemSetFingerprint,
                   Generation,Status,SubmissionState,SubmissionAcceptance,ExtractionCodeMode,FixedExtractionCode,
                   ExistingShareDecision,SettingsFingerprint,BaselineFingerprint,BaselineShareCount,
-                  BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt)
+                  BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 VALUES($id,$batch,$account,$sequence,$display,$kind,$path,$fingerprint,$generation,$status,$submission,
-                  $acceptance,$codeMode,$fixedCode,$existingDecision,$settings,NULL,NULL,NULL,0,NULL,NULL,NULL,$revision,$created,$updated);
+                  $acceptance,$codeMode,$fixedCode,$existingDecision,$settings,NULL,NULL,NULL,0,NULL,NULL,NULL,$revision,$created,$updated,
+                  $engine,$browserFamily,$profile,$installation,$session);
                 """;
             command.Parameters.AddWithValue("$id", operation.Id.ToString("D"));
             command.Parameters.AddWithValue("$batch", operation.BatchId.ToString("D"));
@@ -1004,6 +1008,13 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             command.Parameters.AddWithValue("$revision", operation.Revision);
             command.Parameters.AddWithValue("$created", operation.CreatedAt.ToUniversalTime().ToString("O"));
             command.Parameters.AddWithValue("$updated", operation.UpdatedAt.ToUniversalTime().ToString("O"));
+            command.Parameters.AddWithValue("$engine", SqliteExecutionProfileSnapshotCodec.FormatEngine(operation.ExecutionProfile.Engine));
+            command.Parameters.AddWithValue("$browserFamily", SqliteExecutionProfileSnapshotCodec.FormatFamily(operation.ExecutionProfile.BrowserFamily));
+            command.Parameters.AddWithValue("$profile", operation.ExecutionProfile.ProfileId);
+            command.Parameters.AddWithValue("$installation", operation.ExecutionProfile.InstallationId is { } installationId
+                ? installationId.ToString("D") : DBNull.Value);
+            command.Parameters.AddWithValue("$session", operation.ExecutionProfile.SessionId is { } sessionId
+                ? sessionId.ToString("D") : DBNull.Value);
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         var item = operation.ExactRemoteItems.Items.Single();
@@ -1094,6 +1105,7 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
         DateTimeOffset? baselineCompleted;
         int? baselineCount;
         Guid? leaseOwnerId;
+        ExecutionProfileSnapshot executionProfile;
         await using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
@@ -1102,7 +1114,8 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
                        SubmissionAcceptance,ExactItemSetFingerprint,Generation,SequenceNumber,Revision,
                        ExtractionCodeMode,FixedExtractionCode,SettingsFingerprint,
                        BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,LeaseExpiresAt,
-                       LastErrorCode,CreatedAt,UpdatedAt,ExistingShareDecision,AttemptCount
+                       LastErrorCode,CreatedAt,UpdatedAt,ExistingShareDecision,AttemptCount,
+                       ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
                 FROM StandaloneShareOperations WHERE Id=$id;
                 """;
             command.Parameters.AddWithValue("$id", operationId.ToString("D"));
@@ -1119,6 +1132,7 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             leaseExpires = reader.IsDBNull(21) ? null : Parse(reader.GetString(21));
             created = Parse(reader.GetString(23));
             updated = Parse(reader.GetString(24));
+            executionProfile = SqliteExecutionProfileSnapshotCodec.Read(reader, 27);
         }
         if ((leaseOwnerId is null) != (leaseExpires is null))
             throw new InvalidDataException("STANDALONE_SHARE_LEASE_EVIDENCE_MISMATCH");
@@ -1148,7 +1162,7 @@ public sealed class SqliteStandaloneShareStore(SqliteConnectionFactory factory) 
             Enum.Parse<StandaloneShareSubmissionState>(values[7]), revision, created, updated,
             Enum.Parse<ShareExtractionCodeBehavior>(values[13]),
             string.IsNullOrEmpty(values[14]) ? null : values[14],
-            Enum.Parse<ExistingShareDecision>(values[25]), int.Parse(values[26]))
+            Enum.Parse<ExistingShareDecision>(values[25]), int.Parse(values[26]), executionProfile)
         {
             SubmissionAcceptance = Enum.Parse<SubmissionAcceptance>(values[8]),
             BaselineFingerprint = string.IsNullOrEmpty(values[16]) ? null : values[16],

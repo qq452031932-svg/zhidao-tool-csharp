@@ -98,7 +98,8 @@ public sealed record WebAutomationAttemptRecord
         TransferTargetPreparationEvidence? targetPreparationEvidence = null,
         TransferSubmissionEvidence? submissionEvidence = null,
         string? officialRequestId = null,
-        TransferIdentityMapping? transferIdentityMapping = null)
+        TransferIdentityMapping? transferIdentityMapping = null,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
@@ -173,6 +174,7 @@ public sealed record WebAutomationAttemptRecord
         SubmissionEvidence = submissionEvidence;
         OfficialRequestId = officialRequestId;
         TransferIdentityMapping = transferIdentityMapping;
+        ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(accountId);
     }
 
     public Guid OperationId { get; }
@@ -194,15 +196,17 @@ public sealed record WebAutomationAttemptRecord
     public TransferSubmissionEvidence? SubmissionEvidence { get; }
     public string? OfficialRequestId { get; }
     public TransferIdentityMapping? TransferIdentityMapping { get; }
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
 
     public static WebAutomationAttemptRecord Create(
         Guid operationId,
         Guid accountId,
         int generation,
         WebAutomationOwnerKind ownerKind,
-        DateTimeOffset createdAt) =>
+        DateTimeOffset createdAt,
+        ExecutionProfileSnapshot? executionProfile = null) =>
         new(operationId, accountId, generation, ownerKind, WebAutomationAttemptState.Preparing,
-            null, null, null, false, 0, createdAt, createdAt);
+            null, null, null, false, 0, createdAt, createdAt, executionProfile: executionProfile);
 
     public override string ToString() =>
         $"WebAutomationAttemptRecord {{ OperationId = {OperationId}, AccountId = {AccountId}, Generation = {Generation}, OwnerKind = {OwnerKind}, State = {State}, ResumeStage = {ResumeStage}, Baseline = [REDACTED], AcceptedRemoteItems = [REDACTED], Observation = [REDACTED], IsWaitingForUser = {IsWaitingForUser}, Revision = {Revision} }}";

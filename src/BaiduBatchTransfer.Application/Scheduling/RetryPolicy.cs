@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Scheduling;
@@ -6,6 +7,15 @@ public sealed record RetryDecision(bool ShouldRetry, TimeSpan Delay)
 {
     public static RetryDecision Stop { get; } = new(false, TimeSpan.Zero);
 }
+
+public readonly record struct ExecutionProfileReselectionEvidence(
+    WebAutomationAttemptState PreviousAttemptState,
+    bool HasSourceEvidence,
+    bool HasDirectoryMutation,
+    bool HasShareMutation,
+    bool HasSubmittingEvidence,
+    bool HasResultPendingEvidence,
+    bool HasRemoteSideEffectEvidence);
 
 public sealed class RetryPolicy
 {
@@ -39,5 +49,22 @@ public sealed class RetryPolicy
         if (serverWait is { } requested && requested > delay) delay = requested;
         if (delay > MaximumSupportedDelay) delay = MaximumSupportedDelay;
         return new RetryDecision(true, delay);
+    }
+
+    public static ExecutionProfileSnapshot SelectExecutionProfileForNextGeneration(
+        ExecutionProfileSnapshot original,
+        ExecutionProfileSnapshot currentDefault,
+        ExecutionProfileReselectionEvidence evidence)
+    {
+        ArgumentNullException.ThrowIfNull(original);
+        ArgumentNullException.ThrowIfNull(currentDefault);
+        var canReselect = evidence.PreviousAttemptState == WebAutomationAttemptState.DefinitelyNotSubmitted &&
+            !evidence.HasSourceEvidence &&
+            !evidence.HasDirectoryMutation &&
+            !evidence.HasShareMutation &&
+            !evidence.HasSubmittingEvidence &&
+            !evidence.HasResultPendingEvidence &&
+            !evidence.HasRemoteSideEffectEvidence;
+        return canReselect ? currentDefault : original;
     }
 }

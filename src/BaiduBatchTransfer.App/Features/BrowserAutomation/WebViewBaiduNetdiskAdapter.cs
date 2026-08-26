@@ -72,6 +72,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(path);
         context.Validate();
+        RequireWebView2ExecutionProfile(context.ExecutionProfile);
         if (context.AccountId != session.LocalAccountId)
             throw new InvalidOperationException("The directory preparation identity does not match its account.");
         if (!HasExactCandidateBinding(context) || string.IsNullOrWhiteSpace(session.BaiduUserId) ||
@@ -310,6 +311,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(query);
         context.Validate();
+        RequireWebView2ExecutionProfile(context.ExecutionProfile);
         if (context.AccountId != session.LocalAccountId ||
             !string.Equals(context.SourceShare.StableShareId, query.SourceShareId, StringComparison.Ordinal))
             throw new InvalidOperationException("The transfer recovery identity does not match its account or source share.");
@@ -506,7 +508,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             context.BatchId,
             context.AccountId,
             context.Generation,
-            WebAutomationOwnerKind.Transfer);
+            WebAutomationOwnerKind.Transfer,
+            context.ExecutionProfile);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
         var candidate = context.AuthorizationBinding is not { } binding
@@ -532,7 +535,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
     {
         var identity = new WebAutomationRequestIdentity(
             context.OperationId, context.BatchId, context.AccountId, context.Generation,
-            WebAutomationOwnerKind.Transfer);
+            WebAutomationOwnerKind.Transfer, context.ExecutionProfile);
         var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
         profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
         var navigation = new BaiduNavigationAuthorizationRequest(
@@ -648,8 +651,16 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(share);
         context.Validate();
+        RequireWebView2ExecutionProfile(context.ExecutionProfile);
         if (context.AccountId != session.LocalAccountId || context.SourceShare != share)
             throw new InvalidOperationException("The transfer automation identity does not match its account or source share.");
+    }
+
+    private static void RequireWebView2ExecutionProfile(ExecutionProfileSnapshot snapshot)
+    {
+        if (snapshot.Engine != BaiduExecutionEngine.WebView2V1 ||
+            snapshot.BrowserFamily != BrowserFamily.LegacyWebView2)
+            throw new InvalidOperationException("The persisted execution engine is unavailable in this adapter.");
     }
 
     private static WebAutomationAttemptState? EffectiveRecoverableStage(

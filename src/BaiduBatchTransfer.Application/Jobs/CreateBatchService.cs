@@ -314,7 +314,8 @@ public sealed class CreateBatchService
             Guid.NewGuid(), resource.Id, resource.BatchJobId, resource.CandidateSequence, ordinal,
             target, normalizedTarget, folder, account.AccountId, source, "Waiting", null, 0,
             BatchFingerprint.Create(resource.NormalizedShareId, account.AccountId, normalizedTarget, folder),
-            null, null, null, "NotPrepared", "Unoccupied", null, null, null, null, null, null, now, now);
+            null, null, null, "NotPrepared", "Unoccupied", null, null, null, null, null, null, now, now,
+            ExecutionProfileSnapshot.LegacyForAccount(account.AccountId));
     }
 
     private static List<AccountAllocationRecord> CreateAllocations(

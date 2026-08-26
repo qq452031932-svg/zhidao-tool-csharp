@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.Core.Abstractions;
 
 public record PageQuery(int PageNumber, int PageSize)
@@ -235,8 +237,12 @@ public sealed record TransferOperationRecord(
     string? ConfirmationDescriptorJson, string? AdapterRequestId, string? RemoteItemIdsJson, string SubmitState,
     string TargetSlotState, DateTimeOffset? TargetSlotReservedAt, DateTimeOffset? DailyCountedAt,
     DateTimeOffset? SubmitStartedAt, string? LastErrorCode, string? LastErrorMessage,
-    DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt)
+    DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile { get; } =
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AssignedAccountId);
+
     public override string ToString() =>
         $"TransferOperationRecord {{ Id = {Id}, BatchJobId = {BatchJobId}, SequenceNumber = {SequenceNumber}, AllocationOrdinal = {AllocationOrdinal}, Status = {Status}, OutcomeKind = {OutcomeKind}, UserContent = [REDACTED] }}";
 }
@@ -357,8 +363,12 @@ public sealed record ShareOperationRecord(
     string? LastErrorMessage,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
-    long LeaseGeneration = 0)
+    long LeaseGeneration = 0,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public override string ToString() =>
         $"ShareOperationRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, Status = {Status}, Generation = {Generation}, UserContent = [REDACTED] }}";
 }

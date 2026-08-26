@@ -297,9 +297,13 @@ public sealed class SqliteTransferSchedulingStore :
                   Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
                   ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
                   SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
-                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
-                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,
-                  NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                SELECT $id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,
+                  NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now,
+                  transfer.ExecutionEngineVersion,transfer.BrowserFamily,transfer.ProfileId,
+                  transfer.InstallationId,transfer.SessionId
+                FROM TransferOperations transfer WHERE transfer.Id=$transfer;
                 """))
             {
                 Add(share, "$id", Id(Guid.NewGuid())); Add(share, "$transfer", Id(operationId));
@@ -415,13 +419,17 @@ public sealed class SqliteTransferSchedulingStore :
                 return null;
             }
         }
+        var executionProfile = ExecutionProfileSnapshot.LegacyForAccount(account.Value.AccountId);
         await using (var insert = Command(connection, transaction,
-            "INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,SubmitState,TargetSlotState,TargetSlotReservedAt,LeaseExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$resource,$batch,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,'Reserved',0,$fingerprint,'NotPrepared','Reserved',$now,$lease,$now,$now);"))
+            "INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,SubmitState,TargetSlotState,TargetSlotReservedAt,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) VALUES($id,$resource,$batch,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,'Reserved',0,$fingerprint,'NotPrepared','Reserved',$now,$lease,$now,$now,$engine,$browserFamily,$profile,NULL,NULL);"))
         {
             Add(insert, "$id", Id(operationId)); Add(insert, "$resource", Id(candidate.Value.ResourceId)); Add(insert, "$batch", Id(batchId));
             Add(insert, "$sequence", candidate.Value.Sequence); Add(insert, "$ordinal", ordinal); Add(insert, "$target", target);
             Add(insert, "$normalized", normalizedTarget); Add(insert, "$folder", folder); Add(insert, "$account", Id(account.Value.AccountId));
             Add(insert, "$source", source); Add(insert, "$fingerprint", fingerprint); Add(insert, "$now", Time(reservedAt)); Add(insert, "$lease", Time(leaseExpiresAt));
+            Add(insert, "$engine", SqliteExecutionProfileSnapshotCodec.FormatEngine(executionProfile.Engine));
+            Add(insert, "$browserFamily", SqliteExecutionProfileSnapshotCodec.FormatFamily(executionProfile.BrowserFamily));
+            Add(insert, "$profile", executionProfile.ProfileId);
             await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         if (shareBinding is not null)
@@ -431,15 +439,20 @@ public sealed class SqliteTransferSchedulingStore :
                   Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
                   ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
                   SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
-                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+                  LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 VALUES(
                   $id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,
-                  'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created);
+                  'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created,
+                  $engine,$browserFamily,$profile,NULL,NULL);
                 """);
             Add(insertShare, "$id", Id(Guid.NewGuid())); Add(insertShare, "$transfer", Id(operationId));
             Add(insertShare, "$resource", Id(candidate.Value.ResourceId)); Add(insertShare, "$batch", Id(batchId));
             Add(insertShare, "$account", Id(account.Value.AccountId)); Add(insertShare, "$ordinal", shareBinding.Value.OutputOrdinal);
             Add(insertShare, "$settings", shareBinding.Value.SettingsFingerprint); Add(insertShare, "$created", Time(reservedAt));
+            Add(insertShare, "$engine", SqliteExecutionProfileSnapshotCodec.FormatEngine(executionProfile.Engine));
+            Add(insertShare, "$browserFamily", SqliteExecutionProfileSnapshotCodec.FormatFamily(executionProfile.BrowserFamily));
+            Add(insertShare, "$profile", executionProfile.ProfileId);
             RequireOne(await insertShare.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false),
                 "The confirmed share output could not accept the dynamic transfer.");
         }
@@ -459,7 +472,7 @@ public sealed class SqliteTransferSchedulingStore :
             RequireOne(await updateBatch.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false), "The batch allocation cursor changed during candidate reservation.");
         }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new ScheduledOperation(operationId, batchId, account.Value.AccountId, ordinal, source);
+        return new ScheduledOperation(operationId, batchId, account.Value.AccountId, ordinal, source, executionProfile);
     }
 
     public async Task<BatchExhaustionOutcome> TryFinalizeExhaustedBatchAsync(
@@ -767,7 +780,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,o.AttemptCount,o.ConfirmationDescriptorJson,o.AdapterRequestId,o.RemoteItemIdsJson,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.BatchJobId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.Id=$id AND o.Status='ResultPending' AND o.SubmitState='PendingConfirmation' AND o.TargetSlotState='Reserved' AND o.ConfirmationDescriptorJson IS NOT NULL;");
+            "SELECT o.Id,o.AssignedAccountId,o.AttemptCount,o.ConfirmationDescriptorJson,o.AdapterRequestId,o.RemoteItemIdsJson,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.BatchJobId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.ExecutionEngineVersion,o.BrowserFamily,o.ProfileId,o.InstallationId,o.SessionId FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.Id=$id AND o.Status='ResultPending' AND o.SubmitState='PendingConfirmation' AND o.TargetSlotState='Reserved' AND o.ConfirmationDescriptorJson IS NOT NULL;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
@@ -783,7 +796,8 @@ public sealed class SqliteTransferSchedulingStore :
                 new ShareReference(
                     reader.GetString(8),
                     reader.GetString(9),
-                    ReadString(reader, 10)))
+                    ReadString(reader, 10)),
+                SqliteExecutionProfileSnapshotCodec.Read(reader, 11))
             : null;
     }
 
@@ -931,7 +945,7 @@ public sealed class SqliteTransferSchedulingStore :
     {
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = Command(connection, null,
-            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState,o.BatchJobId,o.SubmitState='PreparingToSubmit' AND EXISTS(SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=o.Id AND attempt.AccountId=o.AssignedAccountId AND attempt.Generation=o.AttemptCount AND attempt.OwnerKind='Transfer') FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
+            "SELECT o.Id,o.AssignedAccountId,r.NormalizedShareId,r.ShareUrl,r.ExtractionCode,o.TargetPath,o.CreateFolderName,b.DuplicatePolicy,o.OperationFingerprint,EXISTS(SELECT 1 FROM ShareOperations share WHERE share.TransferOperationId=o.Id AND share.Status='WaitingTransfer'),o.AttemptCount,o.SubmitState,o.BatchJobId,o.SubmitState='PreparingToSubmit' AND EXISTS(SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=o.Id AND attempt.AccountId=o.AssignedAccountId AND attempt.Generation=o.AttemptCount AND attempt.OwnerKind='Transfer'),o.ExecutionEngineVersion,o.BrowserFamily,o.ProfileId,o.InstallationId,o.SessionId FROM TransferOperations o JOIN ResourceItems r ON r.Id=o.ResourceItemId JOIN BatchJobs b ON b.Id=o.BatchJobId WHERE o.Id=$id;");
         Add(command, "$id", Id(operationId));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
@@ -944,7 +958,8 @@ public sealed class SqliteTransferSchedulingStore :
                 new RemotePath(reader.GetString(5)), reader.IsDBNull(6) ? null : reader.GetString(6),
                 Enum.Parse<DuplicatePolicy>(reader.GetString(7)), reader.GetString(8), reader.GetInt64(9) != 0,
                 attemptCount, string.Equals(reader.GetString(11), "PreparingToSubmit", StringComparison.Ordinal),
-                Guid.Parse(reader.GetString(12)), reader.GetInt64(13) != 0);
+                Guid.Parse(reader.GetString(12)), reader.GetInt64(13) != 0,
+                SqliteExecutionProfileSnapshotCodec.Read(reader, 14));
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
         {
@@ -1775,11 +1790,12 @@ public sealed class SqliteTransferSchedulingStore :
     private static async Task<ScheduledOperation?> ReadWaitingAsync(SqliteConnection connection, SqliteTransaction transaction, Guid batchId, string dateKey, CancellationToken cancellationToken)
     {
         await using var command = Command(connection, transaction,
-            "SELECT o.Id,o.AssignedAccountId,o.AllocationOrdinal,o.AllocationSource FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId JOIN AccountAllocations al ON al.BatchJobId=o.BatchJobId AND al.AccountId=o.AssignedAccountId JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch AND o.Status='Waiting' AND o.TargetSlotState IN ('Unoccupied','Released') AND r.CandidateStatus<>'GloballyInvalid' AND r.GlobalValidityStatus<>'Invalid' AND (b.QuotaBasis<>'SuccessTarget' OR al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0) AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (o.DailyCountedAt IS NOT NULL OR a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=o.AssignedAccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy WHERE shareBusy.AccountId=o.AssignedAccountId AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT 1;");
+            "SELECT o.Id,o.AssignedAccountId,o.AllocationOrdinal,o.AllocationSource,o.ExecutionEngineVersion,o.BrowserFamily,o.ProfileId,o.InstallationId,o.SessionId FROM TransferOperations o JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId JOIN AccountAllocations al ON al.BatchJobId=o.BatchJobId AND al.AccountId=o.AssignedAccountId JOIN ResourceItems r ON r.Id=o.ResourceItemId WHERE o.BatchJobId=$batch AND o.Status='Waiting' AND o.TargetSlotState IN ('Unoccupied','Released') AND r.CandidateStatus<>'GloballyInvalid' AND r.GlobalValidityStatus<>'Invalid' AND (b.QuotaBasis<>'SuccessTarget' OR al.EffectiveTargetSuccessCount-al.FulfilledCount-al.ReservedSlotCount>0) AND a.Status='Active' AND a.IsEnabled=1 AND a.IsDeleted=0 AND (o.DailyCountedAt IS NOT NULL OR a.DailyLimit=0 OR a.DailyCountDateKey<>$date OR a.DailyExecutedCount<a.DailyLimit) AND NOT EXISTS(SELECT 1 FROM TransferOperations busy WHERE busy.AssignedAccountId=o.AssignedAccountId AND busy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) AND NOT EXISTS(SELECT 1 FROM ShareOperations shareBusy WHERE shareBusy.AccountId=o.AssignedAccountId AND shareBusy.Status IN ('Reserved','Preparing','Submitting','ResultPending','Paused')) ORDER BY o.AllocationOrdinal,o.SequenceNumber,o.Id LIMIT 1;");
         Add(command, "$batch", Id(batchId)); Add(command, "$date", dateKey);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new ScheduledOperation(Guid.Parse(reader.GetString(0)),batchId,Guid.Parse(reader.GetString(1)),reader.GetInt64(2),reader.GetString(3)) : null;
+            ? new ScheduledOperation(Guid.Parse(reader.GetString(0)),batchId,Guid.Parse(reader.GetString(1)),reader.GetInt64(2),reader.GetString(3),
+                SqliteExecutionProfileSnapshotCodec.Read(reader, 4)) : null;
     }
 
     private static async Task<(Guid AccountId, string DefaultTarget, string NormalizedDefaultTarget)?> SelectSuccessAccountAsync(SqliteConnection connection, SqliteTransaction transaction, Guid batchId, string dateKey, CancellationToken cancellationToken)

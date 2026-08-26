@@ -154,7 +154,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
               operation.AdapterRequestId,operation.SubmissionAcceptance,operation.AttemptCount,
               operation.LeaseExpiresAt,operation.SubmitStartedAt,operation.NextReconcileAt,
               operation.LastErrorCode,operation.LastErrorMessage,operation.CreatedAt,operation.UpdatedAt,
-              operation.LeaseGeneration,
+              operation.LeaseGeneration,operation.ExecutionEngineVersion,operation.BrowserFamily,
+              operation.ProfileId,operation.InstallationId,operation.SessionId,
               settings.IsPermanent,settings.IsAccessUnlimited,settings.ExtractionCodeMode,
               settings.FixedExtractionCode,settings.ExistingSharePolicy,settings.CreatedAt,
               output.ShareEnabled,
@@ -221,18 +222,18 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         }
         var operation = ReadOperation(reader);
         var settings = new BatchShareSettingsRecord(
-            operation.BatchJobId, reader.GetInt64(22) != 0, reader.GetInt64(23) != 0,
-            reader.GetString(24), reader.IsDBNull(25) ? null : reader.GetString(25), reader.GetString(26),
-            ReadTime(reader, 27), operation.SettingsFingerprint);
-        var shareEnabled = reader.GetInt64(28) != 0;
-        var decision = reader.IsDBNull(29)
+            operation.BatchJobId, reader.GetInt64(27) != 0, reader.GetInt64(28) != 0,
+            reader.GetString(29), reader.IsDBNull(30) ? null : reader.GetString(30), reader.GetString(31),
+            ReadTime(reader, 32), operation.SettingsFingerprint);
+        var shareEnabled = reader.GetInt64(33) != 0;
+        var decision = reader.IsDBNull(34)
             ? (ExistingShareDecision?)null
-            : Enum.Parse<ExistingShareDecision>(reader.GetString(29), ignoreCase: false);
-        var existingShareId = reader.IsDBNull(30) ? null : reader.GetString(30);
-        var existingShareUrl = reader.IsDBNull(31) ? null : reader.GetString(31);
-        var existingCode = reader.IsDBNull(32) ? null : reader.GetString(32);
-        var existingPermanent = !reader.IsDBNull(33) && reader.GetInt64(33) != 0;
-        var existingUnlimited = !reader.IsDBNull(34) && reader.GetInt64(34) != 0;
+            : Enum.Parse<ExistingShareDecision>(reader.GetString(34), ignoreCase: false);
+        var existingShareId = reader.IsDBNull(35) ? null : reader.GetString(35);
+        var existingShareUrl = reader.IsDBNull(36) ? null : reader.GetString(36);
+        var existingCode = reader.IsDBNull(37) ? null : reader.GetString(37);
+        var existingPermanent = !reader.IsDBNull(38) && reader.GetInt64(38) != 0;
+        var existingUnlimited = !reader.IsDBNull(39) && reader.GetInt64(39) != 0;
         await reader.DisposeAsync().ConfigureAwait(false);
 
         await using var itemsCommand = Command(connection, transaction, """
@@ -1912,11 +1913,12 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         reader.GetInt32(5),reader.GetString(6),reader.GetString(7),reader.GetString(8),reader.GetInt32(9),
         reader.IsDBNull(10)?null:reader.GetString(10),reader.IsDBNull(11)?null:reader.GetString(11),reader.GetString(12),reader.GetInt32(13),
         ReadNullableTime(reader,14),ReadNullableTime(reader,15),ReadNullableTime(reader,16),reader.IsDBNull(17)?null:reader.GetString(17),
-        reader.IsDBNull(18)?null:reader.GetString(18),ReadTime(reader,19),ReadTime(reader,20),reader.GetInt64(21));
+        reader.IsDBNull(18)?null:reader.GetString(18),ReadTime(reader,19),ReadTime(reader,20),reader.GetInt64(21),
+        SqliteExecutionProfileSnapshotCodec.Read(reader, 22));
 
     private static async Task<ShareOperationRecord> GetOperationAsync(SqliteConnection connection, SqliteTransaction transaction, string id, CancellationToken token)
     {
-        await using var command = Command(connection,transaction,"SELECT Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,LeaseGeneration FROM ShareOperations WHERE Id=$id;");
+        await using var command = Command(connection,transaction,"SELECT Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,LeaseGeneration,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId FROM ShareOperations WHERE Id=$id;");
         Add(command,"$id",id); await using var reader=await command.ExecuteReaderAsync(token).ConfigureAwait(false);
         if(!await reader.ReadAsync(token).ConfigureAwait(false))throw new InvalidDataException("Reserved share work disappeared.");
         return ReadOperation(reader);

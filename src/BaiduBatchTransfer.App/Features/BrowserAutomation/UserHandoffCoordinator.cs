@@ -49,7 +49,8 @@ public sealed class UserHandoffCoordinator
             identity.AccountId,
             identity.Generation,
             identity.OwnerKind,
-            now);
+            now,
+            identity.ExecutionProfile);
         if (await store.BeginAsync(created, cancellationToken).ConfigureAwait(false)) return created;
 
         var existing = await LoadExactAsync(identity, cancellationToken).ConfigureAwait(false);

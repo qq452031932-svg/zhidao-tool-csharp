@@ -13,8 +13,12 @@ public sealed record PendingReconciliationOperation(
     string? RemoteItemIdsJson,
     bool RequiresExactShareEvidence = false,
     Guid BatchId = default,
-    ShareReference? SourceShare = null)
+    ShareReference? SourceShare = null,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public override string ToString() =>
         "PendingReconciliationOperation { EntityIds = [REDACTED], Confirmation = [REDACTED] }";
 }
@@ -150,7 +154,8 @@ public sealed class OperationReconciliationService : ITransferResultReconciler
                         pending.AccountId,
                         pending.AttemptCount,
                         pending.SourceShare,
-                        IsRecovery: true).Validate(),
+                        IsRecovery: true,
+                        PersistedExecutionProfile: pending.ExecutionProfile).Validate(),
                     session,
                     query,
                     cancellationToken).ConfigureAwait(false);

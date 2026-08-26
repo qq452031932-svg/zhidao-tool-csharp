@@ -254,7 +254,8 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         var account = AccountRecord.Create(Guid.NewGuid(), "job-user", "Worker");
         var job = new BatchJobRecord(Guid.NewGuid(), "Job", "Text", "Distribution", "TaskCount", "ProportionalReduction", 1, 1, "/", "None", "Skip", "Immediate", "Queued", now, null, null, null, 1);
         var resource = new ResourceItemRecord(Guid.NewGuid(), job.Id, null, 1, "url", "share", null, null, null, null, null, "None", "Unknown", null, "Unallocated", null, null, now, now);
-        var operation = new TransferOperationRecord(Guid.NewGuid(), resource.Id, job.Id, 1, 1, "/", "/", "", account.Id, "Rule", "Waiting", null, 0, "fingerprint", "{}", null, null, "NotPrepared", "Unoccupied", null, null, null, null, null, null, now, now);
+        var operation = new TransferOperationRecord(Guid.NewGuid(), resource.Id, job.Id, 1, 1, "/", "/", "", account.Id, "Rule", "Waiting", null, 0, "fingerprint", "{}", null, null, "NotPrepared", "Unoccupied", null, null, null, null, null, null, now, now,
+            ExecutionProfileSnapshot.LegacyForAccount(account.Id));
         var allocation = new AccountAllocationRecord(Guid.NewGuid(), job.Id, account.Id, 1, "/", "/", 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
         {
@@ -266,6 +267,59 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         Assert.Equal(resource, Assert.Single((await read.Jobs.GetResourcesPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(operation, Assert.Single((await read.Jobs.GetOperationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
         Assert.Equal(allocation, Assert.Single((await read.Jobs.GetAllocationsPageAsync(job.Id, new PageQuery(1, 1))).Items));
+    }
+
+    [Fact]
+    public async Task TransferOperationRoundTripsItsManagedExecutionProfileSnapshot()
+    {
+        var factory = await CreateFactoryAsync();
+        var now = DateTimeOffset.UtcNow;
+        var account = AccountRecord.Create(Guid.NewGuid(), "managed-job-user", "Managed Worker");
+        await using (var seed = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await seed.Accounts.UpsertAsync(account);
+            await seed.CommitAsync();
+        }
+        var managedState = new SqliteManagedBrowserStateStore(factory);
+        var directory = Path.GetFullPath(Path.Combine(root, "managed-chrome"));
+        var installationIdentity = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+            "Google LLC", "Google Chrome", "managed-transfer-file");
+        await managedState.CreateInstallationAsync(installationIdentity, default);
+        var sessionIdentity = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installationIdentity.InstallationId, account.Id, account.BaiduUserId,
+            BrowserFamily.Chrome, "managed-transfer-profile", "managed-transfer-ownership");
+        await managedState.CreateSessionAsync(sessionIdentity, default);
+        var snapshot = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, sessionIdentity.ProfileId,
+            installationIdentity.InstallationId, sessionIdentity.SessionId);
+        var job = new BatchJobRecord(
+            Guid.NewGuid(), "Managed Job", "Text", "Distribution", "TaskCount", "ProportionalReduction",
+            1, 1, "/", "None", "Skip", "Immediate", "Queued", now, null, null, null, 1);
+        var resource = new ResourceItemRecord(
+            Guid.NewGuid(), job.Id, null, 1, "url", "share", null, null, null, null, null,
+            "None", "Unknown", null, "Unallocated", null, null, now, now);
+        var operation = new TransferOperationRecord(
+            Guid.NewGuid(), resource.Id, job.Id, 1, 1, "/", "/", "", account.Id, "Rule", "Waiting",
+            null, 0, "managed-fingerprint", null, null, null, "NotPrepared", "Unoccupied",
+            null, null, null, null, null, null, now, now, snapshot);
+
+        await using (var write = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await write.Jobs.AddAsync(job);
+            await write.Jobs.AddResourcesAsync([resource]);
+            await write.Jobs.AddOperationsAsync([operation]);
+            await write.CommitAsync();
+        }
+
+        await using var read = await SqliteUnitOfWork.BeginAsync(factory);
+        var restored = Assert.Single((await read.Jobs.GetOperationsPageAsync(
+            job.Id, new PageQuery(1, 10))).Items);
+        Assert.Equal(BaiduExecutionEngine.ManagedChromiumV1, restored.ExecutionProfile.Engine);
+        Assert.Equal(BrowserFamily.Chrome, restored.ExecutionProfile.BrowserFamily);
+        Assert.Equal(sessionIdentity.ProfileId, restored.ExecutionProfile.ProfileId);
+        Assert.Equal(installationIdentity.InstallationId, restored.ExecutionProfile.InstallationId);
+        Assert.Equal(sessionIdentity.SessionId, restored.ExecutionProfile.SessionId);
     }
 
     [Fact]

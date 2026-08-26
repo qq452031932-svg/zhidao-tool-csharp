@@ -96,7 +96,7 @@ public sealed class WebView2AutomationSession :
         BaiduCandidateSessionBinding? candidateBinding = null,
         ReadOnlyTransferRecoveryBinding? transferRecoveryBinding = null)
     {
-        this.identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+        this.identity = RequireWebView2Identity(identity);
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
         this.profilePath = profilePath;
         this.window = window ?? throw new ArgumentNullException(nameof(window));
@@ -116,7 +116,7 @@ public sealed class WebView2AutomationSession :
         IBaiduCandidateDomExecutor candidateExecutor,
         CancellationToken userClosed)
     {
-        this.identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+        this.identity = RequireWebView2Identity(identity);
         this.candidateBinding = candidateBinding ?? throw new ArgumentNullException(nameof(candidateBinding));
         this.candidateExecutor = candidateExecutor ?? throw new ArgumentNullException(nameof(candidateExecutor));
         headlessUserClosed = userClosed;
@@ -132,7 +132,7 @@ public sealed class WebView2AutomationSession :
         IBaiduCandidateDomExecutor candidateExecutor,
         CancellationToken userClosed)
     {
-        this.identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+        this.identity = RequireWebView2Identity(identity);
         this.transferRecoveryBinding = transferRecoveryBinding ??
             throw new ArgumentNullException(nameof(transferRecoveryBinding));
         if (transferRecoveryBinding.OperationId != identity.OperationId ||
@@ -149,6 +149,16 @@ public sealed class WebView2AutomationSession :
 
     public CancellationToken UserClosed => window?.UserClosed ?? headlessUserClosed;
     public WebAutomationRequestIdentity Identity => identity;
+
+    private static WebAutomationRequestIdentity RequireWebView2Identity(
+        WebAutomationRequestIdentity? identity)
+    {
+        var validated = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+        if (validated.ExecutionProfile.Engine != BaiduExecutionEngine.WebView2V1 ||
+            validated.ExecutionProfile.BrowserFamily != BrowserFamily.LegacyWebView2)
+            throw new InvalidOperationException("The persisted execution engine is unavailable in this adapter.");
+        return validated;
+    }
 
     public IDisposable Subscribe(Action<IWebViewDownloadOperation> onDownloadStarting) =>
         downloadRouter.Subscribe(onDownloadStarting);

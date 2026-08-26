@@ -18,8 +18,12 @@ public sealed record OperationExecutionSnapshot(
     int AttemptCount = 0,
     bool AttemptGenerationPrepared = false,
     Guid BatchId = default,
-    bool IsAutomationRecovery = false)
+    bool IsAutomationRecovery = false,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public override string ToString() =>
         $"OperationExecutionSnapshot {{ EntityIds = [REDACTED], Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy}, OperationFingerprint = [REDACTED] }}";
 }
@@ -191,7 +195,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 snapshot.AccountId,
                 attemptCount,
                 snapshot.Share,
-                IsRecovery: snapshot.IsAutomationRecovery).Validate()
+                IsRecovery: snapshot.IsAutomationRecovery,
+                PersistedExecutionProfile: snapshot.ExecutionProfile).Validate()
             : null;
         RemotePath completePath;
         try

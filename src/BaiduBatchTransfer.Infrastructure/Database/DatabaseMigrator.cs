@@ -4,7 +4,7 @@ namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class DatabaseMigrator
 {
-    public const int LatestVersion = 15;
+    public const int LatestVersion = 16;
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseBackupService backupService;
     private readonly DatabaseIntegrityService integrityService;
@@ -54,6 +54,12 @@ public sealed class DatabaseMigrator
     {
         var sql = ReadMigrationSql(version);
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        if (version == 16)
+        {
+            await using var disableForeignKeys = connection.CreateCommand();
+            disableForeignKeys.CommandText = "PRAGMA foreign_keys=OFF;";
+            await disableForeignKeys.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         try
         {

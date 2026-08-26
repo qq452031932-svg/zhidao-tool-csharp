@@ -15,6 +15,46 @@ public sealed class SqliteSchedulingStoreTests
     private static readonly DateTimeOffset Now = new(2026, 8, 19, 1, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public async Task ExecutionLoadReturnsThePersistedManagedSnapshot()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null);
+        var operation = Operation(resource, account, 1);
+        await db.SeedAsync([Account(account, 0)], job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource], operations: [operation], allocations: [Allocation(batch, account, 1, 1)]);
+        var state = new SqliteManagedBrowserStateStore(db.ConnectionFactory);
+        var directory = Path.GetFullPath(Path.Combine(Path.GetTempPath(), $"managed-scheduling-{Guid.NewGuid():N}"));
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Edge, directory, Path.Combine(directory, "msedge.exe"),
+            "Microsoft Corporation", "Microsoft Edge", $"managed-scheduling-file-{Guid.NewGuid():N}");
+        await state.CreateInstallationAsync(installation, default);
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.InstallationId, account, $"baidu-{account:N}",
+            BrowserFamily.Edge, $"managed-scheduling-{account:N}", $"owner-{account:N}");
+        await state.CreateSessionAsync(session, default);
+        await ExecuteAsync(db, """
+            UPDATE TransferOperations
+            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Edge',ProfileId=$profile,
+                InstallationId=$installation,SessionId=$session
+            WHERE Id=$operation;
+            """, ("$profile", session.ProfileId),
+            ("$installation", installation.InstallationId.ToString("D")),
+            ("$session", session.SessionId.ToString("D")), ("$operation", operation.Id.ToString("D")));
+
+        var loaded = await new SqliteTransferSchedulingStore(db.ConnectionFactory)
+            .LoadOperationAsync(operation.Id);
+
+        Assert.NotNull(loaded);
+        Assert.Equal(BaiduExecutionEngine.ManagedChromiumV1, loaded.ExecutionProfile.Engine);
+        Assert.Equal(BrowserFamily.Edge, loaded.ExecutionProfile.BrowserFamily);
+        Assert.Equal(session.ProfileId, loaded.ExecutionProfile.ProfileId);
+        Assert.Equal(installation.InstallationId, loaded.ExecutionProfile.InstallationId);
+        Assert.Equal(session.SessionId, loaded.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
     public async Task PausedReadyBatchCannotActivateUntilExplicitUserConfirmedResumeCommand()
     {
         await using var db = await BatchTestDatabase.CreateAsync();

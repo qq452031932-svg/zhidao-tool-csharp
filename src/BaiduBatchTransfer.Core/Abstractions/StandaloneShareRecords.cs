@@ -104,7 +104,8 @@ public sealed record StandaloneShareOperationRecord
         ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
         string? fixedExtractionCode = null,
         ExistingShareDecision existingShareDecision = ExistingShareDecision.Reuse,
-        int attemptCount = 0)
+        int attemptCount = 0,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         if (id == Guid.Empty) throw new ArgumentException("An operation id is required.", nameof(id));
         if (batchId == Guid.Empty) throw new ArgumentException("A batch id is required.", nameof(batchId));
@@ -153,6 +154,7 @@ public sealed record StandaloneShareOperationRecord
             true, true, extractionCodeBehavior, FixedExtractionCode);
         ExistingShareDecision = existingShareDecision;
         AttemptCount = attemptCount;
+        ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(accountId);
     }
 
     public Guid Id { get; }
@@ -174,6 +176,7 @@ public sealed record StandaloneShareOperationRecord
     public string SettingsFingerprint { get; }
     public ExistingShareDecision ExistingShareDecision { get; }
     public int AttemptCount { get; }
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
     public SubmissionAcceptance SubmissionAcceptance { get; init; } =
         BaiduBatchTransfer.Core.Domain.SubmissionAcceptance.Unknown;
     public string? BaselineFingerprint { get; init; }
@@ -196,7 +199,8 @@ public sealed record StandaloneShareOperationRecord
         DateTimeOffset createdAt,
         ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
         string? fixedExtractionCode = null,
-        ExistingShareDecision existingShareDecision = ExistingShareDecision.Reuse)
+        ExistingShareDecision existingShareDecision = ExistingShareDecision.Reuse,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         ArgumentNullException.ThrowIfNull(selection);
         return new(
@@ -216,7 +220,8 @@ public sealed record StandaloneShareOperationRecord
             createdAt,
             extractionCodeBehavior,
             fixedExtractionCode,
-            existingShareDecision);
+            existingShareDecision,
+            executionProfile: executionProfile);
     }
 
     public override string ToString() =>
@@ -231,8 +236,12 @@ public sealed record StandaloneShareOperationLease(
     long LeaseGeneration,
     Guid LeaseOwnerId,
     long Revision,
-    DateTimeOffset LeaseExpiresAt)
+    DateTimeOffset LeaseExpiresAt,
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
+    public ExecutionProfileSnapshot ExecutionProfile =>
+        PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AccountId);
+
     public override string ToString() =>
         $"StandaloneShareOperationLease {{ OperationId = {OperationId}, BatchId = {BatchId}, AccountId = {AccountId}, Generation = {Generation}, LeaseGeneration = {LeaseGeneration}, LeaseOwnerId = [REDACTED], Revision = {Revision}, LeaseExpiresAt = [REDACTED] }}";
 }

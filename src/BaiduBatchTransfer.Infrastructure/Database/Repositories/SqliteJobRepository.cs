@@ -86,7 +86,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddOperationsAsync(IEnumerable<TransferOperationRecord> operations, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(operations);
-        await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated);");
+        await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated,$engine,$browserFamily,$profile,$installation,$session);");
         var id = c.Parameters.Add("$id", SqliteType.Text);
         var resource = c.Parameters.Add("$resource", SqliteType.Text);
         var job = c.Parameters.Add("$job", SqliteType.Text);
@@ -114,6 +114,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var lease = c.Parameters.Add("$lease", SqliteType.Text);
         var created = c.Parameters.Add("$created", SqliteType.Text);
         var updated = c.Parameters.Add("$updated", SqliteType.Text);
+        var engine = c.Parameters.Add("$engine", SqliteType.Text);
+        var browserFamily = c.Parameters.Add("$browserFamily", SqliteType.Text);
+        var profile = c.Parameters.Add("$profile", SqliteType.Text);
+        var installation = c.Parameters.Add("$installation", SqliteType.Text);
+        var managedSession = c.Parameters.Add("$session", SqliteType.Text);
         c.Prepare();
         foreach (var x in operations)
         {
@@ -129,6 +134,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             counted.Value = NullableTime(x.DailyCountedAt); started.Value = NullableTime(x.SubmitStartedAt);
             errorCode.Value = x.LastErrorCode ?? (object)DBNull.Value; errorMessage.Value = x.LastErrorMessage ?? (object)DBNull.Value;
             lease.Value = NullableTime(x.LeaseExpiresAt); created.Value = Time(x.CreatedAt); updated.Value = Time(x.UpdatedAt);
+            engine.Value = SqliteExecutionProfileSnapshotCodec.FormatEngine(x.ExecutionProfile.Engine);
+            browserFamily.Value = SqliteExecutionProfileSnapshotCodec.FormatFamily(x.ExecutionProfile.BrowserFamily);
+            profile.Value = x.ExecutionProfile.ProfileId;
+            installation.Value = NullableId(x.ExecutionProfile.InstallationId);
+            managedSession.Value = NullableId(x.ExecutionProfile.SessionId);
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -137,9 +147,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     {
         query.Validate(); cancellationToken.ThrowIfCancellationRequested();
         var total = await CountAsync("TransferOperations",batchJobId,cancellationToken).ConfigureAwait(false);
-        await using var c = Command("SELECT Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt FROM TransferOperations WHERE BatchJobId=$job ORDER BY SequenceNumber,AllocationOrdinal,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
+        await using var c = Command("SELECT Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId FROM TransferOperations WHERE BatchJobId=$job ORDER BY SequenceNumber,AllocationOrdinal,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
         var items = new List<TransferOperationRecord>(); await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),Guid.Parse(r.GetString(2)),r.GetInt64(3),r.GetInt64(4),r.GetString(5),r.GetString(6),r.GetString(7),Guid.Parse(r.GetString(8)),r.GetString(9),r.GetString(10),r.IsDBNull(11)?null:r.GetString(11),r.GetInt32(12),r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetString(16),r.GetString(17),r.GetString(18),ReadNullableTime(r,19),ReadNullableTime(r,20),ReadNullableTime(r,21),r.IsDBNull(22)?null:r.GetString(22),r.IsDBNull(23)?null:r.GetString(23),ReadNullableTime(r,24),ReadTime(r,25),ReadTime(r,26)));
+        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),Guid.Parse(r.GetString(2)),r.GetInt64(3),r.GetInt64(4),r.GetString(5),r.GetString(6),r.GetString(7),Guid.Parse(r.GetString(8)),r.GetString(9),r.GetString(10),r.IsDBNull(11)?null:r.GetString(11),r.GetInt32(12),r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetString(16),r.GetString(17),r.GetString(18),ReadNullableTime(r,19),ReadNullableTime(r,20),ReadNullableTime(r,21),r.IsDBNull(22)?null:r.GetString(22),r.IsDBNull(23)?null:r.GetString(23),ReadNullableTime(r,24),ReadTime(r,25),ReadTime(r,26),SqliteExecutionProfileSnapshotCodec.Read(r,27)));
         return new(items,total,query.PageNumber,query.PageSize);
     }
 
@@ -623,8 +633,13 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         await using var command = Command("""
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,
-              AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
-            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created);
+              AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            SELECT $id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created,
+              transfer.ExecutionEngineVersion,transfer.BrowserFamily,transfer.ProfileId,transfer.InstallationId,transfer.SessionId
+            FROM TransferOperations transfer
+            WHERE transfer.Id=$transfer AND transfer.ResourceItemId=$resource
+              AND transfer.BatchJobId=$batch AND transfer.AssignedAccountId=$account;
             """);
         var prepared = false;
         foreach (var value in snapshot)
@@ -635,7 +650,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             Bind(command,"$account",Id(value.AccountId),!prepared); Bind(command,"$ordinal",value.OutputOrdinal,!prepared);
             Bind(command,"$settings",value.SettingsFingerprint,!prepared); Bind(command,"$created",Time(value.CreatedAt),!prepared);
             if (!prepared) { command.Prepare(); prepared = true; }
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException("The pending share operation source is unavailable.");
         }
     }
 
@@ -673,9 +689,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             await using (var command = Command("""
                 INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
                   ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,
-                  LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+                  LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$fingerprint,$settings,$generation,$descriptor,$request,
-                  $acceptance,$attempts,$leaseGeneration,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated);
+                  $acceptance,$attempts,$leaseGeneration,$lease,$submitted,$reconcile,$errorCode,$errorMessage,$created,$updated,
+                  $engine,$browserFamily,$profile,$installation,$session);
                 """))
             {
                 var prepared = false;
@@ -864,6 +882,11 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         Bind(command, "$submitted", NullableTime(value.SubmitStartedAt), add); Bind(command, "$reconcile", NullableTime(value.NextReconcileAt), add);
         Bind(command, "$errorCode", value.LastErrorCode, add); Bind(command, "$errorMessage", value.LastErrorMessage, add);
         Bind(command, "$created", Time(value.CreatedAt), add); Bind(command, "$updated", Time(value.UpdatedAt), add);
+        Bind(command, "$engine", SqliteExecutionProfileSnapshotCodec.FormatEngine(value.ExecutionProfile.Engine), add);
+        Bind(command, "$browserFamily", SqliteExecutionProfileSnapshotCodec.FormatFamily(value.ExecutionProfile.BrowserFamily), add);
+        Bind(command, "$profile", value.ExecutionProfile.ProfileId, add);
+        Bind(command, "$installation", value.ExecutionProfile.InstallationId is { } installationId ? Id(installationId) : null, add);
+        Bind(command, "$session", value.ExecutionProfile.SessionId is { } sessionId ? Id(sessionId) : null, add);
     }
 
     private static void Bind(SqliteCommand command, string name, object? value, bool add)

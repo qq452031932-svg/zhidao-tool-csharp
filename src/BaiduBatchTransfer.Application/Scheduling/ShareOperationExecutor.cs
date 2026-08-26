@@ -109,7 +109,8 @@ public sealed class ShareOperationExecutor
         if (adapter is IOperationBoundBaiduShareAdapter operationBound)
             automationContext = new ShareOperationAutomationContext(
                 operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
-                WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems).Validate();
+                WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems,
+                PersistedExecutionProfile: operation.ExecutionProfile).Validate();
         var submission = await submissionEngine.ExecuteSubmissionAsync(
             request,
             new ShareSubmissionPorts(
