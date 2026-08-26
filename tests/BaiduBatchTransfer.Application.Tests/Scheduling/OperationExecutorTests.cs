@@ -153,6 +153,31 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
+    public async Task DirectoryPageNotValidatedPersistsOnlyTypedSafeDiagnosticCode()
+    {
+        var snapshot = Snapshot(createFolderName: "乙") with { BatchId = Guid.NewGuid() };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new OperationBoundRecordingAdapter
+        {
+            DirectoryOutcome = TransferDirectoryPreparationOutcome.NeedsAttention(
+                new RemotePath("/"),
+                BaiduErrorKind.NotValidated,
+                BaiduCandidateDiagnosticCode.TrustedRootMissing),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.Equal("NotValidated", store.FailureCode);
+        Assert.Equal(
+            "百度转存或分享能力尚未通过现场验收。 [TrustedRootMissing]",
+            store.FailureMessage);
+        Assert.DoesNotContain("pan.baidu.com", store.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("pwd=", store.FailureMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, adapter.PrepareCalls);
+        Assert.Equal(0, adapter.SaveCalls);
+    }
+
+    [Fact]
     public async Task TransientDirectoryFailureUsesThreeRetriesAndControlledDelays()
     {
         var snapshot = Snapshot(createFolderName: null);

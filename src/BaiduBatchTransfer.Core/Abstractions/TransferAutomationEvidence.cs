@@ -269,33 +269,45 @@ public sealed record TransferDirectoryPreparationOutcome
         TransferDirectoryPreparationStatus status,
         RemoteDirectory? directory,
         RemotePath? confirmedPartialPath,
-        BaiduErrorKind? errorKind)
+        BaiduErrorKind? errorKind,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode)
     {
         Status = status;
         Directory = directory;
         ConfirmedPartialPath = confirmedPartialPath;
         ErrorKind = errorKind;
+        SafeDiagnosticCode = safeDiagnosticCode;
     }
 
     public TransferDirectoryPreparationStatus Status { get; }
     public RemoteDirectory? Directory { get; }
     public RemotePath? ConfirmedPartialPath { get; }
     public BaiduErrorKind? ErrorKind { get; }
+    public BaiduCandidateDiagnosticCode SafeDiagnosticCode { get; }
 
     public static TransferDirectoryPreparationOutcome Prepared(RemoteDirectory directory) =>
         new(TransferDirectoryPreparationStatus.Prepared,
-            directory ?? throw new ArgumentNullException(nameof(directory)), null, null);
+            directory ?? throw new ArgumentNullException(nameof(directory)), null, null,
+            BaiduCandidateDiagnosticCode.None);
 
     public static TransferDirectoryPreparationOutcome NeedsAttention(
         RemotePath confirmedPartialPath,
-        BaiduErrorKind errorKind)
+        BaiduErrorKind errorKind,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None)
     {
         ArgumentNullException.ThrowIfNull(confirmedPartialPath);
         if (confirmedPartialPath.Value.Length > 2_048 || confirmedPartialPath.Value.Any(char.IsControl))
             throw new ArgumentException("The confirmed partial path contains control characters.",
                 nameof(confirmedPartialPath));
+        if (!Enum.IsDefined(safeDiagnosticCode))
+            throw new ArgumentOutOfRangeException(nameof(safeDiagnosticCode));
+        if (safeDiagnosticCode != BaiduCandidateDiagnosticCode.None &&
+            errorKind != BaiduErrorKind.NotValidated)
+            throw new ArgumentException(
+                "Candidate diagnostics are valid only for unvalidated candidate observations.",
+                nameof(safeDiagnosticCode));
         return new(TransferDirectoryPreparationStatus.NeedsAttention, null,
-            confirmedPartialPath, errorKind);
+            confirmedPartialPath, errorKind, safeDiagnosticCode);
     }
 
     public override string ToString() =>

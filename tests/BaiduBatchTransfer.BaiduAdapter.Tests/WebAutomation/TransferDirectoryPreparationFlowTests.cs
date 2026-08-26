@@ -149,6 +149,29 @@ public sealed class TransferDirectoryPreparationFlowTests
         Assert.Equal(0, session.SourceOpenCount);
     }
 
+    [Fact]
+    public async Task SourceObservationFailurePreservesOnlyTypedSafeDiagnosticCode()
+    {
+        var request = Request("/目标");
+        var store = new MemoryEvidenceStore(Attempt(request));
+        var session = new FixtureSession(store)
+        {
+            SourceFailure = new BaiduAutomationNotValidatedException(
+                BaiduAutomationDenialReason.ObservationNotValidated,
+                "untrusted https://pan.baidu.com/s/private?pwd=1234 uid=secret",
+                BaiduCandidateDiagnosticCode.TrustedRootMissing),
+        };
+
+        var outcome = await new TransferDirectoryPreparationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, store, request);
+
+        Assert.Equal(TransferDirectoryPreparationStatus.NeedsAttention, outcome.Status);
+        Assert.Equal(BaiduErrorKind.NotValidated, outcome.ErrorKind);
+        Assert.Equal(BaiduCandidateDiagnosticCode.TrustedRootMissing, outcome.SafeDiagnosticCode);
+        Assert.DoesNotContain("private", outcome.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", outcome.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     private static TransferDirectoryPreparationRequest Request(string path) => new(
         Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1, Share(), new RemotePath(path), Capability);
 
@@ -185,6 +208,7 @@ public sealed class TransferDirectoryPreparationFlowTests
         public int OpenRootCount { get; private set; }
         public int RecoveryReadCount { get; private set; }
         public bool ThrowAfterCreate { get; init; }
+        public Exception? SourceFailure { get; init; }
 
         public Task OpenSourceAsync(ShareReference share, CancellationToken cancellationToken)
         {
@@ -193,9 +217,11 @@ public sealed class TransferDirectoryPreparationFlowTests
         }
 
         public Task<TransferSourceListing> ReadCompleteSourceAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
-                new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
-                "source-generation", "uid-1", Capability, Fingerprint)));
+            SourceFailure is not null
+                ? Task.FromException<TransferSourceListing>(SourceFailure)
+                : Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
+                    new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
+                    "source-generation", "uid-1", Capability, Fingerprint)));
 
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) =>
             Task.CompletedTask;

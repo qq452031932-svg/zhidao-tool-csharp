@@ -1,0 +1,30 @@
+namespace BaiduBatchTransfer.Core.Domain;
+
+public enum BaiduCandidateDiagnosticCode
+{
+    None = 0,
+    OfficialRouteMismatch,
+    TrustedRootMissing,
+    UnapprovedShadowRoot,
+    UnknownPageState,
+    TrustedRootNotUnique,
+    CandidateNotUnique,
+    AccountIdentityMismatch,
+    DuplicateStableId,
+    ServerNameMissing,
+    CursorCycle,
+    CursorGap,
+    GenerationMissing,
+    EnumerationIncomplete,
+    TargetBindingMismatch,
+    AncestorChainMismatch,
+    ExactItemMismatch,
+    ChangingGeneration,
+    OfficialResultIncomplete,
+    TrustedRootRoleMissing,
+    ItemEvidenceInvalid,
+    EnumerationChanged,
+    ObservationChanged,
+    ActionTargetNotUnique,
+    ActionNotAllowlisted,
+}

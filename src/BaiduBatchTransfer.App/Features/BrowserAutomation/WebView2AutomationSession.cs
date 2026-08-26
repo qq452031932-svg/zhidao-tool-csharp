@@ -703,7 +703,8 @@ public sealed class WebView2AutomationSession :
         var request = new BaiduCandidateDomReadRequest(
             currentOfficialUri, pageState, uid, exactIds, parentExactId, path);
         var result = await executor.ObserveTransferAsync(request, fence.Token).ConfigureAwait(false);
-        if (!result.IsSuccess || result.Observation is null) throw NotValidated(result.DenialReason);
+        if (!result.IsSuccess || result.Observation is null)
+            throw NotValidated(result.DenialReason, result.SafeDiagnosticCode);
         lastTransferObservation = result.Observation;
         return result.Observation;
     }
@@ -729,7 +730,8 @@ public sealed class WebView2AutomationSession :
             targetExactId);
         var result = await executor.MutateTransferAsync(request, observation, fence.Token)
             .ConfigureAwait(false);
-        if (!result.IsSuccess) throw NotValidated(result.DenialReason);
+        if (!result.IsSuccess)
+            throw NotValidated(result.DenialReason, result.SafeDiagnosticCode);
     }
 
     private BaiduTransferCandidateObservation RequireLastDirectoryObservation() =>
@@ -813,8 +815,11 @@ public sealed class WebView2AutomationSession :
         throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
     }
 
-    private static WebAutomationAuthorizationException NotValidated(BaiduAutomationDenialReason reason) =>
-        new(reason, "Candidate WebView2 field protocol is not validated for this typed operation.");
+    private static WebAutomationAuthorizationException NotValidated(
+        BaiduAutomationDenialReason reason,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) =>
+        new(reason, "Candidate WebView2 field protocol is not validated for this typed operation.",
+            safeDiagnosticCode);
 
     private void ValidateReadOnlyRecovery(RemoteDirectory destination, Uri officialTargetUri)
     {

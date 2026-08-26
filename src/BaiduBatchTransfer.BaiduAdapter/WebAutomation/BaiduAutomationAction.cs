@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 
 public enum BaiduAutomationAction
@@ -41,9 +43,12 @@ public enum BaiduAutomationDenialReason
 
 public class BaiduAutomationNotValidatedException(
     BaiduAutomationDenialReason denialReason,
-    string message) : InvalidOperationException(message)
+    string message,
+    BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) :
+    InvalidOperationException(message)
 {
     public BaiduAutomationDenialReason DenialReason { get; } = denialReason;
+    public BaiduCandidateDiagnosticCode SafeDiagnosticCode { get; } = safeDiagnosticCode;
 }
 
 public sealed record BaiduAutomationAcceptance(

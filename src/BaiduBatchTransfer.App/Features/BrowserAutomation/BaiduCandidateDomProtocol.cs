@@ -281,14 +281,18 @@ public sealed record BaiduTransferCandidateObservation(
 public readonly record struct BaiduTransferCandidateDomResult(
     bool IsSuccess,
     BaiduAutomationDenialReason DenialReason,
-    BaiduTransferCandidateObservation? Observation)
+    BaiduTransferCandidateObservation? Observation,
+    BaiduCandidateDiagnosticCode SafeDiagnosticCode)
 {
     public static BaiduTransferCandidateDomResult Success(BaiduTransferCandidateObservation observation) =>
         new(true, BaiduAutomationDenialReason.None,
-            observation ?? throw new ArgumentNullException(nameof(observation)));
+            observation ?? throw new ArgumentNullException(nameof(observation)),
+            BaiduCandidateDiagnosticCode.None);
 
-    public static BaiduTransferCandidateDomResult Denied(BaiduAutomationDenialReason reason) =>
-        new(false, reason, null);
+    public static BaiduTransferCandidateDomResult Denied(
+        BaiduAutomationDenialReason reason,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) =>
+        new(false, reason, null, safeDiagnosticCode);
 }
 
 public interface IBaiduCandidateDomScriptHost

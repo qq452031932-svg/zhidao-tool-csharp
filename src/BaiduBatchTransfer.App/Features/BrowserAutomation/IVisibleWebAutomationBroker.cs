@@ -342,7 +342,9 @@ public sealed record WebAutomationBatchCancellationResult(
 
 public sealed class WebAutomationAuthorizationException(
     BaiduAutomationDenialReason denialReason,
-    string message) : BaiduAutomationNotValidatedException(denialReason, message);
+    string message,
+    BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) :
+    BaiduAutomationNotValidatedException(denialReason, message, safeDiagnosticCode);
 
 public sealed class ProductionWebAutomationNavigationAuthorizer(
     IAcceptanceNavigationAuthorizationSource? acceptanceSource = null) : IWebAutomationNavigationAuthorizer

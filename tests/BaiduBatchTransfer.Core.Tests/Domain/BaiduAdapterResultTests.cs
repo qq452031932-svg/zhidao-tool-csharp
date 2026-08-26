@@ -41,4 +41,37 @@ public sealed class BaiduAdapterResultTests
         Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, definite.SubmissionAcceptance);
         Assert.Equal(SubmissionAcceptance.Unknown, unknown.SubmissionAcceptance);
     }
+
+    [Fact]
+    public void NotValidatedFailurePublishesOnlyTypedSafeDiagnosticCode()
+    {
+        const string untrusted =
+            "https://pan.baidu.com/s/private?pwd=1234 uid=secret raw-js-response";
+
+        var result = BaiduAdapterResult<string>.Failure(
+            BaiduErrorKind.NotValidated,
+            untrusted,
+            safeDiagnosticCode: BaiduCandidateDiagnosticCode.TrustedRootMissing);
+
+        Assert.Equal(BaiduCandidateDiagnosticCode.TrustedRootMissing, result.SafeDiagnosticCode);
+        Assert.Equal("百度转存或分享能力尚未通过现场验收。 [TrustedRootMissing]", result.SafeMessage);
+        Assert.DoesNotContain("private", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("raw-js-response", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void UndefinedOrNonNotValidatedSafeDiagnosticCodeIsRejected()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            BaiduAdapterResult<string>.Failure(
+                BaiduErrorKind.NotValidated,
+                null,
+                safeDiagnosticCode: (BaiduCandidateDiagnosticCode)int.MaxValue));
+        Assert.Throws<ArgumentException>(() =>
+            BaiduAdapterResult<string>.Failure(
+                BaiduErrorKind.InvalidLink,
+                null,
+                safeDiagnosticCode: BaiduCandidateDiagnosticCode.TrustedRootMissing));
+    }
 }

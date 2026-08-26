@@ -149,6 +149,61 @@ public sealed class BaiduTransferCandidateScriptsTests
     }
 
     [Theory]
+    [InlineData("official-route-mismatch", BaiduCandidateDiagnosticCode.OfficialRouteMismatch)]
+    [InlineData("trusted-root-missing", BaiduCandidateDiagnosticCode.TrustedRootMissing)]
+    [InlineData("unapproved-shadow-root", BaiduCandidateDiagnosticCode.UnapprovedShadowRoot)]
+    [InlineData("unknown-page-state", BaiduCandidateDiagnosticCode.UnknownPageState)]
+    [InlineData("trusted-root-not-unique", BaiduCandidateDiagnosticCode.TrustedRootNotUnique)]
+    [InlineData("candidate-not-unique", BaiduCandidateDiagnosticCode.CandidateNotUnique)]
+    [InlineData("uid-mismatch", BaiduCandidateDiagnosticCode.AccountIdentityMismatch)]
+    [InlineData("duplicate-stable-id", BaiduCandidateDiagnosticCode.DuplicateStableId)]
+    [InlineData("server-name-missing", BaiduCandidateDiagnosticCode.ServerNameMissing)]
+    [InlineData("cursor-cycle", BaiduCandidateDiagnosticCode.CursorCycle)]
+    [InlineData("cursor-gap", BaiduCandidateDiagnosticCode.CursorGap)]
+    [InlineData("generation-missing", BaiduCandidateDiagnosticCode.GenerationMissing)]
+    [InlineData("enumeration-incomplete", BaiduCandidateDiagnosticCode.EnumerationIncomplete)]
+    [InlineData("target-binding-mismatch", BaiduCandidateDiagnosticCode.TargetBindingMismatch)]
+    [InlineData("ancestor-chain-mismatch", BaiduCandidateDiagnosticCode.AncestorChainMismatch)]
+    [InlineData("exact-item-mismatch", BaiduCandidateDiagnosticCode.ExactItemMismatch)]
+    [InlineData("changing-generation", BaiduCandidateDiagnosticCode.ChangingGeneration)]
+    [InlineData("official-result-incomplete", BaiduCandidateDiagnosticCode.OfficialResultIncomplete)]
+    [InlineData("trusted-root-role-missing", BaiduCandidateDiagnosticCode.TrustedRootRoleMissing)]
+    [InlineData("item-evidence-invalid", BaiduCandidateDiagnosticCode.ItemEvidenceInvalid)]
+    [InlineData("enumeration-changed", BaiduCandidateDiagnosticCode.EnumerationChanged)]
+    [InlineData("observation-changed", BaiduCandidateDiagnosticCode.ObservationChanged)]
+    [InlineData("action-target-not-unique", BaiduCandidateDiagnosticCode.ActionTargetNotUnique)]
+    [InlineData("action-not-allowlisted", BaiduCandidateDiagnosticCode.ActionNotAllowlisted)]
+    public void NotValidatedResponseMapsOnlyFixedScriptReasonsToSafeDiagnosticCode(
+        string reason,
+        BaiduCandidateDiagnosticCode expected)
+    {
+        var result = BaiduTransferCandidateScripts.ParseAndValidate(
+            NotValidated(reason),
+            Request(BaiduCandidatePageState.ExternalShare, ["item-1"], false));
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduAutomationDenialReason.ObservationNotValidated, result.DenialReason);
+        Assert.Equal(expected, result.SafeDiagnosticCode);
+    }
+
+    [Fact]
+    public void UnknownOrMalformedNotValidatedReasonStaysGenericAndNeverLeaksRawReason()
+    {
+        const string secret = "https://pan.baidu.com/s/private?pwd=1234 uid=secret";
+        var request = Request(BaiduCandidatePageState.ExternalShare, ["item-1"], false);
+
+        var unknown = BaiduTransferCandidateScripts.ParseAndValidate(NotValidated(secret), request);
+        var malformed = BaiduTransferCandidateScripts.ParseAndValidate(
+            NotValidated("trusted-root-missing").Replace(
+                "\"reason\":\"trusted-root-missing\"", "\"reason\":123", StringComparison.Ordinal),
+            request);
+
+        Assert.Equal(BaiduCandidateDiagnosticCode.None, unknown.SafeDiagnosticCode);
+        Assert.Equal(BaiduCandidateDiagnosticCode.None, malformed.SafeDiagnosticCode);
+        Assert.DoesNotContain(secret, unknown.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
     [InlineData("wrong-uid")]
     [InlineData("wrong-parent")]
     [InlineData("wrong-path")]

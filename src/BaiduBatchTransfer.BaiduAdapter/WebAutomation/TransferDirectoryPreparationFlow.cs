@@ -142,6 +142,10 @@ public sealed class TransferDirectoryPreparationFlow(TimeProvider? timeProvider 
                 source = (await session.ReadCompleteSourceAsync(cancellationToken).ConfigureAwait(false)).Evidence;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (BaiduAutomationNotValidatedException exception)
+            {
+                return NotValidated(new RemotePath("/"), exception.SafeDiagnosticCode);
+            }
             catch { return NotValidated(new RemotePath("/")); }
 
             if (!MatchesSource(source, request) || !await store.PersistSourceEvidenceAsync(
@@ -172,6 +176,10 @@ public sealed class TransferDirectoryPreparationFlow(TimeProvider? timeProvider 
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (BaiduAutomationNotValidatedException exception)
+        {
+            return NotValidated(new RemotePath("/"), exception.SafeDiagnosticCode);
+        }
         catch { return NotValidated(new RemotePath("/")); }
 
         var confirmedPath = current.Directory!.Path;
@@ -391,8 +399,11 @@ public sealed class TransferDirectoryPreparationFlow(TimeProvider? timeProvider 
 
     private static string LastSegment(RemotePath path) => Segments(path)[^1];
 
-    private static TransferDirectoryPreparationOutcome NotValidated(RemotePath partial) =>
-        TransferDirectoryPreparationOutcome.NeedsAttention(partial, BaiduErrorKind.NotValidated);
+    private static TransferDirectoryPreparationOutcome NotValidated(
+        RemotePath partial,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) =>
+        TransferDirectoryPreparationOutcome.NeedsAttention(
+            partial, BaiduErrorKind.NotValidated, safeDiagnosticCode);
 
     private static TransferDirectoryPreparationOutcome NeedsAttention(RemotePath partial) =>
         TransferDirectoryPreparationOutcome.NeedsAttention(partial, BaiduErrorKind.UnknownResponse);

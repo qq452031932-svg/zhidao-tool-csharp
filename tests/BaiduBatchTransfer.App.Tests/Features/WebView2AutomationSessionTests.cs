@@ -118,6 +118,28 @@ public sealed class WebView2AutomationSessionTests
     }
 
     [Fact]
+    public async Task TransferObservationFailureCarriesTypedSafeDiagnosticIntoAuthorizationException()
+    {
+        var identity = TransferIdentity();
+        var executor = new RecordingTransferCandidateExecutor
+        {
+            ObservationFailureCode = BaiduCandidateDiagnosticCode.TrustedRootMissing,
+        };
+        await using var session = new WebView2AutomationSession(
+            identity, TransferBinding(identity), executor, CancellationToken.None);
+        var transfer = (ITransferDirectoryPreparationSession)session;
+        await transfer.OpenSourceAsync(
+            new ShareReference("share", "https://pan.baidu.com/s/share?pwd=1111", "1111"),
+            CancellationToken.None);
+
+        var error = await Assert.ThrowsAsync<WebAutomationAuthorizationException>(() =>
+            transfer.ReadCompleteSourceAsync(CancellationToken.None));
+
+        Assert.Equal(BaiduAutomationDenialReason.ObservationNotValidated, error.DenialReason);
+        Assert.Equal(BaiduCandidateDiagnosticCode.TrustedRootMissing, error.SafeDiagnosticCode);
+    }
+
+    [Fact]
     public async Task ExactShareSelectionDelegatesObserveAndSingleMutation()
     {
         var identity = Identity();
@@ -281,12 +303,17 @@ public sealed class WebView2AutomationSessionTests
     {
         public List<BaiduAutomationAction> Actions { get; } = [];
         public List<string?> TargetIds { get; } = [];
+        public BaiduCandidateDiagnosticCode ObservationFailureCode { get; init; }
 
         public Task<BaiduTransferCandidateDomResult> ObserveTransferAsync(
             BaiduCandidateDomReadRequest request,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (ObservationFailureCode != BaiduCandidateDiagnosticCode.None)
+                return Task.FromResult(BaiduTransferCandidateDomResult.Denied(
+                    BaiduAutomationDenialReason.ObservationNotValidated,
+                    ObservationFailureCode));
             BaiduTransferCandidateItem[] items = request.ExpectedPageState switch
             {
                 BaiduCandidatePageState.ExternalShare =>

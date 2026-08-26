@@ -103,6 +103,23 @@ public sealed class TransferAutomationEvidenceTests
     }
 
     [Fact]
+    public void PartialOutcomeAcceptsOnlyDefinedDiagnosticsForNotValidatedFailures()
+    {
+        var path = new RemotePath("/");
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            TransferDirectoryPreparationOutcome.NeedsAttention(
+                path,
+                BaiduErrorKind.NotValidated,
+                (BaiduCandidateDiagnosticCode)int.MaxValue));
+        Assert.Throws<ArgumentException>(() =>
+            TransferDirectoryPreparationOutcome.NeedsAttention(
+                path,
+                BaiduErrorKind.UnknownResponse,
+                BaiduCandidateDiagnosticCode.TrustedRootMissing));
+    }
+
+    [Fact]
     public void DirectoryMutationBindsUidCapabilityAndOwningRevision()
     {
         var mutation = new TransferDirectoryMutationRecord(

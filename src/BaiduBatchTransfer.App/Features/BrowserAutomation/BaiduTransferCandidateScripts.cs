@@ -10,6 +10,35 @@ public static class BaiduTransferCandidateScripts
 {
     private const int MaximumResponseLength = 65_536;
 
+    private static readonly IReadOnlyDictionary<string, BaiduCandidateDiagnosticCode>
+        SafeDiagnosticCodes = new Dictionary<string, BaiduCandidateDiagnosticCode>(StringComparer.Ordinal)
+        {
+            ["official-route-mismatch"] = BaiduCandidateDiagnosticCode.OfficialRouteMismatch,
+            ["trusted-root-missing"] = BaiduCandidateDiagnosticCode.TrustedRootMissing,
+            ["unapproved-shadow-root"] = BaiduCandidateDiagnosticCode.UnapprovedShadowRoot,
+            ["unknown-page-state"] = BaiduCandidateDiagnosticCode.UnknownPageState,
+            ["trusted-root-not-unique"] = BaiduCandidateDiagnosticCode.TrustedRootNotUnique,
+            ["candidate-not-unique"] = BaiduCandidateDiagnosticCode.CandidateNotUnique,
+            ["uid-mismatch"] = BaiduCandidateDiagnosticCode.AccountIdentityMismatch,
+            ["duplicate-stable-id"] = BaiduCandidateDiagnosticCode.DuplicateStableId,
+            ["server-name-missing"] = BaiduCandidateDiagnosticCode.ServerNameMissing,
+            ["cursor-cycle"] = BaiduCandidateDiagnosticCode.CursorCycle,
+            ["cursor-gap"] = BaiduCandidateDiagnosticCode.CursorGap,
+            ["generation-missing"] = BaiduCandidateDiagnosticCode.GenerationMissing,
+            ["enumeration-incomplete"] = BaiduCandidateDiagnosticCode.EnumerationIncomplete,
+            ["target-binding-mismatch"] = BaiduCandidateDiagnosticCode.TargetBindingMismatch,
+            ["ancestor-chain-mismatch"] = BaiduCandidateDiagnosticCode.AncestorChainMismatch,
+            ["exact-item-mismatch"] = BaiduCandidateDiagnosticCode.ExactItemMismatch,
+            ["changing-generation"] = BaiduCandidateDiagnosticCode.ChangingGeneration,
+            ["official-result-incomplete"] = BaiduCandidateDiagnosticCode.OfficialResultIncomplete,
+            ["trusted-root-role-missing"] = BaiduCandidateDiagnosticCode.TrustedRootRoleMissing,
+            ["item-evidence-invalid"] = BaiduCandidateDiagnosticCode.ItemEvidenceInvalid,
+            ["enumeration-changed"] = BaiduCandidateDiagnosticCode.EnumerationChanged,
+            ["observation-changed"] = BaiduCandidateDiagnosticCode.ObservationChanged,
+            ["action-target-not-unique"] = BaiduCandidateDiagnosticCode.ActionTargetNotUnique,
+            ["action-not-allowlisted"] = BaiduCandidateDiagnosticCode.ActionNotAllowlisted,
+        };
+
     private static readonly HashSet<string> ResponseFields = new(StringComparer.Ordinal)
     {
         "status", "reason", "officialOriginMatched", "pageState", "controlCount",
@@ -333,9 +362,14 @@ public static class BaiduTransferCandidateScripts
             var root = document.RootElement;
             if (!HasExactFields(root, ResponseFields)) return Invalid();
             var status = RequiredText(root, "status", 32);
-            _ = RequiredText(root, "reason", 128);
+            var reason = RequiredText(root, "reason", 128);
+            if (string.Equals(status, "notValidated", StringComparison.Ordinal))
+                return SafeDiagnosticCodes.TryGetValue(reason, out var safeDiagnosticCode)
+                    ? BaiduTransferCandidateDomResult.Denied(
+                        BaiduAutomationDenialReason.ObservationNotValidated, safeDiagnosticCode)
+                    : Invalid();
             if (!string.Equals(status, "validated", StringComparison.Ordinal)) return Invalid();
-            if (!string.Equals(root.GetProperty("reason").GetString(), "none", StringComparison.Ordinal) ||
+            if (!string.Equals(reason, "none", StringComparison.Ordinal) ||
                 !root.GetProperty("officialOriginMatched").GetBoolean())
                 return Invalid();
             if (!Enum.TryParse<BaiduCandidatePageState>(RequiredText(root, "pageState", 64), false, out var pageState) ||

@@ -246,7 +246,8 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                         .ConfigureAwait(false);
                 else
                     await FailAsync(
-                        snapshot.OperationId, directoryError, false, attemptCount, cancellationToken)
+                        snapshot.OperationId, directoryError, false, attemptCount, cancellationToken,
+                        directoryOutcome.SafeDiagnosticCode)
                         .ConfigureAwait(false);
                 return;
             }
@@ -464,9 +465,11 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         BaiduErrorKind errorKind,
         bool globallyInvalid,
         int? expectedAttemptCount,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None)
     {
-        var safe = BaiduAdapterResult.Failure(errorKind, null);
+        var safe = BaiduAdapterResult.Failure(
+            errorKind, null, safeDiagnosticCode: safeDiagnosticCode);
         return store.MarkFailedAsync(
             operationId,
             errorKind.ToString(),

@@ -6,8 +6,10 @@ public static class BaiduAdapterResult
         BaiduErrorKind errorKind,
         string? adapterDiagnostic,
         TimeSpan? retryAfter = null,
-        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown) =>
-        BaiduAdapterResult<object>.Failure(errorKind, adapterDiagnostic, retryAfter, submissionAcceptance);
+        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None) =>
+        BaiduAdapterResult<object>.Failure(
+            errorKind, adapterDiagnostic, retryAfter, submissionAcceptance, safeDiagnosticCode);
 
     internal static BaiduErrorScope GetScope(BaiduErrorKind errorKind) => errorKind switch
     {
@@ -39,6 +41,23 @@ public static class BaiduAdapterResult
         BaiduErrorKind.NotValidated => "百度转存或分享能力尚未通过现场验收。",
         _ => throw new ArgumentOutOfRangeException(nameof(errorKind), errorKind, "Unknown adapter error kind.")
     };
+
+    internal static string GetSafeMessage(
+        BaiduErrorKind errorKind,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode)
+    {
+        if (!Enum.IsDefined(safeDiagnosticCode))
+            throw new ArgumentOutOfRangeException(nameof(safeDiagnosticCode));
+        if (safeDiagnosticCode != BaiduCandidateDiagnosticCode.None &&
+            errorKind != BaiduErrorKind.NotValidated)
+            throw new ArgumentException(
+                "Candidate diagnostics are valid only for unvalidated candidate observations.",
+                nameof(safeDiagnosticCode));
+        var message = GetSafeMessage(errorKind);
+        return safeDiagnosticCode == BaiduCandidateDiagnosticCode.None
+            ? message
+            : $"{message} [{safeDiagnosticCode}]";
+    }
 }
 
 public sealed class BaiduAdapterResult<T>
@@ -50,7 +69,8 @@ public sealed class BaiduAdapterResult<T>
         BaiduErrorScope? scope,
         string? safeMessage,
         TimeSpan? retryAfter,
-        SubmissionAcceptance submissionAcceptance)
+        SubmissionAcceptance submissionAcceptance,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode)
     {
         IsSuccess = isSuccess;
         Value = value;
@@ -59,6 +79,7 @@ public sealed class BaiduAdapterResult<T>
         SafeMessage = safeMessage;
         RetryAfter = retryAfter;
         SubmissionAcceptance = submissionAcceptance;
+        SafeDiagnosticCode = safeDiagnosticCode;
     }
 
     public bool IsSuccess { get; }
@@ -75,6 +96,8 @@ public sealed class BaiduAdapterResult<T>
 
     public SubmissionAcceptance SubmissionAcceptance { get; }
 
+    public BaiduCandidateDiagnosticCode SafeDiagnosticCode { get; }
+
     public static BaiduAdapterResult<T> Success(T value)
         => Success(value, SubmissionAcceptance.Unknown);
 
@@ -83,14 +106,17 @@ public sealed class BaiduAdapterResult<T>
         SubmissionAcceptance submissionAcceptance)
     {
         ArgumentNullException.ThrowIfNull(value);
-        return new BaiduAdapterResult<T>(true, value, null, null, null, null, submissionAcceptance);
+        return new BaiduAdapterResult<T>(
+            true, value, null, null, null, null, submissionAcceptance,
+            BaiduCandidateDiagnosticCode.None);
     }
 
     public static BaiduAdapterResult<T> Failure(
         BaiduErrorKind errorKind,
         string? adapterDiagnostic,
         TimeSpan? retryAfter = null,
-        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown)
+        SubmissionAcceptance submissionAcceptance = SubmissionAcceptance.Unknown,
+        BaiduCandidateDiagnosticCode safeDiagnosticCode = BaiduCandidateDiagnosticCode.None)
     {
         if (retryAfter < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(retryAfter), "The server retry delay cannot be negative.");
@@ -102,8 +128,9 @@ public sealed class BaiduAdapterResult<T>
             default,
             errorKind,
             scope,
-            BaiduAdapterResult.GetSafeMessage(errorKind),
+            BaiduAdapterResult.GetSafeMessage(errorKind, safeDiagnosticCode),
             retryAfter,
-            submissionAcceptance);
+            submissionAcceptance,
+            safeDiagnosticCode);
     }
 }
