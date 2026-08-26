@@ -129,7 +129,7 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
-    public async Task StartingTheHostRunsQueuedTransferWorkThroughTheRegisteredCoordinator()
+    public async Task StartingAnOrdinaryHostLeavesQueuedTransferWorkUntouched()
     {
         var executor = new RecordingTransferExecutor();
         using var host = AppBootstrap.CreateHost(root, services =>
@@ -149,11 +149,44 @@ public sealed class AppBootstrapTests : IDisposable
             DateTimeOffset.UtcNow.AddMinutes(-1));
 
         await host.StartAsync();
+        await Task.Delay(150);
+        await host.StopAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Null(executor.OperationId);
+        Assert.Equal(
+            "Waiting",
+            await ReadOperationStatusAsync(
+                host.Services.GetRequiredService<SqliteConnectionFactory>(), operationId));
+    }
+
+#if DEBUG
+    [Fact]
+    public async Task StartingAnExplicitAcceptanceHostRunsQueuedTransferWork()
+    {
+        var executor = new RecordingTransferExecutor();
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch], services =>
+        {
+            services.RemoveAll<ITransferOperationExecutor>();
+            services.AddSingleton<ITransferOperationExecutor>(executor);
+        });
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var operationId = Guid.NewGuid();
+        await SeedTransferOwnerAsync(
+            host.Services.GetRequiredService<SqliteConnectionFactory>(),
+            operationId,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            generation: 1,
+            baiduUserId: "acceptance-hosted-loop-user",
+            DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        await host.StartAsync();
         await executor.Executed.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await host.StopAsync(TimeSpan.FromSeconds(2));
 
         Assert.Equal(operationId, executor.OperationId);
     }
+#endif
 
     [Fact]
     public void ExplicitAcceptanceSwitchUsesTheCompileTimeDebugGate()
@@ -806,6 +839,17 @@ public sealed class AppBootstrapTests : IDisposable
         command.Parameters.AddWithValue("$generation", generation);
         command.Parameters.AddWithValue("$now", now.ToString("O"));
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string?> ReadOperationStatusAsync(
+        SqliteConnectionFactory factory,
+        Guid operationId)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Status FROM TransferOperations WHERE Id=$id;";
+        command.Parameters.AddWithValue("$id", operationId.ToString("D"));
+        return await command.ExecuteScalarAsync() as string;
     }
 
     private static WizardAccountOption AccountOption(int value) => new(

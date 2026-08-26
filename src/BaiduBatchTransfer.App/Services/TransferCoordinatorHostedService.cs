@@ -6,15 +6,18 @@ namespace BaiduBatchTransfer.App.Services;
 public sealed class TransferCoordinatorHostedService : BackgroundService
 {
     private readonly TransferCoordinator coordinator;
+    private readonly IAdapterAvailability availability;
     private readonly TimeProvider timeProvider;
     private readonly TimeSpan idleScanInterval;
 
     public TransferCoordinatorHostedService(
         TransferCoordinator coordinator,
+        IAdapterAvailability availability,
         TimeProvider? timeProvider = null,
         TimeSpan? idleScanInterval = null)
     {
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
+        this.availability = availability ?? throw new ArgumentNullException(nameof(availability));
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.idleScanInterval = idleScanInterval ?? TimeSpan.FromSeconds(1);
         if (this.idleScanInterval <= TimeSpan.Zero)
@@ -23,9 +26,10 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (!availability.CanStartTransfers) return;
         while (!stoppingToken.IsCancellationRequested)
         {
-            var scheduled = 0;
+            int scheduled;
             try
             {
                 scheduled = await coordinator.RunCycleAsync(stoppingToken).ConfigureAwait(false);
@@ -33,10 +37,6 @@ public sealed class TransferCoordinatorHostedService : BackgroundService
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
-            }
-            catch
-            {
-                // Scheduling state is durable. A bounded idle scan retries transient failures.
             }
 
             if (scheduled > 0) continue;

@@ -51,6 +51,22 @@ public sealed class TransferCoordinatorHostedServiceTests
         Assert.True(store.RecoveryCancellationObserved);
     }
 
+    [Fact]
+    public async Task UnexpectedCoordinatorFailureFaultsOnceInsteadOfBeingRetriedForever()
+    {
+        var failure = new InvalidOperationException("corrupt scheduling invariant");
+        var store = new ControllableAllocationStore { RecoveryFailure = failure };
+        var service = Service(store, new RecordingExecutor(), TimeSpan.FromMilliseconds(10));
+
+        await service.StartAsync(CancellationToken.None);
+        var observed = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await service.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(1)));
+        await Task.Delay(50);
+
+        Assert.Same(failure, observed);
+        Assert.Equal(1, store.RecoveryCount);
+    }
+
     private static TransferCoordinatorHostedService Service(
         ControllableAllocationStore store,
         ITransferOperationExecutor executor,
@@ -59,8 +75,15 @@ public sealed class TransferCoordinatorHostedServiceTests
                 new AllocationTransactionService(store),
                 executor,
                 new NetworkExecutionGate(initiallyOnline: true)),
+            new AvailableAdapter(),
             TimeProvider.System,
             idleScanInterval);
+
+    private sealed class AvailableAdapter : IAdapterAvailability
+    {
+        public bool CanStartTransfers => true;
+        public string StatusMessage => string.Empty;
+    }
 
     private sealed class RecordingExecutor : ITransferOperationExecutor
     {
@@ -86,6 +109,7 @@ public sealed class TransferCoordinatorHostedServiceTests
         public TaskCompletionSource FirstRecovery { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int RecoveryCount { get; private set; }
         public bool BlockRecovery { get; init; }
+        public Exception? RecoveryFailure { get; init; }
         public bool RecoveryCancellationObserved { get; private set; }
 
         public void QueueOne() => Volatile.Write(ref queued, 1);
@@ -96,6 +120,7 @@ public sealed class TransferCoordinatorHostedServiceTests
         {
             RecoveryCount++;
             FirstRecovery.TrySetResult();
+            if (RecoveryFailure is not null) throw RecoveryFailure;
             if (BlockRecovery)
             {
                 try { await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken); }
