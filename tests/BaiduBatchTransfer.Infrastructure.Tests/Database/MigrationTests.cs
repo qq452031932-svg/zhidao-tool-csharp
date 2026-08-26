@@ -247,27 +247,29 @@ public sealed class MigrationTests : IDisposable
             UPDATE TransferOperations SET AssignedAccountId=$newAccount WHERE Id=$operation;
             """, ("$newAccount", ids.AccountTwo.ToString("D")),
             ("$operation", ids.TransferWaiting.ToString("D"))));
-        await ExecuteAsync(upgraded, """
-            INSERT INTO WebAutomationDirectoryMutations(
-              OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
-              ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
-              CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
-              CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
-            VALUES($operation,$account,1,0,'root','folder',NULL,'/folder','listing','uid-one',
-              'WebView2','1','1','1','Intent',0,'2026-08-01','2026-08-01');
-            """, ("$operation", ids.TransferWaiting.ToString("D")),
-            ("$account", ids.AccountOne.ToString("D")));
-        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
-            UPDATE TransferOperations
-            SET AssignedAccountId=$newAccount,ProfileId=$newProfile
-            WHERE Id=$operation;
-            """, ("$newAccount", ids.AccountTwo.ToString("D")), ("$newProfile", accountTwoProfile),
-            ("$operation", ids.TransferWaiting.ToString("D"))));
-        await ExecuteAsync(upgraded, """
-            DELETE FROM WebAutomationDirectoryMutations
-            WHERE OperationId=$operation AND AccountId=$account;
-            """, ("$operation", ids.TransferWaiting.ToString("D")),
-            ("$account", ids.AccountOne.ToString("D")));
+        foreach (var mutationAccount in new[] { ids.AccountOne, ids.AccountTwo, Guid.NewGuid() })
+        {
+            await ExecuteAsync(upgraded, """
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,1,0,'root','folder',NULL,'/folder','listing','uid-one',
+                  'WebView2','1','1','1','Intent',0,'2026-08-01','2026-08-01');
+                """, ("$operation", ids.TransferWaiting.ToString("D")),
+                ("$account", mutationAccount.ToString("D")));
+            await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+                UPDATE TransferOperations
+                SET AssignedAccountId=$newAccount,ProfileId=$newProfile
+                WHERE Id=$operation;
+                """, ("$newAccount", ids.AccountTwo.ToString("D")), ("$newProfile", accountTwoProfile),
+                ("$operation", ids.TransferWaiting.ToString("D"))));
+            await ExecuteAsync(upgraded, """
+                DELETE FROM WebAutomationDirectoryMutations
+                WHERE OperationId=$operation;
+                """, ("$operation", ids.TransferWaiting.ToString("D")));
+        }
         await ExecuteAsync(upgraded, """
             UPDATE TransferOperations
             SET AssignedAccountId=$newAccount,ProfileId=$newProfile

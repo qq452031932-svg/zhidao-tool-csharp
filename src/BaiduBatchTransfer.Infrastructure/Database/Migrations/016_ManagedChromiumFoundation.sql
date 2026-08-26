@@ -567,7 +567,7 @@ BEGIN
         SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=OLD.Id)
       AND NOT EXISTS(
         SELECT 1 FROM WebAutomationDirectoryMutations mutation
-        WHERE mutation.OperationId=OLD.Id AND mutation.AccountId=OLD.AssignedAccountId)
+        WHERE mutation.OperationId=OLD.Id)
     ) THEN RAISE(ABORT, 'execution snapshot is immutable') END;
 END;
 

@@ -1069,7 +1069,9 @@ public sealed class SqliteSchedulingStoreTests
     [InlineData("submit-started")]
     [InlineData("adapter-request")]
     [InlineData("remote-items")]
-    [InlineData("directory-mutation")]
+    [InlineData("directory-mutation-old")]
+    [InlineData("directory-mutation-target")]
+    [InlineData("directory-mutation-third")]
     public async Task ReassignmentRejectsAnyStartedOrRemoteSideEffectEvidence(string evidence)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -1082,6 +1084,12 @@ public sealed class SqliteSchedulingStoreTests
             job: Job(batch, "TaskCount", "Paused", 1, 1), resources: [resource], operations: [operation],
             allocations: [Allocation(batch, oldAccount, 1, 1), Allocation(batch, newAccount, 2, 0)]);
 
+        var mutationAccount = evidence switch
+        {
+            "directory-mutation-target" => newAccount,
+            "directory-mutation-third" => Guid.NewGuid(),
+            _ => oldAccount,
+        };
         var mutation = evidence switch
         {
             "attempt" => "UPDATE TransferOperations SET AttemptCount=1 WHERE Id=$operation; INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) SELECT Id,AssignedAccountId,1,'Transfer','Preparing',0,$now,$now,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId FROM TransferOperations WHERE Id=$operation;",
@@ -1090,7 +1098,7 @@ public sealed class SqliteSchedulingStoreTests
             "submit-started" => "UPDATE TransferOperations SET SubmitStartedAt=$now WHERE Id=$operation;",
             "adapter-request" => "UPDATE TransferOperations SET AdapterRequestId='request' WHERE Id=$operation;",
             "remote-items" => "UPDATE TransferOperations SET RemoteItemIdsJson='[\"remote\"]' WHERE Id=$operation;",
-            "directory-mutation" => """
+            "directory-mutation-old" or "directory-mutation-target" or "directory-mutation-third" => """
                 INSERT INTO WebAutomationDirectoryMutations(
                   OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
                   ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
@@ -1102,7 +1110,7 @@ public sealed class SqliteSchedulingStoreTests
             _ => throw new ArgumentOutOfRangeException(nameof(evidence)),
         };
         await ExecuteAsync(db, mutation, ("$operation", operation.Id.ToString("D")),
-            ("$account", oldAccount.ToString("D")), ("$now", Now.ToString("O")));
+            ("$account", mutationAccount.ToString("D")), ("$now", Now.ToString("O")));
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var state = await store.LoadAsync(batch);
 
