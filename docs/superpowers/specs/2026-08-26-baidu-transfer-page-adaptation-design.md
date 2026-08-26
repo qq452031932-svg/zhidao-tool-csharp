@@ -57,13 +57,13 @@
 
 目标目录由用户在软件界面提前选择并保存为规范化网盘绝对路径。目录准备与最终转存分开执行，避免新目录没有提交前 baseline。
 
-`EnsureDirectory` 阶段打开保存弹窗，从已验证的起始目录 exact ID 开始逐级处理路径片段：
+`EnsureDirectory` 阶段打开保存弹窗，并绑定 `(start exact ID, start canonical absolute path, target canonical absolute path)`。只有 start path 是 target path 在完整目录段边界上的前缀时，才处理剩余 suffix；否则先安全回到已验证的网盘根目录，无法证明根目录身份时返回 `NotValidated`。每进入一级都重新核对 exact ancestor ID chain 与 breadcrumb，不能仅比较最后一个目录名。
 
 1. 对当前层完成全量遍历，证明 total/end-marker、无 gap/cycle、全局 ID 唯一并稳定；只看当前 viewport 不算完整。
 2. 若恰好一个文件夹与当前片段精确匹配，进入该文件夹。
 3. 若不存在，先持久化 `parent exact ID + 规范目录段 + mutation intent + generation`，再获取 mutation permit，点击唯一“新建文件夹”、输入当前片段并确认创建。
 4. 点击后若响应丢失、进程中断或租约过期，将该段标记为 `OutcomeUnknown`，禁止自动重发；恢复时只能只读完整枚举原 parent。只有账号、parent、路径均匹配且恰好一个 exact child 时才能确认，否则要求人工处理。新 generation 也必须先恢复核对，不能盲目再次创建。
-5. 创建成功后持久化 confirmed child exact ID，再进入该目录。若出现多个候选、同名歧义、服务端改名、同名非文件夹、非法名称、路径超限或结果无法确认，立即停止，并向用户显示已经成功创建的部分路径。
+5. 创建后重新完整扫描同一 parent，重新证明 total/end-marker、远端 UID、parent exact ID、ancestor chain 和 canonical path，并要求服务端返回的精确名称匹配、`kind=folder`、恰好一个 stable child exact ID。只有这些全部成立才持久化 `Confirmed` child ID 并进入；否则记录 `OutcomeUnknown`。若出现多个候选、同名歧义、服务端改名、同名非文件夹、非法名称、路径超限或结果无法确认，立即停止，并向用户显示已经成功创建的部分路径。
 6. 到达完整目标路径后，精确复核面包屑/路径、target exact ID 和远端百度 UID，然后点击“取消”关闭弹窗，不点击最终“确定”。取消必须经过现场验证；若无法证明取消不会转存，则缺失目录场景保持 `NotValidated`。
 
 创建目录的每一步都是网页写操作，必须获取当前 operation 的 mutation permit。授权过期或被释放后，旧会话不能再修改页面。
@@ -91,6 +91,12 @@
 
 这些精确 destination IDs 会传给后续自动分享，保证分享的是实际保存的文件或文件夹。
 
+### 7. 只读恢复
+
+替换现有恢复时重新打开外链并输入提取码的做法。提交前已经持久化完整 source IDs、source generation token、target exact ID、目标 baseline 和 durable submission descriptor；提交时若获得官方 request/result mapping，也立即持久化。
+
+恢复流程使用独立的 typed read-only contract，只打开已知 target exact ID，完整遍历当前目录，并使用持久化 source IDs、baseline 与 official mapping 判断结果。它绝不重新打开受提取码保护的 source、绝不填写提取码、绝不点击任何 source-page 控件，也不获取 candidate write permit。恢复读取由 durable pending operation、AccountId 和稳定百度 UID 共同授权；UID 不匹配立即停止。这样临时 candidate 可以形成真实恢复证据，而不把临时写租约扩展到 recovery。
+
 ## 账号绑定
 
 本地 `AccountId` 不能靠头像或显示名映射。candidate session payload 必须携带 `AccountSession.BaiduUserId`（或已验证的等价稳定远端 UID）。每次导航、每次弹窗重开、每次 observe 以及每次 mutation 的同一 JavaScript turn 都必须读取并精确复核该 UID；UID 缺失、变化或出现切号状态时立即撤销 binding，保持零 mutation。
@@ -102,15 +108,29 @@
 - 扩展 candidate command/payload，支持提取码输入、提取按钮、资源保存、目录进入、新建目录和最终确认；所有 `ToString` 与诊断均脱敏。
 - 将 DOM 查询封装为固定内置脚本。调用者只能传 typed 参数，不能传任意脚本或定位器。
 - 扩展 `ITransferAutomationSession` typed contract，使 source listing 携带完整 `RemoteItemIdentitySet`、完整性证据与 generation token；`WebView2AutomationSession` 把新命令翻译为 listing、baseline、official acceptance 与确认结果。
+- 新增只读 transfer recovery contract，并修改 `TransferAutomationFlow.ConfirmExactAsync`：只读取 target current listing 和持久化证据，不再调用 `OpenExternalShareAsync` 或 `EnterExtractionCodeAsync`。
 - 为目录创建增加可恢复的逐段持久化记录，保存 parent/child exact ID、规范段名、generation、intent 和 `Confirmed/OutcomeUnknown`，不保存账号凭据或提取码。
 - 继续使用现有 immutable binding、阶段白名单和 mutation permit；不放宽导航域名、正式能力记录或恢复规则。
+
+## Candidate action 与阶段白名单
+
+所有输入、选择和点击型 DOM mutation 都必须逐次取得当前 immutable binding 的 mutation permit；同一会话中的前一次 permit 不能复用。
+
+| 阶段 | 允许的 candidate mutation | 明确禁止 |
+| --- | --- | --- |
+| `EnsureDirectory` | `SetExtractionCode`、`SubmitExtraction`、`OpenDestinationPicker`、`EnterDirectory`、`CreateDirectory`、`ConfirmDirectoryCreation`、`CancelDestinationPicker` | 最终 `ClickConfirmTransfer` |
+| `PrepareTransfer` | 无；仅官方导航、完整枚举和 baseline 持久化 | 输入、选择、创建、最终确认 |
+| `SubmitTransfer` | `SetExtractionCode`、`SubmitExtraction`、`SelectExactItems`、`OpenDestinationPicker`、`EnterDirectory`、最终 `ClickConfirmTransfer` | `CreateDirectory`、重复最终确认 |
+| `Recovery` | 无；仅目标目录只读完整枚举 | 任何 input/click、打开或解锁 source、任何重提交流程 |
+
+列表滚动属于固定脚本内的只读枚举过程，不得触发网络写操作或点击资源动作。阶段白名单、action/payload 或页面语义变化都要求提升 candidate selector/protocol 版本。
 
 ## 失败与安全规则
 
 - 页面状态与 trusted root 必须唯一；任何冲突都返回 `NotValidated`。
 - Mutation 脚本必须在同一次 JavaScript 执行中重新获取节点，并核对 URL、远端 UID、状态、祖先链、角色、可见/启用/connected/topmost、控件数量、资源集合和观察指纹，再做一次逻辑动作。
 - durable boundary 前的转存失败是 `DefinitelyNotAccepted`；目录创建已发生但结果未知时单独记录 `OutcomeUnknown`，不能笼统当成无副作用；boundary 后无法确认是 `ResultPending`。
-- 不读取或记录 Cookie、请求头、账号凭据、完整 DOM、完整分享链接或提取码。
+- 不读取或记录 Cookie、请求头、账号凭据、完整 DOM、完整分享链接或提取码。提取码可以短暂存在于进程内 typed payload 和发往当前官方页面的内存 script 参数中，但不得持久化，也不得出现在针对 script args/response 的 telemetry、日志、异常输出或截图。
 - 不使用开放平台 API、XHR/fetch、远程调试端口、外部脚本或百度客户端自动拉起协议。
 - 广告按钮、客户端下载、顶部导航等不属于目标容器的同名文字不得成为候选。
 
@@ -119,16 +139,19 @@
 ### 自动化测试
 
 - 三种页面状态和 trusted root 的唯一识别，以及 0 个/多个候选拒绝；覆盖同名广告、隐藏副本、遮罩、stale node 和未验收 shadow root。
-- 提取码不出现在 observation token/hash、script args/response telemetry、日志、异常 `Data`、`ToString`、截图或快照中；覆盖 serializer、host 和 dispatcher 抛错路径，测试只使用假码。
+- 提取码不出现在 observation token/hash、针对 script args/response 的 telemetry、日志、异常 `Data`、`ToString`、截图或快照中；内存 typed payload 不持久化，覆盖 serializer、host 和 dispatcher 抛错路径，测试只使用假码。
 - 资源列表未完成、不稳定、重复 ID、无稳定 ID、集合变化时零 mutation。
 - 虚拟滚动/分页覆盖同名目录位于未渲染页、懒加载插入/重排、cursor cycle/gap、total 变化和全局重复 ID。
 - 目录已存在、非根目录起点、逐级进入、缺失一级自动创建、多级缺失依次创建。
+- 非根起点只有在 segment-boundary 前缀成立时处理 suffix；错误前缀必须安全回根或 `NotValidated`，每级 ancestor exact ID chain 必须匹配。
 - 新建结果缺失/重复/服务端改名、Unicode/空白、同名非文件夹、路径变化、账号变化和弹窗关闭时停止。
 - 并发创建同名目录、部分创建后 crash/lease expiry/restart：只读恢复，不重复创建，并报告已创建部分。
 - 每个写动作前必须有 mutation permit；过期、释放、跨账号/操作/代次均零 mutation。
 - observe→mutate 间切换远端 UID 必须零 mutation并撤销 binding。
 - Prepare 证明完整 baseline；Submit 不创建目录，durable boundary 后只允许一次最终确认。
 - 提交响应丢失保持 `ResultPending`，恢复只读且永不再次提交。
+- 带提取码的 temporary candidate 在 recovery 中只读取 target，source-page mutation 数为 0，且不需要 recovery write lease。
+- 对阶段白名单逐项测试；`CreateDirectory` 只能 Ensure，`ClickConfirmTransfer` 只能 Submit，Recovery 的所有 mutation 均拒绝。
 - 一个文件、一个文件夹和多个顶层资源均持久化完整 source IDs，并验证官方 source→destination 映射。
 
 ### 现场验收
