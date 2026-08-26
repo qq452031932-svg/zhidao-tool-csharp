@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.App.Features.Acceptance;
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Threading;
@@ -101,4 +102,13 @@ public sealed class UnavailableAdapterAvailability : IAdapterAvailability
 {
     public bool CanStartTransfers => false;
     public string StatusMessage => "百度转存功能尚不可用，当前版本不能开始任务。";
+}
+
+internal sealed class TemporaryAcceptanceAdapterAvailability(
+    AcceptanceWriteLeaseOptions options) : IAdapterAvailability
+{
+    public bool CanStartTransfers => options.IsEnabled;
+    public string StatusMessage => CanStartTransfers
+        ? "百度转存现场验收模式已启用，每项实际操作仍需单独确认。"
+        : "百度转存功能尚不可用，当前版本不能开始任务。";
 }

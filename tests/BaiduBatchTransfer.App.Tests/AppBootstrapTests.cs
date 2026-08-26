@@ -124,7 +124,7 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
-    public void ExplicitAcceptanceSwitchIsPassedOnlyToTheInMemoryWriteLeaseCoordinator()
+    public void ExplicitAcceptanceSwitchUsesTheCompileTimeDebugGate()
     {
         using var host = AppBootstrap.CreateHost(
             root,
@@ -137,6 +137,65 @@ public sealed class AppBootstrapTests : IDisposable
 #else
         Assert.False(options.IsEnabled);
 #endif
+    }
+
+    [Fact]
+    public async Task ExactDebugAcceptanceSwitchOpensOnlyTransferCreationWhileWriteLeaseAndResultActionsStayGated()
+    {
+        var capabilityStore = new RecordingAdapterCapabilityStore();
+        var presenter = new RecordingAcceptancePresenter(confirmed: false);
+        using var host = AppBootstrap.CreateHost(
+            root,
+            [AcceptanceWriteLeaseOptions.Switch],
+            services =>
+            {
+                services.RemoveAll<IAdapterCapabilityStore>();
+                services.AddSingleton<IAdapterCapabilityStore>(capabilityStore);
+                services.RemoveAll<IAcceptanceWriteLeasePresenter>();
+                services.AddSingleton<IAcceptanceWriteLeasePresenter>(presenter);
+            });
+
+        var availability = host.Services.GetRequiredService<IAdapterAvailability>();
+        var resultCapabilities = host.Services.GetRequiredService<IJobResultCapabilityAvailability>();
+        var resultActionCapability = host.Services.GetRequiredService<IJobResultActionCapability>();
+
+#if DEBUG
+        Assert.True(availability.CanStartTransfers);
+#else
+        Assert.False(availability.CanStartTransfers);
+#endif
+        Assert.False(resultCapabilities.CanUseTransferActions);
+        Assert.False(resultCapabilities.CanUseShareActions);
+        Assert.False(resultActionCapability.CanUseTransferActions);
+        Assert.False(resultActionCapability.CanUseShareActions);
+        Assert.Empty(capabilityStore.Accepted);
+
+        var request = new AdapterWriteAuthorizationRequest(
+            new AdapterCapabilityVersion("BaiduTransfer", "p1", "s1", "b1"),
+            Guid.NewGuid(), Guid.NewGuid(), 1, Guid.NewGuid(),
+            AdapterWriteAction.EnsureDirectory);
+        var binding = await host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>()
+            .TryCreateBindingAsync(request);
+
+        Assert.Null(binding);
+#if DEBUG
+        Assert.Equal(1, presenter.PresentCount);
+#else
+        Assert.Equal(0, presenter.PresentCount);
+#endif
+        Assert.Equal(0, presenter.EnableCount);
+        Assert.Empty(capabilityStore.Accepted);
+    }
+
+    [Theory]
+    [InlineData("--webview-acceptance ")]
+    [InlineData("--WEBVIEW-ACCEPTANCE")]
+    [InlineData("--webview-acceptance=true")]
+    public void NearMissAcceptanceSwitchKeepsTransfersUnavailable(string argument)
+    {
+        using var host = AppBootstrap.CreateHost(root, [argument]);
+
+        Assert.False(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
     }
 
     [Fact]
@@ -766,6 +825,26 @@ public sealed class AppBootstrapTests : IDisposable
             EnableCount++;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class RecordingAdapterCapabilityStore : IAdapterCapabilityStore
+    {
+        public List<AdapterCapabilityAcceptanceRecord> Accepted { get; } = [];
+
+        public Task AcceptAsync(
+            AdapterCapabilityAcceptanceRecord acceptance,
+            CancellationToken cancellationToken = default)
+        {
+            Accepted.Add(acceptance);
+            return Task.CompletedTask;
+        }
+
+        public Task<AdapterCapabilityAcceptanceRecord?> GetAsync(
+            string adapterKind,
+            string protocolVersion,
+            string selectorVersion,
+            string adapterBuildVersion,
+            CancellationToken cancellationToken = default) => Task.FromResult<AdapterCapabilityAcceptanceRecord?>(null);
     }
 
     private sealed class RecordingWriteAuthorizationGate : IAdapterWriteAuthorizationGate

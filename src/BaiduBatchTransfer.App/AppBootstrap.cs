@@ -325,8 +325,14 @@ public static class AppBootstrap
         services.AddSingleton<IAccountManagementWindowPresenter, AccountManagementWindowPresenter>();
         services.AddSingleton<IAccountManagementLauncher, AccountManagementLauncher>();
 
-        // 真人扫码仅开放账号登录；实际转存方法尚未逐项通过现场门禁，继续禁止开始任务。
-        services.AddSingleton<IAdapterAvailability, UnavailableAdapterAvailability>();
+        // 普通版本继续禁止开始任务；Debug 显式现场验收仍由逐操作写入租约二次门禁。
+        services.AddSingleton<IAdapterAvailability>(sp =>
+        {
+            var options = sp.GetRequiredService<AcceptanceWriteLeaseOptions>();
+            return options.IsEnabled
+                ? new TemporaryAcceptanceAdapterAvailability(options)
+                : new UnavailableAdapterAvailability();
+        });
         services.AddSingleton<IJobResultCapabilityAvailability, UnavailableJobResultCapabilityAvailability>();
         services.AddSingleton<IJobResultActionCapability, UnavailableJobResultActionCapability>();
         services.AddSingleton<IAsyncDelay>(_ => new TimeProviderDelay(TimeProvider.System));
