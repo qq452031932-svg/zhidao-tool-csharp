@@ -23,6 +23,21 @@ public sealed class BrowserInstallationIdentity
         Publisher = RequireText(publisher, nameof(publisher));
         ProductName = RequireText(productName, nameof(productName));
         FileIdentity = RequireText(fileIdentity, nameof(fileIdentity));
+
+        var executableName = Path.GetFileName(ExecutablePath);
+        var expectedExecutableName = browserFamily == BrowserFamily.Chrome ? "chrome.exe" : "msedge.exe";
+        var expectedPublisher = browserFamily == BrowserFamily.Chrome ? "Google LLC" : "Microsoft Corporation";
+        var expectedProduct = browserFamily == BrowserFamily.Chrome ? "Google Chrome" : "Microsoft Edge";
+        if (!string.Equals(executableName, expectedExecutableName, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Publisher, expectedPublisher, StringComparison.Ordinal) ||
+            !string.Equals(ProductName, expectedProduct, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("The browser installation identity does not match its family.");
+        }
+
+        var executableParent = Path.GetDirectoryName(ExecutablePath);
+        if (!string.Equals(executableParent, InstallationDirectory, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("The browser executable must be directly inside its installation directory.", nameof(executablePath));
     }
 
     public Guid InstallationId { get; }
@@ -47,15 +62,16 @@ public sealed class BrowserInstallationIdentity
     private static string RequireText(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
-        if (value.Any(char.IsControl))
-            throw new ArgumentException("The value cannot contain control characters.", parameterName);
-        return value.Trim();
+        var trimmed = value.Trim();
+        if (trimmed.Length > 256 || trimmed.Any(char.IsControl))
+            throw new ArgumentException("The identity value is invalid or too long.", parameterName);
+        return trimmed;
     }
 
     private static string RequireCanonicalAbsolutePath(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
-        if (value != value.Trim() || value.Any(char.IsControl))
+        if (value != value.Trim() || value.Any(char.IsControl) || Path.EndsInDirectorySeparator(value))
             throw new ArgumentException("A canonical absolute path is required.", parameterName);
         if (!Path.IsPathFullyQualified(value))
             throw new ArgumentException("A canonical absolute path is required.", parameterName);

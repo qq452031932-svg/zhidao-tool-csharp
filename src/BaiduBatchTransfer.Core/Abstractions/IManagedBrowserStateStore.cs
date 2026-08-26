@@ -4,7 +4,7 @@ namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IManagedBrowserStateStore
 {
-    Task SaveInstallationAsync(
+    Task<BrowserInstallationIdentity> CreateInstallationAsync(
         BrowserInstallationIdentity installation,
         CancellationToken cancellationToken);
 
@@ -12,11 +12,17 @@ public interface IManagedBrowserStateStore
         Guid installationId,
         CancellationToken cancellationToken);
 
-    Task ActivateInstallationAsync(Guid installationId, CancellationToken cancellationToken);
+    Task<BrowserInstallationIdentity?> LoadActiveInstallationAsync(CancellationToken cancellationToken);
 
-    Task RetireInstallationAsync(Guid installationId, CancellationToken cancellationToken);
+    Task<ManagedBrowserTransitionResult> TryActivateInstallationAsync(
+        ManagedBrowserTransitionRequest request,
+        CancellationToken cancellationToken);
 
-    Task SaveSessionAsync(
+    Task<ManagedBrowserTransitionResult> TryRetireInstallationAsync(
+        ManagedBrowserTransitionRequest request,
+        CancellationToken cancellationToken);
+
+    Task<ManagedBrowserSessionReference> CreateSessionAsync(
         ManagedBrowserSessionReference session,
         CancellationToken cancellationToken);
 
@@ -24,9 +30,29 @@ public interface IManagedBrowserStateStore
         Guid sessionId,
         CancellationToken cancellationToken);
 
-    Task ActivateSessionAsync(Guid sessionId, CancellationToken cancellationToken);
+    Task<ManagedBrowserSessionReference?> LoadActiveSessionAsync(
+        Guid accountId,
+        BrowserFamily browserFamily,
+        CancellationToken cancellationToken);
 
-    Task RetireSessionAsync(Guid sessionId, CancellationToken cancellationToken);
+    Task<ManagedBrowserTransitionResult> TryActivateSessionAsync(
+        ManagedBrowserTransitionRequest request,
+        CancellationToken cancellationToken);
 
-    Task RetainAsync(Guid installationId, Guid sessionId, CancellationToken cancellationToken);
+    Task<ManagedBrowserTransitionResult> TryRetireSessionAsync(
+        ManagedBrowserTransitionRequest request,
+        CancellationToken cancellationToken);
+
+    Task AddRetentionAsync(
+        ManagedBrowserRetentionReference reference,
+        CancellationToken cancellationToken);
+
+    Task ReleaseRetentionAsync(
+        ManagedBrowserRetentionReference reference,
+        CancellationToken cancellationToken);
+
+    Task<bool> IsRetirementEligibleAsync(
+        Guid installationId,
+        Guid sessionId,
+        CancellationToken cancellationToken);
 }
