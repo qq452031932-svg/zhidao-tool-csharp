@@ -1174,6 +1174,77 @@ public sealed class SqliteSchedulingStoreTests
     }
 
     [Fact]
+    public async Task NotValidatedCandidateDiagnosticIsPersistedByMarkFailed()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        await db.SeedAsync(
+            [Account(account, 0)],
+            job: Job(batch, "SuccessTarget", "Active", 1),
+            resources: [Resource(batch, 1, null)],
+            allocations: [Allocation(batch, account, 1, 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var operation = await store.TryReserveNextAsync(batch, Now, Now.AddMinutes(5));
+        Assert.NotNull(operation);
+        var safeMessage = BaiduAdapterResult.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null,
+            safeDiagnosticCode: BaiduCandidateDiagnosticCode.TrustedRootMissing).SafeMessage!;
+
+        await store.MarkFailedAsync(
+            operation.OperationId,
+            BaiduErrorKind.NotValidated.ToString(),
+            safeMessage,
+            globallyInvalid: false,
+            Now.AddSeconds(1));
+
+        Assert.Equal("Failed", await ScalarStringAsync(db, "SELECT Status FROM TransferOperations"));
+        Assert.Equal("NotValidated", await ScalarStringAsync(db, "SELECT LastErrorCode FROM TransferOperations"));
+        Assert.Equal(safeMessage, await ScalarStringAsync(db, "SELECT LastErrorMessage FROM TransferOperations"));
+    }
+
+    [Fact]
+    public async Task NotValidatedCandidateDiagnosticRejectsArbitraryAppendedText()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var safeMessage = BaiduAdapterResult.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null,
+            safeDiagnosticCode: BaiduCandidateDiagnosticCode.TrustedRootMissing).SafeMessage!;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => store.MarkFailedAsync(
+            Guid.NewGuid(), "NotValidated", $"{safeMessage} extra", false, Now));
+    }
+
+    [Fact]
+    public async Task NotValidatedCandidateDiagnosticRejectsUndefinedCode()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var safeMessage = BaiduAdapterResult.Failure(
+            BaiduErrorKind.NotValidated,
+            adapterDiagnostic: null).SafeMessage!;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => store.MarkFailedAsync(
+            Guid.NewGuid(), "NotValidated", $"{safeMessage} [DefinitelyNotDefined]", false, Now));
+    }
+
+    [Fact]
+    public async Task NonNotValidatedFailureRejectsCandidateDiagnostic()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var safeMessage = BaiduAdapterResult.Failure(
+            BaiduErrorKind.InvalidTargetPath,
+            adapterDiagnostic: null).SafeMessage!;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => store.MarkFailedAsync(
+            Guid.NewGuid(), "InvalidTargetPath", $"{safeMessage} [TrustedRootMissing]", false, Now));
+    }
+
+    [Fact]
     public async Task BatchStatusChangeInvalidatesReassignmentPreviewVersion()
     {
         await using var db = await BatchTestDatabase.CreateAsync();

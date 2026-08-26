@@ -1975,6 +1975,20 @@ public sealed class SqliteTransferSchedulingStore :
     {
         var allowed = Enum.GetNames<BaiduErrorKind>().Append("DailyLimit").Append("UserInterventionRequired").ToHashSet(StringComparer.Ordinal);
         if (!allowed.Contains(code)) throw new ArgumentException("The scheduler error code is not allowlisted.", nameof(code));
+        if (code == nameof(BaiduErrorKind.NotValidated))
+        {
+            var isCanonicalCandidateMessage = Enum.GetValues<BaiduCandidateDiagnosticCode>()
+                .Any(diagnosticCode => string.Equals(
+                    BaiduAdapterResult.Failure(
+                        BaiduErrorKind.NotValidated,
+                        adapterDiagnostic: null,
+                        safeDiagnosticCode: diagnosticCode).SafeMessage,
+                    safeMessage,
+                    StringComparison.Ordinal));
+            if (!isCanonicalCandidateMessage)
+                throw new ArgumentException("Only canonical safe scheduler messages may be persisted.", nameof(safeMessage));
+            return;
+        }
         var expected = code switch
         {
             "DailyLimit" => "The account daily limit has been reached.",
