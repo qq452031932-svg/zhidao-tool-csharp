@@ -77,7 +77,8 @@ public sealed record VisibleWebAutomationRequest<T>
 
 public sealed record BaiduCandidateSessionBinding(
     AdapterWriteAuthorizationRequest Authorization,
-    AdapterWriteAuthorizationBinding Binding)
+    AdapterWriteAuthorizationBinding Binding,
+    string? ExpectedBaiduUserId = null)
 {
     public void Validate(
         WebAutomationRequestIdentity identity,
@@ -101,6 +102,10 @@ public sealed record BaiduCandidateSessionBinding(
         ArgumentNullException.ThrowIfNull(identity);
         ArgumentNullException.ThrowIfNull(Authorization);
         ArgumentNullException.ThrowIfNull(Binding);
+        if (ExpectedBaiduUserId is not null &&
+            (string.IsNullOrWhiteSpace(ExpectedBaiduUserId) || ExpectedBaiduUserId.Length > 512 ||
+             ExpectedBaiduUserId.Any(char.IsControl)))
+            throw new InvalidOperationException("Candidate session account identity is invalid.");
         var ownerMatches = Binding.Capability.AdapterKind switch
         {
             "BaiduTransfer" => identity.OwnerKind == WebAutomationOwnerKind.Transfer,

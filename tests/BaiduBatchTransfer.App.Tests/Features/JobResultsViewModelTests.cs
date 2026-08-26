@@ -39,6 +39,22 @@ public sealed class JobResultsViewModelTests
     }
 
     [Fact]
+    public async Task DisplaysSanitizedPersistedDirectoryPreparationStatus()
+    {
+        var message = "目录创建结果不确定；已确认创建到：/base/甲";
+        var workflow = new FakeWorkflow
+        {
+            Summary = new(1, 1, 0, 0),
+            Pages = [new([Row(1) with { TransferDetailMessage = message }], 1, null)],
+        };
+        var vm = Create(workflow);
+
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        Assert.Equal(message, Assert.Single(vm.Items).TransferDetailMessage);
+    }
+
+    [Fact]
     public async Task LatePageFromPreviousBatchDoesNotOverwriteNewBatch()
     {
         var firstBatch = Guid.NewGuid();

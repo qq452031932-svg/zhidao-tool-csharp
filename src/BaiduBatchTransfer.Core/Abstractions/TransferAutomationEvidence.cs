@@ -230,6 +230,8 @@ public sealed record TransferDirectoryMutationRecord
         ParentExactId = TransferEvidenceValidation.ExactId(parentExactId, nameof(parentExactId));
         ChildExactId = childExactId is null ? null : TransferEvidenceValidation.ExactId(childExactId, nameof(childExactId));
         CanonicalChildPath = canonicalChildPath ?? throw new ArgumentNullException(nameof(canonicalChildPath));
+        if (CanonicalChildPath.Value.Length > 2_048 || CanonicalChildPath.Value.Any(char.IsControl))
+            throw new ArgumentException("The canonical child path is invalid.", nameof(canonicalChildPath));
         ListingGenerationToken = TransferEvidenceValidation.BoundedText(
             listingGenerationToken, nameof(listingGenerationToken));
         BaiduUserId = TransferEvidenceValidation.BoundedText(baiduUserId, nameof(baiduUserId));
@@ -286,9 +288,15 @@ public sealed record TransferDirectoryPreparationOutcome
 
     public static TransferDirectoryPreparationOutcome NeedsAttention(
         RemotePath confirmedPartialPath,
-        BaiduErrorKind errorKind) =>
-        new(TransferDirectoryPreparationStatus.NeedsAttention, null,
-            confirmedPartialPath ?? throw new ArgumentNullException(nameof(confirmedPartialPath)), errorKind);
+        BaiduErrorKind errorKind)
+    {
+        ArgumentNullException.ThrowIfNull(confirmedPartialPath);
+        if (confirmedPartialPath.Value.Length > 2_048 || confirmedPartialPath.Value.Any(char.IsControl))
+            throw new ArgumentException("The confirmed partial path contains control characters.",
+                nameof(confirmedPartialPath));
+        return new(TransferDirectoryPreparationStatus.NeedsAttention, null,
+            confirmedPartialPath, errorKind);
+    }
 
     public override string ToString() =>
         $"TransferDirectoryPreparationOutcome {{ Status = {Status}, Values = [REDACTED] }}";

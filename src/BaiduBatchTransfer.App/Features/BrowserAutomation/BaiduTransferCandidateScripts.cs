@@ -111,12 +111,14 @@ public static class BaiduTransferCandidateScripts
           const canonicalPath = root.getAttribute('data-path') || null;
           const ancestorExactIds = Array.from(root.querySelectorAll('[data-ancestor-id]'))
             .map(node => node.getAttribute('data-ancestor-id')).filter(Boolean);
-          if (parentExactId !== args.expectedParentExactId || canonicalPath !== args.expectedCanonicalPath)
+          if ((args.expectedParentExactId !== null && parentExactId !== args.expectedParentExactId) ||
+              (args.expectedCanonicalPath !== null && canonicalPath !== args.expectedCanonicalPath))
             return fail('target-binding-mismatch');
           if ((parentExactId === null) !== (ancestorExactIds.length === 0) ||
               parentExactId !== null && ancestorExactIds[ancestorExactIds.length - 1] !== parentExactId)
             return fail('ancestor-chain-mismatch');
-          if (JSON.stringify(items.map(item => item.exactId)) !== JSON.stringify(args.expectedExactIds))
+          if (args.expectedExactIds.length > 0 &&
+              JSON.stringify(items.map(item => item.exactId)) !== JSON.stringify(args.expectedExactIds))
             return fail('exact-item-mismatch');
           await Promise.resolve();
           const stableGeneration = root.getAttribute('data-generation') || root.getAttribute('data-list-version');
@@ -229,16 +231,19 @@ public static class BaiduTransferCandidateScripts
           };
           const setValue = (input, value) => {
             const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (!descriptor || typeof descriptor.set !== 'function' || !(input instanceof HTMLInputElement))
+              return false;
             descriptor.set.call(input, value);
             input.dispatchEvent(new Event('input', { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
           };
           let target = null;
           switch (args.action) {
             case 'SetExtractionCode':
-              target = unique('input,[role="textbox"]', /提取码|访问码/);
+              target = unique('input', /提取码|访问码/);
               if (!target || typeof args.typedValue !== 'string') return fail('action-target-not-unique');
-              setValue(target, args.typedValue);
+              if (!setValue(target, args.typedValue)) return fail('action-target-not-unique');
               break;
             case 'SubmitExtraction':
               target = unique('button,[role="button"]', /提取文件|确认提取/);
@@ -254,15 +259,26 @@ public static class BaiduTransferCandidateScripts
               }
               break;
             case 'EnterDirectory':
-              target = rows.length === 1 ? rows[0] : null;
-              if (!target) return fail('action-target-not-unique');
-              target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); break;
+              {
+                const rowMatches = rows.filter(row =>
+                  (row.getAttribute('data-fsid') || row.getAttribute('data-file-id') ||
+                    row.getAttribute('data-id')) === args.targetExactId);
+                const ancestorMatches = Array.from(root.querySelectorAll('[data-ancestor-id]')).filter(visible)
+                  .filter(node => node.getAttribute('data-ancestor-id') === args.targetExactId);
+                target = rowMatches.length === 1 && ancestorMatches.length === 0 ? rowMatches[0] :
+                  ancestorMatches.length === 1 && rowMatches.length === 0 ? ancestorMatches[0] : null;
+                if (!target) return fail('action-target-not-unique');
+                if (ancestorMatches.length === 1) target.click();
+                else target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+              }
+              break;
             case 'CreateDirectory':
               target = unique('button,[role="button"]', /新建文件夹/);
               if (!target || typeof args.typedValue !== 'string') return fail('action-target-not-unique');
               target.click(); await Promise.resolve();
-              target = unique('input,[role="textbox"]', /文件夹名称|新建文件夹/);
-              if (!target) return fail('action-target-not-unique'); setValue(target, args.typedValue); break;
+              target = unique('input', /文件夹名称|新建文件夹/);
+              if (!target || !setValue(target, args.typedValue))
+                return fail('action-target-not-unique'); break;
             case 'ConfirmDirectoryCreation':
               target = unique('button,[role="button"]', /确定|创建/);
               if (!target) return fail('action-target-not-unique'); target.click(); break;
@@ -321,8 +337,9 @@ public static class BaiduTransferCandidateScripts
             var parent = OptionalText(root, "parentExactId", 512);
             var pathText = OptionalText(root, "canonicalPath", 2_048);
             var path = pathText is null ? null : new RemotePath(pathText);
-            if (!string.Equals(parent, request.ExpectedParentExactId, StringComparison.Ordinal) ||
-                !Equals(path, request.ExpectedCanonicalPath))
+            if (request.ExpectedParentExactId is not null &&
+                    !string.Equals(parent, request.ExpectedParentExactId, StringComparison.Ordinal) ||
+                request.ExpectedCanonicalPath is not null && !Equals(path, request.ExpectedCanonicalPath))
                 return Invalid();
             var ancestors = ReadTextArray(root.GetProperty("ancestorExactIds"), 64, 512, requireSorted: false);
             if (ancestors.Distinct(StringComparer.Ordinal).Count() != ancestors.Length) return Invalid();
@@ -332,9 +349,11 @@ public static class BaiduTransferCandidateScripts
             }
             else
             {
-                if (path is null || ancestors.IsEmpty ||
+                var pathDepth = path?.Value.Split('/', StringSplitOptions.RemoveEmptyEntries).Length ?? -1;
+                if (path is null || pathDepth == 0 && !ancestors.IsEmpty ||
+                    pathDepth > 0 && (ancestors.IsEmpty ||
                     !string.Equals(ancestors[^1], parent, StringComparison.Ordinal) ||
-                    path.Value.Split('/', StringSplitOptions.RemoveEmptyEntries).Length != ancestors.Length)
+                    pathDepth != ancestors.Length))
                     return Invalid();
             }
 
@@ -344,7 +363,7 @@ public static class BaiduTransferCandidateScripts
             var complete = root.GetProperty("complete").GetBoolean();
             var stable = root.GetProperty("stable").GetBoolean();
             if (totalCount != items.Length || !reachedEnd || !complete || !stable) return Invalid();
-            if (!items.Select(item => item.ExactId)
+            if (!request.ExpectedExactIds.IsEmpty && !items.Select(item => item.ExactId)
                     .SequenceEqual(request.ExpectedExactIds, StringComparer.Ordinal))
                 return Invalid();
             var generation = RequiredText(root, "generationToken", 512);
@@ -369,10 +388,12 @@ public static class BaiduTransferCandidateScripts
         request is not null && observation is not null &&
         observation.PageState == request.ExpectedPageState &&
         string.Equals(observation.BaiduUserId, request.ExpectedBaiduUserId, StringComparison.Ordinal) &&
-        string.Equals(observation.ParentExactId, request.ExpectedParentExactId, StringComparison.Ordinal) &&
-        Equals(observation.CanonicalPath, request.ExpectedCanonicalPath) &&
-        observation.Items.Select(item => item.ExactId)
-            .SequenceEqual(request.ExpectedExactIds, StringComparer.Ordinal) &&
+        (request.ExpectedParentExactId is null || string.Equals(
+            observation.ParentExactId, request.ExpectedParentExactId, StringComparison.Ordinal)) &&
+        (request.ExpectedCanonicalPath is null || Equals(
+            observation.CanonicalPath, request.ExpectedCanonicalPath)) &&
+        (request.ExpectedExactIds.IsEmpty || observation.Items.Select(item => item.ExactId)
+            .SequenceEqual(request.ExpectedExactIds, StringComparer.Ordinal)) &&
         observation.TotalCount == observation.Items.Length && observation.ReachedEnd &&
         observation.IsComplete && observation.IsStable &&
         !string.IsNullOrWhiteSpace(observation.GenerationToken) &&

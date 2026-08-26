@@ -99,7 +99,8 @@ public sealed record BaiduCandidateDomMutationRequest
         AdapterWriteAuthorizationBinding binding,
         BaiduAutomationAction action,
         BaiduCandidateDomReadRequest readBinding,
-        string? typedValue)
+        string? typedValue,
+        string? targetExactId = null)
     {
         Authorization = authorization ?? throw new ArgumentNullException(nameof(authorization));
         Binding = binding ?? throw new ArgumentNullException(nameof(binding));
@@ -126,6 +127,11 @@ public sealed record BaiduCandidateDomMutationRequest
         }
         Action = action;
         TypedValue = typedValue;
+        TargetExactId = targetExactId is null ? null : ValidateTarget(targetExactId);
+        if (action == BaiduAutomationAction.EnterDirectory && TargetExactId is null)
+            throw new ArgumentException("Entering a directory requires its exact target ID.", nameof(targetExactId));
+        if (action != BaiduAutomationAction.EnterDirectory && TargetExactId is not null)
+            throw new ArgumentException("This action cannot contain a target exact ID.", nameof(targetExactId));
     }
 
     public AdapterWriteAuthorizationRequest Authorization { get; }
@@ -133,9 +139,18 @@ public sealed record BaiduCandidateDomMutationRequest
     public BaiduAutomationAction Action { get; }
     public BaiduCandidateDomReadRequest ReadBinding { get; }
     public string? TypedValue { get; }
+    public string? TargetExactId { get; }
 
     public override string ToString() =>
         $"BaiduCandidateDomMutationRequest {{ Action = {Action}, Authorization = [REDACTED], Binding = [REDACTED], ReadBinding = [REDACTED], TypedValue = [REDACTED] }}";
+
+    private static string ValidateTarget(string value)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value);
+        if (value.Length > 512 || value.Any(char.IsControl))
+            throw new ArgumentException("The exact target ID is invalid.", nameof(value));
+        return value.Trim();
+    }
 }
 
 public enum BaiduCandidateBuiltInScript

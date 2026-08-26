@@ -77,6 +77,47 @@ public sealed class OperationExecutorTests
     }
 
     [Fact]
+    public async Task UnknownDirectoryCreationStopsBeforeSubmissionAndPersistsConfirmedPartialPath()
+    {
+        var snapshot = Snapshot(createFolderName: "乙") with { BatchId = Guid.NewGuid() };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new OperationBoundRecordingAdapter
+        {
+            DirectoryOutcome = TransferDirectoryPreparationOutcome.NeedsAttention(
+                new RemotePath("/base/甲"), BaiduErrorKind.UnknownResponse),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.True(store.ResultPending);
+        Assert.Equal("DirectoryCreationOutcomeUnknown", store.FailureCode);
+        Assert.Equal("目录创建结果不确定；已确认创建到：/base/甲", store.FailureMessage);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, store.PendingAcceptance);
+        Assert.Equal(0, adapter.PrepareCalls);
+        Assert.Equal(0, adapter.SaveCalls);
+        Assert.DoesNotContain(store.Events, item => item.Name == "Boundary");
+    }
+
+    [Fact]
+    public async Task DirectoryPageNotValidatedFailsWithoutClaimingAnUnknownWrite()
+    {
+        var snapshot = Snapshot(createFolderName: "乙") with { BatchId = Guid.NewGuid() };
+        var store = new RecordingExecutionStore(snapshot);
+        var adapter = new OperationBoundRecordingAdapter
+        {
+            DirectoryOutcome = TransferDirectoryPreparationOutcome.NeedsAttention(
+                new RemotePath("/"), BaiduErrorKind.NotValidated),
+        };
+
+        await Executor(store, adapter).ExecuteAsync(snapshot.OperationId);
+
+        Assert.False(store.ResultPending);
+        Assert.Equal("NotValidated", store.FailureCode);
+        Assert.Equal(0, adapter.PrepareCalls);
+        Assert.Equal(0, adapter.SaveCalls);
+    }
+
+    [Fact]
     public async Task TransientDirectoryFailureUsesThreeRetriesAndControlledDelays()
     {
         var snapshot = Snapshot(createFolderName: null);
@@ -738,6 +779,23 @@ public sealed class OperationExecutorTests
         public TransferOperationAutomationContext? Context { get; private set; }
         public Exception? PrepareException { get; init; }
         public int PrepareCalls { get; private set; }
+        public TransferDirectoryPreparationOutcome? DirectoryOutcome { get; init; }
+
+        public async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
+            TransferOperationAutomationContext context,
+            AccountSession session,
+            RemotePath path,
+            CancellationToken cancellationToken)
+        {
+            if (DirectoryOutcome is not null)
+                return BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(DirectoryOutcome);
+            var legacy = await EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
+            return legacy.IsSuccess
+                ? BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                    TransferDirectoryPreparationOutcome.Prepared(legacy.Value!))
+                : BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Failure(
+                    legacy.ErrorKind!.Value, null, legacy.RetryAfter, legacy.SubmissionAcceptance);
+        }
 
         public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
             TransferOperationAutomationContext context,

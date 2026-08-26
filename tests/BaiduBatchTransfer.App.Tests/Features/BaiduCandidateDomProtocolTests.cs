@@ -70,7 +70,8 @@ public sealed class BaiduCandidateDomProtocolTests
             ["private-item"], "private-parent", new RemotePath("/private-target"));
 
         var mutation = new BaiduCandidateDomMutationRequest(
-            legacy.Authorization, legacy.Binding, action, read, typedValue);
+            legacy.Authorization, legacy.Binding, action, read, typedValue,
+            action == BaiduAutomationAction.EnterDirectory ? "private-item" : null);
 
         var text = mutation.ToString();
         Assert.DoesNotContain("private", text, StringComparison.OrdinalIgnoreCase);
@@ -461,7 +462,7 @@ public sealed class BaiduCandidateDomProtocolTests
         Assert.True(coordinator.TryCreateLease(ensure, new(true, true, true)));
         var destination = Assert.IsType<RemoteDirectory>((await wrapped
             .EnsureDirectoryForOperationAsync(
-                context, session, new RemotePath("/target"), CancellationToken.None)).Value);
+                context, session, new RemotePath("/target"), CancellationToken.None)).Value!.Directory);
         Assert.True((await wrapped.PrepareWholeShareForOperationAsync(
             context, session, share, destination, DuplicatePolicy.Skip, CancellationToken.None)).IsSuccess);
         var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
@@ -878,11 +879,11 @@ public sealed class BaiduCandidateDomProtocolTests
     {
         public TransferOperationAutomationContext? PreparedContext { get; private set; }
 
-        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+        public Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
             TransferOperationAutomationContext context, AccountSession session, RemotePath path,
             CancellationToken cancellationToken) =>
-            Task.FromResult(BaiduAdapterResult<RemoteDirectory>.Success(
-                new RemoteDirectory("target", path)));
+            Task.FromResult(BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                TransferDirectoryPreparationOutcome.Prepared(new RemoteDirectory("target", path))));
 
         public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
             TransferOperationAutomationContext context, AccountSession session, ShareReference share,

@@ -221,7 +221,7 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
     private readonly TimeProvider transferTimeProvider = timeProvider ?? TimeProvider.System;
     private readonly ConcurrentDictionary<TransferBindingKey, AdapterWriteAuthorizationBinding> bindings = [];
 
-    public async Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+    public async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         RemotePath path,
@@ -234,9 +234,9 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
                 cancellationToken).ConfigureAwait(false);
         await PruneExpiredBindingsAsync().ConfigureAwait(false);
         context.Validate();
-        if (session.LocalAccountId != context.AccountId) return NotValidated<RemoteDirectory>();
+        if (session.LocalAccountId != context.AccountId) return NotValidated<TransferDirectoryPreparationOutcome>();
         var key = TransferBindingKey.From(context);
-        if (bindings.ContainsKey(key)) return NotValidated<RemoteDirectory>();
+        if (bindings.ContainsKey(key)) return NotValidated<TransferDirectoryPreparationOutcome>();
         return await RunAsync(
             session,
             async token =>
@@ -248,14 +248,15 @@ public sealed class CoordinatedOperationBoundBaiduNetdiskAdapter(
                 {
                     if (binding is not null)
                         await transferWriteGate.ReleaseBindingAsync(binding, CancellationToken.None).ConfigureAwait(false);
-                    return NotValidated<RemoteDirectory>();
+                    return NotValidated<TransferDirectoryPreparationOutcome>();
                 }
                 var keep = false;
                 try
                 {
                     var result = await inner.EnsureDirectoryForOperationAsync(
                         context with { AuthorizationBinding = binding }, session, path, token).ConfigureAwait(false);
-                    keep = result.IsSuccess;
+                    keep = result is { IsSuccess: true,
+                        Value.Status: TransferDirectoryPreparationStatus.Prepared };
                     return result;
                 }
                 finally

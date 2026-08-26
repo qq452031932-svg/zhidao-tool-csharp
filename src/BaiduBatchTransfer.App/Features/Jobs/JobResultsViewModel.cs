@@ -460,6 +460,7 @@ public sealed class JobResultsViewModel : ObservableObject
             {
                 TransferStatusText = SafeStatus(item.TransferStatusText),
                 ShareStatusText = SafeStatus(item.ShareStatusText),
+                TransferDetailMessage = SafeDetail(item.TransferDetailMessage),
             });
         }
         TotalCount = page.TotalCount;
@@ -473,6 +474,13 @@ public sealed class JobResultsViewModel : ObservableObject
         return status.Any(character => character is >= '\u3400' and <= '\u9fff')
             ? status
             : "状态未知";
+    }
+
+    private static string? SafeDetail(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var trimmed = value.Trim();
+        return trimmed.Length <= 1_024 && !trimmed.Any(char.IsControl) ? trimmed : null;
     }
 
     private void CancelSave() => saveCancellation?.Cancel();

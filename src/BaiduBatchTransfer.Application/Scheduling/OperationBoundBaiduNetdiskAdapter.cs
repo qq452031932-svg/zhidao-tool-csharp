@@ -35,12 +35,20 @@ public sealed record TransferPreparationReceipt
 
 public interface IOperationBoundBaiduNetdiskAdapter : IBaiduNetdiskAdapter
 {
-    Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+    async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         RemotePath path,
-        CancellationToken cancellationToken) =>
-        EnsureDirectoryAsync(session, path, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var result = await EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
+        return result.IsSuccess
+            ? BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                TransferDirectoryPreparationOutcome.Prepared(result.Value!),
+                result.SubmissionAcceptance)
+            : BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Failure(
+                result.ErrorKind!.Value, null, result.RetryAfter, result.SubmissionAcceptance);
+    }
 
     Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
         TransferOperationAutomationContext context,

@@ -20,7 +20,8 @@ public sealed record JobResultRow(
     bool CanResumeShare = false,
     int TransferAttemptCount = 0,
     string TransferStatus = "",
-    bool CanSafelyRetryTransfer = false);
+    bool CanSafelyRetryTransfer = false,
+    string? TransferDetailMessage = null);
 
 public sealed record JobResultsPage(
     IReadOnlyList<JobResultRow> Items,

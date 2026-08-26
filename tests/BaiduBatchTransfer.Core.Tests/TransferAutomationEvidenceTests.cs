@@ -94,6 +94,15 @@ public sealed class TransferAutomationEvidenceTests
     }
 
     [Fact]
+    public void PartialOutcomeRejectsControlCharactersBeforeUserFacingPersistence()
+    {
+        var path = new RemotePath("/confirmed\nforged-status");
+
+        Assert.Throws<ArgumentException>(() =>
+            TransferDirectoryPreparationOutcome.NeedsAttention(path, BaiduErrorKind.UnknownResponse));
+    }
+
+    [Fact]
     public void DirectoryMutationBindsUidCapabilityAndOwningRevision()
     {
         var mutation = new TransferDirectoryMutationRecord(

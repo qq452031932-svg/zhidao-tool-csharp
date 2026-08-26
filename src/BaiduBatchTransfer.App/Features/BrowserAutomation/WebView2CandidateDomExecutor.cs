@@ -115,21 +115,27 @@ public sealed class WebView2CandidateDomExecutor(
                 officialUri = request.ReadBinding.OfficialUri.AbsoluteUri,
                 expectedPageState = request.ReadBinding.ExpectedPageState.ToString(),
                 expectedBaiduUserId = request.ReadBinding.ExpectedBaiduUserId,
-                expectedExactIds = request.ReadBinding.ExpectedExactIds,
-                expectedParentExactId = request.ReadBinding.ExpectedParentExactId,
-                expectedCanonicalPath = request.ReadBinding.ExpectedCanonicalPath?.Value,
+                expectedExactIds = observation.Items.Select(item => item.ExactId),
+                expectedParentExactId = observation.ParentExactId,
+                expectedCanonicalPath = observation.CanonicalPath?.Value,
                 expectedAncestorExactIds = observation.AncestorExactIds,
                 expectedTotalCount = observation.TotalCount,
                 expectedGenerationToken = observation.GenerationToken,
                 expectedObservationToken = observation.ObservationToken,
                 action = request.Action.ToString(),
                 typedValue = request.TypedValue,
+                targetExactId = request.TargetExactId,
             });
             var raw = await host.ExecuteAsync(
                 BaiduCandidateBuiltInScript.MutateTransfer, arguments, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            var exactReadBinding = new BaiduCandidateDomReadRequest(
+                request.ReadBinding.OfficialUri, request.ReadBinding.ExpectedPageState,
+                request.ReadBinding.ExpectedBaiduUserId,
+                observation.Items.Select(item => item.ExactId), observation.ParentExactId,
+                observation.CanonicalPath);
             return BaiduTransferCandidateScripts.ParseAndValidate(
-                raw, request.ReadBinding, expectedMutationCount: 1,
+                raw, exactReadBinding, expectedMutationCount: 1,
                 expectedObservationToken: observation.ObservationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

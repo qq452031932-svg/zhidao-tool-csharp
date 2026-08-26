@@ -614,7 +614,7 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
                 BaiduAutomationAction.SetExtractionCode => "1111",
                 BaiduAutomationAction.CreateDirectory => "目录",
                 _ => null,
-            });
+            }, action == BaiduAutomationAction.EnterDirectory ? "item-1" : null);
     private static LocalResultExportCompletedEvidence ExportEvidence(
         AdapterWriteAuthorizationRequest request,
         Guid? operationId = null,

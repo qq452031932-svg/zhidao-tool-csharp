@@ -101,9 +101,9 @@ public sealed class NetworkExecutionGateTests
         var ensured = await wrapped.EnsureDirectoryForOperationAsync(
             context, session, new RemotePath("/target"), CancellationToken.None);
         var prepared = await wrapped.PrepareWholeShareForOperationAsync(
-            context, session, share, ensured.Value!, DuplicatePolicy.Skip, CancellationToken.None);
+            context, session, share, ensured.Value!.Directory!, DuplicatePolicy.Skip, CancellationToken.None);
         var submitted = await wrapped.SaveWholeShareForOperationAsync(
-            context, session, share, ensured.Value!, DuplicatePolicy.Skip, CancellationToken.None);
+            context, session, share, ensured.Value!.Directory!, DuplicatePolicy.Skip, CancellationToken.None);
 
         Assert.True(ensured.IsSuccess);
         Assert.True(prepared.IsSuccess);
@@ -643,17 +643,18 @@ public sealed class NetworkExecutionGateTests
         public TransferOperationAutomationContext? PreparedContext { get; private set; }
         public TransferOperationAutomationContext? SubmitContext { get; private set; }
 
-        public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(TransferOperationAutomationContext context, AccountSession session, RemotePath path, CancellationToken cancellationToken)
+        public Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(TransferOperationAutomationContext context, AccountSession session, RemotePath path, CancellationToken cancellationToken)
         {
             DirectoryWriteCount++;
             EnsureContext = context;
             if (CancelEnsure)
-                return Task.FromCanceled<BaiduAdapterResult<RemoteDirectory>>(
+                return Task.FromCanceled<BaiduAdapterResult<TransferDirectoryPreparationOutcome>>(
                     new CancellationToken(canceled: true));
             return Task.FromResult(FailEnsure
-                ? BaiduAdapterResult<RemoteDirectory>.Failure(
+                ? BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Failure(
                     BaiduErrorKind.NotValidated, adapterDiagnostic: null)
-                : BaiduAdapterResult<RemoteDirectory>.Success(new RemoteDirectory("target", path)));
+                : BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                    TransferDirectoryPreparationOutcome.Prepared(new RemoteDirectory("target", path))));
         }
 
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(TransferOperationAutomationContext context, AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)

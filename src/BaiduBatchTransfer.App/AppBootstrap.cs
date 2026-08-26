@@ -207,6 +207,7 @@ public static class AppBootstrap
                 sp.GetRequiredService<AcceptanceWriteLeaseCoordinator>(), request));
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<TransferAutomationFlow>();
+        services.AddSingleton<ITransferRecoveryAuthorizationSource, TransferRecoveryAuthorizationSource>();
         services.AddSingleton<WebViewBaiduNetdiskAdapter>(sp => new WebViewBaiduNetdiskAdapter(
             sp.GetRequiredService<LiveBaiduNetdiskAdapter>(),
             sp.GetRequiredService<IVisibleWebAutomationBroker>(),
@@ -214,7 +215,8 @@ public static class AppBootstrap
             sp.GetRequiredService<TransferAutomationFlow>(),
             Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
-            sp.GetRequiredService<IAcceptanceOperationEvidenceSink>()));
+            sp.GetRequiredService<IAcceptanceOperationEvidenceSink>(),
+            sp.GetRequiredService<ITransferRecoveryAuthorizationSource>()));
         services.AddSingleton<IBaiduNetdiskAdapter>(sp => CoordinatedBaiduNetdiskAdapter.Wrap(
             sp.GetRequiredService<WebViewBaiduNetdiskAdapter>(),
             sp.GetRequiredService<BaiduAdapterConcurrencyGate>(),

@@ -16,10 +16,26 @@ public enum TransferRemoteItemKind
     Folder,
 }
 
-public sealed record TransferRemoteItem(
-    RemoteItemIdentity Identity,
-    TransferRemoteItemKind Kind,
-    string ExactServerName);
+public sealed record TransferRemoteItem
+{
+    public TransferRemoteItem(
+        RemoteItemIdentity identity,
+        TransferRemoteItemKind kind,
+        string exactServerName)
+    {
+        Identity = identity ?? throw new ArgumentNullException(nameof(identity));
+        if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
+        ArgumentException.ThrowIfNullOrWhiteSpace(exactServerName);
+        if (exactServerName.Length > 512 || exactServerName.Any(char.IsControl))
+            throw new ArgumentException("The exact server name is invalid.", nameof(exactServerName));
+        Kind = kind;
+        ExactServerName = exactServerName;
+    }
+
+    public RemoteItemIdentity Identity { get; }
+    public TransferRemoteItemKind Kind { get; }
+    public string ExactServerName { get; }
+}
 
 public sealed record TransferSourceListing
 {
@@ -54,11 +70,85 @@ public sealed record TransferDirectoryListing
         IsStable = isStable;
         TopLevelItems = Array.AsReadOnly(snapshot);
         ObservationFingerprint = observationFingerprint;
+        DetailedItems = Array.AsReadOnly(snapshot.Select(item => new TransferRemoteItem(
+            item, TransferRemoteItemKind.File, item.DisplayedTopLevelName)).ToArray());
+        TotalCount = snapshot.Length;
+        ReachedEnd = isComplete;
+        AncestorExactIds = Array.Empty<string>();
     }
+
+    private TransferDirectoryListing(
+        RemoteDirectory directory,
+        IReadOnlyList<string> ancestorExactIds,
+        IReadOnlyList<TransferRemoteItem> items,
+        int totalCount,
+        bool reachedEnd,
+        bool isStable,
+        string generationToken,
+        string baiduUserId,
+        string observationFingerprint)
+    {
+        ArgumentNullException.ThrowIfNull(directory);
+        ArgumentNullException.ThrowIfNull(ancestorExactIds);
+        ArgumentNullException.ThrowIfNull(items);
+        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        if (totalCount < 0 || totalCount != items.Count)
+            throw new ArgumentOutOfRangeException(nameof(totalCount));
+        var itemSnapshot = items.Select(item => item ??
+            throw new ArgumentException("Directory items cannot contain null values.", nameof(items))).ToArray();
+        if (itemSnapshot.Select(item => item.Identity.ExactId).Distinct(StringComparer.Ordinal).Count() != itemSnapshot.Length)
+            throw new ArgumentException("Directory item identities must be unique.", nameof(items));
+        var ancestorSnapshot = ancestorExactIds.Select(item =>
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(item);
+            if (item.Length > 512 || item.Any(char.IsControl))
+                throw new ArgumentException("Directory ancestor identity is invalid.", nameof(ancestorExactIds));
+            return item.Trim();
+        }).ToArray();
+        if (ancestorSnapshot.Distinct(StringComparer.Ordinal).Count() != ancestorSnapshot.Length)
+            throw new ArgumentException("Directory ancestors must be unique.", nameof(ancestorExactIds));
+        ArgumentException.ThrowIfNullOrWhiteSpace(generationToken);
+        ArgumentException.ThrowIfNullOrWhiteSpace(baiduUserId);
+        if (generationToken.Length > 512 || generationToken.Any(char.IsControl) ||
+            baiduUserId.Length > 512 || baiduUserId.Any(char.IsControl))
+            throw new ArgumentException("Directory listing identity is invalid.");
+
+        Directory = directory;
+        AncestorExactIds = Array.AsReadOnly(ancestorSnapshot);
+        DetailedItems = Array.AsReadOnly(itemSnapshot);
+        TopLevelItems = Array.AsReadOnly(itemSnapshot.Select(item => item.Identity).ToArray());
+        TotalCount = totalCount;
+        ReachedEnd = reachedEnd;
+        IsComplete = reachedEnd && totalCount == itemSnapshot.Length;
+        IsStable = isStable;
+        GenerationToken = generationToken.Trim();
+        BaiduUserId = baiduUserId.Trim();
+        ObservationFingerprint = observationFingerprint;
+    }
+
+    public static TransferDirectoryListing Exact(
+        RemoteDirectory directory,
+        IReadOnlyList<string> ancestorExactIds,
+        IReadOnlyList<TransferRemoteItem> items,
+        int totalCount,
+        bool reachedEnd,
+        bool isStable,
+        string generationToken,
+        string baiduUserId,
+        string observationFingerprint) =>
+        new(directory, ancestorExactIds, items, totalCount, reachedEnd, isStable,
+            generationToken, baiduUserId, observationFingerprint);
 
     public bool IsComplete { get; }
     public bool IsStable { get; }
     public IReadOnlyList<RemoteItemIdentity> TopLevelItems { get; }
+    public RemoteDirectory? Directory { get; }
+    public IReadOnlyList<string> AncestorExactIds { get; }
+    public IReadOnlyList<TransferRemoteItem> DetailedItems { get; }
+    public int TotalCount { get; }
+    public bool ReachedEnd { get; }
+    public string? GenerationToken { get; }
+    public string? BaiduUserId { get; }
     public string ObservationFingerprint { get; }
 
     public override string ToString() =>

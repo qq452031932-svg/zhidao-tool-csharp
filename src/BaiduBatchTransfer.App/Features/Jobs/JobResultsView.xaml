@@ -34,6 +34,7 @@
                 <DataGridTextColumn Header="标题" Binding="{Binding ResolvedTitle}" Width="2*" />
                 <DataGridTextColumn Header="账号" Binding="{Binding AccountDisplayName}" Width="*" />
                 <DataGridTextColumn Header="转存状态" Binding="{Binding TransferStatusText}" Width="120" />
+                <DataGridTextColumn Header="转存提示" Binding="{Binding TransferDetailMessage}" Width="2*" />
                 <DataGridTextColumn Header="分享状态" Binding="{Binding ShareStatusText}" Width="120" />
                 <DataGridTextColumn Header="转存错误码" Binding="{Binding TransferErrorCode}" Width="120" />
                 <DataGridTextColumn Header="分享错误码" Binding="{Binding ShareErrorCode}" Width="120" />

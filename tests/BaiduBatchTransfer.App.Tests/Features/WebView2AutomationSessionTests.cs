@@ -12,8 +12,46 @@ public sealed class WebView2AutomationSessionTests
     public void SessionImplementsTypedTransferShareAndExportContracts()
     {
         Assert.Contains(typeof(ITransferAutomationSession), typeof(WebView2AutomationSession).GetInterfaces());
+        Assert.Contains(typeof(ITransferDirectoryPreparationSession), typeof(WebView2AutomationSession).GetInterfaces());
         Assert.Contains(typeof(IShareAutomationSession), typeof(WebView2AutomationSession).GetInterfaces());
         Assert.Contains(typeof(IShareResultExportSession), typeof(WebView2AutomationSession).GetInterfaces());
+    }
+
+    [Fact]
+    public async Task DirectoryPreparationUsesSeparatePermitsForUnlockOpenCreateAndConfirm()
+    {
+        var identity = TransferIdentity();
+        var binding = TransferBinding(identity);
+        var executor = new RecordingTransferCandidateExecutor();
+        await using var session = new WebView2AutomationSession(
+            identity, binding, executor, CancellationToken.None);
+        var transfer = (ITransferDirectoryPreparationSession)session;
+        var share = new ShareReference(
+            "share", "https://pan.baidu.com/s/share?pwd=1111", "1111");
+
+        await transfer.OpenSourceAsync(share, CancellationToken.None);
+        await transfer.EnterExtractionCodeAsync("1111", CancellationToken.None);
+        var source = await transfer.ReadCompleteSourceAsync(CancellationToken.None);
+        var root = await transfer.OpenDestinationPickerAsync(CancellationToken.None);
+        await transfer.BeginCreateDirectoryAsync("目标", CancellationToken.None);
+        await transfer.ConfirmDirectoryCreationAsync(CancellationToken.None);
+        await transfer.EnterDirectoryAsync(
+            new RemoteDirectory("target", new RemotePath("/目标")), CancellationToken.None);
+
+        Assert.Equal("source-1", Assert.Single(source.ExactItems.Items).ExactId);
+        Assert.Equal("root", root.Directory!.RemoteId);
+        Assert.Equal(
+            [
+                BaiduAutomationAction.SetExtractionCode,
+                BaiduAutomationAction.SubmitExtraction,
+                BaiduAutomationAction.OpenDestinationPicker,
+                BaiduAutomationAction.CreateDirectory,
+                BaiduAutomationAction.ConfirmDirectoryCreation,
+                BaiduAutomationAction.EnterDirectory,
+            ],
+            executor.Actions);
+        Assert.All(executor.TargetIds.Take(5), target => Assert.Null(target));
+        Assert.Equal("target", executor.TargetIds[^1]);
     }
 
     [Fact]
@@ -127,6 +165,13 @@ public sealed class WebView2AutomationSessionTests
         1,
         WebAutomationOwnerKind.StandaloneShare);
 
+    private static WebAutomationRequestIdentity TransferIdentity() => new(
+        Guid.Parse("11111111-1111-1111-1111-111111111111"),
+        Guid.Parse("22222222-2222-2222-2222-222222222222"),
+        Guid.Parse("33333333-3333-3333-3333-333333333333"),
+        1,
+        WebAutomationOwnerKind.Transfer);
+
     private static BaiduCandidateSessionBinding Binding(WebAutomationRequestIdentity identity)
     {
         var capability = new AdapterCapabilityVersion(
@@ -147,6 +192,75 @@ public sealed class WebView2AutomationSessionTests
                 DateTimeOffset.UtcNow.AddMinutes(5),
                 false,
                 null));
+    }
+
+    private static BaiduCandidateSessionBinding TransferBinding(WebAutomationRequestIdentity identity)
+    {
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion, "build-1");
+        var authorization = new AdapterWriteAuthorizationRequest(
+            capability, identity.AccountId, identity.OperationId, identity.Generation,
+            identity.BatchId, AdapterWriteAction.EnsureDirectory);
+        return new(
+            authorization,
+            new AdapterWriteAuthorizationBinding(
+                AdapterWriteAuthorizationSource.ConsumedLease, capability,
+                identity.AccountId, identity.OperationId, identity.Generation,
+                identity.BatchId, DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddMinutes(5), false, null),
+            "uid-1");
+    }
+
+    private sealed class RecordingTransferCandidateExecutor :
+        IBaiduCandidateDomExecutor,
+        IBaiduTransferCandidateDomExecutor
+    {
+        public List<BaiduAutomationAction> Actions { get; } = [];
+        public List<string?> TargetIds { get; } = [];
+
+        public Task<BaiduTransferCandidateDomResult> ObserveTransferAsync(
+            BaiduCandidateDomReadRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            BaiduTransferCandidateItem[] items = request.ExpectedPageState switch
+            {
+                BaiduCandidatePageState.ExternalShare =>
+                    [new("source-1", RemoteResourceKind.File, "来源")],
+                BaiduCandidatePageState.DestinationPicker when request.ExpectedParentExactId is null =>
+                    [new("target", RemoteResourceKind.Folder, "目标")],
+                _ => [],
+            };
+            var parent = request.ExpectedPageState == BaiduCandidatePageState.DestinationPicker
+                ? request.ExpectedParentExactId ?? "root"
+                : null;
+            var path = parent is null ? null : request.ExpectedCanonicalPath ?? new RemotePath("/");
+            var ancestors = path?.Value == "/" ? [] : new[] { parent! };
+            return Task.FromResult(BaiduTransferCandidateDomResult.Success(new(
+                request.ExpectedPageState, "uid-1", parent, path, [.. ancestors], [.. items], items.Length,
+                true, true, true, "generation-1", new string('a', 64))));
+        }
+
+        public Task<BaiduTransferCandidateDomResult> MutateTransferAsync(
+            BaiduCandidateDomMutationRequest request,
+            BaiduTransferCandidateObservation observation,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Actions.Add(request.Action);
+            TargetIds.Add(request.TargetExactId);
+            return Task.FromResult(BaiduTransferCandidateDomResult.Success(observation));
+        }
+
+        public Task<BaiduCandidateDomResult> ObserveAsync(
+            BaiduCandidateDomRequest request,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task<BaiduCandidateDomResult> MutateAsync(
+            BaiduCandidateDomRequest request,
+            BaiduCandidateDomObservation observation,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class RecordingCandidateExecutor : IBaiduCandidateDomExecutor

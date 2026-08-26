@@ -204,7 +204,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 .ConfigureAwait(false);
             return;
         }
-        BaiduAdapterResult<RemoteDirectory> directoryResult;
+        BaiduAdapterResult<TransferDirectoryPreparationOutcome> directoryResult;
         try
         {
             directoryResult = await EnsureWithRetryAsync(
@@ -229,6 +229,39 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                 await FailAsync(snapshot.OperationId, error, false, attemptCount, cancellationToken).ConfigureAwait(false);
             return;
         }
+        var directoryOutcome = directoryResult.Value!;
+        if (directoryOutcome.Status == TransferDirectoryPreparationStatus.NeedsAttention)
+        {
+            var directoryError = directoryOutcome.ErrorKind ?? BaiduErrorKind.NotValidated;
+            if (directoryError != BaiduErrorKind.UnknownResponse)
+            {
+                if (directoryError is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
+                    await PauseAccountBeforeSubmissionAsync(
+                        snapshot.OperationId, directoryError, session.CapturedAtUtc, attemptCount,
+                        cancellationToken).ConfigureAwait(false);
+                else if (IsAccountPausingFailure(directoryError))
+                    await FailAndPauseAccountAsync(
+                        snapshot.OperationId, directoryError, attemptCount, cancellationToken)
+                        .ConfigureAwait(false);
+                else
+                    await FailAsync(
+                        snapshot.OperationId, directoryError, false, attemptCount, cancellationToken)
+                        .ConfigureAwait(false);
+                return;
+            }
+            var partialPath = directoryOutcome.ConfirmedPartialPath?.Value ?? "/";
+            await store.MarkResultPendingAsync(
+                snapshot.OperationId,
+                "DirectoryCreationOutcomeUnknown",
+                $"目录创建结果不确定；已确认创建到：{partialPath}",
+                SubmissionAcceptance.DefinitelyNotAccepted,
+                timeProvider.GetUtcNow(),
+                cancellationToken,
+                attemptCount).ConfigureAwait(false);
+            return;
+        }
+        var preparedDirectory = directoryOutcome.Directory ??
+            throw new InvalidOperationException("Prepared directory evidence is missing.");
 
         if (adapter is IOperationBoundBaiduNetdiskAdapter operationBoundAdapter)
         {
@@ -239,7 +272,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     automationContext!,
                     session,
                     snapshot.Share,
-                    directoryResult.Value!,
+                    preparedDirectory,
                     snapshot.DuplicatePolicy,
                     cancellationToken).ConfigureAwait(false);
             }
@@ -293,13 +326,13 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     automationContext!,
                     session,
                     snapshot.Share,
-                    directoryResult.Value!,
+                    preparedDirectory,
                     snapshot.DuplicatePolicy,
                     cancellationToken).ConfigureAwait(false)
                 : await adapter.SaveWholeShareAsync(
                     session,
                     snapshot.Share,
-                    directoryResult.Value!,
+                    preparedDirectory,
                     snapshot.DuplicatePolicy,
                     cancellationToken).ConfigureAwait(false);
         }
@@ -391,7 +424,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             snapshot.OperationId, now, cancellationToken, attemptCount).ConfigureAwait(false);
     }
 
-    private async Task<BaiduAdapterResult<RemoteDirectory>> EnsureWithRetryAsync(
+    private async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureWithRetryAsync(
         TransferOperationAutomationContext? context,
         AccountSession session,
         RemotePath path,
@@ -400,10 +433,23 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         var completedRetries = 0;
         while (true)
         {
-            var result = context is not null && adapter is IOperationBoundBaiduNetdiskAdapter operationBound
-                ? await operationBound.EnsureDirectoryForOperationAsync(
-                    context, session, path, cancellationToken).ConfigureAwait(false)
-                : await adapter.EnsureDirectoryAsync(session, path, cancellationToken).ConfigureAwait(false);
+            BaiduAdapterResult<TransferDirectoryPreparationOutcome> result;
+            if (context is not null && adapter is IOperationBoundBaiduNetdiskAdapter operationBound)
+            {
+                result = await operationBound.EnsureDirectoryForOperationAsync(
+                    context, session, path, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                var legacy = await adapter.EnsureDirectoryAsync(session, path, cancellationToken)
+                    .ConfigureAwait(false);
+                result = legacy.IsSuccess
+                    ? BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                        TransferDirectoryPreparationOutcome.Prepared(legacy.Value!),
+                        legacy.SubmissionAcceptance)
+                    : BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Failure(
+                        legacy.ErrorKind!.Value, null, legacy.RetryAfter, legacy.SubmissionAcceptance);
+            }
             if (result.IsSuccess) return result;
             var decision = retryPolicy.Decide(result.ErrorKind!.Value, completedRetries, result.RetryAfter);
             if (!decision.ShouldRetry) return result;

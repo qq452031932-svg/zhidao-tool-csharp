@@ -17,6 +17,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
     private readonly string applicationBuildVersion;
     private readonly IWebAutomationAttemptStore? attemptStore;
     private readonly IAcceptanceOperationEvidenceSink? acceptanceEvidence;
+    private readonly ITransferRecoveryAuthorizationSource? recoveryAuthorization;
 
     public WebViewBaiduNetdiskAdapter(
         IBaiduNetdiskAdapter readOnlyAdapter,
@@ -25,7 +26,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         TransferAutomationFlow flow,
         string applicationBuildVersion,
         IWebAutomationAttemptStore? attemptStore = null,
-        IAcceptanceOperationEvidenceSink? acceptanceEvidence = null)
+        IAcceptanceOperationEvidenceSink? acceptanceEvidence = null,
+        ITransferRecoveryAuthorizationSource? recoveryAuthorization = null)
     {
         this.readOnlyAdapter = readOnlyAdapter ?? throw new ArgumentNullException(nameof(readOnlyAdapter));
         this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
@@ -35,6 +37,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         this.applicationBuildVersion = applicationBuildVersion.Trim();
         this.attemptStore = attemptStore;
         this.acceptanceEvidence = acceptanceEvidence;
+        this.recoveryAuthorization = recoveryAuthorization;
     }
 
     public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(
@@ -59,7 +62,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         CancellationToken cancellationToken) =>
         readOnlyAdapter.EnsureDirectoryAsync(session, path, cancellationToken);
 
-    public async Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryForOperationAsync(
+    public async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
         TransferOperationAutomationContext context,
         AccountSession session,
         RemotePath path,
@@ -71,34 +74,38 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         context.Validate();
         if (context.AccountId != session.LocalAccountId)
             throw new InvalidOperationException("The directory preparation identity does not match its account.");
-        if (!HasExactCandidateBinding(context))
-            return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+        if (!HasExactCandidateBinding(context) || string.IsNullOrWhiteSpace(session.BaiduUserId) ||
+            attemptStore is null)
+            return NotValidated<TransferDirectoryPreparationOutcome>(SubmissionAcceptance.DefinitelyNotAccepted);
         var request = Request(
             context,
-            OfficialFilesUri,
+            new Uri(context.SourceShare.OriginalUrl),
             async (visibleSession, visibleContext, token) =>
             {
-                if (visibleSession is not IAcceptanceDirectoryPreparationSession manual)
-                    return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
-                var evidence = await manual.ConfirmDirectoryPreparedAsync(
-                    visibleContext.Identity, path, token).ConfigureAwait(false);
-                if (evidence is null || evidence.Directory.Path != path ||
-                    evidence.ObservationFingerprint is not { Length: 64 })
-                    return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
-                return BaiduAdapterResult<RemoteDirectory>.Success(
-                    evidence.Directory,
+                if (visibleSession is not ITransferDirectoryPreparationSession automation)
+                    return NotValidated<TransferDirectoryPreparationOutcome>(SubmissionAcceptance.DefinitelyNotAccepted);
+                var preparationRequest = new TransferDirectoryPreparationRequest(
+                    context.OperationId, context.BatchId, context.AccountId, context.Generation,
+                    context.SourceShare, path, context.AuthorizationBinding!.Capability);
+                var outcome = await new TransferDirectoryPreparationFlow().ExecuteAsync(
+                    automation, new TransferDirectoryPreparationEvidenceStore(
+                        attemptStore, recoveryAuthorization),
+                    preparationRequest, token).ConfigureAwait(false);
+                return BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
+                    outcome,
                     SubmissionAcceptance.DefinitelyNotAccepted);
-            });
+            },
+            session.BaiduUserId);
         try
         {
             var result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false);
             return result.Disposition == VisibleWebAutomationDisposition.ActionCompleted && result.Value is not null
                 ? result.Value
-                : NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+                : NotValidated<TransferDirectoryPreparationOutcome>(SubmissionAcceptance.DefinitelyNotAccepted);
         }
         catch (WebAutomationAuthorizationException)
         {
-            return NotValidated<RemoteDirectory>(SubmissionAcceptance.DefinitelyNotAccepted);
+            return NotValidated<TransferDirectoryPreparationOutcome>(SubmissionAcceptance.DefinitelyNotAccepted);
         }
     }
 
@@ -431,7 +438,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
     private VisibleWebAutomationRequest<T> Request<T>(
         TransferOperationAutomationContext context,
         Uri officialUri,
-        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action,
+        string? expectedBaiduUserId = null)
     {
         var identity = new WebAutomationRequestIdentity(
             context.OperationId,
@@ -452,7 +460,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                     context.BatchId,
                     AdapterWriteAction.EnsureDirectory,
                     context.IsRecovery),
-                binding);
+                binding,
+                expectedBaiduUserId);
         return new(identity, profilePath, Navigation(context, officialUri), action, candidate);
     }
 

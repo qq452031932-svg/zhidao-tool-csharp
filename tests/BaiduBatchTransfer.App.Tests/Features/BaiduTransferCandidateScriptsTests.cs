@@ -201,6 +201,24 @@ public sealed class BaiduTransferCandidateScriptsTests
             .ObserveTransferAsync(request)).IsSuccess);
     }
 
+    [Fact]
+    public async Task EmptyExpectedSetCanDiscoverACompleteExactDirectoryListing()
+    {
+        var request = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"),
+            BaiduCandidatePageState.DestinationPicker, "uid-1", [], null, null);
+
+        var result = await new WebView2CandidateDomExecutor(
+                new TransferReadHost(Response(
+                    BaiduCandidatePageState.DestinationPicker, true, directory: true)),
+                new DenyAuthorization())
+            .ObserveTransferAsync(request);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("parent-1", result.Observation!.ParentExactId);
+        Assert.Equal("item-1", Assert.Single(result.Observation.Items).ExactId);
+    }
+
     private static BaiduCandidateDomReadRequest Request(
         BaiduCandidatePageState state,
         string[] ids,

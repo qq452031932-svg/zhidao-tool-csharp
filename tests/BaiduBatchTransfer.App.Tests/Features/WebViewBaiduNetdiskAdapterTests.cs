@@ -111,7 +111,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
-    public async Task OperationBoundDirectoryPreparationRequiresTypedVisibleUserEvidence()
+    public async Task OperationBoundDirectoryPreparationCreatesExactTargetWithoutManualConfirmation()
     {
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
@@ -130,8 +130,9 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context, Session(accountId), path, CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(path, result.Value!.Path);
-        Assert.Equal(1, session.ConfirmationCount);
+        Assert.Equal(path, result.Value!.Directory!.Path);
+        Assert.Equal(1, session.CreateCount);
+        Assert.Equal(1, session.CancelCount);
     }
 
     [Fact]
@@ -889,6 +890,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     private sealed class AttemptStore(WebAutomationAttemptRecord attempt) : IWebAutomationAttemptStore
     {
         public WebAutomationAttemptRecord Current { get; private set; } = attempt;
+        public List<TransferDirectoryMutationRecord> Mutations { get; } = [];
 
         public Task<WebAutomationAttemptRecord?> GetAsync(Guid operationId, Guid accountId, int generation, CancellationToken cancellationToken = default) =>
             Task.FromResult<WebAutomationAttemptRecord?>(
@@ -941,6 +943,46 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 Current.CreatedAt,
                 updatedAt,
                 acceptedRemoteItems);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryPersistTransferSourceEvidenceAsync(
+            Guid operationId, Guid accountId, int generation, long expectedRevision,
+            TransferSourceEvidence evidence, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.Preparing ||
+                expectedRevision != Current.Revision || Current.SourceEvidence is not null)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                Current.State, Current.ResumeStage, Current.Baseline, evidence.ObservationFingerprint,
+                Current.IsWaitingForUser, checked(Current.Revision + 1), Current.CreatedAt, updatedAt,
+                Current.AcceptedRemoteItems, evidence);
+            return Task.FromResult(true);
+        }
+        public Task<IReadOnlyList<TransferDirectoryMutationRecord>> GetDirectoryMutationsAsync(
+            Guid operationId, Guid accountId, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<TransferDirectoryMutationRecord>>(Mutations.ToArray());
+        public Task<bool> TryBeginDirectoryMutationAsync(
+            TransferDirectoryMutationRecord mutation, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            Mutations.Add(mutation);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryResolveDirectoryMutationAsync(
+            TransferDirectoryMutationRecord expected, TransferDirectoryMutationState nextState,
+            string? childExactId, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            var index = Mutations.IndexOf(expected);
+            if (index < 0) return Task.FromResult(false);
+            Mutations[index] = new(
+                expected.OperationId, expected.AccountId, expected.Generation, expected.SegmentOrdinal,
+                expected.ParentExactId, childExactId, expected.CanonicalChildPath,
+                expected.ListingGenerationToken, expected.BaiduUserId, expected.Capability,
+                nextState, expected.OwningAttemptRevision);
             return Task.FromResult(true);
         }
         public Task<bool> TryResumeFromUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
@@ -1014,21 +1056,57 @@ public sealed class WebViewBaiduNetdiskAdapterTests
 
     private sealed class ManualDirectorySession :
         IVisibleWebAutomationSession,
-        IAcceptanceDirectoryPreparationSession
+        ITransferDirectoryPreparationSession
     {
-        public int ConfirmationCount { get; private set; }
+        public int CreateCount { get; private set; }
+        public int CancelCount { get; private set; }
         public CancellationToken UserClosed => CancellationToken.None;
 
-        public Task<AcceptanceDirectoryPreparationEvidence?> ConfirmDirectoryPreparedAsync(
-            WebAutomationRequestIdentity identity,
-            RemotePath requestedPath,
-            CancellationToken cancellationToken = default)
+        public Task OpenSourceAsync(ShareReference share, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferSourceListing> ReadCompleteSourceAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
+                new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
+                "source-generation", "fictional-user", new AdapterCapabilityVersion(
+                    "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+                    BaiduSelectorCatalog.SelectorVersion, "build-a"), new string('a', 64))));
+        public Task<TransferDirectoryListing> OpenDestinationPickerAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Listing(rootHasChild: false));
+        public Task<TransferDirectoryListing> OpenVerifiedRootAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Listing(rootHasChild: false));
+        public Task<TransferDirectoryListing> EnterDirectoryAsync(RemoteDirectory directory, CancellationToken cancellationToken) =>
+            Task.FromResult(TransferDirectoryListing.Exact(
+                directory, [directory.RemoteId], [], 0, true, true,
+                "directory-generation", "fictional-user", new string('b', 64)));
+        public Task BeginCreateDirectoryAsync(string segment, CancellationToken cancellationToken)
         {
-            ConfirmationCount++;
-            return Task.FromResult<AcceptanceDirectoryPreparationEvidence?>(new(
-                new RemoteDirectory(requestedPath.Value, requestedPath),
-                new string('e', 64)));
+            CreateCount++;
+            return Task.CompletedTask;
         }
+        public Task ConfirmDirectoryCreationAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferDirectoryListing> ReadCurrentDirectoryAsync(CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Listing(rootHasChild: true));
+        }
+        public Task CancelDestinationPickerAsync(CancellationToken cancellationToken)
+        {
+            CancelCount++;
+            return Task.CompletedTask;
+        }
+        public Task<TransferDirectoryListing> ReadExactParentForRecoveryAsync(
+            RemoteDirectory parent, IReadOnlyList<string> expectedAncestors,
+            TransferDirectoryRecoveryAuthorization authorization,
+            CancellationToken cancellationToken) => Task.FromResult(Listing(rootHasChild: true));
+
+        private static TransferDirectoryListing Listing(bool rootHasChild) =>
+            TransferDirectoryListing.Exact(
+                new RemoteDirectory("root", new RemotePath("/")), [],
+                rootHasChild
+                    ? [new TransferRemoteItem(new RemoteItemIdentity("target", "acceptance-target"),
+                        TransferRemoteItemKind.Folder, "acceptance-target")]
+                    : [],
+                rootHasChild ? 1 : 0, true, true, "directory-generation",
+                "fictional-user", new string('b', 64));
 
         public Task ShowAsync(Uri initialUri, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ShowHandoffAsync(WebAutomationHandoffPrompt prompt, CancellationToken cancellationToken = default) => Task.CompletedTask;
