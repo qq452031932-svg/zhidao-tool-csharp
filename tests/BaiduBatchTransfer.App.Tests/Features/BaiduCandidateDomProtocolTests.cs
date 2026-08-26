@@ -11,6 +11,87 @@ public sealed class BaiduCandidateDomProtocolTests
 {
     private const string Token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    [Theory]
+    [InlineData(BaiduCandidatePageState.ExtractionCode)]
+    [InlineData(BaiduCandidatePageState.ExternalShare)]
+    [InlineData(BaiduCandidatePageState.DestinationPicker)]
+    [InlineData(BaiduCandidatePageState.OwnDrive)]
+    [InlineData(BaiduCandidatePageState.TransferResult)]
+    public void TransferReadRequestNeedsNoWriteBindingAndRedactsAllRemoteEvidence(
+        BaiduCandidatePageState state)
+    {
+        var request = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/s/private-share"), state, "private-baidu-uid",
+            ["private-source-2", "private-source-1"], "private-parent", new RemotePath("/私密/目录"));
+        var same = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/s/private-share"), state, "private-baidu-uid",
+            ["private-source-1", "private-source-2"], "private-parent", new RemotePath("/私密/目录"));
+
+        Assert.Equal(request, same);
+        Assert.DoesNotContain("Authorization", request.GetType().GetProperties().Select(property => property.Name));
+        var text = request.ToString();
+        Assert.DoesNotContain("private", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("私密", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TransferReadRequestEqualityBindsUidIdsParentAndCanonicalPath()
+    {
+        BaiduCandidateDomReadRequest Create(
+            string uid = "uid-1",
+            string[]? ids = null,
+            string? parent = "parent-1",
+            string path = "/目标") =>
+            new(new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.OwnDrive,
+                uid, ids ?? ["item-1"], parent, new RemotePath(path));
+
+        var expected = Create();
+        Assert.NotEqual(expected, Create(uid: "uid-2"));
+        Assert.NotEqual(expected, Create(ids: ["item-2"]));
+        Assert.NotEqual(expected, Create(parent: "parent-2"));
+        Assert.NotEqual(expected, Create(path: "/另一个目标"));
+    }
+
+    [Theory]
+    [InlineData(BaiduAutomationAction.SubmitExtraction, null)]
+    [InlineData(BaiduAutomationAction.OpenDestinationPicker, null)]
+    [InlineData(BaiduAutomationAction.EnterDirectory, null)]
+    [InlineData(BaiduAutomationAction.CreateDirectory, "private-directory-name")]
+    [InlineData(BaiduAutomationAction.ConfirmDirectoryCreation, null)]
+    [InlineData(BaiduAutomationAction.CancelDestinationPicker, null)]
+    [InlineData(BaiduAutomationAction.ClickConfirmTransfer, null)]
+    public void TransferMutationRequestRequiresWriteBindingAndNeverPrintsTypedOrRemoteValues(
+        BaiduAutomationAction action,
+        string? typedValue)
+    {
+        var legacy = Request();
+        var read = new BaiduCandidateDomReadRequest(
+            legacy.OfficialUri, BaiduCandidatePageState.DestinationPicker, "private-uid",
+            ["private-item"], "private-parent", new RemotePath("/private-target"));
+
+        var mutation = new BaiduCandidateDomMutationRequest(
+            legacy.Authorization, legacy.Binding, action, read, typedValue);
+
+        var text = mutation.ToString();
+        Assert.DoesNotContain("private", text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("directory-name", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TypedCandidateValueIsAllowedOnlyForExtractionInputAndDirectoryCreation()
+    {
+        var legacy = Request();
+        var read = new BaiduCandidateDomReadRequest(
+            legacy.OfficialUri, BaiduCandidatePageState.ExtractionCode, "uid", [], null, null);
+
+        _ = new BaiduCandidateDomMutationRequest(
+            legacy.Authorization, legacy.Binding, BaiduAutomationAction.SetExtractionCode, read, "1111");
+        Assert.Throws<ArgumentException>(() => new BaiduCandidateDomMutationRequest(
+            legacy.Authorization, legacy.Binding, BaiduAutomationAction.SubmitExtraction, read, "1111"));
+        Assert.ThrowsAny<ArgumentException>(() => new BaiduCandidateDomMutationRequest(
+            legacy.Authorization, legacy.Binding, BaiduAutomationAction.CreateDirectory, read, null));
+    }
+
     [Fact]
     public async Task UniqueStableCompleteExactObservationCanMutateOnce()
     {

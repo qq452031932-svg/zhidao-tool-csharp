@@ -32,6 +32,8 @@ public sealed class BaiduSelectorCatalog
 {
     public const string ProtocolVersion = "baidu-visible-web-v1";
     public const string SelectorVersion = "baidu-selectors-v1";
+    public const string TransferProtocolVersion = "baidu-visible-transfer-v2";
+    public const string TransferSelectorVersion = "baidu-transfer-pages-v2";
 
     private static readonly ImmutableArray<BaiduSelectorDefinition> NotValidatedDefinitions =
     [
@@ -45,6 +47,14 @@ public sealed class BaiduSelectorCatalog
         Definition(BaiduPageState.ShareDialogReady, BaiduAutomationAction.SetExtractionCode),
         Definition(BaiduPageState.ShareDialogReady, BaiduAutomationAction.CreateLink),
         Definition(BaiduPageState.ShareResultReady, BaiduAutomationAction.ExportResult),
+        Definition(BaiduPageState.ExtractionCodeReady, BaiduAutomationAction.SetExtractionCode),
+        Definition(BaiduPageState.ExtractionCodeReady, BaiduAutomationAction.SubmitExtraction),
+        Definition(BaiduPageState.ExternalShareReady, BaiduAutomationAction.OpenDestinationPicker),
+        Definition(BaiduPageState.DestinationPickerReady, BaiduAutomationAction.EnterDirectory),
+        Definition(BaiduPageState.DestinationPickerReady, BaiduAutomationAction.CreateDirectory),
+        Definition(BaiduPageState.DestinationPickerReady, BaiduAutomationAction.ConfirmDirectoryCreation),
+        Definition(BaiduPageState.DestinationPickerReady, BaiduAutomationAction.CancelDestinationPicker),
+        Definition(BaiduPageState.DestinationPickerReady, BaiduAutomationAction.ClickConfirmTransfer),
     ];
 
     private static readonly ImmutableDictionary<(BaiduPageState State, BaiduAutomationAction Action), BaiduSelectorDefinition>
@@ -237,6 +247,9 @@ public sealed class BaiduSelectorCatalog
         BaiduPageState.SaveDestinationReady => "save-destination",
         BaiduPageState.ShareDialogReady => "share-dialog",
         BaiduPageState.ShareResultReady => "share-result",
+        BaiduPageState.ExtractionCodeReady => "extraction-code",
+        BaiduPageState.DestinationPickerReady => "destination-picker",
+        BaiduPageState.TransferResultReady => "transfer-result",
         _ => throw new ArgumentOutOfRangeException(nameof(state)),
     };
 
@@ -251,6 +264,13 @@ public sealed class BaiduSelectorCatalog
         BaiduAutomationAction.SetExtractionCode => "code-setting",
         BaiduAutomationAction.CreateLink => "create-link-action",
         BaiduAutomationAction.ExportResult => "export-result-action",
+        BaiduAutomationAction.SubmitExtraction => "submit-extraction",
+        BaiduAutomationAction.OpenDestinationPicker => "open-destination-picker",
+        BaiduAutomationAction.EnterDirectory => "enter-directory",
+        BaiduAutomationAction.CreateDirectory => "create-directory",
+        BaiduAutomationAction.ConfirmDirectoryCreation => "confirm-directory-creation",
+        BaiduAutomationAction.CancelDestinationPicker => "cancel-destination-picker",
+        BaiduAutomationAction.ClickConfirmTransfer => "confirm-transfer",
         _ => throw new ArgumentOutOfRangeException(nameof(action)),
     };
 }

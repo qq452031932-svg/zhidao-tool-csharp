@@ -50,6 +50,13 @@ public sealed class BaiduSelectorCatalogTests
             BaiduAutomationAction.SetExtractionCode,
             BaiduAutomationAction.CreateLink,
             BaiduAutomationAction.ExportResult,
+            BaiduAutomationAction.SubmitExtraction,
+            BaiduAutomationAction.OpenDestinationPicker,
+            BaiduAutomationAction.EnterDirectory,
+            BaiduAutomationAction.CreateDirectory,
+            BaiduAutomationAction.ConfirmDirectoryCreation,
+            BaiduAutomationAction.CancelDestinationPicker,
+            BaiduAutomationAction.ClickConfirmTransfer,
         };
 
         Assert.Equal(
@@ -59,6 +66,30 @@ public sealed class BaiduSelectorCatalogTests
                 .Append(BaiduSelectorCatalog.NavigationAction)
                 .Distinct()
                 .Order());
+    }
+
+    [Fact]
+    public void TransferCatalogV2UsesIndependentVersionsAndExplicitPageActions()
+    {
+        Assert.Equal("baidu-visible-transfer-v2", BaiduSelectorCatalog.TransferProtocolVersion);
+        Assert.Equal("baidu-transfer-pages-v2", BaiduSelectorCatalog.TransferSelectorVersion);
+        Assert.NotEqual(BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.TransferProtocolVersion);
+        Assert.NotEqual(BaiduSelectorCatalog.SelectorVersion, BaiduSelectorCatalog.TransferSelectorVersion);
+
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.ExtractionCodeReady, BaiduAutomationAction.SubmitExtraction));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.ExternalShareReady, BaiduAutomationAction.OpenDestinationPicker));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.DestinationPickerReady, BaiduAutomationAction.EnterDirectory));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.DestinationPickerReady, BaiduAutomationAction.CreateDirectory));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.DestinationPickerReady, BaiduAutomationAction.ConfirmDirectoryCreation));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.DestinationPickerReady, BaiduAutomationAction.CancelDestinationPicker));
+        Assert.True(BaiduSelectorCatalog.Production.IsActionAllowedForState(
+            BaiduPageState.DestinationPickerReady, BaiduAutomationAction.ClickConfirmTransfer));
     }
 
     [Fact]

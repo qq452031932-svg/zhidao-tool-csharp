@@ -12,6 +12,13 @@ public enum BaiduAutomationAction
     SetExtractionCode,
     CreateLink,
     ExportResult,
+    SubmitExtraction,
+    OpenDestinationPicker,
+    EnterDirectory,
+    CreateDirectory,
+    ConfirmDirectoryCreation,
+    CancelDestinationPicker,
+    ClickConfirmTransfer,
 }
 
 public enum BaiduAutomationDenialReason

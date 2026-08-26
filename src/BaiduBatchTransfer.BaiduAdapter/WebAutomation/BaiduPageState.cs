@@ -10,6 +10,9 @@ public enum BaiduPageState
     ShareDialogReady,
     ShareResultReady,
     UserVerificationRequired,
+    ExtractionCodeReady,
+    DestinationPickerReady,
+    TransferResultReady,
 }
 
 public enum BaiduObservationProvenance

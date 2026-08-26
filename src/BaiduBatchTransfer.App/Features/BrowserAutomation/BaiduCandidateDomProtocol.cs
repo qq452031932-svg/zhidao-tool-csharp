@@ -2,11 +2,13 @@ using System.Collections.Immutable;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public enum BaiduCandidatePageState
 {
+    ExtractionCode,
     ExternalShare,
     OwnDrive,
     DestinationPicker,
@@ -14,6 +16,126 @@ public enum BaiduCandidatePageState
     ShareDialog,
     ShareResult,
     OfficialShareList,
+}
+
+public sealed record BaiduCandidateDomReadRequest
+{
+    public BaiduCandidateDomReadRequest(
+        Uri officialUri,
+        BaiduCandidatePageState expectedPageState,
+        string expectedBaiduUserId,
+        IEnumerable<string> expectedExactIds,
+        string? expectedParentExactId,
+        RemotePath? expectedCanonicalPath)
+    {
+        OfficialUri = officialUri ?? throw new ArgumentNullException(nameof(officialUri));
+        if (!BaiduNavigationPolicy.Evaluate(officialUri).IsAllowed)
+            throw new ArgumentException("Only an official Baidu URI is allowed.", nameof(officialUri));
+        if (!Enum.IsDefined(expectedPageState)) throw new ArgumentOutOfRangeException(nameof(expectedPageState));
+        ExpectedPageState = expectedPageState;
+        ExpectedBaiduUserId = ValidateText(expectedBaiduUserId, nameof(expectedBaiduUserId));
+        ExpectedExactIds = NormalizeExactIds(expectedExactIds);
+        ExpectedParentExactId = expectedParentExactId is null
+            ? null
+            : ValidateText(expectedParentExactId, nameof(expectedParentExactId));
+        ExpectedCanonicalPath = expectedCanonicalPath;
+    }
+
+    public Uri OfficialUri { get; }
+    public BaiduCandidatePageState ExpectedPageState { get; }
+    public string ExpectedBaiduUserId { get; }
+    public ImmutableArray<string> ExpectedExactIds { get; }
+    public string? ExpectedParentExactId { get; }
+    public RemotePath? ExpectedCanonicalPath { get; }
+
+    public bool Equals(BaiduCandidateDomReadRequest? other) =>
+        other is not null &&
+        Equals(OfficialUri, other.OfficialUri) &&
+        ExpectedPageState == other.ExpectedPageState &&
+        string.Equals(ExpectedBaiduUserId, other.ExpectedBaiduUserId, StringComparison.Ordinal) &&
+        ExpectedExactIds.SequenceEqual(other.ExpectedExactIds, StringComparer.Ordinal) &&
+        string.Equals(ExpectedParentExactId, other.ExpectedParentExactId, StringComparison.Ordinal) &&
+        Equals(ExpectedCanonicalPath, other.ExpectedCanonicalPath);
+
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(OfficialUri);
+        hash.Add(ExpectedPageState);
+        hash.Add(ExpectedBaiduUserId, StringComparer.Ordinal);
+        foreach (var exactId in ExpectedExactIds) hash.Add(exactId, StringComparer.Ordinal);
+        hash.Add(ExpectedParentExactId, StringComparer.Ordinal);
+        hash.Add(ExpectedCanonicalPath);
+        return hash.ToHashCode();
+    }
+
+    public override string ToString() =>
+        $"BaiduCandidateDomReadRequest {{ ExpectedPageState = {ExpectedPageState}, Uri = [REDACTED], BaiduUserId = [REDACTED], ExactIds = [REDACTED], ParentExactId = [REDACTED], CanonicalPath = [REDACTED] }}";
+
+    private static ImmutableArray<string> NormalizeExactIds(IEnumerable<string> values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        var result = values.Select(value => ValidateText(value, nameof(values)))
+            .Order(StringComparer.Ordinal)
+            .ToImmutableArray();
+        if (result.Distinct(StringComparer.Ordinal).Count() != result.Length)
+            throw new ArgumentException("Exact IDs must be unique.", nameof(values));
+        return result;
+    }
+
+    private static string ValidateText(string value, string parameterName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
+        if (value.Length > 512 || value.Any(char.IsControl))
+            throw new ArgumentException("The value must be bounded non-control text.", parameterName);
+        return value;
+    }
+}
+
+public sealed record BaiduCandidateDomMutationRequest
+{
+    public BaiduCandidateDomMutationRequest(
+        AdapterWriteAuthorizationRequest authorization,
+        AdapterWriteAuthorizationBinding binding,
+        BaiduAutomationAction action,
+        BaiduCandidateDomReadRequest readBinding,
+        string? typedValue)
+    {
+        Authorization = authorization ?? throw new ArgumentNullException(nameof(authorization));
+        Binding = binding ?? throw new ArgumentNullException(nameof(binding));
+        ReadBinding = readBinding ?? throw new ArgumentNullException(nameof(readBinding));
+        if (!Enum.IsDefined(action) || action is BaiduAutomationAction.Unspecified or BaiduAutomationAction.OpenOfficialUri)
+            throw new ArgumentOutOfRangeException(nameof(action));
+        if (authorization.Capability != binding.Capability ||
+            authorization.AccountId != binding.AccountId ||
+            authorization.OperationId != binding.OperationId ||
+            authorization.Generation != binding.Generation ||
+            authorization.BatchId != binding.BatchId)
+            throw new ArgumentException("The write binding must match the exact authorization.", nameof(binding));
+        var requiresTypedValue = action is BaiduAutomationAction.SetExtractionCode or
+            BaiduAutomationAction.CreateDirectory;
+        if (requiresTypedValue)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(typedValue);
+            if (typedValue.Length > 512 || typedValue.Any(char.IsControl))
+                throw new ArgumentException("The typed value is invalid.", nameof(typedValue));
+        }
+        else if (typedValue is not null)
+        {
+            throw new ArgumentException("This action cannot contain typed text.", nameof(typedValue));
+        }
+        Action = action;
+        TypedValue = typedValue;
+    }
+
+    public AdapterWriteAuthorizationRequest Authorization { get; }
+    public AdapterWriteAuthorizationBinding Binding { get; }
+    public BaiduAutomationAction Action { get; }
+    public BaiduCandidateDomReadRequest ReadBinding { get; }
+    public string? TypedValue { get; }
+
+    public override string ToString() =>
+        $"BaiduCandidateDomMutationRequest {{ Action = {Action}, Authorization = [REDACTED], Binding = [REDACTED], ReadBinding = [REDACTED], TypedValue = [REDACTED] }}";
 }
 
 public enum BaiduCandidateBuiltInScript
