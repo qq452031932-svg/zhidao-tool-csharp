@@ -707,7 +707,15 @@ public sealed class BaiduCandidateDomProtocolTests
             ShareReference share, CancellationToken cancellationToken)
         {
             await AuthorizeAsync(BaiduAutomationAction.SelectExactItems, cancellationToken);
-            return new(exactItems.Items.Length, Token);
+            return new(new TransferSourceEvidence(
+                exactItems,
+                exactItems.Items.Length,
+                reachedEnd: true,
+                isStable: true,
+                "source-generation",
+                "baidu-user",
+                binding.Capability,
+                Token));
         }
 
         public Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
@@ -733,7 +741,13 @@ public sealed class BaiduCandidateDomProtocolTests
         {
             await AuthorizeAsync(BaiduAutomationAction.ChooseDestination, cancellationToken);
             await AuthorizeAsync(BaiduAutomationAction.ClickSave, cancellationToken);
-            return new(TransferOfficialAcceptanceStatus.Accepted, "request", exactItems, Token);
+            return new(
+                TransferOfficialAcceptanceStatus.Accepted,
+                "request",
+                exactItems,
+                new TransferIdentityMapping(exactItems.Items.Select(item =>
+                    new TransferIdentityMappingEntry(item.ExactId, item.ExactId))),
+                Token);
         }
 
         public Task SelectExactRemoteItemsAsSingleGroupAsync(

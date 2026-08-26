@@ -201,6 +201,21 @@ public sealed class TransferAutomationFlowTests
     }
 
     [Fact]
+    public async Task OfficialMappingMustCoverEveryExactSourceIdentity()
+    {
+        var scenario = Load("multi-root-transfer.json") with
+        {
+            OfficialRemoteIds = ["fictional-multi-a", "fictional-multi-b"],
+        };
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(new FixtureSession(scenario), Request(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+    }
+
+    [Fact]
     public async Task ConcurrentUnrelatedAdditionAlongsideAcceptedItemRemainsAmbiguous()
     {
         var scenario = Load("folder-transfer.json") with
@@ -318,12 +333,25 @@ public sealed class TransferAutomationFlowTests
             scenario.OfficialRemoteIds is null
                 ? null
                 : new RemoteItemIdentitySet(scenario.OfficialRemoteIds.Select(id => new RemoteItemIdentity(id, id))),
+            scenario.OfficialRemoteIds is null
+                ? null
+                : new TransferIdentityMapping(scenario.SourceIds.Zip(
+                    scenario.OfficialRemoteIds,
+                    (source, destination) => new TransferIdentityMappingEntry(source, destination))),
             Fingerprint('d'));
 
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken)
         {
             Events.Add("open-share");
-            return Task.FromResult(new TransferSourceListing(scenario.ExpectedTopLevelCount, Fingerprint('a')));
+            return Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
+                new RemoteItemIdentitySet(scenario.SourceIds.Select(id => new RemoteItemIdentity(id, id))),
+                scenario.ExpectedTopLevelCount,
+                reachedEnd: true,
+                isStable: true,
+                "source-generation",
+                "baidu-user",
+                Capability(),
+                Fingerprint('a'))));
         }
 
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken)
@@ -385,6 +413,7 @@ public sealed class TransferAutomationFlowTests
 
     private sealed record FixtureScenario(
         int ExpectedTopLevelCount,
+        string[] SourceIds,
         string[] Baseline,
         FixtureItem[] After,
         bool OfficialAccepted,
@@ -398,4 +427,7 @@ public sealed class TransferAutomationFlowTests
     }
 
     private static string Fingerprint(char value) => new(value, 64);
+
+    private static AdapterCapabilityVersion Capability() => new(
+        "BaiduTransfer", "baidu-visible-transfer-v2", "baidu-transfer-pages-v2", "build-1");
 }

@@ -21,86 +21,6 @@ public sealed record TransferAutomationRequest(
         $"TransferAutomationRequest {{ Share = [REDACTED], Destination = [REDACTED], DuplicatePolicy = {DuplicatePolicy} }}";
 }
 
-public sealed record TransferSourceListing
-{
-    public TransferSourceListing(int topLevelItemCount, string observationFingerprint)
-    {
-        if (topLevelItemCount < 1) throw new ArgumentOutOfRangeException(nameof(topLevelItemCount));
-        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
-        TopLevelItemCount = topLevelItemCount;
-        ObservationFingerprint = observationFingerprint;
-    }
-
-    public int TopLevelItemCount { get; }
-    public string ObservationFingerprint { get; }
-
-    public override string ToString() =>
-        $"TransferSourceListing {{ TopLevelItemCount = {TopLevelItemCount}, ObservationFingerprint = [REDACTED] }}";
-}
-
-public sealed record TransferDirectoryListing
-{
-    public TransferDirectoryListing(
-        bool isComplete,
-        bool isStable,
-        IReadOnlyList<RemoteItemIdentity> topLevelItems,
-        string observationFingerprint)
-    {
-        ArgumentNullException.ThrowIfNull(topLevelItems);
-        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
-        var snapshot = topLevelItems
-            .Select(item => item ?? throw new ArgumentException("Directory items cannot contain null values.", nameof(topLevelItems)))
-            .ToArray();
-        if (snapshot.Select(item => item.ExactId).Distinct(StringComparer.Ordinal).Count() != snapshot.Length)
-            throw new ArgumentException("Directory item identities must be unique.", nameof(topLevelItems));
-        IsComplete = isComplete;
-        IsStable = isStable;
-        TopLevelItems = Array.AsReadOnly(snapshot);
-        ObservationFingerprint = observationFingerprint;
-    }
-
-    public bool IsComplete { get; }
-    public bool IsStable { get; }
-    public IReadOnlyList<RemoteItemIdentity> TopLevelItems { get; }
-    public string ObservationFingerprint { get; }
-
-    public override string ToString() =>
-        $"TransferDirectoryListing {{ IsComplete = {IsComplete}, IsStable = {IsStable}, ItemCount = {TopLevelItems.Count}, ObservationFingerprint = [REDACTED], Items = [REDACTED] }}";
-}
-
-public enum TransferOfficialAcceptanceStatus
-{
-    Accepted = 0,
-    ExplicitlyRejected = 1,
-    Unobserved = 2,
-}
-
-public sealed record TransferOfficialAcceptance
-{
-    public TransferOfficialAcceptance(
-        TransferOfficialAcceptanceStatus status,
-        string? adapterRequestId,
-        RemoteItemIdentitySet? exactRemoteItems,
-        string observationFingerprint)
-    {
-        if (!Enum.IsDefined(status)) throw new ArgumentOutOfRangeException(nameof(status));
-        WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
-        Status = status;
-        AdapterRequestId = string.IsNullOrWhiteSpace(adapterRequestId) ? null : adapterRequestId.Trim();
-        ExactRemoteItems = exactRemoteItems;
-        ObservationFingerprint = observationFingerprint;
-    }
-
-    public TransferOfficialAcceptanceStatus Status { get; }
-    public bool IsAccepted => Status == TransferOfficialAcceptanceStatus.Accepted;
-    public string? AdapterRequestId { get; }
-    public RemoteItemIdentitySet? ExactRemoteItems { get; }
-    public string ObservationFingerprint { get; }
-
-    public override string ToString() =>
-        $"TransferOfficialAcceptance {{ Status = {Status}, AdapterRequestId = [REDACTED], ExactRemoteItems = [REDACTED] }}";
-}
-
 public interface ITransferAutomationSession
 {
     Task<TransferSourceListing> OpenExternalShareAsync(
@@ -136,11 +56,14 @@ public interface ITransferAutomationSession
         CancellationToken cancellationToken);
 }
 
-public sealed record TransferAutomationPreparation(WebAutomationBaseline Baseline)
+public sealed record TransferAutomationPreparation(
+    WebAutomationBaseline Baseline,
+    TransferSourceEvidence SourceEvidence)
 {
     public TransferAutomationPreparation Validate()
     {
         ArgumentNullException.ThrowIfNull(Baseline);
+        ArgumentNullException.ThrowIfNull(SourceEvidence);
         return this;
     }
 }
@@ -165,7 +88,9 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 adapterDiagnostic: null,
                 preparation.RetryAfter,
                 preparation.SubmissionAcceptance);
-        return await SubmitAsync(session, request, preparation.Value!.Baseline, cancellationToken)
+        return await SubmitAsync(
+                session, request, preparation.Value!.Baseline,
+                preparation.Value.SourceEvidence, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -180,7 +105,7 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
 
         try
         {
-            await session.OpenExternalShareAsync(request.Share, cancellationToken).ConfigureAwait(false);
+            var source = await session.OpenExternalShareAsync(request.Share, cancellationToken).ConfigureAwait(false);
             if (request.Share.ExtractionCode is not null)
                 await session.EnterExtractionCodeAsync(request.Share.ExtractionCode, cancellationToken)
                     .ConfigureAwait(false);
@@ -195,7 +120,7 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 baselineListing.ObservationFingerprint,
                 cancellationToken).ConfigureAwait(false);
             return BaiduAdapterResult<TransferAutomationPreparation>.Success(
-                new TransferAutomationPreparation(baseline),
+                new TransferAutomationPreparation(baseline, source.Evidence),
                 SubmissionAcceptance.DefinitelyNotAccepted);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -216,7 +141,16 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         ITransferAutomationSession session,
         TransferAutomationRequest request,
         WebAutomationBaseline baseline,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await SubmitAsync(session, request, baseline, expectedSource: null, cancellationToken)
+            .ConfigureAwait(false);
+
+    private async Task<BaiduAdapterResult<TransferReceipt>> SubmitAsync(
+        ITransferAutomationSession session,
+        TransferAutomationRequest request,
+        WebAutomationBaseline baseline,
+        TransferSourceEvidence? expectedSource,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(request);
@@ -231,6 +165,8 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
             if (request.Share.ExtractionCode is not null)
                 await session.EnterExtractionCodeAsync(request.Share.ExtractionCode, cancellationToken)
                     .ConfigureAwait(false);
+            if (expectedSource is not null && !SameSource(expectedSource, source.Evidence))
+                return DefinitelyNotValidated();
 
             await session.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
             submitted = true;
@@ -344,12 +280,30 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         IReadOnlyCollection<RemoteItemIdentity> added)
     {
         if (!acceptance.IsAccepted || acceptance.ExactRemoteItems is null ||
+            acceptance.IdentityMapping is null ||
+            !acceptance.IdentityMapping.Covers(source.ExactItems) ||
             acceptance.ExactRemoteItems.Count != source.TopLevelItemCount ||
             added.Count != acceptance.ExactRemoteItems.Count)
+            return false;
+        var mappedIds = acceptance.IdentityMapping.Entries
+            .Select(entry => entry.DestinationExactId)
+            .ToHashSet(StringComparer.Ordinal);
+        if (mappedIds.Count != acceptance.ExactRemoteItems.Count ||
+            acceptance.ExactRemoteItems.Items.Any(item => !mappedIds.Contains(item.ExactId)))
             return false;
         var addedIds = added.Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
         return acceptance.ExactRemoteItems.Items.All(item => addedIds.Contains(item.ExactId));
     }
+
+    private static bool SameSource(TransferSourceEvidence expected, TransferSourceEvidence current) =>
+        expected.Items == current.Items &&
+        expected.TotalCount == current.TotalCount &&
+        expected.ReachedEnd == current.ReachedEnd &&
+        expected.IsStable == current.IsStable &&
+        string.Equals(expected.GenerationToken, current.GenerationToken, StringComparison.Ordinal) &&
+        string.Equals(expected.BaiduUserId, current.BaiduUserId, StringComparison.Ordinal) &&
+        expected.Capability == current.Capability &&
+        string.Equals(expected.ObservationFingerprint, current.ObservationFingerprint, StringComparison.Ordinal);
 
     private static BaiduAdapterResult<TransferReceipt> DefinitelyNotAccepted() =>
         BaiduAdapterResult<TransferReceipt>.Failure(

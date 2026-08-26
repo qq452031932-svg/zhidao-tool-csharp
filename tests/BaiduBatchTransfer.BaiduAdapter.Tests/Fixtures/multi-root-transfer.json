@@ -1,5 +1,6 @@
 {
   "expectedTopLevelCount": 3,
+  "sourceIds": ["fictional-source-a", "fictional-source-b", "fictional-source-c"],
   "baseline": ["fictional-baseline-a"],
   "after": [
     { "exactId": "fictional-baseline-a", "displayName": "旧资源" },

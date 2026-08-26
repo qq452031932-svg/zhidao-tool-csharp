@@ -1,5 +1,6 @@
 {
   "expectedTopLevelCount": 1,
+  "sourceIds": ["fictional-source-apk"],
   "baseline": ["fictional-baseline-a"],
   "after": [
     { "exactId": "fictional-baseline-a", "displayName": "旧资源" },

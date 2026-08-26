@@ -1055,7 +1055,17 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
-            Record("open-share", new TransferSourceListing(1, new string('b', 64)));
+            Record("open-share", new TransferSourceListing(new TransferSourceEvidence(
+                new RemoteItemIdentitySet([new("fictional-source", "来源资源")]),
+                1,
+                reachedEnd: true,
+                isStable: true,
+                "source-generation",
+                "baidu-user",
+                new AdapterCapabilityVersion(
+                    "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+                    BaiduSelectorCatalog.SelectorVersion, "build-a"),
+                new string('b', 64))));
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
             Record("open-destination", new TransferDirectoryListing(true, true, [new("fictional-old", "旧资源")], new string('c', 64)));
@@ -1077,6 +1087,9 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             TransferOfficialAcceptanceStatus.Accepted,
             "fictional-request",
             new RemoteItemIdentitySet([new("fictional-new", "新资源")]),
+            new TransferIdentityMapping([
+                new TransferIdentityMappingEntry("fictional-source", "fictional-new"),
+            ]),
             new string('e', 64));
 
         private Task<T> Record<T>(string name, T value)
