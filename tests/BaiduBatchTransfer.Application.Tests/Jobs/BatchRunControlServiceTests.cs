@@ -862,6 +862,29 @@ public sealed class BatchRunControlServiceTests
         Assert.True(snapshot.IsAutomationRecovery);
     }
 
+    [Fact]
+    public async Task NotPreparedGenerationWithRetainedExactAttemptIsNotAutomationRecovery()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var resource = Resource(batchId, 1) with { CandidateStatus = "Reserved", ReservedAccountId = accountId };
+        var operation = Operation(resource, accountId, 1,
+            status: "Reserved", submitState: "NotPrepared", slotState: "Reserved", attemptCount: 1);
+        await db.SeedAsync([Account(accountId)], job: Job(batchId, "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batchId, accountId, 1, reserved: 1)]);
+        var attemptStore = new SqliteWebAutomationAttemptStore(db.ConnectionFactory);
+        Assert.True(await attemptStore.BeginAsync(WebAutomationAttemptRecord.Create(
+            operation.Id, accountId, 1, WebAutomationOwnerKind.Transfer, Now.AddMinutes(1))));
+
+        var snapshot = (await new SqliteTransferSchedulingStore(db.ConnectionFactory)
+            .LoadOperationAsync(operation.Id))!;
+
+        Assert.False(snapshot.AttemptGenerationPrepared);
+        Assert.False(snapshot.IsAutomationRecovery);
+    }
+
     private static AccountRecord Account(Guid id) =>
         AccountRecord.Create(id, $"baidu-{id:N}", "Account") with { DailyCountDateKey = "2026-08-19" };
 
