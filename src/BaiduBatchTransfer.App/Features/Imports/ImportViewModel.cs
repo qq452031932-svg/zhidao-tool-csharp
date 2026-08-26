@@ -291,17 +291,30 @@ public sealed class ImportViewModel : ObservableObject, IDisposable
     public async Task<bool> SaveCurrentRowEditAsync(CancellationToken cancellationToken = default)
     {
         if (isClosed) return false;
-        if (SelectedRow is null) return true;
+        if (SelectedRow is not { } selectedRow) return true;
+        var shareUrl = SelectedShareUrl;
+        var extractionCode = NormalizeSubmittedExtractionCode(SelectedExtractionCode);
+        var originalExtractionCode = string.IsNullOrEmpty(selectedRow.ExtractionCode)
+            ? null
+            : selectedRow.ExtractionCode;
+        if (string.Equals(shareUrl, selectedRow.ShareUrl, StringComparison.Ordinal) &&
+            string.Equals(extractionCode, originalExtractionCode, StringComparison.Ordinal))
+        {
+            return true;
+        }
         return await RunMutationAsync(
             token => workflow.UpdateLinkAsync(
-                SelectedRow.RowId,
-                SelectedShareUrl,
-                string.IsNullOrWhiteSpace(SelectedExtractionCode) ? null : SelectedExtractionCode,
+                selectedRow.RowId,
+                shareUrl,
+                extractionCode,
                 token),
             "链接修改已保存，开始前会重新检查。",
             "修改失败，请检查链接与提取码。",
             cancellationToken);
     }
+
+    private static string? NormalizeSubmittedExtractionCode(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value;
 
     private async Task SaveSelectedRowAsync(CancellationToken cancellationToken)
     {

@@ -239,6 +239,87 @@ public sealed class ImportViewModelTests
         Assert.Equal([(row.RowId, true), (row.RowId, false)], workflow.Exclusions);
     }
 
+    [Theory]
+    [InlineData(null, "")]
+    [InlineData(null, "   ")]
+    [InlineData("", "")]
+    [InlineData("", "   ")]
+    [InlineData("a1b2", "a1b2")]
+    public async Task SavingSemanticallyUnchangedSelectedRowSkipsWorkflowMutation(
+        string? originalExtractionCode,
+        string selectedExtractionCode)
+    {
+        var row = new ImportPreviewRow(
+            Guid.NewGuid(),
+            1,
+            "https://pan.baidu.com/s/unchanged",
+            originalExtractionCode,
+            null,
+            "就绪",
+            "有效");
+        var workflow = new FakeImportWorkflow { RejectEdits = true };
+        var vm = Create(workflow);
+        vm.SelectedRow = row;
+        vm.SelectedExtractionCode = selectedExtractionCode;
+
+        var saved = await vm.SaveCurrentRowEditAsync();
+
+        Assert.True(saved);
+        Assert.Equal(0, workflow.UpdateLinkCalls);
+    }
+
+    [Theory]
+    [InlineData("https://pan.baidu.com/s/changed", "a1b2")]
+    [InlineData("https://pan.baidu.com/s/original", "c3d4")]
+    [InlineData("https://pan.baidu.com/s/original", " a1b2 ")]
+    [InlineData("https://pan.baidu.com/s/original", "   ")]
+    [InlineData(" https://pan.baidu.com/s/original ", "a1b2")]
+    public async Task SavingChangedSelectedRowStillUsesWorkflowValidation(
+        string selectedShareUrl,
+        string selectedExtractionCode)
+    {
+        var row = new ImportPreviewRow(
+            Guid.NewGuid(),
+            1,
+            "https://pan.baidu.com/s/original",
+            "a1b2",
+            null,
+            "就绪",
+            "有效");
+        var workflow = new FakeImportWorkflow { RejectEdits = true };
+        var vm = Create(workflow);
+        vm.SelectedRow = row;
+        vm.SelectedShareUrl = selectedShareUrl;
+        vm.SelectedExtractionCode = selectedExtractionCode;
+
+        var saved = await vm.SaveCurrentRowEditAsync();
+
+        Assert.False(saved);
+        Assert.Equal(1, workflow.UpdateLinkCalls);
+    }
+
+    [Fact]
+    public async Task SavingCurrentRowHonorsEmptySelectionAndClosedLifecycle()
+    {
+        var workflow = new FakeImportWorkflow();
+        var vm = Create(workflow);
+
+        Assert.True(await vm.SaveCurrentRowEditAsync());
+
+        vm.SelectedRow = new(
+            Guid.NewGuid(),
+            1,
+            "https://pan.baidu.com/s/original",
+            null,
+            null,
+            "就绪",
+            "有效");
+        vm.Close();
+
+        Assert.False(await vm.SaveCurrentRowEditAsync());
+        Assert.Equal(0, workflow.UpdateLinkCalls);
+    }
+
     [Fact]
     public void StatisticsExposeEveryDraftDispositionAndTotalCount()
     {
@@ -568,6 +649,8 @@ public sealed class ImportViewModelTests
         public (Guid, bool) LastExclusion { get; private set; }
         public List<(Guid, bool)> Exclusions { get; } = [];
         public Guid? MutationSessionId { get; set; }
+        public bool RejectEdits { get; set; }
+        public int UpdateLinkCalls { get; private set; }
 
         public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken)
             => Result();
@@ -583,6 +666,8 @@ public sealed class ImportViewModelTests
 
         public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
         {
+            UpdateLinkCalls++;
+            if (RejectEdits) throw new InvalidOperationException("Injected edit rejection.");
             LastEdit = (rowId, shareUrl, extractionCode);
             return MutationResult();
         }
