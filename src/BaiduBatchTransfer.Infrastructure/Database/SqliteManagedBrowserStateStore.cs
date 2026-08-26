@@ -746,6 +746,7 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
             FROM ManagedBrowserSessions session
             JOIN Accounts account ON account.Id=session.AccountId
             WHERE session.AccountId=$account AND session.BrowserFamily=$family AND session.State='Active'
+              AND account.BaiduUserId=session.BaiduUserId
               AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0;
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));

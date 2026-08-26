@@ -516,6 +516,28 @@ ON StandaloneShareOperations(Status,NextReconcileAt,BatchId,SequenceNumber,Id);
 CREATE INDEX IX_WebAutomationAttempts_Recovery
 ON WebAutomationAttempts(State,IsWaitingForUser,UpdatedAt,OperationId);
 
+CREATE TRIGGER TR_ManagedBrowserSessions_StableUid_Insert
+BEFORE INSERT ON ManagedBrowserSessions
+WHEN NOT EXISTS(
+  SELECT 1 FROM Accounts account
+  WHERE account.Id=NEW.AccountId AND account.BaiduUserId=NEW.BaiduUserId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser session account identity mismatch');
+END;
+
+CREATE TRIGGER TR_ManagedBrowserSessions_IdentityImmutable
+BEFORE UPDATE OF AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,ProfileOwnershipId
+ON ManagedBrowserSessions
+WHEN NEW.AccountId IS NOT OLD.AccountId
+  OR NEW.BaiduUserId IS NOT OLD.BaiduUserId
+  OR NEW.InstallationId IS NOT OLD.InstallationId
+  OR NEW.BrowserFamily IS NOT OLD.BrowserFamily
+  OR NEW.ProfileId IS NOT OLD.ProfileId
+  OR NEW.ProfileOwnershipId IS NOT OLD.ProfileOwnershipId
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser session identity is immutable');
+END;
+
 CREATE TRIGGER TR_TransferOperations_ExecutionSnapshotImmutable
 BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
 ON TransferOperations
@@ -543,6 +565,9 @@ BEGIN
       AND OLD.RemoteItemIdsJson IS NULL AND NEW.RemoteItemIdsJson IS NULL
       AND NOT EXISTS(
         SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=OLD.Id)
+      AND NOT EXISTS(
+        SELECT 1 FROM WebAutomationDirectoryMutations mutation
+        WHERE mutation.OperationId=OLD.Id AND mutation.AccountId=OLD.AssignedAccountId)
     ) THEN RAISE(ABORT, 'execution snapshot is immutable') END;
 END;
 

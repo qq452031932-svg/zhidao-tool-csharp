@@ -1069,6 +1069,7 @@ public sealed class SqliteSchedulingStoreTests
     [InlineData("submit-started")]
     [InlineData("adapter-request")]
     [InlineData("remote-items")]
+    [InlineData("directory-mutation")]
     public async Task ReassignmentRejectsAnyStartedOrRemoteSideEffectEvidence(string evidence)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -1089,9 +1090,19 @@ public sealed class SqliteSchedulingStoreTests
             "submit-started" => "UPDATE TransferOperations SET SubmitStartedAt=$now WHERE Id=$operation;",
             "adapter-request" => "UPDATE TransferOperations SET AdapterRequestId='request' WHERE Id=$operation;",
             "remote-items" => "UPDATE TransferOperations SET RemoteItemIdsJson='[\"remote\"]' WHERE Id=$operation;",
+            "directory-mutation" => """
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,1,0,'root','folder',NULL,'/folder','listing','uid',
+                  'WebView2','1','1','1','Intent',0,$now,$now);
+                """,
             _ => throw new ArgumentOutOfRangeException(nameof(evidence)),
         };
-        await ExecuteAsync(db, mutation, ("$operation", operation.Id.ToString("D")), ("$now", Now.ToString("O")));
+        await ExecuteAsync(db, mutation, ("$operation", operation.Id.ToString("D")),
+            ("$account", oldAccount.ToString("D")), ("$now", Now.ToString("O")));
         var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
         var state = await store.LoadAsync(batch);
 

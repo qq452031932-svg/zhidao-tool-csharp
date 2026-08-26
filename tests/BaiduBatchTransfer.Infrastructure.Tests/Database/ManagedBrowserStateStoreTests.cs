@@ -126,6 +126,84 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ActiveSessionLookupFailsClosedAfterTheAccountStableUidChanges()
+    {
+        var (factory, store) = await CreateStoreAsync();
+        var accountId = Guid.NewGuid();
+        await SeedAccountAsync(factory, accountId, "uid-before");
+        var installation = await store.CreateInstallationAsync(
+            Installation(BrowserFamily.Chrome, "chrome-uid-change", "uid-change-file"), default);
+        installation = (await store.TryReplaceActiveInstallationAsync(
+            new ManagedBrowserInstallationActivationRequest(null, installation), default)).Current!;
+        var identity = Session(
+            installation.Identity.InstallationId, accountId, "uid-before", BrowserFamily.Chrome,
+            "profile-uid-change", "ownership-uid-change");
+        var session = await store.CreateSessionAsync(identity, default);
+        session = (await store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, session), default)).Current!;
+        Assert.Equal(identity.SessionId,
+            (await store.LoadActiveSessionAsync(accountId, BrowserFamily.Chrome, default))!.Identity.SessionId);
+
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await using var update = connection.CreateCommand();
+            update.CommandText = "UPDATE Accounts SET BaiduUserId='uid-after' WHERE Id=$account;";
+            update.Parameters.AddWithValue("$account", accountId.ToString("D"));
+            Assert.Equal(1, await update.ExecuteNonQueryAsync());
+        }
+
+        Assert.Null(await store.LoadActiveSessionAsync(accountId, BrowserFamily.Chrome, default));
+        Assert.Equal("uid-before", (await store.LoadSessionAsync(identity.SessionId, default))!.Identity.StableBaiduUserId);
+    }
+
+    [Fact]
+    public async Task SessionUidWriteGuardAndActiveLookupFailClosedForPersistedUidCorruption()
+    {
+        var (factory, store) = await CreateStoreAsync();
+        var accountId = Guid.NewGuid();
+        var otherAccountId = Guid.NewGuid();
+        await SeedAccountAsync(factory, accountId, "uid-valid");
+        await SeedAccountAsync(factory, otherAccountId, "uid-other");
+        var installation = await store.CreateInstallationAsync(
+            Installation(BrowserFamily.Chrome, "chrome-uid-corrupt", "uid-corrupt-file"), default);
+        installation = (await store.TryReplaceActiveInstallationAsync(
+            new ManagedBrowserInstallationActivationRequest(null, installation), default)).Current!;
+        var identity = Session(
+            installation.Identity.InstallationId, accountId, "uid-valid", BrowserFamily.Chrome,
+            "profile-uid-corrupt", "ownership-uid-corrupt");
+        var session = await store.CreateSessionAsync(identity, default);
+        _ = await store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, session), default);
+
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await using var rejected = connection.CreateCommand();
+            rejected.CommandText = "UPDATE ManagedBrowserSessions SET BaiduUserId='uid-corrupt' WHERE SessionId=$session;";
+            rejected.Parameters.AddWithValue("$session", identity.SessionId.ToString("D"));
+            await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => rejected.ExecuteNonQueryAsync());
+
+            await using var rebound = connection.CreateCommand();
+            rebound.CommandText = """
+                UPDATE ManagedBrowserSessions SET AccountId=$account,BaiduUserId='uid-other'
+                WHERE SessionId=$session;
+                """;
+            rebound.Parameters.AddWithValue("$account", otherAccountId.ToString("D"));
+            rebound.Parameters.AddWithValue("$session", identity.SessionId.ToString("D"));
+            await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => rebound.ExecuteNonQueryAsync());
+
+            await using var corrupt = connection.CreateCommand();
+            corrupt.CommandText = """
+                DROP TRIGGER TR_ManagedBrowserSessions_IdentityImmutable;
+                UPDATE ManagedBrowserSessions SET BaiduUserId='uid-corrupt' WHERE SessionId=$session;
+                """;
+            corrupt.Parameters.AddWithValue("$session", identity.SessionId.ToString("D"));
+            Assert.Equal(1, await corrupt.ExecuteNonQueryAsync());
+        }
+
+        Assert.Null(await store.LoadActiveSessionAsync(accountId, BrowserFamily.Chrome, default));
+    }
+
+    [Fact]
     public async Task RetentionRequiresRealOwnersAndHistoricalOwnersKeepRetiredIdentityIneligible()
     {
         var (factory, store) = await CreateStoreAsync();
