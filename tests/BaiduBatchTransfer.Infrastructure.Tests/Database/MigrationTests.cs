@@ -57,6 +57,14 @@ public sealed class MigrationTests : IDisposable
                 SELECT COUNT(*) FROM {table}
                 WHERE ExecutionEngineVersion IS NULL OR BrowserFamily IS NULL OR ProfileId IS NULL;
                 """));
+            await using var snapshotDefinition = upgraded.CreateCommand();
+            snapshotDefinition.CommandText = """
+                SELECT COUNT(*) FROM pragma_table_info($table)
+                WHERE name IN ('ExecutionEngineVersion','BrowserFamily','ProfileId')
+                  AND "notnull"=1 AND dflt_value IS NULL;
+                """;
+            snapshotDefinition.Parameters.AddWithValue("$table", table);
+            Assert.Equal(3L, Convert.ToInt64(await snapshotDefinition.ExecuteScalarAsync()));
         }
 
         var accountOneProfile = LegacyProfileId(ids.AccountOne);
@@ -99,6 +107,41 @@ public sealed class MigrationTests : IDisposable
         Assert.Equal("Succeeded", await ScalarAsync<string>(upgraded,
             "SELECT Status FROM StandaloneShareOperations WHERE Id=$id;", ("$id", ids.StandaloneSucceeded.ToString("D"))));
 
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE TransferOperations SET ProfileId='legacy-webview2-unassigned' WHERE Id=$id;
+            """, ("$id", ids.TransferWaiting.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE ShareOperations SET ProfileId='legacy-webview2-unassigned' WHERE Id=$id;
+            """, ("$id", ids.ShareWaiting.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE StandaloneShareOperations SET ProfileId='legacy-webview2-unassigned' WHERE Id=$id;
+            """, ("$id", ids.StandaloneQueued.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET ProfileId='legacy-webview2-unassigned'
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", ids.TransferWaiting.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET OwnerKind='StandaloneShare'
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", ids.TransferWaiting.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            INSERT INTO TransferOperations(
+              Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+              CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+              OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,
+              TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,
+              LeaseExpiresAt,CreatedAt,UpdatedAt)
+            SELECT $newId,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal+1000,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,'Cancelled',OutcomeKind,
+              AttemptCount,'missing-snapshot',ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,
+              SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,
+              LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt
+            FROM TransferOperations WHERE Id=$source;
+            """, ("$newId", Guid.NewGuid().ToString("D")),
+            ("$source", ids.TransferWaiting.ToString("D"))));
+
         var tableNames = await NamesAsync(upgraded, "table");
         Assert.Subset(new HashSet<string>(tableNames), new HashSet<string>
         {
@@ -113,6 +156,14 @@ public sealed class MigrationTests : IDisposable
         var triggerNames = await NamesAsync(upgraded, "trigger");
         Assert.Contains("TR_TransferOperations_RemoveTerminalPendingShare", triggerNames);
         Assert.Contains("TR_ShareOperations_RecordNextGeneration", triggerNames);
+        Assert.Contains("TR_TransferOperations_ExecutionSnapshotImmutable", triggerNames);
+        Assert.Contains("TR_WebAutomationAttempts_ExactOwnerSnapshot_Update", triggerNames);
+        Assert.Contains("TR_ManagedProfileCleanupManifests_RetainIdentity_Insert", triggerNames);
+
+        var cleanupForeignKeys = await ForeignKeysAsync(upgraded, "ManagedProfileCleanupManifests");
+        Assert.Contains(cleanupForeignKeys, row => row.Table == "ManagedBrowserSessions" && row.From == "SessionId");
+        Assert.Contains(cleanupForeignKeys, row => row.Table == "ManagedBrowserSessions" && row.From == "AccountId");
+        Assert.Contains(cleanupForeignKeys, row => row.Table == "ManagedBrowserSessions" && row.From == "ExpectedOwnershipId");
 
         foreach (var table in new[]
                  {
@@ -180,6 +231,31 @@ public sealed class MigrationTests : IDisposable
             """, ("$installation", installationId.ToString("D")),
             ("$session", accountOneSessionId.ToString("D")),
             ("$operation", ids.TransferWaiting.ToString("D")), ("$account", ids.AccountOne.ToString("D"))));
+
+        await ExecuteAsync(upgraded, """
+            DELETE FROM WebAutomationAttempts WHERE OperationId=$operation;
+            DELETE FROM ShareOperations WHERE TransferOperationId=$operation;
+            UPDATE TransferOperations
+            SET AttemptCount=0,ConfirmationDescriptorJson=NULL,AdapterRequestId=NULL,
+                RemoteItemIdsJson=NULL,SubmitStartedAt=NULL,DailyCountedAt=NULL
+            WHERE Id=$operation;
+            """, ("$operation", ids.TransferWaiting.ToString("D")));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE TransferOperations SET ProfileId=$newProfile WHERE Id=$operation;
+            """, ("$newProfile", accountTwoProfile), ("$operation", ids.TransferWaiting.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE TransferOperations SET AssignedAccountId=$newAccount WHERE Id=$operation;
+            """, ("$newAccount", ids.AccountTwo.ToString("D")),
+            ("$operation", ids.TransferWaiting.ToString("D"))));
+        await ExecuteAsync(upgraded, """
+            UPDATE TransferOperations
+            SET AssignedAccountId=$newAccount,ProfileId=$newProfile
+            WHERE Id=$operation;
+            """, ("$newAccount", ids.AccountTwo.ToString("D")), ("$newProfile", accountTwoProfile),
+            ("$operation", ids.TransferWaiting.ToString("D")));
+        Assert.Equal(ids.AccountTwo.ToString("D"), await ScalarAsync<string>(upgraded,
+            "SELECT AssignedAccountId FROM TransferOperations WHERE Id=$operation;",
+            ("$operation", ids.TransferWaiting.ToString("D"))));
     }
 
     [Fact]
@@ -634,11 +710,12 @@ public sealed class MigrationTests : IDisposable
         await new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         await using var connection = await factory.OpenConnectionAsync();
         var ids = await SeedOperationParentsAsync(connection);
-        const string sql = "INSERT INTO TransferOperations (Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt) VALUES ($id,$resource,$job,1,1,'/x','/x','folder',$account,'Rule',$status,0,$fingerprint,'NotPrepared','Unoccupied','2026-01-01','2026-01-01');";
-        await ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "a"));
-        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "b")));
+        const string sql = "INSERT INTO TransferOperations (Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) VALUES ($id,$resource,$job,1,1,'/x','/x','folder',$account,'Rule',$status,0,$fingerprint,'NotPrepared','Unoccupied','2026-01-01','2026-01-01','WebView2-v1','LegacyWebView2',$profile,NULL,NULL);";
+        var profile = LegacyProfileId(Guid.Parse(ids.Account));
+        await ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "a"), ("$profile", profile));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "b"), ("$profile", profile)));
         await ExecuteAsync(connection, "UPDATE TransferOperations SET Status='Cancelled' WHERE OperationFingerprint='a';");
-        await ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "a"));
+        await ExecuteAsync(connection, sql, ("$id", Guid.NewGuid().ToString("D")), ("$resource", ids.Resource), ("$job", ids.Job), ("$account", ids.Account), ("$status", "Waiting"), ("$fingerprint", "a"), ("$profile", profile));
     }
 
     [Fact]

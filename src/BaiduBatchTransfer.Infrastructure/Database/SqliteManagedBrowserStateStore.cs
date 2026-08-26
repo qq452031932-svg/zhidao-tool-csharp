@@ -407,6 +407,118 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         }
     }
 
+    public async Task<StoredManagedProfileCleanupManifest> CreateCleanupManifestAsync(
+        ManagedProfileCleanupManifest manifest,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        cancellationToken.ThrowIfCancellationRequested();
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        try
+        {
+            await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO ManagedProfileCleanupManifests(
+                  ManifestId,AccountId,SessionId,State,SourceProfilePath,QuarantinePath,
+                  ExpectedOwnershipId,ConfirmationTokenHash,Revision,CreatedAt,UpdatedAt)
+                SELECT $manifest,$account,$session,'Prepared',$source,$quarantine,
+                       $ownership,$confirmation,0,$now,$now
+                FROM ManagedBrowserSessions managed
+                WHERE managed.SessionId=$session AND managed.AccountId=$account
+                  AND managed.ProfileOwnershipId=$ownership;
+                """;
+            command.Parameters.AddWithValue("$manifest", manifest.ManifestId.ToString("D"));
+            command.Parameters.AddWithValue("$account", manifest.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$session", manifest.SessionId.ToString("D"));
+            command.Parameters.AddWithValue("$source", manifest.SourceProfilePath);
+            command.Parameters.AddWithValue("$quarantine", manifest.QuarantinePath);
+            command.Parameters.AddWithValue("$ownership", manifest.ExpectedOwnershipId);
+            command.Parameters.AddWithValue("$confirmation", (object?)manifest.ConfirmationTokenHash ?? DBNull.Value);
+            command.Parameters.AddWithValue("$now", now);
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException();
+            return new StoredManagedProfileCleanupManifest(
+                manifest, ManagedProfileCleanupState.Prepared, revision: 0);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is SqliteException or InvalidOperationException)
+        {
+            throw new InvalidOperationException("Managed profile cleanup manifest could not be created.");
+        }
+    }
+
+    public async Task<StoredManagedProfileCleanupManifest?> LoadCleanupManifestAsync(
+        Guid manifestId,
+        CancellationToken cancellationToken)
+    {
+        if (manifestId == Guid.Empty)
+            throw new ArgumentException("A manifest ID is required.", nameof(manifestId));
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return await LoadCleanupManifestAsync(
+            connection, null, manifestId, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(
+        ManagedProfileCleanupTransitionRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqliteTransaction)await connection
+            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var current = await LoadCleanupManifestAsync(
+                connection, transaction, request.ManifestId, cancellationToken).ConfigureAwait(false);
+            if (current is null)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.NotFound();
+            }
+            if (current.Revision != request.ExpectedRevision || current.State != request.ExpectedState)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.Conflict(current.Revision);
+            }
+
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE ManagedProfileCleanupManifests
+                SET State=$target,Revision=Revision+1,UpdatedAt=$updated
+                WHERE ManifestId=$manifest AND Revision=$revision AND State=$expected;
+                """;
+            command.Parameters.AddWithValue("$target", FormatState(request.TargetState));
+            command.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
+            command.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
+            command.Parameters.AddWithValue("$revision", request.ExpectedRevision);
+            command.Parameters.AddWithValue("$expected", FormatState(request.ExpectedState));
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                var conflict = await LoadCleanupManifestAsync(
+                    request.ManifestId, cancellationToken).ConfigureAwait(false);
+                return conflict is null
+                    ? ManagedBrowserTransitionResult.NotFound()
+                    : ManagedBrowserTransitionResult.Conflict(conflict.Revision);
+            }
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return ManagedBrowserTransitionResult.Applied(checked(current.Revision + 1));
+        }
+        catch
+        {
+            try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
+            catch { /* Preserve the original safe failure. */ }
+            throw;
+        }
+    }
+
     public async Task AddRetentionAsync(
         ManagedBrowserRetentionReference reference,
         CancellationToken cancellationToken)
@@ -418,19 +530,42 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
             await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.CommandText = """
-                INSERT OR IGNORE INTO ManagedBrowserRetentions(
+                INSERT INTO ManagedBrowserRetentions(
                   OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
-                VALUES($kind,$owner,$installation,$session,$created);
+                SELECT $kind,$owner,$installation,$session,$created
+                WHERE
+                  ($kind='Operation' AND (
+                    EXISTS(SELECT 1 FROM TransferOperations operation
+                      WHERE operation.Id=$owner AND operation.ExecutionEngineVersion='ManagedChromium-v1'
+                        AND operation.InstallationId=$installation AND operation.SessionId=$session)
+                    OR EXISTS(SELECT 1 FROM ShareOperations operation
+                      WHERE operation.Id=$owner AND operation.ExecutionEngineVersion='ManagedChromium-v1'
+                        AND operation.InstallationId=$installation AND operation.SessionId=$session)
+                    OR EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                      WHERE operation.Id=$owner AND operation.ExecutionEngineVersion='ManagedChromium-v1'
+                        AND operation.InstallationId=$installation AND operation.SessionId=$session)))
+                  OR ($kind='Attempt' AND EXISTS(
+                    SELECT 1 FROM WebAutomationAttempts attempt
+                    WHERE attempt.OperationId=$owner AND attempt.ExecutionEngineVersion='ManagedChromium-v1'
+                      AND attempt.InstallationId=$installation AND attempt.SessionId=$session))
+                  OR ($kind='CleanupManifest' AND EXISTS(
+                    SELECT 1 FROM ManagedProfileCleanupManifests manifest
+                    JOIN ManagedBrowserSessions managed ON managed.SessionId=manifest.SessionId
+                    WHERE manifest.ManifestId=$owner AND manifest.State<>'Deleted'
+                      AND managed.InstallationId=$installation AND manifest.SessionId=$session))
+                ON CONFLICT(OwnerKind,OwnerId,InstallationId,SessionId)
+                DO UPDATE SET CreatedAt=ManagedBrowserRetentions.CreatedAt;
                 """;
             AddRetentionParameters(command, reference);
             command.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (SqliteException)
+        catch (Exception exception) when (exception is SqliteException or InvalidOperationException)
         {
             throw new InvalidOperationException("Managed browser retention could not be added.");
         }
@@ -475,7 +610,30 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
                 AND NOT EXISTS(
                   SELECT 1 FROM ManagedBrowserRetentions retention
                   WHERE retention.InstallationId=installation.InstallationId
-                    AND retention.SessionId=session.SessionId));
+                    AND retention.SessionId=session.SessionId)
+                AND NOT EXISTS(
+                  SELECT 1 FROM TransferOperations operation
+                  WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                    AND operation.InstallationId=installation.InstallationId
+                    AND operation.SessionId=session.SessionId)
+                AND NOT EXISTS(
+                  SELECT 1 FROM ShareOperations operation
+                  WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                    AND operation.InstallationId=installation.InstallationId
+                    AND operation.SessionId=session.SessionId)
+                AND NOT EXISTS(
+                  SELECT 1 FROM StandaloneShareOperations operation
+                  WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                    AND operation.InstallationId=installation.InstallationId
+                    AND operation.SessionId=session.SessionId)
+                AND NOT EXISTS(
+                  SELECT 1 FROM WebAutomationAttempts attempt
+                  WHERE attempt.ExecutionEngineVersion='ManagedChromium-v1'
+                    AND attempt.InstallationId=installation.InstallationId
+                    AND attempt.SessionId=session.SessionId)
+                AND NOT EXISTS(
+                  SELECT 1 FROM ManagedProfileCleanupManifests manifest
+                  WHERE manifest.SessionId=session.SessionId AND manifest.State<>'Deleted'));
             """;
         command.Parameters.AddWithValue("$installation", installationId.ToString("D"));
         command.Parameters.AddWithValue("$session", sessionId.ToString("D"));
@@ -632,6 +790,55 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         }
     }
 
+    private static async Task<StoredManagedProfileCleanupManifest?> LoadCleanupManifestAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        Guid manifestId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT ManifestId,AccountId,SessionId,State,SourceProfilePath,QuarantinePath,
+                   ExpectedOwnershipId,ConfirmationTokenHash,Revision
+            FROM ManagedProfileCleanupManifests WHERE ManifestId=$manifest;
+            """;
+        command.Parameters.AddWithValue("$manifest", manifestId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var current = ReadCleanupManifest(reader);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("Managed profile cleanup manifest state is invalid.");
+        return current;
+    }
+
+    private static StoredManagedProfileCleanupManifest ReadCleanupManifest(SqliteDataReader reader)
+    {
+        try
+        {
+            var state = reader.GetString(3) switch
+            {
+                "Prepared" => ManagedProfileCleanupState.Prepared,
+                "QuarantineMoveIntent" => ManagedProfileCleanupState.QuarantineMoveIntent,
+                "Quarantined" => ManagedProfileCleanupState.Quarantined,
+                "DeleteIntent" => ManagedProfileCleanupState.DeleteIntent,
+                "CleanupPending" => ManagedProfileCleanupState.CleanupPending,
+                "Deleted" => ManagedProfileCleanupState.Deleted,
+                _ => throw new InvalidDataException(),
+            };
+            var manifest = new ManagedProfileCleanupManifest(
+                Guid.ParseExact(reader.GetString(0), "D"), Guid.ParseExact(reader.GetString(1), "D"),
+                Guid.ParseExact(reader.GetString(2), "D"), reader.GetString(4), reader.GetString(5),
+                reader.GetString(6), reader.IsDBNull(7) ? null : reader.GetString(7));
+            return new StoredManagedProfileCleanupManifest(manifest, state, reader.GetInt64(8));
+        }
+        catch (Exception exception) when (exception is ArgumentException or FormatException or InvalidDataException or
+                                                 InvalidCastException or OverflowException)
+        {
+            throw new InvalidDataException("Managed profile cleanup manifest state is invalid.");
+        }
+    }
+
     private static async Task<int> UpdateInstallationStateAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -750,6 +957,17 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         ManagedBrowserSessionLifecycleState.CleanupPending => "CleanupPending",
         ManagedBrowserSessionLifecycleState.Deleted => "Deleted",
         _ => throw new ArgumentOutOfRangeException(nameof(state), state, "A valid session state is required."),
+    };
+
+    private static string FormatState(ManagedProfileCleanupState state) => state switch
+    {
+        ManagedProfileCleanupState.Prepared => "Prepared",
+        ManagedProfileCleanupState.QuarantineMoveIntent => "QuarantineMoveIntent",
+        ManagedProfileCleanupState.Quarantined => "Quarantined",
+        ManagedProfileCleanupState.DeleteIntent => "DeleteIntent",
+        ManagedProfileCleanupState.CleanupPending => "CleanupPending",
+        ManagedProfileCleanupState.Deleted => "Deleted",
+        _ => throw new ArgumentOutOfRangeException(nameof(state), state, "A valid cleanup state is required."),
     };
 
     private static void AddRetentionParameters(

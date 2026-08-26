@@ -114,8 +114,9 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
         await graph.AddTransferAsync(Guid.NewGuid(), second, graph.Account2, 3, 3, "/second", "Failed", "SECOND_FAILED");
         var share = Guid.NewGuid();
         await graph.ExecuteAsync("""
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
-            VALUES($share,$transfer,$resource,$batch,$account1,1,'Succeeded','exact','settings',1,'Unknown',$now,$now);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account1,1,'Succeeded','exact','settings',1,'Unknown',$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL);
             INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,IsAccepted,IsCurrent,SharedAt,UpdatedAt)
             VALUES($oldResult,$share,$batch,$resource,$account1,1,1,'exact','settings',1,'old-share','https://old','old0',1,0,$now,$now),
                   ($rejectedResult,$share,$batch,$resource,$account1,1,1,'exact','settings',1,'rejected-share','https://rejected-current','bad0',0,1,$now,$now),
@@ -191,8 +192,9 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
         var transfer = Guid.NewGuid();
         await graph.AddTransferAsync(transfer, resource, graph.Account1, 1, 1, "/target", "Succeeded", null);
         await graph.ExecuteAsync("""
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
-            VALUES($share,$transfer,$resource,$batch,$account1,1,$status,'exact','settings',1,'Unknown',$now,$now);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account1,1,$status,'exact','settings',1,'Unknown',$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL);
             """,
             ("$share", Guid.NewGuid()), ("$transfer", transfer), ("$resource", resource), ("$status", shareStatus));
 
@@ -221,9 +223,11 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
         await graph.AddTransferAsync(firstTransfer, first, graph.Account1, 1, 1, "/first", "Succeeded", null);
         await graph.AddTransferAsync(secondTransfer, second, graph.Account1, 2, 2, "/second", "Succeeded", null);
         await graph.ExecuteAsync("""
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
-            VALUES($firstShare,$firstTransfer,$first,$batch,$account1,1,'Succeeded','same-set','settings',1,'Unknown',$now,$now),
-                  ($secondShare,$secondTransfer,$second,$batch,$account1,1,'ReusedExisting','same-set','settings',1,'Unknown',$now,$now);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($firstShare,$firstTransfer,$first,$batch,$account1,1,'Succeeded','same-set','settings',1,'Unknown',$now,$now,
+                    'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL),
+                  ($secondShare,$secondTransfer,$second,$batch,$account1,1,'ReusedExisting','same-set','settings',1,'Unknown',$now,$now,
+                    'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL);
             INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,IsAccepted,IsCurrent,SharedAt,UpdatedAt)
             VALUES($oldResult,$firstShare,$batch,$first,$account1,1,1,'same-set','settings',1,'old-share','https://old','old0',1,0,$now,$now),
                   ($currentResult,$secondShare,$batch,$second,$account1,2,1,'same-set','settings',1,'current-share','https://current','new1',1,1,$now,$now);
@@ -265,8 +269,9 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
         var share = Guid.NewGuid();
         await graph.AddTransferAsync(transfer, resource, graph.Account1, 1, 1, "/target", "Succeeded", null);
         await graph.ExecuteAsync("""
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
-            VALUES($share,$transfer,$resource,$batch,$account1,1,'Succeeded','exact','settings',1,'Unknown',$now,$now);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account1,1,'Succeeded','exact','settings',1,'Unknown',$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL);
             INSERT INTO BaiduShareResults(Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,IsAccepted,IsCurrent,SharedAt,UpdatedAt)
             VALUES($result,$share,$batch,$resource,$account1,1,1,'exact','settings',1,'share-id','https://pan.baidu.com/s/replacement','r4nd',1,1,$now,$now);
             """,
@@ -334,10 +339,11 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
                    printf('30000000-0000-0000-0000-%012d',x),x,
                    'https://mutable/'||x,'normalized-'||x,'None','Unknown','Expanded',$now,$now,'标题-'||x FROM seq;
             WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<200000)
-            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,LastErrorCode,CreatedAt,UpdatedAt)
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,LastErrorCode,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             SELECT printf('50000000-0000-0000-0000-%012d',x),
                    printf('40000000-0000-0000-0000-%012d',x),$batch,x,x,'/target','/target','',$account1,
-                   'Weighted','Failed','Failed',1,'fingerprint-'||x,'{}','ResultReceived','Fulfilled','SCALE_FAILURE',$now,$now FROM seq;
+                   'Weighted','Failed','Failed',1,'fingerprint-'||x,'{}','ResultReceived','Fulfilled','SCALE_FAILURE',$now,$now,
+                   'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account1,'-','')),NULL,NULL FROM seq;
             """);
 
         GC.Collect();
@@ -411,8 +417,9 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
 
         public Task AddTransferAsync(Guid operationId, Guid resourceId, Guid accountId, long sequenceNumber,
             long allocationOrdinal, string targetPath, string status, string? errorCode) => ExecuteAsync("""
-                INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,LastErrorCode,CreatedAt,UpdatedAt)
-                VALUES($operation,$resource,$batch,$sequence,$ordinal,$path,$path,'',$account,'Weighted',$status,NULL,1,$fingerprint,'{}','ResultReceived','Fulfilled',$error,$now,$now);
+                INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,LastErrorCode,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($operation,$resource,$batch,$sequence,$ordinal,$path,$path,'',$account,'Weighted',$status,NULL,1,$fingerprint,'{}','ResultReceived','Fulfilled',$error,$now,$now,
+                  'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
                 """,
                 ("$operation", operationId), ("$resource", resourceId), ("$account", accountId),
                 ("$sequence", sequenceNumber), ("$ordinal", allocationOrdinal), ("$path", targetPath),

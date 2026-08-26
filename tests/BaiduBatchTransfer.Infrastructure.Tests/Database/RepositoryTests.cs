@@ -1169,15 +1169,19 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             INSERT INTO TransferOperations(
               Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
               CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
-              OperationFingerprint,ConfirmationDescriptorJson,RemoteItemIdsJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+              OperationFingerprint,ConfirmationDescriptorJson,RemoteItemIdsJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($transfer,$resource,$transferBatch,1,1,'/','/','',$account,'Rule','Succeeded',
-              'NewTransfer',2,'operation','{}','["exact-remote"]','ResultReceived','Fulfilled',$now,$now);
+              'NewTransfer',2,'operation','{}','["exact-remote"]','ResultReceived','Fulfilled',$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
 
             INSERT INTO ShareOperations(
               Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
-              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt)
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($transferShare,$transfer,$resource,$transferBatch,$account,1,'Succeeded',
-              $fingerprint,'settings',2,'Unknown',$now,$now);
+              $fingerprint,'settings',2,'Unknown',$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO BaiduShareResults(
               Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,
@@ -1188,9 +1192,11 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             INSERT INTO StandaloneShareOperations(
               Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,
               ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
-              SettingsFingerprint,CreatedAt,UpdatedAt)
+              SettingsFingerprint,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($standaloneShare,$standaloneBatch,$account,1,'safe','File','/',
-              $fingerprint,2,'Succeeded','Completed','Unknown','standalone-settings',$now,$now);
+              $fingerprint,2,'Succeeded','Completed','Unknown','standalone-settings',$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO StandaloneShareResults(
               Id,OperationId,BatchId,AccountId,Generation,ExactItemSetFingerprint,SettingsFingerprint,
               ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited,AcceptedAt,CreatedAt)
@@ -1200,11 +1206,15 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
             INSERT INTO WebAutomationAttempts(
               OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,BaselineItemCount,
               BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
-              AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
+              AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES
-              ($transfer,$account,2,'Transfer','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now),
-              ($transferShare,$account,2,'TransferShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now),
-              ($standaloneShare,$account,2,'StandaloneShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now);
+              ($transfer,$account,2,'Transfer','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now,
+                'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL),
+              ($transferShare,$account,2,'TransferShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now,
+                'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL),
+              ($standaloneShare,$account,2,'StandaloneShare','Succeeded','baseline',1,$now,0,1,$now,$now,$fingerprint,1,$now,
+                'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
               OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
             VALUES
@@ -1222,6 +1232,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         command.Parameters.AddWithValue("$standaloneBatch", standaloneBatch.ToString("D"));
         command.Parameters.AddWithValue("$account", account.ToString("D"));
         command.Parameters.AddWithValue("$fingerprint", fingerprint);
+        command.Parameters.AddWithValue("$legacyProfile", ExecutionProfileSnapshot.LegacyForAccount(account).ProfileId);
         command.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey("exact-remote"));
         command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
         await command.ExecuteNonQueryAsync();

@@ -780,8 +780,9 @@ public sealed class ReconciliationTests
             VALUES($batch,1,1,'Random',NULL,'Ask','settings-fingerprint',$now);
             INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
             VALUES($batch,$account,1,'账号',1,1,1);
-            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
-            SELECT $share,o.Id,o.ResourceItemId,o.BatchJobId,o.AssignedAccountId,1,'WaitingTransfer',NULL,'settings-fingerprint',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            SELECT $share,o.Id,o.ResourceItemId,o.BatchJobId,o.AssignedAccountId,1,'WaitingTransfer',NULL,'settings-fingerprint',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now,
+                   'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace(o.AssignedAccountId,'-','')),NULL,NULL
             FROM TransferOperations o WHERE o.Id=$operation;
             """,
             ("$batch", data.BatchId.ToString("D")),

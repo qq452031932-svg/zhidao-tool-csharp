@@ -567,9 +567,11 @@ public sealed class BatchRunControlServiceTests
               Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
               SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
-              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,
-              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
             """,
             ("$batch", batchId.ToString("D")), ("$account", accountId.ToString("D")),
             ("$share", shareId.ToString("D")), ("$operation", operation.Id.ToString("D")),
@@ -994,9 +996,11 @@ public sealed class BatchRunControlServiceTests
               Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,
               SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,
-              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+              LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,
-              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now);
+              NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
             """, ("$share", Guid.NewGuid().ToString("D")), ("$operation", operationId.ToString("D")),
             ("$resource", resourceId.ToString("D")), ("$batch", batchId.ToString("D")),
             ("$account", accountId.ToString("D")), ("$now", Now.ToString("O")));

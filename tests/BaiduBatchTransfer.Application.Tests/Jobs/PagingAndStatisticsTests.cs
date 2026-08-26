@@ -958,12 +958,14 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
                 INSERT INTO TransferOperations(
                     Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
                     AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,
-                    SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+                    SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+                    ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 SELECT printf('20000000-0000-0000-0000-%012d',x),
                     printf('10000000-0000-0000-0000-%012d',x),$batch,x,x,'/target','/target',$account,'Rule',
                     CASE x%4 WHEN 0 THEN 'Waiting' WHEN 3 THEN 'Failed' ELSE 'Succeeded' END,
                     CASE x%4 WHEN 1 THEN 'NewTransfer' WHEN 2 THEN 'AlreadySatisfied' WHEN 3 THEN 'Failed' ELSE NULL END,
-                    0,'fp-'||x,'NotPrepared','Unoccupied',$time,$time
+                    0,'fp-'||x,'NotPrepared','Unoccupied',$time,$time,
+                    'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL
                 FROM seq;
                 """, ("$batch", batch.ToString("D")), ("$account", account.ToString("D")), ("$time", BatchTestData.Now.ToString("O")));
 
@@ -1132,9 +1134,11 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
               Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
               AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,
-              SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+              SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($share,$transfer,$resource,$batch,$account,1,$status,'exact-fp','settings-fp',1,
-              NULL,NULL,'DefinitelyNotAccepted',1,1,NULL,NULL,NULL,$error,'safe share failure',$time,$time);
+              NULL,NULL,'DefinitelyNotAccepted',1,1,NULL,NULL,NULL,$error,'safe share failure',$time,$time,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
             INSERT INTO ShareOperationRemoteItems(
               ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
             VALUES($share,0,'remote-1',X'01','remote');
@@ -1172,9 +1176,11 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
               Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
               AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,
-              SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt)
+              SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($share,$transfer,$resource,$batch,$account,1,'WaitingTransfer',
-              NULL,'settings-fp',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$time,$time);
+              NULL,'settings-fp',1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$time,$time,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
             """,
             ("$batch", batch.ToString("D")),
             ("$account", account.ToString("D")),

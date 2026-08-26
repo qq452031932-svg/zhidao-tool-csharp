@@ -14,35 +14,9 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     [Fact]
     public async Task AttemptInheritsAndRoundTripsTheExactManagedParentSnapshot()
     {
-        var graph = await CreateAsync();
+        var graph = await CreateAsync(managedTransfer: true);
         await SetTransferGenerationAsync(graph, 1);
-        var state = new SqliteManagedBrowserStateStore(graph.Factory);
-        var directory = Path.GetFullPath(Path.Combine(root, "managed-attempt-chrome"));
-        var installation = new BrowserInstallationIdentity(
-            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
-            "Google LLC", "Google Chrome", "managed-attempt-file");
-        await state.CreateInstallationAsync(installation, default);
-        var session = new ManagedBrowserSessionReference(
-            Guid.NewGuid(), installation.InstallationId, graph.AccountId, "owner",
-            BrowserFamily.Chrome, "managed-attempt-profile", "managed-attempt-owner");
-        await state.CreateSessionAsync(session, default);
-        var snapshot = ExecutionProfileSnapshot.Managed(
-            BrowserFamily.Chrome, session.ProfileId, installation.InstallationId, session.SessionId);
-        await using (var connection = await graph.Factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                UPDATE TransferOperations
-                SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId=$profile,
-                    InstallationId=$installation,SessionId=$session
-                WHERE Id=$operation;
-                """;
-            command.Parameters.AddWithValue("$profile", session.ProfileId);
-            command.Parameters.AddWithValue("$installation", installation.InstallationId.ToString("D"));
-            command.Parameters.AddWithValue("$session", session.SessionId.ToString("D"));
-            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
-            await command.ExecuteNonQueryAsync();
-        }
+        var snapshot = graph.TransferExecutionProfile;
 
         Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now, snapshot)));
@@ -54,6 +28,27 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Assert.Equal(snapshot.ProfileId, restored.ExecutionProfile.ProfileId);
         Assert.Equal(snapshot.InstallationId, restored.ExecutionProfile.InstallationId);
         Assert.Equal(snapshot.SessionId, restored.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
+    public async Task HistoricalAttemptMetadataCanAdvanceAfterTheParentStartsANewerGeneration()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        await SetTransferGenerationAsync(graph, 2);
+
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE WebAutomationAttempts SET UpdatedAt=$updated
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """;
+        command.Parameters.AddWithValue("$updated", graph.Now.AddMinutes(1).ToString("O"));
+        command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+        Assert.Equal(1, await command.ExecuteNonQueryAsync());
     }
 
     [Fact]
@@ -391,6 +386,36 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task LoadFailsClosedWhenThePersistedAttemptNoLongerMatchesItsParentOwnerTuple()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                DROP TRIGGER TR_WebAutomationAttempts_ExecutionSnapshotImmutable;
+                DROP TRIGGER TR_WebAutomationAttempts_ExactOwnerSnapshot_Update;
+                PRAGMA ignore_check_constraints=ON;
+                UPDATE WebAutomationAttempts SET ProfileId='corrupt-profile'
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new SqliteWebAutomationAttemptStore(graph.Factory).GetAsync(
+                graph.OperationId, graph.AccountId, 1));
+
+        Assert.Equal("WEB_ATTEMPT_OWNER_SNAPSHOT_MISMATCH", error.Message);
+    }
+
+    [Fact]
     public async Task RequestOwnershipRequiresTheExactAuthoritativeBatchAccountAndGeneration()
     {
         var graph = await CreateAsync();
@@ -705,7 +730,8 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
 
     private async Task<Graph> CreateAsync(
         int maximumBaselineItemCount = 100_000,
-        int baselineReadPageSize = 1_000)
+        int baselineReadPageSize = 1_000,
+        bool managedTransfer = false)
     {
         Directory.CreateDirectory(root);
         var factory = new SqliteConnectionFactory(Path.Combine(root, "app.db"));
@@ -720,14 +746,19 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         var standaloneBatchId = Guid.NewGuid();
         var standaloneOperationId = Guid.NewGuid();
         var now = new DateTimeOffset(2026, 8, 25, 0, 0, 0, TimeSpan.Zero);
+        var transferExecutionProfile = managedTransfer
+            ? ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Chrome, $"managed-attempt-profile-{Guid.NewGuid():N}",
+                Guid.NewGuid(), Guid.NewGuid())
+            : ExecutionProfileSnapshot.LegacyForAccount(accountId);
         await SeedBusinessOwnersAsync(
             factory, accountId, otherAccountId, batchId, resourceId, operationId,
-            shareOperationId, standaloneBatchId, standaloneOperationId, now);
+            shareOperationId, standaloneBatchId, standaloneOperationId, now, transferExecutionProfile);
         return new Graph(
             new SqliteWebAutomationAttemptStore(factory, maximumBaselineItemCount, baselineReadPageSize),
             factory,
             operationId, shareOperationId, standaloneOperationId, batchId, standaloneBatchId,
-            accountId, otherAccountId, now);
+            accountId, otherAccountId, now, transferExecutionProfile);
     }
 
     private static async Task SeedBusinessOwnersAsync(
@@ -740,7 +771,8 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Guid shareOperationId,
         Guid standaloneBatchId,
         Guid standaloneOperationId,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        ExecutionProfileSnapshot transferExecutionProfile)
     {
         await using var connection = await factory.OpenConnectionAsync();
         await using var command = connection.CreateCommand();
@@ -749,6 +781,18 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
               SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
             VALUES($account,'owner','owner','WebView2','Active',0,0,0,1,'2026-08-25',0),
                   ($other,'other','other','WebView2','Active',0,0,1,1,'2026-08-25',0);
+            INSERT INTO BrowserInstallations(
+              InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,ProductName,
+              FileIdentity,State,Revision,CreatedAt,UpdatedAt)
+            SELECT $installation,$family,$browserDirectory,$executable,'Google LLC','Google Chrome',$fileIdentity,
+                   'Retired',0,$now,$now
+            WHERE $managed=1;
+            INSERT INTO ManagedBrowserSessions(
+              SessionId,AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,ProfileOwnershipId,
+              State,Revision,CreatedAt,UpdatedAt)
+            SELECT $session,$account,'owner',$installation,$family,$transferProfile,$ownership,
+                   'Retired',0,$now,$now
+            WHERE $managed=1;
             INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
               OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
             VALUES($batch,'job','Text','Distribution','TaskCount','ProportionalReduction',1,1,'/','None','Skip',
@@ -758,9 +802,10 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
             VALUES($resource,$batch,1,'https://pan.baidu.com/s/test','test','1111','None','Valid','Expanded',$now,$now);
             INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
               NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
-              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Automatic','Waiting',0,'transfer-fp',
-              'NotPrepared','Unoccupied',$now,$now);
+              'NotPrepared','Unoccupied',$now,$now,$transferEngine,$family,$transferProfile,$installation,$session);
             INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,
               PlannedShareCount,ShareEnabled,CreatedShareOperationCount)
             VALUES($batch,$account,1,'owner',1,1,1,0);
@@ -769,27 +814,21 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
             VALUES($batch,1,1,'Random',NULL,'Ask','settings-fp',$now);
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
               Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,
-              LeaseGeneration,BaselineShareCount,CreatedAt,UpdatedAt)
-            VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,'Unknown',0,0,0,$now,$now);
+              LeaseGeneration,BaselineShareCount,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$operation,$resource,$batch,$account,1,'WaitingTransfer',NULL,'settings-fp',1,'Unknown',0,0,0,$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO StandaloneShareBatches(Id,DraftFingerprint,ResultDirectoryReference,Status,OperationCount,
               Revision,CreatedAt,UpdatedAt)
             VALUES($standaloneBatch,'draft-fp',$directory,'Queued',1,0,$now,$now);
             INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
               ParentPath,ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
-              LeaseGeneration,Revision,CreatedAt,UpdatedAt)
+              LeaseGeneration,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($standaloneOperation,$standaloneBatch,$account,1,'item','File','/','exact-fp',1,'Queued',
-              'NotStarted','Unknown',0,0,$now,$now);
+              'NotStarted','Unknown',0,0,$now,$now,'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO StandaloneShareRemoteItems(OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
             VALUES($standaloneOperation,0,'remote-id',X'01','item');
-            UPDATE TransferOperations
-            SET ProfileId='legacy-webview2-account-' || lower(replace(AssignedAccountId,'-',''))
-            WHERE Id=$operation;
-            UPDATE ShareOperations
-            SET ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
-            WHERE Id=$share;
-            UPDATE StandaloneShareOperations
-            SET ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
-            WHERE Id=$standaloneOperation;
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$other", otherAccountId.ToString("D"));
@@ -799,6 +838,19 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         command.Parameters.AddWithValue("$share", shareOperationId.ToString("D"));
         command.Parameters.AddWithValue("$standaloneBatch", standaloneBatchId.ToString("D"));
         command.Parameters.AddWithValue("$standaloneOperation", standaloneOperationId.ToString("D"));
+        command.Parameters.AddWithValue("$legacyProfile", ExecutionProfileSnapshot.LegacyForAccount(accountId).ProfileId);
+        command.Parameters.AddWithValue("$managed", transferExecutionProfile.Engine == BaiduExecutionEngine.ManagedChromiumV1 ? 1 : 0);
+        command.Parameters.AddWithValue("$transferEngine", transferExecutionProfile.Engine == BaiduExecutionEngine.ManagedChromiumV1
+            ? "ManagedChromium-v1" : "WebView2-v1");
+        command.Parameters.AddWithValue("$family", transferExecutionProfile.BrowserFamily.ToString());
+        command.Parameters.AddWithValue("$transferProfile", transferExecutionProfile.ProfileId);
+        command.Parameters.AddWithValue("$installation", (object?)transferExecutionProfile.InstallationId?.ToString("D") ?? DBNull.Value);
+        command.Parameters.AddWithValue("$session", (object?)transferExecutionProfile.SessionId?.ToString("D") ?? DBNull.Value);
+        var directory = Path.Combine(Path.GetTempPath(), $"managed-attempt-{operationId:N}");
+        command.Parameters.AddWithValue("$browserDirectory", directory);
+        command.Parameters.AddWithValue("$executable", Path.Combine(directory, "chrome.exe"));
+        command.Parameters.AddWithValue("$fileIdentity", $"managed-attempt-file-{operationId:N}");
+        command.Parameters.AddWithValue("$ownership", $"managed-attempt-owner-{operationId:N}");
         command.Parameters.AddWithValue("$directory", Path.Combine(Path.GetTempPath(), $"web-owner-{standaloneBatchId:N}"));
         command.Parameters.AddWithValue("$now", now.ToString("O"));
         await command.ExecuteNonQueryAsync();
@@ -827,5 +879,6 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Guid StandaloneBatchId,
         Guid AccountId,
         Guid OtherAccountId,
-        DateTimeOffset Now);
+        DateTimeOffset Now,
+        ExecutionProfileSnapshot TransferExecutionProfile);
 }

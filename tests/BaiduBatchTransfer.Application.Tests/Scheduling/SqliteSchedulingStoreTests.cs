@@ -21,9 +21,7 @@ public sealed class SqliteSchedulingStoreTests
         var batch = Guid.NewGuid();
         var account = Guid.NewGuid();
         var resource = Resource(batch, 1, null);
-        var operation = Operation(resource, account, 1);
-        await db.SeedAsync([Account(account, 0)], job: Job(batch, "TaskCount", "Active", 1, 1),
-            resources: [resource], operations: [operation], allocations: [Allocation(batch, account, 1, 1)]);
+        await db.SeedAsync([Account(account, 0)]);
         var state = new SqliteManagedBrowserStateStore(db.ConnectionFactory);
         var directory = Path.GetFullPath(Path.Combine(Path.GetTempPath(), $"managed-scheduling-{Guid.NewGuid():N}"));
         var installation = new BrowserInstallationIdentity(
@@ -34,14 +32,13 @@ public sealed class SqliteSchedulingStoreTests
             Guid.NewGuid(), installation.InstallationId, account, $"baidu-{account:N}",
             BrowserFamily.Edge, $"managed-scheduling-{account:N}", $"owner-{account:N}");
         await state.CreateSessionAsync(session, default);
-        await ExecuteAsync(db, """
-            UPDATE TransferOperations
-            SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Edge',ProfileId=$profile,
-                InstallationId=$installation,SessionId=$session
-            WHERE Id=$operation;
-            """, ("$profile", session.ProfileId),
-            ("$installation", installation.InstallationId.ToString("D")),
-            ("$session", session.SessionId.ToString("D")), ("$operation", operation.Id.ToString("D")));
+        var operation = Operation(resource, account, 1) with
+        {
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Edge, session.ProfileId, installation.InstallationId, session.SessionId),
+        };
+        await db.SeedAsync([], job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource], operations: [operation], allocations: [Allocation(batch, account, 1, 1)]);
 
         var loaded = await new SqliteTransferSchedulingStore(db.ConnectionFactory)
             .LoadOperationAsync(operation.Id);
@@ -395,14 +392,16 @@ public sealed class SqliteSchedulingStoreTests
             INSERT INTO TransferOperations(
                 Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
                 CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
-                OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+                OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+                ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             SELECT printf('30000000-0000-0000-0000-%012d',n+1),
                 printf('20000000-0000-0000-0000-%012d',n+1),$batch,n+1,n+1,'/base','/base','',$account,'Weighted',
                 CASE WHEN n<199744 THEN 'Succeeded' ELSE 'Waiting' END,
                 CASE WHEN n<199744 THEN 'NewTransfer' ELSE NULL END,0,'task-fp-'||(n+1),
                 CASE WHEN n<199744 THEN '{}' ELSE NULL END,
                 CASE WHEN n<199744 THEN 'ResultReceived' ELSE 'NotPrepared' END,
-                CASE WHEN n<199744 THEN 'Fulfilled' ELSE 'Unoccupied' END,$now,$now
+                CASE WHEN n<199744 THEN 'Fulfilled' ELSE 'Unoccupied' END,$now,$now,
+                'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL
             FROM numbers;
             """,
             ("$batch", batch.ToString("D")), ("$account", account.ToString("D")), ("$now", Now.ToString("O")));
@@ -1061,6 +1060,90 @@ public sealed class SqliteSchedulingStoreTests
 
         Assert.Equal("/override", await ScalarStringAsync(db, "SELECT TargetPath FROM TransferOperations"));
         Assert.Equal("/override", await ScalarStringAsync(db, "SELECT NormalizedTargetPath FROM TransferOperations"));
+    }
+
+    [Theory]
+    [InlineData("attempt")]
+    [InlineData("daily")]
+    [InlineData("confirmation")]
+    [InlineData("submit-started")]
+    [InlineData("adapter-request")]
+    [InlineData("remote-items")]
+    public async Task ReassignmentRejectsAnyStartedOrRemoteSideEffectEvidence(string evidence)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var oldAccount = Guid.NewGuid();
+        var newAccount = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, oldAccount, 1);
+        await db.SeedAsync([Account(oldAccount, 0), Account(newAccount, 0)],
+            job: Job(batch, "TaskCount", "Paused", 1, 1), resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, oldAccount, 1, 1), Allocation(batch, newAccount, 2, 0)]);
+
+        var mutation = evidence switch
+        {
+            "attempt" => "UPDATE TransferOperations SET AttemptCount=1 WHERE Id=$operation; INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) SELECT Id,AssignedAccountId,1,'Transfer','Preparing',0,$now,$now,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId FROM TransferOperations WHERE Id=$operation;",
+            "daily" => "UPDATE TransferOperations SET DailyCountedAt=$now WHERE Id=$operation;",
+            "confirmation" => "UPDATE TransferOperations SET ConfirmationDescriptorJson='{}' WHERE Id=$operation;",
+            "submit-started" => "UPDATE TransferOperations SET SubmitStartedAt=$now WHERE Id=$operation;",
+            "adapter-request" => "UPDATE TransferOperations SET AdapterRequestId='request' WHERE Id=$operation;",
+            "remote-items" => "UPDATE TransferOperations SET RemoteItemIdsJson='[\"remote\"]' WHERE Id=$operation;",
+            _ => throw new ArgumentOutOfRangeException(nameof(evidence)),
+        };
+        await ExecuteAsync(db, mutation, ("$operation", operation.Id.ToString("D")), ("$now", Now.ToString("O")));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var state = await store.LoadAsync(batch);
+
+        var applied = await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(operation.Id, oldAccount, newAccount)], [],
+            [new ReassignmentAllocationDelta(oldAccount, 1, 0, -1),
+             new ReassignmentAllocationDelta(newAccount, 0, 1, 1)]), state!.BatchVersion);
+
+        Assert.False(applied);
+        Assert.Equal(oldAccount, await ScalarGuidAsync(db,
+            "SELECT AssignedAccountId FROM TransferOperations WHERE Id=$id", operation.Id));
+    }
+
+    [Fact]
+    public async Task ManagedOperationCannotBeReassignedWithoutAnExplicitValidatedTargetSnapshot()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var oldAccount = Guid.NewGuid();
+        var newAccount = Guid.NewGuid();
+        await db.SeedAsync([Account(oldAccount, 0), Account(newAccount, 0)]);
+        var browserStore = new SqliteManagedBrowserStateStore(db.ConnectionFactory);
+        var directory = Path.Combine(Path.GetTempPath(), $"managed-reassignment-{Guid.NewGuid():N}");
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+            "Google LLC", "Google Chrome", $"managed-reassignment-file-{Guid.NewGuid():N}");
+        await browserStore.CreateInstallationAsync(installation, default);
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.InstallationId, oldAccount, $"baidu-{oldAccount:N}",
+            BrowserFamily.Chrome, $"managed-reassignment-profile-{Guid.NewGuid():N}",
+            $"managed-reassignment-owner-{Guid.NewGuid():N}");
+        await browserStore.CreateSessionAsync(session, default);
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, oldAccount, 1) with
+        {
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Chrome, session.ProfileId, installation.InstallationId, session.SessionId),
+        };
+        await db.SeedAsync([], job: Job(batch, "TaskCount", "Paused", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, oldAccount, 1, 1), Allocation(batch, newAccount, 2, 0)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var state = await store.LoadAsync(batch);
+
+        var applied = await store.ApplyAsync(new ReassignmentMutation(batch,
+            [new ReassignmentOperationMove(operation.Id, oldAccount, newAccount)], [],
+            [new ReassignmentAllocationDelta(oldAccount, 1, 0, -1),
+             new ReassignmentAllocationDelta(newAccount, 0, 1, 1)]), state!.BatchVersion);
+
+        Assert.False(applied);
+        Assert.Equal(oldAccount, await ScalarGuidAsync(db,
+            "SELECT AssignedAccountId FROM TransferOperations WHERE Id=$id", operation.Id));
     }
 
     [Fact]

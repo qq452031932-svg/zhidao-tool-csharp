@@ -40,6 +40,7 @@ CREATE TABLE ManagedBrowserSessions (
     UNIQUE(SessionId,InstallationId),
     UNIQUE(SessionId,InstallationId,BrowserFamily),
     UNIQUE(SessionId,InstallationId,BrowserFamily,ProfileId,AccountId),
+    UNIQUE(SessionId,AccountId,ProfileOwnershipId),
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
     FOREIGN KEY(InstallationId,BrowserFamily)
       REFERENCES BrowserInstallations(InstallationId,BrowserFamily)
@@ -65,7 +66,8 @@ CREATE TABLE ManagedProfileCleanupManifests (
     CreatedAt TEXT NOT NULL,
     UpdatedAt TEXT NOT NULL,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
-    FOREIGN KEY(SessionId) REFERENCES ManagedBrowserSessions(SessionId)
+    FOREIGN KEY(SessionId,AccountId,ExpectedOwnershipId)
+      REFERENCES ManagedBrowserSessions(SessionId,AccountId,ProfileOwnershipId)
 );
 
 CREATE INDEX IX_ManagedProfileCleanupManifests_Session_State
@@ -178,9 +180,9 @@ CREATE TABLE TransferOperations_v16 (
     TargetSlotReservedAt TEXT NULL, DailyCountedAt TEXT NULL,
     SubmitStartedAt TEXT NULL, LastErrorCode TEXT NULL, LastErrorMessage TEXT NULL, LeaseExpiresAt TEXT NULL,
     CreatedAt TEXT NOT NULL, UpdatedAt TEXT NOT NULL,
-    ExecutionEngineVersion TEXT NOT NULL DEFAULT 'WebView2-v1',
-    BrowserFamily TEXT NOT NULL DEFAULT 'LegacyWebView2' CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
-    ProfileId TEXT NOT NULL DEFAULT 'legacy-webview2-unassigned' CHECK(length(trim(ProfileId)) > 0),
+    ExecutionEngineVersion TEXT NOT NULL,
+    BrowserFamily TEXT NOT NULL CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
+    ProfileId TEXT NOT NULL CHECK(length(trim(ProfileId)) > 0),
     InstallationId TEXT NULL, SessionId TEXT NULL,
     FOREIGN KEY(ResourceItemId) REFERENCES ResourceItems(Id) ON DELETE CASCADE,
     FOREIGN KEY(BatchJobId) REFERENCES BatchJobs(Id) ON DELETE CASCADE, FOREIGN KEY(AssignedAccountId) REFERENCES Accounts(Id),
@@ -189,6 +191,7 @@ CREATE TABLE TransferOperations_v16 (
       REFERENCES ManagedBrowserSessions(SessionId,InstallationId,BrowserFamily,ProfileId,AccountId),
     CHECK(SubmitState IN ('NotPrepared','PreparingToSubmit') OR ConfirmationDescriptorJson IS NOT NULL),
     CHECK((ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+             AND ProfileId='legacy-webview2-account-' || lower(replace(AssignedAccountId,'-',''))
              AND InstallationId IS NULL AND SessionId IS NULL)
        OR (ExecutionEngineVersion='ManagedChromium-v1' AND BrowserFamily IN ('Chrome','Edge')
              AND InstallationId IS NOT NULL AND SessionId IS NOT NULL))
@@ -238,9 +241,9 @@ CREATE TABLE ShareOperations_v16 (
     LastErrorMessage TEXT NULL,
     CreatedAt TEXT NOT NULL,
     UpdatedAt TEXT NOT NULL,
-    ExecutionEngineVersion TEXT NOT NULL DEFAULT 'WebView2-v1',
-    BrowserFamily TEXT NOT NULL DEFAULT 'LegacyWebView2' CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
-    ProfileId TEXT NOT NULL DEFAULT 'legacy-webview2-unassigned' CHECK(length(trim(ProfileId)) > 0),
+    ExecutionEngineVersion TEXT NOT NULL,
+    BrowserFamily TEXT NOT NULL CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
+    ProfileId TEXT NOT NULL CHECK(length(trim(ProfileId)) > 0),
     InstallationId TEXT NULL, SessionId TEXT NULL,
     FOREIGN KEY(TransferOperationId) REFERENCES TransferOperations(Id) ON DELETE CASCADE,
     FOREIGN KEY(ResourceItemId) REFERENCES ResourceItems(Id) ON DELETE CASCADE,
@@ -262,6 +265,7 @@ CREATE TABLE ShareOperations_v16 (
     CHECK((BaselineCompletedAt IS NULL AND BaselineGeneration IS NULL AND BaselineFingerprint IS NULL AND BaselineShareCount=0)
        OR (BaselineCompletedAt IS NOT NULL AND BaselineGeneration IS NOT NULL AND BaselineFingerprint IS NOT NULL)),
     CHECK((ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+             AND ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
              AND InstallationId IS NULL AND SessionId IS NULL)
        OR (ExecutionEngineVersion='ManagedChromium-v1' AND BrowserFamily IN ('Chrome','Edge')
              AND InstallationId IS NOT NULL AND SessionId IS NOT NULL))
@@ -317,9 +321,9 @@ CREATE TABLE StandaloneShareOperations_v16 (
     AttemptCount INTEGER NOT NULL DEFAULT 0 CHECK(AttemptCount >= 0),
     NextReconcileAt TEXT NULL,
     ReconciliationIssue TEXT NULL,
-    ExecutionEngineVersion TEXT NOT NULL DEFAULT 'WebView2-v1',
-    BrowserFamily TEXT NOT NULL DEFAULT 'LegacyWebView2' CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
-    ProfileId TEXT NOT NULL DEFAULT 'legacy-webview2-unassigned' CHECK(length(trim(ProfileId)) > 0),
+    ExecutionEngineVersion TEXT NOT NULL,
+    BrowserFamily TEXT NOT NULL CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
+    ProfileId TEXT NOT NULL CHECK(length(trim(ProfileId)) > 0),
     InstallationId TEXT NULL, SessionId TEXT NULL,
     FOREIGN KEY(BatchId) REFERENCES StandaloneShareBatches(Id) ON DELETE CASCADE,
     FOREIGN KEY(AccountId) REFERENCES Accounts(Id),
@@ -333,6 +337,7 @@ CREATE TABLE StandaloneShareOperations_v16 (
     CHECK((LeaseOwnerId IS NULL AND LeaseExpiresAt IS NULL)
        OR (LeaseOwnerId IS NOT NULL AND LeaseExpiresAt IS NOT NULL)),
     CHECK((ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+             AND ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
              AND InstallationId IS NULL AND SessionId IS NULL)
        OR (ExecutionEngineVersion='ManagedChromium-v1' AND BrowserFamily IN ('Chrome','Edge')
              AND InstallationId IS NOT NULL AND SessionId IS NOT NULL))
@@ -401,9 +406,9 @@ CREATE TABLE WebAutomationAttempts_v16 (
     OfficialRequestId TEXT NULL,
     TransferMappingFingerprint TEXT NULL,
     TransferMappingCount INTEGER NOT NULL DEFAULT 0 CHECK(TransferMappingCount >= 0),
-    ExecutionEngineVersion TEXT NOT NULL DEFAULT 'WebView2-v1',
-    BrowserFamily TEXT NOT NULL DEFAULT 'LegacyWebView2' CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
-    ProfileId TEXT NOT NULL DEFAULT 'legacy-webview2-unassigned' CHECK(length(trim(ProfileId)) > 0),
+    ExecutionEngineVersion TEXT NOT NULL,
+    BrowserFamily TEXT NOT NULL CHECK(BrowserFamily IN ('LegacyWebView2','Chrome','Edge')),
+    ProfileId TEXT NOT NULL CHECK(length(trim(ProfileId)) > 0),
     InstallationId TEXT NULL, SessionId TEXT NULL,
     PRIMARY KEY(OperationId, AccountId, Generation),
     FOREIGN KEY(InstallationId) REFERENCES BrowserInstallations(InstallationId),
@@ -416,6 +421,7 @@ CREATE TABLE WebAutomationAttempts_v16 (
     CHECK(State<>'UserHandoff' OR ResumeStage='Preparing'
        OR (BaselineFingerprint IS NOT NULL AND BaselinePersistedAt IS NOT NULL)),
     CHECK((ExecutionEngineVersion='WebView2-v1' AND BrowserFamily='LegacyWebView2'
+             AND ProfileId='legacy-webview2-account-' || lower(replace(AccountId,'-',''))
              AND InstallationId IS NULL AND SessionId IS NULL)
        OR (ExecutionEngineVersion='ManagedChromium-v1' AND BrowserFamily IN ('Chrome','Edge')
              AND InstallationId IS NOT NULL AND SessionId IS NOT NULL))
@@ -509,6 +515,249 @@ ON StandaloneShareOperations(Status,NextReconcileAt,BatchId,SequenceNumber,Id);
 
 CREATE INDEX IX_WebAutomationAttempts_Recovery
 ON WebAutomationAttempts(State,IsWaitingForUser,UpdatedAt,OperationId);
+
+CREATE TRIGGER TR_TransferOperations_ExecutionSnapshotImmutable
+BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+ON TransferOperations
+WHEN NEW.ExecutionEngineVersion IS NOT OLD.ExecutionEngineVersion
+  OR NEW.BrowserFamily IS NOT OLD.BrowserFamily
+  OR NEW.ProfileId IS NOT OLD.ProfileId
+  OR NEW.InstallationId IS NOT OLD.InstallationId
+  OR NEW.SessionId IS NOT OLD.SessionId
+BEGIN
+    SELECT CASE WHEN NOT (
+      OLD.ExecutionEngineVersion='WebView2-v1' AND NEW.ExecutionEngineVersion='WebView2-v1'
+      AND OLD.BrowserFamily='LegacyWebView2' AND NEW.BrowserFamily='LegacyWebView2'
+      AND OLD.InstallationId IS NULL AND NEW.InstallationId IS NULL
+      AND OLD.SessionId IS NULL AND NEW.SessionId IS NULL
+      AND OLD.AssignedAccountId<>NEW.AssignedAccountId
+      AND OLD.ProfileId='legacy-webview2-account-' || lower(replace(OLD.AssignedAccountId,'-',''))
+      AND NEW.ProfileId='legacy-webview2-account-' || lower(replace(NEW.AssignedAccountId,'-',''))
+      AND OLD.Status='Waiting' AND NEW.Status='Waiting'
+      AND OLD.SubmitState='NotPrepared' AND NEW.SubmitState='NotPrepared'
+      AND OLD.AttemptCount=0 AND NEW.AttemptCount=0
+      AND OLD.DailyCountedAt IS NULL AND NEW.DailyCountedAt IS NULL
+      AND OLD.ConfirmationDescriptorJson IS NULL AND NEW.ConfirmationDescriptorJson IS NULL
+      AND OLD.SubmitStartedAt IS NULL AND NEW.SubmitStartedAt IS NULL
+      AND OLD.AdapterRequestId IS NULL AND NEW.AdapterRequestId IS NULL
+      AND OLD.RemoteItemIdsJson IS NULL AND NEW.RemoteItemIdsJson IS NULL
+      AND NOT EXISTS(
+        SELECT 1 FROM WebAutomationAttempts attempt WHERE attempt.OperationId=OLD.Id)
+    ) THEN RAISE(ABORT, 'execution snapshot is immutable') END;
+END;
+
+CREATE TRIGGER TR_ShareOperations_ExecutionSnapshotImmutable
+BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+ON ShareOperations
+WHEN NEW.ExecutionEngineVersion IS NOT OLD.ExecutionEngineVersion
+  OR NEW.BrowserFamily IS NOT OLD.BrowserFamily
+  OR NEW.ProfileId IS NOT OLD.ProfileId
+  OR NEW.InstallationId IS NOT OLD.InstallationId
+  OR NEW.SessionId IS NOT OLD.SessionId
+BEGIN
+    SELECT RAISE(ABORT, 'execution snapshot is immutable');
+END;
+
+CREATE TRIGGER TR_StandaloneShareOperations_ExecutionSnapshotImmutable
+BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+ON StandaloneShareOperations
+WHEN NEW.ExecutionEngineVersion IS NOT OLD.ExecutionEngineVersion
+  OR NEW.BrowserFamily IS NOT OLD.BrowserFamily
+  OR NEW.ProfileId IS NOT OLD.ProfileId
+  OR NEW.InstallationId IS NOT OLD.InstallationId
+  OR NEW.SessionId IS NOT OLD.SessionId
+BEGIN
+    SELECT RAISE(ABORT, 'execution snapshot is immutable');
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_ExecutionSnapshotImmutable
+BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+ON WebAutomationAttempts
+WHEN NEW.ExecutionEngineVersion IS NOT OLD.ExecutionEngineVersion
+  OR NEW.BrowserFamily IS NOT OLD.BrowserFamily
+  OR NEW.ProfileId IS NOT OLD.ProfileId
+  OR NEW.InstallationId IS NOT OLD.InstallationId
+  OR NEW.SessionId IS NOT OLD.SessionId
+BEGIN
+    SELECT RAISE(ABORT, 'execution snapshot is immutable');
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_ExactOwnerSnapshot_Insert
+BEFORE INSERT ON WebAutomationAttempts
+WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
+ AND NOT (
+   (NEW.OwnerKind='Transfer' AND EXISTS(
+      SELECT 1 FROM TransferOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AssignedAccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='TransferShare' AND EXISTS(
+      SELECT 1 FROM ShareOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='StandaloneShare' AND EXISTS(
+      SELECT 1 FROM StandaloneShareOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_ExactOwnerSnapshot_Update
+BEFORE UPDATE ON WebAutomationAttempts
+WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
+ AND NOT (
+   (NEW.OwnerKind='Transfer' AND EXISTS(
+      SELECT 1 FROM TransferOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AssignedAccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='TransferShare' AND EXISTS(
+      SELECT 1 FROM ShareOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='StandaloneShare' AND EXISTS(
+      SELECT 1 FROM StandaloneShareOperations operation
+      WHERE operation.Id=NEW.OperationId AND operation.AccountId=NEW.AccountId
+        AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
+        AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
+        AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_IdentityImmutable
+BEFORE UPDATE OF AccountId,SessionId,SourceProfilePath,QuarantinePath,ExpectedOwnershipId,ConfirmationTokenHash
+ON ManagedProfileCleanupManifests
+WHEN NEW.AccountId IS NOT OLD.AccountId
+  OR NEW.SessionId IS NOT OLD.SessionId
+  OR NEW.SourceProfilePath IS NOT OLD.SourceProfilePath
+  OR NEW.QuarantinePath IS NOT OLD.QuarantinePath
+  OR NEW.ExpectedOwnershipId IS NOT OLD.ExpectedOwnershipId
+  OR NEW.ConfirmationTokenHash IS NOT OLD.ConfirmationTokenHash
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup manifest identity is immutable');
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_DeletedTerminal
+BEFORE UPDATE OF State ON ManagedProfileCleanupManifests
+WHEN OLD.State='Deleted' AND NEW.State<>'Deleted'
+BEGIN
+    SELECT RAISE(ABORT, 'deleted cleanup manifest is terminal');
+END;
+
+CREATE TRIGGER TR_TransferOperations_RetainManagedIdentity_Insert
+AFTER INSERT ON TransferOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    INSERT OR IGNORE INTO ManagedBrowserRetentions(
+      OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
+    VALUES('Operation',NEW.Id,NEW.InstallationId,NEW.SessionId,NEW.CreatedAt);
+END;
+
+CREATE TRIGGER TR_TransferOperations_ReleaseManagedIdentity_Delete
+AFTER DELETE ON TransferOperations
+WHEN OLD.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='Operation' AND OwnerId=OLD.Id
+      AND InstallationId=OLD.InstallationId AND SessionId=OLD.SessionId;
+END;
+
+CREATE TRIGGER TR_ShareOperations_RetainManagedIdentity_Insert
+AFTER INSERT ON ShareOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    INSERT OR IGNORE INTO ManagedBrowserRetentions(
+      OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
+    VALUES('Operation',NEW.Id,NEW.InstallationId,NEW.SessionId,NEW.CreatedAt);
+END;
+
+CREATE TRIGGER TR_ShareOperations_ReleaseManagedIdentity_Delete
+AFTER DELETE ON ShareOperations
+WHEN OLD.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='Operation' AND OwnerId=OLD.Id
+      AND InstallationId=OLD.InstallationId AND SessionId=OLD.SessionId;
+END;
+
+CREATE TRIGGER TR_StandaloneShareOperations_RetainManagedIdentity_Insert
+AFTER INSERT ON StandaloneShareOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    INSERT OR IGNORE INTO ManagedBrowserRetentions(
+      OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
+    VALUES('Operation',NEW.Id,NEW.InstallationId,NEW.SessionId,NEW.CreatedAt);
+END;
+
+CREATE TRIGGER TR_StandaloneShareOperations_ReleaseManagedIdentity_Delete
+AFTER DELETE ON StandaloneShareOperations
+WHEN OLD.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='Operation' AND OwnerId=OLD.Id
+      AND InstallationId=OLD.InstallationId AND SessionId=OLD.SessionId;
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_RetainManagedIdentity_Insert
+AFTER INSERT ON WebAutomationAttempts
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    INSERT OR IGNORE INTO ManagedBrowserRetentions(
+      OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
+    VALUES('Attempt',NEW.OperationId,NEW.InstallationId,NEW.SessionId,NEW.CreatedAt);
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_ReleaseManagedIdentity_Delete
+AFTER DELETE ON WebAutomationAttempts
+WHEN OLD.ExecutionEngineVersion='ManagedChromium-v1'
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='Attempt' AND OwnerId=OLD.OperationId
+      AND InstallationId=OLD.InstallationId AND SessionId=OLD.SessionId
+      AND NOT EXISTS(
+        SELECT 1 FROM WebAutomationAttempts attempt
+        WHERE attempt.OperationId=OLD.OperationId
+          AND attempt.InstallationId IS OLD.InstallationId
+          AND attempt.SessionId IS OLD.SessionId);
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_RetainIdentity_Insert
+AFTER INSERT ON ManagedProfileCleanupManifests
+BEGIN
+    INSERT OR IGNORE INTO ManagedBrowserRetentions(
+      OwnerKind,OwnerId,InstallationId,SessionId,CreatedAt)
+    SELECT 'CleanupManifest',NEW.ManifestId,session.InstallationId,NEW.SessionId,NEW.CreatedAt
+    FROM ManagedBrowserSessions session
+    WHERE session.SessionId=NEW.SessionId AND session.AccountId=NEW.AccountId
+      AND session.ProfileOwnershipId=NEW.ExpectedOwnershipId;
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_ReleaseIdentity_Deleted
+AFTER UPDATE OF State ON ManagedProfileCleanupManifests
+WHEN OLD.State<>'Deleted' AND NEW.State='Deleted'
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='CleanupManifest' AND OwnerId=NEW.ManifestId AND SessionId=NEW.SessionId;
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_ReleaseIdentity_Delete
+AFTER DELETE ON ManagedProfileCleanupManifests
+BEGIN
+    DELETE FROM ManagedBrowserRetentions
+    WHERE OwnerKind='CleanupManifest' AND OwnerId=OLD.ManifestId AND SessionId=OLD.SessionId;
+END;
 
 CREATE TRIGGER TR_ShareOperations_RequireEnabledPlannedOutput
 BEFORE INSERT ON ShareOperations

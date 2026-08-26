@@ -240,7 +240,7 @@ public sealed record TransferOperationRecord(
     DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
     ExecutionProfileSnapshot? PersistedExecutionProfile = null)
 {
-    public ExecutionProfileSnapshot ExecutionProfile { get; } =
+    public ExecutionProfileSnapshot ExecutionProfile =>
         PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AssignedAccountId);
 
     public override string ToString() =>

@@ -13,40 +13,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     [Fact]
     public async Task ReservationReturnsThePersistedManagedExecutionProfileSnapshot()
     {
-        var graph = await CreateGraphAsync(includeShareSettings: true);
-        string uid;
-        await using (var connection = await graph.Factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = "SELECT BaiduUserId FROM Accounts WHERE Id=$id;";
-            command.Parameters.AddWithValue("$id", graph.AccountId.ToString("D"));
-            uid = (string)(await command.ExecuteScalarAsync())!;
-        }
-        var state = new SqliteManagedBrowserStateStore(graph.Factory);
-        var directory = Path.GetFullPath(Path.Combine(root, "managed-share-chrome"));
-        var installation = new BrowserInstallationIdentity(
-            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
-            "Google LLC", "Google Chrome", "managed-share-file");
-        await state.CreateInstallationAsync(installation, default);
-        var session = new ManagedBrowserSessionReference(
-            Guid.NewGuid(), installation.InstallationId, graph.AccountId, uid,
-            BrowserFamily.Chrome, "managed-share-profile", "managed-share-ownership");
-        await state.CreateSessionAsync(session, default);
-        await using (var connection = await graph.Factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                UPDATE ShareOperations
-                SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',ProfileId=$profile,
-                    InstallationId=$installation,SessionId=$session
-                WHERE Id=$id;
-                """;
-            command.Parameters.AddWithValue("$profile", session.ProfileId);
-            command.Parameters.AddWithValue("$installation", installation.InstallationId.ToString("D"));
-            command.Parameters.AddWithValue("$session", session.SessionId.ToString("D"));
-            command.Parameters.AddWithValue("$id", graph.ShareOperationId.ToString("D"));
-            await command.ExecuteNonQueryAsync();
-        }
+        var graph = await CreateGraphAsync(includeShareSettings: true, managedShare: true);
 
         var reserved = await new SqliteShareSchedulingStore(graph.Factory)
             .TryReserveNextAsync(graph.Now, TimeSpan.FromMinutes(2));
@@ -54,9 +21,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.NotNull(reserved);
         Assert.Equal(BaiduExecutionEngine.ManagedChromiumV1, reserved.ExecutionProfile.Engine);
         Assert.Equal(BrowserFamily.Chrome, reserved.ExecutionProfile.BrowserFamily);
-        Assert.Equal(session.ProfileId, reserved.ExecutionProfile.ProfileId);
-        Assert.Equal(installation.InstallationId, reserved.ExecutionProfile.InstallationId);
-        Assert.Equal(session.SessionId, reserved.ExecutionProfile.SessionId);
+        Assert.Equal(graph.ShareExecutionProfile, reserved.ExecutionProfile);
     }
 
     [Fact]
@@ -650,8 +615,10 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 VALUES($batch,$account,$ordinal,$label,$planned,$planned,1);
                 INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
                   Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,
-                  LeaseGeneration,LeaseExpiresAt,CreatedAt,UpdatedAt)
-                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'Reserved',$items,$settings,1,'Unknown',0,1,$lease,$created,$created);
+                  LeaseGeneration,LeaseExpiresAt,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($id,$transfer,$resource,$batch,$account,$ordinal,'Reserved',$items,$settings,1,'Unknown',0,1,$lease,$created,$created,
+                  'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
                 """;
             for (var index = 1; index <= unexpiredCount + 1; index++)
             {
@@ -1864,7 +1831,10 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         Assert.Equal(0, await CountAsync(graph.Factory, "BaiduShareResults"));
     }
 
-    private async Task<Graph> CreateGraphAsync(bool includeShareSettings, string batchStatus = "Active")
+    private async Task<Graph> CreateGraphAsync(
+        bool includeShareSettings,
+        string batchStatus = "Active",
+        bool managedShare = false)
     {
         Directory.CreateDirectory(root);
         var factory = new SqliteConnectionFactory(Path.Combine(root, $"{Guid.NewGuid():N}.db"));
@@ -1886,13 +1856,40 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         var itemSetFingerprint = new RemoteItemIdentitySet([
             new("remote-a", "A"),
             new("remote-b", "B")]).Fingerprint;
+        ExecutionProfileSnapshot? managedExecutionProfile = null;
+        if (managedShare)
+        {
+            await using (var accountUnit = await SqliteUnitOfWork.BeginAsync(factory))
+            {
+                await accountUnit.Accounts.UpsertAsync(account);
+                await accountUnit.Accounts.UpsertAsync(secondAccount);
+                await accountUnit.CommitAsync();
+            }
+            var state = new SqliteManagedBrowserStateStore(factory);
+            var directory = Path.GetFullPath(Path.Combine(root, $"managed-share-chrome-{Guid.NewGuid():N}"));
+            var installation = new BrowserInstallationIdentity(
+                Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+                "Google LLC", "Google Chrome", $"managed-share-file-{Guid.NewGuid():N}");
+            await state.CreateInstallationAsync(installation, default);
+            var session = new ManagedBrowserSessionReference(
+                Guid.NewGuid(), installation.InstallationId, account.Id, account.BaiduUserId,
+                BrowserFamily.Chrome, $"managed-share-profile-{Guid.NewGuid():N}",
+                $"managed-share-ownership-{Guid.NewGuid():N}");
+            await state.CreateSessionAsync(session, default);
+            managedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                BrowserFamily.Chrome, session.ProfileId, installation.InstallationId, session.SessionId);
+        }
         var share = new ShareOperationRecord(shareId, transfer.Id, resource.Id, batch.Id, account.Id, 1,
-            "WaitingShare", itemSetFingerprint, settingsFingerprint, 1, null, null, "Unknown", 0, null, null, null, null, null, now, now);
+            "WaitingShare", itemSetFingerprint, settingsFingerprint, 1, null, null, "Unknown", 0, null, null, null, null, null,
+            now, now, 0, managedExecutionProfile);
 
         await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
         {
-            await unit.Accounts.UpsertAsync(account);
-            await unit.Accounts.UpsertAsync(secondAccount);
+            if (!managedShare)
+            {
+                await unit.Accounts.UpsertAsync(account);
+                await unit.Accounts.UpsertAsync(secondAccount);
+            }
             await unit.Jobs.AddAsync(batch);
             await unit.Jobs.AddResourcesAsync([resource]);
             await unit.Jobs.AddOperationsAsync([transfer]);
@@ -1913,7 +1910,9 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         }
         if (!includeShareSettings)
             await SeedOrphanShareOperationAsync(factory, share);
-        return new(factory, now, account.Id, secondAccount.Id, batch.Id, resource.Id, transfer.Id, shareId, itemSetFingerprint, settingsFingerprint);
+        return new(factory, now, account.Id, secondAccount.Id, batch.Id, resource.Id, transfer.Id, shareId,
+            itemSetFingerprint, settingsFingerprint,
+            managedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(account.Id));
     }
 
     private static async Task<Guid> StageDiscoveryAsync(
@@ -2286,8 +2285,10 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         await using var command = connection.CreateCommand();
         command.CommandText = """
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
-              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt)
-            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$items,$settings,$generation,'Unknown',0,$created,$updated);
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($id,$transfer,$resource,$batch,$account,$ordinal,$status,$items,$settings,$generation,'Unknown',0,$created,$updated,
+              $engine,$family,$profile,$installation,$session);
             """;
         command.Parameters.AddWithValue("$id", share.Id.ToString("D"));
         command.Parameters.AddWithValue("$transfer", share.TransferOperationId.ToString("D"));
@@ -2301,6 +2302,12 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         command.Parameters.AddWithValue("$generation", share.Generation);
         command.Parameters.AddWithValue("$created", share.CreatedAt.ToString("O"));
         command.Parameters.AddWithValue("$updated", share.UpdatedAt.ToString("O"));
+        command.Parameters.AddWithValue("$engine", share.ExecutionProfile.Engine == BaiduExecutionEngine.WebView2V1
+            ? "WebView2-v1" : "ManagedChromium-v1");
+        command.Parameters.AddWithValue("$family", share.ExecutionProfile.BrowserFamily.ToString());
+        command.Parameters.AddWithValue("$profile", share.ExecutionProfile.ProfileId);
+        command.Parameters.AddWithValue("$installation", (object?)share.ExecutionProfile.InstallationId?.ToString("D") ?? DBNull.Value);
+        command.Parameters.AddWithValue("$session", (object?)share.ExecutionProfile.SessionId?.ToString("D") ?? DBNull.Value);
         Assert.Equal(1, await command.ExecuteNonQueryAsync());
     }
 
@@ -2325,8 +2332,10 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             operation.Transaction = transaction;
             operation.CommandText = """
                 INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
-                  ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt)
-                VALUES($id,$transfer,$resource,$batch,$account,1,'WaitingShare','unsealed-items',$settings,1,'Unknown',0,$now,$now);
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($id,$transfer,$resource,$batch,$account,1,'WaitingShare','unsealed-items',$settings,1,'Unknown',0,$now,$now,
+                  'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
                 """;
             operation.Parameters.AddWithValue("$id", shareId.ToString("D"));
             operation.Parameters.AddWithValue("$transfer", transferId.ToString("D"));
@@ -2335,6 +2344,7 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             operation.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
             operation.Parameters.AddWithValue("$settings", graph.SettingsFingerprint);
             operation.Parameters.AddWithValue("$now", graph.Now.ToString("O"));
+            operation.Parameters.AddWithValue("$profile", ExecutionProfileSnapshot.LegacyForAccount(graph.AccountId).ProfileId);
             Assert.Equal(1, await operation.ExecuteNonQueryAsync());
         }
         await using (var remoteItem = connection.CreateCommand())
@@ -2449,5 +2459,6 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
 
     private sealed record Graph(SqliteConnectionFactory Factory, DateTimeOffset Now, Guid AccountId, Guid SecondAccountId, Guid BatchId,
-        Guid ResourceId, Guid TransferId, Guid ShareOperationId, string ItemSetFingerprint, string SettingsFingerprint);
+        Guid ResourceId, Guid TransferId, Guid ShareOperationId, string ItemSetFingerprint, string SettingsFingerprint,
+        ExecutionProfileSnapshot ShareExecutionProfile);
 }

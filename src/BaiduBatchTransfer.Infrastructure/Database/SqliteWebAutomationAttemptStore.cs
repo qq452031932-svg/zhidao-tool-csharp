@@ -1171,12 +1171,62 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             throw new InvalidDataException("WEB_TRANSFER_MAPPING_METADATA_MISMATCH");
         }
 
-        return new(operationId, accountId, generation,
+        var attempt = new WebAutomationAttemptRecord(operationId, accountId, generation,
             Enum.Parse<WebAutomationOwnerKind>(owner), Enum.Parse<WebAutomationAttemptState>(state),
             resumeStage is null ? null : Enum.Parse<WebAutomationAttemptState>(resumeStage),
             baseline, observation, waiting, revision, created, updated, acceptedRemoteItems,
             sourceEvidence, targetPreparationEvidence, submissionEvidence, officialRequestId,
             transferIdentityMapping, executionProfile);
+        if (!await OwnerSnapshotMatchesAsync(
+                connection, transaction, attempt, cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("WEB_ATTEMPT_OWNER_SNAPSHOT_MISMATCH");
+        return attempt;
+    }
+
+    private static async Task<bool> OwnerSnapshotMatchesAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        WebAutomationAttemptRecord attempt,
+        CancellationToken cancellationToken)
+    {
+        if (attempt.OwnerKind == WebAutomationOwnerKind.RemoteSelection &&
+            attempt.ExecutionProfile.Engine == BaiduExecutionEngine.WebView2V1)
+            return attempt.ExecutionProfile.Equals(
+                ExecutionProfileSnapshot.LegacyForAccount(attempt.AccountId));
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = attempt.OwnerKind switch
+        {
+            WebAutomationOwnerKind.Transfer => """
+                SELECT EXISTS(SELECT 1 FROM TransferOperations
+                WHERE Id=$operation AND AssignedAccountId=$account
+                  AND ExecutionEngineVersion=$engine AND BrowserFamily=$browserFamily AND ProfileId=$profile
+                  AND InstallationId IS $installation AND SessionId IS $session);
+                """,
+            WebAutomationOwnerKind.TransferShare => """
+                SELECT EXISTS(SELECT 1 FROM ShareOperations
+                WHERE Id=$operation AND AccountId=$account
+                  AND ExecutionEngineVersion=$engine AND BrowserFamily=$browserFamily AND ProfileId=$profile
+                  AND InstallationId IS $installation AND SessionId IS $session);
+                """,
+            WebAutomationOwnerKind.StandaloneShare => """
+                SELECT EXISTS(SELECT 1 FROM StandaloneShareOperations
+                WHERE Id=$operation AND AccountId=$account
+                  AND ExecutionEngineVersion=$engine AND BrowserFamily=$browserFamily AND ProfileId=$profile
+                  AND InstallationId IS $installation AND SessionId IS $session);
+                """,
+            WebAutomationOwnerKind.RemoteSelection => """
+                SELECT EXISTS(SELECT 1 FROM ManagedBrowserSessions
+                WHERE SessionId=$session AND AccountId=$account AND InstallationId=$installation
+                  AND BrowserFamily=$browserFamily AND ProfileId=$profile);
+                """,
+            _ => throw new InvalidDataException("WEB_ATTEMPT_OWNER_SNAPSHOT_MISMATCH"),
+        };
+        command.Parameters.AddWithValue("$operation", attempt.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$account", attempt.AccountId.ToString("D"));
+        AddExecutionProfile(command, attempt.ExecutionProfile);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
 
     private static void AddIdentity(SqliteCommand command, Guid operationId, Guid accountId, int generation)

@@ -425,6 +425,43 @@ public sealed class ManagedBrowserContractsTests
     }
 
     [Fact]
+    public void CleanupManifestContractExposesCreateLoadAndCasWithoutLeakingProfilePaths()
+    {
+        var manifest = new ManagedProfileCleanupManifest(
+            Guid.NewGuid(), AccountId, SessionId,
+            "C:\\Sensitive\\profile", "C:\\Sensitive\\quarantine", "ownership-1",
+            "confirmation-hash");
+        var stored = new StoredManagedProfileCleanupManifest(
+            manifest, ManagedProfileCleanupState.Prepared, revision: 0);
+        var transition = new ManagedProfileCleanupTransitionRequest(
+            manifest.ManifestId, expectedRevision: 0,
+            ManagedProfileCleanupState.Prepared,
+            ManagedProfileCleanupState.QuarantineMoveIntent);
+        IManagedBrowserStateStore store = new ContractStore();
+        Func<ManagedProfileCleanupManifest, CancellationToken, Task<StoredManagedProfileCleanupManifest>> create =
+            store.CreateCleanupManifestAsync;
+        Func<Guid, CancellationToken, Task<StoredManagedProfileCleanupManifest?>> load =
+            store.LoadCleanupManifestAsync;
+        Func<ManagedProfileCleanupTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> change =
+            store.TryTransitionCleanupManifestAsync;
+
+        Assert.Equal(ManagedProfileCleanupState.Prepared, stored.State);
+        Assert.Equal(0, stored.Revision);
+        Assert.Equal(ManagedProfileCleanupState.QuarantineMoveIntent, transition.TargetState);
+        Assert.DoesNotContain("Sensitive", manifest.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("ownership-1", manifest.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("confirmation-hash", manifest.ToString(), StringComparison.Ordinal);
+        Assert.NotNull(create);
+        Assert.NotNull(load);
+        Assert.NotNull(change);
+        Assert.Throws<ArgumentException>(() => new ManagedProfileCleanupManifest(
+            Guid.Empty, AccountId, SessionId, "source", "quarantine", "owner", null));
+        Assert.Throws<ArgumentException>(() => new ManagedProfileCleanupTransitionRequest(
+            manifest.ManifestId, 0, ManagedProfileCleanupState.Prepared,
+            ManagedProfileCleanupState.Prepared));
+    }
+
+    [Fact]
     public void ManagedBrowserTransitionAndRetentionContractsValidateIdentityAndStatus()
     {
         var transition = new ManagedBrowserTransitionRequest(InstallationId, expectedRevision: 4);
@@ -487,6 +524,9 @@ public sealed class ManagedBrowserContractsTests
         public Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>> TryReplaceActiveSessionAsync(ManagedBrowserSessionActivationRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryRetireSessionAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredManagedProfileCleanupManifest> CreateCleanupManifestAsync(ManagedProfileCleanupManifest manifest, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredManagedProfileCleanupManifest?> LoadCleanupManifestAsync(Guid manifestId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(ManagedProfileCleanupTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task AddRetentionAsync(ManagedBrowserRetentionReference reference, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task ReleaseRetentionAsync(ManagedBrowserRetentionReference reference, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<bool> IsRetirementEligibleAsync(Guid installationId, Guid sessionId, CancellationToken cancellationToken) => throw new NotImplementedException();
