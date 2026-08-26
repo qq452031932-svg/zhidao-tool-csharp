@@ -530,7 +530,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context,
             WebAutomationAttemptState.Succeeded,
             WebAutomationBaseline.Create(["fictional-old"]),
-            AcceptedItems()));
+            AcceptedItems(),
+            includeTransferMapping: true));
         var broker = new RecordingBroker();
         var evidence = new RecordingEvidenceSink();
         var adapter = new WebViewBaiduNetdiskAdapter(
@@ -548,6 +549,109 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
+    public async Task LegacySucceededAttemptWithoutExactTransferEvidenceFailsClosed()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
+        var attempts = new AttemptStore(new WebAutomationAttemptRecord(
+            context.OperationId,
+            context.AccountId,
+            context.Generation,
+            WebAutomationOwnerKind.Transfer,
+            WebAutomationAttemptState.Succeeded,
+            null,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            new string('a', 64),
+            false,
+            2,
+            Now.AddMinutes(-2),
+            Now.AddMinutes(-1),
+            AcceptedItems()));
+        var broker = new RecordingBroker();
+        var evidence = new RecordingEvidenceSink();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts, evidence);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.Null(broker.Identity);
+        Assert.Empty(evidence.Remote);
+        Assert.Empty(evidence.Recovery);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task SucceededAttemptWithoutSubmissionOrMappingFailsClosed(
+        bool includeSubmission,
+        bool includeMapping)
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems(),
+            includeTransferMapping: includeMapping,
+            includeTransferSubmission: includeSubmission));
+        var evidence = new RecordingEvidenceSink();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new RecordingBroker(), new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts, evidence);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Empty(evidence.Remote);
+        Assert.Empty(evidence.Recovery);
+    }
+
+    [Theory]
+    [InlineData("protocol")]
+    [InlineData("selector")]
+    [InlineData("build")]
+    public async Task SucceededAttemptWithNonCurrentTransferCapabilityFailsClosed(string mismatch)
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share(), IsRecovery: true);
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            mismatch == "protocol" ? "old-protocol" : BaiduSelectorCatalog.TransferProtocolVersion,
+            mismatch == "selector" ? "old-selector" : BaiduSelectorCatalog.TransferSelectorVersion,
+            mismatch == "build" ? "old-build" : "build-a");
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.Succeeded,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            AcceptedItems(),
+            includeTransferMapping: true,
+            capabilityOverride: capability));
+        var evidence = new RecordingEvidenceSink();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), new RecordingBroker(), new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts, evidence);
+
+        var result = await adapter.ConfirmExactTransferForOperationAsync(
+            context, Session(accountId), Query(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Empty(evidence.Remote);
+        Assert.Empty(evidence.Recovery);
+    }
+
+    [Fact]
     public async Task AcceptanceTelemetryFailureCannotChangePersistedExactTransferResult()
     {
         var accountId = Guid.NewGuid();
@@ -557,7 +661,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context,
             WebAutomationAttemptState.Succeeded,
             WebAutomationBaseline.Create(["fictional-old"]),
-            AcceptedItems()));
+            AcceptedItems(),
+            includeTransferMapping: true));
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), new RecordingBroker(), new RecordingProfilePolicy(accountId),
             new TransferAutomationFlow(), "build-a", attempts, new ThrowingEvidenceSink());
@@ -820,7 +925,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         RemoteItemIdentitySet? acceptedRemoteItems = null,
         WebAutomationAttemptState? resumeStage = null,
         bool includeTransferMapping = false,
-        AdapterCapabilityVersion? capabilityOverride = null)
+        AdapterCapabilityVersion? capabilityOverride = null,
+        bool includeTransferSubmission = true)
     {
         var capability = capabilityOverride ?? new AdapterCapabilityVersion(
             "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
@@ -834,7 +940,9 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             true, true, "target-generation", "fictional-user", baseline,
             new string('c', 64));
         var effectiveState = state == WebAutomationAttemptState.UserHandoff ? resumeStage : state;
-        var submission = effectiveState == WebAutomationAttemptState.ResultPending &&
+        var submission = includeTransferSubmission &&
+                         effectiveState is (WebAutomationAttemptState.ResultPending or
+                             WebAutomationAttemptState.Succeeded) &&
                          source is not null && target is not null
             ? new TransferSubmissionEvidence(
                 source.Items.Fingerprint, target.TargetExactId, target.Baseline.Fingerprint,

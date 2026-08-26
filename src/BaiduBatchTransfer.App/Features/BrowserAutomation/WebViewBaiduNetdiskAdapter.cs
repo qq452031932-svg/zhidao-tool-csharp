@@ -321,22 +321,20 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             cancellationToken).ConfigureAwait(false);
         if (!MatchesStableBaiduUserId(session, attempt))
             return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
-        if (attempt is
-            {
-                OwnerKind: WebAutomationOwnerKind.Transfer,
-                State: WebAutomationAttemptState.Succeeded,
-                AcceptedRemoteItems: not null,
-            })
+        if (attempt?.State == WebAutomationAttemptState.Succeeded)
         {
+            if (!HasCompleteCurrentSucceededEvidence(session, query, attempt))
+                return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
+            var acceptedRemoteItems = attempt.AcceptedRemoteItems!;
             if (acceptanceEvidence is not null)
             {
                 await RecordAcceptanceEvidenceSafelyAsync(
                     EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
-                    attempt.AcceptedRemoteItems.Fingerprint,
+                    acceptedRemoteItems.Fingerprint,
                     recovery: false).ConfigureAwait(false);
             }
             return BaiduAdapterResult<TransferConfirmationResult>.Success(
-                TransferConfirmationResult.ExactPresent(attempt.AcceptedRemoteItems),
+                TransferConfirmationResult.ExactPresent(acceptedRemoteItems),
                 SubmissionAcceptance.Unknown);
         }
         var effectiveStage = EffectiveRecoverableStage(attempt);
@@ -569,6 +567,50 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         binding.Generation == context.Generation &&
         binding.BatchId == context.BatchId &&
         binding.IsRecovery == context.IsRecovery;
+
+    private bool HasCompleteCurrentSucceededEvidence(
+        AccountSession session,
+        TransferConfirmationQuery query,
+        WebAutomationAttemptRecord attempt)
+    {
+        if (attempt.OwnerKind != WebAutomationOwnerKind.Transfer ||
+            attempt.SourceEvidence is not { } source ||
+            attempt.TargetPreparationEvidence is not { } target ||
+            attempt.SubmissionEvidence is not { } submission ||
+            attempt.AcceptedRemoteItems is not { } accepted ||
+            string.IsNullOrWhiteSpace(attempt.OfficialRequestId) ||
+            attempt.TransferIdentityMapping is not { } mapping ||
+            target.TargetPath != query.TargetPath)
+            return false;
+        var expectedCapability = new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion,
+            applicationBuildVersion);
+        if (source.Capability != expectedCapability || submission.Capability != expectedCapability ||
+            !string.Equals(source.BaiduUserId, session.BaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(target.BaiduUserId, session.BaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(submission.BaiduUserId, session.BaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(submission.SourceFingerprint, source.Items.Fingerprint, StringComparison.Ordinal) ||
+            !string.Equals(submission.TargetExactId, target.TargetExactId, StringComparison.Ordinal) ||
+            !string.Equals(
+                submission.TargetBaselineFingerprint,
+                target.Baseline.Fingerprint,
+                StringComparison.Ordinal) ||
+            !mapping.Covers(source.Items))
+            return false;
+        try
+        {
+            _ = new TransferPreparationEvidence(source, target).Validate();
+            var mappedItems = new RemoteItemIdentitySet(mapping.Entries.Select(entry =>
+                new RemoteItemIdentity(entry.DestinationExactId, null)));
+            return mappedItems == accepted;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
 
     private bool MatchesStableBaiduUserId(
         AccountSession session,
