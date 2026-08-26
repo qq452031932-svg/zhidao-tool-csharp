@@ -76,6 +76,7 @@ public sealed class WebView2AutomationSession :
     private readonly string profilePath;
     private readonly WebAutomationWindow? window;
     private readonly WebViewDownloadEventRouter downloadRouter;
+    private readonly WebViewNavigationCompletionCoordinator navigationCompletion = new();
     private readonly IBaiduCandidateActionAuthorizationSource? candidateAuthorizationSource;
     private readonly BaiduCandidateSessionBinding? candidateBinding;
     private readonly ReadOnlyTransferRecoveryBinding? transferRecoveryBinding;
@@ -174,6 +175,7 @@ public sealed class WebView2AutomationSession :
         core = window.WebView.CoreWebView2;
         Harden(core);
         core.NavigationStarting += OnNavigationStarting;
+        core.NavigationCompleted += OnNavigationCompleted;
         core.NewWindowRequested += OnNewWindowRequested;
         core.DownloadStarting += OnDownloadStarting;
         core.PermissionRequested += OnPermissionRequested;
@@ -181,7 +183,11 @@ public sealed class WebView2AutomationSession :
         if (candidateBinding is not null || transferRecoveryBinding is not null)
             candidateExecutor = new WebView2CandidateDomExecutor(
                 new CoreWebView2CandidateDomScriptHost(core), candidateAuthorizationSource!);
-        core.Navigate(initialUri.AbsoluteUri);
+        await navigationCompletion.NavigateAsync(
+            initialUri,
+            () => core.Navigate(initialUri.AbsoluteUri),
+            cancellationToken,
+            UserClosed).ConfigureAwait(true);
     }
 
     public Task ShowHandoffAsync(
@@ -278,13 +284,18 @@ public sealed class WebView2AutomationSession :
     private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
         var destination = Uri.TryCreate(e.Uri, UriKind.Absolute, out var parsed) ? parsed : null;
-        if (BaiduNavigationPolicy.Evaluate(destination).IsAllowed)
+        var decision = BaiduNavigationPolicy.Evaluate(destination);
+        navigationCompletion.OnNavigationStarting(e.NavigationId, destination, decision.IsAllowed);
+        if (decision.IsAllowed)
         {
             currentOfficialUri = destination;
             return;
         }
         e.Cancel = true;
     }
+
+    private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e) =>
+        navigationCompletion.OnNavigationCompleted(e.NavigationId, e.IsSuccess);
 
     private static void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
@@ -309,6 +320,7 @@ public sealed class WebView2AutomationSession :
     {
         if (core is null) return;
         core.NavigationStarting -= OnNavigationStarting;
+        core.NavigationCompleted -= OnNavigationCompleted;
         core.NewWindowRequested -= OnNewWindowRequested;
         core.DownloadStarting -= OnDownloadStarting;
         core.PermissionRequested -= OnPermissionRequested;
@@ -658,7 +670,7 @@ public sealed class WebView2AutomationSession :
         return ToDirectoryListing(observed);
     }
 
-    private Task NavigateOfficialAsync(Uri uri, CancellationToken cancellationToken)
+    private async Task NavigateOfficialAsync(Uri uri, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!BaiduNavigationPolicy.Evaluate(uri).IsAllowed)
@@ -666,8 +678,11 @@ public sealed class WebView2AutomationSession :
         currentOfficialUri = uri;
         lastTransferObservation = null;
         if (core is not null)
-            core.Navigate(uri.AbsoluteUri);
-        return Task.CompletedTask;
+            await navigationCompletion.NavigateAsync(
+                uri,
+                () => core.Navigate(uri.AbsoluteUri),
+                cancellationToken,
+                UserClosed).ConfigureAwait(false);
     }
 
     private async Task<BaiduTransferCandidateObservation> ObserveTransferAsync(
