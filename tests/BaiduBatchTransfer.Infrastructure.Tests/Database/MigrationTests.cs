@@ -8,6 +8,65 @@ public sealed class MigrationTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-migration-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task VersionFifteenAddsExactTransferEvidenceAndCrossGenerationDirectoryGuard()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v14-to-v15.db");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 14; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "v15-backups")),
+            "new").MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal(15L, await ScalarAsync<long>(upgraded,
+            "SELECT MAX(Version) FROM SchemaVersions;"));
+        var tables = await NamesAsync(upgraded, "table");
+        Assert.Contains("WebAutomationAttemptSourceItems", tables);
+        Assert.Contains("WebAutomationTransferMappings", tables);
+        Assert.Contains("WebAutomationDirectoryMutations", tables);
+
+        var attemptColumns = await ColumnsAsync(upgraded, "WebAutomationAttempts");
+        Assert.Subset(new HashSet<string>(attemptColumns), new HashSet<string>
+        {
+            "SourceTotalCount", "SourceReachedEnd", "SourceIsStable", "SourceGenerationToken",
+            "SourceFingerprint", "SourceObservationFingerprint", "BaiduUserId",
+            "CapabilityAdapterKind", "CapabilityProtocolVersion", "CapabilitySelectorVersion",
+            "CapabilityBuildVersion", "TargetExactId", "TargetPath", "TargetTotalCount",
+            "TargetReachedEnd", "TargetIsStable", "TargetGenerationToken",
+            "TargetObservationFingerprint", "SubmissionSourceFingerprint",
+            "SubmissionTargetExactId", "SubmissionTargetBaselineFingerprint",
+            "SubmissionMarkedAt", "OfficialRequestId", "TransferMappingFingerprint",
+            "TransferMappingCount",
+        });
+        Assert.DoesNotContain(attemptColumns, column =>
+            column.Contains("Url", StringComparison.OrdinalIgnoreCase) ||
+            column.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
+            column.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
+            column.Contains("Response", StringComparison.OrdinalIgnoreCase) ||
+            column.Contains("Extraction", StringComparison.OrdinalIgnoreCase));
+
+        var indexSql = await ScalarAsync<string>(upgraded,
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='UX_WebAutomationDirectoryMutations_Unresolved';");
+        Assert.Contains("OperationId, AccountId, ParentExactId, CanonicalSegment", indexSql, StringComparison.Ordinal);
+        Assert.DoesNotContain("OriginGeneration", indexSql, StringComparison.Ordinal);
+        Assert.Contains("State IN ('Intent','OutcomeUnknown')", indexSql, StringComparison.Ordinal);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 15)).IsValid);
+    }
+
+    [Fact]
     public async Task VersionFourteenInvalidatesLegacyCapabilityRowsThatDidNotBindSelectorVersion()
     {
         Directory.CreateDirectory(root);
@@ -40,15 +99,16 @@ public sealed class MigrationTests : IDisposable
         Assert.Equal(0L, await ScalarAsync<long>(upgraded,
             "SELECT COUNT(*) FROM AdapterCapabilityAcceptances;"));
         Assert.Contains("SelectorVersion", await ColumnsAsync(upgraded, "AdapterCapabilityAcceptances"));
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 14)).IsValid);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
     }
 
     // Field ownership for v9:
     // - transfer submit evidence remains in TransferOperations;
     // - transfer-triggered share evidence remains in ShareOperations/ShareOperationGenerations;
     // - standalone share facts never fabricate a TransferOperation or relax ShareOperations.TransferOperationId;
-    // - local paths exist only in BatchResultDestinations/StandaloneShareBatches/LocalResultExports;
-    // - browser recovery stores only stable remote ids, canonical keys and sanitized fingerprints.
+    // - local result paths exist only in BatchResultDestinations/StandaloneShareBatches/LocalResultExports;
+    // - browser recovery stores stable remote ids, canonical remote paths, UID/capability binding and fingerprints.
     [Fact]
     public async Task VersionOneUpgradeCreatesV9WorkspacePersistenceWithoutSensitiveWebFields()
     {
@@ -89,9 +149,7 @@ public sealed class MigrationTests : IDisposable
             column.Contains("Cookie", StringComparison.OrdinalIgnoreCase) ||
             column.Contains("Header", StringComparison.OrdinalIgnoreCase) ||
             column.Contains("Response", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Extraction", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Uid", StringComparison.OrdinalIgnoreCase) ||
-            column.Contains("Path", StringComparison.OrdinalIgnoreCase));
+            column.Contains("Extraction", StringComparison.OrdinalIgnoreCase));
 
         var shareColumns = await ColumnsAsync(upgraded, "ShareOperations");
         Assert.Contains("TransferOperationId", shareColumns);
@@ -609,7 +667,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(14, DatabaseMigrator.LatestVersion);
+        Assert.Equal(15, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -658,7 +716,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(14, DatabaseMigrator.LatestVersion);
+        Assert.Equal(15, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));

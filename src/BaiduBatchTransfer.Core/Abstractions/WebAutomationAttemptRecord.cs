@@ -93,7 +93,12 @@ public sealed record WebAutomationAttemptRecord
         long revision,
         DateTimeOffset createdAt,
         DateTimeOffset updatedAt,
-        RemoteItemIdentitySet? acceptedRemoteItems = null)
+        RemoteItemIdentitySet? acceptedRemoteItems = null,
+        TransferSourceEvidence? sourceEvidence = null,
+        TransferTargetPreparationEvidence? targetPreparationEvidence = null,
+        TransferSubmissionEvidence? submissionEvidence = null,
+        string? officialRequestId = null,
+        TransferIdentityMapping? transferIdentityMapping = null)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
@@ -119,6 +124,36 @@ public sealed record WebAutomationAttemptRecord
         {
             throw new ArgumentException("This state requires an exact baseline.", nameof(baseline));
         }
+        if (targetPreparationEvidence is not null && sourceEvidence is null)
+            throw new ArgumentException("Target preparation requires exact source evidence.", nameof(targetPreparationEvidence));
+        if (sourceEvidence is not null && targetPreparationEvidence is not null)
+        {
+            _ = new TransferPreparationEvidence(sourceEvidence, targetPreparationEvidence).Validate();
+            if (baseline is not null && !string.Equals(
+                    baseline.Fingerprint, targetPreparationEvidence.Baseline.Fingerprint, StringComparison.Ordinal))
+                throw new ArgumentException("The legacy baseline must match target preparation evidence.", nameof(baseline));
+        }
+        if (submissionEvidence is not null)
+        {
+            if (sourceEvidence is null || targetPreparationEvidence is null ||
+                !string.Equals(submissionEvidence.SourceFingerprint, sourceEvidence.Items.Fingerprint, StringComparison.Ordinal) ||
+                !string.Equals(submissionEvidence.TargetExactId, targetPreparationEvidence.TargetExactId, StringComparison.Ordinal) ||
+                !string.Equals(submissionEvidence.TargetBaselineFingerprint,
+                    targetPreparationEvidence.Baseline.Fingerprint, StringComparison.Ordinal) ||
+                !string.Equals(submissionEvidence.BaiduUserId, sourceEvidence.BaiduUserId, StringComparison.Ordinal) ||
+                submissionEvidence.Capability != sourceEvidence.Capability)
+                throw new ArgumentException("Submission evidence must bind the frozen preparation evidence.", nameof(submissionEvidence));
+        }
+        if (transferIdentityMapping is not null)
+        {
+            if (sourceEvidence is null || !transferIdentityMapping.Covers(sourceEvidence.Items) ||
+                string.IsNullOrWhiteSpace(officialRequestId))
+                throw new ArgumentException("Official transfer acceptance must cover the exact source set.", nameof(transferIdentityMapping));
+            var mappedDestinations = new RemoteItemIdentitySet(transferIdentityMapping.Entries
+                .Select(entry => new RemoteItemIdentity(entry.DestinationExactId, null)));
+            if (acceptedRemoteItems is null || mappedDestinations != acceptedRemoteItems)
+                throw new ArgumentException("Accepted remote items must match the transfer mapping.", nameof(acceptedRemoteItems));
+        }
 
         OperationId = operationId;
         AccountId = accountId;
@@ -133,6 +168,11 @@ public sealed record WebAutomationAttemptRecord
         CreatedAt = createdAt;
         UpdatedAt = updatedAt;
         AcceptedRemoteItems = acceptedRemoteItems;
+        SourceEvidence = sourceEvidence;
+        TargetPreparationEvidence = targetPreparationEvidence;
+        SubmissionEvidence = submissionEvidence;
+        OfficialRequestId = officialRequestId;
+        TransferIdentityMapping = transferIdentityMapping;
     }
 
     public Guid OperationId { get; }
@@ -149,6 +189,11 @@ public sealed record WebAutomationAttemptRecord
     public DateTimeOffset CreatedAt { get; }
     public DateTimeOffset UpdatedAt { get; }
     public RemoteItemIdentitySet? AcceptedRemoteItems { get; }
+    public TransferSourceEvidence? SourceEvidence { get; }
+    public TransferTargetPreparationEvidence? TargetPreparationEvidence { get; }
+    public TransferSubmissionEvidence? SubmissionEvidence { get; }
+    public string? OfficialRequestId { get; }
+    public TransferIdentityMapping? TransferIdentityMapping { get; }
 
     public static WebAutomationAttemptRecord Create(
         Guid operationId,

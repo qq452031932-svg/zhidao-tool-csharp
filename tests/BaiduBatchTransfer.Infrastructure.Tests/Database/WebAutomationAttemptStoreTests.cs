@@ -12,6 +12,97 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-web-attempt-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task ExactTransferEvidenceRoundTripsThroughPreparedSubmittedAndAcceptedStages()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        var capability = Capability();
+        var source = new TransferSourceEvidence(
+            new RemoteItemIdentitySet([new("source-2", null), new("source-1", null)]),
+            2, true, true, "source-generation", "baidu-user", capability, Fingerprint('1'));
+
+        Assert.True(await graph.Store.TryPersistTransferSourceEvidenceAsync(
+            graph.OperationId, graph.AccountId, 1, 0, source, graph.Now.AddSeconds(1)));
+        var target = new TransferTargetPreparationEvidence(
+            "target-directory", new RemotePath("/自动转存/游戏"), 1, true, true,
+            "target-generation", "baidu-user", ExactBaseline("before"), Fingerprint('2'));
+        Assert.True(await graph.Store.TryPersistTransferTargetPreparationAsync(
+            graph.OperationId, graph.AccountId, 1, 1, target, graph.Now.AddSeconds(2)));
+        var submission = new TransferSubmissionEvidence(
+            source.Items.Fingerprint, target.TargetExactId, target.Baseline.Fingerprint,
+            "baidu-user", capability, graph.Now.AddSeconds(3));
+        Assert.True(await graph.Store.TryPersistTransferSubmissionAsync(
+            graph.OperationId, graph.AccountId, 1, 2, submission, graph.Now.AddSeconds(3)));
+        var mapping = new TransferIdentityMapping([
+            new("source-1", "destination-1"),
+            new("source-2", "destination-2"),
+        ]);
+        Assert.True(await graph.Store.TryPersistTransferAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, 3, "official-request", mapping,
+            Fingerprint('3'), graph.Now.AddSeconds(4)));
+
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.NotNull(restored);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, restored.State);
+        Assert.Equal(source, restored.SourceEvidence);
+        Assert.Equal(target.TargetExactId, restored.TargetPreparationEvidence!.TargetExactId);
+        Assert.Equal(target.TargetPath, restored.TargetPreparationEvidence.TargetPath);
+        Assert.Equal(target.Baseline.Fingerprint, restored.TargetPreparationEvidence.Baseline.Fingerprint);
+        Assert.Equal(target.TargetGenerationToken, restored.TargetPreparationEvidence.TargetGenerationToken);
+        Assert.Equal(submission, restored.SubmissionEvidence);
+        Assert.Equal("official-request", restored.OfficialRequestId);
+        Assert.Equal(mapping.Fingerprint, restored.TransferIdentityMapping!.Fingerprint);
+        Assert.Equal(mapping.Entries.ToArray(), restored.TransferIdentityMapping.Entries.ToArray());
+        Assert.Equal(["destination-1", "destination-2"],
+            restored.AcceptedRemoteItems!.Items.Select(item => item.ExactId));
+        Assert.Equal(4, restored.Revision);
+    }
+
+    [Fact]
+    public async Task UnresolvedDirectoryMutationBlocksSameTargetAcrossGenerationsUntilConfirmed()
+    {
+        var graph = await CreateAsync();
+        var capability = Capability();
+        await SetTransferGenerationAsync(graph, 1);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        Assert.True(await graph.Store.TryPersistTransferSourceEvidenceAsync(
+            graph.OperationId, graph.AccountId, 1, 0,
+            SourceEvidence(capability, '4'), graph.Now.AddSeconds(1)));
+        var first = Mutation(graph, 1, 1, capability, TransferDirectoryMutationState.Intent);
+        Assert.True(await graph.Store.TryBeginDirectoryMutationAsync(first, graph.Now.AddSeconds(2)));
+
+        await SetTransferGenerationAsync(graph, 2);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now.AddMinutes(1))));
+        Assert.True(await graph.Store.TryPersistTransferSourceEvidenceAsync(
+            graph.OperationId, graph.AccountId, 2, 0,
+            SourceEvidence(capability, '5'), graph.Now.AddMinutes(1).AddSeconds(1)));
+        var second = Mutation(graph, 2, 1, capability, TransferDirectoryMutationState.Intent);
+        Assert.False(await graph.Store.TryBeginDirectoryMutationAsync(second, graph.Now.AddMinutes(1).AddSeconds(2)));
+
+        Assert.True(await graph.Store.TryResolveDirectoryMutationAsync(
+            first, TransferDirectoryMutationState.OutcomeUnknown, null, graph.Now.AddSeconds(3)));
+        var unresolved = await graph.Store.GetUnresolvedDirectoryMutationAsync(
+            graph.OperationId, graph.AccountId, "root", "游戏");
+        Assert.NotNull(unresolved);
+        Assert.Equal(1, unresolved.Generation);
+        Assert.Equal(1, unresolved.OwningAttemptRevision);
+        Assert.False(await graph.Store.TryBeginDirectoryMutationAsync(second, graph.Now.AddMinutes(1).AddSeconds(3)));
+
+        var unknown = unresolved;
+        Assert.True(await graph.Store.TryResolveDirectoryMutationAsync(
+            unknown, TransferDirectoryMutationState.Confirmed, "created-directory",
+            graph.Now.AddMinutes(1).AddSeconds(4)));
+        Assert.True(await graph.Store.TryBeginDirectoryMutationAsync(second, graph.Now.AddMinutes(1).AddSeconds(5)));
+        Assert.Equal(2, (await graph.Store.GetDirectoryMutationsAsync(
+            graph.OperationId, graph.AccountId)).Count);
+    }
+
+    [Fact]
     public async Task TransferBaseline_RoundTripsExactPreSubmitDirectorySet()
     {
         var graph = await CreateAsync();
@@ -490,6 +581,23 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
 
     private static WebAutomationBaseline ExactBaseline(params string[] ids) =>
         WebAutomationBaseline.Create(ids);
+
+    private static AdapterCapabilityVersion Capability() => new(
+        "BaiduTransfer", "protocol-1", "selectors-1", "build-1");
+
+    private static TransferSourceEvidence SourceEvidence(AdapterCapabilityVersion capability, char fingerprint) =>
+        new(new RemoteItemIdentitySet([new("source", null)]), 1, true, true,
+            $"source-generation-{fingerprint}", "baidu-user", capability, Fingerprint(fingerprint));
+
+    private static TransferDirectoryMutationRecord Mutation(
+        Graph graph,
+        int generation,
+        long revision,
+        AdapterCapabilityVersion capability,
+        TransferDirectoryMutationState state) =>
+        new(graph.OperationId, graph.AccountId, generation, 0, "root", null,
+            new RemotePath("/自动转存/游戏"), $"listing-{generation}", "baidu-user", capability,
+            state, revision);
 
     private static async Task<WebAutomationAttemptRecord> MoveToStageAsync(
         Graph graph,
