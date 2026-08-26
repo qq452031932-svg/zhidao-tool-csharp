@@ -94,6 +94,30 @@ public sealed class WebView2AutomationSessionTests
     }
 
     [Fact]
+    public async Task ReadOnlyRecoveryCanReadExactTargetButCannotRequestMutationPermit()
+    {
+        var identity = TransferIdentity();
+        var destination = new RemoteDirectory("target", new RemotePath("/目标"));
+        var capability = TransferBinding(identity).Binding.Capability;
+        var binding = new ReadOnlyTransferRecoveryBinding(
+            identity.OperationId, identity.BatchId, identity.AccountId, identity.Generation,
+            destination, "uid-1", new string('a', 64), new string('b', 64),
+            DateTimeOffset.UtcNow, null, capability, DateTimeOffset.UtcNow.AddMinutes(5));
+        var executor = new RecordingTransferCandidateExecutor();
+        await using var session = new WebView2AutomationSession(
+            identity, binding, executor, CancellationToken.None);
+
+        var listing = await ((ITransferAutomationSession)session)
+            .ReopenDestinationAndReadStableListingAsync(destination, CancellationToken.None);
+        await Assert.ThrowsAsync<WebAutomationAuthorizationException>(() =>
+            ((ITransferDirectoryPreparationSession)session)
+                .BeginCreateDirectoryAsync("禁止创建", CancellationToken.None));
+
+        Assert.Equal(destination, listing.Directory);
+        Assert.Empty(executor.Actions);
+    }
+
+    [Fact]
     public async Task ExactShareSelectionDelegatesObserveAndSingleMutation()
     {
         var identity = Identity();

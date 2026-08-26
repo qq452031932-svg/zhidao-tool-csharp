@@ -477,6 +477,76 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         }
     }
 
+    public async Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactFromTargetAsync(
+        ITransferAutomationSession session,
+        RemoteDirectory destination,
+        TransferPreparationEvidence preparation,
+        TransferSubmissionEvidence submission,
+        TransferOfficialAcceptance? officialAcceptance,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(preparation);
+        ArgumentNullException.ThrowIfNull(submission);
+        preparation.Validate();
+        if (preparation.Target.TargetPath != destination.Path ||
+            !string.Equals(preparation.Target.TargetExactId, destination.RemoteId, StringComparison.Ordinal) ||
+            !string.Equals(submission.SourceFingerprint,
+                preparation.Source.Items.Fingerprint, StringComparison.Ordinal) ||
+            !string.Equals(submission.TargetExactId,
+                preparation.Target.TargetExactId, StringComparison.Ordinal) ||
+            !string.Equals(submission.TargetBaselineFingerprint,
+                preparation.Target.Baseline.Fingerprint, StringComparison.Ordinal) ||
+            !string.Equals(submission.BaiduUserId,
+                preparation.Source.BaiduUserId, StringComparison.Ordinal) ||
+            submission.Capability != preparation.Source.Capability)
+            return BaiduAdapterResult<TransferConfirmationResult>.Failure(
+                BaiduErrorKind.NotValidated,
+                adapterDiagnostic: null,
+                submissionAcceptance: SubmissionAcceptance.Unknown);
+
+        try
+        {
+            var current = await session.ReopenDestinationAndReadStableListingAsync(
+                destination, cancellationToken).ConfigureAwait(false);
+            if (!IsStableComplete(current) || current.Directory != destination ||
+                !string.Equals(current.BaiduUserId,
+                    preparation.Source.BaiduUserId, StringComparison.Ordinal))
+                return AmbiguousConfirmation();
+            if (officialAcceptance is null || !officialAcceptance.IsAccepted ||
+                officialAcceptance.IdentityMapping is null ||
+                officialAcceptance.ExactRemoteItems is null ||
+                string.IsNullOrWhiteSpace(officialAcceptance.AdapterRequestId) ||
+                !string.Equals(officialAcceptance.TargetExactId,
+                    destination.RemoteId, StringComparison.Ordinal))
+                return AmbiguousConfirmation();
+
+            var baselineIds = preparation.Target.Baseline.Items
+                .Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
+            var currentIds = current.TopLevelItems
+                .Select(item => item.ExactId).ToHashSet(StringComparer.Ordinal);
+            if (baselineIds.Any(id => !currentIds.Contains(id)))
+                return AmbiguousConfirmation();
+            var added = current.TopLevelItems
+                .Where(item => !baselineIds.Contains(item.ExactId)).ToArray();
+            if (!IsExactlyCorrelated(
+                    new TransferSourceListing(preparation.Source), officialAcceptance, added))
+                return AmbiguousConfirmation();
+            return BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(officialAcceptance.ExactRemoteItems),
+                SubmissionAcceptance.Unknown);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return AmbiguousConfirmation();
+        }
+    }
+
     private static bool IsStableComplete(TransferDirectoryListing listing) =>
         listing is { IsComplete: true, IsStable: true };
 

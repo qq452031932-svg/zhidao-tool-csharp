@@ -9,7 +9,21 @@ public interface ITransferRecoveryAuthorizationSource
     Task<TransferDirectoryRecoveryAuthorization?> TryAuthorizeDirectoryMutationAsync(
         TransferDirectoryRecoveryAuthorizationRequest request,
         CancellationToken cancellationToken = default);
+
+    Task<ReadOnlyTransferRecoveryBinding?> TryAuthorizeSubmissionRecoveryAsync(
+        TransferSubmissionRecoveryAuthorizationRequest request,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<ReadOnlyTransferRecoveryBinding?>(null);
 }
+
+public sealed record TransferSubmissionRecoveryAuthorizationRequest(
+    Guid OperationId,
+    Guid BatchId,
+    Guid AccountId,
+    int Generation,
+    RemoteDirectory Target,
+    string BaiduUserId,
+    AdapterCapabilityVersion Capability);
 
 public sealed class TransferRecoveryAuthorizationSource(
     IWebAutomationAttemptStore attempts,
@@ -59,6 +73,60 @@ public sealed class TransferRecoveryAuthorizationSource(
             mutation.OwningAttemptRevision, mutation.ParentExactId,
             Parent(mutation.CanonicalChildPath), mutation.CanonicalChildPath,
             mutation.BaiduUserId, mutation.Capability,
+            timeProvider.GetUtcNow().Add(AuthorizationLifetime));
+    }
+
+    public async Task<ReadOnlyTransferRecoveryBinding?> TryAuthorizeSubmissionRecoveryAsync(
+        TransferSubmissionRecoveryAuthorizationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.OperationId == Guid.Empty || request.BatchId == Guid.Empty ||
+            request.AccountId == Guid.Empty || request.Generation < 1 || request.Target is null ||
+            string.IsNullOrWhiteSpace(request.BaiduUserId) || request.Capability is null)
+            return null;
+        var attempt = await attempts.GetAsync(
+            request.OperationId, request.AccountId, request.Generation, cancellationToken)
+            .ConfigureAwait(false);
+        var effectiveState = attempt?.State == WebAutomationAttemptState.UserHandoff
+            ? attempt.ResumeStage
+            : attempt?.State;
+        if (attempt is null || attempt.OwnerKind != WebAutomationOwnerKind.Transfer ||
+            effectiveState != WebAutomationAttemptState.ResultPending ||
+            attempt.SourceEvidence is null || attempt.TargetPreparationEvidence is null ||
+            attempt.SubmissionEvidence is null ||
+            attempt.TargetPreparationEvidence.TargetPath != request.Target.Path ||
+            !string.Equals(attempt.TargetPreparationEvidence.TargetExactId,
+                request.Target.RemoteId, StringComparison.Ordinal) ||
+            !string.Equals(attempt.SourceEvidence.BaiduUserId,
+                request.BaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(attempt.TargetPreparationEvidence.BaiduUserId,
+                request.BaiduUserId, StringComparison.Ordinal) ||
+            attempt.SourceEvidence.Capability != request.Capability ||
+            attempt.SubmissionEvidence.Capability != request.Capability ||
+            !string.Equals(attempt.SubmissionEvidence.SourceFingerprint,
+                attempt.SourceEvidence.Items.Fingerprint, StringComparison.Ordinal) ||
+            !string.Equals(attempt.SubmissionEvidence.TargetBaselineFingerprint,
+                attempt.TargetPreparationEvidence.Baseline.Fingerprint, StringComparison.Ordinal) ||
+            !string.Equals(attempt.SubmissionEvidence.TargetExactId,
+                request.Target.RemoteId, StringComparison.Ordinal))
+            return null;
+        if (!await ownership.IsBoundAsync(
+                request.OperationId, request.BatchId, request.AccountId, request.Generation,
+                WebAutomationOwnerKind.Transfer, cancellationToken).ConfigureAwait(false))
+            return null;
+        return new ReadOnlyTransferRecoveryBinding(
+            request.OperationId,
+            request.BatchId,
+            request.AccountId,
+            request.Generation,
+            request.Target,
+            request.BaiduUserId,
+            attempt.SourceEvidence.Items.Fingerprint,
+            attempt.TargetPreparationEvidence.Baseline.Fingerprint,
+            attempt.SubmissionEvidence.MarkedSubmittingAtUtc,
+            attempt.TransferIdentityMapping?.Fingerprint,
+            request.Capability,
             timeProvider.GetUtcNow().Add(AuthorizationLifetime));
     }
 

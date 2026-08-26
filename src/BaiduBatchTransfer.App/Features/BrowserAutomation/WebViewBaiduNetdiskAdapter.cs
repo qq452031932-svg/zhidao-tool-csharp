@@ -354,26 +354,53 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         }
         if (effectiveStage != WebAutomationAttemptState.ResultPending)
             return UnknownConfirmation();
-        var baseline = attempt!.Baseline!;
-        var acceptedRemoteItems = attempt.AcceptedRemoteItems!;
+        if (attempt?.SourceEvidence is null || attempt.TargetPreparationEvidence is null ||
+            attempt.SubmissionEvidence is null || recoveryAuthorization is null ||
+            string.IsNullOrWhiteSpace(session.BaiduUserId))
+            return UnknownConfirmation();
+        var destination = new RemoteDirectory(
+            attempt.TargetPreparationEvidence.TargetExactId,
+            attempt.TargetPreparationEvidence.TargetPath);
+        if (destination.Path != query.TargetPath)
+            return UnknownConfirmation();
+        var recoveryBinding = await recoveryAuthorization.TryAuthorizeSubmissionRecoveryAsync(
+            new TransferSubmissionRecoveryAuthorizationRequest(
+                context.OperationId,
+                context.BatchId,
+                context.AccountId,
+                context.Generation,
+                destination,
+                session.BaiduUserId,
+                attempt.SourceEvidence.Capability),
+            cancellationToken).ConfigureAwait(false);
+        if (recoveryBinding is null) return UnknownConfirmation();
+        TransferOfficialAcceptance? officialAcceptance = null;
+        if (attempt.AcceptedRemoteItems is not null &&
+            attempt.TransferIdentityMapping is not null &&
+            !string.IsNullOrWhiteSpace(attempt.OfficialRequestId))
+        {
+            officialAcceptance = new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.Accepted,
+                attempt.OfficialRequestId,
+                attempt.AcceptedRemoteItems,
+                attempt.TransferIdentityMapping,
+                attempt.ObservationFingerprint ?? attempt.AcceptedRemoteItems.Fingerprint,
+                destination.RemoteId);
+        }
 
-        var request = Request(
+        var request = RecoveryRequest(
             context,
-            context.SourceShare,
+            recoveryBinding,
             async (visibleSession, visibleContext, token) =>
             {
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
-                var officialAcceptance = new TransferOfficialAcceptance(
-                    TransferOfficialAcceptanceStatus.Accepted,
-                    adapterRequestId: null,
-                    acceptedRemoteItems,
-                    attempt.ObservationFingerprint ?? acceptedRemoteItems.Fingerprint);
-                var result = await flow.ConfirmExactAsync(
+                var result = await flow.ConfirmExactFromTargetAsync(
                     automationSession,
-                    context.SourceShare,
-                    new RemoteDirectory(query.TargetPath.Value, query.TargetPath),
-                    baseline,
+                    destination,
+                    new TransferPreparationEvidence(
+                        attempt.SourceEvidence, attempt.TargetPreparationEvidence).Validate(),
+                    attempt.SubmissionEvidence,
                     officialAcceptance,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
@@ -390,7 +417,7 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         {
             await RecordAcceptanceEvidenceSafelyAsync(
                 EvidenceRequest(context, AdapterWriteAction.SubmitTransfer),
-                acceptedRemoteItems.Fingerprint,
+                attempt.AcceptedRemoteItems!.Fingerprint,
                 recovery: true).ConfigureAwait(false);
         }
         return result.Value;
@@ -485,6 +512,36 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 binding,
                 expectedBaiduUserId);
         return new(identity, profilePath, Navigation(context, officialUri), action, candidate);
+    }
+
+    private VisibleWebAutomationRequest<T> RecoveryRequest<T>(
+        TransferOperationAutomationContext context,
+        ReadOnlyTransferRecoveryBinding binding,
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+    {
+        var identity = new WebAutomationRequestIdentity(
+            context.OperationId, context.BatchId, context.AccountId, context.Generation,
+            WebAutomationOwnerKind.Transfer);
+        var profilePath = profilePaths.GetAccountProfilePath(context.AccountId);
+        profilePaths.EnsureSafeAccountPath(context.AccountId, profilePath);
+        var navigation = new BaiduNavigationAuthorizationRequest(
+            BaiduAutomationAction.OpenOfficialUri,
+            binding.OfficialTargetUri,
+            binding.Capability.ProtocolVersion,
+            binding.Capability.SelectorVersion,
+            binding.Capability.BuildVersion,
+            new BaiduAutomationAcceptance(
+                false,
+                binding.Capability.ProtocolVersion,
+                binding.Capability.SelectorVersion,
+                binding.Capability.BuildVersion),
+            BaiduProtocolValidationStatus.NotValidated,
+            new BaiduAcceptanceOperationScope(
+                "BaiduTransfer", context.AccountId, context.OperationId,
+                context.Generation, context.BatchId));
+        return new VisibleWebAutomationRequest<T>(
+            identity, profilePath, navigation, action,
+            candidateBinding: null, transferRecoveryBinding: binding);
     }
 
     private bool HasExactCandidateBinding(TransferOperationAutomationContext context) =>

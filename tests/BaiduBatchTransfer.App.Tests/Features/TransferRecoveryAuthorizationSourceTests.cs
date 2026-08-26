@@ -50,6 +50,54 @@ public sealed class TransferRecoveryAuthorizationSourceTests
             new(graph.BatchId, 2, forged)));
     }
 
+    [Fact]
+    public async Task ResultPendingSubmissionReceivesTargetOnlyReadBinding()
+    {
+        var operationId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var sourceEvidence = new TransferSourceEvidence(
+            new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
+            "source-generation", "uid-1", Capability, new string('a', 64));
+        var baseline = WebAutomationBaseline.Create(["old"]);
+        var target = new TransferTargetPreparationEvidence(
+            "target-id", new RemotePath("/目标"), 1, true, true,
+            "target-generation", "uid-1", baseline, new string('b', 64));
+        var submission = new TransferSubmissionEvidence(
+            sourceEvidence.Items.Fingerprint, target.TargetExactId, baseline.Fingerprint,
+            "uid-1", Capability, Now.AddMinutes(-1));
+        var attempt = new WebAutomationAttemptRecord(
+            operationId, accountId, 2, WebAutomationOwnerKind.Transfer,
+            WebAutomationAttemptState.ResultPending, null, baseline, new string('b', 64),
+            false, 5, Now.AddMinutes(-2), Now.AddMinutes(-1),
+            sourceEvidence: sourceEvidence, targetPreparationEvidence: target,
+            submissionEvidence: submission);
+        var source = new TransferRecoveryAuthorizationSource(
+            new AttemptStore(attempt, Graph().Mutation), new Ownership(true),
+            new FixedTimeProvider(Now));
+
+        var binding = await source.TryAuthorizeSubmissionRecoveryAsync(new(
+            operationId, batchId, accountId, 2,
+            new RemoteDirectory("target-id", new RemotePath("/目标")),
+            "uid-1", Capability));
+
+        Assert.NotNull(binding);
+        Assert.Equal(sourceEvidence.Items.Fingerprint, binding.SourceFingerprint);
+        Assert.Equal(baseline.Fingerprint, binding.BaselineFingerprint);
+        Assert.Equal("https://pan.baidu.com/disk/main#/all?path=%2F%E7%9B%AE%E6%A0%87",
+            binding.OfficialTargetUri.AbsoluteUri);
+        Assert.DoesNotContain("目标", binding.ToString(), StringComparison.Ordinal);
+
+        Assert.Null(await source.TryAuthorizeSubmissionRecoveryAsync(new(
+            operationId, batchId, accountId, 2,
+            new RemoteDirectory("forged-target", new RemotePath("/目标")),
+            "uid-1", Capability)));
+        Assert.Null(await source.TryAuthorizeSubmissionRecoveryAsync(new(
+            operationId, batchId, accountId, 2,
+            new RemoteDirectory("target-id", new RemotePath("/目标")),
+            "wrong-uid", Capability)));
+    }
+
     private static GraphData Graph()
     {
         var operationId = Guid.NewGuid();

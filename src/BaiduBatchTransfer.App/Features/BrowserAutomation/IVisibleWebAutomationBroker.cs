@@ -55,7 +55,8 @@ public sealed record VisibleWebAutomationRequest<T>
         string profilePath,
         BaiduNavigationAuthorizationRequest navigation,
         Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action,
-        BaiduCandidateSessionBinding? candidateBinding = null)
+        BaiduCandidateSessionBinding? candidateBinding = null,
+        ReadOnlyTransferRecoveryBinding? transferRecoveryBinding = null)
     {
         Identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
@@ -63,6 +64,9 @@ public sealed record VisibleWebAutomationRequest<T>
         Navigation = navigation ?? throw new ArgumentNullException(nameof(navigation));
         Action = action ?? throw new ArgumentNullException(nameof(action));
         CandidateBinding = candidateBinding;
+        TransferRecoveryBinding = transferRecoveryBinding;
+        if (candidateBinding is not null && transferRecoveryBinding is not null)
+            throw new ArgumentException("A browser request cannot carry read and write bindings together.");
     }
 
     public WebAutomationRequestIdentity Identity { get; init; }
@@ -70,9 +74,94 @@ public sealed record VisibleWebAutomationRequest<T>
     public BaiduNavigationAuthorizationRequest Navigation { get; init; }
     public Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> Action { get; init; }
     public BaiduCandidateSessionBinding? CandidateBinding { get; init; }
+    public ReadOnlyTransferRecoveryBinding? TransferRecoveryBinding { get; init; }
 
     public override string ToString() =>
         $"VisibleWebAutomationRequest {{ Identity = {Identity}, ProfilePath = [REDACTED], Navigation = [REDACTED], Action = [REDACTED] }}";
+}
+
+public sealed record ReadOnlyTransferRecoveryBinding
+{
+    public ReadOnlyTransferRecoveryBinding(
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        RemoteDirectory target,
+        string baiduUserId,
+        string sourceFingerprint,
+        string baselineFingerprint,
+        DateTimeOffset submissionMarkedAtUtc,
+        string? mappingFingerprint,
+        AdapterCapabilityVersion capability,
+        DateTimeOffset expiresAtUtc)
+    {
+        if (operationId == Guid.Empty || batchId == Guid.Empty || accountId == Guid.Empty)
+            throw new ArgumentException("Recovery ownership is incomplete.");
+        if (generation < 1) throw new ArgumentOutOfRangeException(nameof(generation));
+        OperationId = operationId;
+        BatchId = batchId;
+        AccountId = accountId;
+        Generation = generation;
+        Target = target ?? throw new ArgumentNullException(nameof(target));
+        BaiduUserId = ValidateText(baiduUserId, nameof(baiduUserId));
+        WebAutomationAttemptRecord.ValidateFingerprint(sourceFingerprint, nameof(sourceFingerprint));
+        WebAutomationAttemptRecord.ValidateFingerprint(baselineFingerprint, nameof(baselineFingerprint));
+        WebAutomationAttemptRecord.ValidateFingerprint(mappingFingerprint, nameof(mappingFingerprint));
+        SourceFingerprint = sourceFingerprint;
+        BaselineFingerprint = baselineFingerprint;
+        SubmissionMarkedAtUtc = submissionMarkedAtUtc.ToUniversalTime();
+        MappingFingerprint = mappingFingerprint;
+        Capability = capability ?? throw new ArgumentNullException(nameof(capability));
+        ExpiresAtUtc = expiresAtUtc.ToUniversalTime();
+        if (!string.Equals(Capability.AdapterKind, "BaiduTransfer", StringComparison.Ordinal) ||
+            SubmissionMarkedAtUtc > ExpiresAtUtc)
+            throw new ArgumentException("The recovery capability or lifetime is invalid.");
+    }
+
+    public Guid OperationId { get; }
+    public Guid BatchId { get; }
+    public Guid AccountId { get; }
+    public int Generation { get; }
+    public RemoteDirectory Target { get; }
+    public string BaiduUserId { get; }
+    public string SourceFingerprint { get; }
+    public string BaselineFingerprint { get; }
+    public DateTimeOffset SubmissionMarkedAtUtc { get; }
+    public string? MappingFingerprint { get; }
+    public AdapterCapabilityVersion Capability { get; }
+    public DateTimeOffset ExpiresAtUtc { get; }
+    public Uri OfficialTargetUri => new(
+        $"https://pan.baidu.com/disk/main#/all?path={Uri.EscapeDataString(Target.Path.Value)}");
+
+    public void Validate(WebAutomationRequestIdentity identity, BaiduNavigationAuthorizationRequest navigation)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(navigation);
+        var scope = navigation.AcceptanceScope;
+        if (ExpiresAtUtc <= DateTimeOffset.UtcNow || identity.OwnerKind != WebAutomationOwnerKind.Transfer ||
+            identity.OperationId != OperationId || identity.BatchId != BatchId ||
+            identity.AccountId != AccountId || identity.Generation != Generation ||
+            navigation.OfficialUri != OfficialTargetUri ||
+            navigation.ProtocolVersion != Capability.ProtocolVersion ||
+            navigation.SelectorVersion != Capability.SelectorVersion ||
+            navigation.ApplicationBuildVersion != Capability.BuildVersion ||
+            scope is null || scope.AdapterKind != Capability.AdapterKind ||
+            scope.OperationId != OperationId || scope.BatchId != BatchId ||
+            scope.AccountId != AccountId || scope.Generation != Generation)
+            throw new InvalidOperationException("The read-only recovery binding does not match this request.");
+    }
+
+    public override string ToString() =>
+        "ReadOnlyTransferRecoveryBinding { Identity = [REDACTED], Evidence = [REDACTED] }";
+
+    private static string ValidateText(string value, string parameterName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
+        if (value.Length > 512 || value.Any(char.IsControl))
+            throw new ArgumentException("The recovery value is invalid.", parameterName);
+        return value;
+    }
 }
 
 public sealed record BaiduCandidateSessionBinding(
@@ -197,6 +286,15 @@ public interface IBoundVisibleWebAutomationSessionFactory : IVisibleWebAutomatio
         WebAutomationRequestIdentity identity,
         string profilePath,
         BaiduCandidateSessionBinding binding,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IReadOnlyTransferRecoverySessionFactory : IVisibleWebAutomationSessionFactory
+{
+    Task<IVisibleWebAutomationSession> CreateReadOnlyTransferRecoveryAsync(
+        WebAutomationRequestIdentity identity,
+        string profilePath,
+        ReadOnlyTransferRecoveryBinding binding,
         CancellationToken cancellationToken = default);
 }
 

@@ -847,6 +847,39 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadOnlyTransferRecoveryUsesDedicatedFactoryWithoutWriteBinding()
+    {
+        await using var fixture = CreateFixture();
+        var ordinary = fixture.Request((_, _, _) => Task.FromResult(1));
+        var target = new RemoteDirectory("target-id", new RemotePath("/目标"));
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion, "test-build");
+        var binding = new ReadOnlyTransferRecoveryBinding(
+            ordinary.Identity.OperationId, ordinary.Identity.BatchId,
+            ordinary.Identity.AccountId, ordinary.Identity.Generation,
+            target, "uid-1", new string('a', 64), new string('b', 64),
+            DateTimeOffset.UtcNow, null, capability, DateTimeOffset.UtcNow.AddMinutes(5));
+        var request = ordinary with
+        {
+            Navigation = fixture.Navigation(binding.OfficialTargetUri) with
+            {
+                AcceptanceScope = new BaiduAcceptanceOperationScope(
+                    capability.AdapterKind, ordinary.Identity.AccountId,
+                    ordinary.Identity.OperationId, ordinary.Identity.Generation,
+                    ordinary.Identity.BatchId),
+            },
+            TransferRecoveryBinding = binding,
+        };
+
+        var result = await fixture.Queue.EnqueueAsync(request);
+
+        Assert.Equal(VisibleWebAutomationDisposition.ActionCompleted, result.Disposition);
+        Assert.Same(binding, fixture.Factory.LastTransferRecoveryBinding);
+        Assert.Null(fixture.Factory.LastCandidateBinding);
+    }
+
+    [Fact]
     public async Task CrossIdentityCandidateBindingIsRejectedBeforeSessionFactory()
     {
         await using var fixture = CreateFixture();
@@ -1096,7 +1129,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
     }
 
     private sealed class RecordingSessionFactory(RecordingDispatcher dispatcher)
-        : IBoundVisibleWebAutomationSessionFactory
+        : IBoundVisibleWebAutomationSessionFactory, IReadOnlyTransferRecoverySessionFactory
     {
         private readonly List<RecordingSession> sessions = [];
         private int active;
@@ -1107,6 +1140,7 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
         public bool NextCloseNeverCompletes { get; set; }
         public bool NextShowNeverCompletes { get; set; }
         public BaiduCandidateSessionBinding? LastCandidateBinding { get; private set; }
+        public ReadOnlyTransferRecoveryBinding? LastTransferRecoveryBinding { get; private set; }
 
         public Task<IVisibleWebAutomationSession> CreateBoundAsync(
             WebAutomationRequestIdentity identity,
@@ -1115,6 +1149,16 @@ public sealed class VisibleWebAutomationQueueTests : IDisposable
             CancellationToken cancellationToken = default)
         {
             LastCandidateBinding = binding;
+            return CreateAsync(identity, profilePath, cancellationToken);
+        }
+
+        public Task<IVisibleWebAutomationSession> CreateReadOnlyTransferRecoveryAsync(
+            WebAutomationRequestIdentity identity,
+            string profilePath,
+            ReadOnlyTransferRecoveryBinding binding,
+            CancellationToken cancellationToken = default)
+        {
+            LastTransferRecoveryBinding = binding;
             return CreateAsync(identity, profilePath, cancellationToken);
         }
 

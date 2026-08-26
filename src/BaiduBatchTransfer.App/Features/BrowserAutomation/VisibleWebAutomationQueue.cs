@@ -186,7 +186,15 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                 queueScope.Token,
                 profileCloseRequested.Token);
             session = await dispatcher.InvokeAsync(
-                () => request.CandidateBinding is { } candidate
+                () => request.TransferRecoveryBinding is { } recovery
+                    ? sessionFactory is IReadOnlyTransferRecoverySessionFactory recoveryFactory
+                        ? recoveryFactory.CreateReadOnlyTransferRecoveryAsync(
+                            request.Identity, request.ProfilePath, recovery, profileScope.Token)
+                        : Task.FromException<IVisibleWebAutomationSession>(
+                            new WebAutomationAuthorizationException(
+                                BaiduAutomationDenialReason.AcceptanceMissing,
+                                "Read-only transfer recovery session factory is unavailable."))
+                    : request.CandidateBinding is { } candidate
                     ? sessionFactory is IBoundVisibleWebAutomationSessionFactory boundFactory
                         ? boundFactory.CreateBoundAsync(
                             request.Identity, request.ProfilePath, candidate, profileScope.Token)
@@ -354,6 +362,16 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
                     "Candidate binding does not match this exact browser operation.");
             }
         }
+        if (request.TransferRecoveryBinding is { } recovery)
+        {
+            try { recovery.Validate(request.Identity, request.Navigation); }
+            catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+            {
+                throw new WebAutomationAuthorizationException(
+                    BaiduAutomationDenialReason.AcceptanceMissing,
+                    "Read-only transfer recovery binding does not match this browser operation.");
+            }
+        }
         profilePathPolicy.EnsureSafeAccountPath(request.Identity.AccountId, request.ProfilePath);
         var expectedPath = profilePathPolicy.GetAccountProfilePath(request.Identity.AccountId);
         if (!string.Equals(request.ProfilePath, expectedPath, StringComparison.OrdinalIgnoreCase))
@@ -366,7 +384,9 @@ public sealed class VisibleWebAutomationQueue : IVisibleWebAutomationBroker, IDi
             throw new WebAutomationAuthorizationException(
                 BaiduAutomationDenialReason.OfficialUriNotAllowed,
                 webDecision.SafeMessage ?? "已阻止不安全的页面跳转。");
-        var protocolDecision = navigationAuthorizer.Authorize(request.Navigation);
+        var protocolDecision = request.TransferRecoveryBinding is not null
+            ? BaiduAutomationDecision.Allowed()
+            : navigationAuthorizer.Authorize(request.Navigation);
         if (!protocolDecision.IsAllowed)
             throw new WebAutomationAuthorizationException(
                 protocolDecision.DenialReason,

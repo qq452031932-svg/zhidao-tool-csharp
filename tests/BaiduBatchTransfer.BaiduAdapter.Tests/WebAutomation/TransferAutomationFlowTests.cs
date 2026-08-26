@@ -408,6 +408,59 @@ public sealed class TransferAutomationFlowTests
         Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
     }
 
+    [Fact]
+    public async Task TargetOnlyRecoveryNeverOpensOrUnlocksTheSource()
+    {
+        var scenario = Load("multi-root-transfer.json");
+        var session = new FixtureSession(scenario);
+        var preparation = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .PrepareFromPersistedSourceAsync(
+                session, Request(), session.SourceEvidence, CancellationToken.None);
+        session.Events.Clear();
+        var evidence = preparation.Value!.Evidence!;
+        var submission = new TransferSubmissionEvidence(
+            evidence.Source.Items.Fingerprint,
+            evidence.Target.TargetExactId,
+            evidence.Target.Baseline.Fingerprint,
+            evidence.Source.BaiduUserId,
+            evidence.Source.Capability,
+            Now);
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ConfirmExactFromTargetAsync(
+                session, Destination(), evidence, submission,
+                session.OfficialAcceptance, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
+        Assert.Equal(["reopen-destination"], session.Events);
+    }
+
+    [Fact]
+    public async Task TargetOnlyRecoveryWithoutOfficialMappingReadsThenRemainsAmbiguous()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario);
+        var preparation = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .PrepareFromPersistedSourceAsync(
+                session, Request(), session.SourceEvidence, CancellationToken.None);
+        session.Events.Clear();
+        var evidence = preparation.Value!.Evidence!;
+        var submission = new TransferSubmissionEvidence(
+            evidence.Source.Items.Fingerprint, evidence.Target.TargetExactId,
+            evidence.Target.Baseline.Fingerprint, evidence.Source.BaiduUserId,
+            evidence.Source.Capability, Now);
+
+        var result = await new TransferAutomationFlow(new FixedTimeProvider(Now))
+            .ConfirmExactFromTargetAsync(
+                session, Destination(), evidence, submission,
+                officialAcceptance: null, CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Equal(["reopen-destination"], session.Events);
+    }
+
     private static TransferAutomationRequest Request() => new(
         Share(),
         Destination(),
@@ -587,7 +640,20 @@ public sealed class TransferAutomationFlowTests
         public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken)
         {
             Events.Add("reopen-destination");
-            return Task.FromResult(Listing(scenario.After, 'c'));
+            var items = scenario.After.Select(item => new TransferRemoteItem(
+                new RemoteItemIdentity(item.ExactId, item.DisplayName),
+                TransferRemoteItemKind.File,
+                item.DisplayName)).ToArray();
+            return Task.FromResult(TransferDirectoryListing.Exact(
+                destination,
+                ["root", destination.RemoteId],
+                items,
+                items.Length,
+                true,
+                true,
+                "target-after-generation",
+                "baidu-user",
+                Fingerprint('c')));
         }
 
         private static TransferDirectoryListing Listing(IEnumerable<FixtureItem> items, char fingerprint) =>

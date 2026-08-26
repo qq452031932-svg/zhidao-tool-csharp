@@ -12,7 +12,7 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebView2AutomationSessionFactory(
     IBaiduCandidateActionAuthorizationSource candidateAuthorizationSource)
-    : IBoundVisibleWebAutomationSessionFactory
+    : IBoundVisibleWebAutomationSessionFactory, IReadOnlyTransferRecoverySessionFactory
 {
     public Task<IVisibleWebAutomationSession> CreateAsync(
         WebAutomationRequestIdentity identity,
@@ -44,6 +44,23 @@ public sealed class WebView2AutomationSessionFactory(
             new WebView2AutomationSession(
                 identity, profilePath, window, candidateAuthorizationSource, binding));
     }
+
+    public Task<IVisibleWebAutomationSession> CreateReadOnlyTransferRecoveryAsync(
+        WebAutomationRequestIdentity identity,
+        string profilePath,
+        ReadOnlyTransferRecoveryBinding binding,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var window = new WebAutomationWindow
+        {
+            Owner = System.Windows.Application.Current?.MainWindow,
+        };
+        return Task.FromResult<IVisibleWebAutomationSession>(
+            new WebView2AutomationSession(
+                identity, profilePath, window, candidateAuthorizationSource,
+                candidateBinding: null, transferRecoveryBinding: binding));
+    }
 }
 
 public sealed class WebView2AutomationSession :
@@ -61,6 +78,7 @@ public sealed class WebView2AutomationSession :
     private readonly WebViewDownloadEventRouter downloadRouter;
     private readonly IBaiduCandidateActionAuthorizationSource? candidateAuthorizationSource;
     private readonly BaiduCandidateSessionBinding? candidateBinding;
+    private readonly ReadOnlyTransferRecoveryBinding? transferRecoveryBinding;
     private readonly CancellationToken headlessUserClosed;
     private IBaiduCandidateDomExecutor? candidateExecutor;
     private Uri? currentOfficialUri;
@@ -74,7 +92,8 @@ public sealed class WebView2AutomationSession :
         string profilePath,
         WebAutomationWindow window,
         IBaiduCandidateActionAuthorizationSource candidateAuthorizationSource,
-        BaiduCandidateSessionBinding? candidateBinding = null)
+        BaiduCandidateSessionBinding? candidateBinding = null,
+        ReadOnlyTransferRecoveryBinding? transferRecoveryBinding = null)
     {
         this.identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
         ArgumentException.ThrowIfNullOrWhiteSpace(profilePath);
@@ -83,6 +102,9 @@ public sealed class WebView2AutomationSession :
         this.candidateAuthorizationSource = candidateAuthorizationSource ??
             throw new ArgumentNullException(nameof(candidateAuthorizationSource));
         this.candidateBinding = candidateBinding;
+        this.transferRecoveryBinding = transferRecoveryBinding;
+        if (candidateBinding is not null && transferRecoveryBinding is not null)
+            throw new ArgumentException("Read-only recovery cannot carry a write binding.");
         ValidateCandidateIdentity(candidateBinding, this.identity);
         downloadRouter = new WebViewDownloadEventRouter(this.identity);
     }
@@ -100,6 +122,27 @@ public sealed class WebView2AutomationSession :
         profilePath = "[HEADLESS]";
         currentOfficialUri = new Uri("https://pan.baidu.com/disk/main");
         ValidateCandidateIdentity(candidateBinding, this.identity);
+        downloadRouter = new WebViewDownloadEventRouter(this.identity);
+    }
+
+    internal WebView2AutomationSession(
+        WebAutomationRequestIdentity identity,
+        ReadOnlyTransferRecoveryBinding transferRecoveryBinding,
+        IBaiduCandidateDomExecutor candidateExecutor,
+        CancellationToken userClosed)
+    {
+        this.identity = (identity ?? throw new ArgumentNullException(nameof(identity))).Validate();
+        this.transferRecoveryBinding = transferRecoveryBinding ??
+            throw new ArgumentNullException(nameof(transferRecoveryBinding));
+        if (transferRecoveryBinding.OperationId != identity.OperationId ||
+            transferRecoveryBinding.BatchId != identity.BatchId ||
+            transferRecoveryBinding.AccountId != identity.AccountId ||
+            transferRecoveryBinding.Generation != identity.Generation)
+            throw new InvalidOperationException("Read-only recovery identity does not match the session.");
+        this.candidateExecutor = candidateExecutor ?? throw new ArgumentNullException(nameof(candidateExecutor));
+        headlessUserClosed = userClosed;
+        profilePath = "[HEADLESS]";
+        currentOfficialUri = transferRecoveryBinding.OfficialTargetUri;
         downloadRouter = new WebViewDownloadEventRouter(this.identity);
     }
 
@@ -135,7 +178,7 @@ public sealed class WebView2AutomationSession :
         core.DownloadStarting += OnDownloadStarting;
         core.PermissionRequested += OnPermissionRequested;
         currentOfficialUri = initialUri;
-        if (candidateBinding is not null)
+        if (candidateBinding is not null || transferRecoveryBinding is not null)
             candidateExecutor = new WebView2CandidateDomExecutor(
                 new CoreWebView2CandidateDomScriptHost(core), candidateAuthorizationSource!);
         core.Navigate(initialUri.AbsoluteUri);
@@ -352,6 +395,7 @@ public sealed class WebView2AutomationSession :
         ArgumentNullException.ThrowIfNull(destination);
         var exactTargetUri = new Uri(
             $"https://pan.baidu.com/disk/main#/all?path={Uri.EscapeDataString(destination.Path.Value)}");
+        ValidateReadOnlyRecovery(destination, exactTargetUri);
         await NavigateOfficialAsync(exactTargetUri, cancellationToken).ConfigureAwait(false);
         var observed = await ObserveTransferAsync(
             BaiduCandidatePageState.OwnDrive,
@@ -362,6 +406,7 @@ public sealed class WebView2AutomationSession :
         if (observed.AncestorExactIds.IsEmpty ||
             !string.Equals(observed.AncestorExactIds[^1], destination.RemoteId, StringComparison.Ordinal))
             throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+        ValidateReadOnlyRecovery(destination, exactTargetUri);
         return ToDirectoryListing(observed);
     }
 
@@ -634,7 +679,8 @@ public sealed class WebView2AutomationSession :
     {
         using var fence = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, UserClosed);
         fence.Token.ThrowIfCancellationRequested();
-        if (candidateBinding?.ExpectedBaiduUserId is not { Length: > 0 } uid ||
+        var uid = candidateBinding?.ExpectedBaiduUserId ?? transferRecoveryBinding?.BaiduUserId;
+        if (uid is not { Length: > 0 } ||
             candidateExecutor is not IBaiduTransferCandidateDomExecutor executor ||
             currentOfficialUri is null)
             throw NotValidated(BaiduAutomationDenialReason.AcceptanceMissing);
@@ -753,6 +799,20 @@ public sealed class WebView2AutomationSession :
 
     private static WebAutomationAuthorizationException NotValidated(BaiduAutomationDenialReason reason) =>
         new(reason, "Candidate WebView2 field protocol is not validated for this typed operation.");
+
+    private void ValidateReadOnlyRecovery(RemoteDirectory destination, Uri officialTargetUri)
+    {
+        if (transferRecoveryBinding is null) return;
+        if (candidateBinding is not null || transferRecoveryBinding.ExpiresAtUtc <= DateTimeOffset.UtcNow ||
+            transferRecoveryBinding.OperationId != identity.OperationId ||
+            transferRecoveryBinding.BatchId != identity.BatchId ||
+            transferRecoveryBinding.AccountId != identity.AccountId ||
+            transferRecoveryBinding.Generation != identity.Generation ||
+            transferRecoveryBinding.Target != destination ||
+            transferRecoveryBinding.OfficialTargetUri != officialTargetUri ||
+            currentOfficialUri is not null && currentOfficialUri != officialTargetUri)
+            throw NotValidated(BaiduAutomationDenialReason.AcceptanceMissing);
+    }
 
     private static void ValidateCandidateIdentity(
         BaiduCandidateSessionBinding? candidate,

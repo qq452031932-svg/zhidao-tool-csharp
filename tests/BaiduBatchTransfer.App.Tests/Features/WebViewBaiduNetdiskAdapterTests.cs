@@ -276,11 +276,13 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context,
             WebAutomationAttemptState.ResultPending,
             baseline,
-            AcceptedItems()));
+            AcceptedItems(),
+            includeTransferMapping: true));
         var broker = new RecordingBroker();
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
-            new TransferAutomationFlow(), "build-a", attempts);
+            new TransferAutomationFlow(), "build-a", attempts,
+            recoveryAuthorization: new RecoveryAuthorization(attempts));
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context,
@@ -292,6 +294,11 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
         Assert.Equal(context.OperationId, broker.Identity!.OperationId);
         Assert.Equal(context.Generation, broker.Identity.Generation);
+        Assert.Null(broker.CandidateBinding);
+        Assert.NotNull(broker.TransferRecoveryBinding);
+        Assert.Equal(Destination(), broker.TransferRecoveryBinding!.Target);
+        Assert.DoesNotContain(context.SourceShare.OriginalUrl,
+            broker.Navigation!.OfficialUri.AbsoluteUri, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -328,7 +335,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context,
             WebAutomationAttemptState.BaselinePersisted,
             WebAutomationBaseline.Create(["fictional-old"])));
-        var broker = new CallbackBroker(attempts, new AutomationSession());
+        var automation = new AutomationSession();
+        var broker = new CallbackBroker(attempts, automation);
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
             new TransferAutomationFlow(), "build-a", attempts);
@@ -353,10 +361,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             WebAutomationAttemptState.ResultPending,
             WebAutomationBaseline.Create(["fictional-old"]),
             AcceptedItems()));
-        var broker = new CallbackBroker(attempts, new AutomationSession());
+        var automation = new AutomationSession();
+        var broker = new CallbackBroker(attempts, automation);
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
-            new TransferAutomationFlow(), "build-a", attempts);
+            new TransferAutomationFlow(), "build-a", attempts,
+            recoveryAuthorization: new RecoveryAuthorization(attempts));
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context, Session(accountId), Query(), CancellationToken.None);
@@ -364,6 +374,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.True(result.IsSuccess);
         Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
         Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
+        Assert.Equal(["reopen-destination"], automation.Events);
     }
 
     [Fact]
@@ -381,7 +392,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), new CallbackBroker(attempts, new AutomationSession()),
             new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a",
-            attempts, evidence);
+            attempts, evidence, new RecoveryAuthorization(attempts));
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context, Session(accountId), Query(), CancellationToken.None);
@@ -408,7 +419,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             new AutomationSession { CurrentItems = [new("fictional-old", "旧资源")] });
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
-            new TransferAutomationFlow(), "build-a", attempts);
+            new TransferAutomationFlow(), "build-a", attempts,
+            recoveryAuthorization: new RecoveryAuthorization(attempts));
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context, Session(accountId), Query(), CancellationToken.None);
@@ -436,7 +448,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             new AutomationSession { CancelListingRead = true });
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
-            new TransferAutomationFlow(), "build-a", attempts);
+            new TransferAutomationFlow(), "build-a", attempts,
+            recoveryAuthorization: new RecoveryAuthorization(attempts));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             adapter.ConfirmExactTransferForOperationAsync(
@@ -560,7 +573,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             WebAutomationAttemptState.ResultPending));
         var adapter = new WebViewBaiduNetdiskAdapter(
             new ReadOnlyAdapter(), new CallbackBroker(attempts, new AutomationSession()),
-            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a", attempts);
+            new RecordingProfilePolicy(accountId), new TransferAutomationFlow(), "build-a", attempts,
+            recoveryAuthorization: new RecoveryAuthorization(attempts));
 
         var result = await adapter.ConfirmExactTransferForOperationAsync(
             context, Session(accountId), Query(), CancellationToken.None);
@@ -742,7 +756,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         WebAutomationAttemptState state,
         WebAutomationBaseline? baseline,
         RemoteItemIdentitySet? acceptedRemoteItems = null,
-        WebAutomationAttemptState? resumeStage = null)
+        WebAutomationAttemptState? resumeStage = null,
+        bool includeTransferMapping = false)
     {
         var capability = new AdapterCapabilityVersion(
             "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
@@ -755,6 +770,20 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             Destination().RemoteId, Destination().Path, baseline.Items.Length,
             true, true, "target-generation", "baidu-user", baseline,
             new string('c', 64));
+        var effectiveState = state == WebAutomationAttemptState.UserHandoff ? resumeStage : state;
+        var submission = effectiveState == WebAutomationAttemptState.ResultPending &&
+                         source is not null && target is not null
+            ? new TransferSubmissionEvidence(
+                source.Items.Fingerprint, target.TargetExactId, target.Baseline.Fingerprint,
+                source.BaiduUserId, source.Capability, Now.AddMinutes(-1))
+            : null;
+        var mapping = includeTransferMapping && source is not null && acceptedRemoteItems is not null
+            ? new TransferIdentityMapping([
+                new TransferIdentityMappingEntry(
+                    source.Items.Items[0].ExactId,
+                    acceptedRemoteItems.Items[0].ExactId),
+            ])
+            : null;
         return new WebAutomationAttemptRecord(
             context.OperationId,
             context.AccountId,
@@ -770,7 +799,10 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             Now.AddMinutes(-1),
             acceptedRemoteItems,
             source,
-            target);
+            target,
+            submission,
+            mapping is null ? null : "request-1",
+            mapping);
     }
 
     private static RemoteItemIdentitySet AcceptedItems() =>
@@ -813,6 +845,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public string? ProfilePath { get; private set; }
         public BaiduNavigationAuthorizationRequest? Navigation { get; private set; }
         public BaiduCandidateSessionBinding? CandidateBinding { get; private set; }
+        public ReadOnlyTransferRecoveryBinding? TransferRecoveryBinding { get; private set; }
 
         public Task<VisibleWebAutomationResult<T>> EnqueueAsync<T>(
             VisibleWebAutomationRequest<T> request,
@@ -822,6 +855,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             ProfilePath = request.ProfilePath;
             Navigation = request.Navigation;
             CandidateBinding = request.CandidateBinding;
+            TransferRecoveryBinding = request.TransferRecoveryBinding;
             if (ThrowAuthorization)
                 throw new WebAutomationAuthorizationException(
                     BaiduAutomationDenialReason.CatalogNotValidated,
@@ -1104,6 +1138,34 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         public Task<bool> TryResolveUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, WebAutomationAttemptState terminalState, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
+    private sealed class RecoveryAuthorization(AttemptStore attempts)
+        : ITransferRecoveryAuthorizationSource
+    {
+        public Task<TransferDirectoryRecoveryAuthorization?> TryAuthorizeDirectoryMutationAsync(
+            TransferDirectoryRecoveryAuthorizationRequest request,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<TransferDirectoryRecoveryAuthorization?>(null);
+
+        public Task<ReadOnlyTransferRecoveryBinding?> TryAuthorizeSubmissionRecoveryAsync(
+            TransferSubmissionRecoveryAuthorizationRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            var current = attempts.Current;
+            if (current.SourceEvidence is null || current.TargetPreparationEvidence is null ||
+                current.SubmissionEvidence is null)
+                return Task.FromResult<ReadOnlyTransferRecoveryBinding?>(null);
+            return Task.FromResult<ReadOnlyTransferRecoveryBinding?>(new(
+                request.OperationId, request.BatchId, request.AccountId, request.Generation,
+                request.Target, request.BaiduUserId,
+                current.SourceEvidence.Items.Fingerprint,
+                current.TargetPreparationEvidence.Baseline.Fingerprint,
+                current.SubmissionEvidence.MarkedSubmittingAtUtc,
+                current.TransferIdentityMapping?.Fingerprint,
+                request.Capability,
+                DateTimeOffset.UtcNow.AddMinutes(5)));
+        }
+    }
+
     private sealed class CallbackBroker(AttemptStore attempts, IVisibleWebAutomationSession session) : IVisibleWebAutomationBroker
     {
         public int EnqueueCount { get; private set; }
@@ -1261,10 +1323,24 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
             SaveWholeShareAsync(destination, duplicatePolicy, cancellationToken);
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
-            CancelListingRead
-                ? Task.FromException<TransferDirectoryListing>(new OperationCanceledException(cancellationToken))
-                : Task.FromResult(new TransferDirectoryListing(true, true, CurrentItems, new string('d', 64)));
+        public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken)
+        {
+            if (CancelListingRead)
+                return Task.FromException<TransferDirectoryListing>(new OperationCanceledException(cancellationToken));
+
+            return Record("reopen-destination", TransferDirectoryListing.Exact(
+                destination,
+                [destination.RemoteId],
+                CurrentItems.Select(item => new TransferRemoteItem(
+                    item, TransferRemoteItemKind.File,
+                    item.DisplayedTopLevelName ?? item.ExactId)).ToArray(),
+                CurrentItems.Count,
+                true,
+                true,
+                "target-current-generation",
+                "baidu-user",
+                new string('d', 64)));
+        }
         private static TransferOfficialAcceptance Acceptance() => new(
             TransferOfficialAcceptanceStatus.Accepted,
             "fictional-request",
