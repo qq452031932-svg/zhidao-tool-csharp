@@ -191,6 +191,9 @@ public sealed record BaiduCandidateSessionBinding(
         ArgumentNullException.ThrowIfNull(identity);
         ArgumentNullException.ThrowIfNull(Authorization);
         ArgumentNullException.ThrowIfNull(Binding);
+        if (Binding.Capability.AdapterKind == "BaiduTransfer" &&
+            string.IsNullOrWhiteSpace(ExpectedBaiduUserId))
+            throw new InvalidOperationException("Transfer candidate sessions require a stable Baidu account identity.");
         if (ExpectedBaiduUserId is not null &&
             (string.IsNullOrWhiteSpace(ExpectedBaiduUserId) || ExpectedBaiduUserId.Length > 512 ||
              ExpectedBaiduUserId.Any(char.IsControl)))

@@ -18,6 +18,8 @@ public sealed class LiveAdapterAvailabilityTests
         Assert.Equal(BaiduProtocolValidationStatus.NotValidated, BaiduSelectorCatalog.Production.ValidationStatus);
         Assert.All(BaiduSelectorCatalog.Production.Definitions,
             definition => Assert.Empty(definition.ExecutableLocators));
+        Assert.NotEqual(BaiduSelectorCatalog.ProtocolVersion, BaiduSelectorCatalog.TransferProtocolVersion);
+        Assert.NotEqual(BaiduSelectorCatalog.SelectorVersion, BaiduSelectorCatalog.TransferSelectorVersion);
     }
 
     [Fact]

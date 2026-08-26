@@ -48,6 +48,68 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         Assert.False(broker.Navigation.Acceptance.IsAccepted);
         Assert.Same(context.AuthorizationBinding, broker.CandidateBinding!.Binding);
         Assert.Equal(AdapterWriteAction.EnsureDirectory, broker.CandidateBinding.Authorization.Action);
+        Assert.Equal(BaiduSelectorCatalog.TransferProtocolVersion, broker.Navigation.ProtocolVersion);
+        Assert.Equal(BaiduSelectorCatalog.TransferSelectorVersion, broker.Navigation.SelectorVersion);
+        Assert.Equal("fictional-user", broker.CandidateBinding.ExpectedBaiduUserId);
+    }
+
+    [Fact]
+    public async Task PersistedTransferEvidenceRejectsAMismatchedStableBaiduUserIdBeforeOpeningBrowser()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationBaseline.Create(["fictional-old"])));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+        var wrongSession = new AccountSession(
+            accountId,
+            "different-baidu-user",
+            [new SessionCookie("BDUSS", "fictional", ".baidu.com", "/", null, true, true)],
+            Now);
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, wrongSession, Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Null(broker.Identity);
+    }
+
+    [Fact]
+    public async Task PersistedOldTransferCapabilityCannotBeReusedByTransferV2()
+    {
+        var accountId = Guid.NewGuid();
+        var context = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 2, Share());
+        var oldCapability = new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion,
+            "build-a");
+        var attempts = new AttemptStore(Attempt(
+            context,
+            WebAutomationAttemptState.BaselinePersisted,
+            WebAutomationBaseline.Create(["fictional-old"]),
+            capabilityOverride: oldCapability));
+        var broker = new RecordingBroker();
+        var adapter = new WebViewBaiduNetdiskAdapter(
+            new ReadOnlyAdapter(), broker, new RecordingProfilePolicy(accountId),
+            new TransferAutomationFlow(), "build-a", attempts);
+
+        var result = await adapter.PrepareWholeShareForOperationAsync(
+            context, Session(accountId), Share(), Destination(), DuplicatePolicy.Skip,
+            CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Null(broker.Identity);
     }
 
     [Fact]
@@ -757,18 +819,19 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         WebAutomationBaseline? baseline,
         RemoteItemIdentitySet? acceptedRemoteItems = null,
         WebAutomationAttemptState? resumeStage = null,
-        bool includeTransferMapping = false)
+        bool includeTransferMapping = false,
+        AdapterCapabilityVersion? capabilityOverride = null)
     {
-        var capability = new AdapterCapabilityVersion(
-            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
-            BaiduSelectorCatalog.SelectorVersion, "build-a");
+        var capability = capabilityOverride ?? new AdapterCapabilityVersion(
+            "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion, "build-a");
         var source = baseline is null ? null : new TransferSourceEvidence(
             new RemoteItemIdentitySet([new("fictional-source", "来源资源")]),
-            1, true, true, "source-generation", "baidu-user", capability,
+            1, true, true, "source-generation", "fictional-user", capability,
             new string('b', 64));
         var target = baseline is null ? null : new TransferTargetPreparationEvidence(
             Destination().RemoteId, Destination().Path, baseline.Items.Length,
-            true, true, "target-generation", "baidu-user", baseline,
+            true, true, "target-generation", "fictional-user", baseline,
             new string('c', 64));
         var effectiveState = state == WebAutomationAttemptState.UserHandoff ? resumeStage : state;
         var submission = effectiveState == WebAutomationAttemptState.ResultPending &&
@@ -812,8 +875,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         TransferOperationAutomationContext context)
     {
         var capability = new AdapterCapabilityVersion(
-            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
-            BaiduSelectorCatalog.SelectorVersion, "build-a");
+            "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion, "build-a");
         var authorization = new AdapterWriteAuthorizationRequest(
             capability, context.AccountId, context.OperationId, context.Generation,
             context.BatchId, AdapterWriteAction.EnsureDirectory, context.IsRecovery);
@@ -829,7 +892,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 Now,
                 Now.AddMinutes(5),
                 context.IsRecovery,
-                null));
+                null),
+            "fictional-user");
     }
 
     private static AccountSession Session(Guid accountId) => new(
@@ -1224,8 +1288,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
                 new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
                 "source-generation", "fictional-user", new AdapterCapabilityVersion(
-                    "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
-                    BaiduSelectorCatalog.SelectorVersion, "build-a"), new string('a', 64))));
+                    "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+                    BaiduSelectorCatalog.TransferSelectorVersion, "build-a"), new string('a', 64))));
         public Task<TransferDirectoryListing> OpenDestinationPickerAsync(CancellationToken cancellationToken) =>
             Task.FromResult(Listing(rootHasChild: false));
         public Task<TransferDirectoryListing> OpenVerifiedRootAsync(CancellationToken cancellationToken) =>
@@ -1290,10 +1354,10 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 reachedEnd: true,
                 isStable: true,
                 "source-generation",
-                "baidu-user",
+                "fictional-user",
                 new AdapterCapabilityVersion(
-                    "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
-                    BaiduSelectorCatalog.SelectorVersion, "build-a"),
+                    "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+                    BaiduSelectorCatalog.TransferSelectorVersion, "build-a"),
                 new string('b', 64))));
         public async Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
             ShareReference share, CancellationToken cancellationToken)
@@ -1338,7 +1402,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 true,
                 true,
                 "target-current-generation",
-                "baidu-user",
+                "fictional-user",
                 new string('d', 64)));
         }
         private static TransferOfficialAcceptance Acceptance() => new(

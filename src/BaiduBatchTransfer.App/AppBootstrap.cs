@@ -223,8 +223,8 @@ public static class AppBootstrap
             sp.GetRequiredService<IAdapterWriteAuthorizationGate>(),
             new AdapterCapabilityVersion(
                 "BaiduTransfer",
-                BaiduSelectorCatalog.ProtocolVersion,
-                BaiduSelectorCatalog.SelectorVersion,
+                BaiduSelectorCatalog.TransferProtocolVersion,
+                BaiduSelectorCatalog.TransferSelectorVersion,
                 Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0")));
         services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();

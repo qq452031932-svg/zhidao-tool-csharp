@@ -12,6 +12,7 @@ using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -115,6 +116,9 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IVisibleWebAutomationSessionFactory>());
         Assert.IsType<SqliteAdapterCapabilityStore>(
             host.Services.GetRequiredService<IAdapterCapabilityStore>());
+        Assert.Single(host.Services.GetServices<ITransferRecoveryAuthorizationSource>());
+        Assert.IsType<TransferRecoveryAuthorizationSource>(
+            host.Services.GetRequiredService<ITransferRecoveryAuthorizationSource>());
         Assert.NotNull(host.Services.GetRequiredService<
             Func<AdapterWriteAuthorizationRequest, AcceptanceConfirmationWindow>>());
     }
@@ -134,6 +138,193 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.False(options.IsEnabled);
 #endif
     }
+
+    [Fact]
+    public async Task HostBindsTransferV2WithoutChangingTheIndependentShareV1Capability()
+    {
+        var gate = new RecordingWriteAuthorizationGate();
+        using var host = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<IAdapterWriteAuthorizationGate>();
+            services.AddSingleton<IAdapterWriteAuthorizationGate>(gate);
+        });
+        var accountId = Guid.NewGuid();
+        var session = new AccountSession(
+            accountId,
+            "stable-baidu-user",
+            [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
+            DateTimeOffset.UtcNow);
+        var transferContext = new TransferOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
+            new ShareReference("share-id", "https://pan.baidu.com/s/share-id", "a1b2"));
+        var items = new RemoteItemIdentitySet([new("remote-1", "item")]);
+        var shareContext = new ShareOperationAutomationContext(
+            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
+            WebAutomationOwnerKind.StandaloneShare, items);
+
+        await Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(
+                host.Services.GetRequiredService<IBaiduNetdiskAdapter>())
+            .EnsureDirectoryForOperationAsync(
+                transferContext, session, new RemotePath("/target"), CancellationToken.None);
+        await Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(
+                host.Services.GetRequiredService<IBaiduShareAdapter>())
+            .PreparePermanentShareForOperationAsync(
+                shareContext, session, new PermanentShareRequest(items), CancellationToken.None);
+
+        var transfer = Assert.Single(gate.Requests, request =>
+            request.Capability.AdapterKind == "BaiduTransfer");
+        var share = Assert.Single(gate.Requests, request =>
+            request.Capability.AdapterKind == "BaiduShare");
+        Assert.Equal(BaiduSelectorCatalog.TransferProtocolVersion, transfer.Capability.ProtocolVersion);
+        Assert.Equal(BaiduSelectorCatalog.TransferSelectorVersion, transfer.Capability.SelectorVersion);
+        Assert.Equal(BaiduSelectorCatalog.ProtocolVersion, share.Capability.ProtocolVersion);
+        Assert.Equal(BaiduSelectorCatalog.SelectorVersion, share.Capability.SelectorVersion);
+    }
+
+    [Fact]
+    public async Task OnlyExactTransferV2FormalRecordAuthorizesTheProductionBinding()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var store = host.Services.GetRequiredService<IAdapterCapabilityStore>();
+        var gate = host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>();
+        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var request = new AdapterWriteAuthorizationRequest(
+            new AdapterCapabilityVersion(
+                "BaiduTransfer",
+                BaiduSelectorCatalog.TransferProtocolVersion,
+                BaiduSelectorCatalog.TransferSelectorVersion,
+                build),
+            Guid.NewGuid(), Guid.NewGuid(), 1, Guid.NewGuid(),
+            AdapterWriteAction.EnsureDirectory);
+        var acceptedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        await store.AcceptAsync(new AdapterCapabilityAcceptanceRecord(
+            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion, build, acceptedAt, new string('A', 64)));
+        await store.AcceptAsync(new AdapterCapabilityAcceptanceRecord(
+            "BaiduShare", BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion, build, acceptedAt, new string('B', 64)));
+        await store.AcceptAsync(new AdapterCapabilityAcceptanceRecord(
+            "BaiduTransfer", BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion, build + "-other", acceptedAt,
+            new string('C', 64)));
+
+        Assert.Null(await gate.TryCreateBindingAsync(request));
+
+        await store.AcceptAsync(new AdapterCapabilityAcceptanceRecord(
+            request.Capability.AdapterKind, request.Capability.ProtocolVersion,
+            request.Capability.SelectorVersion, request.Capability.BuildVersion,
+            acceptedAt, new string('D', 64)));
+
+        var binding = await gate.TryCreateBindingAsync(request);
+        Assert.NotNull(binding);
+        Assert.Equal(AdapterWriteAuthorizationSource.ExactFormalRecord, binding.Source);
+        Assert.Equal(request.Capability, binding.Capability);
+    }
+
+    [Fact]
+    public async Task StoreBackedTransferRecoveryAuthorizationSurvivesHostRestart()
+    {
+        var operationId = Guid.NewGuid();
+        var batchId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        const int generation = 2;
+        const string baiduUserId = "stable-baidu-user";
+        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion,
+            build);
+        var target = new RemoteDirectory("target-id", new RemotePath("/target"));
+        var now = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        using (var firstHost = AppBootstrap.CreateHost(root))
+        {
+            await firstHost.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+            await SeedTransferOwnerAsync(
+                firstHost.Services.GetRequiredService<SqliteConnectionFactory>(),
+                operationId, batchId, accountId, generation, baiduUserId, now);
+            var attempts = firstHost.Services.GetRequiredService<IWebAutomationAttemptStore>();
+            Assert.True(await attempts.BeginAsync(WebAutomationAttemptRecord.Create(
+                operationId, accountId, generation, WebAutomationOwnerKind.Transfer, now)));
+            var source = new TransferSourceEvidence(
+                new RemoteItemIdentitySet([new("source-id", "source")]),
+                1, true, true, "source-generation", baiduUserId, capability,
+                new string('a', 64));
+            Assert.True(await attempts.TryPersistTransferSourceEvidenceAsync(
+                operationId, accountId, generation, 0, source, now.AddSeconds(1)));
+            var baseline = WebAutomationBaseline.Create(["existing-id"]);
+            var preparation = new TransferTargetPreparationEvidence(
+                target.RemoteId, target.Path, 1, true, true, "target-generation",
+                baiduUserId, baseline, new string('b', 64));
+            Assert.True(await attempts.TryPersistTransferTargetPreparationAsync(
+                operationId, accountId, generation, 1, preparation, now.AddSeconds(2)));
+            var submission = new TransferSubmissionEvidence(
+                source.Items.Fingerprint, target.RemoteId, baseline.Fingerprint,
+                baiduUserId, capability, now.AddSeconds(3));
+            Assert.True(await attempts.TryPersistTransferSubmissionAsync(
+                operationId, accountId, generation, 2, submission, now.AddSeconds(3)));
+            Assert.True(await attempts.TryAdvanceAsync(
+                operationId, accountId, generation,
+                WebAutomationAttemptState.Submitting, 3,
+                WebAutomationAttemptState.ResultPending, new string('c', 64), false,
+                now.AddSeconds(4)));
+        }
+
+        var ownership = new ExactOwnershipStore(
+            operationId, batchId, accountId, generation, WebAutomationOwnerKind.Transfer);
+        using var restarted = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<IWebAutomationRequestOwnershipStore>();
+            services.AddSingleton<IWebAutomationRequestOwnershipStore>(ownership);
+        });
+        await restarted.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var sources = restarted.Services.GetServices<ITransferRecoveryAuthorizationSource>().ToArray();
+
+        var sourceAfterRestart = Assert.Single(sources);
+        var binding = await sourceAfterRestart.TryAuthorizeSubmissionRecoveryAsync(
+            new TransferSubmissionRecoveryAuthorizationRequest(
+                operationId, batchId, accountId, generation,
+                target, baiduUserId, capability));
+
+        Assert.NotNull(binding);
+        Assert.Equal(target, binding.Target);
+        Assert.Equal(baiduUserId, binding.BaiduUserId);
+        Assert.Null(binding.MappingFingerprint);
+    }
+
+#if DEBUG
+    [Fact]
+    public async Task DebugAcceptanceLeaseCreatesOnlyOneTransferV2BindingForTheExactOperation()
+    {
+        var presenter = new RecordingAcceptancePresenter(confirmed: true);
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch], services =>
+        {
+            services.RemoveAll<IAcceptanceWriteLeasePresenter>();
+            services.AddSingleton<IAcceptanceWriteLeasePresenter>(presenter);
+        });
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var request = new AdapterWriteAuthorizationRequest(
+            new AdapterCapabilityVersion(
+                "BaiduTransfer",
+                BaiduSelectorCatalog.TransferProtocolVersion,
+                BaiduSelectorCatalog.TransferSelectorVersion,
+                build),
+            Guid.NewGuid(), Guid.NewGuid(), 1, Guid.NewGuid(),
+            AdapterWriteAction.EnsureDirectory);
+        var gate = host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>();
+
+        var first = await gate.TryCreateBindingAsync(request);
+        var second = await gate.TryCreateBindingAsync(request);
+
+        Assert.NotNull(first);
+        Assert.Equal(AdapterWriteAuthorizationSource.ConsumedLease, first.Source);
+        Assert.Null(second);
+    }
+#endif
 
     [Fact]
     public async Task ProductionGatePresentsExactWriteAndReachesInnerOnlyAfterExplicitConfirmation()
@@ -461,6 +652,45 @@ public sealed class AppBootstrapTests : IDisposable
             PrecheckedAt = now,
         };
 
+    private static async Task SeedTransferOwnerAsync(
+        SqliteConnectionFactory factory,
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        string baiduUserId,
+        DateTimeOffset now)
+    {
+        var resourceId = Guid.NewGuid();
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
+              SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
+            VALUES($account,$uid,'recovery-owner','WebView2','Active',0,0,0,1,'2026-08-26',0);
+            INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
+              OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
+            VALUES($batch,'recovery-job','Text','Distribution','TaskCount','ProportionalReduction',1,1,'/target',
+              'None','Skip','Immediate','Active',$now,1);
+            INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+              FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES($resource,$batch,1,'https://pan.baidu.com/s/test','test','a1b2','None','Valid','Expanded',$now,$now);
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+            VALUES($operation,$resource,$batch,1,1,'/target','/target','',$account,'Automatic','Waiting',$generation,
+              'transfer-fingerprint','NotPrepared','Unoccupied',$now,$now);
+            """;
+        command.Parameters.AddWithValue("$account", accountId.ToString("D"));
+        command.Parameters.AddWithValue("$uid", baiduUserId);
+        command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+        command.Parameters.AddWithValue("$resource", resourceId.ToString("D"));
+        command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
+        command.Parameters.AddWithValue("$generation", generation);
+        command.Parameters.AddWithValue("$now", now.ToString("O"));
+        await command.ExecuteNonQueryAsync();
+    }
+
     private static WizardAccountOption AccountOption(int value) => new(
         Guid.Parse($"00000000-0000-0000-0000-{value:000000000000}"),
         $"账号 {value}",
@@ -536,6 +766,44 @@ public sealed class AppBootstrapTests : IDisposable
             EnableCount++;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class RecordingWriteAuthorizationGate : IAdapterWriteAuthorizationGate
+    {
+        public List<AdapterWriteAuthorizationRequest> Requests { get; } = [];
+
+        public ValueTask<bool> TryAuthorizeAsync(
+            AdapterWriteAuthorizationRequest request,
+            CancellationToken cancellationToken = default) => ValueTask.FromResult(false);
+
+        public ValueTask<AdapterWriteAuthorizationBinding?> TryCreateBindingAsync(
+            AdapterWriteAuthorizationRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            Requests.Add(request);
+            return ValueTask.FromResult<AdapterWriteAuthorizationBinding?>(null);
+        }
+    }
+
+    private sealed class ExactOwnershipStore(
+        Guid operationId,
+        Guid batchId,
+        Guid accountId,
+        int generation,
+        WebAutomationOwnerKind ownerKind) : IWebAutomationRequestOwnershipStore
+    {
+        public Task<bool> IsBoundAsync(
+            Guid candidateOperationId,
+            Guid candidateBatchId,
+            Guid candidateAccountId,
+            int candidateGeneration,
+            WebAutomationOwnerKind candidateOwnerKind,
+            CancellationToken cancellationToken = default) => Task.FromResult(
+                candidateOperationId == operationId &&
+                candidateBatchId == batchId &&
+                candidateAccountId == accountId &&
+                candidateGeneration == generation &&
+                candidateOwnerKind == ownerKind);
     }
 
     private sealed class AcceptanceShareAdapter : IOperationBoundBaiduShareAdapter

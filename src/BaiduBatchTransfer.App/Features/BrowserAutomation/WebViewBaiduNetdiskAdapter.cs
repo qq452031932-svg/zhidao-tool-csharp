@@ -138,6 +138,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         CancellationToken cancellationToken)
     {
         ValidateOperationIdentity(context, session, share);
+        if (string.IsNullOrWhiteSpace(session.BaiduUserId))
+            return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         if (attemptStore is not { } store)
             return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         {
@@ -147,6 +149,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 context.Generation,
                 cancellationToken).ConfigureAwait(false);
             var existingStage = EffectiveRecoverableStage(existing);
+            if (!MatchesStableBaiduUserId(session, existing))
+                return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
             if (existingStage == WebAutomationAttemptState.BaselinePersisted)
             {
                 if (existing?.SourceEvidence is null || existing.TargetPreparationEvidence is null)
@@ -162,7 +166,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                         Request(
                             context,
                             share,
-                            (_, _, _) => Task.FromResult(prepared)),
+                            (_, _, _) => Task.FromResult(prepared),
+                            session.BaiduUserId),
                         cancellationToken).ConfigureAwait(false);
                     return resumed.Disposition is VisibleWebAutomationDisposition.ActionCompleted &&
                            resumed.Value is not null
@@ -206,7 +211,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                         adapterDiagnostic: null,
                         result.RetryAfter,
                         result.SubmissionAcceptance);
-            });
+            },
+            session.BaiduUserId);
         try
         {
             var result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false);
@@ -236,6 +242,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+        if (!MatchesStableBaiduUserId(session, attempt))
+            return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         if (EffectiveRecoverableStage(attempt) != WebAutomationAttemptState.BaselinePersisted)
             return Unknown<TransferReceipt>(
                 attempt?.State == WebAutomationAttemptState.UserHandoff
@@ -269,7 +277,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                     preparation,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
-            });
+            },
+            session.BaiduUserId!);
         VisibleWebAutomationResult<BaiduAdapterResult<TransferReceipt>> result;
         try { result = await broker.EnqueueAsync(request, cancellationToken).ConfigureAwait(false); }
         catch (WebAutomationAuthorizationException)
@@ -310,6 +319,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             context.AccountId,
             context.Generation,
             cancellationToken).ConfigureAwait(false);
+        if (!MatchesStableBaiduUserId(session, attempt))
+            return NotValidated<TransferConfirmationResult>(SubmissionAcceptance.Unknown);
         if (attempt is
             {
                 OwnerKind: WebAutomationOwnerKind.Transfer,
@@ -340,7 +351,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                     Request(
                         context,
                         context.SourceShare,
-                        (_, _, _) => Task.FromResult(absent)),
+                        (_, _, _) => Task.FromResult(absent),
+                        session.BaiduUserId!),
                     cancellationToken).ConfigureAwait(false);
                 return resumed.Disposition is VisibleWebAutomationDisposition.ActionCompleted &&
                        resumed.Value is not null
@@ -428,8 +440,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         AdapterWriteAction action) => new(
             new AdapterCapabilityVersion(
                 "BaiduTransfer",
-                BaiduSelectorCatalog.ProtocolVersion,
-                BaiduSelectorCatalog.SelectorVersion,
+                BaiduSelectorCatalog.TransferProtocolVersion,
+                BaiduSelectorCatalog.TransferSelectorVersion,
                 applicationBuildVersion),
             context.AccountId,
             context.OperationId,
@@ -463,13 +475,13 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         Uri officialUri) => new(
         BaiduAutomationAction.OpenOfficialUri,
         officialUri,
-        BaiduSelectorCatalog.ProtocolVersion,
-        BaiduSelectorCatalog.SelectorVersion,
+        BaiduSelectorCatalog.TransferProtocolVersion,
+        BaiduSelectorCatalog.TransferSelectorVersion,
         applicationBuildVersion,
         new BaiduAutomationAcceptance(
             false,
-            BaiduSelectorCatalog.ProtocolVersion,
-            BaiduSelectorCatalog.SelectorVersion,
+            BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion,
             applicationBuildVersion),
         BaiduProtocolValidationStatus.NotValidated,
         new BaiduAcceptanceOperationScope(
@@ -479,16 +491,17 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
     private VisibleWebAutomationRequest<T> Request<T>(
         TransferOperationAutomationContext context,
         ShareReference share,
-        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action)
+        Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action,
+        string expectedBaiduUserId)
     {
-        return Request(context, new Uri(share.OriginalUrl), action);
+        return Request(context, new Uri(share.OriginalUrl), action, expectedBaiduUserId);
     }
 
     private VisibleWebAutomationRequest<T> Request<T>(
         TransferOperationAutomationContext context,
         Uri officialUri,
         Func<IVisibleWebAutomationSession, VisibleWebAutomationContext, CancellationToken, Task<T>> action,
-        string? expectedBaiduUserId = null)
+        string expectedBaiduUserId)
     {
         var identity = new WebAutomationRequestIdentity(
             context.OperationId,
@@ -548,14 +561,41 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         context.AuthorizationBinding is { } binding &&
         binding.Capability == new AdapterCapabilityVersion(
             "BaiduTransfer",
-            BaiduSelectorCatalog.ProtocolVersion,
-            BaiduSelectorCatalog.SelectorVersion,
+            BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion,
             applicationBuildVersion) &&
         binding.AccountId == context.AccountId &&
         binding.OperationId == context.OperationId &&
         binding.Generation == context.Generation &&
         binding.BatchId == context.BatchId &&
         binding.IsRecovery == context.IsRecovery;
+
+    private bool MatchesStableBaiduUserId(
+        AccountSession session,
+        WebAutomationAttemptRecord? attempt)
+    {
+        if (session.LocalAccountId is null || string.IsNullOrWhiteSpace(session.BaiduUserId))
+            return false;
+        if (attempt?.SourceEvidence is null) return true;
+        var expectedCapability = new AdapterCapabilityVersion(
+            "BaiduTransfer",
+            BaiduSelectorCatalog.TransferProtocolVersion,
+            BaiduSelectorCatalog.TransferSelectorVersion,
+            applicationBuildVersion);
+        return attempt.SourceEvidence.Capability == expectedCapability &&
+            string.Equals(
+                attempt.SourceEvidence.BaiduUserId,
+                session.BaiduUserId,
+                StringComparison.Ordinal) &&
+            (attempt.TargetPreparationEvidence is null || string.Equals(
+                attempt.TargetPreparationEvidence.BaiduUserId,
+                session.BaiduUserId,
+                StringComparison.Ordinal)) &&
+            (attempt.SubmissionEvidence is null || string.Equals(
+                attempt.SubmissionEvidence.BaiduUserId,
+                session.BaiduUserId,
+                StringComparison.Ordinal));
+    }
 
     private static void ValidateOperationIdentity(
         TransferOperationAutomationContext context,
