@@ -96,6 +96,7 @@ public interface IAdapterAvailability
 {
     bool CanStartTransfers { get; }
     string StatusMessage { get; }
+    bool RequiresBulkPrecheckBeforeStart => true;
 }
 
 public sealed class UnavailableAdapterAvailability : IAdapterAvailability
@@ -108,6 +109,7 @@ internal sealed class TemporaryAcceptanceAdapterAvailability(
     AcceptanceWriteLeaseOptions options) : IAdapterAvailability
 {
     public bool CanStartTransfers => options.IsEnabled;
+    public bool RequiresBulkPrecheckBeforeStart => false;
     public string StatusMessage => CanStartTransfers
         ? "百度转存现场验收模式已启用，每项实际操作仍需单独确认。"
         : "百度转存功能尚不可用，当前版本不能开始任务。";

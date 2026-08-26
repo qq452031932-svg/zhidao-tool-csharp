@@ -187,6 +187,25 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Empty(capabilityStore.Accepted);
     }
 
+    [Fact]
+    public void ExactDebugAcceptanceSwitchAloneMaySkipLegacyBulkPrecheck()
+    {
+        using var ordinaryHost = AppBootstrap.CreateHost(root);
+        using var acceptanceHost = AppBootstrap.CreateHost(
+            root,
+            [AcceptanceWriteLeaseOptions.Switch]);
+
+        Assert.True(ordinaryHost.Services.GetRequiredService<IAdapterAvailability>()
+            .RequiresBulkPrecheckBeforeStart);
+#if DEBUG
+        Assert.False(acceptanceHost.Services.GetRequiredService<IAdapterAvailability>()
+            .RequiresBulkPrecheckBeforeStart);
+#else
+        Assert.True(acceptanceHost.Services.GetRequiredService<IAdapterAvailability>()
+            .RequiresBulkPrecheckBeforeStart);
+#endif
+    }
+
     [Theory]
     [InlineData("--webview-acceptance ")]
     [InlineData("--WEBVIEW-ACCEPTANCE")]

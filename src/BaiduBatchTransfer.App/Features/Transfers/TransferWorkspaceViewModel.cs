@@ -15,6 +15,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     private readonly IResultSaveDialog resultDirectoryDialog;
     private readonly ITransferResultDestinationSink destinationSink;
     private readonly Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>> handoffBatchAsync;
+    private readonly IAdapterAvailability adapterAvailability;
     private readonly TransferWorkspaceOptions options;
     private readonly CancellationTokenSource lifetime = new();
     private TransferAccountMode? accountMode;
@@ -33,6 +34,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         IResultSaveDialog resultDirectoryDialog,
         ITransferResultDestinationSink destinationSink,
         Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>> handoffBatchAsync,
+        IAdapterAvailability adapterAvailability,
         TransferWorkspaceOptions? options = null)
     {
         Import = import ?? throw new ArgumentNullException(nameof(import));
@@ -41,6 +43,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         this.resultDirectoryDialog = resultDirectoryDialog ?? throw new ArgumentNullException(nameof(resultDirectoryDialog));
         this.destinationSink = destinationSink ?? throw new ArgumentNullException(nameof(destinationSink));
         this.handoffBatchAsync = handoffBatchAsync ?? throw new ArgumentNullException(nameof(handoffBatchAsync));
+        this.adapterAvailability = adapterAvailability ?? throw new ArgumentNullException(nameof(adapterAvailability));
         this.options = (options ?? new TransferWorkspaceOptions()).Validate();
         StartCommand = new AsyncRelayCommand(StartAsync, () => CanStart);
         SelectSingleAccountCommand = new AsyncRelayCommand(
@@ -67,6 +70,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
         IResultSaveDialog resultDirectoryDialog,
         ITransferResultDestinationSink destinationSink,
         Func<Guid, CancellationToken, Task> handoffBatchAsync,
+        IAdapterAvailability adapterAvailability,
         TransferWorkspaceOptions? options = null)
         : this(
             import,
@@ -79,6 +83,7 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
                 await handoffBatchAsync(batchJobId, cancellationToken).ConfigureAwait(false);
                 return new(ResultWorkspaceHandoffStatus.Succeeded);
             },
+            adapterAvailability,
             options)
     {
     }
@@ -269,31 +274,34 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
             }
             var resultDirectory = AutoShare ? ShareResultDirectory : null;
 
-            var selectedAccount = Wizard.Accounts.First(account => account.IsSelected);
-            Wizard.UseBulkPrecheck = true;
-            Wizard.PrecheckAccountId = selectedAccount.AccountId;
-            StatusMessage = "正在检查链接和账号配置……";
-            var precheck = await Wizard.RunBackgroundPrecheckAsync(linked.Token).ConfigureAwait(true);
-            if (!IsAlive(linked)) return;
-            if (precheck.Status == WizardPrecheckStatus.Unavailable)
+            Wizard.UseBulkPrecheck = adapterAvailability.RequiresBulkPrecheckBeforeStart;
+            if (Wizard.UseBulkPrecheck)
             {
-                StatusMessage = "链接检查暂不可用，请稍后重试。";
-                return;
-            }
-            if (precheck.Status is WizardPrecheckStatus.PausedForLogin or WizardPrecheckStatus.PausedForVerification)
-            {
-                StatusMessage = precheck.Status switch
+                var selectedAccount = Wizard.Accounts.First(account => account.IsSelected);
+                Wizard.PrecheckAccountId = selectedAccount.AccountId;
+                StatusMessage = "正在检查链接和账号配置……";
+                var precheck = await Wizard.RunBackgroundPrecheckAsync(linked.Token).ConfigureAwait(true);
+                if (!IsAlive(linked)) return;
+                if (precheck.Status == WizardPrecheckStatus.Unavailable)
                 {
-                    WizardPrecheckStatus.PausedForLogin => "请先完成账号登录，再重新开始转存。",
-                    WizardPrecheckStatus.PausedForVerification => "请先完成百度安全验证，再重新开始转存。",
-                    _ => throw new ArgumentOutOfRangeException(nameof(precheck)),
-                };
-                return;
-            }
-            if (precheck.HasActionableFailures)
-            {
-                StatusMessage = BuildActionableFailureMessage(precheck);
-                return;
+                    StatusMessage = "链接检查暂不可用，请稍后重试。";
+                    return;
+                }
+                if (precheck.Status is WizardPrecheckStatus.PausedForLogin or WizardPrecheckStatus.PausedForVerification)
+                {
+                    StatusMessage = precheck.Status switch
+                    {
+                        WizardPrecheckStatus.PausedForLogin => "请先完成账号登录，再重新开始转存。",
+                        WizardPrecheckStatus.PausedForVerification => "请先完成百度安全验证，再重新开始转存。",
+                        _ => throw new ArgumentOutOfRangeException(nameof(precheck)),
+                    };
+                    return;
+                }
+                if (precheck.HasActionableFailures)
+                {
+                    StatusMessage = BuildActionableFailureMessage(precheck);
+                    return;
+                }
             }
 
             await Wizard.PrepareConfirmationAsync(linked.Token).ConfigureAwait(true);

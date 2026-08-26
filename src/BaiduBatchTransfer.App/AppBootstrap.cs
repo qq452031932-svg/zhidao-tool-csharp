@@ -623,6 +623,7 @@ public sealed class AppShellFactory(
             resultSaveDialog,
             resultDestinationSink,
             (batchJobId, token) => handoff.ActivateJobAsync(batchJobId, token),
+            adapterAvailability,
             transferOptions);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         var shareViewModel = new ShareWorkspaceViewModel(

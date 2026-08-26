@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.App;
+using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
@@ -108,6 +109,49 @@ public sealed class TransferWorkspaceViewModelTests
         Assert.Equal("https://pan.baidu.com/s/edited", fixture.ImportWorkflow.SavedUrl);
         Assert.Equal("c3d4", fixture.ImportWorkflow.SavedCode);
         Assert.DoesNotContain("创建任务", fixture.Dialog.LastConfirmationMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task TemporaryAcceptanceSkipsLegacyPrecheckAndCreatesImmediateValidationBatch()
+    {
+        var availability = new TemporaryAcceptanceAdapterAvailability(
+            new AcceptanceWriteLeaseOptions(
+                isDebugBuild: true,
+                [AcceptanceWriteLeaseOptions.Switch]));
+        using var fixture = Fixture.Valid(
+            precheck: new WizardPrecheckResult(
+                WizardPrecheckStatus.Completed,
+                0,
+                OtherFailureCount: 1),
+            adapterAvailability: availability);
+        fixture.Events.Clear();
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Equal(["preview", "confirm", "handoff"], fixture.Events);
+        Assert.Equal("Immediate", fixture.BatchService.ConfirmedDraft?.ValidationMode);
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+    }
+
+    [Fact]
+    public async Task TemporaryAcceptanceStillRejectsInvalidConfigurationBeforeBatchWork()
+    {
+        var availability = new TemporaryAcceptanceAdapterAvailability(
+            new AcceptanceWriteLeaseOptions(
+                isDebugBuild: true,
+                [AcceptanceWriteLeaseOptions.Switch]));
+        using var fixture = Fixture.Create(
+            adapterAvailability: availability);
+        fixture.ApplyReadyDraft();
+        fixture.Wizard.Accounts[0].DefaultTargetPath = string.Empty;
+        fixture.Events.Clear();
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.Empty(fixture.Events);
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.Equal(0, fixture.BatchService.ConfirmCalls);
+        Assert.Null(fixture.ViewModel.CreatedBatchJobId);
     }
 
     [Fact]
@@ -588,15 +632,17 @@ public sealed class TransferWorkspaceViewModelTests
             WizardPrecheckResult? precheck,
             IWizardPrecheckWorkflow? precheckWorkflow,
             TransferWorkspaceOptions? options,
-            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff)
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff,
+            IAdapterAvailability? adapterAvailability)
         {
             Ready = ready;
             Events = [];
             ImportWorkflow = new FakeImportWorkflow(Events);
             PageSource = new FakePageSource();
             Dialog = new FakeDialog();
+            var availability = adapterAvailability ?? new AvailableAdapter();
             Import = new ImportViewModel(
-                ImportWorkflow, PageSource, Dialog, new AvailableAdapter());
+                ImportWorkflow, PageSource, Dialog, availability);
             BatchService = new FakeBatchService(Events);
             DraftWorkflow = new FakeDraftWorkflow(ready);
             Wizard = new CreateJobWizardViewModel(
@@ -604,7 +650,7 @@ public sealed class TransferWorkspaceViewModelTests
                 PageSource,
                 BatchService,
                 Dialog,
-                new AvailableAdapter(),
+                availability,
                 DraftWorkflow,
                 precheckWorkflow ?? new FakePrecheckWorkflow(Events, precheck ?? new(WizardPrecheckStatus.Completed, ready)),
                 new AvailableCapabilities());
@@ -619,9 +665,9 @@ public sealed class TransferWorkspaceViewModelTests
             Handoff = new RecordingHandoff(Events, HandedOffBatches);
             ViewModel = explicitHandoff is null
                 ? new TransferWorkspaceViewModel(
-                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, Handoff.RunAsync, options)
+                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, Handoff.RunAsync, availability, options)
                 : new TransferWorkspaceViewModel(
-                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, explicitHandoff, options);
+                    Import, Wizard, RunPanel, new FakeResultSaveDialog(), DestinationSink, explicitHandoff, availability, options);
         }
 
         public int Ready { get; }
@@ -645,8 +691,9 @@ public sealed class TransferWorkspaceViewModelTests
             WizardPrecheckResult? precheck = null,
             IWizardPrecheckWorkflow? precheckWorkflow = null,
             TransferWorkspaceOptions? options = null,
-            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null) =>
-            new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff);
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null,
+            IAdapterAvailability? adapterAvailability = null) =>
+            new(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff, adapterAvailability);
 
         public static Fixture Valid(
             int accountCount = 1,
@@ -654,9 +701,17 @@ public sealed class TransferWorkspaceViewModelTests
             WizardPrecheckResult? precheck = null,
             IWizardPrecheckWorkflow? precheckWorkflow = null,
             TransferWorkspaceOptions? options = null,
-            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null)
+            Func<Guid, CancellationToken, Task<ResultWorkspaceHandoffOutcome>>? explicitHandoff = null,
+            IAdapterAvailability? adapterAvailability = null)
         {
-            var fixture = Create(accountCount, ready, precheck, precheckWorkflow, options, explicitHandoff);
+            var fixture = Create(
+                accountCount,
+                ready,
+                precheck,
+                precheckWorkflow,
+                options,
+                explicitHandoff,
+                adapterAvailability);
             fixture.ApplyReadyDraft();
             if (accountCount == 1)
             {
