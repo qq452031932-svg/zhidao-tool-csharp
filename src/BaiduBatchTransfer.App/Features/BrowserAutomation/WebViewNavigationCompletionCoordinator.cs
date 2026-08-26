@@ -5,6 +5,21 @@ internal sealed class WebViewNavigationCompletionCoordinator
     private readonly object sync = new();
     private PendingNavigation? pending;
 
+    internal Task NavigateDispatchedAsync(
+        Uri target,
+        Action navigate,
+        Func<Func<Task>, Task> dispatchAsync,
+        CancellationToken cancellationToken,
+        CancellationToken userClosed)
+    {
+        ArgumentNullException.ThrowIfNull(dispatchAsync);
+        return dispatchAsync(() => NavigateAsync(
+            target,
+            navigate,
+            cancellationToken,
+            userClosed));
+    }
+
     internal async Task NavigateAsync(
         Uri target,
         Action navigate,
@@ -49,7 +64,10 @@ internal sealed class WebViewNavigationCompletionCoordinator
             {
                 if (expectedId == navigationId && !isAllowed) rejected = request.Completion;
             }
-            else if (destination is not null && destination == request.Target)
+            else if (destination is { IsAbsoluteUri: true } && string.Equals(
+                destination.AbsoluteUri,
+                request.TargetAbsoluteUri,
+                StringComparison.Ordinal))
             {
                 request.NavigationId = navigationId;
                 if (!isAllowed) rejected = request.Completion;
@@ -79,7 +97,7 @@ internal sealed class WebViewNavigationCompletionCoordinator
 
     private sealed class PendingNavigation(Uri target)
     {
-        public Uri Target { get; } = target;
+        public string TargetAbsoluteUri { get; } = target.AbsoluteUri;
         public ulong? NavigationId { get; set; }
         public TaskCompletionSource Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);

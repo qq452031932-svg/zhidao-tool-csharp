@@ -678,9 +678,10 @@ public sealed class WebView2AutomationSession :
         currentOfficialUri = uri;
         lastTransferObservation = null;
         if (core is not null)
-            await navigationCompletion.NavigateAsync(
+            await navigationCompletion.NavigateDispatchedAsync(
                 uri,
                 () => core.Navigate(uri.AbsoluteUri),
+                callback => window!.Dispatcher.InvokeAsync(callback).Task.Unwrap(),
                 cancellationToken,
                 UserClosed).ConfigureAwait(false);
     }
