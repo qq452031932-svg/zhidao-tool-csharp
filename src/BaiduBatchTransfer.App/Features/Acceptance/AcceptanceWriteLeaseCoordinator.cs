@@ -429,6 +429,65 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         }
     }
 
+    public async ValueTask<IBaiduCandidateMutationPermit?> TryAcquireTransferMutationPermitAsync(
+        BaiduCandidateDomMutationRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var authorization = request.Authorization;
+        var binding = request.Binding;
+        var now = timeProvider.GetUtcNow();
+        if (authorization.Capability.AdapterKind != "BaiduTransfer" ||
+            authorization.IsRecovery || binding.IsRecovery ||
+            !IsTransferV2ActionAllowed(request.Action) ||
+            !BindingMatches(authorization, binding) || binding.ExpiresAtUtc <= now)
+            return null;
+
+        if (binding.Source == AdapterWriteAuthorizationSource.ConsumedLease)
+        {
+            if (!options.IsEnabled || binding.FormalEvidenceFingerprint is not null)
+                return null;
+            var key = AcceptanceWriteLeaseIdentity.From(authorization);
+            lock (sync)
+            {
+                now = timeProvider.GetUtcNow();
+                if (!operationAuthorizationExpiries.TryGetValue(key, out var expires) ||
+                    expires != binding.ExpiresAtUtc || expires <= now ||
+                    !consumedLeaseOperations.TryGetValue(key, out var actions) ||
+                    !actions.Contains(AdapterWriteAction.EnsureDirectory))
+                    return null;
+                return TryAcquireTransferMutationPermitLocked(binding, request.Action);
+            }
+        }
+
+        if (binding.Source != AdapterWriteAuthorizationSource.ExactFormalRecord ||
+            string.IsNullOrWhiteSpace(binding.FormalEvidenceFingerprint))
+            return null;
+        var accepted = await GetFreshFormalAcceptanceAsync(authorization, now, cancellationToken)
+            .ConfigureAwait(false);
+        if (accepted is null || accepted.AcceptedAt != binding.IssuedAtUtc ||
+            accepted.AcceptedAt + FormalEvidenceLifetime != binding.ExpiresAtUtc ||
+            !string.Equals(accepted.EvidenceHash, binding.FormalEvidenceFingerprint, StringComparison.Ordinal))
+            return null;
+        lock (sync)
+        {
+            if (binding.ExpiresAtUtc <= timeProvider.GetUtcNow()) return null;
+            return TryAcquireTransferMutationPermitLocked(binding, request.Action);
+        }
+    }
+
+    private IBaiduCandidateMutationPermit? TryAcquireTransferMutationPermitLocked(
+        AdapterWriteAuthorizationBinding binding,
+        BaiduAutomationAction action)
+    {
+        if (!bindingStates.TryGetValue(binding, out var state) || state.IsRevoking ||
+            !IsTransferV2ActionAllowedForStage(state.Stage, action))
+            return null;
+        state.ActiveMutationPermits++;
+        return new MutationPermit(this, binding);
+    }
+
     private IBaiduCandidateMutationPermit? TryAcquireMutationPermitLocked(
         AdapterWriteAuthorizationBinding binding,
         BaiduAutomationAction action)
@@ -481,12 +540,39 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
             _ => false,
         };
 
+    private static bool IsTransferV2ActionAllowedForStage(
+        AdapterWriteAction stage,
+        BaiduAutomationAction action) => stage switch
+        {
+            AdapterWriteAction.EnsureDirectory => action is BaiduAutomationAction.SetExtractionCode or
+                BaiduAutomationAction.SubmitExtraction or BaiduAutomationAction.OpenDestinationPicker or
+                BaiduAutomationAction.EnterDirectory or BaiduAutomationAction.CreateDirectory or
+                BaiduAutomationAction.ConfirmDirectoryCreation or
+                BaiduAutomationAction.CancelDestinationPicker,
+            AdapterWriteAction.PrepareTransfer => false,
+            AdapterWriteAction.SubmitTransfer => action is BaiduAutomationAction.SetExtractionCode or
+                BaiduAutomationAction.SubmitExtraction or BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.OpenDestinationPicker or BaiduAutomationAction.EnterDirectory or
+                BaiduAutomationAction.ClickConfirmTransfer,
+            _ => false,
+        };
+
+    private static bool IsTransferV2ActionAllowed(BaiduAutomationAction action) =>
+        action is BaiduAutomationAction.SetExtractionCode or BaiduAutomationAction.SubmitExtraction or
+            BaiduAutomationAction.SelectExactItems or BaiduAutomationAction.OpenDestinationPicker or
+            BaiduAutomationAction.EnterDirectory or BaiduAutomationAction.CreateDirectory or
+            BaiduAutomationAction.ConfirmDirectoryCreation or
+            BaiduAutomationAction.CancelDestinationPicker or BaiduAutomationAction.ClickConfirmTransfer;
+
     private static bool IsCandidateActionAllowed(string adapterKind, BaiduAutomationAction action) =>
         adapterKind switch
         {
-            "BaiduTransfer" => action is BaiduAutomationAction.SelectExactItems or
-                BaiduAutomationAction.ClickSave or BaiduAutomationAction.ChooseDestination or
-                BaiduAutomationAction.SetExtractionCode,
+            "BaiduTransfer" => action is BaiduAutomationAction.SetExtractionCode or
+                BaiduAutomationAction.SubmitExtraction or BaiduAutomationAction.SelectExactItems or
+                BaiduAutomationAction.OpenDestinationPicker or BaiduAutomationAction.EnterDirectory or
+                BaiduAutomationAction.CreateDirectory or BaiduAutomationAction.ConfirmDirectoryCreation or
+                BaiduAutomationAction.CancelDestinationPicker or BaiduAutomationAction.ClickConfirmTransfer or
+                BaiduAutomationAction.ClickSave or BaiduAutomationAction.ChooseDestination,
             "BaiduShare" => action is BaiduAutomationAction.SelectExactItems or
                 BaiduAutomationAction.ClickShare or BaiduAutomationAction.ChoosePermanent or
                 BaiduAutomationAction.SetExtractionCode or BaiduAutomationAction.CreateLink or

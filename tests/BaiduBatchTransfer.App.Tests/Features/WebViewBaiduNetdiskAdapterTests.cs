@@ -342,7 +342,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
-    public async Task RecoveryExactTransferAdvancesPersistentWebAttemptToSucceeded()
+    public async Task RecoveryWithoutOfficialIdentityMappingStaysResultPending()
     {
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
@@ -361,12 +361,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context, Session(accountId), Query(), CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
-        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
     }
 
     [Fact]
-    public async Task RecoveryFeedsExactOperationBoundEvidenceWithoutAnotherWrite()
+    public async Task RecoveryWithoutOfficialIdentityMappingEmitsNoAcceptanceEvidence()
     {
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
@@ -386,14 +386,9 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context, Session(accountId), Query(), CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        var remote = Assert.Single(evidence.Remote);
-        var recovery = Assert.Single(evidence.Recovery);
-        Assert.Equal(context.OperationId, remote.Request.OperationId);
-        Assert.Equal(context.BatchId, remote.Request.BatchId);
-        Assert.Equal(context.Generation, remote.Request.Generation);
-        Assert.Equal("BaiduTransfer", remote.Request.Capability.AdapterKind);
-        Assert.True(recovery.Request.IsRecovery);
-        Assert.Equal(remote.Fingerprint, recovery.Fingerprint);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Empty(evidence.Remote);
+        Assert.Empty(evidence.Recovery);
     }
 
     [Fact]
@@ -549,7 +544,7 @@ public sealed class WebViewBaiduNetdiskAdapterTests
     }
 
     [Fact]
-    public async Task ResultPendingUserHandoffResumesExactRecoveryAndSucceeds()
+    public async Task ResultPendingUserHandoffWithoutOfficialIdentityMappingStaysAmbiguous()
     {
         var accountId = Guid.NewGuid();
         var context = new TransferOperationAutomationContext(
@@ -570,8 +565,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             context, Session(accountId), Query(), CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(TransferConfirmationState.ExactPresent, result.Value!.State);
-        Assert.Equal(WebAutomationAttemptState.Succeeded, attempts.Current.State);
+        Assert.Equal(TransferConfirmationState.Ambiguous, result.Value!.State);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, attempts.Current.State);
         Assert.Equal(baseline, attempts.Current.Baseline);
         Assert.Equal(accepted, attempts.Current.AcceptedRemoteItems);
     }

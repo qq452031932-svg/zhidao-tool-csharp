@@ -143,6 +143,7 @@ public enum BaiduCandidateBuiltInScript
     Observe,
     Mutate,
     ObserveTransfer,
+    MutateTransfer,
 }
 
 public sealed record BaiduCandidateDomRequest
@@ -289,6 +290,11 @@ public interface IBaiduCandidateActionAuthorizationSource
     ValueTask<IBaiduCandidateMutationPermit?> TryAcquireMutationPermitAsync(
         BaiduCandidateDomRequest request,
         CancellationToken cancellationToken = default);
+
+    ValueTask<IBaiduCandidateMutationPermit?> TryAcquireTransferMutationPermitAsync(
+        BaiduCandidateDomMutationRequest request,
+        CancellationToken cancellationToken = default) =>
+        ValueTask.FromResult<IBaiduCandidateMutationPermit?>(null);
 }
 
 public interface IBaiduCandidateMutationPermit : IAsyncDisposable
@@ -307,9 +313,14 @@ public interface IBaiduCandidateDomExecutor
         CancellationToken cancellationToken = default);
 }
 
-public interface IBaiduTransferCandidateDomReader
+public interface IBaiduTransferCandidateDomExecutor
 {
     Task<BaiduTransferCandidateDomResult> ObserveTransferAsync(
         BaiduCandidateDomReadRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<BaiduTransferCandidateDomResult> MutateTransferAsync(
+        BaiduCandidateDomMutationRequest request,
+        BaiduTransferCandidateObservation observation,
         CancellationToken cancellationToken = default);
 }

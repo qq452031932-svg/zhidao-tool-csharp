@@ -139,9 +139,156 @@ public static class BaiduTransferCandidateScripts
         }
         """;
 
+    public const string MutateScript = """
+        async function(argsJson) {
+          'use strict';
+          const args = JSON.parse(argsJson);
+          const fail = (reason) => ({
+            status: 'notValidated', reason, officialOriginMatched: false,
+            pageState: args.expectedPageState, controlCount: 0, baiduUserId: '',
+            parentExactId: null, canonicalPath: null, ancestorExactIds: [], totalCount: 0,
+            reachedEnd: false, complete: false, stable: false, generationToken: 'none',
+            items: [], observationToken: '', mutationCount: 0
+          });
+          const url = new URL(location.href);
+          if (url.protocol !== 'https:' || url.hostname !== 'pan.baidu.com' || url.port !== '' ||
+              location.href !== args.officialUri) return fail('official-route-mismatch');
+          const visible = (node) => {
+            if (!node || !node.isConnected || node.disabled === true ||
+                node.getAttribute('aria-disabled') === 'true') return false;
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden' ||
+                Number(style.opacity) === 0 || style.pointerEvents === 'none') return false;
+            const rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            const top = document.elementFromPoint(
+              Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)),
+              Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2)));
+            return top === node || node.contains(top);
+          };
+          if (Array.from(document.querySelectorAll('*')).some(node =>
+              node.shadowRoot && node.getAttribute('data-baidu-approved-shadow-root') !== 'true'))
+            return fail('unapproved-shadow-root');
+          const label = (node) => `${node.getAttribute('aria-label') || ''} ${node.textContent || ''}`.trim();
+          const semantics = {
+            ExtractionCode: /提取文件|提取码/,
+            ExternalShare: /保存到网盘|转存|分享文件/,
+            DestinationPicker: /保存到|选择保存位置|新建文件夹/,
+            OwnDrive: /我的网盘|我的资源|全部文件/,
+            TransferResult: /保存成功|转存成功|已保存到网盘/
+          };
+          const matcher = semantics[args.expectedPageState];
+          const roots = Array.from(document.querySelectorAll('main,form,[role="main"],[role="dialog"],[role="alertdialog"]'))
+            .filter(visible).filter(node => matcher && matcher.test(label(node)));
+          if (roots.length !== 1) return fail('trusted-root-not-unique');
+          const root = roots[0];
+          if (!(root.getAttribute('role') || root.tagName)) return fail('trusted-root-role-missing');
+          const uidValues = Array.from(new Set(Array.from(document.querySelectorAll('[data-uid],[data-uk]'))
+            .map(node => node.getAttribute('data-uid') || node.getAttribute('data-uk')).filter(Boolean)));
+          if (uidValues.length !== 1 || uidValues[0] !== args.expectedBaiduUserId)
+            return fail('uid-mismatch');
+          const rows = Array.from(root.querySelectorAll('[data-fsid],[data-file-id],[data-id]')).filter(visible);
+          const seen = new Set();
+          const items = [];
+          for (const row of rows) {
+            const exactId = row.getAttribute('data-fsid') || row.getAttribute('data-file-id') || row.getAttribute('data-id');
+            const serverName = row.getAttribute('data-name') || row.getAttribute('title') ||
+              row.getAttribute('aria-label');
+            if (!exactId || !serverName || seen.has(exactId)) return fail('item-evidence-invalid');
+            seen.add(exactId);
+            items.push({ exactId,
+              kind: row.getAttribute('data-kind') === 'folder' ? 'Folder' : 'File', serverName });
+          }
+          items.sort((left, right) => left.exactId < right.exactId ? -1 : left.exactId > right.exactId ? 1 : 0);
+          if (JSON.stringify(items.map(item => item.exactId)) !== JSON.stringify(args.expectedExactIds))
+            return fail('exact-item-mismatch');
+          const parentExactId = root.getAttribute('data-parent-id') || null;
+          const canonicalPath = root.getAttribute('data-path') || null;
+          const ancestorExactIds = Array.from(root.querySelectorAll('[data-ancestor-id]'))
+            .map(node => node.getAttribute('data-ancestor-id')).filter(Boolean);
+          if (parentExactId !== args.expectedParentExactId || canonicalPath !== args.expectedCanonicalPath ||
+              JSON.stringify(ancestorExactIds) !== JSON.stringify(args.expectedAncestorExactIds))
+            return fail('target-binding-mismatch');
+          const totalCount = items.length;
+          const generation = root.getAttribute('data-generation') || root.getAttribute('data-list-version');
+          if (totalCount !== args.expectedTotalCount || generation !== args.expectedGenerationToken)
+            return fail('enumeration-changed');
+          const evidence = JSON.stringify({
+            pageState: args.expectedPageState, baiduUserId: uidValues[0], parentExactId,
+            canonicalPath, ancestorExactIds, totalCount, reachedEnd: true,
+            complete: true, stable: true, generationToken: generation, items
+          });
+          const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(evidence));
+          const observationToken = Array.from(new Uint8Array(digest))
+            .map(value => value.toString(16).padStart(2, '0')).join('');
+          if (observationToken !== args.expectedObservationToken) return fail('observation-changed');
+          const unique = (selector, pattern) => {
+            const found = Array.from(root.querySelectorAll(selector)).filter(visible)
+              .filter(node => pattern.test(label(node)));
+            return found.length === 1 ? found[0] : null;
+          };
+          const setValue = (input, value) => {
+            const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            descriptor.set.call(input, value);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          };
+          let target = null;
+          switch (args.action) {
+            case 'SetExtractionCode':
+              target = unique('input,[role="textbox"]', /提取码|访问码/);
+              if (!target || typeof args.typedValue !== 'string') return fail('action-target-not-unique');
+              setValue(target, args.typedValue);
+              break;
+            case 'SubmitExtraction':
+              target = unique('button,[role="button"]', /提取文件|确认提取/);
+              if (!target) return fail('action-target-not-unique'); target.click(); break;
+            case 'OpenDestinationPicker':
+              target = unique('button,[role="button"]', /保存到网盘|转存/);
+              if (!target) return fail('action-target-not-unique'); target.click(); break;
+            case 'SelectExactItems':
+              if (rows.length !== args.expectedExactIds.length) return fail('action-target-not-unique');
+              for (const row of rows) {
+                const checkbox = row.querySelector('input[type="checkbox"],[role="checkbox"]');
+                if (!visible(checkbox)) return fail('action-target-not-unique'); checkbox.click();
+              }
+              break;
+            case 'EnterDirectory':
+              target = rows.length === 1 ? rows[0] : null;
+              if (!target) return fail('action-target-not-unique');
+              target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); break;
+            case 'CreateDirectory':
+              target = unique('button,[role="button"]', /新建文件夹/);
+              if (!target || typeof args.typedValue !== 'string') return fail('action-target-not-unique');
+              target.click(); await Promise.resolve();
+              target = unique('input,[role="textbox"]', /文件夹名称|新建文件夹/);
+              if (!target) return fail('action-target-not-unique'); setValue(target, args.typedValue); break;
+            case 'ConfirmDirectoryCreation':
+              target = unique('button,[role="button"]', /确定|创建/);
+              if (!target) return fail('action-target-not-unique'); target.click(); break;
+            case 'CancelDestinationPicker':
+              target = unique('button,[role="button"]', /取消/);
+              if (!target) return fail('action-target-not-unique'); target.click(); break;
+            case 'ClickConfirmTransfer':
+              target = unique('button,[role="button"]', /确定|确认转存|保存到这里/);
+              if (!target) return fail('action-target-not-unique'); target.click(); break;
+            default: return fail('action-not-allowlisted');
+          }
+          return {
+            status: 'validated', reason: 'none', officialOriginMatched: true,
+            pageState: args.expectedPageState, controlCount: 1, baiduUserId: uidValues[0],
+            parentExactId, canonicalPath, ancestorExactIds, totalCount, reachedEnd: true,
+            complete: true, stable: true, generationToken: generation, items,
+            observationToken, mutationCount: 1
+          };
+        }
+        """;
+
     public static BaiduTransferCandidateDomResult ParseAndValidate(
         string raw,
-        BaiduCandidateDomReadRequest request)
+        BaiduCandidateDomReadRequest request,
+        int expectedMutationCount = 0,
+        string? expectedObservationToken = null)
     {
         ArgumentNullException.ThrowIfNull(request);
         if (string.IsNullOrWhiteSpace(raw) || raw.Length > MaximumResponseLength)
@@ -166,7 +313,7 @@ public static class BaiduTransferCandidateScripts
                 pageState != request.ExpectedPageState)
                 return Invalid();
             if (root.GetProperty("controlCount").GetInt32() != 1 ||
-                root.GetProperty("mutationCount").GetInt32() != 0)
+                root.GetProperty("mutationCount").GetInt32() != expectedMutationCount)
                 return Invalid();
             var uid = RequiredText(root, "baiduUserId", 512);
             if (!string.Equals(uid, request.ExpectedBaiduUserId, StringComparison.Ordinal)) return Invalid();
@@ -202,7 +349,8 @@ public static class BaiduTransferCandidateScripts
                 return Invalid();
             var generation = RequiredText(root, "generationToken", 512);
             var observation = RequiredText(root, "observationToken", 64);
-            if (!IsLowercaseFingerprint(observation)) return Invalid();
+            if (!IsLowercaseFingerprint(observation) || expectedObservationToken is not null &&
+                !string.Equals(observation, expectedObservationToken, StringComparison.Ordinal)) return Invalid();
 
             return BaiduTransferCandidateDomResult.Success(new(
                 pageState, uid, parent, path, ancestors, items, totalCount, reachedEnd,
@@ -214,6 +362,21 @@ public static class BaiduTransferCandidateScripts
             return Invalid();
         }
     }
+
+    public static bool Matches(
+        BaiduCandidateDomReadRequest request,
+        BaiduTransferCandidateObservation observation) =>
+        request is not null && observation is not null &&
+        observation.PageState == request.ExpectedPageState &&
+        string.Equals(observation.BaiduUserId, request.ExpectedBaiduUserId, StringComparison.Ordinal) &&
+        string.Equals(observation.ParentExactId, request.ExpectedParentExactId, StringComparison.Ordinal) &&
+        Equals(observation.CanonicalPath, request.ExpectedCanonicalPath) &&
+        observation.Items.Select(item => item.ExactId)
+            .SequenceEqual(request.ExpectedExactIds, StringComparer.Ordinal) &&
+        observation.TotalCount == observation.Items.Length && observation.ReachedEnd &&
+        observation.IsComplete && observation.IsStable &&
+        !string.IsNullOrWhiteSpace(observation.GenerationToken) &&
+        IsLowercaseFingerprint(observation.ObservationToken);
 
     private static ImmutableArray<BaiduTransferCandidateItem> ReadItems(JsonElement element)
     {

@@ -170,6 +170,76 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task TransferCandidateMutationPermitsFollowExactStageMatrixAndRecoveryIsReadOnly()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+        var read = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.DestinationPicker,
+            "uid-1", ["item-1"], "parent-1", new RemotePath("/目标"));
+
+        foreach (var action in new[]
+        {
+            BaiduAutomationAction.SetExtractionCode,
+            BaiduAutomationAction.SubmitExtraction,
+            BaiduAutomationAction.OpenDestinationPicker,
+            BaiduAutomationAction.EnterDirectory,
+            BaiduAutomationAction.CreateDirectory,
+            BaiduAutomationAction.ConfirmDirectoryCreation,
+            BaiduAutomationAction.CancelDestinationPicker,
+        })
+        {
+            var permit = await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(ensure, binding, read, action));
+            Assert.NotNull(permit);
+            await permit.DisposeAsync();
+        }
+        Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+            Mutation(ensure, binding, read, BaiduAutomationAction.ClickConfirmTransfer)));
+
+        var prepare = ensure with { Action = AdapterWriteAction.PrepareTransfer };
+        Assert.True(await coordinator.TryValidateBindingAsync(prepare, binding));
+        foreach (var action in Enum.GetValues<BaiduAutomationAction>().Where(value =>
+                     value is not BaiduAutomationAction.Unspecified and not BaiduAutomationAction.OpenOfficialUri))
+            Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(prepare, binding, read, action)));
+
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        foreach (var action in new[]
+        {
+            BaiduAutomationAction.SetExtractionCode,
+            BaiduAutomationAction.SubmitExtraction,
+            BaiduAutomationAction.SelectExactItems,
+            BaiduAutomationAction.OpenDestinationPicker,
+            BaiduAutomationAction.EnterDirectory,
+            BaiduAutomationAction.ClickConfirmTransfer,
+        })
+        {
+            var permit = await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, action));
+            Assert.NotNull(permit);
+            await permit.DisposeAsync();
+        }
+        Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+            Mutation(submit, binding, read, BaiduAutomationAction.CreateDirectory)));
+
+        var store = new MemoryCapabilityStore();
+        store.Records.Add(new(
+            ensure.Capability.AdapterKind, ensure.Capability.ProtocolVersion,
+            ensure.Capability.SelectorVersion, ensure.Capability.BuildVersion, Now, Hash));
+        var formal = Coordinator(false, [], store: store);
+        var recovery = ensure with { OperationId = Guid.NewGuid(), IsRecovery = true };
+        var recoveryBinding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await formal.TryCreateBindingAsync(recovery));
+        Assert.Null(await formal.TryAcquireTransferMutationPermitAsync(
+            Mutation(recovery, recoveryBinding, read, BaiduAutomationAction.CreateDirectory)));
+    }
+
+    [Fact]
     public async Task TransferBindingRejectsExpiredTemporaryRecoveryAndAllowsExactFormalRecovery()
     {
         var clock = new MutableTimeProvider(Now);
@@ -532,6 +602,19 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Guid.Parse("33333333-3333-3333-3333-333333333333"));
 
     private static AcceptanceWriteLeaseConfirmation Confirmed() => new(true, true, true);
+
+    private static BaiduCandidateDomMutationRequest Mutation(
+        AdapterWriteAuthorizationRequest authorization,
+        AdapterWriteAuthorizationBinding binding,
+        BaiduCandidateDomReadRequest read,
+        BaiduAutomationAction action) =>
+        new(authorization, binding, action, read,
+            action switch
+            {
+                BaiduAutomationAction.SetExtractionCode => "1111",
+                BaiduAutomationAction.CreateDirectory => "目录",
+                _ => null,
+            });
     private static LocalResultExportCompletedEvidence ExportEvidence(
         AdapterWriteAuthorizationRequest request,
         Guid? operationId = null,

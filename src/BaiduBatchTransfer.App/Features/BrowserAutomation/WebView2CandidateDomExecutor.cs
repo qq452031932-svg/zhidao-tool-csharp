@@ -10,7 +10,7 @@ public sealed class WebView2CandidateDomExecutor(
     IBaiduCandidateDomScriptHost host,
     IBaiduCandidateActionAuthorizationSource authorizationSource) :
     IBaiduCandidateDomExecutor,
-    IBaiduTransferCandidateDomReader
+    IBaiduTransferCandidateDomExecutor
 {
     private static readonly HashSet<string> ResponseFields = new(StringComparer.Ordinal)
     {
@@ -91,6 +91,55 @@ public sealed class WebView2CandidateDomExecutor(
             BaiduCandidateBuiltInScript.ObserveTransfer, arguments, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         return BaiduTransferCandidateScripts.ParseAndValidate(raw, request);
+    }
+
+    public async Task<BaiduTransferCandidateDomResult> MutateTransferAsync(
+        BaiduCandidateDomMutationRequest request,
+        BaiduTransferCandidateObservation observation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(observation);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!BaiduTransferCandidateScripts.Matches(request.ReadBinding, observation))
+            return BaiduTransferCandidateDomResult.Denied(BaiduAutomationDenialReason.ObservationNotValidated);
+        await using var permit = await authorizationSource
+            .TryAcquireTransferMutationPermitAsync(request, cancellationToken).ConfigureAwait(false);
+        if (permit is null)
+            return BaiduTransferCandidateDomResult.Denied(BaiduAutomationDenialReason.AcceptanceMissing);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var arguments = JsonSerializer.Serialize(new
+            {
+                officialUri = request.ReadBinding.OfficialUri.AbsoluteUri,
+                expectedPageState = request.ReadBinding.ExpectedPageState.ToString(),
+                expectedBaiduUserId = request.ReadBinding.ExpectedBaiduUserId,
+                expectedExactIds = request.ReadBinding.ExpectedExactIds,
+                expectedParentExactId = request.ReadBinding.ExpectedParentExactId,
+                expectedCanonicalPath = request.ReadBinding.ExpectedCanonicalPath?.Value,
+                expectedAncestorExactIds = observation.AncestorExactIds,
+                expectedTotalCount = observation.TotalCount,
+                expectedGenerationToken = observation.GenerationToken,
+                expectedObservationToken = observation.ObservationToken,
+                action = request.Action.ToString(),
+                typedValue = request.TypedValue,
+            });
+            var raw = await host.ExecuteAsync(
+                BaiduCandidateBuiltInScript.MutateTransfer, arguments, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            return BaiduTransferCandidateScripts.ParseAndValidate(
+                raw, request.ReadBinding, expectedMutationCount: 1,
+                expectedObservationToken: observation.ObservationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch
+        {
+            return BaiduTransferCandidateDomResult.Denied(BaiduAutomationDenialReason.ObservationNotValidated);
+        }
     }
 
     public async Task<BaiduCandidateDomResult> MutateAsync(
@@ -246,6 +295,7 @@ public sealed class CoreWebView2CandidateDomScriptHost(CoreWebView2 core) : IBai
             BaiduCandidateBuiltInScript.Observe => WebView2CandidateDomExecutor.ObserveScript,
             BaiduCandidateBuiltInScript.Mutate => WebView2CandidateDomExecutor.MutateScript,
             BaiduCandidateBuiltInScript.ObserveTransfer => BaiduTransferCandidateScripts.ObserveScript,
+            BaiduCandidateBuiltInScript.MutateTransfer => BaiduTransferCandidateScripts.MutateScript,
             _ => throw new ArgumentOutOfRangeException(nameof(script)),
         };
         var encodedArguments = JsonSerializer.Serialize(argumentsJson);
