@@ -112,6 +112,41 @@ public sealed class TransferWorkspaceViewModelTests
     }
 
     [Fact]
+    public async Task PendingImportMutationDisablesStartAndCannotCreateAStaleBatch()
+    {
+        using var fixture = Fixture.Valid();
+        var row = new ImportPreviewRow(
+            Guid.NewGuid(), 1, "https://pan.baidu.com/s/unchanged", null, null, "就绪", null);
+        fixture.Import.SelectedRow = row;
+        fixture.ImportWorkflow.BlockExclusions = true;
+        var observedStartStates = new List<bool>();
+        fixture.ViewModel.StartCommand.CanExecuteChanged +=
+            (_, _) => observedStartStates.Add(fixture.ViewModel.StartCommand.CanExecute(null));
+
+        var mutation = fixture.Import.SetExcludedAsync(row.RowId, true);
+        await fixture.ImportWorkflow.ExclusionStarted.Task;
+        var canStartWhilePending = fixture.ViewModel.CanStart;
+
+        await fixture.ViewModel.StartAsync();
+        var batchCreatedWhilePending = fixture.ViewModel.CreatedBatchJobId;
+
+        fixture.ImportWorkflow.ReleaseExclusion();
+        await mutation;
+
+        Assert.Null(batchCreatedWhilePending);
+        Assert.False(canStartWhilePending);
+        Assert.Equal(0, fixture.BatchService.PreviewCalls);
+        Assert.Equal(0, fixture.BatchService.ConfirmCalls);
+        Assert.Contains(false, observedStartStates);
+        Assert.True(fixture.ViewModel.CanStart);
+        Assert.Contains(true, observedStartStates);
+
+        await fixture.ViewModel.StartAsync();
+
+        Assert.NotNull(fixture.ViewModel.CreatedBatchJobId);
+    }
+
+    [Fact]
     public async Task TemporaryAcceptanceSkipsLegacyPrecheckAndCreatesImmediateValidationBatch()
     {
         var availability = new TemporaryAcceptanceAdapterAvailability(
@@ -753,14 +788,30 @@ public sealed class TransferWorkspaceViewModelTests
 
     private sealed class FakeImportWorkflow(List<string> events) : IImportWorkflow
     {
+        private readonly TaskCompletionSource exclusionRelease =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public string? SavedUrl { get; private set; }
         public string? SavedCode { get; private set; }
         public ImportWorkflowResult? NextMutation { get; set; }
+        public bool BlockExclusions { get; set; }
+        public TaskCompletionSource ExclusionStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task<ImportWorkflowResult> ImportTextAsync(Guid sessionId, string text, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ImportExcelAsync(Guid sessionId, string filePath, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<ImportWorkflowResult> ResumeAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken) =>
-            Task.FromResult(NextMutation ?? throw new InvalidOperationException("A mutation result is required."));
+        public async Task<ImportWorkflowResult> SetExcludedAsync(Guid rowId, bool excluded, CancellationToken cancellationToken)
+        {
+            if (BlockExclusions)
+            {
+                ExclusionStarted.TrySetResult();
+                await exclusionRelease.Task.WaitAsync(cancellationToken);
+            }
+            return NextMutation ?? throw new InvalidOperationException("A mutation result is required.");
+        }
+
+        public void ReleaseExclusion() => exclusionRelease.TrySetResult();
+
         public Task<ImportWorkflowResult> UpdateLinkAsync(Guid rowId, string shareUrl, string? extractionCode, CancellationToken cancellationToken)
         {
             events.Add("save");

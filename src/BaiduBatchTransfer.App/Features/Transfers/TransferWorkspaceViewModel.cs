@@ -177,7 +177,8 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
     public bool IsClosed => isClosed;
     public bool CanEditConfiguration => !isClosed && !IsStarting;
     public Guid? CreatedBatchJobId => createdBatchJobId;
-    public bool CanStart => !isClosed && !IsStarting && string.IsNullOrEmpty(EvaluateConfiguration());
+    public bool CanStart =>
+        !isClosed && !IsStarting && !Import.IsBusy && string.IsNullOrEmpty(EvaluateConfiguration());
     public string ConfigurationMessage => EvaluateConfiguration();
     public IAsyncRelayCommand StartCommand { get; }
     public IAsyncRelayCommand SelectSingleAccountCommand { get; }
@@ -258,13 +259,13 @@ public sealed class TransferWorkspaceViewModel : ObservableObject, IDisposable
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (isClosed || IsStarting || createdBatchJobId is not null) return;
+        if (isClosed || IsStarting || createdBatchJobId is not null || Import.IsBusy) return;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         IsStarting = true;
         try
         {
             var saved = await Import.SaveCurrentRowEditAsync(linked.Token).ConfigureAwait(true);
-            if (!IsAlive(linked) || !saved) return;
+            if (!IsAlive(linked) || !saved || Import.IsBusy) return;
 
             var validation = EvaluateConfiguration();
             if (validation.Length != 0)
