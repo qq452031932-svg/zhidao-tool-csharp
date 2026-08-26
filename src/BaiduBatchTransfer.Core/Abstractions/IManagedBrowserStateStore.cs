@@ -4,39 +4,39 @@ namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IManagedBrowserStateStore
 {
-    Task<BrowserInstallationIdentity> CreateInstallationAsync(
+    Task<StoredBrowserInstallation> CreateInstallationAsync(
         BrowserInstallationIdentity installation,
         CancellationToken cancellationToken);
 
-    Task<BrowserInstallationIdentity?> LoadInstallationAsync(
+    Task<StoredBrowserInstallation?> LoadInstallationAsync(
         Guid installationId,
         CancellationToken cancellationToken);
 
-    Task<BrowserInstallationIdentity?> LoadActiveInstallationAsync(CancellationToken cancellationToken);
+    Task<StoredBrowserInstallation?> LoadActiveInstallationAsync(CancellationToken cancellationToken);
 
-    Task<ManagedBrowserTransitionResult> TryActivateInstallationAsync(
-        ManagedBrowserTransitionRequest request,
+    Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>> TryReplaceActiveInstallationAsync(
+        ManagedBrowserInstallationActivationRequest request,
         CancellationToken cancellationToken);
 
     Task<ManagedBrowserTransitionResult> TryRetireInstallationAsync(
         ManagedBrowserTransitionRequest request,
         CancellationToken cancellationToken);
 
-    Task<ManagedBrowserSessionReference> CreateSessionAsync(
+    Task<StoredManagedBrowserSession> CreateSessionAsync(
         ManagedBrowserSessionReference session,
         CancellationToken cancellationToken);
 
-    Task<ManagedBrowserSessionReference?> LoadSessionAsync(
+    Task<StoredManagedBrowserSession?> LoadSessionAsync(
         Guid sessionId,
         CancellationToken cancellationToken);
 
-    Task<ManagedBrowserSessionReference?> LoadActiveSessionAsync(
+    Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(
         Guid accountId,
         BrowserFamily browserFamily,
         CancellationToken cancellationToken);
 
-    Task<ManagedBrowserTransitionResult> TryActivateSessionAsync(
-        ManagedBrowserTransitionRequest request,
+    Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>> TryReplaceActiveSessionAsync(
+        ManagedBrowserSessionActivationRequest request,
         CancellationToken cancellationToken);
 
     Task<ManagedBrowserTransitionResult> TryRetireSessionAsync(

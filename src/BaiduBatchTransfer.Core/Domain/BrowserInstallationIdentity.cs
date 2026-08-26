@@ -62,10 +62,9 @@ public sealed class BrowserInstallationIdentity
     private static string RequireText(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
-        var trimmed = value.Trim();
-        if (trimmed.Length > 256 || trimmed.Any(char.IsControl))
+        if (value != value.Trim() || value.Length > 256 || value.Any(char.IsControl))
             throw new ArgumentException("The identity value is invalid or too long.", parameterName);
-        return trimmed;
+        return value;
     }
 
     private static string RequireCanonicalAbsolutePath(string value, string parameterName)

@@ -43,6 +43,8 @@ public sealed record ManagedBrowserTransitionResult
             throw new ArgumentOutOfRangeException(nameof(currentRevision), currentRevision, "A non-negative revision is required.");
         if (status == ManagedBrowserTransitionStatus.Applied && !currentRevision.HasValue)
             throw new ArgumentException("An applied transition must report its current revision.", nameof(currentRevision));
+        if (status == ManagedBrowserTransitionStatus.Conflict && !currentRevision.HasValue)
+            throw new ArgumentException("A conflicting transition must report the current revision.", nameof(currentRevision));
         if (status == ManagedBrowserTransitionStatus.NotFound && currentRevision.HasValue)
             throw new ArgumentException("A missing identity cannot report a current revision.", nameof(currentRevision));
 

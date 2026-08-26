@@ -61,8 +61,8 @@ public sealed class ExecutionProfileSnapshot
     private static string RequireText(string value, string parameterName)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
-        if (value.Any(char.IsControl))
-            throw new ArgumentException("The value cannot contain control characters.", parameterName);
-        return value.Trim();
+        if (value != value.Trim() || value.Length > 256 || value.Any(char.IsControl))
+            throw new ArgumentException("The identity value is invalid or too long.", parameterName);
+        return value;
     }
 }

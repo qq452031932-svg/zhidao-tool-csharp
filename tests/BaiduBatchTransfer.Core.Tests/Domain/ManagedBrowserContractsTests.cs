@@ -52,6 +52,9 @@ public sealed class ManagedBrowserContractsTests
 
         Assert.Equal(InstallationId, chrome.InstallationId);
         Assert.Equal(BrowserFamily.Chrome, chrome.BrowserFamily);
+        Assert.Equal("Google LLC", chrome.Publisher);
+        Assert.Equal("Google Chrome", chrome.ProductName);
+        Assert.Equal("file-identity", chrome.FileIdentity);
         Assert.Equal(BrowserFamily.Edge, edge.BrowserFamily);
         Assert.Throws<ArgumentOutOfRangeException>(() => CreateInstallation(BrowserFamily.LegacyWebView2));
     }
@@ -97,8 +100,94 @@ public sealed class ManagedBrowserContractsTests
             "file-identity"));
     }
 
+    [Fact]
+    public void StoredBrowserSnapshotsExposeValidatedStateAndRevision()
+    {
+        var installation = CreateInstallation(BrowserFamily.Chrome);
+        var storedInstallation = new StoredBrowserInstallation(
+            installation, BrowserInstallationLifecycleState.Retired, revision: 3);
+        var session = CreateReference(BrowserFamily.Chrome);
+        var storedSession = new StoredManagedBrowserSession(
+            session, ManagedBrowserSessionLifecycleState.Active, revision: 4);
+
+        Assert.Same(installation, storedInstallation.Identity);
+        Assert.Equal(BrowserInstallationLifecycleState.Retired, storedInstallation.State);
+        Assert.Equal(3, storedInstallation.Revision);
+        Assert.Same(session, storedSession.Identity);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Active, storedSession.State);
+        Assert.Equal(4, storedSession.Revision);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new StoredBrowserInstallation(
+            installation, BrowserInstallationLifecycleState.Retired, revision: -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new StoredManagedBrowserSession(
+            session, (ManagedBrowserSessionLifecycleState)99, revision: 0));
+    }
+
+    [Fact]
+    public void ActiveSlotCasRequestsSupportInitialAndReplacementButRejectStaleScopes()
+    {
+        var currentInstallation = new StoredBrowserInstallation(
+            CreateInstallation(BrowserFamily.Chrome), BrowserInstallationLifecycleState.Active, 8);
+        var targetInstallation = new StoredBrowserInstallation(
+            new BrowserInstallationIdentity(
+                Guid.Parse("21000000-0000-0000-0000-000000000001"), BrowserFamily.Edge,
+                "C:\\Browsers\\Edge", "C:\\Browsers\\Edge\\msedge.exe",
+                "Microsoft Corporation", "Microsoft Edge", "edge-file"),
+            BrowserInstallationLifecycleState.Retired, 0);
+
+        var initial = new ManagedBrowserInstallationActivationRequest(null, targetInstallation);
+        var replacement = new ManagedBrowserInstallationActivationRequest(currentInstallation, targetInstallation);
+        Assert.Null(initial.ExpectedCurrent);
+        Assert.Same(targetInstallation, initial.Target);
+        Assert.Same(currentInstallation, replacement.ExpectedCurrent);
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserInstallationActivationRequest(
+            currentInstallation, currentInstallation));
+
+        var currentSession = new StoredManagedBrowserSession(
+            CreateReference(BrowserFamily.Chrome), ManagedBrowserSessionLifecycleState.Active, 5);
+        var targetSession = new StoredManagedBrowserSession(
+            new ManagedBrowserSessionReference(
+                Guid.Parse("31000000-0000-0000-0000-000000000001"), InstallationId, AccountId,
+                "stable-edge", BrowserFamily.Chrome, "profile-2", "ownership-2"),
+            ManagedBrowserSessionLifecycleState.Retired, 0);
+        var sessionReplacement = new ManagedBrowserSessionActivationRequest(currentSession, targetSession);
+        Assert.Same(currentSession, sessionReplacement.ExpectedCurrent);
+        Assert.Same(targetSession, sessionReplacement.Target);
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionActivationRequest(
+            currentSession,
+            new StoredManagedBrowserSession(
+                new ManagedBrowserSessionReference(
+                    Guid.Parse("32000000-0000-0000-0000-000000000001"), InstallationId,
+                    Guid.Parse("10000000-0000-0000-0000-000000000002"), "other-account",
+                    BrowserFamily.Chrome, "profile-3", "ownership-3"),
+                ManagedBrowserSessionLifecycleState.Retired, 0)));
+
+        var conflict = ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>.Conflict(currentInstallation);
+        Assert.Equal(ManagedBrowserTransitionStatus.Conflict, conflict.Status);
+        Assert.Same(currentInstallation, conflict.Current);
+
+        var applied = ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>.Applied(targetInstallation);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, applied.Status);
+        Assert.Same(targetInstallation, applied.Current);
+        var notFound = ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>.NotFound();
+        Assert.Equal(ManagedBrowserTransitionStatus.NotFound, notFound.Status);
+        Assert.Null(notFound.Current);
+
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionActivationRequest(
+            currentSession,
+            new StoredManagedBrowserSession(
+                new ManagedBrowserSessionReference(
+                    Guid.Parse("33000000-0000-0000-0000-000000000001"), InstallationId, AccountId,
+                    "stable-edge-family", BrowserFamily.Edge, "profile-4", "ownership-4"),
+                ManagedBrowserSessionLifecycleState.Retired, 0)));
+    }
+
     [Theory]
     [InlineData(" ", "Google Chrome", "file-identity")]
+    [InlineData(" Google LLC", "Google Chrome", "file-identity")]
+    [InlineData("Google LLC ", "Google Chrome", "file-identity")]
+    [InlineData("\tGoogle LLC", "Google Chrome", "file-identity")]
+    [InlineData("Google LLC", "Google Chrome\n", "file-identity")]
+    [InlineData("Google LLC", "Google Chrome", "file-identity ")]
     [InlineData("Google LLC", " ", "file-identity")]
     [InlineData("Google LLC", "Google Chrome", " ")]
     [InlineData("Google\nLLC", "Google Chrome", "file-identity")]
@@ -217,6 +306,27 @@ public sealed class ManagedBrowserContractsTests
     }
 
     [Fact]
+    public void ManagedBrowserSessionReferenceAndSnapshotsRejectWhitespaceNearMisses()
+    {
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionReference(
+            SessionId, InstallationId, AccountId, " stable-uid", BrowserFamily.Chrome,
+            "profile-1", "ownership-1"));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionReference(
+            SessionId, InstallationId, AccountId, "stable-uid\t", BrowserFamily.Chrome,
+            "profile-1", "ownership-1"));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionReference(
+            SessionId, InstallationId, AccountId, "stable-uid", BrowserFamily.Chrome,
+            " profile-1", "ownership-1"));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserSessionReference(
+            SessionId, InstallationId, AccountId, "stable-uid", BrowserFamily.Chrome,
+            "profile-1", "ownership-1\n"));
+        Assert.Throws<ArgumentException>(() => new ExecutionProfileSnapshot(
+            BaiduExecutionEngine.WebView2V1, BrowserFamily.LegacyWebView2, " legacy-profile"));
+        Assert.Throws<ArgumentException>(() => new ExecutionProfileSnapshot(
+            BaiduExecutionEngine.ManagedChromiumV1, BrowserFamily.Chrome, "profile-1\t", InstallationId, SessionId));
+    }
+
+    [Fact]
     public void ManagedContextCarriesReferenceWithoutCookies()
     {
         var reference = new ManagedBrowserSessionReference(
@@ -285,15 +395,15 @@ public sealed class ManagedBrowserContractsTests
     public void ManagedBrowserStateStore_ExposesCreateOnlyCasLookupAndRetentionSignatures()
     {
         IManagedBrowserStateStore store = new ContractStore();
-        Func<BrowserInstallationIdentity, CancellationToken, Task<BrowserInstallationIdentity>> createInstallation = store.CreateInstallationAsync;
-        Func<Guid, CancellationToken, Task<BrowserInstallationIdentity?>> loadInstallation = store.LoadInstallationAsync;
-        Func<CancellationToken, Task<BrowserInstallationIdentity?>> loadActiveInstallation = store.LoadActiveInstallationAsync;
-        Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> activateInstallation = store.TryActivateInstallationAsync;
+        Func<BrowserInstallationIdentity, CancellationToken, Task<StoredBrowserInstallation>> createInstallation = store.CreateInstallationAsync;
+        Func<Guid, CancellationToken, Task<StoredBrowserInstallation?>> loadInstallation = store.LoadInstallationAsync;
+        Func<CancellationToken, Task<StoredBrowserInstallation?>> loadActiveInstallation = store.LoadActiveInstallationAsync;
+        Func<ManagedBrowserInstallationActivationRequest, CancellationToken, Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>>> activateInstallation = store.TryReplaceActiveInstallationAsync;
         Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> retireInstallation = store.TryRetireInstallationAsync;
-        Func<ManagedBrowserSessionReference, CancellationToken, Task<ManagedBrowserSessionReference>> createSession = store.CreateSessionAsync;
-        Func<Guid, CancellationToken, Task<ManagedBrowserSessionReference?>> loadSession = store.LoadSessionAsync;
-        Func<Guid, BrowserFamily, CancellationToken, Task<ManagedBrowserSessionReference?>> loadActiveSession = store.LoadActiveSessionAsync;
-        Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> activateSession = store.TryActivateSessionAsync;
+        Func<ManagedBrowserSessionReference, CancellationToken, Task<StoredManagedBrowserSession>> createSession = store.CreateSessionAsync;
+        Func<Guid, CancellationToken, Task<StoredManagedBrowserSession?>> loadSession = store.LoadSessionAsync;
+        Func<Guid, BrowserFamily, CancellationToken, Task<StoredManagedBrowserSession?>> loadActiveSession = store.LoadActiveSessionAsync;
+        Func<ManagedBrowserSessionActivationRequest, CancellationToken, Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>>> activateSession = store.TryReplaceActiveSessionAsync;
         Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> retireSession = store.TryRetireSessionAsync;
         Func<ManagedBrowserRetentionReference, CancellationToken, Task> addRetention = store.AddRetentionAsync;
         Func<ManagedBrowserRetentionReference, CancellationToken, Task> releaseRetention = store.ReleaseRetentionAsync;
@@ -323,6 +433,7 @@ public sealed class ManagedBrowserContractsTests
         Assert.Equal(ManagedBrowserTransitionStatus.Applied, ManagedBrowserTransitionResult.Applied(5).Status);
         Assert.Equal(5, ManagedBrowserTransitionResult.Applied(5).CurrentRevision);
         Assert.Equal(ManagedBrowserTransitionStatus.Conflict, ManagedBrowserTransitionResult.Conflict(6).Status);
+        Assert.Throws<ArgumentException>(() => ManagedBrowserTransitionResult.Conflict(null));
         Assert.Equal(ManagedBrowserTransitionStatus.NotFound, ManagedBrowserTransitionResult.NotFound().Status);
         Assert.Throws<ArgumentException>(() => new ManagedBrowserTransitionRequest(Guid.Empty, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => new ManagedBrowserTransitionRequest(InstallationId, -1));
@@ -361,17 +472,20 @@ public sealed class ManagedBrowserContractsTests
         family == BrowserFamily.Chrome ? "Google Chrome" : "Microsoft Edge",
         "file-identity");
 
+    private static ManagedBrowserSessionReference CreateReference(BrowserFamily family) => new(
+        SessionId, InstallationId, AccountId, "stable-uid", family, "profile-1", "ownership-1");
+
     private sealed class ContractStore : IManagedBrowserStateStore
     {
-        public Task<BrowserInstallationIdentity> CreateInstallationAsync(BrowserInstallationIdentity installation, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<BrowserInstallationIdentity?> LoadInstallationAsync(Guid installationId, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<BrowserInstallationIdentity?> LoadActiveInstallationAsync(CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<ManagedBrowserTransitionResult> TryActivateInstallationAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredBrowserInstallation> CreateInstallationAsync(BrowserInstallationIdentity installation, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredBrowserInstallation?> LoadInstallationAsync(Guid installationId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredBrowserInstallation?> LoadActiveInstallationAsync(CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>> TryReplaceActiveInstallationAsync(ManagedBrowserInstallationActivationRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryRetireInstallationAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<ManagedBrowserSessionReference> CreateSessionAsync(ManagedBrowserSessionReference session, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<ManagedBrowserSessionReference?> LoadSessionAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<ManagedBrowserSessionReference?> LoadActiveSessionAsync(Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken) => throw new NotImplementedException();
-        public Task<ManagedBrowserTransitionResult> TryActivateSessionAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredManagedBrowserSession> CreateSessionAsync(ManagedBrowserSessionReference session, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredManagedBrowserSession?> LoadSessionAsync(Guid sessionId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>> TryReplaceActiveSessionAsync(ManagedBrowserSessionActivationRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryRetireSessionAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task AddRetentionAsync(ManagedBrowserRetentionReference reference, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task ReleaseRetentionAsync(ManagedBrowserRetentionReference reference, CancellationToken cancellationToken) => throw new NotImplementedException();
