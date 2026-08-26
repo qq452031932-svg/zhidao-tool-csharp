@@ -142,6 +142,7 @@ public enum BaiduCandidateBuiltInScript
 {
     Observe,
     Mutate,
+    ObserveTransfer,
 }
 
 public sealed record BaiduCandidateDomRequest
@@ -214,6 +215,63 @@ public readonly record struct BaiduCandidateDomResult(
         new(false, reason, null);
 }
 
+public sealed record BaiduTransferCandidateItem
+{
+    public BaiduTransferCandidateItem(string exactId, RemoteResourceKind kind, string serverName)
+    {
+        if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
+        ExactId = Validate(exactId, nameof(exactId));
+        Kind = kind;
+        ServerName = Validate(serverName, nameof(serverName));
+    }
+
+    public string ExactId { get; }
+    public RemoteResourceKind Kind { get; }
+    public string ServerName { get; }
+
+    public override string ToString() =>
+        $"BaiduTransferCandidateItem {{ Kind = {Kind}, ExactId = [REDACTED], ServerName = [REDACTED] }}";
+
+    private static string Validate(string value, string parameterName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
+        if (value.Length > 512 || value.Any(char.IsControl))
+            throw new ArgumentException("The candidate item field is invalid.", parameterName);
+        return value;
+    }
+}
+
+public sealed record BaiduTransferCandidateObservation(
+    BaiduCandidatePageState PageState,
+    string BaiduUserId,
+    string? ParentExactId,
+    RemotePath? CanonicalPath,
+    ImmutableArray<string> AncestorExactIds,
+    ImmutableArray<BaiduTransferCandidateItem> Items,
+    int TotalCount,
+    bool ReachedEnd,
+    bool IsComplete,
+    bool IsStable,
+    string GenerationToken,
+    string ObservationToken)
+{
+    public override string ToString() =>
+        $"BaiduTransferCandidateObservation {{ PageState = {PageState}, ItemCount = {Items.Length}, TotalCount = {TotalCount}, ReachedEnd = {ReachedEnd}, Complete = {IsComplete}, Stable = {IsStable}, Identity = [REDACTED], Path = [REDACTED], Items = [REDACTED], Tokens = [REDACTED] }}";
+}
+
+public readonly record struct BaiduTransferCandidateDomResult(
+    bool IsSuccess,
+    BaiduAutomationDenialReason DenialReason,
+    BaiduTransferCandidateObservation? Observation)
+{
+    public static BaiduTransferCandidateDomResult Success(BaiduTransferCandidateObservation observation) =>
+        new(true, BaiduAutomationDenialReason.None,
+            observation ?? throw new ArgumentNullException(nameof(observation)));
+
+    public static BaiduTransferCandidateDomResult Denied(BaiduAutomationDenialReason reason) =>
+        new(false, reason, null);
+}
+
 public interface IBaiduCandidateDomScriptHost
 {
     Task<string> ExecuteAsync(
@@ -246,5 +304,12 @@ public interface IBaiduCandidateDomExecutor
     Task<BaiduCandidateDomResult> MutateAsync(
         BaiduCandidateDomRequest request,
         BaiduCandidateDomObservation observation,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IBaiduTransferCandidateDomReader
+{
+    Task<BaiduTransferCandidateDomResult> ObserveTransferAsync(
+        BaiduCandidateDomReadRequest request,
         CancellationToken cancellationToken = default);
 }

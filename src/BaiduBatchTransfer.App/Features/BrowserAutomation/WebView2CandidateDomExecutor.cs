@@ -8,7 +8,9 @@ namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
 
 public sealed class WebView2CandidateDomExecutor(
     IBaiduCandidateDomScriptHost host,
-    IBaiduCandidateActionAuthorizationSource authorizationSource) : IBaiduCandidateDomExecutor
+    IBaiduCandidateActionAuthorizationSource authorizationSource) :
+    IBaiduCandidateDomExecutor,
+    IBaiduTransferCandidateDomReader
 {
     private static readonly HashSet<string> ResponseFields = new(StringComparer.Ordinal)
     {
@@ -68,6 +70,27 @@ public sealed class WebView2CandidateDomExecutor(
             BaiduCandidateBuiltInScript.Observe, arguments, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         return ParseAndValidate(raw, request, expectedMutationCount: 0, expectedObservationToken: null);
+    }
+
+    public async Task<BaiduTransferCandidateDomResult> ObserveTransferAsync(
+        BaiduCandidateDomReadRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        var arguments = JsonSerializer.Serialize(new
+        {
+            officialUri = request.OfficialUri.AbsoluteUri,
+            expectedPageState = request.ExpectedPageState.ToString(),
+            expectedBaiduUserId = request.ExpectedBaiduUserId,
+            expectedExactIds = request.ExpectedExactIds,
+            expectedParentExactId = request.ExpectedParentExactId,
+            expectedCanonicalPath = request.ExpectedCanonicalPath?.Value,
+        });
+        var raw = await host.ExecuteAsync(
+            BaiduCandidateBuiltInScript.ObserveTransfer, arguments, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return BaiduTransferCandidateScripts.ParseAndValidate(raw, request);
     }
 
     public async Task<BaiduCandidateDomResult> MutateAsync(
@@ -222,6 +245,7 @@ public sealed class CoreWebView2CandidateDomScriptHost(CoreWebView2 core) : IBai
         {
             BaiduCandidateBuiltInScript.Observe => WebView2CandidateDomExecutor.ObserveScript,
             BaiduCandidateBuiltInScript.Mutate => WebView2CandidateDomExecutor.MutateScript,
+            BaiduCandidateBuiltInScript.ObserveTransfer => BaiduTransferCandidateScripts.ObserveScript,
             _ => throw new ArgumentOutOfRangeException(nameof(script)),
         };
         var encodedArguments = JsonSerializer.Serialize(argumentsJson);
