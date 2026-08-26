@@ -42,6 +42,11 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.NotNull(host.Services.GetRequiredService<WebViewBaiduShareAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<StandaloneShareCoordinator>());
         Assert.NotNull(host.Services.GetRequiredService<CreateStandaloneShareBatchService>());
+        Assert.NotNull(host.Services.GetRequiredService<TransferCoordinator>());
+        Assert.IsType<OperationExecutor>(host.Services.GetRequiredService<ITransferOperationExecutor>());
+        Assert.Contains(
+            host.Services.GetServices<IHostedService>(),
+            service => service.GetType().Name == "TransferCoordinatorHostedService");
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduAdapterConcurrencyGate>());
@@ -121,6 +126,33 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<ITransferRecoveryAuthorizationSource>());
         Assert.NotNull(host.Services.GetRequiredService<
             Func<AdapterWriteAuthorizationRequest, AcceptanceConfirmationWindow>>());
+    }
+
+    [Fact]
+    public async Task StartingTheHostRunsQueuedTransferWorkThroughTheRegisteredCoordinator()
+    {
+        var executor = new RecordingTransferExecutor();
+        using var host = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<ITransferOperationExecutor>();
+            services.AddSingleton<ITransferOperationExecutor>(executor);
+        });
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var operationId = Guid.NewGuid();
+        await SeedTransferOwnerAsync(
+            host.Services.GetRequiredService<SqliteConnectionFactory>(),
+            operationId,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            generation: 1,
+            baiduUserId: "hosted-loop-user",
+            DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        await host.StartAsync();
+        await executor.Executed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await host.StopAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(operationId, executor.OperationId);
     }
 
     [Fact]
@@ -750,6 +782,12 @@ public sealed class AppBootstrapTests : IDisposable
               OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
             VALUES($batch,'recovery-job','Text','Distribution','TaskCount','ProportionalReduction',1,1,'/target',
               'None','Skip','Immediate','Active',$now,1);
+            INSERT INTO AccountAllocations(Id,BatchJobId,AccountId,PriorityOrder,DefaultTargetPath,
+              NormalizedDefaultTargetPath,TargetItemCount,TargetSuccessCount,EffectiveTargetSuccessCount,
+              AssignedItemCount,AttemptedItemCount,NewSuccessItemCount,AlreadySatisfiedItemCount,
+              SuccessItemCount,FailedItemCount,LockedItemCount,ExclusiveCandidateCount,UnusedCandidateCount,
+              ReservedSlotCount,FulfilledCount)
+            VALUES($allocation,$batch,$account,1,'/target','/target',1,1,1,1,0,0,0,0,0,0,0,0,0,0);
             INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
               FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
             VALUES($resource,$batch,1,'https://pan.baidu.com/s/test','test','a1b2','None','Valid','Expanded',$now,$now);
@@ -762,6 +800,7 @@ public sealed class AppBootstrapTests : IDisposable
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$uid", baiduUserId);
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+        command.Parameters.AddWithValue("$allocation", Guid.NewGuid().ToString("D"));
         command.Parameters.AddWithValue("$resource", resourceId.ToString("D"));
         command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
         command.Parameters.AddWithValue("$generation", generation);
@@ -880,6 +919,19 @@ public sealed class AppBootstrapTests : IDisposable
         {
             Requests.Add(request);
             return ValueTask.FromResult<AdapterWriteAuthorizationBinding?>(null);
+        }
+    }
+
+    private sealed class RecordingTransferExecutor : ITransferOperationExecutor
+    {
+        public TaskCompletionSource Executed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Guid? OperationId { get; private set; }
+
+        public Task ExecuteAsync(Guid operationId, CancellationToken cancellationToken = default)
+        {
+            OperationId = operationId;
+            Executed.TrySetResult();
+            return Task.CompletedTask;
         }
     }
 
