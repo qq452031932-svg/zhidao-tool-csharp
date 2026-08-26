@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Scheduling;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
@@ -269,7 +270,9 @@ public sealed record BaiduTransferCandidateObservation(
     bool IsComplete,
     bool IsStable,
     string GenerationToken,
-    string ObservationToken)
+    string ObservationToken,
+    string? OfficialRequestId = null,
+    TransferIdentityMapping? OfficialIdentityMapping = null)
 {
     public override string ToString() =>
         $"BaiduTransferCandidateObservation {{ PageState = {PageState}, ItemCount = {Items.Length}, TotalCount = {TotalCount}, ReachedEnd = {ReachedEnd}, Complete = {IsComplete}, Stable = {IsStable}, Identity = [REDACTED], Path = [REDACTED], Items = [REDACTED], Tokens = [REDACTED] }}";

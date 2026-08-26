@@ -55,6 +55,45 @@ public sealed class WebView2AutomationSessionTests
     }
 
     [Fact]
+    public async Task ExactTransferRechecksSourceSelectsTargetAndConfirmsOnce()
+    {
+        var identity = TransferIdentity();
+        var executor = new RecordingTransferCandidateExecutor();
+        await using var session = new WebView2AutomationSession(
+            identity, TransferBinding(identity), executor, CancellationToken.None);
+        var transfer = (ITransferAutomationSession)session;
+        var share = new ShareReference(
+            "share", "https://pan.baidu.com/s/share?pwd=1111", "1111");
+        var source = await transfer.OpenAndReadSourceForSubmissionAsync(
+            share, CancellationToken.None);
+
+        var destination = new RemoteDirectory("target", new RemotePath("/目标"));
+        await transfer.PrepareWholeShareSubmissionAsync(
+            destination,
+            source.Evidence,
+            DuplicatePolicy.Skip,
+            CancellationToken.None);
+        var acceptance = await transfer.SaveWholeShareExactlyOnceAsync(
+            destination, source.Evidence, DuplicatePolicy.Skip, CancellationToken.None);
+
+        Assert.True(acceptance.IsAccepted);
+        Assert.Equal("request-1", acceptance.AdapterRequestId);
+        Assert.Equal("target", acceptance.TargetExactId);
+        Assert.Equal(1, executor.Actions.Count(action =>
+            action == BaiduAutomationAction.ClickConfirmTransfer));
+        Assert.Equal(
+            [
+                BaiduAutomationAction.SetExtractionCode,
+                BaiduAutomationAction.SubmitExtraction,
+                BaiduAutomationAction.SelectExactItems,
+                BaiduAutomationAction.OpenDestinationPicker,
+                BaiduAutomationAction.EnterDirectory,
+                BaiduAutomationAction.ClickConfirmTransfer,
+            ],
+            executor.Actions);
+    }
+
+    [Fact]
     public async Task ExactShareSelectionDelegatesObserveAndSingleMutation()
     {
         var identity = Identity();
@@ -232,14 +271,21 @@ public sealed class WebView2AutomationSessionTests
                     [new("target", RemoteResourceKind.Folder, "目标")],
                 _ => [],
             };
-            var parent = request.ExpectedPageState == BaiduCandidatePageState.DestinationPicker
+            var parent = request.ExpectedPageState is BaiduCandidatePageState.DestinationPicker or
+                BaiduCandidatePageState.OwnDrive or BaiduCandidatePageState.TransferResult
                 ? request.ExpectedParentExactId ?? "root"
                 : null;
             var path = parent is null ? null : request.ExpectedCanonicalPath ?? new RemotePath("/");
             var ancestors = path?.Value == "/" ? [] : new[] { parent! };
+            var mapping = request.ExpectedPageState == BaiduCandidatePageState.TransferResult
+                ? new TransferIdentityMapping([
+                    new TransferIdentityMappingEntry("source-1", "destination-1"),
+                ])
+                : null;
             return Task.FromResult(BaiduTransferCandidateDomResult.Success(new(
                 request.ExpectedPageState, "uid-1", parent, path, [.. ancestors], [.. items], items.Length,
-                true, true, true, "generation-1", new string('a', 64))));
+                true, true, true, "generation-1", new string('a', 64),
+                mapping is null ? null : "request-1", mapping)));
         }
 
         public Task<BaiduTransferCandidateDomResult> MutateTransferAsync(

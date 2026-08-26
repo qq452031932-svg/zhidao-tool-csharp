@@ -47,6 +47,28 @@ public sealed class TransferAutomationFlowTests
     }
 
     [Fact]
+    public async Task PrepareFromPersistedSourceReadsOnlyTheExactTarget()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario);
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+
+        var result = await flow.PrepareFromPersistedSourceAsync(
+            session,
+            Request(),
+            session.SourceEvidence,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            ["open-exact-target", "persist-target"],
+            session.Events);
+        Assert.Equal(session.SourceEvidence, result.Value!.Evidence!.Source);
+        Assert.Equal(Destination().RemoteId, result.Value.Evidence.Target.TargetExactId);
+        Assert.Equal(Destination().Path, result.Value.Evidence.Target.TargetPath);
+    }
+
+    [Fact]
     public async Task SubmitUsesPersistedBaselineAndMarksSubmittingImmediatelyBeforeClick()
     {
         var scenario = Load("folder-transfer.json");
@@ -63,6 +85,89 @@ public sealed class TransferAutomationFlowTests
         Assert.Equal(
             ["open-share", "enter-code", "mark-submitting", "submit", "persist-acceptance", "reopen-destination"],
             session.Events);
+    }
+
+    [Theory]
+    [InlineData("apk-transfer.json")]
+    [InlineData("folder-transfer.json")]
+    [InlineData("multi-root-transfer.json")]
+    public async Task SubmitRequiresCombinedPreparationAndBindsTheOfficialTarget(string fixture)
+    {
+        var scenario = Load(fixture);
+        var session = new FixtureSession(scenario);
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+        var prepared = await flow.PrepareFromPersistedSourceAsync(
+            session, Request(), session.SourceEvidence, CancellationToken.None);
+        session.Events.Clear();
+
+        var result = await flow.SubmitAsync(
+            session,
+            Request(),
+            prepared.Value!.Evidence!,
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            ["open-share", "enter-code", "prepare-submit", "mark-transfer-submitting", "submit", "persist-transfer-acceptance", "reopen-destination"],
+            session.Events);
+        Assert.NotNull(session.PersistedSubmission);
+        Assert.Equal(session.SourceEvidence.Items.Fingerprint, session.PersistedSubmission!.SourceFingerprint);
+        Assert.Equal(Destination().RemoteId, session.PersistedSubmission.TargetExactId);
+    }
+
+    [Fact]
+    public async Task ReopenedSourceGenerationMismatchStopsBeforeSubmissionBoundary()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario)
+        {
+            OpenedSourceOverride = new TransferSourceEvidence(
+                new RemoteItemIdentitySet(scenario.SourceIds.Select(id => new RemoteItemIdentity(id, id))),
+                scenario.ExpectedTopLevelCount, true, true, "different-generation",
+                "baidu-user", Capability(), Fingerprint('a')),
+        };
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+        var prepared = await flow.PrepareFromPersistedSourceAsync(
+            session, Request(), session.SourceEvidence, CancellationToken.None);
+        session.Events.Clear();
+
+        var result = await flow.SubmitAsync(
+            session, Request(), prepared.Value!.Evidence!, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.DoesNotContain("mark-transfer-submitting", session.Events);
+        Assert.DoesNotContain("submit", session.Events);
+    }
+
+    [Fact]
+    public async Task OfficialResultForAnotherTargetRemainsPending()
+    {
+        var scenario = Load("folder-transfer.json");
+        var session = new FixtureSession(scenario)
+        {
+            AcceptanceOverride = new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.Accepted,
+                "request-1",
+                new RemoteItemIdentitySet([new("fictional-accepted-folder", null)]),
+                new TransferIdentityMapping([
+                    new TransferIdentityMappingEntry(
+                        scenario.SourceIds[0], "fictional-accepted-folder"),
+                ]),
+                Fingerprint('d'),
+                "another-target"),
+        };
+        var flow = new TransferAutomationFlow(new FixedTimeProvider(Now));
+        var prepared = await flow.PrepareFromPersistedSourceAsync(
+            session, Request(), session.SourceEvidence, CancellationToken.None);
+        session.Events.Clear();
+
+        var result = await flow.SubmitAsync(
+            session, Request(), prepared.Value!.Evidence!, CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(SubmissionAcceptance.Unknown, result.SubmissionAcceptance);
+        Assert.DoesNotContain("persist-transfer-acceptance", session.Events);
     }
 
     [Fact]
@@ -325,6 +430,17 @@ public sealed class TransferAutomationFlowTests
         public Exception? SaveFailure { get; init; }
         public Exception? MarkSubmittingFailure { get; init; }
         public TransferOfficialAcceptance? AcceptanceOverride { get; init; }
+        public TransferSourceEvidence? OpenedSourceOverride { get; init; }
+        public TransferSubmissionEvidence? PersistedSubmission { get; private set; }
+        public TransferSourceEvidence SourceEvidence => new(
+            new RemoteItemIdentitySet(scenario.SourceIds.Select(id => new RemoteItemIdentity(id, id))),
+            scenario.ExpectedTopLevelCount,
+            reachedEnd: true,
+            isStable: true,
+            "source-generation",
+            "baidu-user",
+            Capability(),
+            Fingerprint('a'));
         public TransferOfficialAcceptance OfficialAcceptance => new(
             scenario.OfficialAccepted
                 ? TransferOfficialAcceptanceStatus.Accepted
@@ -338,20 +454,51 @@ public sealed class TransferAutomationFlowTests
                 : new TransferIdentityMapping(scenario.SourceIds.Zip(
                     scenario.OfficialRemoteIds,
                     (source, destination) => new TransferIdentityMappingEntry(source, destination))),
-            Fingerprint('d'));
+            Fingerprint('d'),
+            Destination().RemoteId);
 
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken)
         {
             Events.Add("open-share");
-            return Task.FromResult(new TransferSourceListing(new TransferSourceEvidence(
-                new RemoteItemIdentitySet(scenario.SourceIds.Select(id => new RemoteItemIdentity(id, id))),
-                scenario.ExpectedTopLevelCount,
+            return Task.FromResult(new TransferSourceListing(OpenedSourceOverride ?? SourceEvidence));
+        }
+
+        public async Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
+            ShareReference share,
+            CancellationToken cancellationToken)
+        {
+            var source = await OpenExternalShareAsync(share, cancellationToken);
+            if (share.ExtractionCode is not null)
+                await EnterExtractionCodeAsync(share.ExtractionCode, cancellationToken);
+            return source;
+        }
+
+        public Task<TransferDirectoryListing> OpenExactTargetAndReadStableListingAsync(
+            RemoteDirectory destination,
+            CancellationToken cancellationToken)
+        {
+            Events.Add("open-exact-target");
+            var items = scenario.Baseline.Select(id => new TransferRemoteItem(
+                new RemoteItemIdentity(id, id), TransferRemoteItemKind.File, id)).ToArray();
+            return Task.FromResult(TransferDirectoryListing.Exact(
+                destination,
+                ["root", destination.RemoteId],
+                items,
+                items.Length,
                 reachedEnd: true,
                 isStable: true,
-                "source-generation",
+                "target-generation",
                 "baidu-user",
-                Capability(),
-                Fingerprint('a'))));
+                Fingerprint('b')));
+        }
+
+        public Task PersistTargetPreparationAsync(
+            TransferTargetPreparationEvidence evidence,
+            CancellationToken cancellationToken)
+        {
+            Events.Add("persist-target");
+            PersistedBaseline = evidence.Baseline;
+            return Task.CompletedTask;
         }
 
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken)
@@ -387,6 +534,17 @@ public sealed class TransferAutomationFlowTests
                 : Task.FromException(MarkSubmittingFailure);
         }
 
+        public Task MarkSubmittingAsync(
+            TransferSubmissionEvidence evidence,
+            CancellationToken cancellationToken)
+        {
+            Events.Add("mark-transfer-submitting");
+            PersistedSubmission = evidence;
+            return MarkSubmittingFailure is null
+                ? Task.CompletedTask
+                : Task.FromException(MarkSubmittingFailure);
+        }
+
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken)
         {
             Events.Add("submit");
@@ -395,9 +553,34 @@ public sealed class TransferAutomationFlowTests
                 : Task.FromException<TransferOfficialAcceptance>(SaveFailure);
         }
 
+        public Task<TransferOfficialAcceptance> SaveWholeShareExactlyOnceAsync(
+            RemoteDirectory destination,
+            TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) =>
+            SaveWholeShareAsync(destination, duplicatePolicy, cancellationToken);
+
+        public Task PrepareWholeShareSubmissionAsync(
+            RemoteDirectory destination,
+            TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken)
+        {
+            Events.Add("prepare-submit");
+            return Task.CompletedTask;
+        }
+
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken)
         {
             Events.Add("persist-acceptance");
+            return Task.CompletedTask;
+        }
+
+        public Task PersistTransferAcceptanceAsync(
+            TransferOfficialAcceptance acceptance,
+            CancellationToken cancellationToken)
+        {
+            Events.Add("persist-transfer-acceptance");
             return Task.CompletedTask;
         }
 

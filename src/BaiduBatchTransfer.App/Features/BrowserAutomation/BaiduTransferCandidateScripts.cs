@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Text.Json;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.BrowserAutomation;
@@ -14,7 +15,7 @@ public static class BaiduTransferCandidateScripts
         "status", "reason", "officialOriginMatched", "pageState", "controlCount",
         "baiduUserId", "parentExactId", "canonicalPath", "ancestorExactIds", "totalCount",
         "reachedEnd", "complete", "stable", "generationToken", "items",
-        "observationToken", "mutationCount",
+        "observationToken", "mutationCount", "officialRequestId", "officialMapping",
     };
 
     private static readonly HashSet<string> ItemFields = new(StringComparer.Ordinal)
@@ -31,7 +32,8 @@ public static class BaiduTransferCandidateScripts
             pageState: args.expectedPageState, controlCount: 0, baiduUserId: '',
             parentExactId: null, canonicalPath: null, ancestorExactIds: [], totalCount: 0,
             reachedEnd: false, complete: false, stable: false, generationToken: 'none',
-            items: [], observationToken: '', mutationCount: 0
+            items: [], observationToken: '', mutationCount: 0,
+            officialRequestId: null, officialMapping: []
           });
           const url = new URL(location.href);
           const official = url.protocol === 'https:' && url.hostname === 'pan.baidu.com' &&
@@ -131,12 +133,22 @@ public static class BaiduTransferCandidateScripts
           const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(evidence));
           const observationToken = Array.from(new Uint8Array(digest))
             .map(value => value.toString(16).padStart(2, '0')).join('');
+          const officialRequestId = args.expectedPageState === 'TransferResult'
+            ? (root.getAttribute('data-transfer-request-id') || root.getAttribute('data-request-id')) : null;
+          const officialMapping = args.expectedPageState === 'TransferResult' ? rows.map(row => ({
+            sourceExactId: row.getAttribute('data-source-fsid') || row.getAttribute('data-source-id'),
+            destinationExactId: row.getAttribute('data-fsid') || row.getAttribute('data-file-id') || row.getAttribute('data-id')
+          })) : [];
+          if (args.expectedPageState === 'TransferResult' &&
+              (!officialRequestId || officialMapping.length !== items.length ||
+               officialMapping.some(entry => !entry.sourceExactId || !entry.destinationExactId)))
+            return fail('official-result-incomplete');
           return {
             status: 'validated', reason: 'none', officialOriginMatched: true,
             pageState: args.expectedPageState, controlCount, baiduUserId: uids[0],
             parentExactId, canonicalPath, ancestorExactIds, totalCount, reachedEnd: true,
             complete: true, stable: true, generationToken: generation, items,
-            observationToken, mutationCount: 0
+            observationToken, mutationCount: 0, officialRequestId, officialMapping
           };
         }
         """;
@@ -150,7 +162,8 @@ public static class BaiduTransferCandidateScripts
             pageState: args.expectedPageState, controlCount: 0, baiduUserId: '',
             parentExactId: null, canonicalPath: null, ancestorExactIds: [], totalCount: 0,
             reachedEnd: false, complete: false, stable: false, generationToken: 'none',
-            items: [], observationToken: '', mutationCount: 0
+            items: [], observationToken: '', mutationCount: 0,
+            officialRequestId: null, officialMapping: []
           });
           const url = new URL(location.href);
           if (url.protocol !== 'https:' || url.hostname !== 'pan.baidu.com' || url.port !== '' ||
@@ -295,7 +308,7 @@ public static class BaiduTransferCandidateScripts
             pageState: args.expectedPageState, controlCount: 1, baiduUserId: uidValues[0],
             parentExactId, canonicalPath, ancestorExactIds, totalCount, reachedEnd: true,
             complete: true, stable: true, generationToken: generation, items,
-            observationToken, mutationCount: 1
+            observationToken, mutationCount: 1, officialRequestId: null, officialMapping: []
           };
         }
         """;
@@ -371,9 +384,20 @@ public static class BaiduTransferCandidateScripts
             if (!IsLowercaseFingerprint(observation) || expectedObservationToken is not null &&
                 !string.Equals(observation, expectedObservationToken, StringComparison.Ordinal)) return Invalid();
 
+            var officialRequestId = OptionalText(root, "officialRequestId", 512);
+            var officialMapping = ReadOfficialMapping(root.GetProperty("officialMapping"));
+            if (pageState == BaiduCandidatePageState.TransferResult)
+            {
+                if (officialRequestId is null || officialMapping is null) return Invalid();
+            }
+            else if (officialRequestId is not null || officialMapping is not null)
+            {
+                return Invalid();
+            }
+
             return BaiduTransferCandidateDomResult.Success(new(
                 pageState, uid, parent, path, ancestors, items, totalCount, reachedEnd,
-                complete, stable, generation, observation));
+                complete, stable, generation, observation, officialRequestId, officialMapping));
         }
         catch (Exception exception) when (exception is JsonException or InvalidOperationException or
                                            FormatException or ArgumentException or OverflowException)
@@ -419,6 +443,24 @@ public static class BaiduTransferCandidateScripts
             result.Select(item => item.ExactId).Distinct(StringComparer.Ordinal).Count() != result.Length)
             throw new JsonException("Exact IDs must be strictly ordered and unique.");
         return result;
+    }
+
+    private static TransferIdentityMapping? ReadOfficialMapping(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() > 500)
+            throw new JsonException("The official mapping is invalid.");
+        if (element.GetArrayLength() == 0) return null;
+        var entries = new List<TransferIdentityMappingEntry>(element.GetArrayLength());
+        foreach (var item in element.EnumerateArray())
+        {
+            if (!HasExactFields(item, new HashSet<string>(StringComparer.Ordinal)
+                { "sourceExactId", "destinationExactId" }))
+                throw new JsonException("The official mapping shape is invalid.");
+            entries.Add(new TransferIdentityMappingEntry(
+                RequiredText(item, "sourceExactId", 512),
+                RequiredText(item, "destinationExactId", 512)));
+        }
+        return new TransferIdentityMapping(entries);
     }
 
     private static ImmutableArray<string> ReadTextArray(

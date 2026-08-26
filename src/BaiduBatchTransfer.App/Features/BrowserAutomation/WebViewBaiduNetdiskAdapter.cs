@@ -138,9 +138,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         CancellationToken cancellationToken)
     {
         ValidateOperationIdentity(context, session, share);
-        if (attemptStore is not null)
+        if (attemptStore is not { } store)
+            return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
         {
-            var existing = await attemptStore.GetAsync(
+            var existing = await store.GetAsync(
                 context.OperationId,
                 context.AccountId,
                 context.Generation,
@@ -148,6 +149,8 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             var existingStage = EffectiveRecoverableStage(existing);
             if (existingStage == WebAutomationAttemptState.BaselinePersisted)
             {
+                if (existing?.SourceEvidence is null || existing.TargetPreparationEvidence is null)
+                    return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
                 var prepared = Prepared();
                 if (existing!.State != WebAutomationAttemptState.UserHandoff)
                     return prepared;
@@ -183,9 +186,16 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             {
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
-                var result = await flow.PrepareAsync(
-                    new PersistentTransferAutomationSession(automationSession, visibleContext),
+                var current = await store.GetAsync(
+                    context.OperationId, context.AccountId, context.Generation, token)
+                    .ConfigureAwait(false);
+                if (current?.SourceEvidence is null)
+                    return NotValidated<TransferPreparationReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+                var result = await flow.PrepareFromPersistedSourceAsync(
+                    new PersistentTransferAutomationSession(
+                        automationSession, visibleContext, store, TimeProvider.System),
                     new TransferAutomationRequest(share, destination, duplicatePolicy),
+                    current.SourceEvidence,
                     token).ConfigureAwait(false);
                 return result.IsSuccess
                     ? BaiduAdapterResult<TransferPreparationReceipt>.Success(
@@ -233,7 +243,18 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                     : SubmissionAcceptance.DefinitelyNotAccepted);
         if (!HasExactCandidateBinding(context))
             return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
-        var baseline = attempt!.Baseline!;
+        if (attempt?.SourceEvidence is null || attempt.TargetPreparationEvidence is null)
+            return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        TransferPreparationEvidence preparation;
+        try
+        {
+            preparation = new TransferPreparationEvidence(
+                attempt.SourceEvidence, attempt.TargetPreparationEvidence).Validate();
+        }
+        catch (ArgumentException)
+        {
+            return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
+        }
         var request = Request(
             context,
             share,
@@ -242,9 +263,10 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 if (visibleSession is not ITransferAutomationSession automationSession)
                     return NotValidated<TransferReceipt>(SubmissionAcceptance.DefinitelyNotAccepted);
                 var result = await flow.SubmitAsync(
-                    new PersistentTransferAutomationSession(automationSession, visibleContext),
+                    new PersistentTransferAutomationSession(
+                        automationSession, visibleContext, attemptStore, TimeProvider.System),
                     new TransferAutomationRequest(share, destination, duplicatePolicy),
-                    baseline,
+                    preparation,
                     token).ConfigureAwait(false);
                 return await MarkSucceededAfterExactAsync(result, visibleContext, token).ConfigureAwait(false);
             });
@@ -579,10 +601,17 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
 
     private sealed class PersistentTransferAutomationSession(
         ITransferAutomationSession inner,
-        VisibleWebAutomationContext context) : ITransferAutomationSession
+        VisibleWebAutomationContext context,
+        IWebAutomationAttemptStore attemptStore,
+        TimeProvider timeProvider) : ITransferAutomationSession
     {
         public Task<TransferSourceListing> OpenExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
             inner.OpenExternalShareAsync(share, cancellationToken);
+
+        public Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
+            ShareReference share,
+            CancellationToken cancellationToken) =>
+            inner.OpenAndReadSourceForSubmissionAsync(share, cancellationToken);
 
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) =>
             inner.EnterExtractionCodeAsync(extractionCode, cancellationToken);
@@ -590,10 +619,39 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
         public Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
             inner.OpenDestinationAndReadStableListingAsync(destination, cancellationToken);
 
+        public Task<TransferDirectoryListing> OpenExactTargetAndReadStableListingAsync(
+            RemoteDirectory destination,
+            CancellationToken cancellationToken) =>
+            inner.OpenExactTargetAndReadStableListingAsync(destination, cancellationToken);
+
         public async Task PersistBaselineAsync(WebAutomationBaseline baseline, string observationFingerprint, CancellationToken cancellationToken)
         {
             await context.PersistBaselineAsync(baseline, observationFingerprint, cancellationToken).ConfigureAwait(false);
             await inner.PersistBaselineAsync(baseline, observationFingerprint, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task PersistTargetPreparationAsync(
+            TransferTargetPreparationEvidence evidence,
+            CancellationToken cancellationToken)
+        {
+            var identity = context.Identity;
+            var attempt = await attemptStore.GetAsync(
+                identity.OperationId, identity.AccountId, identity.Generation, cancellationToken)
+                .ConfigureAwait(false) ?? throw new InvalidOperationException("转存尝试不存在。");
+            if (attempt.State != WebAutomationAttemptState.Preparing ||
+                !await attemptStore.TryPersistTransferTargetPreparationAsync(
+                    identity.OperationId,
+                    identity.AccountId,
+                    identity.Generation,
+                    attempt.Revision,
+                    evidence,
+                    timeProvider.GetUtcNow(),
+                    cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("转存目标基线未能持久化。");
+            context.TrackPersistentStage(
+                WebAutomationAttemptState.BaselinePersisted,
+                evidence.ObservationFingerprint);
+            await inner.PersistTargetPreparationAsync(evidence, cancellationToken).ConfigureAwait(false);
         }
 
         public Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
@@ -609,8 +667,66 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
             await inner.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        public async Task MarkSubmittingAsync(
+            TransferSubmissionEvidence evidence,
+            CancellationToken cancellationToken)
+        {
+            var identity = context.Identity;
+            var attempt = await attemptStore.GetAsync(
+                identity.OperationId, identity.AccountId, identity.Generation, cancellationToken)
+                .ConfigureAwait(false) ?? throw new InvalidOperationException("转存尝试不存在。");
+            if (attempt.State != WebAutomationAttemptState.BaselinePersisted ||
+                !await attemptStore.TryPersistTransferSubmissionAsync(
+                    identity.OperationId,
+                    identity.AccountId,
+                    identity.Generation,
+                    attempt.Revision,
+                    evidence,
+                    evidence.MarkedSubmittingAtUtc,
+                    cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("转存提交边界未能持久化。");
+            context.TrackPersistentStage(WebAutomationAttemptState.Submitting);
+            await inner.MarkSubmittingAsync(evidence, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task MarkSubmissionResultPendingAsync(CancellationToken cancellationToken)
+        {
+            await context.AdvancePersistentStageAsync(
+                WebAutomationAttemptState.Submitting,
+                WebAutomationAttemptState.ResultPending,
+                null,
+                cancellationToken).ConfigureAwait(false);
+            await inner.MarkSubmissionResultPendingAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task MarkSubmissionDefinitelyNotAcceptedAsync(CancellationToken cancellationToken)
+        {
+            await context.AdvancePersistentStageAsync(
+                WebAutomationAttemptState.Submitting,
+                WebAutomationAttemptState.DefinitelyNotSubmitted,
+                null,
+                cancellationToken).ConfigureAwait(false);
+            await inner.MarkSubmissionDefinitelyNotAcceptedAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
             inner.SaveWholeShareAsync(destination, duplicatePolicy, cancellationToken);
+
+        public Task<TransferOfficialAcceptance> SaveWholeShareExactlyOnceAsync(
+            RemoteDirectory destination,
+            TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) =>
+            inner.SaveWholeShareExactlyOnceAsync(
+                destination, source, duplicatePolicy, cancellationToken);
+
+        public Task PrepareWholeShareSubmissionAsync(
+            RemoteDirectory destination,
+            TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) =>
+            inner.PrepareWholeShareSubmissionAsync(
+                destination, source, duplicatePolicy, cancellationToken);
 
         public async Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken)
         {
@@ -621,6 +737,37 @@ public sealed class WebViewBaiduNetdiskAdapter : IOperationBoundBaiduNetdiskAdap
                 acceptance.ObservationFingerprint,
                 cancellationToken).ConfigureAwait(false);
             await inner.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task PersistTransferAcceptanceAsync(
+            TransferOfficialAcceptance acceptance,
+            CancellationToken cancellationToken)
+        {
+            if (!acceptance.IsAccepted || acceptance.ExactRemoteItems is null ||
+                acceptance.IdentityMapping is null ||
+                string.IsNullOrWhiteSpace(acceptance.AdapterRequestId))
+                throw new InvalidOperationException("官方转存结果缺少精确身份映射。");
+            var identity = context.Identity;
+            var attempt = await attemptStore.GetAsync(
+                identity.OperationId, identity.AccountId, identity.Generation, cancellationToken)
+                .ConfigureAwait(false) ?? throw new InvalidOperationException("转存尝试不存在。");
+            var updatedAt = timeProvider.GetUtcNow();
+            if (attempt.State != WebAutomationAttemptState.Submitting ||
+                !await attemptStore.TryPersistTransferAcceptanceAsync(
+                    identity.OperationId,
+                    identity.AccountId,
+                    identity.Generation,
+                    attempt.Revision,
+                    acceptance.AdapterRequestId,
+                    acceptance.IdentityMapping,
+                    acceptance.ObservationFingerprint,
+                    updatedAt,
+                    cancellationToken).ConfigureAwait(false))
+                throw new InvalidOperationException("官方转存结果未能持久化。");
+            context.TrackPersistentStage(
+                WebAutomationAttemptState.ResultPending,
+                acceptance.ObservationFingerprint);
+            await inner.PersistTransferAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
         }
 
         public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>

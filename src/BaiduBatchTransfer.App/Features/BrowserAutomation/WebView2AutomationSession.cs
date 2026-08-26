@@ -326,6 +326,18 @@ public sealed class WebView2AutomationSession :
         ShareReference share,
         CancellationToken cancellationToken) => UnprovenAsync<TransferSourceListing>(share, cancellationToken);
 
+    public async Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
+        ShareReference share,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(share);
+        await OpenSourceAsync(share, cancellationToken).ConfigureAwait(false);
+        if (share.ExtractionCode is not null)
+            await ((ITransferDirectoryPreparationSession)this).EnterExtractionCodeAsync(
+                share.ExtractionCode, cancellationToken).ConfigureAwait(false);
+        return await ReadCompleteSourceAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) =>
         UnprovenAsync(extractionCode, cancellationToken);
 
@@ -333,9 +345,33 @@ public sealed class WebView2AutomationSession :
         RemoteDirectory destination,
         CancellationToken cancellationToken) => UnprovenAsync<TransferDirectoryListing>(destination, cancellationToken);
 
+    public async Task<TransferDirectoryListing> OpenExactTargetAndReadStableListingAsync(
+        RemoteDirectory destination,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        var exactTargetUri = new Uri(
+            $"https://pan.baidu.com/disk/main#/all?path={Uri.EscapeDataString(destination.Path.Value)}");
+        await NavigateOfficialAsync(exactTargetUri, cancellationToken).ConfigureAwait(false);
+        var observed = await ObserveTransferAsync(
+            BaiduCandidatePageState.OwnDrive,
+            [],
+            destination.RemoteId,
+            destination.Path,
+            cancellationToken).ConfigureAwait(false);
+        if (observed.AncestorExactIds.IsEmpty ||
+            !string.Equals(observed.AncestorExactIds[^1], destination.RemoteId, StringComparison.Ordinal))
+            throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+        return ToDirectoryListing(observed);
+    }
+
     Task ITransferAutomationSession.PersistBaselineAsync(
         WebAutomationBaseline baseline,
         string observationFingerprint,
+        CancellationToken cancellationToken) => FenceAsync(cancellationToken);
+
+    public Task PersistTargetPreparationAsync(
+        TransferTargetPreparationEvidence evidence,
         CancellationToken cancellationToken) => FenceAsync(cancellationToken);
 
     public Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken) =>
@@ -344,10 +380,97 @@ public sealed class WebView2AutomationSession :
     Task ITransferAutomationSession.MarkSubmittingAsync(CancellationToken cancellationToken) =>
         FenceAsync(cancellationToken);
 
+    public Task MarkSubmissionResultPendingAsync(CancellationToken cancellationToken) =>
+        FenceAsync(cancellationToken);
+
+    public Task MarkSubmissionDefinitelyNotAcceptedAsync(CancellationToken cancellationToken) =>
+        FenceAsync(cancellationToken);
+
     public Task<TransferOfficialAcceptance> SaveWholeShareAsync(
         RemoteDirectory destination,
         DuplicatePolicy duplicatePolicy,
         CancellationToken cancellationToken) => UnprovenAsync<TransferOfficialAcceptance>(destination, cancellationToken);
+
+    public async Task PrepareWholeShareSubmissionAsync(
+        RemoteDirectory destination,
+        TransferSourceEvidence source,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(source);
+        if (duplicatePolicy != DuplicatePolicy.Skip)
+            throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+        var sourceObservation = lastTransferObservation is
+            { PageState: BaiduCandidatePageState.ExternalShare } observed
+            ? observed
+            : throw NotValidated(BaiduAutomationDenialReason.ObservationNotValidated);
+        if (!sourceObservation.Items.Select(item => item.ExactId)
+                .SequenceEqual(source.Items.Items.Select(item => item.ExactId), StringComparer.Ordinal))
+            throw NotValidated(BaiduAutomationDenialReason.ObservationNotValidated);
+        await MutateTransferAsync(
+            BaiduAutomationAction.SelectExactItems, sourceObservation, null, null,
+            cancellationToken).ConfigureAwait(false);
+        var current = await OpenDestinationPickerAsync(cancellationToken).ConfigureAwait(false);
+        if (current.Directory?.Path.Value != "/")
+            current = await OpenVerifiedRootAsync(cancellationToken).ConfigureAwait(false);
+        var segments = destination.Path.Value.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var segment in segments)
+        {
+            var matches = current.DetailedItems.Where(item =>
+                item.Kind == TransferRemoteItemKind.Folder &&
+                string.Equals(item.ExactServerName, segment, StringComparison.Ordinal)).ToArray();
+            if (matches.Length != 1)
+                throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+            var next = matches[0];
+            var nextPath = new RemotePath(
+                current.Directory!.Path.Value == "/"
+                    ? $"/{segment}"
+                    : $"{current.Directory.Path.Value}/{segment}");
+            current = await EnterDirectoryAsync(
+                new RemoteDirectory(next.Identity.ExactId, nextPath), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        if (current.Directory != destination)
+            throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+    }
+
+    public async Task<TransferOfficialAcceptance> SaveWholeShareExactlyOnceAsync(
+        RemoteDirectory destination,
+        TransferSourceEvidence source,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(source);
+        if (duplicatePolicy != DuplicatePolicy.Skip)
+            throw NotValidated(BaiduAutomationDenialReason.FieldEvidenceNotValidated);
+        var targetObservation = RequireLastDirectoryObservation();
+        if (targetObservation.ParentExactId != destination.RemoteId ||
+            targetObservation.CanonicalPath != destination.Path)
+            throw NotValidated(BaiduAutomationDenialReason.ObservationNotValidated);
+        await MutateTransferAsync(
+            BaiduAutomationAction.ClickConfirmTransfer, targetObservation, null, null,
+            cancellationToken).ConfigureAwait(false);
+        var result = await ObserveTransferAsync(
+            BaiduCandidatePageState.TransferResult, [], destination.RemoteId,
+            destination.Path, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(result.OfficialRequestId) ||
+            result.OfficialIdentityMapping is null ||
+            !result.OfficialIdentityMapping.Covers(source.Items))
+            return new TransferOfficialAcceptance(
+                TransferOfficialAcceptanceStatus.Unobserved,
+                null, null, null, result.ObservationToken, destination.RemoteId);
+        var remoteItems = new RemoteItemIdentitySet(result.OfficialIdentityMapping.Entries.Select(entry =>
+            new RemoteItemIdentity(entry.DestinationExactId, null)));
+        return new TransferOfficialAcceptance(
+            TransferOfficialAcceptanceStatus.Accepted,
+            result.OfficialRequestId,
+            remoteItems,
+            result.OfficialIdentityMapping,
+            result.ObservationToken,
+            destination.RemoteId);
+    }
 
     public Task PersistOfficialAcceptanceAsync(
         TransferOfficialAcceptance acceptance,
@@ -355,7 +478,8 @@ public sealed class WebView2AutomationSession :
 
     public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(
         RemoteDirectory destination,
-        CancellationToken cancellationToken) => UnprovenAsync<TransferDirectoryListing>(destination, cancellationToken);
+        CancellationToken cancellationToken) =>
+        OpenExactTargetAndReadStableListingAsync(destination, cancellationToken);
 
     public Task OpenSourceAsync(ShareReference share, CancellationToken cancellationToken) =>
         NavigateOfficialAsync(new Uri(share.OriginalUrl), cancellationToken);

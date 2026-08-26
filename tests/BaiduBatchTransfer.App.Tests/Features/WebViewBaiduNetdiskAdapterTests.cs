@@ -742,7 +742,20 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         WebAutomationAttemptState state,
         WebAutomationBaseline? baseline,
         RemoteItemIdentitySet? acceptedRemoteItems = null,
-        WebAutomationAttemptState? resumeStage = null) => new(
+        WebAutomationAttemptState? resumeStage = null)
+    {
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
+            BaiduSelectorCatalog.SelectorVersion, "build-a");
+        var source = baseline is null ? null : new TransferSourceEvidence(
+            new RemoteItemIdentitySet([new("fictional-source", "来源资源")]),
+            1, true, true, "source-generation", "baidu-user", capability,
+            new string('b', 64));
+        var target = baseline is null ? null : new TransferTargetPreparationEvidence(
+            Destination().RemoteId, Destination().Path, baseline.Items.Length,
+            true, true, "target-generation", "baidu-user", baseline,
+            new string('c', 64));
+        return new WebAutomationAttemptRecord(
             context.OperationId,
             context.AccountId,
             context.Generation,
@@ -755,7 +768,10 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             2,
             Now.AddMinutes(-2),
             Now.AddMinutes(-1),
-            acceptedRemoteItems);
+            acceptedRemoteItems,
+            source,
+            target);
+    }
 
     private static RemoteItemIdentitySet AcceptedItems() =>
         new([new("fictional-new", "新资源")]);
@@ -920,7 +936,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 checked(Current.Revision + 1),
                 Current.CreatedAt,
                 updatedAt,
-                Current.AcceptedRemoteItems);
+                Current.AcceptedRemoteItems,
+                Current.SourceEvidence,
+                Current.TargetPreparationEvidence,
+                Current.SubmissionEvidence,
+                Current.OfficialRequestId,
+                Current.TransferIdentityMapping);
             return Task.FromResult(true);
         }
         public Task<bool> TryPersistOfficialAcceptanceAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, RemoteItemIdentitySet acceptedRemoteItems, string observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
@@ -942,7 +963,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 checked(Current.Revision + 1),
                 Current.CreatedAt,
                 updatedAt,
-                acceptedRemoteItems);
+                acceptedRemoteItems,
+                Current.SourceEvidence,
+                Current.TargetPreparationEvidence,
+                Current.SubmissionEvidence,
+                Current.OfficialRequestId,
+                Current.TransferIdentityMapping);
             return Task.FromResult(true);
         }
         public Task<bool> TryPersistTransferSourceEvidenceAsync(
@@ -958,7 +984,70 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
                 Current.State, Current.ResumeStage, Current.Baseline, evidence.ObservationFingerprint,
                 Current.IsWaitingForUser, checked(Current.Revision + 1), Current.CreatedAt, updatedAt,
-                Current.AcceptedRemoteItems, evidence);
+                Current.AcceptedRemoteItems, evidence,
+                Current.TargetPreparationEvidence,
+                Current.SubmissionEvidence,
+                Current.OfficialRequestId,
+                Current.TransferIdentityMapping);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryPersistTransferTargetPreparationAsync(
+            Guid operationId, Guid accountId, int generation, long expectedRevision,
+            TransferTargetPreparationEvidence evidence, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.Preparing ||
+                expectedRevision != Current.Revision || Current.SourceEvidence is null)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                WebAutomationAttemptState.BaselinePersisted, null, evidence.Baseline,
+                evidence.ObservationFingerprint, false, checked(Current.Revision + 1),
+                Current.CreatedAt, updatedAt, Current.AcceptedRemoteItems,
+                Current.SourceEvidence, evidence, Current.SubmissionEvidence,
+                Current.OfficialRequestId, Current.TransferIdentityMapping);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryPersistTransferSubmissionAsync(
+            Guid operationId, Guid accountId, int generation, long expectedRevision,
+            TransferSubmissionEvidence evidence, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.BaselinePersisted ||
+                expectedRevision != Current.Revision || Current.SourceEvidence is null ||
+                Current.TargetPreparationEvidence is null)
+                return Task.FromResult(false);
+            Current = new(
+                Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                WebAutomationAttemptState.Submitting, null, Current.Baseline,
+                Current.ObservationFingerprint, false, checked(Current.Revision + 1),
+                Current.CreatedAt, updatedAt, Current.AcceptedRemoteItems,
+                Current.SourceEvidence, Current.TargetPreparationEvidence, evidence,
+                Current.OfficialRequestId, Current.TransferIdentityMapping);
+            return Task.FromResult(true);
+        }
+        public Task<bool> TryPersistTransferAcceptanceAsync(
+            Guid operationId, Guid accountId, int generation, long expectedRevision,
+            string officialRequestId, TransferIdentityMapping mapping,
+            string observationFingerprint, DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default)
+        {
+            if (operationId != Current.OperationId || accountId != Current.AccountId ||
+                generation != Current.Generation || Current.State != WebAutomationAttemptState.Submitting ||
+                expectedRevision != Current.Revision || Current.SourceEvidence is null ||
+                Current.SubmissionEvidence is null || !mapping.Covers(Current.SourceEvidence.Items))
+                return Task.FromResult(false);
+            var accepted = new RemoteItemIdentitySet(mapping.Entries.Select(entry =>
+                new RemoteItemIdentity(entry.DestinationExactId, null)));
+            Current = new(
+                Current.OperationId, Current.AccountId, Current.Generation, Current.OwnerKind,
+                WebAutomationAttemptState.ResultPending, null, Current.Baseline,
+                observationFingerprint, false, checked(Current.Revision + 1),
+                Current.CreatedAt, updatedAt, accepted, Current.SourceEvidence,
+                Current.TargetPreparationEvidence, Current.SubmissionEvidence,
+                officialRequestId, mapping);
             return Task.FromResult(true);
         }
         public Task<IReadOnlyList<TransferDirectoryMutationRecord>> GetDirectoryMutationsAsync(
@@ -1004,7 +1093,12 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                 checked(Current.Revision + 1),
                 Current.CreatedAt,
                 updatedAt,
-                Current.AcceptedRemoteItems);
+                Current.AcceptedRemoteItems,
+                Current.SourceEvidence,
+                Current.TargetPreparationEvidence,
+                Current.SubmissionEvidence,
+                Current.OfficialRequestId,
+                Current.TransferIdentityMapping);
             return Task.FromResult(true);
         }
         public Task<bool> TryResolveUserHandoffAsync(Guid operationId, Guid accountId, int generation, long expectedRevision, WebAutomationAttemptState resumeStage, WebAutomationAttemptState terminalState, string? observationFingerprint, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -1139,6 +1233,14 @@ public sealed class WebViewBaiduNetdiskAdapterTests
                     "BaiduTransfer", BaiduSelectorCatalog.ProtocolVersion,
                     BaiduSelectorCatalog.SelectorVersion, "build-a"),
                 new string('b', 64))));
+        public async Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
+            ShareReference share, CancellationToken cancellationToken)
+        {
+            var source = await OpenExternalShareAsync(share, cancellationToken);
+            if (share.ExtractionCode is not null)
+                await EnterExtractionCodeAsync(share.ExtractionCode, cancellationToken);
+            return source;
+        }
         public Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
             Record("open-destination", new TransferDirectoryListing(true, true, [new("fictional-old", "旧资源")], new string('c', 64)));
@@ -1151,6 +1253,13 @@ public sealed class WebViewBaiduNetdiskAdapterTests
         }
         public Task<TransferOfficialAcceptance> SaveWholeShareAsync(RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
             Record("submit", Acceptance());
+        public Task PrepareWholeShareSubmissionAsync(
+            RemoteDirectory destination, TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<TransferOfficialAcceptance> SaveWholeShareExactlyOnceAsync(
+            RemoteDirectory destination, TransferSourceEvidence source,
+            DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) =>
+            SaveWholeShareAsync(destination, duplicatePolicy, cancellationToken);
         public Task PersistOfficialAcceptanceAsync(TransferOfficialAcceptance acceptance, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(RemoteDirectory destination, CancellationToken cancellationToken) =>
             CancelListingRead
@@ -1163,7 +1272,8 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             new TransferIdentityMapping([
                 new TransferIdentityMappingEntry("fictional-source", "fictional-new"),
             ]),
-            new string('e', 64));
+            new string('e', 64),
+            Destination().RemoteId);
 
         private Task<T> Record<T>(string name, T value)
         {

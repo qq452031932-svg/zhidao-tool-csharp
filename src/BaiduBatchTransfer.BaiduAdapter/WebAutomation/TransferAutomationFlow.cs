@@ -27,43 +27,106 @@ public interface ITransferAutomationSession
         ShareReference share,
         CancellationToken cancellationToken);
 
+    Task<TransferSourceListing> OpenAndReadSourceForSubmissionAsync(
+        ShareReference share,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Exact source reopening is not implemented by this session.");
+
     Task EnterExtractionCodeAsync(string extractionCode, CancellationToken cancellationToken);
 
     Task<TransferDirectoryListing> OpenDestinationAndReadStableListingAsync(
         RemoteDirectory destination,
         CancellationToken cancellationToken);
 
+    Task<TransferDirectoryListing> OpenExactTargetAndReadStableListingAsync(
+        RemoteDirectory destination,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Exact target reading is not implemented by this session.");
+
     Task PersistBaselineAsync(
         WebAutomationBaseline baseline,
         string observationFingerprint,
         CancellationToken cancellationToken);
 
+    Task PersistTargetPreparationAsync(
+        TransferTargetPreparationEvidence evidence,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Exact target preparation persistence is not implemented by this session.");
+
     Task ReturnToExternalShareAsync(ShareReference share, CancellationToken cancellationToken);
 
     Task MarkSubmittingAsync(CancellationToken cancellationToken);
+
+    Task MarkSubmittingAsync(
+        TransferSubmissionEvidence evidence,
+        CancellationToken cancellationToken) => MarkSubmittingAsync(cancellationToken);
+
+    Task MarkSubmissionResultPendingAsync(CancellationToken cancellationToken) =>
+        Task.CompletedTask;
+
+    Task MarkSubmissionDefinitelyNotAcceptedAsync(CancellationToken cancellationToken) =>
+        Task.CompletedTask;
 
     Task<TransferOfficialAcceptance> SaveWholeShareAsync(
         RemoteDirectory destination,
         DuplicatePolicy duplicatePolicy,
         CancellationToken cancellationToken);
 
+    Task<TransferOfficialAcceptance> SaveWholeShareExactlyOnceAsync(
+        RemoteDirectory destination,
+        TransferSourceEvidence source,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Single-submit transfer is not implemented by this session.");
+
+    Task PrepareWholeShareSubmissionAsync(
+        RemoteDirectory destination,
+        TransferSourceEvidence source,
+        DuplicatePolicy duplicatePolicy,
+        CancellationToken cancellationToken) =>
+        throw new NotSupportedException("Exact transfer preparation is not implemented by this session.");
+
     Task PersistOfficialAcceptanceAsync(
         TransferOfficialAcceptance acceptance,
         CancellationToken cancellationToken);
+
+    Task PersistTransferAcceptanceAsync(
+        TransferOfficialAcceptance acceptance,
+        CancellationToken cancellationToken) =>
+        PersistOfficialAcceptanceAsync(acceptance, cancellationToken);
 
     Task<TransferDirectoryListing> ReopenDestinationAndReadStableListingAsync(
         RemoteDirectory destination,
         CancellationToken cancellationToken);
 }
 
-public sealed record TransferAutomationPreparation(
-    WebAutomationBaseline Baseline,
-    TransferSourceEvidence SourceEvidence)
+public sealed record TransferAutomationPreparation
 {
+    public TransferAutomationPreparation(
+        WebAutomationBaseline baseline,
+        TransferSourceEvidence sourceEvidence)
+    {
+        Baseline = baseline ?? throw new ArgumentNullException(nameof(baseline));
+        SourceEvidence = sourceEvidence ?? throw new ArgumentNullException(nameof(sourceEvidence));
+    }
+
+    public TransferAutomationPreparation(TransferPreparationEvidence evidence)
+    {
+        Evidence = evidence ?? throw new ArgumentNullException(nameof(evidence));
+        evidence.Validate();
+        Baseline = evidence.Target.Baseline;
+        SourceEvidence = evidence.Source;
+    }
+
+    public WebAutomationBaseline Baseline { get; }
+    public TransferSourceEvidence SourceEvidence { get; }
+    public TransferPreparationEvidence? Evidence { get; }
+
     public TransferAutomationPreparation Validate()
     {
         ArgumentNullException.ThrowIfNull(Baseline);
         ArgumentNullException.ThrowIfNull(SourceEvidence);
+        Evidence?.Validate();
         return this;
     }
 }
@@ -90,7 +153,7 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 preparation.SubmissionAcceptance);
         return await SubmitAsync(
                 session, request, preparation.Value!.Baseline,
-                preparation.Value.SourceEvidence, cancellationToken)
+                preparation.Value.SourceEvidence, exactPreparation: null, cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -137,19 +200,100 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         }
     }
 
+    public async Task<BaiduAdapterResult<TransferAutomationPreparation>> PrepareFromPersistedSourceAsync(
+        ITransferAutomationSession session,
+        TransferAutomationRequest request,
+        TransferSourceEvidence persistedSource,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(persistedSource);
+        request.Validate();
+
+        try
+        {
+            var listing = await session.OpenExactTargetAndReadStableListingAsync(
+                request.Destination, cancellationToken).ConfigureAwait(false);
+            if (!IsStableComplete(listing) || listing.Directory is null ||
+                listing.Directory != request.Destination ||
+                listing.GenerationToken is not { Length: > 0 } targetGeneration ||
+                listing.BaiduUserId is not { Length: > 0 } targetUserId ||
+                !string.Equals(targetUserId, persistedSource.BaiduUserId, StringComparison.Ordinal))
+                return PreparationNotValidated();
+            var baseline = WebAutomationBaseline.Create(
+                listing.TopLevelItems.Select(item => item.ExactId));
+            var target = new TransferTargetPreparationEvidence(
+                request.Destination.RemoteId,
+                request.Destination.Path,
+                listing.TotalCount,
+                listing.ReachedEnd,
+                listing.IsStable,
+                targetGeneration,
+                targetUserId,
+                baseline,
+                listing.ObservationFingerprint);
+            await session.PersistTargetPreparationAsync(target, cancellationToken).ConfigureAwait(false);
+            return BaiduAdapterResult<TransferAutomationPreparation>.Success(
+                new TransferAutomationPreparation(
+                    new TransferPreparationEvidence(persistedSource, target).Validate()),
+                SubmissionAcceptance.DefinitelyNotAccepted);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (BaiduAutomationNotValidatedException)
+        {
+            return PreparationNotValidated();
+        }
+        catch (Exception)
+        {
+            return PreparationFailed();
+        }
+    }
+
     public async Task<BaiduAdapterResult<TransferReceipt>> SubmitAsync(
         ITransferAutomationSession session,
         TransferAutomationRequest request,
         WebAutomationBaseline baseline,
         CancellationToken cancellationToken = default) =>
-        await SubmitAsync(session, request, baseline, expectedSource: null, cancellationToken)
+        await SubmitAsync(
+                session, request, baseline, expectedSource: null,
+                exactPreparation: null, cancellationToken)
             .ConfigureAwait(false);
+
+    public async Task<BaiduAdapterResult<TransferReceipt>> SubmitAsync(
+        ITransferAutomationSession session,
+        TransferAutomationRequest request,
+        TransferPreparationEvidence preparation,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(preparation);
+        preparation.Validate();
+        if (preparation.Target.TargetPath != request.Destination.Path ||
+            !string.Equals(
+                preparation.Target.TargetExactId,
+                request.Destination.RemoteId,
+                StringComparison.Ordinal))
+            return DefinitelyNotValidated();
+        return await SubmitAsync(
+                session,
+                request,
+                preparation.Target.Baseline,
+                preparation.Source,
+                preparation,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     private async Task<BaiduAdapterResult<TransferReceipt>> SubmitAsync(
         ITransferAutomationSession session,
         TransferAutomationRequest request,
         WebAutomationBaseline baseline,
         TransferSourceEvidence? expectedSource,
+        TransferPreparationEvidence? exactPreparation,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(session);
@@ -160,25 +304,75 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         var submitted = false;
         try
         {
-            var source = await session.OpenExternalShareAsync(request.Share, cancellationToken)
-                .ConfigureAwait(false);
-            if (request.Share.ExtractionCode is not null)
+            var source = exactPreparation is null
+                ? await session.OpenExternalShareAsync(request.Share, cancellationToken).ConfigureAwait(false)
+                : await session.OpenAndReadSourceForSubmissionAsync(
+                    request.Share, cancellationToken).ConfigureAwait(false);
+            if (exactPreparation is null && request.Share.ExtractionCode is not null)
                 await session.EnterExtractionCodeAsync(request.Share.ExtractionCode, cancellationToken)
                     .ConfigureAwait(false);
             if (expectedSource is not null && !SameSource(expectedSource, source.Evidence))
                 return DefinitelyNotValidated();
 
-            await session.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
+            if (exactPreparation is not null)
+                await session.PrepareWholeShareSubmissionAsync(
+                    request.Destination,
+                    exactPreparation.Source,
+                    request.DuplicatePolicy,
+                    cancellationToken).ConfigureAwait(false);
+
+            if (exactPreparation is null)
+            {
+                await session.MarkSubmittingAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                await session.MarkSubmittingAsync(
+                    new TransferSubmissionEvidence(
+                        exactPreparation.Source.Items.Fingerprint,
+                        exactPreparation.Target.TargetExactId,
+                        exactPreparation.Target.Baseline.Fingerprint,
+                        exactPreparation.Source.BaiduUserId,
+                        exactPreparation.Source.Capability,
+                        timeProvider.GetUtcNow()),
+                    cancellationToken).ConfigureAwait(false);
+            }
             submitted = true;
-            var acceptance = await session.SaveWholeShareAsync(
-                request.Destination,
-                request.DuplicatePolicy,
-                cancellationToken).ConfigureAwait(false);
+            var acceptance = exactPreparation is null
+                ? await session.SaveWholeShareAsync(
+                    request.Destination, request.DuplicatePolicy, cancellationToken).ConfigureAwait(false)
+                : await session.SaveWholeShareExactlyOnceAsync(
+                    request.Destination, exactPreparation.Source,
+                    request.DuplicatePolicy, cancellationToken).ConfigureAwait(false);
             if (acceptance.Status == TransferOfficialAcceptanceStatus.ExplicitlyRejected)
+            {
+                if (exactPreparation is not null)
+                    await session.MarkSubmissionDefinitelyNotAcceptedAsync(cancellationToken)
+                        .ConfigureAwait(false);
                 return DefinitelyNotAccepted();
+            }
             if (acceptance.Status != TransferOfficialAcceptanceStatus.Accepted)
+            {
+                if (exactPreparation is not null)
+                    await session.MarkSubmissionResultPendingAsync(cancellationToken)
+                        .ConfigureAwait(false);
                 return ResultPending();
-            await session.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
+            }
+            if (exactPreparation is not null &&
+                (string.IsNullOrWhiteSpace(acceptance.AdapterRequestId) ||
+                 !string.Equals(
+                     acceptance.TargetExactId,
+                     exactPreparation.Target.TargetExactId,
+                     StringComparison.Ordinal)))
+            {
+                await session.MarkSubmissionResultPendingAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                return ResultPending();
+            }
+            if (exactPreparation is null)
+                await session.PersistOfficialAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
+            else
+                await session.PersistTransferAcceptanceAsync(acceptance, cancellationToken).ConfigureAwait(false);
 
             var current = await session
                 .ReopenDestinationAndReadStableListingAsync(request.Destination, cancellationToken)
@@ -210,6 +404,18 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
         }
         catch (Exception)
         {
+            if (submitted && exactPreparation is not null)
+            {
+                try
+                {
+                    await session.MarkSubmissionResultPendingAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Preserve the original outcome; recovery also treats Submitting as unresolved.
+                }
+            }
             return submitted ? ResultPending() : DefinitelyNotAccepted();
         }
     }

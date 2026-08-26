@@ -169,15 +169,17 @@ public sealed record TransferOfficialAcceptance
         string? adapterRequestId,
         RemoteItemIdentitySet? exactRemoteItems,
         TransferIdentityMapping? identityMapping,
-        string observationFingerprint)
+        string observationFingerprint,
+        string? targetExactId = null)
     {
         if (!Enum.IsDefined(status)) throw new ArgumentOutOfRangeException(nameof(status));
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
         Status = status;
-        AdapterRequestId = string.IsNullOrWhiteSpace(adapterRequestId) ? null : adapterRequestId.Trim();
+        AdapterRequestId = ValidateOptional(adapterRequestId, nameof(adapterRequestId));
         ExactRemoteItems = exactRemoteItems;
         IdentityMapping = identityMapping;
         ObservationFingerprint = observationFingerprint;
+        TargetExactId = ValidateOptional(targetExactId, nameof(targetExactId));
     }
 
     public TransferOfficialAcceptance(
@@ -195,7 +197,16 @@ public sealed record TransferOfficialAcceptance
     public RemoteItemIdentitySet? ExactRemoteItems { get; }
     public TransferIdentityMapping? IdentityMapping { get; }
     public string ObservationFingerprint { get; }
+    public string? TargetExactId { get; }
 
     public override string ToString() =>
         $"TransferOfficialAcceptance {{ Status = {Status}, Values = [REDACTED] }}";
+
+    private static string? ValidateOptional(string? value, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        if (value.Length > 512 || value.Any(char.IsControl))
+            throw new ArgumentException("The official result identity is invalid.", parameterName);
+        return value.Trim();
+    }
 }

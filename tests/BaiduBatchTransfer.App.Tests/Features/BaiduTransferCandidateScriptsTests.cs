@@ -250,6 +250,12 @@ public sealed class BaiduTransferCandidateScriptsTests
         var parentValue = directory ? parent ?? "parent-1" : null;
         var pathValue = directory ? path ?? "/目录" : null;
         var ancestors = directory ? $"[\"{ancestor ?? parentValue}\"]" : "[]";
+        var officialRequestId = state == BaiduCandidatePageState.TransferResult
+            ? "\"request-1\""
+            : "null";
+        var officialMapping = state == BaiduCandidatePageState.TransferResult
+            ? $"[{{\"sourceExactId\":\"source-1\",\"destinationExactId\":\"{ids[0]}\"}}]"
+            : "[]";
         return $$"""
             {"status":"validated","reason":"none","officialOriginMatched":true,
              "pageState":"{{state}}","controlCount":1,"baiduUserId":"{{uid}}",
@@ -258,7 +264,8 @@ public sealed class BaiduTransferCandidateScriptsTests
              "ancestorExactIds":{{ancestors}},"totalCount":{{total ?? ids.Length}},
              "reachedEnd":{{reachedEnd.ToString().ToLowerInvariant()}},"complete":true,
              "stable":{{stable.ToString().ToLowerInvariant()}},"generationToken":"generation-1",
-             "items":[{{items}}],"observationToken":"{{Token}}","mutationCount":{{mutationCount}}}
+             "items":[{{items}}],"observationToken":"{{Token}}","mutationCount":{{mutationCount}},
+             "officialRequestId":{{officialRequestId}},"officialMapping":{{officialMapping}}}
             """;
     }
 
@@ -267,7 +274,8 @@ public sealed class BaiduTransferCandidateScriptsTests
          "pageState":"ExternalShare","controlCount":0,"baiduUserId":"uid-1",
          "parentExactId":null,"canonicalPath":null,"ancestorExactIds":[],"totalCount":0,
          "reachedEnd":false,"complete":false,"stable":false,"generationToken":"none",
-         "items":[],"observationToken":"","mutationCount":0}
+         "items":[],"observationToken":"","mutationCount":0,
+         "officialRequestId":null,"officialMapping":[]}
         """;
 
     private sealed class TransferReadHost(string response) : IBaiduCandidateDomScriptHost
