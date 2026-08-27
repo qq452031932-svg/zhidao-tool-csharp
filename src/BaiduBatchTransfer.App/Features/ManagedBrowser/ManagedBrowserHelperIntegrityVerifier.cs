@@ -63,6 +63,12 @@ internal enum ManagedBrowserHelperSnapshotPhase
     MarkerWritten = 2,
     PinningSnapshot = 3,
     SealingAcl = 4,
+    OwnershipPersisted = 5,
+    PayloadSealed = 6,
+    OwnershipSealed = 7,
+    ReadyPreparingSealed = 8,
+    ContainerSealed = 9,
+    ReadyCommitted = 10,
 }
 
 internal sealed class ManagedBrowserHelperCleanupStatus
@@ -735,11 +741,11 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
     private const int MaximumOrphanCursorParents = 64;
     private const string MarkerFileName = "ownership.json";
     private const string ActiveLockFileName = "active.lock";
-    private const string ReadyMarkerTemporaryFileName = "ownership.ready.tmp";
     private const string ReadyMarkerFileName = "ownership.ready.json";
     private const string PayloadDirectoryName = "payload";
     private const string IncompleteState = "Incomplete";
-    private const string ReadyState = "Ready";
+    private const string ReadyPreparingState = "Ready0";
+    private const string ReadyState = "Ready1";
     private const FileSystemRights DeniedMutationRights = FileSystemRights.Write |
         FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles;
     private const FileSystemRights AllowedRuntimeRights = FileSystemRights.ReadAndExecute |
@@ -844,20 +850,24 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         PinnedHelperEntry? markerFence = null;
         PinnedHelperEntry? activeLock = null;
         PinnedHelperEntry? readyMarkerFence = null;
+        PinnedHelperEntry? readyCommitFence = null;
         PinnedHelperTree? pinned = null;
         try
         {
             containerFence = PinnedHelperEntry.OpenRelativeDirectory(
-                parentFence, containerName, createIfMissing: true, deleteCapable: true,
-                mutationCapable: true);
+                parentFence, containerName, createIfMissing: true, deleteCapable: true);
             containerFence.ApplyWritableDirectoryAcl(user);
             var incompleteMarker = new OwnershipMarker(
                 OwnershipMarkerVersion, IncompleteState, snapshotId.ToString("N"),
                 buildIdentity, createdUtc.ToUniversalTime(), containerFence.VolumeSerialNumber,
                 containerFence.FileId, user.Value);
-            markerFence = PinnedHelperEntry.CreateRelativeFile(
-                containerFence, MarkerFileName, SerializeMarker(incompleteMarker),
-                FileShare.Read | FileShare.Write | FileShare.Delete, deleteCapable: true);
+            using (PinnedHelperEntry.CreateRelativeFile(
+                       containerFence, MarkerFileName, SerializeMarker(incompleteMarker),
+                       FileShare.Read | FileShare.Write | FileShare.Delete, deleteCapable: true)) { }
+            markerFence = PinnedHelperEntry.OpenRelativeFile(
+                containerFence, MarkerFileName, deleteCapable: true,
+                shareMode: FileShare.Read | FileShare.Delete);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.OwnershipPersisted);
             activeLock = PinnedHelperEntry.CreateRelativeFile(
                 containerFence, ActiveLockFileName, [], FileShare.None, deleteCapable: true);
             using (var payloadFence = PinnedHelperEntry.OpenRelativeDirectory(
@@ -884,19 +894,31 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.PinningSnapshot);
             pinned = PinnedHelperTree.Capture(payload, limits, cancellationToken);
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.SealingAcl);
-            var readyMarker = incompleteMarker with { State = ReadyState };
-            var readyMarkerPath = Path.Combine(container, ReadyMarkerTemporaryFileName);
-            readyMarkerFence = PinnedHelperEntry.CreateRelativeFile(
-                containerFence, ReadyMarkerTemporaryFileName, SerializeMarker(readyMarker),
+            var readyMarker = incompleteMarker with { State = ReadyPreparingState };
+            var readyMarkerPath = Path.Combine(container, ReadyMarkerFileName);
+            var readyMarkerBytes = SerializeMarker(readyMarker);
+            var readyCommitOffset = FindReadyCommitOffset(readyMarkerBytes);
+            readyCommitFence = PinnedHelperEntry.CreateRelativeFile(
+                containerFence, ReadyMarkerFileName, readyMarkerBytes,
                 FileShare.Read | FileShare.Write | FileShare.Delete, deleteCapable: true);
+            readyMarkerFence = PinnedHelperEntry.OpenRelativeFile(
+                containerFence, ReadyMarkerFileName, deleteCapable: true,
+                shareMode: FileShare.Read | FileShare.Write | FileShare.Delete);
             SealTreeReadOnly(payload, user);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.PayloadSealed);
             ApplyReadOnlyAcl(Path.Combine(container, ActiveLockFileName), isDirectory: false, user);
-            ApplyReadOnlyAcl(readyMarkerPath, isDirectory: false, user);
-            containerFence.EnsureSameIdentity();
-            readyMarkerFence.RenameRelative(containerFence, ReadyMarkerFileName);
             ApplyReadOnlyAcl(Path.Combine(container, MarkerFileName), isDirectory: false, user);
-            ApplyReadOnlyAcl(Path.Combine(container, ReadyMarkerFileName), isDirectory: false, user);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.OwnershipSealed);
+            ApplyReadOnlyAcl(readyMarkerPath, isDirectory: false, user);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.ReadyPreparingSealed);
             ApplyReadOnlyAcl(container, isDirectory: true, user);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.ContainerSealed);
+            containerFence.EnsureSameIdentity();
+            readyCommitFence.WriteCommitByte(readyCommitOffset, (byte)'1');
+            readyMarkerFence.RefreshAfterExpectedContentWrite();
+            readyCommitFence.Dispose();
+            readyCommitFence = null;
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.ReadyCommitted);
             var lease = new VerifiedHelperSnapshotLease(snapshotParent, container, user, parentFence,
                 containerFence, markerFence, readyMarkerFence, activeLock, pinned, limits,
                 cleanupAttemptObserver);
@@ -915,6 +937,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             activeLock?.Dispose();
             markerFence?.Dispose();
             readyMarkerFence?.Dispose();
+            readyCommitFence?.Dispose();
             TryDeleteIncompleteSnapshot(container, containerFence, user, limits);
             containerFence?.Dispose();
             parentFence?.Dispose();
@@ -1184,26 +1207,16 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             using var containerFence = PinnedHelperEntry.Open(
                 container, shareMode: FileShare.Read | FileShare.Delete);
             if (!containerFence.IsDirectory || !HasProtectedOwnerAcl(container, user)) return;
-            var marker = ReadMarker(Path.Combine(container, MarkerFileName));
-            if (marker is null || marker.Version != OwnershipMarkerVersion ||
-                !string.Equals(marker.State, IncompleteState, StringComparison.Ordinal) ||
-                !string.Equals(marker.SnapshotId, Path.GetFileName(container)[9..], StringComparison.Ordinal) ||
-                marker.VolumeSerialNumber != containerFence.VolumeSerialNumber ||
-                !string.Equals(marker.FileId, containerFence.FileId, StringComparison.Ordinal) ||
-                !string.Equals(marker.OwnerSid, user.Value, StringComparison.Ordinal) ||
-                !IsLowerHex64(marker.BuildIdentity) ||
-                now - marker.CreatedUtc < minimumAge) return;
-            var readyPath = Path.Combine(container, ReadyMarkerFileName);
-            var readyExists = File.Exists(readyPath);
-            var readyMarker = readyExists ? ReadMarker(readyPath) : null;
-            if (readyExists &&
-                (readyMarker is null || !MarkersDescribeSameSnapshot(marker, readyMarker) ||
-                 !string.Equals(readyMarker.State, ReadyState, StringComparison.Ordinal))) return;
-            var isReady = readyMarker is not null;
+            var activeMissing = false;
             try
             {
                 using var activeProbe = PinnedHelperEntry.Open(
                     Path.Combine(container, ActiveLockFileName), shareMode: FileShare.None);
+                if (activeProbe.IsDirectory) return;
+            }
+            catch (Win32Exception exception) when (exception.NativeErrorCode is 2 or 3)
+            {
+                activeMissing = true;
             }
             catch (Win32Exception exception) when (exception.NativeErrorCode is 32 or 33)
             {
@@ -1212,6 +1225,29 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
 
             using (var observed = PinnedHelperTree.Capture(container, limits, cancellationToken))
             {
+                if (!observed.Files.TryGetValue(MarkerFileName, out var markerEntry) ||
+                    observed.Directories.ContainsKey(MarkerFileName)) return;
+                var marker = ReadMarker(markerEntry, cancellationToken);
+                if (marker is null || marker.Version != OwnershipMarkerVersion ||
+                    !string.Equals(marker.State, IncompleteState, StringComparison.Ordinal) ||
+                    !string.Equals(marker.SnapshotId, Path.GetFileName(container)[9..],
+                        StringComparison.Ordinal) ||
+                    marker.VolumeSerialNumber != containerFence.VolumeSerialNumber ||
+                    !string.Equals(marker.FileId, containerFence.FileId, StringComparison.Ordinal) ||
+                    !string.Equals(marker.OwnerSid, user.Value, StringComparison.Ordinal) ||
+                    !IsLowerHex64(marker.BuildIdentity) ||
+                    now - marker.CreatedUtc < minimumAge) return;
+                if (observed.Directories.ContainsKey(ReadyMarkerFileName)) return;
+                var hasReady = observed.Files.TryGetValue(ReadyMarkerFileName, out var readyEntry);
+                var readyMarker = hasReady ? ReadMarker(readyEntry!, cancellationToken) : null;
+                if (hasReady &&
+                    (readyMarker is null || !MarkersDescribeSameSnapshot(marker, readyMarker) ||
+                     (!string.Equals(readyMarker.State, ReadyPreparingState, StringComparison.Ordinal) &&
+                      !string.Equals(readyMarker.State, ReadyState, StringComparison.Ordinal)))) return;
+                var hasActiveFile = observed.Files.ContainsKey(ActiveLockFileName);
+                if (observed.Directories.ContainsKey(ActiveLockFileName) ||
+                    activeMissing == hasActiveFile || (activeMissing && hasReady)) return;
+                var isReady = string.Equals(readyMarker?.State, ReadyState, StringComparison.Ordinal);
                 if (isReady)
                 {
                     foreach (var entry in observed.Files.Values)
@@ -1234,8 +1270,8 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             }
             using var cleanup = PinnedHelperTree.Capture(
                 container, limits, cancellationToken, deleteCapable: true);
-            if (cleanup.Directories[string.Empty].VolumeSerialNumber != marker.VolumeSerialNumber ||
-                !string.Equals(cleanup.Directories[string.Empty].FileId, marker.FileId,
+            if (cleanup.Directories[string.Empty].VolumeSerialNumber != containerFence.VolumeSerialNumber ||
+                !string.Equals(cleanup.Directories[string.Empty].FileId, containerFence.FileId,
                     StringComparison.Ordinal)) return;
             cleanup.DeletePinnedTree();
         }
@@ -1474,13 +1510,24 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         return [.. bytes, (byte)'\n'];
     }
 
-    private static OwnershipMarker? ReadMarker(string path)
+    private static long FindReadyCommitOffset(byte[] bytes)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-            FileShare.Read | FileShare.Delete);
-        if (stream.Length is < 2 or > 4096) return null;
-        var bytes = new byte[(int)stream.Length];
-        stream.ReadExactly(bytes);
+        var needle = Encoding.UTF8.GetBytes($"\"State\":\"{ReadyPreparingState}\"");
+        var index = bytes.AsSpan().IndexOf(needle);
+        if (index < 0 || bytes.AsSpan(index + needle.Length).IndexOf(needle) >= 0)
+            throw new InvalidOperationException("The helper ready marker commit field is invalid.");
+        var offset = checked(index + needle.Length - 2);
+        if (bytes[offset] != (byte)'0')
+            throw new InvalidOperationException("The helper ready marker commit byte is invalid.");
+        return offset;
+    }
+
+    private static OwnershipMarker? ReadMarker(
+        PinnedHelperEntry entry,
+        CancellationToken cancellationToken)
+    {
+        var bytes = entry.ReadAllBytes(4096, cancellationToken);
+        if (bytes.Length < 2) return null;
         if (bytes[^1] != (byte)'\n') return null;
         return JsonSerializer.Deserialize<OwnershipMarker>(bytes.AsSpan(0, bytes.Length - 1));
     }
@@ -1534,11 +1581,11 @@ internal sealed class PinnedHelperEntry : IDisposable
     private const uint ReadControl = 0x00020000;
     private const uint Synchronize = 0x00100000;
     private const uint FileTraverse = 0x00000020;
-    private const uint FileAddFile = 0x00000002;
     private const uint FileReadAttributes = 0x00000080;
     private const uint OpenExisting = 3;
     private const uint FileOpenIf = 3;
     private const uint FileCreate = 2;
+    private const uint FileOpen = 1;
     private const uint FileDirectoryFile = 0x00000001;
     private const uint FileNonDirectoryFile = 0x00000040;
     private const uint FileSynchronousIoNonAlert = 0x00000020;
@@ -1553,7 +1600,7 @@ internal sealed class PinnedHelperEntry : IDisposable
     private const uint DaclSecurityInformation = 0x00000004;
     private const uint ProtectedDaclSecurityInformation = 0x80000000;
     private readonly SafeFileHandle handle;
-    private readonly ByHandleFileInformation original;
+    private ByHandleFileInformation original;
 
     private PinnedHelperEntry(
         string fullPath,
@@ -1618,8 +1665,7 @@ internal sealed class PinnedHelperEntry : IDisposable
         PinnedHelperEntry parent,
         string name,
         bool createIfMissing,
-        bool deleteCapable = false,
-        bool mutationCapable = false)
+        bool deleteCapable = false)
     {
         if (!parent.IsDirectory || string.IsNullOrWhiteSpace(name) || name is "." or ".." ||
             name.Any(char.IsControl) || name.Contains(Path.DirectorySeparatorChar) ||
@@ -1636,8 +1682,7 @@ internal sealed class PinnedHelperEntry : IDisposable
         var status = NtCreateFile(
             out var handle,
             FileReadAttributes | FileTraverse | ReadControl | WriteDac | Synchronize |
-            (deleteCapable ? DeleteAccess : 0) |
-            (mutationCapable ? FileAddFile : 0),
+            (deleteCapable ? DeleteAccess : 0),
             ref attributes,
             out _,
             IntPtr.Zero,
@@ -1721,6 +1766,60 @@ internal sealed class PinnedHelperEntry : IDisposable
                 throw new UnsafeHelperFilesystemException();
             var length = checked(((long)info.FileSizeHigh << 32) | info.FileSizeLow);
             if (length != contents.Length) throw new IOException("Helper marker write was incomplete.");
+            var expected = Path.GetFullPath(Path.Combine(parent.FullPath, name));
+            var finalPath = ReadFinalPath(handle);
+            if (!string.Equals(expected, finalPath, StringComparison.OrdinalIgnoreCase))
+                throw new UnsafeHelperFilesystemException();
+            return new PinnedHelperEntry(expected, handle, info, isDirectory: false);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static PinnedHelperEntry OpenRelativeFile(
+        PinnedHelperEntry parent,
+        string name,
+        bool deleteCapable = false,
+        FileShare shareMode = FileShare.Read)
+    {
+        if (!parent.IsDirectory || string.IsNullOrWhiteSpace(name) || name is "." or ".." ||
+            name.Any(char.IsControl) || name.Contains(Path.DirectorySeparatorChar) ||
+            name.Contains(Path.AltDirectorySeparatorChar) || name.Contains(':'))
+            throw new UnsafeHelperFilesystemException();
+        using var relative = new RelativeName(name);
+        var attributes = new ObjectAttributes
+        {
+            Length = Marshal.SizeOf<ObjectAttributes>(),
+            RootDirectory = parent.handle.DangerousGetHandle(),
+            ObjectName = relative.UnicodeStringPointer,
+            Attributes = ObjCaseInsensitive,
+        };
+        var status = NtCreateFile(
+            out var handle,
+            GenericRead | ReadControl | Synchronize | (deleteCapable ? DeleteAccess : 0),
+            ref attributes,
+            out _,
+            IntPtr.Zero,
+            FileAttributeNormal,
+            (uint)shareMode,
+            FileOpen,
+            FileNonDirectoryFile | FileSynchronousIoNonAlert | FileFlagOpenReparsePoint,
+            IntPtr.Zero,
+            0);
+        if (status < 0)
+        {
+            handle?.Dispose();
+            throw new Win32Exception(status);
+        }
+        try
+        {
+            if (!GetFileInformationByHandle(handle, out var info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
+                throw new UnsafeHelperFilesystemException();
             var expected = Path.GetFullPath(Path.Combine(parent.FullPath, name));
             var finalPath = ReadFinalPath(handle);
             if (!string.Equals(expected, finalPath, StringComparison.OrdinalIgnoreCase))
@@ -1848,6 +1947,33 @@ internal sealed class PinnedHelperEntry : IDisposable
             throw new IOException("Helper filesystem entry identity changed.");
     }
 
+    public void WriteCommitByte(long offset, byte value)
+    {
+        if (IsDirectory || offset < 0 || offset >= Length)
+            throw new IOException("The helper ready marker commit offset is invalid.");
+        EnsureSameIdentity();
+        Span<byte> buffer = stackalloc byte[1];
+        buffer[0] = value;
+        RandomAccess.Write(handle, buffer, offset);
+        RandomAccess.FlushToDisk(handle);
+        RefreshAfterExpectedContentWrite();
+    }
+
+    public void RefreshAfterExpectedContentWrite()
+    {
+        if (!GetFileInformationByHandle(handle, out var current))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        var currentLength = checked(((long)current.FileSizeHigh << 32) | current.FileSizeLow);
+        if (current.VolumeSerialNumber != original.VolumeSerialNumber ||
+            current.FileIndexHigh != original.FileIndexHigh ||
+            current.FileIndexLow != original.FileIndexLow ||
+            (current.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) !=
+            (original.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) ||
+            currentLength != Length)
+            throw new IOException("Helper ready marker identity changed during commit.");
+        original = current;
+    }
+
     public void MarkDeleteAndDispose()
     {
         EnsureSameIdentity();
@@ -1857,44 +1983,6 @@ internal sealed class PinnedHelperEntry : IDisposable
                 ref disposition, (uint)Marshal.SizeOf<FileDispositionInformation>()))
             throw new Win32Exception(Marshal.GetLastWin32Error());
         Dispose();
-    }
-
-    public void RenameRelative(PinnedHelperEntry destinationParent, string destinationName)
-    {
-        if (!destinationParent.IsDirectory || string.IsNullOrWhiteSpace(destinationName) ||
-            destinationName is "." or ".." || destinationName.Any(char.IsControl) ||
-            destinationName.Contains(Path.DirectorySeparatorChar) ||
-            destinationName.Contains(Path.AltDirectorySeparatorChar) || destinationName.Contains(':'))
-            throw new UnsafeHelperFilesystemException();
-        EnsureSameIdentity();
-        destinationParent.EnsureSameIdentity();
-        var nameBytes = Encoding.Unicode.GetBytes(destinationName);
-        var offset = Marshal.OffsetOf<FileRenameInformation>(nameof(FileRenameInformation.FileName)).ToInt32();
-        var size = Math.Max(Marshal.SizeOf<FileRenameInformation>() + nameBytes.Length,
-            checked(offset + nameBytes.Length + sizeof(char)));
-        var buffer = Marshal.AllocHGlobal(size);
-        try
-        {
-            Marshal.Copy(new byte[size], 0, buffer, size);
-            Marshal.WriteInt32(buffer, 0, 0);
-            Marshal.WriteIntPtr(buffer, Marshal.OffsetOf<FileRenameInformation>(
-                nameof(FileRenameInformation.RootDirectory)).ToInt32(),
-                destinationParent.handle.DangerousGetHandle());
-            Marshal.WriteInt32(buffer, Marshal.OffsetOf<FileRenameInformation>(
-                nameof(FileRenameInformation.FileNameLength)).ToInt32(), nameBytes.Length);
-            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, offset), nameBytes.Length);
-            var status = NtSetInformationFile(handle, out _, buffer, checked((uint)size),
-                FileRenameInformationClass);
-            if (status < 0)
-                throw new IOException("Helper ownership marker could not be committed safely.",
-                    new Win32Exception(status));
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
-        EnsureSameIdentity();
-        destinationParent.EnsureSameIdentity();
     }
 
     public void Dispose() => handle.Dispose();
@@ -1956,17 +2044,6 @@ internal sealed class PinnedHelperEntry : IDisposable
     private enum FileInformationClass
     {
         FileDispositionInfo = 4,
-    }
-
-    private const int FileRenameInformationClass = 10;
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct FileRenameInformation
-    {
-        [MarshalAs(UnmanagedType.Bool)] public bool ReplaceIfExists;
-        public IntPtr RootDirectory;
-        public uint FileNameLength;
-        public char FileName;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -2072,14 +2149,6 @@ internal sealed class PinnedHelperEntry : IDisposable
         uint createOptions,
         IntPtr eaBuffer,
         uint eaLength);
-
-    [DllImport("ntdll.dll")]
-    private static extern int NtSetInformationFile(
-        SafeFileHandle fileHandle,
-        out IoStatusBlock ioStatusBlock,
-        IntPtr fileInformation,
-        uint length,
-        int fileInformationClass);
 
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

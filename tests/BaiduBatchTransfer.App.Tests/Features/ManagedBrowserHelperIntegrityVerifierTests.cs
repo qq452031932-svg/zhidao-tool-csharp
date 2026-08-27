@@ -34,7 +34,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
                    ReadAllTextShared(Path.Combine(snapshotContainer, "ownership.ready.json"))))
         {
             Assert.Equal("Incomplete", ownership.RootElement.GetProperty("State").GetString());
-            Assert.Equal("Ready", ready.RootElement.GetProperty("State").GetString());
+            Assert.Equal("Ready1", ready.RootElement.GetProperty("State").GetString());
             Assert.Equal(ownership.RootElement.GetProperty("SnapshotId").GetString(),
                 ready.RootElement.GetProperty("SnapshotId").GetString());
         }
@@ -518,6 +518,275 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
     }
 
+    [Fact]
+    public async Task IncompleteOwnedSnapshotWithoutActiveLockIsRecovered()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-missing-active-{Guid.NewGuid():N}", "snapshots");
+        var created = new DateTimeOffset(2026, 8, 28, 0, 0, 0, TimeSpan.Zero);
+        var first = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent);
+        var crashed = await first.VerifyAsync(fixture.Root, CancellationToken.None);
+        var incomplete = Directory.GetParent(Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+        MakeWritableTree(incomplete);
+        File.Delete(Path.Combine(incomplete, "ownership.ready.json"));
+        File.Delete(Path.Combine(incomplete, "active.lock"));
+
+        using var recovered = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.False(Directory.Exists(incomplete));
+        recovered.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task ReadyMarkerNameThatIsADirectoryIsMalformedAndLeftUntouched()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-directory-{Guid.NewGuid():N}", "snapshots");
+        var created = new DateTimeOffset(2026, 8, 28, 0, 0, 0, TimeSpan.Zero);
+        var first = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent);
+        var crashed = await first.VerifyAsync(fixture.Root, CancellationToken.None);
+        var malformed = Directory.GetParent(Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+        MakeWritableTree(malformed);
+        var readyPath = Path.Combine(malformed, "ownership.ready.json");
+        File.Delete(readyPath);
+        Directory.CreateDirectory(readyPath);
+
+        using var verified = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.True(Directory.Exists(malformed));
+        verified.Dispose();
+        MakeWritableTree(malformed);
+        Directory.Delete(malformed, recursive: true);
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task ReadyMarkerNameThatIsAReparsePointIsMalformedAndLeavesTargetUntouched()
+    {
+        using var fixture = HelperFixture.Create();
+        var testRoot = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-reparse-{Guid.NewGuid():N}");
+        var snapshotParent = Path.Combine(testRoot, "snapshots");
+        var outside = Path.Combine(testRoot, "outside");
+        Directory.CreateDirectory(outside);
+        File.WriteAllText(Path.Combine(outside, "sentinel.txt"), "untouched");
+        var created = new DateTimeOffset(2026, 8, 28, 0, 0, 0, TimeSpan.Zero);
+        var first = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent);
+        var crashed = await first.VerifyAsync(fixture.Root, CancellationToken.None);
+        var malformed = Directory.GetParent(Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+        MakeWritableTree(malformed);
+        var readyPath = Path.Combine(malformed, "ownership.ready.json");
+        File.Delete(readyPath);
+        CreateDirectoryJunction(readyPath, outside);
+
+        using var verified = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.True(Directory.Exists(malformed));
+        Assert.Equal("untouched", File.ReadAllText(Path.Combine(outside, "sentinel.txt")));
+        verified.Dispose();
+        Directory.Delete(readyPath);
+        MakeWritableTree(malformed);
+        Directory.Delete(malformed, recursive: true);
+        Directory.Delete(testRoot, recursive: true);
+    }
+
+    [Fact]
+    public async Task ReadyPreparingMarkerIsRecoveredAsIncomplete()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-preparing-{Guid.NewGuid():N}", "snapshots");
+        var created = new DateTimeOffset(2026, 8, 28, 0, 0, 0, TimeSpan.Zero);
+        var first = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent);
+        var crashed = await first.VerifyAsync(fixture.Root, CancellationToken.None);
+        var incomplete = Directory.GetParent(Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+        var readyPath = Path.Combine(incomplete, "ownership.ready.json");
+        MakeWritable(readyPath, isDirectory: false);
+        var committed = File.ReadAllText(readyPath);
+        var preparing = committed.Replace("\"State\":\"Ready1\"", "\"State\":\"Ready0\"",
+            StringComparison.Ordinal);
+        Assert.Equal(committed.Length, preparing.Length);
+        Assert.NotEqual(committed, preparing);
+        File.WriteAllText(readyPath, preparing);
+
+        using var recovered = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.False(Directory.Exists(incomplete));
+        recovered.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task UnexpectedFixedLengthReadyStateIsMalformedAndLeftUntouched()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-state-{Guid.NewGuid():N}", "snapshots");
+        var created = new DateTimeOffset(2026, 8, 28, 0, 0, 0, TimeSpan.Zero);
+        var first = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent);
+        var crashed = await first.VerifyAsync(fixture.Root, CancellationToken.None);
+        var malformed = Directory.GetParent(Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+        var readyPath = Path.Combine(malformed, "ownership.ready.json");
+        MakeWritable(readyPath, isDirectory: false);
+        var committed = File.ReadAllText(readyPath);
+        var malformedMarker = committed.Replace("\"State\":\"Ready1\"", "\"State\":\"ReadyX\"",
+            StringComparison.Ordinal);
+        Assert.Equal(committed.Length, malformedMarker.Length);
+        Assert.NotEqual(committed, malformedMarker);
+        File.WriteAllText(readyPath, malformedMarker);
+
+        using var verified = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.True(Directory.Exists(malformed));
+        verified.Dispose();
+        MakeWritableTree(malformed);
+        Directory.Delete(malformed, recursive: true);
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Theory]
+    [InlineData((int)ManagedBrowserHelperSnapshotPhase.OwnershipPersisted)]
+    [InlineData((int)ManagedBrowserHelperSnapshotPhase.PayloadSealed)]
+    [InlineData((int)ManagedBrowserHelperSnapshotPhase.OwnershipSealed)]
+    [InlineData((int)ManagedBrowserHelperSnapshotPhase.ReadyPreparingSealed)]
+    [InlineData((int)ManagedBrowserHelperSnapshotPhase.ContainerSealed)]
+    public async Task EveryPrecommitSealPhaseStillHasOnlyIncompleteOwnership(int phaseValue)
+    {
+        using var fixture = HelperFixture.Create();
+        var target = (ManagedBrowserHelperSnapshotPhase)phaseValue;
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-precommit-{Guid.NewGuid():N}", "snapshots");
+        var inspected = false;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase != target) return;
+                var container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                Assert.True(File.Exists(Path.Combine(container, "ownership.json")));
+                var readyPath = Path.Combine(container, "ownership.ready.json");
+                if (File.Exists(readyPath))
+                {
+                    using var ready = JsonDocument.Parse(ReadAllTextShared(readyPath));
+                    Assert.Equal("Ready0", ready.RootElement.GetProperty("State").GetString());
+                }
+                inspected = true;
+                throw new IOException("simulated precommit crash");
+            });
+
+        var error = await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+
+        Assert.Equal(ManagedBrowserHelperIntegrityError.VerificationIoFailure, error.Error);
+        Assert.True(inspected);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(snapshotParent));
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task ReadyCommitIsObservedOnlyAfterEveryBoundaryIsReadOnly()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-commit-{Guid.NewGuid():N}", "snapshots");
+        var inspected = false;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase != ManagedBrowserHelperSnapshotPhase.ReadyCommitted) return;
+                var container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                var readyPath = Path.Combine(container, "ownership.ready.json");
+                Assert.True(File.Exists(readyPath));
+                using (var ready = JsonDocument.Parse(ReadAllTextShared(readyPath)))
+                    Assert.Equal("Ready1", ready.RootElement.GetProperty("State").GetString());
+                Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(
+                    Path.Combine(container, "ownership.json"), "replacement"));
+                Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(
+                    Path.Combine(container, "ownership.ready.json"), "replacement"));
+                Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(
+                    Path.Combine(container, "payload", "main.py"), "replacement"));
+                Assert.Throws<UnauthorizedAccessException>(() => File.WriteAllText(
+                    Path.Combine(container, "late-injection.pth"), "replacement"));
+                inspected = true;
+            });
+
+        using var verified = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.True(inspected);
+        verified.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task ReadyCommitChangesExactlyOneByteWithoutChangingMarkerLength()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-ready-byte-{Guid.NewGuid():N}", "snapshots");
+        byte[]? preparing = null;
+        byte[]? committed = null;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase is not (ManagedBrowserHelperSnapshotPhase.ReadyPreparingSealed or
+                    ManagedBrowserHelperSnapshotPhase.ReadyCommitted)) return;
+                var container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                var bytes = ReadAllBytesShared(Path.Combine(container, "ownership.ready.json"));
+                if (phase == ManagedBrowserHelperSnapshotPhase.ReadyPreparingSealed)
+                    preparing = bytes;
+                else
+                    committed = bytes;
+            });
+
+        using var verified = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.NotNull(preparing);
+        Assert.NotNull(committed);
+        Assert.Equal(preparing.Length, committed.Length);
+        var differences = preparing.Zip(committed, (before, after) => (before, after))
+            .Where(pair => pair.before != pair.after).ToArray();
+        var difference = Assert.Single(differences);
+        Assert.Equal((byte)'0', difference.before);
+        Assert.Equal((byte)'1', difference.after);
+        verified.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
     [Theory]
     [InlineData((int)ManagedBrowserHelperSnapshotPhase.ContainerCreated)]
     [InlineData((int)ManagedBrowserHelperSnapshotPhase.MarkerWritten)]
@@ -838,6 +1107,15 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             FileShare.Read | FileShare.Write | FileShare.Delete);
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         return reader.ReadToEnd();
+    }
+
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Write | FileShare.Delete);
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        return memory.ToArray();
     }
 
     private static void MakeWritable(string path, bool isDirectory)
