@@ -138,7 +138,10 @@ WHERE (attempt.OwnerKind='Transfer' AND NOT EXISTS(
            AND operation.AccountId=attempt.AccountId
            AND operation.Generation=attempt.Generation))
    OR (attempt.OwnerKind='RemoteSelection' AND NOT EXISTS(
-         SELECT 1 FROM Accounts account WHERE account.Id=attempt.AccountId));
+         SELECT 1 FROM RemoteSelectionSessions selection
+         WHERE selection.SessionId=attempt.OperationId
+           AND selection.AccountId=attempt.AccountId
+           AND selection.Generation=attempt.Generation));
 
 CREATE TEMP TABLE V16OwnerlessWebAutomationAttemptValidation(
     Value INTEGER NOT NULL CHECK(Value=1)
@@ -929,7 +932,10 @@ WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare','RemoteSelec
         AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
         AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
    OR (NEW.OwnerKind='RemoteSelection' AND EXISTS(
-      SELECT 1 FROM Accounts account WHERE account.Id=NEW.AccountId))
+      SELECT 1 FROM RemoteSelectionSessions selection
+      WHERE selection.SessionId=NEW.OperationId
+        AND selection.AccountId=NEW.AccountId
+        AND selection.Generation=NEW.Generation))
  )
 BEGIN
     SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
@@ -958,7 +964,10 @@ WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare','RemoteSelec
         AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
         AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
    OR (NEW.OwnerKind='RemoteSelection' AND EXISTS(
-      SELECT 1 FROM Accounts account WHERE account.Id=NEW.AccountId))
+      SELECT 1 FROM RemoteSelectionSessions selection
+      WHERE selection.SessionId=NEW.OperationId
+        AND selection.AccountId=NEW.AccountId
+        AND selection.Generation=NEW.Generation))
  )
 BEGIN
     SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');

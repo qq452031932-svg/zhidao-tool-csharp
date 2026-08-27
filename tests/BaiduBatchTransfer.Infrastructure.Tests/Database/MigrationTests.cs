@@ -293,9 +293,10 @@ public sealed class MigrationTests : IDisposable
         var transferOrphan = ids.TransferWaiting;
         var shareOrphan = ids.ShareWaiting;
         var standaloneOrphan = ids.StandaloneQueued;
-        var remoteOrphan = Guid.NewGuid();
+        var remoteMissingSession = Guid.NewGuid();
+        var remoteWrongAccount = Guid.NewGuid();
+        var remoteWrongGeneration = Guid.NewGuid();
         var remoteValid = Guid.NewGuid();
-        var missingAccount = Guid.NewGuid();
         await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
@@ -308,20 +309,33 @@ public sealed class MigrationTests : IDisposable
             }
             await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
             await ExecuteAsync(connection, """
+                INSERT INTO RemoteSelectionSessions(
+                  SessionId,WorkspaceDraftId,AccountId,Generation,State,Revision,CreatedAt,UpdatedAt)
+                VALUES
+                  ($remoteWrongAccount,$wrongAccountDraft,$accountOne,7,'Active',0,'2026-08-01','2026-08-01'),
+                  ($remoteWrongGeneration,$wrongGenerationDraft,$accountOne,6,'Active',0,'2026-08-01','2026-08-01'),
+                  ($remoteValid,$validDraft,$accountOne,7,'Active',0,'2026-08-01','2026-08-01');
+
                 INSERT INTO WebAutomationAttempts(
                   OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt)
                 VALUES
                   ($transfer,$accountOne,7,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
                   ($share,$accountOne,7,'TransferShare','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
                   ($standalone,$accountTwo,7,'StandaloneShare','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
-                  ($remoteOrphan,$missingAccount,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remoteMissingSession,$accountOne,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remoteWrongAccount,$accountTwo,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remoteWrongGeneration,$accountOne,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
                   ($remoteValid,$accountOne,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01');
                 """, ("$transfer", transferOrphan.ToString("D")),
                 ("$share", shareOrphan.ToString("D")),
                 ("$standalone", standaloneOrphan.ToString("D")),
-                ("$remoteOrphan", remoteOrphan.ToString("D")),
+                ("$remoteMissingSession", remoteMissingSession.ToString("D")),
+                ("$remoteWrongAccount", remoteWrongAccount.ToString("D")),
+                ("$remoteWrongGeneration", remoteWrongGeneration.ToString("D")),
                 ("$remoteValid", remoteValid.ToString("D")),
-                ("$missingAccount", missingAccount.ToString("D")),
+                ("$wrongAccountDraft", Guid.NewGuid().ToString("D")),
+                ("$wrongGenerationDraft", Guid.NewGuid().ToString("D")),
+                ("$validDraft", Guid.NewGuid().ToString("D")),
                 ("$accountOne", ids.AccountOne.ToString("D")),
                 ("$accountTwo", ids.AccountTwo.ToString("D")));
         }
@@ -334,7 +348,11 @@ public sealed class MigrationTests : IDisposable
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.Equal(16L, await ScalarAsync<long>(upgraded,
             "SELECT MAX(Version) FROM SchemaVersions;"));
-        foreach (var orphan in new[] { transferOrphan, shareOrphan, standaloneOrphan, remoteOrphan })
+        foreach (var orphan in new[]
+                 {
+                     transferOrphan, shareOrphan, standaloneOrphan,
+                     remoteMissingSession, remoteWrongAccount, remoteWrongGeneration,
+                 })
         {
             Assert.Equal(0L, await ScalarAsync<long>(upgraded,
                 "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId=$operation AND Generation=7;",
@@ -461,6 +479,164 @@ public sealed class MigrationTests : IDisposable
                 ("$operation", operationId.ToString("D"))));
         Assert.DoesNotContain("ExecutionEngineVersion", await ColumnsAsync(live, "WebAutomationAttempts"));
         Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
+    }
+
+    [Theory]
+    [InlineData("MissingSession")]
+    [InlineData("WrongAccount")]
+    [InlineData("WrongGeneration")]
+    public async Task VersionFifteenUpgradeRollsBackForHighRiskRemoteSelectionTupleMismatch(
+        string mismatch)
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, $"v15-high-risk-remote-{mismatch}.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        var operationId = Guid.NewGuid();
+        var attemptAccountId = mismatch == "WrongAccount" ? ids.AccountTwo : ids.AccountOne;
+        const int attemptGeneration = 7;
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            if (mismatch != "MissingSession")
+            {
+                await ExecuteAsync(connection, """
+                    INSERT INTO RemoteSelectionSessions(
+                      SessionId,WorkspaceDraftId,AccountId,Generation,State,Revision,CreatedAt,UpdatedAt)
+                    VALUES($session,$draft,$account,$generation,'Active',0,'2026-08-01','2026-08-01');
+                    """, ("$session", operationId.ToString("D")),
+                    ("$draft", Guid.NewGuid().ToString("D")),
+                    ("$account", ids.AccountOne.ToString("D")),
+                    ("$generation", mismatch == "WrongGeneration" ? 6 : attemptGeneration));
+            }
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,SubmissionMarkedAt,
+                  Revision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,$generation,'RemoteSelection','DefinitelyNotSubmitted',
+                  '2026-08-01',0,'2026-08-01','2026-08-01');
+                """, ("$operation", operationId.ToString("D")),
+                ("$account", attemptAccountId.ToString("D")),
+                ("$generation", attemptGeneration));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var error = await Record.ExceptionAsync(() => new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, $"remote-{mismatch}-backups")), "new")
+            .MigrateAsync());
+
+        Assert.True(error is SqliteException or InvalidDataException, error?.ToString());
+        await using var live = await factory.OpenConnectionAsync();
+        Assert.Equal(15L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(1L, await ScalarAsync<long>(live, """
+            SELECT COUNT(*) FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation;
+            """, ("$operation", operationId.ToString("D")),
+            ("$account", attemptAccountId.ToString("D")),
+            ("$generation", attemptGeneration)));
+        Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
+    }
+
+    [Fact]
+    public async Task VersionSixteenRemoteSelectionAttemptTriggersRequireExactSessionTupleForInsertAndUpdate()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v16-remote-exact-owner.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "remote-exact-owner-backups")), "new")
+            .MigrateAsync();
+        await using var upgraded = await factory.OpenConnectionAsync();
+        var sessionId = Guid.NewGuid();
+        var missingSessionId = Guid.NewGuid();
+        await ExecuteAsync(upgraded, """
+            INSERT INTO RemoteSelectionSessions(
+              SessionId,WorkspaceDraftId,AccountId,Generation,State,Revision,CreatedAt,UpdatedAt)
+            VALUES($session,$draft,$account,1,'Active',0,'2026-08-01','2026-08-01');
+            """, ("$session", sessionId.ToString("D")),
+            ("$draft", Guid.NewGuid().ToString("D")),
+            ("$account", ids.AccountOne.ToString("D")));
+
+        Task InsertAttemptAsync(Guid operationId, Guid accountId, int generation) =>
+            ExecuteAsync(upgraded, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($operation,$account,$generation,'RemoteSelection','Preparing',0,
+                  '2026-08-01','2026-08-01','WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+                """, ("$operation", operationId.ToString("D")),
+                ("$account", accountId.ToString("D")),
+                ("$generation", generation),
+                ("$profile", LegacyProfileId(accountId)));
+
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            InsertAttemptAsync(missingSessionId, ids.AccountOne, 1));
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            InsertAttemptAsync(sessionId, ids.AccountTwo, 1));
+        await Assert.ThrowsAsync<SqliteException>(() =>
+            InsertAttemptAsync(sessionId, ids.AccountOne, 2));
+
+        await InsertAttemptAsync(sessionId, ids.AccountOne, 1);
+        await ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET Revision=Revision+1,UpdatedAt='2026-08-02'
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D")));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded, """
+            SELECT Revision FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET OperationId=$missing
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$missing", missingSessionId.ToString("D")),
+            ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET AccountId=$wrongAccount
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$wrongAccount", ids.AccountTwo.ToString("D")),
+            ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(upgraded, """
+            UPDATE WebAutomationAttempts SET Generation=2
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded, """
+            SELECT COUNT(*) FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", sessionId.ToString("D")),
+            ("$account", ids.AccountOne.ToString("D"))));
     }
 
     [Fact]
