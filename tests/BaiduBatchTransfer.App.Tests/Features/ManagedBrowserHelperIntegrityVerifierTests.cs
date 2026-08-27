@@ -42,17 +42,12 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     {
         using var fixture = HelperFixture.Create();
         File.Delete(Path.Combine(fixture.Root, "helper-manifest.json"));
-        var launched = false;
         var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
 
         var error = await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
-            verifier.VerifyThenLaunchAsync(
-                fixture.Root,
-                (_, _) => { launched = true; return Task.FromResult(0); },
-                CancellationToken.None));
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
 
         Assert.Equal(ManagedBrowserHelperIntegrityError.MissingManifest, error.Error);
-        Assert.False(launched);
     }
 
     [Fact]
@@ -63,8 +58,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
 
         var error = await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
-            verifier.VerifyThenLaunchAsync(
-                fixture.Root, (_, _) => Task.FromResult(0), CancellationToken.None));
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
 
         Assert.Equal(ManagedBrowserHelperIntegrityError.ManifestMismatch, error.Error);
     }
@@ -106,8 +100,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
 
         var error = await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
-            verifier.VerifyThenLaunchAsync(
-                fixture.Root, (_, _) => Task.FromResult(0), CancellationToken.None));
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
 
         Assert.Equal(ManagedBrowserHelperIntegrityError.MissingPayload, error.Error);
     }
@@ -217,20 +210,121 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     }
 
     [Fact]
-    public async Task VerificationFailureNeverCallsLaunchDelegate()
+    public async Task VerificationFailureNeverReturnsAnOwnedBundle()
     {
         using var fixture = HelperFixture.Create();
         File.WriteAllText(Path.Combine(fixture.Root, "main.py"), "tampered");
-        var launched = false;
         var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
 
         await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
-            verifier.VerifyThenLaunchAsync(
-                fixture.Root,
-                (_, _) => { launched = true; return Task.FromResult(0); },
-                CancellationToken.None));
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+    }
 
-        Assert.False(launched);
+    [Fact]
+    public async Task OwnedBundleKeepsSnapshotForTheWholeChildAndDrainLifetime()
+    {
+        using var fixture = HelperFixture.Create();
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
+        var verified = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        var snapshotRoot = Path.GetDirectoryName(verified.ExecutablePath)!;
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = Environment.GetEnvironmentVariable("COMSPEC") ?? "cmd.exe",
+            Arguments = "/d /c ping 127.0.0.1 -n 2 >nul & echo drained",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        }) ?? throw new InvalidOperationException("The lifetime probe did not start.");
+
+        Assert.True(Directory.Exists(snapshotRoot));
+        await process.WaitForExitAsync();
+        _ = await process.StandardOutput.ReadToEndAsync();
+        _ = await process.StandardError.ReadToEndAsync();
+        Assert.True(Directory.Exists(snapshotRoot));
+
+        verified.Dispose();
+
+        Assert.Equal(ManagedBrowserHelperCleanupState.Cleaned, verified.CleanupState);
+        Assert.False(Directory.Exists(snapshotRoot));
+    }
+
+    [Fact]
+    public async Task CallerRetainsOwnershipAcrossStartHandshakeAndCancellationFailures()
+    {
+        using var fixture = HelperFixture.Create();
+        var verified = await new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+        var snapshotRoot = Path.GetDirectoryName(verified.ExecutablePath)!;
+
+        foreach (var failure in new Exception[]
+                 {
+                     new InvalidOperationException("start"),
+                     new EndOfStreamException("handshake"),
+                     new OperationCanceledException("cancel"),
+                 })
+        {
+            try { throw failure; }
+            catch { Assert.True(Directory.Exists(snapshotRoot)); }
+        }
+
+        verified.Dispose();
+        Assert.False(Directory.Exists(snapshotRoot));
+    }
+
+    [Fact]
+    public async Task ExpiredCrashOrphanIsRecoveredButActiveAndForeignSnapshotsAreUntouched()
+    {
+        using var fixture = HelperFixture.Create();
+        var created = new DateTimeOffset(2026, 8, 27, 0, 0, 0, TimeSpan.Zero);
+        var firstClock = new FixedTimeProvider(created);
+        var firstVerifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: firstClock,
+            orphanMinimumAge: TimeSpan.FromHours(1));
+        var crashed = await firstVerifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        var orphanContainer = Directory.GetParent(
+            Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
+        crashed.AbandonForProcessCrashSimulation();
+
+        var active = await firstVerifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        var activeContainer = Directory.GetParent(
+            Path.GetDirectoryName(active.ExecutablePath)!)!.FullName;
+        var foreign = Path.Combine(VerifiedHelperSnapshotLease.SnapshotParentForDiagnostics,
+            $"snapshot-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(foreign);
+        File.WriteAllText(Path.Combine(foreign, "foreign.txt"), "not ours");
+
+        var laterVerifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes,
+            timeProvider: new FixedTimeProvider(created.AddHours(2)),
+            orphanMinimumAge: TimeSpan.FromHours(1));
+        using var verified = await laterVerifier.VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.False(Directory.Exists(orphanContainer));
+        Assert.True(Directory.Exists(activeContainer));
+        Assert.True(Directory.Exists(foreign));
+        active.Dispose();
+        Directory.Delete(foreign, recursive: true);
+    }
+
+    [Fact]
+    public void BuildScriptPinsEachPrivateArchiveForFinalHashAndSameStreamExtraction()
+    {
+        var repositoryRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", ".."));
+        var script = File.ReadAllText(Path.Combine(
+            repositoryRoot, "scripts", "build_managed_browser_helper.ps1"));
+
+        Assert.Contains("function Open-VerifiedZipInput", script, StringComparison.Ordinal);
+        Assert.Contains("[IO.FileShare]::Read", script, StringComparison.Ordinal);
+        Assert.Contains("$ArchiveStream.Position = 0", script, StringComparison.Ordinal);
+        Assert.Contains("[IO.Compression.ZipArchive]::new($ArchiveStream", script,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("[IO.Compression.ZipFile]::OpenRead($Archive)", script,
+            StringComparison.Ordinal);
+        Assert.Contains("Assert-NonReparseAncestors", script, StringComparison.Ordinal);
+        Assert.Contains("[IO.Path]::GetDirectoryName($currentPath)", script,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -354,7 +448,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         await process.WaitForExitAsync();
         var error = await process.StandardError.ReadToEndAsync();
 
-        Assert.Equal(0, process.ExitCode);
+        Assert.True(process.ExitCode == 0, error);
         Assert.Equal(string.Empty, error);
         Assert.Equal(before, EnumerateRelativeEntries(snapshotRoot));
         using var verifiedAgain = await verifier.VerifyAsync(snapshotRoot, CancellationToken.None);
@@ -490,6 +584,11 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         }
 
         private sealed record ManifestEntry(string Path, long Length, string Sha256);
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
     }
 }
 

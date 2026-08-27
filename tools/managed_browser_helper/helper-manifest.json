@@ -4,7 +4,7 @@
     "executionEngineVersion":  "ManagedChromium-v1",
     "pythonVersion":  "3.14.0",
     "distributionMode":  "PersonalNonCommercial",
-    "buildIdentity":  "982899894d253307eb38456f9596e4cd6ffe212779a4f38797417682ca7c141e",
+    "buildIdentity":  "d63d4c3911dbe25f42ee41b107c90f8a087116d1eba79cdb68ef55bbf1ddaa8a",
     "files":  [
                   {
                       "path":  "LICENSE.txt",
@@ -123,8 +123,8 @@
                   },
                   {
                       "path":  "main.py",
-                      "length":  12031,
-                      "sha256":  "f67ea28e16edfc16e26b1fb3938e1a2575e22cf15046c86c280666a58fa95d9e"
+                      "length":  12222,
+                      "sha256":  "a561942fc0568a303308301ec2477d657daa4fe4b280b1bb95be5f2282bbd4f1"
                   },
                   {
                       "path":  "protocol.py",

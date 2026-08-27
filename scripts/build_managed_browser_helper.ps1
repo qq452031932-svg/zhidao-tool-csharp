@@ -14,6 +14,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $pythonVersion = '3.14.0'
 $pythonArchiveName = 'python-3.14.0-embed-amd64.zip'
@@ -154,6 +156,51 @@ function Copy-VerifiedInputToPrivateStaging(
     return $Destination
 }
 
+function Assert-NonReparseAncestors(
+    [string]$Path,
+    [string]$Boundary) {
+    $boundaryFull = [IO.Path]::GetFullPath($Boundary).TrimEnd('\')
+    $pathFull = [IO.Path]::GetFullPath($Path)
+    $prefix = $boundaryFull + '\'
+    if (-not $pathFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Private input is outside its staging boundary: $pathFull"
+    }
+    $currentPath = $pathFull
+    while (-not [string]::IsNullOrEmpty($currentPath)) {
+        $attributes = [IO.File]::GetAttributes($currentPath)
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Private input path contains a reparse point: $currentPath"
+        }
+        if ($currentPath.TrimEnd('\').Equals(
+                $boundaryFull, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $currentPath = [IO.Path]::GetDirectoryName($currentPath)
+    }
+    throw "Private input staging boundary was not reached: $pathFull"
+}
+
+function Open-VerifiedZipInput(
+    [string]$Path,
+    [string]$Boundary,
+    [string]$ExpectedSha256) {
+    Assert-NonReparseAncestors $Path $Boundary
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { $actual = ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+        finally { $algorithm.Dispose() }
+        if ($actual -ne $ExpectedSha256) {
+            throw "Pinned private build input digest mismatch: $Path"
+        }
+        $stream.Position = 0
+        return $stream
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
 function Find-OrDownloadWheel(
     [string]$Name,
     [string]$Version,
@@ -176,13 +223,14 @@ function Find-OrDownloadWheel(
 }
 
 function Expand-SafeZip(
-    [string]$Archive,
+    [IO.Stream]$ArchiveStream,
     [string]$Destination,
     [switch]$SkipPackageTests) {
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Directory]::CreateDirectory($Destination) | Out-Null
     $destinationRoot = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
-    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    $ArchiveStream.Position = 0
+    $zip = [IO.Compression.ZipArchive]::new($ArchiveStream,
+        [IO.Compression.ZipArchiveMode]::Read, $true)
     try {
         foreach ($entry in $zip.Entries) {
             $relative = $entry.FullName
@@ -237,6 +285,8 @@ $inputStaging = Join-Path $outputParent ('.managed-helper-inputs-' + [Guid]::New
 try {
     [IO.Directory]::CreateDirectory($staging) | Out-Null
     [IO.Directory]::CreateDirectory($inputStaging) | Out-Null
+    Assert-NonReparseAncestors $staging $outputParent
+    Assert-NonReparseAncestors $inputStaging $outputParent
     $pythonArchive = Copy-VerifiedInputToPrivateStaging $pythonArchive `
         (Join-Path $inputStaging $pythonArchiveName) $pythonArchiveSha256
     $privateWheels = @()
@@ -246,10 +296,16 @@ try {
             $requirements[$index].Hash
     }
     $wheels = $privateWheels
-    Expand-SafeZip $pythonArchive $staging
+    $pythonStream = Open-VerifiedZipInput $pythonArchive $inputStaging $pythonArchiveSha256
+    try { Expand-SafeZip $pythonStream $staging }
+    finally { $pythonStream.Dispose() }
     $sitePackages = Join-Path $staging 'site-packages'
     [IO.Directory]::CreateDirectory($sitePackages) | Out-Null
-    foreach ($wheel in $wheels) { Expand-SafeZip $wheel $sitePackages -SkipPackageTests }
+    for ($index = 0; $index -lt $wheels.Count; $index++) {
+        $wheelStream = Open-VerifiedZipInput $wheels[$index] $inputStaging $requirements[$index].Hash
+        try { Expand-SafeZip $wheelStream $sitePackages -SkipPackageTests }
+        finally { $wheelStream.Dispose() }
+    }
 
     foreach ($name in @('main.py', 'protocol.py', 'requirements.lock')) {
         [IO.File]::Copy((Join-Path $helperSource $name), (Join-Path $staging $name), $false)

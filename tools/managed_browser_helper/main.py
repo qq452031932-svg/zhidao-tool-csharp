@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import sys
 
-# The verified helper snapshot is deliberately read-only for its entire process lifetime.
-# Set this before importing protocol or any third-party module so imports never attempt pyc writes.
+# The host applies a best-effort no-write ACL for this helper's process lifetime. It blocks
+# ordinary Python/import writes, but is not a security boundary against the same Windows owner,
+# who can deliberately regain WRITE_DAC. A protected installation identity can strengthen this
+# later. Set this before protocol/third-party imports so normal imports never attempt pyc writes.
 sys.dont_write_bytecode = True
 
 import io
