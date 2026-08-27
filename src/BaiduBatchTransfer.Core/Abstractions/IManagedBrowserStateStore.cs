@@ -43,6 +43,10 @@ public interface IManagedBrowserStateStore
         ManagedBrowserTransitionRequest request,
         CancellationToken cancellationToken);
 
+    Task<ManagedBrowserTransitionResult> TryClaimRetiredIdentityForCleanupAsync(
+        ManagedBrowserCleanupClaimRequest request,
+        CancellationToken cancellationToken);
+
     Task<StoredManagedProfileCleanupManifest> CreateCleanupManifestAsync(
         ManagedProfileCleanupManifest manifest,
         CancellationToken cancellationToken);

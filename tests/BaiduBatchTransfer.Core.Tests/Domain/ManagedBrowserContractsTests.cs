@@ -405,6 +405,8 @@ public sealed class ManagedBrowserContractsTests
         Func<Guid, BrowserFamily, CancellationToken, Task<StoredManagedBrowserSession?>> loadActiveSession = store.LoadActiveSessionAsync;
         Func<ManagedBrowserSessionActivationRequest, CancellationToken, Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>>> activateSession = store.TryReplaceActiveSessionAsync;
         Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> retireSession = store.TryRetireSessionAsync;
+        Func<ManagedBrowserCleanupClaimRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> claimCleanup =
+            store.TryClaimRetiredIdentityForCleanupAsync;
         Func<ManagedBrowserRetentionReference, CancellationToken, Task> addRetention = store.AddRetentionAsync;
         Func<ManagedBrowserRetentionReference, CancellationToken, Task> releaseRetention = store.ReleaseRetentionAsync;
         Func<Guid, Guid, CancellationToken, Task<bool>> eligible = store.IsRetirementEligibleAsync;
@@ -419,6 +421,7 @@ public sealed class ManagedBrowserContractsTests
         Assert.NotNull(loadActiveSession);
         Assert.NotNull(activateSession);
         Assert.NotNull(retireSession);
+        Assert.NotNull(claimCleanup);
         Assert.NotNull(addRetention);
         Assert.NotNull(releaseRetention);
         Assert.NotNull(eligible);
@@ -430,7 +433,7 @@ public sealed class ManagedBrowserContractsTests
         var manifest = new ManagedProfileCleanupManifest(
             Guid.NewGuid(), AccountId, SessionId,
             "C:\\Sensitive\\profile", "C:\\Sensitive\\quarantine", "ownership-1",
-            "confirmation-hash");
+            null);
         var stored = new StoredManagedProfileCleanupManifest(
             manifest, ManagedProfileCleanupState.Prepared, revision: 0);
         var transition = new ManagedProfileCleanupTransitionRequest(
@@ -450,7 +453,6 @@ public sealed class ManagedBrowserContractsTests
         Assert.Equal(ManagedProfileCleanupState.QuarantineMoveIntent, transition.TargetState);
         Assert.DoesNotContain("Sensitive", manifest.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("ownership-1", manifest.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("confirmation-hash", manifest.ToString(), StringComparison.Ordinal);
         Assert.NotNull(create);
         Assert.NotNull(load);
         Assert.NotNull(change);
@@ -459,6 +461,47 @@ public sealed class ManagedBrowserContractsTests
         Assert.Throws<ArgumentException>(() => new ManagedProfileCleanupTransitionRequest(
             manifest.ManifestId, 0, ManagedProfileCleanupState.Prepared,
             ManagedProfileCleanupState.Prepared));
+    }
+
+    [Theory]
+    [InlineData(ManagedProfileCleanupState.Prepared, ManagedProfileCleanupState.QuarantineMoveIntent, null)]
+    [InlineData(ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.Quarantined, null)]
+    [InlineData(ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.CleanupPending, null)]
+    [InlineData(ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.DeleteIntent, "confirmation-hash")]
+    [InlineData(ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.Deleted, null)]
+    [InlineData(ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.CleanupPending, null)]
+    public void CleanupManifestTransitionAllowsOnlyApprovedCrashSafeEdges(
+        ManagedProfileCleanupState expected,
+        ManagedProfileCleanupState target,
+        string? confirmationTokenHash)
+    {
+        var request = new ManagedProfileCleanupTransitionRequest(
+            Guid.NewGuid(), 4, expected, target, confirmationTokenHash);
+
+        Assert.Equal(expected, request.ExpectedState);
+        Assert.Equal(target, request.TargetState);
+        Assert.Equal(confirmationTokenHash, request.ConfirmationTokenHash);
+    }
+
+    [Theory]
+    [InlineData(ManagedProfileCleanupState.Prepared, ManagedProfileCleanupState.Quarantined, null)]
+    [InlineData(ManagedProfileCleanupState.Prepared, ManagedProfileCleanupState.Deleted, null)]
+    [InlineData(ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.DeleteIntent, "confirmation-hash")]
+    [InlineData(ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.QuarantineMoveIntent, null)]
+    [InlineData(ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.Deleted, null)]
+    [InlineData(ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.DeleteIntent, null)]
+    [InlineData(ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.DeleteIntent, "")]
+    [InlineData(ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.Quarantined, null)]
+    [InlineData(ManagedProfileCleanupState.CleanupPending, ManagedProfileCleanupState.Deleted, null)]
+    [InlineData(ManagedProfileCleanupState.Deleted, ManagedProfileCleanupState.Prepared, null)]
+    [InlineData(ManagedProfileCleanupState.Prepared, ManagedProfileCleanupState.QuarantineMoveIntent, "unexpected-hash")]
+    public void CleanupManifestTransitionRejectsSkippedBackwardAndUnconfirmedEdges(
+        ManagedProfileCleanupState expected,
+        ManagedProfileCleanupState target,
+        string? confirmationTokenHash)
+    {
+        Assert.Throws<ArgumentException>(() => new ManagedProfileCleanupTransitionRequest(
+            Guid.NewGuid(), 0, expected, target, confirmationTokenHash));
     }
 
     [Fact]
@@ -498,6 +541,20 @@ public sealed class ManagedBrowserContractsTests
             ManagedBrowserRetentionOwnerKind.Operation, Guid.Empty, InstallationId, SessionId));
         Assert.Throws<ArgumentOutOfRangeException>(() => new ManagedBrowserRetentionReference(
             (ManagedBrowserRetentionOwnerKind)99, AccountId, InstallationId, SessionId));
+
+        var claim = new ManagedBrowserCleanupClaimRequest(
+            InstallationId, SessionId, AccountId, expectedInstallationRevision: 3,
+            expectedSessionRevision: 4, Guid.NewGuid(), expectedManifestRevision: 5);
+        Assert.Equal(InstallationId, claim.InstallationId);
+        Assert.Equal(SessionId, claim.SessionId);
+        Assert.Equal(AccountId, claim.AccountId);
+        Assert.Equal(3, claim.ExpectedInstallationRevision);
+        Assert.Equal(4, claim.ExpectedSessionRevision);
+        Assert.Equal(5, claim.ExpectedManifestRevision);
+        Assert.DoesNotContain(InstallationId.ToString(), claim.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(SessionId.ToString(), claim.ToString(), StringComparison.Ordinal);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ManagedBrowserCleanupClaimRequest(
+            InstallationId, SessionId, AccountId, -1, 0, Guid.NewGuid(), 0));
     }
 
     private static BrowserInstallationIdentity CreateInstallation(BrowserFamily family) => new(
@@ -524,6 +581,7 @@ public sealed class ManagedBrowserContractsTests
         public Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserActiveSlotTransitionResult<StoredManagedBrowserSession>> TryReplaceActiveSessionAsync(ManagedBrowserSessionActivationRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryRetireSessionAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<ManagedBrowserTransitionResult> TryClaimRetiredIdentityForCleanupAsync(ManagedBrowserCleanupClaimRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<StoredManagedProfileCleanupManifest> CreateCleanupManifestAsync(ManagedProfileCleanupManifest manifest, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<StoredManagedProfileCleanupManifest?> LoadCleanupManifestAsync(Guid manifestId, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(ManagedProfileCleanupTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();

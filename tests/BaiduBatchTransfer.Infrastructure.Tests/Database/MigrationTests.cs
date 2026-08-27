@@ -282,6 +282,143 @@ public sealed class MigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task VersionFifteenUpgradeDiscardsOwnerlessAttemptsAndTheirEvidence()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v15-orphan-attempt.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        var orphanOperation = Guid.NewGuid();
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,7,'Transfer','Preparing',0,'2026-08-01','2026-08-01');
+                INSERT INTO WebAutomationAttemptSourceItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,7,0,'orphan-source',X'01');
+                INSERT INTO WebAutomationAttemptRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,7,0,'orphan-remote',X'02');
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,7,0,'root','orphan',NULL,'/orphan','listing','uid-one',
+                  'WebView2','1','1','1','Intent',0,'2026-08-01','2026-08-01');
+                """, ("$operation", orphanOperation.ToString("D")),
+                ("$account", ids.AccountOne.ToString("D")));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "orphan-backups")), "new")
+            .MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal(16L, await ScalarAsync<long>(upgraded,
+            "SELECT MAX(Version) FROM SchemaVersions;"));
+        foreach (var table in new[]
+                 {
+                     "WebAutomationAttempts", "WebAutomationAttemptSourceItems",
+                     "WebAutomationAttemptRemoteItems", "WebAutomationDirectoryMutations",
+                 })
+        {
+            Assert.Equal(0L, await ScalarAsync<long>(upgraded,
+                $"SELECT COUNT(*) FROM {table} WHERE OperationId=$operation;",
+                ("$operation", orphanOperation.ToString("D"))));
+        }
+        Assert.Equal(2L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM WebAutomationAttempts;"));
+        Assert.Equal(0L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Fact]
+    public async Task VersionSixteenOwnerDeletionRequiresAttemptClosureForEveryOwnerKind()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v16-owner-delete-fence.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "owner-fence-backups")), "new")
+            .MigrateAsync();
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($operation,$account,1,'TransferShare','Preparing',0,'2026-08-01','2026-08-01',
+                  'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+                """, ("$operation", ids.ShareWaiting.ToString("D")),
+                ("$account", ids.AccountOne.ToString("D")),
+                ("$profile", LegacyProfileId(ids.AccountOne)));
+        }
+
+        async Task AssertBlockedAsync(string table, Guid ownerId)
+        {
+            await using var connection = await factory.OpenConnectionAsync();
+            await using var transaction = connection.BeginTransaction(deferred: false);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"DELETE FROM {table} WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", ownerId.ToString("D"));
+            await Assert.ThrowsAsync<SqliteException>(() => command.ExecuteNonQueryAsync());
+            await transaction.RollbackAsync();
+        }
+
+        await AssertBlockedAsync("TransferOperations", ids.TransferWaiting);
+        await AssertBlockedAsync("ShareOperations", ids.ShareWaiting);
+        await AssertBlockedAsync("StandaloneShareOperations", ids.StandaloneSucceeded);
+
+        await using var verified = await factory.OpenConnectionAsync();
+        await ExecuteAsync(verified, """
+            DELETE FROM WebAutomationAttempts
+            WHERE (OperationId=$transfer AND OwnerKind='Transfer')
+               OR (OperationId=$share AND OwnerKind='TransferShare')
+               OR (OperationId=$standalone AND OwnerKind='StandaloneShare');
+            DELETE FROM ShareOperations WHERE Id=$share;
+            DELETE FROM TransferOperations WHERE Id=$transfer;
+            DELETE FROM StandaloneShareOperations WHERE Id=$standalone;
+            """, ("$transfer", ids.TransferWaiting.ToString("D")),
+            ("$share", ids.ShareWaiting.ToString("D")),
+            ("$standalone", ids.StandaloneSucceeded.ToString("D")));
+        Assert.Equal(0L, await ScalarAsync<long>(verified,
+            "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Fact]
     public async Task VersionSixteenCorruptIdentityRollsBackWithoutReplacingVersionFifteenRows()
     {
         Directory.CreateDirectory(root);
@@ -337,7 +474,7 @@ public sealed class MigrationTests : IDisposable
     }
 
     [Fact]
-    public async Task VersionSixteenMismatchedAttemptOwnerRollsBackWithoutReplacingVersionFifteenRows()
+    public async Task VersionSixteenMismatchedAttemptOwnerIsDiscardedWithoutLosingItsValidOwner()
     {
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v16-mismatched-attempt.db");
@@ -365,19 +502,21 @@ public sealed class MigrationTests : IDisposable
         }
 
         var factory = new SqliteConnectionFactory(path);
-        var error = await Record.ExceptionAsync(() => new DatabaseMigrator(
+        await new DatabaseMigrator(
             factory, new DatabaseBackupService(factory, Path.Combine(root, "mismatch-backups")), "new")
-            .MigrateAsync());
+            .MigrateAsync();
 
-        Assert.True(error is SqliteException or InvalidDataException, error?.ToString());
         await using var live = await factory.OpenConnectionAsync();
-        Assert.Equal(15L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
-        Assert.Equal(ids.AccountTwo.ToString("D"), await ScalarAsync<string>(live, """
-            SELECT AccountId FROM WebAutomationAttempts
+        Assert.Equal(16L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(0L, await ScalarAsync<long>(live, """
+            SELECT COUNT(*) FROM WebAutomationAttempts
             WHERE OperationId=$operation AND Generation=1;
             """, ("$operation", ids.TransferWaiting.ToString("D"))));
-        Assert.DoesNotContain("ExecutionEngineVersion", await ColumnsAsync(live, "WebAutomationAttempts"));
-        Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
+        Assert.Equal("Waiting", await ScalarAsync<string>(live,
+            "SELECT Status FROM TransferOperations WHERE Id=$operation;",
+            ("$operation", ids.TransferWaiting.ToString("D"))));
+        Assert.Contains("ExecutionEngineVersion", await ColumnsAsync(live, "WebAutomationAttempts"));
+        Assert.Contains("BrowserInstallations", await NamesAsync(live, "table"));
     }
 
     [Fact]

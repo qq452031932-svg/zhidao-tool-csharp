@@ -503,6 +503,85 @@ public sealed class AccountRemovalStoreTests : IDisposable
         Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
     }
 
+    [Fact]
+    public async Task RemoveTerminalHistoryDeletesPolymorphicAttemptsAndEvidenceBeforeOwnerCascade()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var shareOperation = Guid.NewGuid();
+        await ExecuteAsync(factory, """
+            INSERT INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','account-removal-settings',$at);
+            INSERT INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,
+              PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'bravo',1,1,1);
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
+              AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,
+              SubmitStartedAt,NextReconcileAt,BaselineGeneration,BaselineFingerprint,
+              BaselineShareCount,BaselineCompletedAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account,1,'Succeeded','exact-removal',
+              'account-removal-settings',1,'{}','share-request','Unknown',1,1,NULL,$at,NULL,
+              NULL,NULL,0,NULL,NULL,NULL,$at,$at,'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+            INSERT INTO WebAutomationAttempts(
+              OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES
+              ($transfer,$account,1,'Transfer','Preparing',0,$at,$at,
+                'WebView2-v1','LegacyWebView2',$profile,NULL,NULL),
+              ($share,$account,1,'TransferShare','Preparing',0,$at,$at,
+                'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+            INSERT INTO WebAutomationAttemptSourceItems(
+              OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+            VALUES($transfer,$account,1,0,'source-transfer',X'01'),
+                  ($share,$account,1,0,'source-share',X'02');
+            INSERT INTO WebAutomationAttemptRemoteItems(
+              OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+            VALUES($transfer,$account,1,0,'remote-transfer',X'03'),
+                  ($share,$account,1,0,'remote-share',X'04');
+            INSERT INTO WebAutomationDirectoryMutations(
+              OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+              ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+              CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+              CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+            VALUES
+              ($transfer,$account,1,0,'root','transfer',NULL,'/transfer','listing-transfer',
+                'baidu-bravo','WebView2','1','1','1','Intent',0,$at,$at),
+              ($share,$account,1,0,'root','share',NULL,'/share','listing-share',
+                'baidu-bravo','WebView2','1','1','1','Intent',0,$at,$at);
+            """,
+            ("$share", Id(shareOperation)), ("$transfer", Id(graph.BOnlyOperation)),
+            ("$resource", Id(graph.BOnlyResource)), ("$batch", Id(graph.BBatch)),
+            ("$account", Id(B)), ("$profile", $"legacy-webview2-account-{B:N}"),
+            ("$at", "2026-08-20T05:45:00Z"));
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        foreach (var table in new[]
+                 {
+                     "WebAutomationAttempts", "WebAutomationAttemptSourceItems",
+                     "WebAutomationAttemptRemoteItems", "WebAutomationDirectoryMutations",
+                 })
+        {
+            Assert.Equal(0, await ScalarAsync(factory,
+                $"SELECT COUNT(*) FROM {table} WHERE OperationId IN ($transfer,$share);",
+                ("$transfer", Id(graph.BOnlyOperation)), ("$share", Id(shareOperation))));
+        }
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM TransferOperations WHERE Id=$id;", ("$id", Id(graph.BOnlyOperation))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;", ("$id", Id(shareOperation))));
+        Assert.Equal(0, await ScalarAsync(factory, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
     [Theory]
     [InlineData("Parsing")]
     [InlineData("Draft")]
@@ -1418,9 +1497,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
             INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,
               AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,
               RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,
-              LeaseExpiresAt,CreatedAt,UpdatedAt)
+              LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($id,$resource,$batch,$sequence,$sequence,'/target','/target','',$account,'Fixed',$status,$outcome,1,$fingerprint,$descriptor,
-              NULL,NULL,$submit,$slot,NULL,$daily,NULL,NULL,NULL,NULL,$at,$at);
+              NULL,NULL,$submit,$slot,NULL,$daily,NULL,NULL,NULL,NULL,$at,$at,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-'||lower(replace($account,'-','')),NULL,NULL);
             """, ("$id", Id(id)), ("$resource", Id(resource)), ("$batch", Id(batch)), ("$sequence", sequence), ("$account", Id(account)),
             ("$status", status), ("$outcome", status == "Succeeded" ? "NewTransfer" : terminal ? status : null), ("$fingerprint", $"fp-{id:N}"),
             ("$descriptor", completedSubmission ? "{}" : null), ("$submit", completedSubmission ? "ResultReceived" : "NotPrepared"),
@@ -1486,10 +1566,12 @@ public sealed class AccountRemovalStoreTests : IDisposable
                           TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,
                           OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,
                           RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,
-                          LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt)
+                          LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,
+                          ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                         VALUES($id,$resource,$batch,$sequence,$sequence,'/target','/target','',$account,'Fixed','Succeeded',
                           'NewTransfer',1,$fingerprint,'{}',NULL,NULL,'ResultReceived','Fulfilled',NULL,$at,NULL,
-                          NULL,NULL,NULL,$at,$at);
+                          NULL,NULL,NULL,$at,$at,'WebView2-v1','LegacyWebView2',
+                          'legacy-webview2-account-'||lower(replace($account,'-','')),NULL,NULL);
                         """;
                     insertOperation.Parameters.AddWithValue("$id", Id(operation));
                     insertOperation.Parameters.AddWithValue("$resource", Id(resource));

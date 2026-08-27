@@ -273,24 +273,36 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         Assert.False(await store.IsRetirementEligibleAsync(
             installation.Identity.InstallationId, sessionIdentity.SessionId, default));
 
-        var current = manifest;
+        var retiredInstallationState = (await store.LoadInstallationAsync(
+            installation.Identity.InstallationId, default))!;
+        var retiredSessionState = (await store.LoadSessionAsync(sessionIdentity.SessionId, default))!;
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await store.TryClaimRetiredIdentityForCleanupAsync(
+                new ManagedBrowserCleanupClaimRequest(
+                    retiredInstallationState.Identity.InstallationId,
+                    retiredSessionState.Identity.SessionId,
+                    accountId,
+                    retiredInstallationState.Revision,
+                    retiredSessionState.Revision,
+                    manifest.Manifest.ManifestId,
+                    manifest.Revision), default)).Status);
+        var current = (await store.LoadCleanupManifestAsync(manifest.Manifest.ManifestId, default))!;
         foreach (var target in new[]
                  {
-                     ManagedProfileCleanupState.QuarantineMoveIntent,
                      ManagedProfileCleanupState.Quarantined,
                      ManagedProfileCleanupState.DeleteIntent,
-                     ManagedProfileCleanupState.CleanupPending,
                      ManagedProfileCleanupState.Deleted,
                  })
         {
             var transition = await store.TryTransitionCleanupManifestAsync(
                 new ManagedProfileCleanupTransitionRequest(
-                    current.Manifest.ManifestId, current.Revision, current.State, target), default);
+                    current.Manifest.ManifestId, current.Revision, current.State, target,
+                    target == ManagedProfileCleanupState.DeleteIntent ? "confirmed-retention-delete" : null), default);
             Assert.Equal(ManagedBrowserTransitionStatus.Applied, transition.Status);
             current = (await store.LoadCleanupManifestAsync(current.Manifest.ManifestId, default))!;
         }
         Assert.Equal(0L, await CountRetentionsAsync(factory));
-        Assert.True(await store.IsRetirementEligibleAsync(
+        Assert.False(await store.IsRetirementEligibleAsync(
             installation.Identity.InstallationId, sessionIdentity.SessionId, default));
 
         Assert.Equal(ManagedBrowserTransitionStatus.NotFound,
@@ -314,8 +326,8 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             installation.Identity.InstallationId, accountId, "uid-cleanup", BrowserFamily.Edge,
             "profile-cleanup", "ownership-cleanup");
         var session = await store.CreateSessionAsync(sessionIdentity, default);
-        _ = await store.TryReplaceActiveSessionAsync(
-            new ManagedBrowserSessionActivationRequest(null, session), default);
+        session = (await store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, session), default)).Current!;
 
         var wrongAccount = CleanupManifest(otherAccountId, sessionIdentity, "wrong-account");
         var wrongAccountFailure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -340,22 +352,280 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         Assert.Equal(manifest.ManifestId, loaded.Manifest.ManifestId);
         Assert.Equal(manifest.SourceProfilePath, loaded.Manifest.SourceProfilePath);
 
-        var request = new ManagedProfileCleanupTransitionRequest(
-            manifest.ManifestId, 0, ManagedProfileCleanupState.Prepared,
-            ManagedProfileCleanupState.QuarantineMoveIntent);
-        var applied = await restarted.TryTransitionCleanupManifestAsync(request, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await store.TryRetireSessionAsync(
+                new ManagedBrowserTransitionRequest(session.Identity.SessionId, session.Revision), default)).Status);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await store.TryRetireInstallationAsync(
+                new ManagedBrowserTransitionRequest(
+                    installation.Identity.InstallationId, installation.Revision), default)).Status);
+        session = (await restarted.LoadSessionAsync(session.Identity.SessionId, default))!;
+        installation = (await restarted.LoadInstallationAsync(
+            installation.Identity.InstallationId, default))!;
+        var request = new ManagedBrowserCleanupClaimRequest(
+            installation.Identity.InstallationId, session.Identity.SessionId, accountId,
+            installation.Revision, session.Revision, manifest.ManifestId, created.Revision);
+        var applied = await restarted.TryClaimRetiredIdentityForCleanupAsync(request, default);
         Assert.Equal(ManagedBrowserTransitionStatus.Applied, applied.Status);
         Assert.Equal(1, applied.CurrentRevision);
-        var stale = await restarted.TryTransitionCleanupManifestAsync(request, default);
+        var stale = await restarted.TryClaimRetiredIdentityForCleanupAsync(request, default);
         Assert.Equal(ManagedBrowserTransitionStatus.Conflict, stale.Status);
         Assert.Equal(1, stale.CurrentRevision);
         Assert.Equal(ManagedProfileCleanupState.QuarantineMoveIntent,
             (await restarted.LoadCleanupManifestAsync(manifest.ManifestId, default))!.State);
         Assert.Equal(ManagedBrowserTransitionStatus.NotFound,
-            (await restarted.TryTransitionCleanupManifestAsync(
+            (await restarted.TryClaimRetiredIdentityForCleanupAsync(
+                new ManagedBrowserCleanupClaimRequest(
+                    installation.Identity.InstallationId, session.Identity.SessionId, accountId,
+                    installation.Revision, session.Revision, Guid.NewGuid(), 0), default)).Status);
+    }
+
+    [Fact]
+    public async Task CleanupClaimAtomicallyFencesTheExactRetiredIdentityPair()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("claim");
+
+        var claimed = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+            fixture.ClaimRequest(), default);
+
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, claimed.Status);
+        Assert.Equal(1, claimed.CurrentRevision);
+        Assert.Equal(ManagedProfileCleanupState.QuarantineMoveIntent,
+            (await fixture.Store.LoadCleanupManifestAsync(fixture.Manifest.Manifest.ManifestId, default))!.State);
+        var session = await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.QuarantinePending, session!.State);
+        Assert.Equal(fixture.Session.Revision + 1, session.Revision);
+        Assert.Equal(1L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task PreparedCleanupManifestRejectsPrematureConfirmationEvidence()
+    {
+        var (factory, store) = await CreateStoreAsync();
+        var accountId = Guid.NewGuid();
+        await SeedAccountAsync(factory, accountId, "uid-premature-confirmation");
+        var installation = await store.CreateInstallationAsync(
+            Installation(BrowserFamily.Chrome, "chrome-premature-confirmation", "file-premature-confirmation"),
+            default);
+        var session = Session(
+            installation.Identity.InstallationId, accountId, "uid-premature-confirmation",
+            BrowserFamily.Chrome, "profile-premature-confirmation", "owner-premature-confirmation");
+        _ = await store.CreateSessionAsync(session, default);
+        var manifest = new ManagedProfileCleanupManifest(
+            Guid.NewGuid(), accountId, session.SessionId,
+            Path.Combine(root, "source-premature-confirmation"),
+            Path.Combine(root, "quarantine-premature-confirmation"),
+            session.ProfileOwnershipId, "premature-confirmation-hash");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.CreateCleanupManifestAsync(manifest, default));
+    }
+
+    [Fact]
+    public async Task CleanupClaimConflictsWithExistingOwnerWithoutPartiallyUpdatingState()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("owner-conflict");
+        _ = await InsertManagedTransferOwnerAsync(fixture);
+
+        var claimed = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+            fixture.ClaimRequest(), default);
+
+        Assert.Equal(ManagedBrowserTransitionStatus.Conflict, claimed.Status);
+        Assert.Equal(ManagedProfileCleanupState.Prepared,
+            (await fixture.Store.LoadCleanupManifestAsync(fixture.Manifest.Manifest.ManifestId, default))!.State);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(0L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+    }
+
+    [Theory]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, true)]
+    public async Task CleanupClaimRejectsStaleIdentityRevisionWithoutPartialUpdates(
+        bool staleInstallation,
+        bool staleSession,
+        bool staleManifest)
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync(
+            $"stale-{staleInstallation}-{staleSession}");
+        var request = new ManagedBrowserCleanupClaimRequest(
+            fixture.Installation.Identity.InstallationId,
+            fixture.Session.Identity.SessionId,
+            fixture.AccountId,
+            fixture.Installation.Revision + (staleInstallation ? 1 : 0),
+            fixture.Session.Revision + (staleSession ? 1 : 0),
+            fixture.Manifest.Manifest.ManifestId,
+            fixture.Manifest.Revision + (staleManifest ? 1 : 0));
+
+        var claimed = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(request, default);
+
+        Assert.Equal(ManagedBrowserTransitionStatus.Conflict, claimed.Status);
+        Assert.Equal(ManagedProfileCleanupState.Prepared,
+            (await fixture.Store.LoadCleanupManifestAsync(fixture.Manifest.Manifest.ManifestId, default))!.State);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(0L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+    }
+
+    [Fact]
+    public async Task CleanupClaimFenceRejectsNewOwnerAttemptAndManifestReferences()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("fence");
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+                fixture.ClaimRequest(), default)).Status);
+
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() =>
+            InsertManagedTransferOwnerAsync(fixture));
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() =>
+            InsertManagedRemoteSelectionAttemptAsync(fixture));
+        var nextManifest = new ManagedProfileCleanupManifest(
+            Guid.NewGuid(), fixture.AccountId, fixture.Session.Identity.SessionId,
+            Path.Combine(root, "source-fenced"), Path.Combine(root, "quarantine-fenced"),
+            fixture.Session.Identity.ProfileOwnershipId, null);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Store.CreateCleanupManifestAsync(nextManifest, default));
+    }
+
+    [Fact]
+    public async Task CleanupStateMachineCoordinatesSessionAndReleasesClaimOnlyAfterConfirmedDeletion()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("state-success");
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+                fixture.ClaimRequest(), default)).Status);
+
+        var current = (await fixture.Store.LoadCleanupManifestAsync(
+            fixture.Manifest.Manifest.ManifestId, default))!;
+        var quarantined = await fixture.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                current.Manifest.ManifestId, current.Revision, current.State,
+                ManagedProfileCleanupState.Quarantined), default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, quarantined.Status);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Quarantined,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+
+        current = (await fixture.Store.LoadCleanupManifestAsync(current.Manifest.ManifestId, default))!;
+        var deleteIntent = await fixture.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                current.Manifest.ManifestId, current.Revision, current.State,
+                ManagedProfileCleanupState.DeleteIntent, "confirmed-delete-hash"), default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, deleteIntent.Status);
+        current = (await fixture.Store.LoadCleanupManifestAsync(current.Manifest.ManifestId, default))!;
+        Assert.Equal("confirmed-delete-hash", current.Manifest.ConfirmationTokenHash);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Quarantined,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(1L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+
+        var deleted = await fixture.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                current.Manifest.ManifestId, current.Revision, current.State,
+                ManagedProfileCleanupState.Deleted), default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, deleted.Status);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Deleted,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(0L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+    }
+
+    [Fact]
+    public async Task CleanupStateMachineKeepsClaimForMoveAndDeleteFailureBranches()
+    {
+        var moveFailure = await CreateRetiredCleanupFixtureAsync("move-failure");
+        _ = await moveFailure.Store.TryClaimRetiredIdentityForCleanupAsync(
+            moveFailure.ClaimRequest(), default);
+        var moveManifest = (await moveFailure.Store.LoadCleanupManifestAsync(
+            moveFailure.Manifest.Manifest.ManifestId, default))!;
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await moveFailure.Store.TryTransitionCleanupManifestAsync(
                 new ManagedProfileCleanupTransitionRequest(
-                    Guid.NewGuid(), 0, ManagedProfileCleanupState.Prepared,
-                    ManagedProfileCleanupState.QuarantineMoveIntent), default)).Status);
+                    moveManifest.Manifest.ManifestId, moveManifest.Revision, moveManifest.State,
+                    ManagedProfileCleanupState.CleanupPending), default)).Status);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.CleanupPending,
+            (await moveFailure.Store.LoadSessionAsync(moveFailure.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(1L, await ScalarLongAsync(moveFailure.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+
+        var deleteFailure = await CreateRetiredCleanupFixtureAsync("delete-failure");
+        _ = await deleteFailure.Store.TryClaimRetiredIdentityForCleanupAsync(
+            deleteFailure.ClaimRequest(), default);
+        var deleteManifest = (await deleteFailure.Store.LoadCleanupManifestAsync(
+            deleteFailure.Manifest.Manifest.ManifestId, default))!;
+        _ = await deleteFailure.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                deleteManifest.Manifest.ManifestId, deleteManifest.Revision, deleteManifest.State,
+                ManagedProfileCleanupState.Quarantined), default);
+        deleteManifest = (await deleteFailure.Store.LoadCleanupManifestAsync(
+            deleteManifest.Manifest.ManifestId, default))!;
+        _ = await deleteFailure.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                deleteManifest.Manifest.ManifestId, deleteManifest.Revision, deleteManifest.State,
+                ManagedProfileCleanupState.DeleteIntent, "delete-failure-hash"), default);
+        deleteManifest = (await deleteFailure.Store.LoadCleanupManifestAsync(
+            deleteManifest.Manifest.ManifestId, default))!;
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await deleteFailure.Store.TryTransitionCleanupManifestAsync(
+                new ManagedProfileCleanupTransitionRequest(
+                    deleteManifest.Manifest.ManifestId, deleteManifest.Revision, deleteManifest.State,
+                    ManagedProfileCleanupState.CleanupPending), default)).Status);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.CleanupPending,
+            (await deleteFailure.Store.LoadSessionAsync(deleteFailure.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(1L, await ScalarLongAsync(deleteFailure.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims WHERE ManifestId=$manifest;",
+            ("$manifest", deleteFailure.Manifest.Manifest.ManifestId.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task CleanupStateMachineDatabaseGuardRejectsSkippingBacktrackingAndHashTampering()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("state-guard");
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            "UPDATE ManagedProfileCleanupManifests SET State='Deleted',Revision=Revision+1 WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+        _ = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(fixture.ClaimRequest(), default);
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            "UPDATE ManagedProfileCleanupManifests SET State='DeleteIntent',ConfirmationTokenHash='hash',Revision=Revision+1 WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+
+        var current = (await fixture.Store.LoadCleanupManifestAsync(
+            fixture.Manifest.Manifest.ManifestId, default))!;
+        _ = await fixture.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                current.Manifest.ManifestId, current.Revision, current.State,
+                ManagedProfileCleanupState.Quarantined), default);
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            "UPDATE ManagedProfileCleanupManifests SET State='DeleteIntent',Revision=Revision+1 WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+        foreach (var invalidHash in new[] { "   ", new string('x', 513) })
+        {
+            await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+                fixture.Factory,
+                "UPDATE ManagedProfileCleanupManifests SET State='DeleteIntent',ConfirmationTokenHash=$hash,Revision=Revision+1 WHERE ManifestId=$manifest;",
+                ("$hash", invalidHash),
+                ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+        }
+        current = (await fixture.Store.LoadCleanupManifestAsync(current.Manifest.ManifestId, default))!;
+        _ = await fixture.Store.TryTransitionCleanupManifestAsync(
+            new ManagedProfileCleanupTransitionRequest(
+                current.Manifest.ManifestId, current.Revision, current.State,
+                ManagedProfileCleanupState.DeleteIntent, "immutable-hash"), default);
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            "UPDATE ManagedProfileCleanupManifests SET ConfirmationTokenHash='replacement',Revision=Revision+1 WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            "UPDATE ManagedProfileCleanupManifests SET State='Quarantined',Revision=Revision+1 WHERE ManifestId=$manifest;",
+            ("$manifest", fixture.Manifest.Manifest.ManifestId.ToString("D"))));
     }
 
     [Fact]
@@ -376,7 +646,12 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         await using (var connection = await factory.OpenConnectionAsync())
         {
             await using var corrupt = connection.CreateCommand();
-            corrupt.CommandText = "PRAGMA ignore_check_constraints=ON; UPDATE ManagedProfileCleanupManifests SET State='UnknownState' WHERE ManifestId=$id; PRAGMA ignore_check_constraints=OFF;";
+            corrupt.CommandText = """
+                DROP TRIGGER TR_ManagedProfileCleanupManifests_StateMachine;
+                PRAGMA ignore_check_constraints=ON;
+                UPDATE ManagedProfileCleanupManifests SET State='UnknownState' WHERE ManifestId=$id;
+                PRAGMA ignore_check_constraints=OFF;
+                """;
             corrupt.Parameters.AddWithValue("$id", manifest.ManifestId.ToString("D"));
             await corrupt.ExecuteNonQueryAsync();
         }
@@ -501,7 +776,7 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         new(Guid.NewGuid(), accountId, session.SessionId,
             Path.Combine(root, $"source-secret-{suffix}"),
             Path.Combine(root, $"quarantine-secret-{suffix}"),
-            session.ProfileOwnershipId, $"confirmation-{suffix}");
+            session.ProfileOwnershipId, null);
 
     private async Task<(Guid OperationId, StoredManagedProfileCleanupManifest Manifest)> SeedManagedOwnersAsync(
         SqliteConnectionFactory factory,
@@ -550,6 +825,137 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         var manifest = await store.CreateCleanupManifestAsync(
             CleanupManifest(accountId, session, "retention"), default);
         return (operationId, manifest);
+    }
+
+    private async Task<CleanupFixture> CreateRetiredCleanupFixtureAsync(string suffix)
+    {
+        var (factory, store) = await CreateStoreAsync();
+        var accountId = Guid.NewGuid();
+        await SeedAccountAsync(factory, accountId, $"uid-{suffix}");
+        var installation = await store.CreateInstallationAsync(
+            Installation(BrowserFamily.Chrome, $"chrome-{suffix}", $"file-{suffix}"), default);
+        installation = (await store.TryReplaceActiveInstallationAsync(
+            new ManagedBrowserInstallationActivationRequest(null, installation), default)).Current!;
+        var identity = Session(
+            installation.Identity.InstallationId, accountId, $"uid-{suffix}", BrowserFamily.Chrome,
+            $"profile-{suffix}", $"ownership-{suffix}");
+        var session = await store.CreateSessionAsync(identity, default);
+        session = (await store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, session), default)).Current!;
+        var manifestIdentity = new ManagedProfileCleanupManifest(
+            Guid.NewGuid(), accountId, identity.SessionId,
+            Path.Combine(root, $"source-{suffix}"), Path.Combine(root, $"quarantine-{suffix}"),
+            identity.ProfileOwnershipId, null);
+        var manifest = await store.CreateCleanupManifestAsync(manifestIdentity, default);
+        var retiredSession = await store.TryRetireSessionAsync(
+            new ManagedBrowserTransitionRequest(identity.SessionId, session.Revision), default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredSession.Status);
+        session = (await store.LoadSessionAsync(identity.SessionId, default))!;
+        var retiredInstallation = await store.TryRetireInstallationAsync(
+            new ManagedBrowserTransitionRequest(installation.Identity.InstallationId, installation.Revision), default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredInstallation.Status);
+        installation = (await store.LoadInstallationAsync(installation.Identity.InstallationId, default))!;
+        return new CleanupFixture(factory, store, accountId, installation, session, manifest);
+    }
+
+    private static async Task<Guid> InsertManagedTransferOwnerAsync(CleanupFixture fixture)
+    {
+        var batchId = Guid.NewGuid();
+        var resourceId = Guid.NewGuid();
+        var operationId = Guid.NewGuid();
+        await using var connection = await fixture.Factory.OpenConnectionAsync();
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
+              OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
+            VALUES($batch,'job','Text','Distribution','TaskCount','ProportionalReduction',1,1,'/','None','Skip',
+              'Immediate','Queued',$now,1);
+            INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+              FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES($resource,$batch,1,'https://pan.baidu.com/s/claim','claim','1111','None','Valid','Expanded',$now,$now);
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Automatic','Waiting',0,'claim-fp',
+              'NotPrepared','Unoccupied',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """;
+        command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
+        command.Parameters.AddWithValue("$resource", resourceId.ToString("D"));
+        command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
+        command.Parameters.AddWithValue("$account", fixture.AccountId.ToString("D"));
+        command.Parameters.AddWithValue("$family", fixture.Session.Identity.BrowserFamily.ToString());
+        command.Parameters.AddWithValue("$profile", fixture.Session.Identity.ProfileId);
+        command.Parameters.AddWithValue("$installation", fixture.Installation.Identity.InstallationId.ToString("D"));
+        command.Parameters.AddWithValue("$session", fixture.Session.Identity.SessionId.ToString("D"));
+        command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync();
+        await transaction.CommitAsync();
+        return operationId;
+    }
+
+    private static async Task InsertManagedRemoteSelectionAttemptAsync(CleanupFixture fixture)
+    {
+        await using var connection = await fixture.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+              Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$account,1,'RemoteSelection','Preparing',0,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """;
+        command.Parameters.AddWithValue("$operation", Guid.NewGuid().ToString("D"));
+        command.Parameters.AddWithValue("$account", fixture.AccountId.ToString("D"));
+        command.Parameters.AddWithValue("$family", fixture.Session.Identity.BrowserFamily.ToString());
+        command.Parameters.AddWithValue("$profile", fixture.Session.Identity.ProfileId);
+        command.Parameters.AddWithValue("$installation", fixture.Installation.Identity.InstallationId.ToString("D"));
+        command.Parameters.AddWithValue("$session", fixture.Session.Identity.SessionId.ToString("D"));
+        command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> ScalarLongAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] parameters)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters) command.Parameters.AddWithValue(name, value);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task<int> ExecuteAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] parameters)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters) command.Parameters.AddWithValue(name, value);
+        return await command.ExecuteNonQueryAsync();
+    }
+
+    private sealed record CleanupFixture(
+        SqliteConnectionFactory Factory,
+        SqliteManagedBrowserStateStore Store,
+        Guid AccountId,
+        StoredBrowserInstallation Installation,
+        StoredManagedBrowserSession Session,
+        StoredManagedProfileCleanupManifest Manifest)
+    {
+        public ManagedBrowserCleanupClaimRequest ClaimRequest() => new(
+            Installation.Identity.InstallationId,
+            Session.Identity.SessionId,
+            AccountId,
+            Installation.Revision,
+            Session.Revision,
+            Manifest.Manifest.ManifestId,
+            Manifest.Revision);
     }
 
     private static async Task DeleteManagedOperationAndAttemptAsync(

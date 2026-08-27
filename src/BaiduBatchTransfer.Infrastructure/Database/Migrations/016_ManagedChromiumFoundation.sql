@@ -88,6 +88,89 @@ CREATE TABLE ManagedBrowserRetentions (
 CREATE INDEX IX_ManagedBrowserRetentions_Identity
 ON ManagedBrowserRetentions(InstallationId,SessionId,OwnerKind,OwnerId);
 
+CREATE TABLE ManagedBrowserCleanupClaims (
+    ManifestId TEXT PRIMARY KEY,
+    InstallationId TEXT NOT NULL,
+    SessionId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    ExpectedInstallationRevision INTEGER NOT NULL CHECK(ExpectedInstallationRevision >= 0),
+    ExpectedSessionRevision INTEGER NOT NULL CHECK(ExpectedSessionRevision >= 0),
+    ExpectedManifestRevision INTEGER NOT NULL CHECK(ExpectedManifestRevision >= 0),
+    CreatedAt TEXT NOT NULL,
+    UNIQUE(InstallationId,SessionId),
+    FOREIGN KEY(ManifestId) REFERENCES ManagedProfileCleanupManifests(ManifestId),
+    FOREIGN KEY(SessionId,InstallationId)
+      REFERENCES ManagedBrowserSessions(SessionId,InstallationId),
+    FOREIGN KEY(AccountId) REFERENCES Accounts(Id)
+);
+
+CREATE INDEX IX_ManagedBrowserCleanupClaims_Identity
+ON ManagedBrowserCleanupClaims(InstallationId,SessionId,ManifestId);
+
+-- v15 intentionally had no polymorphic owner foreign key.  Ownerless attempts
+-- cannot be recovered safely, and retaining them would fabricate an execution
+-- snapshot during the v16 rebuild.  Remove their exact evidence closure first;
+-- migration-time foreign-key enforcement may be suspended by the migrator.
+CREATE TEMP TABLE V16OwnerlessWebAutomationAttempts (
+    OperationId TEXT NOT NULL,
+    AccountId TEXT NOT NULL,
+    Generation INTEGER NOT NULL,
+    PRIMARY KEY(OperationId,AccountId,Generation)
+) WITHOUT ROWID;
+
+INSERT INTO V16OwnerlessWebAutomationAttempts(OperationId,AccountId,Generation)
+SELECT attempt.OperationId,attempt.AccountId,attempt.Generation
+FROM WebAutomationAttempts attempt
+WHERE (attempt.OwnerKind='Transfer' AND NOT EXISTS(
+         SELECT 1 FROM TransferOperations operation
+         WHERE operation.Id=attempt.OperationId
+           AND operation.AssignedAccountId=attempt.AccountId))
+   OR (attempt.OwnerKind='TransferShare' AND NOT EXISTS(
+         SELECT 1 FROM ShareOperations operation
+         WHERE operation.Id=attempt.OperationId
+           AND operation.AccountId=attempt.AccountId))
+   OR (attempt.OwnerKind='StandaloneShare' AND NOT EXISTS(
+         SELECT 1 FROM StandaloneShareOperations operation
+         WHERE operation.Id=attempt.OperationId
+           AND operation.AccountId=attempt.AccountId));
+
+DELETE FROM WebAutomationDirectoryMutations
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationDirectoryMutations.OperationId
+    AND orphan.AccountId=WebAutomationDirectoryMutations.AccountId
+    AND orphan.Generation=WebAutomationDirectoryMutations.OriginGeneration);
+
+DELETE FROM WebAutomationAttemptSourceItems
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationAttemptSourceItems.OperationId
+    AND orphan.AccountId=WebAutomationAttemptSourceItems.AccountId
+    AND orphan.Generation=WebAutomationAttemptSourceItems.Generation);
+
+DELETE FROM WebAutomationAttemptRemoteItems
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationAttemptRemoteItems.OperationId
+    AND orphan.AccountId=WebAutomationAttemptRemoteItems.AccountId
+    AND orphan.Generation=WebAutomationAttemptRemoteItems.Generation);
+
+DELETE FROM WebAutomationTransferMappings
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationTransferMappings.OperationId
+    AND orphan.AccountId=WebAutomationTransferMappings.AccountId
+    AND orphan.Generation=WebAutomationTransferMappings.Generation);
+
+DELETE FROM WebAutomationAttempts
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationAttempts.OperationId
+    AND orphan.AccountId=WebAutomationAttempts.AccountId
+    AND orphan.Generation=WebAutomationAttempts.Generation);
+
+DROP TABLE V16OwnerlessWebAutomationAttempts;
+
 -- Stage and validate every v15 owner before altering any original table.  The
 -- staging table deliberately has final non-null/check constraints so a bad
 -- parent/account mapping aborts the surrounding migration transaction.
@@ -538,6 +621,101 @@ BEGIN
     SELECT RAISE(ABORT, 'managed browser session identity is immutable');
 END;
 
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_Prepared_Insert
+BEFORE INSERT ON ManagedProfileCleanupManifests
+WHEN NEW.State<>'Prepared' OR NEW.ConfirmationTokenHash IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup manifest must begin prepared without confirmation');
+END;
+
+CREATE TRIGGER TR_ManagedBrowserCleanupClaims_Validate_Insert
+BEFORE INSERT ON ManagedBrowserCleanupClaims
+WHEN NOT EXISTS(
+       SELECT 1 FROM BrowserInstallations installation
+       WHERE installation.InstallationId=NEW.InstallationId
+         AND installation.State='Retired' AND installation.Revision=NEW.ExpectedInstallationRevision)
+  OR NOT EXISTS(
+       SELECT 1 FROM ManagedBrowserSessions session
+       WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
+         AND session.AccountId=NEW.AccountId AND session.State='Retired'
+         AND session.Revision=NEW.ExpectedSessionRevision)
+  OR NOT EXISTS(
+       SELECT 1 FROM ManagedProfileCleanupManifests manifest
+       WHERE manifest.ManifestId=NEW.ManifestId AND manifest.SessionId=NEW.SessionId
+         AND manifest.AccountId=NEW.AccountId AND manifest.State='Prepared'
+         AND manifest.Revision=NEW.ExpectedManifestRevision
+         AND manifest.ConfirmationTokenHash IS NULL)
+  OR EXISTS(
+       SELECT 1 FROM TransferOperations operation
+       WHERE operation.InstallationId=NEW.InstallationId AND operation.SessionId=NEW.SessionId)
+  OR EXISTS(
+       SELECT 1 FROM ShareOperations operation
+       WHERE operation.InstallationId=NEW.InstallationId AND operation.SessionId=NEW.SessionId)
+  OR EXISTS(
+       SELECT 1 FROM StandaloneShareOperations operation
+       WHERE operation.InstallationId=NEW.InstallationId AND operation.SessionId=NEW.SessionId)
+  OR EXISTS(
+       SELECT 1 FROM WebAutomationAttempts attempt
+       WHERE attempt.InstallationId=NEW.InstallationId AND attempt.SessionId=NEW.SessionId)
+  OR EXISTS(
+       SELECT 1 FROM ManagedProfileCleanupManifests manifest
+       WHERE manifest.SessionId=NEW.SessionId AND manifest.State<>'Deleted'
+         AND manifest.ManifestId<>NEW.ManifestId)
+  OR EXISTS(
+       SELECT 1 FROM ManagedBrowserRetentions retention
+       WHERE retention.InstallationId=NEW.InstallationId AND retention.SessionId=NEW.SessionId
+         AND NOT(retention.OwnerKind='CleanupManifest' AND retention.OwnerId=NEW.ManifestId))
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser cleanup claim is not eligible');
+END;
+
+CREATE TRIGGER TR_TransferOperations_RejectCleanupClaim_Insert
+BEFORE INSERT ON TransferOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
+  SELECT 1 FROM ManagedBrowserCleanupClaims claim
+  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
+END;
+
+CREATE TRIGGER TR_ShareOperations_RejectCleanupClaim_Insert
+BEFORE INSERT ON ShareOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
+  SELECT 1 FROM ManagedBrowserCleanupClaims claim
+  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
+END;
+
+CREATE TRIGGER TR_StandaloneShareOperations_RejectCleanupClaim_Insert
+BEFORE INSERT ON StandaloneShareOperations
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
+  SELECT 1 FROM ManagedBrowserCleanupClaims claim
+  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
+END;
+
+CREATE TRIGGER TR_WebAutomationAttempts_RejectCleanupClaim_Insert
+BEFORE INSERT ON WebAutomationAttempts
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
+  SELECT 1 FROM ManagedBrowserCleanupClaims claim
+  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_RejectCleanupClaim_Insert
+BEFORE INSERT ON ManagedProfileCleanupManifests
+WHEN EXISTS(
+  SELECT 1 FROM ManagedBrowserSessions session
+  JOIN ManagedBrowserCleanupClaims claim
+    ON claim.InstallationId=session.InstallationId AND claim.SessionId=session.SessionId
+  WHERE session.SessionId=NEW.SessionId)
+BEGIN
+    SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
+END;
+
 CREATE TRIGGER TR_TransferOperations_ExecutionSnapshotImmutable
 BEFORE UPDATE OF ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
 ON TransferOperations
@@ -661,17 +839,99 @@ BEGIN
     SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
 END;
 
+CREATE TRIGGER TR_TransferOperations_RequireAttemptClosure_Delete
+BEFORE DELETE ON TransferOperations
+WHEN EXISTS(
+  SELECT 1 FROM WebAutomationAttempts attempt
+  WHERE attempt.OwnerKind='Transfer' AND attempt.OperationId=OLD.Id
+    AND attempt.AccountId=OLD.AssignedAccountId)
+BEGIN
+    SELECT RAISE(ABORT, 'transfer attempt history must be closed before owner deletion');
+END;
+
+CREATE TRIGGER TR_ShareOperations_RequireAttemptClosure_Delete
+BEFORE DELETE ON ShareOperations
+WHEN EXISTS(
+  SELECT 1 FROM WebAutomationAttempts attempt
+  WHERE attempt.OwnerKind='TransferShare' AND attempt.OperationId=OLD.Id
+    AND attempt.AccountId=OLD.AccountId)
+BEGIN
+    SELECT RAISE(ABORT, 'share attempt history must be closed before owner deletion');
+END;
+
+CREATE TRIGGER TR_StandaloneShareOperations_RequireAttemptClosure_Delete
+BEFORE DELETE ON StandaloneShareOperations
+WHEN EXISTS(
+  SELECT 1 FROM WebAutomationAttempts attempt
+  WHERE attempt.OwnerKind='StandaloneShare' AND attempt.OperationId=OLD.Id
+    AND attempt.AccountId=OLD.AccountId)
+BEGIN
+    SELECT RAISE(ABORT, 'standalone share attempt history must be closed before owner deletion');
+END;
+
 CREATE TRIGGER TR_ManagedProfileCleanupManifests_IdentityImmutable
-BEFORE UPDATE OF AccountId,SessionId,SourceProfilePath,QuarantinePath,ExpectedOwnershipId,ConfirmationTokenHash
+BEFORE UPDATE OF AccountId,SessionId,SourceProfilePath,QuarantinePath,ExpectedOwnershipId
 ON ManagedProfileCleanupManifests
 WHEN NEW.AccountId IS NOT OLD.AccountId
   OR NEW.SessionId IS NOT OLD.SessionId
   OR NEW.SourceProfilePath IS NOT OLD.SourceProfilePath
   OR NEW.QuarantinePath IS NOT OLD.QuarantinePath
   OR NEW.ExpectedOwnershipId IS NOT OLD.ExpectedOwnershipId
-  OR NEW.ConfirmationTokenHash IS NOT OLD.ConfirmationTokenHash
 BEGIN
     SELECT RAISE(ABORT, 'cleanup manifest identity is immutable');
+END;
+
+CREATE TRIGGER TR_ManagedProfileCleanupManifests_StateMachine
+BEFORE UPDATE OF State,ConfirmationTokenHash ON ManagedProfileCleanupManifests
+WHEN NOT (
+  NEW.Revision=OLD.Revision+1
+  AND (
+    (OLD.State='Prepared' AND NEW.State='QuarantineMoveIntent'
+      AND OLD.ConfirmationTokenHash IS NULL AND NEW.ConfirmationTokenHash IS NULL
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='QuarantinePending'))
+    OR (OLD.State='QuarantineMoveIntent' AND NEW.State='Quarantined'
+      AND OLD.ConfirmationTokenHash IS NULL AND NEW.ConfirmationTokenHash IS NULL
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='Quarantined'))
+    OR (OLD.State='QuarantineMoveIntent' AND NEW.State='CleanupPending'
+      AND OLD.ConfirmationTokenHash IS NULL AND NEW.ConfirmationTokenHash IS NULL
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='CleanupPending'))
+    OR (OLD.State='Quarantined' AND NEW.State='DeleteIntent'
+      AND OLD.ConfirmationTokenHash IS NULL
+      AND NEW.ConfirmationTokenHash IS NOT NULL
+      AND length(trim(NEW.ConfirmationTokenHash))>0
+      AND NEW.ConfirmationTokenHash=trim(NEW.ConfirmationTokenHash)
+      AND length(NEW.ConfirmationTokenHash)<=512
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='Quarantined'))
+    OR (OLD.State='DeleteIntent' AND NEW.State='Deleted'
+      AND NEW.ConfirmationTokenHash IS OLD.ConfirmationTokenHash
+      AND OLD.ConfirmationTokenHash IS NOT NULL
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='Deleted'))
+    OR (OLD.State='DeleteIntent' AND NEW.State='CleanupPending'
+      AND NEW.ConfirmationTokenHash IS OLD.ConfirmationTokenHash
+      AND OLD.ConfirmationTokenHash IS NOT NULL
+      AND EXISTS(
+        SELECT 1 FROM ManagedBrowserCleanupClaims claim
+        JOIN ManagedBrowserSessions session ON session.SessionId=claim.SessionId
+        WHERE claim.ManifestId=OLD.ManifestId AND session.State='CleanupPending'))
+  )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup manifest state transition is invalid');
 END;
 
 CREATE TRIGGER TR_ManagedProfileCleanupManifests_DeletedTerminal

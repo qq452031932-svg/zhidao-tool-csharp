@@ -89,7 +89,8 @@ public sealed record ManagedProfileCleanupTransitionRequest
         Guid manifestId,
         long expectedRevision,
         ManagedProfileCleanupState expectedState,
-        ManagedProfileCleanupState targetState)
+        ManagedProfileCleanupState targetState,
+        string? confirmationTokenHash = null)
     {
         if (manifestId == Guid.Empty)
             throw new ArgumentException("A manifest ID is required.", nameof(manifestId));
@@ -99,22 +100,96 @@ public sealed record ManagedProfileCleanupTransitionRequest
             throw new ArgumentOutOfRangeException(nameof(expectedState), expectedState, "An expected cleanup state is required.");
         if (!Enum.IsDefined(targetState))
             throw new ArgumentOutOfRangeException(nameof(targetState), targetState, "A target cleanup state is required.");
-        if (expectedState == ManagedProfileCleanupState.Deleted ||
-            targetState == ManagedProfileCleanupState.Prepared ||
-            expectedState == targetState)
+        var isAllowed = (expectedState, targetState) switch
+        {
+            (ManagedProfileCleanupState.Prepared, ManagedProfileCleanupState.QuarantineMoveIntent) => true,
+            (ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.Quarantined) => true,
+            (ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.CleanupPending) => true,
+            (ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.DeleteIntent) => true,
+            (ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.Deleted) => true,
+            (ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.CleanupPending) => true,
+            _ => false,
+        };
+        if (!isAllowed)
             throw new ArgumentException("The cleanup state transition is invalid.", nameof(targetState));
+        if (targetState == ManagedProfileCleanupState.DeleteIntent)
+        {
+            if (string.IsNullOrWhiteSpace(confirmationTokenHash))
+                throw new ArgumentException("Confirmation evidence is required.", nameof(confirmationTokenHash));
+            if (confirmationTokenHash != confirmationTokenHash.Trim() ||
+                confirmationTokenHash.Length > 512 || confirmationTokenHash.Any(char.IsControl))
+                throw new ArgumentException("The confirmation evidence is invalid or too long.", nameof(confirmationTokenHash));
+        }
+        else if (confirmationTokenHash is not null)
+        {
+            throw new ArgumentException(
+                "Confirmation evidence is valid only for a delete-intent transition.",
+                nameof(confirmationTokenHash));
+        }
         ManifestId = manifestId;
         ExpectedRevision = expectedRevision;
         ExpectedState = expectedState;
         TargetState = targetState;
+        ConfirmationTokenHash = confirmationTokenHash;
     }
 
     public Guid ManifestId { get; }
     public long ExpectedRevision { get; }
     public ManagedProfileCleanupState ExpectedState { get; }
     public ManagedProfileCleanupState TargetState { get; }
+    public string? ConfirmationTokenHash { get; }
 
     public override string ToString() =>
         $"ManagedProfileCleanupTransitionRequest {{ ManifestId = [REDACTED], ExpectedRevision = {ExpectedRevision}, " +
         $"ExpectedState = {ExpectedState}, TargetState = {TargetState} }}";
+}
+
+public sealed record ManagedBrowserCleanupClaimRequest
+{
+    public ManagedBrowserCleanupClaimRequest(
+        Guid installationId,
+        Guid sessionId,
+        Guid accountId,
+        long expectedInstallationRevision,
+        long expectedSessionRevision,
+        Guid manifestId,
+        long expectedManifestRevision)
+    {
+        if (installationId == Guid.Empty)
+            throw new ArgumentException("An installation ID is required.", nameof(installationId));
+        if (sessionId == Guid.Empty)
+            throw new ArgumentException("A session ID is required.", nameof(sessionId));
+        if (accountId == Guid.Empty)
+            throw new ArgumentException("An account ID is required.", nameof(accountId));
+        if (manifestId == Guid.Empty)
+            throw new ArgumentException("A manifest ID is required.", nameof(manifestId));
+        if (expectedInstallationRevision < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedInstallationRevision));
+        if (expectedSessionRevision < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedSessionRevision));
+        if (expectedManifestRevision < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedManifestRevision));
+
+        InstallationId = installationId;
+        SessionId = sessionId;
+        AccountId = accountId;
+        ExpectedInstallationRevision = expectedInstallationRevision;
+        ExpectedSessionRevision = expectedSessionRevision;
+        ManifestId = manifestId;
+        ExpectedManifestRevision = expectedManifestRevision;
+    }
+
+    public Guid InstallationId { get; }
+    public Guid SessionId { get; }
+    public Guid AccountId { get; }
+    public long ExpectedInstallationRevision { get; }
+    public long ExpectedSessionRevision { get; }
+    public Guid ManifestId { get; }
+    public long ExpectedManifestRevision { get; }
+
+    public override string ToString() =>
+        $"ManagedBrowserCleanupClaimRequest {{ Identity = [REDACTED], " +
+        $"ExpectedInstallationRevision = {ExpectedInstallationRevision}, " +
+        $"ExpectedSessionRevision = {ExpectedSessionRevision}, " +
+        $"ExpectedManifestRevision = {ExpectedManifestRevision} }}";
 }

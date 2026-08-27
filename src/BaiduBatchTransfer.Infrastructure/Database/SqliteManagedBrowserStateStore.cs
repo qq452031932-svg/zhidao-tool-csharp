@@ -407,11 +407,114 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         }
     }
 
+    public async Task<ManagedBrowserTransitionResult> TryClaimRetiredIdentityForCleanupAsync(
+        ManagedBrowserCleanupClaimRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            var installation = await LoadInstallationAsync(
+                connection, transaction, request.InstallationId, cancellationToken).ConfigureAwait(false);
+            var session = await LoadSessionAsync(
+                connection, transaction, request.SessionId, cancellationToken).ConfigureAwait(false);
+            var manifest = await LoadCleanupManifestAsync(
+                connection, transaction, request.ManifestId, cancellationToken).ConfigureAwait(false);
+            if (installation is null || session is null || manifest is null)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.NotFound();
+            }
+            if (installation.State != BrowserInstallationLifecycleState.Retired ||
+                installation.Revision != request.ExpectedInstallationRevision ||
+                session.State != ManagedBrowserSessionLifecycleState.Retired ||
+                session.Revision != request.ExpectedSessionRevision ||
+                session.Identity.InstallationId != request.InstallationId ||
+                session.Identity.AccountId != request.AccountId ||
+                manifest.State != ManagedProfileCleanupState.Prepared ||
+                manifest.Revision != request.ExpectedManifestRevision ||
+                manifest.Manifest.SessionId != request.SessionId ||
+                manifest.Manifest.AccountId != request.AccountId ||
+                manifest.Manifest.ConfirmationTokenHash is not null)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.Conflict(manifest.Revision);
+            }
+
+            await using (var claim = connection.CreateCommand())
+            {
+                claim.Transaction = transaction;
+                claim.CommandText = """
+                    INSERT INTO ManagedBrowserCleanupClaims(
+                      ManifestId,InstallationId,SessionId,AccountId,ExpectedInstallationRevision,
+                      ExpectedSessionRevision,ExpectedManifestRevision,CreatedAt)
+                    VALUES($manifest,$installation,$session,$account,$installationRevision,
+                      $sessionRevision,$manifestRevision,$created);
+                    """;
+                claim.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
+                claim.Parameters.AddWithValue("$installation", request.InstallationId.ToString("D"));
+                claim.Parameters.AddWithValue("$session", request.SessionId.ToString("D"));
+                claim.Parameters.AddWithValue("$account", request.AccountId.ToString("D"));
+                claim.Parameters.AddWithValue("$installationRevision", request.ExpectedInstallationRevision);
+                claim.Parameters.AddWithValue("$sessionRevision", request.ExpectedSessionRevision);
+                claim.Parameters.AddWithValue("$manifestRevision", request.ExpectedManifestRevision);
+                claim.Parameters.AddWithValue("$created", DateTimeOffset.UtcNow.ToString("O"));
+                try
+                {
+                    await claim.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return ManagedBrowserTransitionResult.Conflict(manifest.Revision);
+                }
+            }
+
+            var updatedAt = DateTimeOffset.UtcNow.ToString("O");
+            if (await UpdateSessionStateAsync(
+                    connection, transaction, request.SessionId, request.ExpectedSessionRevision,
+                    ManagedBrowserSessionLifecycleState.Retired,
+                    ManagedBrowserSessionLifecycleState.QuarantinePending,
+                    updatedAt, requireActiveAccount: false, cancellationToken).ConfigureAwait(false) != 1)
+                throw new InvalidOperationException("Managed browser cleanup claim could not be applied.");
+
+            await using (var updateManifest = connection.CreateCommand())
+            {
+                updateManifest.Transaction = transaction;
+                updateManifest.CommandText = """
+                    UPDATE ManagedProfileCleanupManifests
+                    SET State='QuarantineMoveIntent',Revision=Revision+1,UpdatedAt=$updated
+                    WHERE ManifestId=$manifest AND State='Prepared' AND Revision=$revision
+                      AND ConfirmationTokenHash IS NULL;
+                    """;
+                updateManifest.Parameters.AddWithValue("$updated", updatedAt);
+                updateManifest.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
+                updateManifest.Parameters.AddWithValue("$revision", request.ExpectedManifestRevision);
+                if (await updateManifest.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                    throw new InvalidOperationException("Managed browser cleanup claim could not be applied.");
+            }
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return ManagedBrowserTransitionResult.Applied(checked(manifest.Revision + 1));
+        }
+        catch
+        {
+            try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
+            catch { /* Preserve the original safe failure. */ }
+            throw;
+        }
+    }
+
     public async Task<StoredManagedProfileCleanupManifest> CreateCleanupManifestAsync(
         ManagedProfileCleanupManifest manifest,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(manifest);
+        if (manifest.ConfirmationTokenHash is not null)
+            throw new InvalidOperationException("Managed profile cleanup manifest could not be created.");
         cancellationToken.ThrowIfCancellationRequested();
         var now = DateTimeOffset.UtcNow.ToString("O");
         try
@@ -470,8 +573,7 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         ArgumentNullException.ThrowIfNull(request);
         cancellationToken.ThrowIfCancellationRequested();
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = (SqliteTransaction)await connection
-            .BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
         try
         {
             var current = await LoadCleanupManifestAsync(
@@ -487,15 +589,109 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
                 return ManagedBrowserTransitionResult.Conflict(current.Revision);
             }
 
+            // Prepared -> QuarantineMoveIntent is the cleanup claim operation.  It must
+            // atomically prove retirement eligibility and install the durable fence, so
+            // it is deliberately unavailable through the generic transition method.
+            if (request.ExpectedState == ManagedProfileCleanupState.Prepared)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.Conflict(current.Revision);
+            }
+
+            Guid claimedInstallationId;
+            Guid claimedSessionId;
+            await using (var loadClaim = connection.CreateCommand())
+            {
+                loadClaim.Transaction = transaction;
+                loadClaim.CommandText = """
+                    SELECT InstallationId,SessionId
+                    FROM ManagedBrowserCleanupClaims
+                    WHERE ManifestId=$manifest;
+                    """;
+                loadClaim.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
+                await using var reader = await loadClaim.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return ManagedBrowserTransitionResult.Conflict(current.Revision);
+                }
+                try
+                {
+                    claimedInstallationId = Guid.ParseExact(reader.GetString(0), "D");
+                    claimedSessionId = Guid.ParseExact(reader.GetString(1), "D");
+                }
+                catch (Exception exception) when (exception is FormatException or InvalidCastException)
+                {
+                    throw new InvalidDataException("Managed browser cleanup claim state is invalid.");
+                }
+                if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    throw new InvalidDataException("Managed browser cleanup claim state is invalid.");
+            }
+
+            var session = await LoadSessionAsync(
+                connection, transaction, claimedSessionId, cancellationToken).ConfigureAwait(false);
+            if (session is null ||
+                claimedSessionId != current.Manifest.SessionId ||
+                session.Identity.SessionId != current.Manifest.SessionId ||
+                session.Identity.InstallationId != claimedInstallationId ||
+                session.Identity.AccountId != current.Manifest.AccountId)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.Conflict(current.Revision);
+            }
+
+            var requiredSessionTransition = (request.ExpectedState, request.TargetState) switch
+            {
+                (ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.Quarantined) =>
+                    (ManagedBrowserSessionLifecycleState.QuarantinePending,
+                     ManagedBrowserSessionLifecycleState.Quarantined),
+                (ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.CleanupPending) =>
+                    (ManagedBrowserSessionLifecycleState.QuarantinePending,
+                     ManagedBrowserSessionLifecycleState.CleanupPending),
+                (ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.Deleted) =>
+                    (ManagedBrowserSessionLifecycleState.Quarantined,
+                     ManagedBrowserSessionLifecycleState.Deleted),
+                (ManagedProfileCleanupState.DeleteIntent, ManagedProfileCleanupState.CleanupPending) =>
+                    (ManagedBrowserSessionLifecycleState.Quarantined,
+                     ManagedBrowserSessionLifecycleState.CleanupPending),
+                (ManagedProfileCleanupState.Quarantined, ManagedProfileCleanupState.DeleteIntent) =>
+                    ((ManagedBrowserSessionLifecycleState Expected,
+                      ManagedBrowserSessionLifecycleState Target)?)null,
+                _ => throw new InvalidOperationException("Managed profile cleanup transition is invalid."),
+            };
+
+            var updatedAt = DateTimeOffset.UtcNow.ToString("O");
+            if (requiredSessionTransition is { } sessionTransition)
+            {
+                if (session.State != sessionTransition.Expected ||
+                    await UpdateSessionStateAsync(
+                        connection, transaction, claimedSessionId, session.Revision,
+                        sessionTransition.Expected, sessionTransition.Target, updatedAt,
+                        requireActiveAccount: false, cancellationToken).ConfigureAwait(false) != 1)
+                {
+                    await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                    return ManagedBrowserTransitionResult.Conflict(current.Revision);
+                }
+            }
+            else if (session.State != ManagedBrowserSessionLifecycleState.Quarantined)
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return ManagedBrowserTransitionResult.Conflict(current.Revision);
+            }
+
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
                 UPDATE ManagedProfileCleanupManifests
-                SET State=$target,Revision=Revision+1,UpdatedAt=$updated
+                SET State=$target,
+                    ConfirmationTokenHash=CASE WHEN $target='DeleteIntent' THEN $confirmation
+                                               ELSE ConfirmationTokenHash END,
+                    Revision=Revision+1,UpdatedAt=$updated
                 WHERE ManifestId=$manifest AND Revision=$revision AND State=$expected;
                 """;
             command.Parameters.AddWithValue("$target", FormatState(request.TargetState));
-            command.Parameters.AddWithValue("$updated", DateTimeOffset.UtcNow.ToString("O"));
+            command.Parameters.AddWithValue("$confirmation", (object?)request.ConfirmationTokenHash ?? DBNull.Value);
+            command.Parameters.AddWithValue("$updated", updatedAt);
             command.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
             command.Parameters.AddWithValue("$revision", request.ExpectedRevision);
             command.Parameters.AddWithValue("$expected", FormatState(request.ExpectedState));
@@ -507,6 +703,16 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
                 return conflict is null
                     ? ManagedBrowserTransitionResult.NotFound()
                     : ManagedBrowserTransitionResult.Conflict(conflict.Revision);
+            }
+
+            if (request.TargetState == ManagedProfileCleanupState.Deleted)
+            {
+                await using var releaseClaim = connection.CreateCommand();
+                releaseClaim.Transaction = transaction;
+                releaseClaim.CommandText = "DELETE FROM ManagedBrowserCleanupClaims WHERE ManifestId=$manifest;";
+                releaseClaim.Parameters.AddWithValue("$manifest", request.ManifestId.ToString("D"));
+                if (await releaseClaim.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                    throw new InvalidOperationException("Managed browser cleanup claim could not be released.");
             }
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return ManagedBrowserTransitionResult.Applied(checked(current.Revision + 1));

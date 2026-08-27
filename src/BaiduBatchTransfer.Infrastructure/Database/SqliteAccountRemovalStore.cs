@@ -721,6 +721,37 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             """, token).ConfigureAwait(false);
 
         await ExecuteChangeAsync(connection, transaction, """
+            DELETE FROM WebAutomationDirectoryMutations
+            WHERE EXISTS(
+              SELECT 1 FROM WebAutomationAttempts attempt
+              WHERE attempt.OperationId=WebAutomationDirectoryMutations.OperationId
+                AND attempt.AccountId=WebAutomationDirectoryMutations.AccountId
+                AND attempt.Generation=WebAutomationDirectoryMutations.OriginGeneration
+                AND (
+                  (attempt.OwnerKind='Transfer'
+                    AND attempt.OperationId IN (
+                      SELECT Id FROM temp.AccountRemovalManifestTargetOperations))
+                  OR
+                  (attempt.OwnerKind='TransferShare'
+                    AND EXISTS(
+                      SELECT 1 FROM ShareOperations share
+                      JOIN temp.AccountRemovalManifestTargetOperations target
+                        ON target.Id=share.TransferOperationId
+                      WHERE share.Id=attempt.OperationId
+                        AND share.AccountId=attempt.AccountId))));
+
+            DELETE FROM WebAutomationAttempts
+            WHERE (OwnerKind='Transfer'
+                    AND OperationId IN (
+                      SELECT Id FROM temp.AccountRemovalManifestTargetOperations))
+               OR (OwnerKind='TransferShare'
+                    AND EXISTS(
+                      SELECT 1 FROM ShareOperations share
+                      JOIN temp.AccountRemovalManifestTargetOperations target
+                        ON target.Id=share.TransferOperationId
+                      WHERE share.Id=WebAutomationAttempts.OperationId
+                        AND share.AccountId=WebAutomationAttempts.AccountId));
+
             DELETE FROM TransferOperations
             WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetOperations);
             """, token).ConfigureAwait(false);
