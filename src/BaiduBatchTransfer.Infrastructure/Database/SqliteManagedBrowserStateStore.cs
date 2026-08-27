@@ -428,8 +428,7 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
                 await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                 return ManagedBrowserTransitionResult.NotFound();
             }
-            if (installation.State != BrowserInstallationLifecycleState.Retired ||
-                installation.Revision != request.ExpectedInstallationRevision ||
+            if (installation.Revision != request.ExpectedInstallationRevision ||
                 session.State != ManagedBrowserSessionLifecycleState.Retired ||
                 session.Revision != request.ExpectedSessionRevision ||
                 session.Identity.InstallationId != request.InstallationId ||

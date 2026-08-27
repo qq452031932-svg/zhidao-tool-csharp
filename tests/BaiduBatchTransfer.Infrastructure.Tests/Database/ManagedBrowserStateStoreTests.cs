@@ -401,6 +401,36 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CleanupClaimAllowsRetiredSessionOnSharedActiveInstallation()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("shared-active-installation", retireInstallation: false);
+        var otherAccountId = Guid.NewGuid();
+        await SeedAccountAsync(fixture.Factory, otherAccountId, "uid-shared-active-other");
+        var otherIdentity = Session(
+            fixture.Installation.Identity.InstallationId, otherAccountId, "uid-shared-active-other",
+            BrowserFamily.Chrome, "profile-shared-active-other", "ownership-shared-active-other");
+        var otherSession = await fixture.Store.CreateSessionAsync(otherIdentity, default);
+        otherSession = (await fixture.Store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, otherSession), default)).Current!;
+
+        var claimed = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+            fixture.ClaimRequest(), default);
+
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied, claimed.Status);
+        Assert.Equal(BrowserInstallationLifecycleState.Active,
+            (await fixture.Store.LoadInstallationAsync(
+                fixture.Installation.Identity.InstallationId, default))!.State);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Active,
+            (await fixture.Store.LoadSessionAsync(otherIdentity.SessionId, default))!.State);
+        var otherFixture = fixture with
+        {
+            AccountId = otherAccountId,
+            Session = otherSession,
+        };
+        _ = await InsertManagedTransferOwnerAsync(otherFixture);
+    }
+
+    [Fact]
     public async Task PreparedCleanupManifestRejectsPrematureConfirmationEvidence()
     {
         var (factory, store) = await CreateStoreAsync();
@@ -532,6 +562,39 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
         Assert.Equal(0L, await ScalarLongAsync(fixture.Factory,
             "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+    }
+
+    [Fact]
+    public async Task DeletedSessionPermanentlyRejectsNewManagedOwnerAndAttemptSnapshots()
+    {
+        var fixture = await CreateRetiredCleanupFixtureAsync("deleted-fence", retireInstallation: false);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
+                fixture.ClaimRequest(), default)).Status);
+        var current = (await fixture.Store.LoadCleanupManifestAsync(
+            fixture.Manifest.Manifest.ManifestId, default))!;
+        foreach (var target in new[]
+                 {
+                     ManagedProfileCleanupState.Quarantined,
+                     ManagedProfileCleanupState.DeleteIntent,
+                     ManagedProfileCleanupState.Deleted,
+                 })
+        {
+            Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+                (await fixture.Store.TryTransitionCleanupManifestAsync(
+                    new ManagedProfileCleanupTransitionRequest(
+                        current.Manifest.ManifestId, current.Revision, current.State, target,
+                        target == ManagedProfileCleanupState.DeleteIntent ? "deleted-fence-confirmation" : null),
+                    default)).Status);
+            current = (await fixture.Store.LoadCleanupManifestAsync(current.Manifest.ManifestId, default))!;
+        }
+
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Deleted,
+            (await fixture.Store.LoadSessionAsync(fixture.Session.Identity.SessionId, default))!.State);
+        Assert.Equal(0L, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserCleanupClaims;"));
+
+        await AssertManagedOwnerAndAttemptInsertsRejectedAsync(fixture);
     }
 
     [Fact]
@@ -827,7 +890,9 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         return (operationId, manifest);
     }
 
-    private async Task<CleanupFixture> CreateRetiredCleanupFixtureAsync(string suffix)
+    private async Task<CleanupFixture> CreateRetiredCleanupFixtureAsync(
+        string suffix,
+        bool retireInstallation = true)
     {
         var (factory, store) = await CreateStoreAsync();
         var accountId = Guid.NewGuid();
@@ -851,11 +916,116 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             new ManagedBrowserTransitionRequest(identity.SessionId, session.Revision), default);
         Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredSession.Status);
         session = (await store.LoadSessionAsync(identity.SessionId, default))!;
-        var retiredInstallation = await store.TryRetireInstallationAsync(
-            new ManagedBrowserTransitionRequest(installation.Identity.InstallationId, installation.Revision), default);
-        Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredInstallation.Status);
-        installation = (await store.LoadInstallationAsync(installation.Identity.InstallationId, default))!;
+        if (retireInstallation)
+        {
+            var retiredInstallation = await store.TryRetireInstallationAsync(
+                new ManagedBrowserTransitionRequest(installation.Identity.InstallationId, installation.Revision), default);
+            Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredInstallation.Status);
+            installation = (await store.LoadInstallationAsync(installation.Identity.InstallationId, default))!;
+        }
         return new CleanupFixture(factory, store, accountId, installation, session, manifest);
+    }
+
+    private static async Task AssertManagedOwnerAndAttemptInsertsRejectedAsync(CleanupFixture fixture)
+    {
+        var batchId = Guid.NewGuid();
+        var transferResourceId = Guid.NewGuid();
+        var shareResourceId = Guid.NewGuid();
+        var legacyTransferId = Guid.NewGuid();
+        var standaloneBatchId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        await ExecuteAsync(fixture.Factory, """
+            INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
+              OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
+            VALUES($batch,'deleted-fence','Text','Distribution','TaskCount','ProportionalReduction',2,2,'/','None','Skip',
+              'Immediate','Queued',$now,1);
+            INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+              FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES
+              ($transferResource,$batch,1,'https://pan.baidu.com/s/deleted-transfer','deleted-transfer','1111','None','Valid','Expanded',$now,$now),
+              ($shareResource,$batch,2,'https://pan.baidu.com/s/deleted-share','deleted-share','1111','None','Valid','Expanded',$now,$now);
+            INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,
+              FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','deleted-fence-settings',$now);
+            INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,
+              PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'deleted-fence-output',2,1,1);
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($legacyTransfer,$shareResource,$batch,2,2,'/','/','',$account,'Fixture','Waiting',0,
+              'deleted-fence-legacy','NotPrepared','Unoccupied',$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
+            INSERT INTO StandaloneShareBatches(Id,DraftFingerprint,ResultDirectoryReference,Status,
+              OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES($standaloneBatch,'deleted-fence-draft','deleted-fence-result','Active',1,0,$now,$now);
+            """,
+            ("$batch", batchId.ToString("D")),
+            ("$transferResource", transferResourceId.ToString("D")),
+            ("$shareResource", shareResourceId.ToString("D")),
+            ("$legacyTransfer", legacyTransferId.ToString("D")),
+            ("$standaloneBatch", standaloneBatchId.ToString("D")),
+            ("$account", fixture.AccountId.ToString("D")),
+            ("$legacyProfile", $"legacy-webview2-account-{fixture.AccountId:N}"),
+            ("$now", now));
+
+        var snapshotParameters = new (string Name, object Value)[]
+        {
+            ("$account", fixture.AccountId.ToString("D")),
+            ("$family", fixture.Session.Identity.BrowserFamily.ToString()),
+            ("$profile", fixture.Session.Identity.ProfileId),
+            ("$installation", fixture.Installation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.Session.Identity.SessionId.ToString("D")),
+            ("$now", now),
+        };
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            """
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Fixture','Waiting',0,
+              'deleted-fence-transfer','NotPrepared','Unoccupied',$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            snapshotParameters.Append(("$operation", Guid.NewGuid().ToString("D")))
+                .Append(("$resource", transferResourceId.ToString("D")))
+                .Append(("$batch", batchId.ToString("D"))).ToArray()));
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            """
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+              Status,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$transfer,$resource,$batch,$account,1,'WaitingTransfer','deleted-fence-settings',1,
+              'Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            snapshotParameters.Append(("$operation", Guid.NewGuid().ToString("D")))
+                .Append(("$transfer", legacyTransferId.ToString("D")))
+                .Append(("$resource", shareResourceId.ToString("D")))
+                .Append(("$batch", batchId.ToString("D"))).ToArray()));
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            """
+            INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+              ParentPath,ExactItemSetFingerprint,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$batch,$account,1,'deleted-fence','File','/','deleted-fence-item','Queued',
+              'NotStarted','Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            snapshotParameters.Append(("$operation", Guid.NewGuid().ToString("D")))
+                .Append(("$batch", standaloneBatchId.ToString("D"))).ToArray()));
+        await Assert.ThrowsAsync<Microsoft.Data.Sqlite.SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            """
+            INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+              Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$account,1,'RemoteSelection','Preparing',0,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            snapshotParameters.Append(("$operation", Guid.NewGuid().ToString("D"))).ToArray()));
     }
 
     private static async Task<Guid> InsertManagedTransferOwnerAsync(CleanupFixture fixture)

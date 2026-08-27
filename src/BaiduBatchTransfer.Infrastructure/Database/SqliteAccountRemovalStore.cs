@@ -26,6 +26,138 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
           AND operation.TargetSlotReservedAt IS NULL
           AND operation.LeaseExpiresAt IS NULL))
         """;
+    private const string SafeDefinitelyNotSubmittedAttemptPredicate = """
+        (attempt.State='DefinitelyNotSubmitted'
+         AND attempt.ResumeStage IS NULL
+         AND attempt.ObservationFingerprint IS NULL
+         AND attempt.BaselineFingerprint IS NULL
+         AND attempt.BaselineItemCount=0
+         AND attempt.BaselinePersistedAt IS NULL
+         AND attempt.IsWaitingForUser=0
+         AND attempt.AcceptanceFingerprint IS NULL
+         AND attempt.AcceptedItemCount=0
+         AND attempt.AcceptancePersistedAt IS NULL
+         AND attempt.SourceTotalCount IS NULL
+         AND attempt.SourceReachedEnd IS NULL
+         AND attempt.SourceIsStable IS NULL
+         AND attempt.SourceGenerationToken IS NULL
+         AND attempt.SourceFingerprint IS NULL
+         AND attempt.SourceObservationFingerprint IS NULL
+         AND attempt.BaiduUserId IS NULL
+         AND attempt.CapabilityAdapterKind IS NULL
+         AND attempt.CapabilityProtocolVersion IS NULL
+         AND attempt.CapabilitySelectorVersion IS NULL
+         AND attempt.CapabilityBuildVersion IS NULL
+         AND attempt.TargetExactId IS NULL
+         AND attempt.TargetPath IS NULL
+         AND attempt.TargetTotalCount IS NULL
+         AND attempt.TargetReachedEnd IS NULL
+         AND attempt.TargetIsStable IS NULL
+         AND attempt.TargetGenerationToken IS NULL
+         AND attempt.TargetObservationFingerprint IS NULL
+         AND attempt.SubmissionSourceFingerprint IS NULL
+         AND attempt.SubmissionTargetExactId IS NULL
+         AND attempt.SubmissionTargetBaselineFingerprint IS NULL
+         AND attempt.SubmissionMarkedAt IS NULL
+         AND attempt.OfficialRequestId IS NULL
+         AND attempt.TransferMappingFingerprint IS NULL
+         AND attempt.TransferMappingCount=0
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationAttemptSourceItems evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.Generation=attempt.Generation)
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationDirectoryMutations evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.OriginGeneration=attempt.Generation)
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationAttemptRemoteItems evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.Generation=attempt.Generation)
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationTransferMappings evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.Generation=attempt.Generation)
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationAttemptAcceptedRemoteItems evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.Generation=attempt.Generation)
+         AND NOT EXISTS(SELECT 1 FROM WebAutomationShareAcceptances evidence
+                        WHERE evidence.OperationId=attempt.OperationId
+                          AND evidence.AccountId=attempt.AccountId
+                          AND evidence.Generation=attempt.Generation))
+        """;
+    private static readonly string SafeTerminalShareOperationPredicate = $"""
+        ((operation.Status IN ('Succeeded','ReusedExisting')
+          AND operation.SubmissionAcceptance='Unknown'
+          AND operation.LeaseExpiresAt IS NULL
+          AND operation.NextReconcileAt IS NULL
+          AND NOT EXISTS(
+                SELECT 1 FROM WebAutomationAttempts attempt
+                WHERE attempt.OperationId=operation.Id
+                  AND NOT(attempt.OwnerKind='TransferShare'
+                          AND attempt.AccountId=operation.AccountId
+                          AND attempt.Generation=operation.Generation)))
+         OR
+         (operation.Status IN ('Failed','Cancelled')
+          AND operation.LeaseExpiresAt IS NULL
+          AND operation.NextReconcileAt IS NULL
+          AND (operation.SubmissionAcceptance='DefinitelyNotAccepted'
+               OR (operation.SubmissionAcceptance='Unknown'
+                   AND operation.RequestDescriptorJson IS NULL
+                   AND operation.AdapterRequestId IS NULL
+                   AND operation.SubmitStartedAt IS NULL
+                   AND operation.BaselineGeneration IS NULL
+                   AND operation.BaselineFingerprint IS NULL
+                   AND operation.BaselineShareCount=0
+                   AND operation.BaselineCompletedAt IS NULL
+                   AND operation.AttemptCount=0))
+          AND NOT EXISTS(
+                SELECT 1 FROM WebAutomationAttempts attempt
+                WHERE attempt.OperationId=operation.Id
+                  AND NOT(attempt.OwnerKind='TransferShare'
+                          AND attempt.AccountId=operation.AccountId
+                          AND attempt.Generation=operation.Generation
+                          AND {SafeDefinitelyNotSubmittedAttemptPredicate}))))
+        """;
+    private static readonly string SafeTerminalStandaloneOperationPredicate = $"""
+        (EXISTS(SELECT 1 FROM StandaloneShareBatches batch
+                WHERE batch.Id=operation.BatchId
+                  AND batch.Status IN ('Completed','CompletedWithFailures','Cancelled'))
+         AND
+         ((operation.Status='Succeeded'
+           AND operation.SubmissionState='Completed'
+           AND operation.LeaseOwnerId IS NULL
+           AND operation.LeaseExpiresAt IS NULL
+           AND operation.NextReconcileAt IS NULL
+           AND operation.ReconciliationIssue IS NULL
+           AND NOT EXISTS(
+                 SELECT 1 FROM WebAutomationAttempts attempt
+                 WHERE attempt.OperationId=operation.Id
+                   AND NOT(attempt.OwnerKind='StandaloneShare'
+                           AND attempt.AccountId=operation.AccountId
+                           AND attempt.Generation=operation.Generation)))
+          OR
+          (operation.Status IN ('Failed','Cancelled')
+           AND operation.LeaseOwnerId IS NULL
+           AND operation.LeaseExpiresAt IS NULL
+           AND operation.RequestDescriptorJson IS NULL
+           AND operation.SubmitStartedAt IS NULL
+           AND operation.AdapterRequestId IS NULL
+           AND operation.NextReconcileAt IS NULL
+           AND operation.ReconciliationIssue IS NULL
+           AND ((operation.SubmissionState='NotStarted'
+                 AND operation.SubmissionAcceptance IN ('Unknown','DefinitelyNotAccepted'))
+                OR (operation.SubmissionState='DefinitelyNotAccepted'
+                    AND operation.SubmissionAcceptance='DefinitelyNotAccepted'))
+           AND NOT EXISTS(
+                 SELECT 1 FROM WebAutomationAttempts attempt
+                 WHERE attempt.OperationId=operation.Id
+                   AND NOT(attempt.OwnerKind='StandaloneShare'
+                           AND attempt.AccountId=operation.AccountId
+                           AND attempt.Generation=operation.Generation
+                           AND {SafeDefinitelyNotSubmittedAttemptPredicate})))))
+        """;
     private const string ReadyMessage = "账号可以安全退出。";
     private const string CleanupReadyMessage = "账号可以安全退出；共享批次的公共审计信息和其他账号仍在使用的数据将保留。";
     private const string BlockedMessage = "账号仍有未完成工作，请先完成、取消或重新分配。";
@@ -295,6 +427,12 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
               (SELECT COUNT(*) FROM TransferOperations operation
                 WHERE operation.AssignedAccountId=$account AND NOT {SafeTerminalOperationPredicate})
               +
+              (SELECT COUNT(*) FROM ShareOperations operation
+                WHERE operation.AccountId=$account AND NOT {SafeTerminalShareOperationPredicate})
+              +
+              (SELECT COUNT(*) FROM StandaloneShareOperations operation
+                WHERE operation.AccountId=$account AND NOT {SafeTerminalStandaloneOperationPredicate})
+              +
               (SELECT COUNT(*) FROM AccountAllocations allocation
                  JOIN BatchJobs batch ON batch.Id=allocation.BatchJobId
                 WHERE allocation.AccountId=$account
@@ -314,7 +452,17 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
                                WHERE batch.ImportSessionId=import.Id)))
               +
               (SELECT COUNT(*) FROM RemoteSelectionSessions selection
-                WHERE selection.AccountId=$account AND selection.State='Active')
+                WHERE selection.AccountId=$account AND selection.State IN ('Active','NeedsDecision'))
+              +
+              (SELECT COUNT(*) FROM WebAutomationAttempts attempt
+                WHERE attempt.AccountId=$account AND attempt.OwnerKind='RemoteSelection'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM RemoteSelectionSessions selection
+                    WHERE selection.SessionId=attempt.OperationId
+                      AND selection.AccountId=attempt.AccountId
+                      AND selection.Generation=attempt.Generation
+                      AND ((selection.State='Confirmed' AND attempt.State='Succeeded')
+                           OR (selection.State='Cancelled' AND {SafeDefinitelyNotSubmittedAttemptPredicate}))))
               ;
             """, token, ("$account", Id(accountId))).ConfigureAwait(false);
         if (count != 0 || mode != AccountExitHistoryMode.RemoveTerminalHistory)
@@ -371,7 +519,7 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         var includeCleanupClosure = mode == AccountExitHistoryMode.RemoveTerminalHistory;
         await MaterializeManifestClosureAsync(connection, transaction, account.Id, includeCleanupClosure, token).ConfigureAwait(false);
         using var writer = new CanonicalWriter();
-        writer.Value("manifest-version", "3");
+        writer.Value("manifest-version", "4");
         writer.Value("history-mode", mode.ToString());
         writer.Value("account-id", Id(account.Id));
         writer.Value("identity-fingerprint", Fingerprint(account.BaiduUserId));
@@ -401,6 +549,138 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             JOIN temp.AccountRemovalManifestBatches closure ON closure.Id=operation.BatchJobId
             ORDER BY operation.BatchJobId,operation.AllocationOrdinal,operation.SequenceNumber,operation.Id;
             """, token, ["TargetSlotReservedAt", "DailyCountedAt", "SubmitStartedAt", "LeaseExpiresAt", "CreatedAt", "UpdatedAt"], []).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "ShareOperations", """
+            SELECT operation.Id,operation.TransferOperationId,operation.ResourceItemId,operation.BatchJobId,
+              operation.AccountId,operation.OutputOrdinal,operation.Status,operation.ExactItemSetFingerprint,
+              operation.SettingsFingerprint,operation.Generation,operation.RequestDescriptorJson,
+              operation.AdapterRequestId,operation.SubmissionAcceptance,operation.AttemptCount,
+              operation.LeaseGeneration,operation.LeaseExpiresAt,operation.SubmitStartedAt,
+              operation.NextReconcileAt,operation.BaselineGeneration,operation.BaselineFingerprint,
+              operation.BaselineShareCount,operation.BaselineCompletedAt,operation.LastErrorCode,
+              operation.LastErrorMessage,operation.CreatedAt,operation.UpdatedAt,
+              operation.ExecutionEngineVersion,operation.BrowserFamily,operation.ProfileId,
+              operation.InstallationId,operation.SessionId
+            FROM ShareOperations operation WHERE operation.AccountId=$account
+            ORDER BY operation.BatchJobId,operation.OutputOrdinal,operation.Id;
+            """, token,
+            ["LeaseExpiresAt", "SubmitStartedAt", "NextReconcileAt", "BaselineCompletedAt", "CreatedAt", "UpdatedAt"],
+            ["RequestDescriptorJson", "AdapterRequestId", "ProfileId"],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "StandaloneShareOperations", """
+            SELECT operation.Id,operation.BatchId,operation.AccountId,operation.SequenceNumber,
+              operation.DisplayName,operation.ResourceKind,operation.ParentPath,operation.ExactItemSetFingerprint,
+              operation.Generation,operation.Status,operation.SubmissionState,operation.SubmissionAcceptance,
+              operation.BaselineFingerprint,operation.BaselineShareCount,operation.BaselineCompletedAt,
+              operation.LeaseGeneration,operation.LeaseOwnerId,operation.LeaseExpiresAt,operation.LastErrorCode,
+              operation.Revision,operation.CreatedAt,operation.UpdatedAt,operation.ExtractionCodeMode,
+              operation.FixedExtractionCode,operation.ExistingShareDecision,operation.SettingsFingerprint,
+              operation.RequestDescriptorJson,operation.SubmitStartedAt,operation.AdapterRequestId,
+              operation.AttemptCount,operation.NextReconcileAt,operation.ReconciliationIssue,
+              operation.ExecutionEngineVersion,operation.BrowserFamily,operation.ProfileId,
+              operation.InstallationId,operation.SessionId
+            FROM StandaloneShareOperations operation WHERE operation.AccountId=$account
+            ORDER BY operation.BatchId,operation.SequenceNumber,operation.Id;
+            """, token,
+            ["BaselineCompletedAt", "LeaseExpiresAt", "CreatedAt", "UpdatedAt", "SubmitStartedAt", "NextReconcileAt"],
+            ["ParentPath", "LeaseOwnerId", "FixedExtractionCode", "RequestDescriptorJson", "AdapterRequestId", "ProfileId"],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "StandaloneShareBatches", """
+            SELECT batch.Id,batch.DraftFingerprint,batch.ResultDirectoryReference,batch.Status,
+              batch.OperationCount,batch.Revision,batch.CreatedAt,batch.UpdatedAt
+            FROM StandaloneShareBatches batch
+            WHERE EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                         WHERE operation.BatchId=batch.Id AND operation.AccountId=$account)
+            ORDER BY batch.Id;
+            """, token, ["CreatedAt", "UpdatedAt"], ["ResultDirectoryReference"],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        foreach (var child in new[]
+                 {
+                     ("ShareOperationGenerations", "ShareOperationId", "Generation"),
+                     ("ShareOperationRemoteItems", "ShareOperationId", "ItemOrdinal"),
+                     ("ShareDiscoveryBaselines", "ShareOperationId", "Generation"),
+                     ("BaiduShareResults", "ShareOperationId", "Generation"),
+                 })
+        {
+            await AppendQueryAsync(connection, transaction, writer, child.Item1, $"""
+                SELECT child.* FROM {child.Item1} child
+                JOIN ShareOperations operation ON operation.Id=child.{child.Item2}
+                WHERE operation.AccountId=$account
+                ORDER BY child.{child.Item2},child.{child.Item3},child.rowid;
+                """, token, ["SharedAt", "UpdatedAt"], ["ShareUrl", "ExtractionCode", "DisplayName"],
+                ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        }
+        foreach (var child in new[]
+                 {
+                     ("StandaloneShareRemoteItems", "ItemOrdinal"),
+                     ("StandaloneShareDiscoveryBaselines", "Generation"),
+                     ("StandaloneShareResults", "Generation"),
+                 })
+        {
+            await AppendQueryAsync(connection, transaction, writer, child.Item1, $"""
+                SELECT child.* FROM {child.Item1} child
+                JOIN StandaloneShareOperations operation ON operation.Id=child.OperationId
+                WHERE operation.AccountId=$account
+                ORDER BY child.OperationId,child.{child.Item2},child.rowid;
+                """, token, ["AcceptedAt", "CreatedAt"], ["ShareUrl", "ExtractionCode", "DisplayName"],
+                ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        }
+        await AppendQueryAsync(connection, transaction, writer, "LocalResultExports", """
+            SELECT export.* FROM LocalResultExports export
+            WHERE export.OwnerKind='StandaloneShareBatch'
+              AND EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                         WHERE operation.BatchId=export.OwnerId AND operation.AccountId=$account)
+            ORDER BY export.OwnerId,export.Generation,export.Id;
+            """, token, ["LeaseExpiresAt", "CreatedAt", "UpdatedAt"], ["TargetFileName", "FinalFileName", "LeaseOwnerId"],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "RemoteSelectionSessions", """
+            SELECT selection.SessionId,selection.WorkspaceDraftId,selection.AccountId,selection.Generation,
+              selection.State,selection.Revision,selection.CreatedAt,selection.UpdatedAt
+            FROM RemoteSelectionSessions selection WHERE selection.AccountId=$account
+            ORDER BY selection.SessionId;
+            """, token, ["CreatedAt", "UpdatedAt"], [],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        await AppendQueryAsync(connection, transaction, writer, "WebAutomationAttempts", """
+            SELECT attempt.OperationId,attempt.AccountId,attempt.Generation,attempt.OwnerKind,attempt.State,
+              attempt.ResumeStage,attempt.ObservationFingerprint,attempt.BaselineFingerprint,
+              attempt.BaselineItemCount,attempt.BaselinePersistedAt,attempt.IsWaitingForUser,attempt.Revision,
+              attempt.CreatedAt,attempt.UpdatedAt,attempt.AcceptanceFingerprint,attempt.AcceptedItemCount,
+              attempt.AcceptancePersistedAt,attempt.SourceTotalCount,attempt.SourceReachedEnd,
+              attempt.SourceIsStable,attempt.SourceGenerationToken,attempt.SourceFingerprint,
+              attempt.SourceObservationFingerprint,attempt.BaiduUserId,attempt.CapabilityAdapterKind,
+              attempt.CapabilityProtocolVersion,attempt.CapabilitySelectorVersion,attempt.CapabilityBuildVersion,
+              attempt.TargetExactId,attempt.TargetPath,attempt.TargetTotalCount,attempt.TargetReachedEnd,
+              attempt.TargetIsStable,attempt.TargetGenerationToken,attempt.TargetObservationFingerprint,
+              attempt.SubmissionSourceFingerprint,attempt.SubmissionTargetExactId,
+              attempt.SubmissionTargetBaselineFingerprint,attempt.SubmissionMarkedAt,attempt.OfficialRequestId,
+              attempt.TransferMappingFingerprint,attempt.TransferMappingCount,attempt.ExecutionEngineVersion,
+              attempt.BrowserFamily,attempt.ProfileId,attempt.InstallationId,attempt.SessionId
+            FROM WebAutomationAttempts attempt WHERE attempt.AccountId=$account
+            ORDER BY attempt.OperationId,attempt.Generation;
+            """, token,
+            ["BaselinePersistedAt", "CreatedAt", "UpdatedAt", "AcceptancePersistedAt", "SubmissionMarkedAt"],
+            ["BaiduUserId", "TargetPath", "OfficialRequestId", "ProfileId"],
+            ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        foreach (var evidence in new[]
+                 {
+                     ("WebAutomationAttemptSourceItems", "Generation"),
+                     ("WebAutomationAttemptRemoteItems", "Generation"),
+                     ("WebAutomationAttemptAcceptedRemoteItems", "Generation"),
+                     ("WebAutomationTransferMappings", "Generation"),
+                     ("WebAutomationDirectoryMutations", "OriginGeneration"),
+                     ("WebAutomationShareAcceptances", "Generation"),
+                 })
+        {
+            await AppendQueryAsync(connection, transaction, writer, evidence.Item1, $"""
+                SELECT evidence.* FROM {evidence.Item1} evidence
+                WHERE evidence.AccountId=$account
+                  AND EXISTS(SELECT 1 FROM WebAutomationAttempts attempt
+                             WHERE attempt.OperationId=evidence.OperationId
+                               AND attempt.AccountId=evidence.AccountId
+                               AND attempt.Generation=evidence.{evidence.Item2})
+                ORDER BY evidence.OperationId,evidence.{evidence.Item2},evidence.rowid;
+                """, token, ["CreatedAt", "UpdatedAt", "AcceptedAt"], ["ExtractionCode", "ShareUrl", "BaiduUserId", "TargetPath"],
+                ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
+        }
         await AppendQueryAsync(connection, transaction, writer, "ResourceItems", """
             SELECT resource.Id,resource.BatchJobId,resource.StagedImportRowId,resource.CandidateSequence,resource.ShareUrl,
               resource.NormalizedShareId,resource.ExtractionCode,resource.Note,resource.TargetPathOverride,
@@ -469,6 +749,18 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             CREATE TEMP TABLE AccountRemovalManifestResources(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestStagedRows(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestTargetOperations(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestTargetShareOperations(
+              Id TEXT PRIMARY KEY,
+              BatchJobId TEXT NOT NULL,
+              AccountId TEXT NOT NULL,
+              OutputOrdinal INTEGER NOT NULL) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestTargetStandaloneOperations(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestTargetStandaloneBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TEMP TABLE AccountRemovalManifestTargetAttempts(
+              OperationId TEXT NOT NULL,
+              AccountId TEXT NOT NULL,
+              Generation INTEGER NOT NULL,
+              PRIMARY KEY(OperationId,AccountId,Generation)) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestTerminalBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestBOnlyBatches(Id TEXT PRIMARY KEY) WITHOUT ROWID;
             CREATE TEMP TABLE AccountRemovalManifestTargetResources(Id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -614,6 +906,50 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             WHERE operation.AssignedAccountId=$account
               AND {SafeTerminalOperationPredicate};
 
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetShareOperations(
+              Id,BatchJobId,AccountId,OutputOrdinal)
+            SELECT operation.Id,operation.BatchJobId,operation.AccountId,operation.OutputOrdinal
+            FROM ShareOperations operation
+            WHERE operation.AccountId=$account
+              AND {SafeTerminalShareOperationPredicate};
+
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetStandaloneOperations(Id)
+            SELECT operation.Id FROM StandaloneShareOperations operation
+            WHERE operation.AccountId=$account
+              AND {SafeTerminalStandaloneOperationPredicate};
+
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetStandaloneBatches(Id)
+            SELECT DISTINCT operation.BatchId FROM StandaloneShareOperations operation
+            JOIN temp.AccountRemovalManifestTargetStandaloneOperations target ON target.Id=operation.Id;
+
+            INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetAttempts(OperationId,AccountId,Generation)
+            SELECT attempt.OperationId,attempt.AccountId,attempt.Generation
+            FROM WebAutomationAttempts attempt
+            WHERE (attempt.OwnerKind='Transfer'
+                   AND attempt.OperationId IN (SELECT Id FROM temp.AccountRemovalManifestTargetOperations))
+               OR (attempt.OwnerKind='TransferShare'
+                   AND EXISTS(
+                     SELECT 1 FROM ShareOperations operation
+                     JOIN temp.AccountRemovalManifestTargetShareOperations target ON target.Id=operation.Id
+                     WHERE operation.Id=attempt.OperationId
+                       AND operation.AccountId=attempt.AccountId
+                       AND operation.Generation=attempt.Generation))
+               OR (attempt.OwnerKind='StandaloneShare'
+                   AND EXISTS(
+                     SELECT 1 FROM StandaloneShareOperations operation
+                     JOIN temp.AccountRemovalManifestTargetStandaloneOperations target ON target.Id=operation.Id
+                     WHERE operation.Id=attempt.OperationId
+                       AND operation.AccountId=attempt.AccountId
+                       AND operation.Generation=attempt.Generation))
+               OR (attempt.OwnerKind='RemoteSelection' AND attempt.AccountId=$account
+                   AND EXISTS(
+                     SELECT 1 FROM RemoteSelectionSessions selection
+                     WHERE selection.SessionId=attempt.OperationId
+                       AND selection.AccountId=attempt.AccountId
+                       AND selection.Generation=attempt.Generation
+                       AND ((selection.State='Confirmed' AND attempt.State='Succeeded')
+                            OR (selection.State='Cancelled' AND {SafeDefinitelyNotSubmittedAttemptPredicate}))));
+
             INSERT OR IGNORE INTO temp.AccountRemovalManifestTargetResources(Id)
             SELECT resource.Id FROM ResourceItems resource
             JOIN temp.AccountRemovalManifestTerminalBatches terminal ON terminal.Id=resource.BatchJobId
@@ -723,38 +1059,104 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         await ExecuteChangeAsync(connection, transaction, """
             DELETE FROM WebAutomationDirectoryMutations
             WHERE EXISTS(
-              SELECT 1 FROM WebAutomationAttempts attempt
-              WHERE attempt.OperationId=WebAutomationDirectoryMutations.OperationId
-                AND attempt.AccountId=WebAutomationDirectoryMutations.AccountId
-                AND attempt.Generation=WebAutomationDirectoryMutations.OriginGeneration
-                AND (
-                  (attempt.OwnerKind='Transfer'
-                    AND attempt.OperationId IN (
-                      SELECT Id FROM temp.AccountRemovalManifestTargetOperations))
-                  OR
-                  (attempt.OwnerKind='TransferShare'
-                    AND EXISTS(
-                      SELECT 1 FROM ShareOperations share
-                      JOIN temp.AccountRemovalManifestTargetOperations target
-                        ON target.Id=share.TransferOperationId
-                      WHERE share.Id=attempt.OperationId
-                        AND share.AccountId=attempt.AccountId))));
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationDirectoryMutations.OperationId
+                AND target.AccountId=WebAutomationDirectoryMutations.AccountId
+                AND target.Generation=WebAutomationDirectoryMutations.OriginGeneration);
+
+            DELETE FROM WebAutomationAttemptSourceItems
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationAttemptSourceItems.OperationId
+                AND target.AccountId=WebAutomationAttemptSourceItems.AccountId
+                AND target.Generation=WebAutomationAttemptSourceItems.Generation);
+
+            DELETE FROM WebAutomationAttemptRemoteItems
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationAttemptRemoteItems.OperationId
+                AND target.AccountId=WebAutomationAttemptRemoteItems.AccountId
+                AND target.Generation=WebAutomationAttemptRemoteItems.Generation);
+
+            DELETE FROM WebAutomationTransferMappings
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationTransferMappings.OperationId
+                AND target.AccountId=WebAutomationTransferMappings.AccountId
+                AND target.Generation=WebAutomationTransferMappings.Generation);
+
+            DELETE FROM WebAutomationAttemptAcceptedRemoteItems
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationAttemptAcceptedRemoteItems.OperationId
+                AND target.AccountId=WebAutomationAttemptAcceptedRemoteItems.AccountId
+                AND target.Generation=WebAutomationAttemptAcceptedRemoteItems.Generation);
+
+            DELETE FROM WebAutomationShareAcceptances
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationShareAcceptances.OperationId
+                AND target.AccountId=WebAutomationShareAcceptances.AccountId
+                AND target.Generation=WebAutomationShareAcceptances.Generation);
 
             DELETE FROM WebAutomationAttempts
-            WHERE (OwnerKind='Transfer'
-                    AND OperationId IN (
-                      SELECT Id FROM temp.AccountRemovalManifestTargetOperations))
-               OR (OwnerKind='TransferShare'
-                    AND EXISTS(
-                      SELECT 1 FROM ShareOperations share
-                      JOIN temp.AccountRemovalManifestTargetOperations target
-                        ON target.Id=share.TransferOperationId
-                      WHERE share.Id=WebAutomationAttempts.OperationId
-                        AND share.AccountId=WebAutomationAttempts.AccountId));
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetAttempts target
+              WHERE target.OperationId=WebAutomationAttempts.OperationId
+                AND target.AccountId=WebAutomationAttempts.AccountId
+                AND target.Generation=WebAutomationAttempts.Generation);
+
+            DELETE FROM ShareOperations
+            WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetShareOperations);
+
+            DELETE FROM StandaloneShareOperations
+            WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetStandaloneOperations);
 
             DELETE FROM TransferOperations
             WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetOperations);
             """, token).ConfigureAwait(false);
+
+        await ExecuteChangeAsync(connection, transaction, """
+            UPDATE BatchJobs
+            SET ShareOperationCount=(SELECT COUNT(*) FROM ShareOperations share
+                                     WHERE share.BatchJobId=BatchJobs.Id)
+            WHERE Id IN (SELECT BatchJobId FROM temp.AccountRemovalManifestTargetShareOperations);
+
+            UPDATE BatchOutputAccounts
+            SET CreatedShareOperationCount=(
+              SELECT COUNT(*) FROM ShareOperations share
+              WHERE share.BatchJobId=BatchOutputAccounts.BatchJobId
+                AND share.AccountId=BatchOutputAccounts.AccountId
+                AND share.OutputOrdinal=BatchOutputAccounts.OutputOrdinal)
+            WHERE EXISTS(
+              SELECT 1 FROM temp.AccountRemovalManifestTargetShareOperations target
+              WHERE target.BatchJobId=BatchOutputAccounts.BatchJobId
+                AND target.AccountId=BatchOutputAccounts.AccountId
+                AND target.OutputOrdinal=BatchOutputAccounts.OutputOrdinal);
+            """, token, ("$account", account)).ConfigureAwait(false);
+
+        await ExecuteChangeAsync(connection, transaction, """
+            UPDATE StandaloneShareBatches
+            SET OperationCount=(SELECT COUNT(*) FROM StandaloneShareOperations operation
+                                WHERE operation.BatchId=StandaloneShareBatches.Id),
+                Revision=Revision+1,
+                UpdatedAt=$updated
+            WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetStandaloneBatches)
+              AND EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                         WHERE operation.BatchId=StandaloneShareBatches.Id);
+
+            DELETE FROM LocalResultExports
+            WHERE OwnerKind='StandaloneShareBatch'
+              AND OwnerId IN (SELECT Id FROM temp.AccountRemovalManifestTargetStandaloneBatches)
+              AND NOT EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                             WHERE operation.BatchId=LocalResultExports.OwnerId);
+
+            DELETE FROM StandaloneShareBatches
+            WHERE Id IN (SELECT Id FROM temp.AccountRemovalManifestTargetStandaloneBatches)
+              AND Status IN ('Completed','CompletedWithFailures','Cancelled')
+              AND NOT EXISTS(SELECT 1 FROM StandaloneShareOperations operation
+                             WHERE operation.BatchId=StandaloneShareBatches.Id);
+            """, token, ("$updated", Time(DateTimeOffset.UtcNow))).ConfigureAwait(false);
 
         await ExecuteChangeAsync(connection, transaction, """
             DELETE FROM AccountAllocations

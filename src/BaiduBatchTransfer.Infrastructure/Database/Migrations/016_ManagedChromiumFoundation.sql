@@ -107,32 +107,119 @@ CREATE TABLE ManagedBrowserCleanupClaims (
 CREATE INDEX IX_ManagedBrowserCleanupClaims_Identity
 ON ManagedBrowserCleanupClaims(InstallationId,SessionId,ManifestId);
 
--- v15 intentionally had no polymorphic owner foreign key.  Ownerless attempts
--- cannot be recovered safely, and retaining them would fabricate an execution
--- snapshot during the v16 rebuild.  Remove their exact evidence closure first;
--- migration-time foreign-key enforcement may be suspended by the migrator.
+-- v15 intentionally had no polymorphic owner foreign key.  Classify every
+-- orphan before deleting anything: only an exact DefinitelyNotSubmitted,
+-- zero-evidence closure is safe to discard.  Any other orphan aborts the whole
+-- migration transaction so recovery evidence is never silently destroyed.
 CREATE TEMP TABLE V16OwnerlessWebAutomationAttempts (
     OperationId TEXT NOT NULL,
     AccountId TEXT NOT NULL,
     Generation INTEGER NOT NULL,
+    OwnerKind TEXT NOT NULL,
     PRIMARY KEY(OperationId,AccountId,Generation)
 ) WITHOUT ROWID;
 
-INSERT INTO V16OwnerlessWebAutomationAttempts(OperationId,AccountId,Generation)
-SELECT attempt.OperationId,attempt.AccountId,attempt.Generation
+INSERT INTO V16OwnerlessWebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind)
+SELECT attempt.OperationId,attempt.AccountId,attempt.Generation,attempt.OwnerKind
 FROM WebAutomationAttempts attempt
 WHERE (attempt.OwnerKind='Transfer' AND NOT EXISTS(
          SELECT 1 FROM TransferOperations operation
          WHERE operation.Id=attempt.OperationId
-           AND operation.AssignedAccountId=attempt.AccountId))
+           AND operation.AssignedAccountId=attempt.AccountId
+           AND operation.AttemptCount=attempt.Generation))
    OR (attempt.OwnerKind='TransferShare' AND NOT EXISTS(
          SELECT 1 FROM ShareOperations operation
          WHERE operation.Id=attempt.OperationId
-           AND operation.AccountId=attempt.AccountId))
+           AND operation.AccountId=attempt.AccountId
+           AND operation.Generation=attempt.Generation))
    OR (attempt.OwnerKind='StandaloneShare' AND NOT EXISTS(
          SELECT 1 FROM StandaloneShareOperations operation
          WHERE operation.Id=attempt.OperationId
-           AND operation.AccountId=attempt.AccountId));
+           AND operation.AccountId=attempt.AccountId
+           AND operation.Generation=attempt.Generation))
+   OR (attempt.OwnerKind='RemoteSelection' AND NOT EXISTS(
+         SELECT 1 FROM Accounts account WHERE account.Id=attempt.AccountId));
+
+CREATE TEMP TABLE V16OwnerlessWebAutomationAttemptValidation(
+    Value INTEGER NOT NULL CHECK(Value=1)
+);
+
+INSERT INTO V16OwnerlessWebAutomationAttemptValidation(Value)
+SELECT CASE WHEN NOT EXISTS(
+  SELECT 1
+  FROM V16OwnerlessWebAutomationAttempts orphan
+  JOIN WebAutomationAttempts attempt
+    ON attempt.OperationId=orphan.OperationId
+   AND attempt.AccountId=orphan.AccountId
+   AND attempt.Generation=orphan.Generation
+  WHERE attempt.State<>'DefinitelyNotSubmitted'
+     OR attempt.ResumeStage IS NOT NULL
+     OR attempt.ObservationFingerprint IS NOT NULL
+     OR attempt.BaselineFingerprint IS NOT NULL
+     OR attempt.BaselineItemCount<>0
+     OR attempt.BaselinePersistedAt IS NOT NULL
+     OR attempt.IsWaitingForUser<>0
+     OR attempt.AcceptanceFingerprint IS NOT NULL
+     OR attempt.AcceptedItemCount<>0
+     OR attempt.AcceptancePersistedAt IS NOT NULL
+     OR attempt.SourceTotalCount IS NOT NULL
+     OR attempt.SourceReachedEnd IS NOT NULL
+     OR attempt.SourceIsStable IS NOT NULL
+     OR attempt.SourceGenerationToken IS NOT NULL
+     OR attempt.SourceFingerprint IS NOT NULL
+     OR attempt.SourceObservationFingerprint IS NOT NULL
+     OR attempt.BaiduUserId IS NOT NULL
+     OR attempt.CapabilityAdapterKind IS NOT NULL
+     OR attempt.CapabilityProtocolVersion IS NOT NULL
+     OR attempt.CapabilitySelectorVersion IS NOT NULL
+     OR attempt.CapabilityBuildVersion IS NOT NULL
+     OR attempt.TargetExactId IS NOT NULL
+     OR attempt.TargetPath IS NOT NULL
+     OR attempt.TargetTotalCount IS NOT NULL
+     OR attempt.TargetReachedEnd IS NOT NULL
+     OR attempt.TargetIsStable IS NOT NULL
+     OR attempt.TargetGenerationToken IS NOT NULL
+     OR attempt.TargetObservationFingerprint IS NOT NULL
+     OR attempt.SubmissionSourceFingerprint IS NOT NULL
+     OR attempt.SubmissionTargetExactId IS NOT NULL
+     OR attempt.SubmissionTargetBaselineFingerprint IS NOT NULL
+     OR attempt.SubmissionMarkedAt IS NOT NULL
+     OR attempt.OfficialRequestId IS NOT NULL
+     OR attempt.TransferMappingFingerprint IS NOT NULL
+     OR attempt.TransferMappingCount<>0
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationAttemptSourceItems evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.Generation=orphan.Generation)
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationDirectoryMutations evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.OriginGeneration=orphan.Generation)
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationAttemptRemoteItems evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.Generation=orphan.Generation)
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationTransferMappings evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.Generation=orphan.Generation)
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationAttemptAcceptedRemoteItems evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.Generation=orphan.Generation)
+     OR EXISTS(
+          SELECT 1 FROM WebAutomationShareAcceptances evidence
+          WHERE evidence.OperationId=orphan.OperationId
+            AND evidence.AccountId=orphan.AccountId
+            AND evidence.Generation=orphan.Generation)
+) THEN 1 ELSE 0 END;
+
+DROP TABLE V16OwnerlessWebAutomationAttemptValidation;
 
 DELETE FROM WebAutomationDirectoryMutations
 WHERE EXISTS(
@@ -161,6 +248,20 @@ WHERE EXISTS(
   WHERE orphan.OperationId=WebAutomationTransferMappings.OperationId
     AND orphan.AccountId=WebAutomationTransferMappings.AccountId
     AND orphan.Generation=WebAutomationTransferMappings.Generation);
+
+DELETE FROM WebAutomationAttemptAcceptedRemoteItems
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationAttemptAcceptedRemoteItems.OperationId
+    AND orphan.AccountId=WebAutomationAttemptAcceptedRemoteItems.AccountId
+    AND orphan.Generation=WebAutomationAttemptAcceptedRemoteItems.Generation);
+
+DELETE FROM WebAutomationShareAcceptances
+WHERE EXISTS(
+  SELECT 1 FROM V16OwnerlessWebAutomationAttempts orphan
+  WHERE orphan.OperationId=WebAutomationShareAcceptances.OperationId
+    AND orphan.AccountId=WebAutomationShareAcceptances.AccountId
+    AND orphan.Generation=WebAutomationShareAcceptances.Generation);
 
 DELETE FROM WebAutomationAttempts
 WHERE EXISTS(
@@ -633,7 +734,7 @@ BEFORE INSERT ON ManagedBrowserCleanupClaims
 WHEN NOT EXISTS(
        SELECT 1 FROM BrowserInstallations installation
        WHERE installation.InstallationId=NEW.InstallationId
-         AND installation.State='Retired' AND installation.Revision=NEW.ExpectedInstallationRevision)
+         AND installation.Revision=NEW.ExpectedInstallationRevision)
   OR NOT EXISTS(
        SELECT 1 FROM ManagedBrowserSessions session
        WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
@@ -671,36 +772,56 @@ END;
 
 CREATE TRIGGER TR_TransferOperations_RejectCleanupClaim_Insert
 BEFORE INSERT ON TransferOperations
-WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
-  SELECT 1 FROM ManagedBrowserCleanupClaims claim
-  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND (
+  NOT EXISTS(
+    SELECT 1 FROM ManagedBrowserSessions session
+    WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
+      AND session.State IN ('Active','Retired'))
+  OR EXISTS(
+    SELECT 1 FROM ManagedBrowserCleanupClaims claim
+    WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId))
 BEGIN
     SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
 END;
 
 CREATE TRIGGER TR_ShareOperations_RejectCleanupClaim_Insert
 BEFORE INSERT ON ShareOperations
-WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
-  SELECT 1 FROM ManagedBrowserCleanupClaims claim
-  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND (
+  NOT EXISTS(
+    SELECT 1 FROM ManagedBrowserSessions session
+    WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
+      AND session.State IN ('Active','Retired'))
+  OR EXISTS(
+    SELECT 1 FROM ManagedBrowserCleanupClaims claim
+    WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId))
 BEGIN
     SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
 END;
 
 CREATE TRIGGER TR_StandaloneShareOperations_RejectCleanupClaim_Insert
 BEFORE INSERT ON StandaloneShareOperations
-WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
-  SELECT 1 FROM ManagedBrowserCleanupClaims claim
-  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND (
+  NOT EXISTS(
+    SELECT 1 FROM ManagedBrowserSessions session
+    WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
+      AND session.State IN ('Active','Retired'))
+  OR EXISTS(
+    SELECT 1 FROM ManagedBrowserCleanupClaims claim
+    WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId))
 BEGIN
     SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
 END;
 
 CREATE TRIGGER TR_WebAutomationAttempts_RejectCleanupClaim_Insert
 BEFORE INSERT ON WebAutomationAttempts
-WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND EXISTS(
-  SELECT 1 FROM ManagedBrowserCleanupClaims claim
-  WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId)
+WHEN NEW.ExecutionEngineVersion='ManagedChromium-v1' AND (
+  NOT EXISTS(
+    SELECT 1 FROM ManagedBrowserSessions session
+    WHERE session.SessionId=NEW.SessionId AND session.InstallationId=NEW.InstallationId
+      AND session.State IN ('Active','Retired'))
+  OR EXISTS(
+    SELECT 1 FROM ManagedBrowserCleanupClaims claim
+    WHERE claim.InstallationId=NEW.InstallationId AND claim.SessionId=NEW.SessionId))
 BEGIN
     SELECT RAISE(ABORT, 'managed browser identity is fenced for cleanup');
 END;
@@ -787,7 +908,7 @@ END;
 
 CREATE TRIGGER TR_WebAutomationAttempts_ExactOwnerSnapshot_Insert
 BEFORE INSERT ON WebAutomationAttempts
-WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
+WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare','RemoteSelection')
  AND NOT (
    (NEW.OwnerKind='Transfer' AND EXISTS(
       SELECT 1 FROM TransferOperations operation
@@ -807,6 +928,8 @@ WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
         AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
         AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
         AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='RemoteSelection' AND EXISTS(
+      SELECT 1 FROM Accounts account WHERE account.Id=NEW.AccountId))
  )
 BEGIN
     SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
@@ -814,7 +937,7 @@ END;
 
 CREATE TRIGGER TR_WebAutomationAttempts_ExactOwnerSnapshot_Update
 BEFORE UPDATE ON WebAutomationAttempts
-WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
+WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare','RemoteSelection')
  AND NOT (
    (NEW.OwnerKind='Transfer' AND EXISTS(
       SELECT 1 FROM TransferOperations operation
@@ -834,6 +957,8 @@ WHEN NEW.OwnerKind IN ('Transfer','TransferShare','StandaloneShare')
         AND operation.ExecutionEngineVersion=NEW.ExecutionEngineVersion
         AND operation.BrowserFamily=NEW.BrowserFamily AND operation.ProfileId=NEW.ProfileId
         AND operation.InstallationId IS NEW.InstallationId AND operation.SessionId IS NEW.SessionId))
+   OR (NEW.OwnerKind='RemoteSelection' AND EXISTS(
+      SELECT 1 FROM Accounts account WHERE account.Id=NEW.AccountId))
  )
 BEGIN
     SELECT RAISE(ABORT, 'attempt execution snapshot does not match its owner');
@@ -867,6 +992,25 @@ WHEN EXISTS(
     AND attempt.AccountId=OLD.AccountId)
 BEGIN
     SELECT RAISE(ABORT, 'standalone share attempt history must be closed before owner deletion');
+END;
+
+CREATE TRIGGER TR_RemoteSelectionSessions_RequireAttemptClosure_Delete
+BEFORE DELETE ON RemoteSelectionSessions
+WHEN EXISTS(
+  SELECT 1 FROM WebAutomationAttempts attempt
+  WHERE attempt.OwnerKind='RemoteSelection' AND attempt.OperationId=OLD.SessionId
+    AND attempt.AccountId=OLD.AccountId AND attempt.Generation=OLD.Generation)
+BEGIN
+    SELECT RAISE(ABORT, 'remote selection attempt history must be closed before owner deletion');
+END;
+
+CREATE TRIGGER TR_Accounts_RequireRemoteSelectionAttemptClosure_Delete
+BEFORE DELETE ON Accounts
+WHEN EXISTS(
+  SELECT 1 FROM WebAutomationAttempts attempt
+  WHERE attempt.OwnerKind='RemoteSelection' AND attempt.AccountId=OLD.Id)
+BEGIN
+    SELECT RAISE(ABORT, 'remote selection attempt history must be closed before account deletion');
 END;
 
 CREATE TRIGGER TR_ManagedProfileCleanupManifests_IdentityImmutable

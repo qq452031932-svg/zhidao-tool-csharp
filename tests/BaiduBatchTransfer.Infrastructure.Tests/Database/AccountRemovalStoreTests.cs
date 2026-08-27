@@ -583,6 +583,246 @@ public sealed class AccountRemovalStoreTests : IDisposable
     }
 
     [Theory]
+    [InlineData("WaitingShare")]
+    [InlineData("Reserved")]
+    [InlineData("Preparing")]
+    [InlineData("Submitting")]
+    [InlineData("ResultPending")]
+    [InlineData("Paused")]
+    public async Task InFlightShareBlocksPreviewAndPrepareWithoutWrites(string status)
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        _ = await InsertShareForRemovalAsync(factory, graph.BOnlyOperation, graph.BOnlyResource,
+            graph.BBatch, status, "Unknown", hasSubmissionEvidence: status is "Submitting" or "ResultPending");
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Theory]
+    [InlineData("Queued", "NotStarted")]
+    [InlineData("Reserved", "NotStarted")]
+    [InlineData("Preparing", "Prepared")]
+    [InlineData("Submitting", "Accepted")]
+    [InlineData("ResultPending", "ResultPending")]
+    [InlineData("NeedsDecision", "ResultPending")]
+    [InlineData("Paused", "ResultPending")]
+    public async Task InFlightStandaloneShareBlocksPreviewAndPrepareWithoutWrites(
+        string status,
+        string submissionState)
+    {
+        var (factory, store, _) = await CreateAsync();
+        _ = await InsertStandaloneForRemovalAsync(
+            factory, status, submissionState, "Unknown", "Active",
+            hasSubmissionEvidence: submissionState is not "NotStarted");
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task UnknownFailedShareAndStandaloneResultsBlockRemoval()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        _ = await InsertShareForRemovalAsync(factory, graph.BOnlyOperation, graph.BOnlyResource,
+            graph.BBatch, "Failed", "Unknown", hasSubmissionEvidence: true);
+        _ = await InsertStandaloneForRemovalAsync(
+            factory, "Failed", "ResultPending", "Unknown", "CompletedWithFailures",
+            hasSubmissionEvidence: true);
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task ShareBecomingInFlightAfterPreviewIsRevalidatedAndRollsBack()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOnlyOperation, graph.BOnlyResource,
+            graph.BBatch, "Succeeded", "Unknown", hasSubmissionEvidence: true);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        await ExecuteAsync(factory,
+            "UPDATE ShareOperations SET Status='ResultPending',UpdatedAt='2026-08-20T23:00:00Z' WHERE Id=$id;",
+            ("$id", Id(share)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task SafeShareManifestMutationMakesConfirmationStale()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOnlyOperation, graph.BOnlyResource,
+            graph.BBatch, "Succeeded", "Unknown", hasSubmissionEvidence: true);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        await ExecuteAsync(factory,
+            "UPDATE ShareOperations SET LastErrorMessage='changed after preview' WHERE Id=$id;",
+            ("$id", Id(share)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task CascadedShareAndStandaloneChildMutationMakesConfirmationStale()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOperation, graph.BResource,
+            graph.SharedBatch, "Succeeded", "Unknown", hasSubmissionEvidence: true);
+        var (_, standalone) = await InsertStandaloneForRemovalAsync(
+            factory, "Succeeded", "Completed", "Unknown", "Completed",
+            hasSubmissionEvidence: true);
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        await ExecuteAsync(factory, """
+            INSERT INTO ShareDiscoveryBaselines(
+              ShareOperationId,Generation,ShareId,ShareUrl,ExtractionCode,IsPermanent,IsAccessUnlimited)
+            VALUES($share,1,'late-share','https://pan.baidu.com/s/late','1234',1,1);
+            UPDATE StandaloneShareRemoteItems
+            SET DisplayName='changed remote item'
+            WHERE OperationId=$standalone;
+            """, ("$share", Id(share)), ("$standalone", Id(standalone)));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.StaleConfirmation, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Fact]
+    public async Task RemoveTerminalHistoryDeletesSafeStandaloneClosureAndRepairsBatchCounters()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOperation, graph.BResource,
+            graph.SharedBatch, "Succeeded", "Unknown", hasSubmissionEvidence: true, withAttemptEvidence: true);
+        var (standaloneBatch, standalone) = await InsertStandaloneForRemovalAsync(
+            factory, "Succeeded", "Completed", "Unknown", "Completed",
+            hasSubmissionEvidence: true, withAttemptEvidence: true);
+        await ExecuteAsync(factory, """
+            INSERT INTO LocalResultExports(
+              Id,OwnerKind,OwnerId,ExportKind,Generation,Status,TargetFileName,
+              LeaseGeneration,Revision,CreatedAt,UpdatedAt)
+            VALUES($id,'StandaloneShareBatch',$batch,'StandaloneShareWorkbook',1,'Pending',
+              'safe.xlsx',0,0,$at,$at);
+            UPDATE BatchJobs SET ShareOperationCount=7 WHERE Id=$batchJob;
+            """, ("$id", Id(Guid.NewGuid())), ("$batch", Id(standaloneBatch)),
+            ("$batchJob", Id(graph.SharedBatch)), ("$at", "2026-08-20T07:00:00Z"));
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;", ("$id", Id(share))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM StandaloneShareOperations WHERE Id=$id;", ("$id", Id(standalone))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM StandaloneShareBatches WHERE Id=$id;", ("$id", Id(standaloneBatch))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM LocalResultExports WHERE OwnerId=$id;", ("$id", Id(standaloneBatch))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId IN ($share,$standalone);",
+            ("$share", Id(share)), ("$standalone", Id(standalone))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM WebAutomationDirectoryMutations WHERE OperationId IN ($share,$standalone);",
+            ("$share", Id(share)), ("$standalone", Id(standalone))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT ShareOperationCount FROM BatchJobs WHERE Id=$batch;", ("$batch", Id(graph.SharedBatch))));
+        Assert.Equal(0, await ScalarAsync(factory, """
+            SELECT CreatedShareOperationCount FROM BatchOutputAccounts
+            WHERE BatchJobId=$batch AND AccountId=$account AND OutputOrdinal=1;
+            """, ("$batch", Id(graph.SharedBatch)), ("$account", Id(B))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Fact]
+    public async Task DefinitelyNotAcceptedTerminalOwnersWithZeroEvidenceAttemptsAreSafelyRemoved()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOperation, graph.BResource,
+            graph.SharedBatch, "Failed", "DefinitelyNotAccepted", hasSubmissionEvidence: false);
+        var (_, standalone) = await InsertStandaloneForRemovalAsync(
+            factory, "Failed", "DefinitelyNotAccepted", "DefinitelyNotAccepted",
+            "CompletedWithFailures", hasSubmissionEvidence: false);
+        await InsertDefinitelyNotSubmittedAttemptAsync(factory, share, "TransferShare");
+        await InsertDefinitelyNotSubmittedAttemptAsync(factory, standalone, "StandaloneShare");
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, result.Status);
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;", ("$id", Id(share))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM StandaloneShareOperations WHERE Id=$id;", ("$id", Id(standalone))));
+        Assert.Equal(0, await ScalarAsync(factory,
+            "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId IN ($share,$standalone);",
+            ("$share", Id(share)), ("$standalone", Id(standalone))));
+    }
+
+    [Fact]
+    public async Task DefinitelyNotAcceptedOwnerWithAttemptDirectoryEvidenceBlocksRemoval()
+    {
+        var (factory, store, graph) = await CreateAsync(seedGraph: true);
+        var share = await InsertShareForRemovalAsync(factory, graph.BOperation, graph.BResource,
+            graph.SharedBatch, "Failed", "DefinitelyNotAccepted", hasSubmissionEvidence: false);
+        await InsertDefinitelyNotSubmittedAttemptAsync(factory, share, "TransferShare");
+        await ExecuteAsync(factory, """
+            INSERT INTO WebAutomationDirectoryMutations(
+              OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+              ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+              CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+              CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+            VALUES($operation,$account,1,0,'root','unsafe',NULL,'/unsafe','listing','baidu-bravo',
+              'WebView2','1','1','1','Intent',0,$at,$at);
+            """, ("$operation", Id(share)), ("$account", Id(B)),
+            ("$at", "2026-08-20T07:15:00Z"));
+        var before = await ReadAllPersistentDataAsync(factory);
+
+        var preview = await store.PreviewAsync(B, AccountExitHistoryMode.RemoveTerminalHistory, default);
+        var result = await store.PrepareRemovalAsync(
+            new(B, AccountExitHistoryMode.RemoveTerminalHistory, preview.ConfirmationToken, RemovedAt), default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, result.Status);
+        Assert.Equal(before, await ReadAllPersistentDataAsync(factory));
+    }
+
+    [Theory]
     [InlineData("Parsing")]
     [InlineData("Draft")]
     [InlineData("Prechecking")]
@@ -1507,6 +1747,149 @@ public sealed class AccountRemovalStoreTests : IDisposable
             ("$slot", status == "Succeeded" ? "Fulfilled" : terminal ? "Released" : "Reserved"),
             ("$daily", status is "Succeeded" or "Failed" ? "2026-08-20T05:15:00Z" : null), ("$at", "2026-08-20T05:30:00Z"));
     }
+
+    private static async Task<Guid> InsertShareForRemovalAsync(
+        SqliteConnectionFactory factory,
+        Guid transferOperationId,
+        Guid resourceId,
+        Guid batchId,
+        string status,
+        string submissionAcceptance,
+        bool hasSubmissionEvidence,
+        bool withAttemptEvidence = false)
+    {
+        var shareId = Guid.NewGuid();
+        var profile = $"legacy-webview2-account-{B:N}";
+        var at = "2026-08-20T06:30:00Z";
+        await ExecuteAsync(factory, """
+            INSERT OR IGNORE INTO BatchShareSettings(
+              BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,FixedExtractionCode,
+              ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','account-removal-share-settings',$at);
+            INSERT OR IGNORE INTO BatchOutputAccounts(
+              BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,
+              PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'bravo-share',10,10,1);
+            INSERT INTO ShareOperations(
+              Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+              ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
+              AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,LeaseExpiresAt,
+              SubmitStartedAt,NextReconcileAt,BaselineGeneration,BaselineFingerprint,
+              BaselineShareCount,BaselineCompletedAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account,1,$status,'exact-removal-share',
+              'account-removal-share-settings',1,$request,$adapter,$acceptance,$attemptCount,1,NULL,$submitStarted,
+              NULL,NULL,NULL,0,NULL,NULL,NULL,$at,$at,
+              'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+            UPDATE BatchJobs
+            SET ShareOperationCount=(SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch)
+            WHERE Id=$batch;
+            """,
+            ("$batch", Id(batchId)), ("$account", Id(B)), ("$share", Id(shareId)),
+            ("$transfer", Id(transferOperationId)), ("$resource", Id(resourceId)),
+            ("$status", status), ("$request", hasSubmissionEvidence ? "{}" : null),
+            ("$adapter", hasSubmissionEvidence ? $"request-{shareId:N}" : null),
+            ("$acceptance", submissionAcceptance), ("$attemptCount", withAttemptEvidence ? 1 : 0),
+            ("$submitStarted", hasSubmissionEvidence ? at : null), ("$profile", profile), ("$at", at));
+
+        if (withAttemptEvidence)
+        {
+            await ExecuteAsync(factory, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($operation,$account,1,'TransferShare','Preparing',0,$at,$at,
+                  'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+                INSERT INTO WebAutomationAttemptSourceItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'share-source',X'01');
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,1,0,'root','share',NULL,'/share','listing','baidu-bravo',
+                  'WebView2','1','1','1','Intent',0,$at,$at);
+                """, ("$operation", Id(shareId)), ("$account", Id(B)),
+                ("$profile", profile), ("$at", at));
+        }
+        return shareId;
+    }
+
+    private static async Task<(Guid BatchId, Guid OperationId)> InsertStandaloneForRemovalAsync(
+        SqliteConnectionFactory factory,
+        string status,
+        string submissionState,
+        string submissionAcceptance,
+        string batchStatus,
+        bool hasSubmissionEvidence,
+        bool withAttemptEvidence = false)
+    {
+        var batchId = Guid.NewGuid();
+        var operationId = Guid.NewGuid();
+        var profile = $"legacy-webview2-account-{B:N}";
+        var at = "2026-08-20T06:45:00Z";
+        await ExecuteAsync(factory, """
+            INSERT INTO StandaloneShareBatches(
+              Id,DraftFingerprint,ResultDirectoryReference,Status,OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES($batch,'account-removal-standalone','result-ref',$batchStatus,1,0,$at,$at);
+            INSERT INTO StandaloneShareOperations(
+              Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,ParentPath,
+              ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
+              BaselineFingerprint,BaselineShareCount,BaselineCompletedAt,LeaseGeneration,LeaseOwnerId,
+              LeaseExpiresAt,LastErrorCode,Revision,CreatedAt,UpdatedAt,ExtractionCodeMode,
+              FixedExtractionCode,ExistingShareDecision,SettingsFingerprint,RequestDescriptorJson,
+              SubmitStartedAt,AdapterRequestId,AttemptCount,NextReconcileAt,ReconciliationIssue,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$batch,$account,1,'standalone removal','File','/','standalone-removal',1,
+              $status,$submissionState,$acceptance,NULL,NULL,NULL,1,NULL,NULL,NULL,0,$at,$at,
+              'Random',NULL,'Reuse','standalone-removal-settings',$request,$submitStarted,$adapter,
+              $attemptCount,NULL,NULL,'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+            INSERT INTO StandaloneShareRemoteItems(OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
+            VALUES($operation,0,'standalone-item',X'01','standalone item');
+            """,
+            ("$batch", Id(batchId)), ("$batchStatus", batchStatus), ("$operation", Id(operationId)),
+            ("$account", Id(B)), ("$status", status), ("$submissionState", submissionState),
+            ("$acceptance", submissionAcceptance), ("$request", hasSubmissionEvidence ? "{}" : null),
+            ("$submitStarted", hasSubmissionEvidence ? at : null),
+            ("$adapter", hasSubmissionEvidence ? $"request-{operationId:N}" : null),
+            ("$attemptCount", withAttemptEvidence ? 1 : 0), ("$profile", profile), ("$at", at));
+
+        if (withAttemptEvidence)
+        {
+            await ExecuteAsync(factory, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($operation,$account,1,'StandaloneShare','Preparing',0,$at,$at,
+                  'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+                INSERT INTO WebAutomationAttemptRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'standalone-remote',X'02');
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,1,0,'root','standalone',NULL,'/standalone','listing','baidu-bravo',
+                  'WebView2','1','1','1','Intent',0,$at,$at);
+                """, ("$operation", Id(operationId)), ("$account", Id(B)),
+                ("$profile", profile), ("$at", at));
+        }
+        return (batchId, operationId);
+    }
+
+    private static Task InsertDefinitelyNotSubmittedAttemptAsync(
+        SqliteConnectionFactory factory,
+        Guid operationId,
+        string ownerKind) => ExecuteAsync(factory, """
+            INSERT INTO WebAutomationAttempts(
+              OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($operation,$account,1,$ownerKind,'DefinitelyNotSubmitted',0,$at,$at,
+              'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+            """, ("$operation", Id(operationId)), ("$account", Id(B)), ("$ownerKind", ownerKind),
+            ("$profile", $"legacy-webview2-account-{B:N}"), ("$at", "2026-08-20T07:10:00Z"));
 
     private static Task InsertLogAsync(
         SqliteConnectionFactory factory,

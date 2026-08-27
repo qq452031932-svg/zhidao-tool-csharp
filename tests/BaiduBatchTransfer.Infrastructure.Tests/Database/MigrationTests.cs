@@ -282,7 +282,7 @@ public sealed class MigrationTests : IDisposable
     }
 
     [Fact]
-    public async Task VersionFifteenUpgradeDiscardsOwnerlessAttemptsAndTheirEvidence()
+    public async Task VersionFifteenUpgradeDiscardsOnlyDefinitelyNotSubmittedZeroEvidenceOrphans()
     {
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v15-orphan-attempt.db");
@@ -290,7 +290,12 @@ public sealed class MigrationTests : IDisposable
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
             Guid.NewGuid());
-        var orphanOperation = Guid.NewGuid();
+        var transferOrphan = ids.TransferWaiting;
+        var shareOrphan = ids.ShareWaiting;
+        var standaloneOrphan = ids.StandaloneQueued;
+        var remoteOrphan = Guid.NewGuid();
+        var remoteValid = Guid.NewGuid();
+        var missingAccount = Guid.NewGuid();
         await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
         {
             await connection.OpenAsync();
@@ -305,22 +310,20 @@ public sealed class MigrationTests : IDisposable
             await ExecuteAsync(connection, """
                 INSERT INTO WebAutomationAttempts(
                   OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt)
-                VALUES($operation,$account,7,'Transfer','Preparing',0,'2026-08-01','2026-08-01');
-                INSERT INTO WebAutomationAttemptSourceItems(
-                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
-                VALUES($operation,$account,7,0,'orphan-source',X'01');
-                INSERT INTO WebAutomationAttemptRemoteItems(
-                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
-                VALUES($operation,$account,7,0,'orphan-remote',X'02');
-                INSERT INTO WebAutomationDirectoryMutations(
-                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
-                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
-                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
-                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
-                VALUES($operation,$account,7,0,'root','orphan',NULL,'/orphan','listing','uid-one',
-                  'WebView2','1','1','1','Intent',0,'2026-08-01','2026-08-01');
-                """, ("$operation", orphanOperation.ToString("D")),
-                ("$account", ids.AccountOne.ToString("D")));
+                VALUES
+                  ($transfer,$accountOne,7,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($share,$accountOne,7,'TransferShare','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($standalone,$accountTwo,7,'StandaloneShare','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remoteOrphan,$missingAccount,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remoteValid,$accountOne,7,'RemoteSelection','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01');
+                """, ("$transfer", transferOrphan.ToString("D")),
+                ("$share", shareOrphan.ToString("D")),
+                ("$standalone", standaloneOrphan.ToString("D")),
+                ("$remoteOrphan", remoteOrphan.ToString("D")),
+                ("$remoteValid", remoteValid.ToString("D")),
+                ("$missingAccount", missingAccount.ToString("D")),
+                ("$accountOne", ids.AccountOne.ToString("D")),
+                ("$accountTwo", ids.AccountTwo.ToString("D")));
         }
 
         var factory = new SqliteConnectionFactory(path);
@@ -331,20 +334,133 @@ public sealed class MigrationTests : IDisposable
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.Equal(16L, await ScalarAsync<long>(upgraded,
             "SELECT MAX(Version) FROM SchemaVersions;"));
-        foreach (var table in new[]
-                 {
-                     "WebAutomationAttempts", "WebAutomationAttemptSourceItems",
-                     "WebAutomationAttemptRemoteItems", "WebAutomationDirectoryMutations",
-                 })
+        foreach (var orphan in new[] { transferOrphan, shareOrphan, standaloneOrphan, remoteOrphan })
         {
             Assert.Equal(0L, await ScalarAsync<long>(upgraded,
-                $"SELECT COUNT(*) FROM {table} WHERE OperationId=$operation;",
-                ("$operation", orphanOperation.ToString("D"))));
+                "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId=$operation AND Generation=7;",
+                ("$operation", orphan.ToString("D"))));
         }
-        Assert.Equal(2L, await ScalarAsync<long>(upgraded,
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId=$operation AND OwnerKind='RemoteSelection';",
+            ("$operation", remoteValid.ToString("D"))));
+        Assert.Equal(3L, await ScalarAsync<long>(upgraded,
             "SELECT COUNT(*) FROM WebAutomationAttempts;"));
         Assert.Equal(0L, await ScalarAsync<long>(upgraded,
             "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+    }
+
+    [Fact]
+    public async Task VersionFifteenUpgradeRollsBackForHighRiskOrphanStateOrAnyEvidence()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v15-high-risk-orphans.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        var missingAccount = Guid.NewGuid();
+        var orphanIds = Enumerable.Range(0, 11).Select(_ => Guid.NewGuid()).ToArray();
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,BaselineItemCount,
+                  BaselinePersistedAt,Revision,CreatedAt,UpdatedAt)
+                VALUES
+                  ($submitting,$accountOne,21,'Transfer','Submitting','baseline-submitting',0,'2026-08-01',0,'2026-08-01','2026-08-01'),
+                  ($resultPending,$accountOne,22,'TransferShare','ResultPending','baseline-result',0,'2026-08-01',0,'2026-08-01','2026-08-01'),
+                  ($needsDecision,$accountTwo,23,'StandaloneShare','NeedsDecision',NULL,0,NULL,0,'2026-08-01','2026-08-01'),
+                  ($remotePreparing,$missingAccount,24,'RemoteSelection','Preparing',NULL,0,NULL,0,'2026-08-01','2026-08-01');
+
+                INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt)
+                VALUES
+                  ($source,$accountOne,31,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($directory,$accountOne,32,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($remote,$accountOne,33,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($mapping,$accountOne,34,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($accepted,$accountOne,35,'Transfer','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01'),
+                  ($shareAcceptance,$accountOne,36,'TransferShare','DefinitelyNotSubmitted',0,'2026-08-01','2026-08-01');
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,SubmissionMarkedAt,Revision,CreatedAt,UpdatedAt)
+                VALUES($submitEvidence,$accountOne,37,'Transfer','DefinitelyNotSubmitted','2026-08-01',0,'2026-08-01','2026-08-01');
+
+                INSERT INTO WebAutomationAttemptSourceItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($source,$accountOne,31,0,'source-id',X'01');
+                INSERT INTO WebAutomationDirectoryMutations(
+                  OperationId,AccountId,OriginGeneration,SegmentOrdinal,ParentExactId,CanonicalSegment,
+                  ChildExactId,CanonicalChildPath,ListingGenerationToken,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,
+                  CapabilityBuildVersion,State,OwningAttemptRevision,CreatedAt,UpdatedAt)
+                VALUES($directory,$accountOne,32,0,'root','child',NULL,'/child','listing','uid-one',
+                  'WebView2','1','1','1','Intent',0,'2026-08-01','2026-08-01');
+                INSERT INTO WebAutomationAttemptRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($remote,$accountOne,33,0,'remote-id',X'02');
+                INSERT INTO WebAutomationTransferMappings(
+                  OperationId,AccountId,Generation,ItemOrdinal,SourceRemoteItemId,SourceCanonicalSortKey,
+                  DestinationRemoteItemId,DestinationCanonicalSortKey)
+                VALUES($mapping,$accountOne,34,0,'source-map',X'03','destination-map',X'04');
+                INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($accepted,$accountOne,35,0,'accepted-id',X'05');
+                INSERT INTO WebAutomationShareAcceptances(
+                  OperationId,AccountId,Generation,OwnerKind,AdapterRequestId,ShareId,ShareUrl,
+                  ExtractionCode,ExtractionCodeMode,ExactItemSetFingerprint,ObservationFingerprint,AcceptedAt)
+                VALUES($shareAcceptance,$accountOne,36,'TransferShare','request','share-id',
+                  'https://pan.baidu.com/s/high-risk','1234','Fixed','exact','observation','2026-08-01');
+                """,
+                ("$submitting", orphanIds[0].ToString("D")),
+                ("$resultPending", orphanIds[1].ToString("D")),
+                ("$needsDecision", orphanIds[2].ToString("D")),
+                ("$remotePreparing", orphanIds[3].ToString("D")),
+                ("$source", orphanIds[4].ToString("D")),
+                ("$directory", orphanIds[5].ToString("D")),
+                ("$remote", orphanIds[6].ToString("D")),
+                ("$mapping", orphanIds[7].ToString("D")),
+                ("$accepted", orphanIds[8].ToString("D")),
+                ("$shareAcceptance", orphanIds[9].ToString("D")),
+                ("$submitEvidence", orphanIds[10].ToString("D")),
+                ("$missingAccount", missingAccount.ToString("D")),
+                ("$accountOne", ids.AccountOne.ToString("D")),
+                ("$accountTwo", ids.AccountTwo.ToString("D")));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var error = await Record.ExceptionAsync(() => new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "high-risk-orphan-backups")), "new")
+            .MigrateAsync());
+
+        Assert.True(error is SqliteException or InvalidDataException, error?.ToString());
+        await using var live = await factory.OpenConnectionAsync();
+        Assert.Equal(15L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(11L, await ScalarAsync<long>(live,
+            "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId IN (" +
+            string.Join(',', orphanIds.Select((_, index) => $"$id{index}")) + ");",
+            orphanIds.Select((id, index) => ($"$id{index}", (object?)id.ToString("D"))).ToArray()));
+        foreach (var (table, operationId) in new[]
+                 {
+                     ("WebAutomationAttemptSourceItems", orphanIds[4]),
+                     ("WebAutomationDirectoryMutations", orphanIds[5]),
+                     ("WebAutomationAttemptRemoteItems", orphanIds[6]),
+                     ("WebAutomationTransferMappings", orphanIds[7]),
+                     ("WebAutomationAttemptAcceptedRemoteItems", orphanIds[8]),
+                     ("WebAutomationShareAcceptances", orphanIds[9]),
+                 })
+            Assert.Equal(1L, await ScalarAsync<long>(live,
+                $"SELECT COUNT(*) FROM {table} WHERE OperationId=$operation;",
+                ("$operation", operationId.ToString("D"))));
+        Assert.DoesNotContain("ExecutionEngineVersion", await ColumnsAsync(live, "WebAutomationAttempts"));
+        Assert.DoesNotContain("BrowserInstallations", await NamesAsync(live, "table"));
     }
 
     [Fact]
@@ -386,34 +502,56 @@ public sealed class MigrationTests : IDisposable
                 ("$profile", LegacyProfileId(ids.AccountOne)));
         }
 
-        async Task AssertBlockedAsync(string table, Guid ownerId)
+        var remoteSessionId = Guid.NewGuid();
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, """
+                INSERT INTO RemoteSelectionSessions(
+                  SessionId,WorkspaceDraftId,AccountId,Generation,State,Revision,CreatedAt,UpdatedAt)
+                VALUES($session,$draft,$account,1,'Active',0,'2026-08-01','2026-08-01');
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($session,$account,1,'RemoteSelection','Preparing',0,'2026-08-01','2026-08-01',
+                  'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
+                """, ("$session", remoteSessionId.ToString("D")),
+                ("$draft", Guid.NewGuid().ToString("D")),
+                ("$account", ids.AccountOne.ToString("D")),
+                ("$profile", LegacyProfileId(ids.AccountOne)));
+        }
+
+        async Task AssertBlockedAsync(string table, string idColumn, Guid ownerId)
         {
             await using var connection = await factory.OpenConnectionAsync();
             await using var transaction = connection.BeginTransaction(deferred: false);
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
-            command.CommandText = $"DELETE FROM {table} WHERE Id=$id;";
+            command.CommandText = $"DELETE FROM {table} WHERE {idColumn}=$id;";
             command.Parameters.AddWithValue("$id", ownerId.ToString("D"));
             await Assert.ThrowsAsync<SqliteException>(() => command.ExecuteNonQueryAsync());
             await transaction.RollbackAsync();
         }
 
-        await AssertBlockedAsync("TransferOperations", ids.TransferWaiting);
-        await AssertBlockedAsync("ShareOperations", ids.ShareWaiting);
-        await AssertBlockedAsync("StandaloneShareOperations", ids.StandaloneSucceeded);
+        await AssertBlockedAsync("TransferOperations", "Id", ids.TransferWaiting);
+        await AssertBlockedAsync("ShareOperations", "Id", ids.ShareWaiting);
+        await AssertBlockedAsync("StandaloneShareOperations", "Id", ids.StandaloneSucceeded);
+        await AssertBlockedAsync("RemoteSelectionSessions", "SessionId", remoteSessionId);
 
         await using var verified = await factory.OpenConnectionAsync();
         await ExecuteAsync(verified, """
             DELETE FROM WebAutomationAttempts
             WHERE (OperationId=$transfer AND OwnerKind='Transfer')
                OR (OperationId=$share AND OwnerKind='TransferShare')
-               OR (OperationId=$standalone AND OwnerKind='StandaloneShare');
+               OR (OperationId=$standalone AND OwnerKind='StandaloneShare')
+               OR (OperationId=$remote AND OwnerKind='RemoteSelection');
             DELETE FROM ShareOperations WHERE Id=$share;
             DELETE FROM TransferOperations WHERE Id=$transfer;
             DELETE FROM StandaloneShareOperations WHERE Id=$standalone;
+            DELETE FROM RemoteSelectionSessions WHERE SessionId=$remote;
             """, ("$transfer", ids.TransferWaiting.ToString("D")),
             ("$share", ids.ShareWaiting.ToString("D")),
-            ("$standalone", ids.StandaloneSucceeded.ToString("D")));
+            ("$standalone", ids.StandaloneSucceeded.ToString("D")),
+            ("$remote", remoteSessionId.ToString("D")));
         Assert.Equal(0L, await ScalarAsync<long>(verified,
             "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
     }
@@ -474,7 +612,7 @@ public sealed class MigrationTests : IDisposable
     }
 
     [Fact]
-    public async Task VersionSixteenMismatchedAttemptOwnerIsDiscardedWithoutLosingItsValidOwner()
+    public async Task VersionSixteenSafeMismatchedAttemptOwnerIsDiscardedWithoutLosingItsValidOwner()
     {
         Directory.CreateDirectory(root);
         var path = Path.Combine(root, "v16-mismatched-attempt.db");
@@ -494,7 +632,7 @@ public sealed class MigrationTests : IDisposable
             }
             await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
             await ExecuteAsync(connection, """
-                UPDATE WebAutomationAttempts SET AccountId=$wrongAccount
+                UPDATE WebAutomationAttempts SET AccountId=$wrongAccount,State='DefinitelyNotSubmitted'
                 WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
                 """, ("$wrongAccount", ids.AccountTwo.ToString("D")),
                 ("$operation", ids.TransferWaiting.ToString("D")),
@@ -1493,7 +1631,7 @@ public sealed class MigrationTests : IDisposable
               LeaseExpiresAt,CreatedAt,UpdatedAt)
             VALUES
               ($transferWaiting,$resourceOne,$job,1,1,'/target','/target','',$accountOne,'Fixture',
-                'Waiting',NULL,0,'transfer-waiting',NULL,NULL,NULL,'NotPrepared','Unoccupied',NULL,NULL,NULL,
+                'Waiting',NULL,1,'transfer-waiting',NULL,NULL,NULL,'NotPrepared','Unoccupied',NULL,NULL,NULL,
                 NULL,NULL,NULL,'2026-08-01T00:00:00Z','2026-08-01T00:00:01Z'),
               ($transferSucceeded,$resourceTwo,$job,2,2,'/target','/target','',$accountOne,'Fixture',
                 'Succeeded','NewTransfer',1,'transfer-succeeded','{}','request-two','[""remote-two""]',
