@@ -43,6 +43,12 @@ public interface IManagedBrowserStateStore
         ManagedBrowserTransitionRequest request,
         CancellationToken cancellationToken);
 
+    Task<ManagedBrowserFamilySwitchTransitionResult> TrySwitchFamilyAsync(
+        ManagedBrowserFamilySwitchTransitionRequest request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(new ManagedBrowserFamilySwitchTransitionResult(
+            ManagedBrowserFamilySwitchTransitionStatus.Conflict));
+
     Task<ManagedBrowserTransitionResult> TryClaimRetiredIdentityForCleanupAsync(
         ManagedBrowserCleanupClaimRequest request,
         CancellationToken cancellationToken);
@@ -54,6 +60,11 @@ public interface IManagedBrowserStateStore
     Task<StoredManagedProfileCleanupManifest?> LoadCleanupManifestAsync(
         Guid manifestId,
         CancellationToken cancellationToken);
+
+    Task<StoredManagedProfileCleanupManifest?> LoadLatestCleanupManifestAsync(
+        Guid accountId,
+        CancellationToken cancellationToken) =>
+        Task.FromResult<StoredManagedProfileCleanupManifest?>(null);
 
     Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(
         ManagedProfileCleanupTransitionRequest request,

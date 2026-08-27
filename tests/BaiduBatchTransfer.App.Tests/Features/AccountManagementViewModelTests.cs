@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using BaiduBatchTransfer.Core.Abstractions;
 using System.Windows;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
@@ -39,7 +40,7 @@ public sealed class AccountManagementViewModelTests
         Assert.Equal("已登录", vm.Accounts[0].LoginStatusText);
         Assert.Equal("已启用", vm.Accounts[0].EnabledStateText);
         Assert.Equal("退出账号", vm.Accounts[0].ActionText);
-        Assert.Equal("重试清理", vm.Accounts[1].ActionText);
+        Assert.Equal("继续清理", vm.Accounts[1].ActionText);
         Assert.Equal("登录已失效", vm.Accounts[2].LoginStatusText);
         Assert.Equal("第 1 页，共 3 页", vm.PageSummary);
 
@@ -331,6 +332,38 @@ public sealed class AccountManagementViewModelTests
     }
 
     [Fact]
+    public async Task ManagedProfileCleanupRequiresExactOwnedConfirmationBeforeDeletion()
+    {
+        var accountId = Guid.NewGuid();
+        var manifestId = Guid.NewGuid();
+        var token = new ManagedBrowserProfileDeletionConfirmation(manifestId, 2, "exact-token");
+        var operations = SingleAccount(accountId, "账号乙", "Disabled", false, true);
+        operations.ManagedPreparation = new(
+            ManagedBrowserProfileCleanupStatus.Quarantined,
+            token);
+        operations.ManagedConfirmResult = new(
+            AccountExitStatus.Removed, "", 0, 0, 0, "", "");
+        var dialogs = new FakeConfirmation { ConfirmResult = false };
+        var vm = Create(operations, dialogs);
+        await vm.LoadFirstPageAsync();
+
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        Assert.Empty(operations.ManagedConfirmRequests);
+        Assert.Empty(operations.ResumeRequests);
+        Assert.Contains("账号乙", Assert.Single(dialogs.ConfirmMessages));
+        Assert.Contains("不可恢复", dialogs.ConfirmMessages[0]);
+
+        dialogs.ConfirmResult = true;
+        await vm.BeginAccountActionAsync(vm.Accounts[0]);
+
+        var request = Assert.Single(operations.ManagedConfirmRequests);
+        Assert.Equal(accountId, request.AccountId);
+        Assert.Same(token, request.Confirmation);
+        Assert.Equal(AccountManagementUiText.Removed, vm.StatusMessage);
+    }
+
+    [Fact]
     public async Task FailedCleanupRetryStaysListedAndShowsSafeChineseStatus()
     {
         var operations = SingleAccount(Guid.NewGuid(), "账号乙", "Disabled", false, true);
@@ -611,6 +644,11 @@ public sealed class AccountManagementViewModelTests
         Assert.Contains("Content=\"重新加载确认信息\"", xaml, StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.Name=\"{Binding ActionAutomationName}\"", xaml, StringComparison.Ordinal);
         Assert.Contains("x:Name=\"ConfirmRemovalButton\"", xaml, StringComparison.Ordinal);
+        Assert.Contains(
+            "Text=\"退出账号后，专用浏览器登录数据会先进入可恢复区；需要彻底删除时，请点击“继续清理”并再次确认。\"",
+            xaml,
+            StringComparison.Ordinal);
+        Assert.Contains("删除专用浏览器登录数据前会再次要求确认", xaml, StringComparison.Ordinal);
         Assert.Contains("TabIndex=", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("云端", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("日期筛选", xaml, StringComparison.Ordinal);
@@ -683,6 +721,11 @@ public sealed class AccountManagementViewModelTests
             new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
         public AccountExitPreview ResumeResult { get; set; } =
             new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
+        public ManagedBrowserProfileDeletionPreparation ManagedPreparation { get; set; } =
+            new(ManagedBrowserProfileCleanupStatus.NotFound, null);
+        public AccountExitPreview ManagedConfirmResult { get; set; } =
+            new(AccountExitStatus.Removed, "", 0, 0, 0, "", "");
+        public List<(Guid AccountId, ManagedBrowserProfileDeletionConfirmation Confirmation)> ManagedConfirmRequests { get; } = [];
         public Func<Guid, AccountExitHistoryMode, Task<AccountExitPreview>>? PreviewHandler { get; set; }
         public Func<Guid, AccountExitHistoryMode, CancellationToken, Task<AccountExitPreview>>? PreviewHandlerWithToken { get; set; }
         public Func<AccountExitRequest, CancellationToken, Task<AccountExitPreview>>? ApplyHandlerWithToken { get; set; }
@@ -724,6 +767,20 @@ public sealed class AccountManagementViewModelTests
         {
             ResumeRequests.Add((accountId, removedAt));
             return Task.FromResult(ResumeResult);
+        }
+
+        public Task<ManagedBrowserProfileDeletionPreparation> PrepareManagedProfileDeletionAsync(
+            Guid accountId,
+            CancellationToken cancellationToken) => Task.FromResult(ManagedPreparation);
+
+        public Task<AccountExitPreview> ConfirmManagedProfileDeletionAsync(
+            Guid accountId,
+            DateTimeOffset removedAt,
+            ManagedBrowserProfileDeletionConfirmation confirmation,
+            CancellationToken cancellationToken)
+        {
+            ManagedConfirmRequests.Add((accountId, confirmation));
+            return Task.FromResult(ManagedConfirmResult);
         }
     }
 

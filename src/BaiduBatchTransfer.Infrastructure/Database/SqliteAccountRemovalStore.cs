@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using BaiduBatchTransfer.Application.Accounts;
+using BaiduBatchTransfer.Core.Abstractions;
 using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
@@ -253,7 +254,15 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             mode == AccountExitHistoryMode.RemoveTerminalHistory ? CleanupReadyMessage : ReadyMessage);
     }
 
-    public async Task<AccountRemovalPreparation> PrepareRemovalAsync(AccountExitRequest request, CancellationToken token)
+    public Task<AccountRemovalPreparation> PrepareRemovalAsync(
+        AccountExitRequest request,
+        CancellationToken token) =>
+        PrepareRemovalAsync(request, null, token);
+
+    public async Task<AccountRemovalPreparation> PrepareRemovalAsync(
+        AccountExitRequest request,
+        ManagedBrowserProfileCleanupPreparation? managedProfileCleanup,
+        CancellationToken token)
     {
         await using var connection = await factory.OpenConnectionAsync(token).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: false);
@@ -269,9 +278,28 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.ActiveWorkBlocked, request.AccountId, BlockedMessage).ConfigureAwait(false);
         if (!TokenEquals(manifest.Digest, request.ConfirmationToken))
             return await RollbackResultAsync(transaction, AccountRemovalPreparationStatus.StaleConfirmation, request.AccountId, StaleMessage).ConfigureAwait(false);
+        // Terminal rows selected by the confirmed removal mode must be removed inside this
+        // same writer transaction before the exact managed identity can be claimed. Their
+        // retention rows are released by v16 triggers; any in-flight row still failed the
+        // HasActiveWorkAsync fence above and can never reach this point.
         if (request.HistoryMode == AccountExitHistoryMode.RemoveTerminalHistory)
             await DeleteTerminalHistoryAsync(connection, transaction, request.AccountId, token).ConfigureAwait(false);
-
+        if (managedProfileCleanup is not null)
+        {
+            var managedStatus = await PrepareManagedProfileCleanupAsync(
+                connection,
+                transaction,
+                request.AccountId,
+                managedProfileCleanup,
+                token).ConfigureAwait(false);
+            if (managedStatus is not null)
+                return await RollbackResultAsync(
+                    transaction,
+                    managedStatus.Value,
+                    request.AccountId,
+                    managedStatus == AccountRemovalPreparationStatus.ActiveWorkBlocked ? BlockedMessage : StaleMessage)
+                    .ConfigureAwait(false);
+        }
         if (afterFinalValidation is not null)
             await afterFinalValidation(connection, transaction, token).ConfigureAwait(false);
 
@@ -299,7 +327,169 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
             AccountRemovalPreparationStatus.Prepared,
             request.AccountId,
             true,
-            "账号已安全退出。");
+            "账号已安全退出。",
+            managedProfileCleanup is null
+                ? null
+                : new ManagedBrowserProfileCleanupPreparation(
+                    managedProfileCleanup.Session,
+                    managedProfileCleanup.ManifestId,
+                    manifestRevision: 1,
+                    managedProfileCleanup.QuarantinePath));
+    }
+
+    private static async Task<AccountRemovalPreparationStatus?> PrepareManagedProfileCleanupAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid accountId,
+        ManagedBrowserProfileCleanupPreparation cleanup,
+        CancellationToken token)
+    {
+        if (cleanup.Session.AccountId != accountId || cleanup.ManifestRevision != 0)
+            return AccountRemovalPreparationStatus.StaleConfirmation;
+
+        var session = cleanup.Session;
+        var exactIdentityCount = await ScalarLongAsync(connection, transaction, """
+            SELECT COUNT(*)
+            FROM ManagedBrowserSessions session
+            JOIN BrowserInstallations installation
+              ON installation.InstallationId=session.InstallationId
+            WHERE session.SessionId=$session AND session.AccountId=$account
+              AND session.InstallationId=$installation
+              AND session.BaiduUserId=(SELECT BaiduUserId FROM Accounts WHERE Id=$account)
+              AND session.BrowserFamily=$family AND session.ProfileId=$profile
+              AND session.ProfileOwnershipId=$ownership
+              AND session.State='Active' AND session.Revision=$sessionRevision
+              AND installation.Revision=$installationRevision;
+            """, token,
+            ("$session", Id(session.SessionId)),
+            ("$account", Id(accountId)),
+            ("$installation", Id(session.InstallationId)),
+            ("$family", session.BrowserFamily.ToString()),
+            ("$profile", session.ProfileId),
+            ("$ownership", session.ProfileOwnershipId),
+            ("$sessionRevision", session.SessionRevision),
+            ("$installationRevision", session.InstallationRevision)).ConfigureAwait(false);
+        if (exactIdentityCount != 1)
+            return AccountRemovalPreparationStatus.StaleConfirmation;
+
+        var retainedOwners = await ScalarLongAsync(connection, transaction, """
+            SELECT
+              (SELECT COUNT(*) FROM TransferOperations
+                WHERE InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM ShareOperations
+                WHERE InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM StandaloneShareOperations
+                WHERE InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM WebAutomationAttempts
+                WHERE InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM ManagedBrowserRetentions
+                WHERE InstallationId=$installation AND SessionId=$session);
+            """, token,
+            ("$installation", Id(session.InstallationId)),
+            ("$session", Id(session.SessionId))).ConfigureAwait(false);
+        if (retainedOwners != 0)
+            return AccountRemovalPreparationStatus.ActiveWorkBlocked;
+
+        var now = DateTimeOffset.UtcNow.ToString("O");
+        await using (var retire = Command(connection, transaction, """
+            UPDATE ManagedBrowserSessions
+            SET State='Retired',Revision=Revision+1,UpdatedAt=$updated
+            WHERE SessionId=$session AND AccountId=$account AND InstallationId=$installation
+              AND State='Active' AND Revision=$revision;
+            """))
+        {
+            Add(retire, "$updated", now);
+            Add(retire, "$session", Id(session.SessionId));
+            Add(retire, "$account", Id(accountId));
+            Add(retire, "$installation", Id(session.InstallationId));
+            Add(retire, "$revision", session.SessionRevision);
+            if (await retire.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                return AccountRemovalPreparationStatus.StaleConfirmation;
+        }
+
+        await using (var create = Command(connection, transaction, """
+            INSERT INTO ManagedProfileCleanupManifests(
+              ManifestId,AccountId,SessionId,State,SourceProfilePath,QuarantinePath,
+              ExpectedOwnershipId,ConfirmationTokenHash,Revision,CreatedAt,UpdatedAt)
+            VALUES($manifest,$account,$session,'Prepared',$source,$quarantine,
+              $ownership,NULL,0,$now,$now);
+            """))
+        {
+            Add(create, "$manifest", Id(cleanup.ManifestId));
+            Add(create, "$account", Id(accountId));
+            Add(create, "$session", Id(session.SessionId));
+            Add(create, "$source", cleanup.SourceProfilePath);
+            Add(create, "$quarantine", cleanup.QuarantinePath);
+            Add(create, "$ownership", session.ProfileOwnershipId);
+            Add(create, "$now", now);
+            try
+            {
+                if (await create.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                    return AccountRemovalPreparationStatus.StaleConfirmation;
+            }
+            catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
+            {
+                return AccountRemovalPreparationStatus.StaleConfirmation;
+            }
+        }
+
+        await using (var claim = Command(connection, transaction, """
+            INSERT INTO ManagedBrowserCleanupClaims(
+              ManifestId,InstallationId,SessionId,AccountId,ExpectedInstallationRevision,
+              ExpectedSessionRevision,ExpectedManifestRevision,CreatedAt)
+            VALUES($manifest,$installation,$session,$account,$installationRevision,
+              $sessionRevision,0,$now);
+            """))
+        {
+            Add(claim, "$manifest", Id(cleanup.ManifestId));
+            Add(claim, "$installation", Id(session.InstallationId));
+            Add(claim, "$session", Id(session.SessionId));
+            Add(claim, "$account", Id(accountId));
+            Add(claim, "$installationRevision", session.InstallationRevision);
+            Add(claim, "$sessionRevision", checked(session.SessionRevision + 1));
+            Add(claim, "$now", now);
+            try
+            {
+                if (await claim.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                    return AccountRemovalPreparationStatus.ActiveWorkBlocked;
+            }
+            catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
+            {
+                return AccountRemovalPreparationStatus.ActiveWorkBlocked;
+            }
+        }
+
+        await using (var fence = Command(connection, transaction, """
+            UPDATE ManagedBrowserSessions
+            SET State='QuarantinePending',Revision=Revision+1,UpdatedAt=$updated
+            WHERE SessionId=$session AND State='Retired' AND Revision=$revision;
+            """))
+        {
+            Add(fence, "$updated", now);
+            Add(fence, "$session", Id(session.SessionId));
+            Add(fence, "$revision", checked(session.SessionRevision + 1));
+            if (await fence.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                return AccountRemovalPreparationStatus.StaleConfirmation;
+        }
+
+        await using (var intent = Command(connection, transaction, """
+            UPDATE ManagedProfileCleanupManifests
+            SET State='QuarantineMoveIntent',Revision=Revision+1,UpdatedAt=$updated
+            WHERE ManifestId=$manifest AND State='Prepared' AND Revision=0
+              AND ConfirmationTokenHash IS NULL;
+            """))
+        {
+            Add(intent, "$updated", now);
+            Add(intent, "$manifest", Id(cleanup.ManifestId));
+            if (await intent.ExecuteNonQueryAsync(token).ConfigureAwait(false) != 1)
+                return AccountRemovalPreparationStatus.StaleConfirmation;
+        }
+
+        return null;
     }
 
     public async Task CompletePreparedRemovalAsync(

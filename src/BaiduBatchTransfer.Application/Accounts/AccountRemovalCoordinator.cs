@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Accounts;
 
@@ -11,6 +12,8 @@ public sealed class AccountRemovalCoordinator
 
     private readonly IAccountRemovalStore store;
     private readonly RemoveAccountService removalService;
+    private readonly IManagedBrowserLifecycle? managedLifecycle;
+    private readonly IManagedBrowserProfileStore? managedProfiles;
 
     public AccountRemovalCoordinator(
         IAccountRemovalStore store,
@@ -23,9 +26,22 @@ public sealed class AccountRemovalCoordinator
     public AccountRemovalCoordinator(
         IAccountRemovalStore store,
         RemoveAccountService removalService)
+        : this(store, removalService, null, null)
+    {
+    }
+
+    public AccountRemovalCoordinator(
+        IAccountRemovalStore store,
+        RemoveAccountService removalService,
+        IManagedBrowserLifecycle? managedLifecycle,
+        IManagedBrowserProfileStore? managedProfiles)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.removalService = removalService ?? throw new ArgumentNullException(nameof(removalService));
+        if ((managedLifecycle is null) != (managedProfiles is null))
+            throw new ArgumentException("Managed browser removal dependencies must be supplied together.");
+        this.managedLifecycle = managedLifecycle;
+        this.managedProfiles = managedProfiles;
     }
 
     public Task<AccountPage> GetAccountsPageAsync(
@@ -52,7 +68,24 @@ public sealed class AccountRemovalCoordinator
         AccountRemovalPreparation preparation;
         try
         {
-            preparation = await store.PrepareRemovalAsync(request, cancellationToken).ConfigureAwait(false);
+            ManagedBrowserProfileCleanupPreparation? managedCleanup = null;
+            if (managedLifecycle is not null)
+            {
+                var active = await managedLifecycle
+                    .LoadActiveSessionAsync(request.AccountId, cancellationToken)
+                    .ConfigureAwait(false);
+                if (active is not null)
+                {
+                    var stopped = await managedLifecycle.StopAsync(active, cancellationToken).ConfigureAwait(false);
+                    if (stopped == ManagedBrowserStopStatus.Blocked)
+                        return Result(AccountExitStatus.ActiveWorkBlocked,
+                            "账号的专用浏览器仍在运行，请关闭后重试。");
+                    managedCleanup = managedProfiles!.PrepareRemoval(active);
+                }
+            }
+            preparation = await store
+                .PrepareRemovalAsync(request, managedCleanup, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -67,6 +100,14 @@ public sealed class AccountRemovalCoordinator
             preparation.AccountId != request.AccountId)
         {
             return Result(AccountExitStatus.Failed, FailedMessage);
+        }
+
+        if (preparation.ManagedProfileCleanup is { } preparedCleanup)
+        {
+            _ = await removalService.RecoverManagedProfileAsync(
+                preparedCleanup.ManifestId,
+                cancellationToken).ConfigureAwait(false);
+            return Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
         }
 
         var cleanup = await removalService.FinalizePreparedAsync(
@@ -89,12 +130,39 @@ public sealed class AccountRemovalCoordinator
         if (accountId == Guid.Empty)
             return Result(AccountExitStatus.Failed, FailedMessage);
 
+        var managed = await removalService.PrepareManagedProfileDeletionAsync(
+            accountId, cancellationToken).ConfigureAwait(false);
+        if (managed.Status is not (ManagedBrowserProfileCleanupStatus.NotFound or ManagedBrowserProfileCleanupStatus.Deleted))
+            return Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
+
         var cleanup = await removalService.FinalizePreparedAsync(
             accountId,
             removedAt,
             store,
             cancellationToken).ConfigureAwait(false);
         return CleanupResult(cleanup);
+    }
+
+    public Task<ManagedBrowserProfileDeletionPreparation> PrepareManagedProfileDeletionAsync(
+        Guid accountId,
+        CancellationToken cancellationToken) =>
+        removalService.PrepareManagedProfileDeletionAsync(accountId, cancellationToken);
+
+    public async Task<AccountExitPreview> ConfirmManagedProfileDeletionAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        ManagedBrowserProfileDeletionConfirmation confirmation,
+        CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty)
+            return Result(AccountExitStatus.Failed, FailedMessage);
+        var deleted = await removalService.DeleteConfirmedManagedProfileAsync(
+            accountId, confirmation, cancellationToken).ConfigureAwait(false);
+        if (deleted.Status != ManagedBrowserProfileCleanupStatus.Deleted)
+            return Result(AccountExitStatus.CleanupPending, CleanupPendingMessage);
+        var finalized = await removalService.FinalizePreparedAsync(
+            accountId, removedAt, store, cancellationToken).ConfigureAwait(false);
+        return CleanupResult(finalized);
     }
 
     private static AccountExitPreview CleanupResult(RemoveAccountResult cleanup) =>
@@ -114,4 +182,90 @@ public sealed class AccountRemovalCoordinator
 
     private static AccountExitPreview Result(AccountExitStatus status, string safeMessage) =>
         new(status, string.Empty, 0, 0, 0, string.Empty, safeMessage);
+}
+
+/// <summary>
+/// Task-6 state-only family switch. Task 11 supplies the real identity observation and process fence.
+/// </summary>
+public sealed class ManagedBrowserFamilySwitchCoordinator(
+    IManagedBrowserStateStore stateStore,
+    IManagedBrowserFamilySwitchFence fence)
+{
+    private readonly IManagedBrowserStateStore stateStore =
+        stateStore ?? throw new ArgumentNullException(nameof(stateStore));
+    private readonly IManagedBrowserFamilySwitchFence fence =
+        fence ?? throw new ArgumentNullException(nameof(fence));
+
+    public async Task<ManagedBrowserFamilySwitchResult> SwitchAsync(
+        ManagedBrowserFamilySwitchObservation observation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(observation);
+        var current = observation.ExpectedCurrent;
+        var targetInstallation = observation.TargetInstallation;
+        var targetSession = observation.TargetSession;
+        if (targetInstallation.BrowserFamily == current.BrowserFamily ||
+            targetSession.BrowserFamily != targetInstallation.BrowserFamily ||
+            targetSession.AccountId != current.AccountId ||
+            targetSession.InstallationId != targetInstallation.InstallationId ||
+            targetSession.SessionId == current.SessionId ||
+            string.Equals(targetSession.ProfileId, current.ProfileId, StringComparison.Ordinal) ||
+            string.Equals(targetSession.ProfileOwnershipId, current.ProfileOwnershipId, StringComparison.Ordinal) ||
+            !string.Equals(observation.ObservedStableBaiduUserId,
+                current.Session.StableBaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(targetSession.StableBaiduUserId,
+                observation.ObservedStableBaiduUserId, StringComparison.Ordinal))
+            return new(ManagedBrowserFamilySwitchStatus.IdentityMismatch);
+
+        if (!await fence.CanSwitchAsync(current.AccountId, cancellationToken).ConfigureAwait(false))
+            return new(ManagedBrowserFamilySwitchStatus.ActiveWorkBlocked);
+
+        var storedInstallation = await stateStore.LoadInstallationAsync(
+            current.InstallationId, cancellationToken).ConfigureAwait(false);
+        var storedSession = await stateStore.LoadSessionAsync(
+            current.SessionId, cancellationToken).ConfigureAwait(false);
+        if (storedInstallation is null || storedSession is null ||
+            storedInstallation.Revision != current.InstallationRevision ||
+            storedInstallation.State != BrowserInstallationLifecycleState.Active ||
+            storedInstallation.Identity.InstallationId != current.InstallationId ||
+            storedInstallation.Identity.BrowserFamily != current.BrowserFamily ||
+            storedSession.Revision != current.SessionRevision ||
+            storedSession.State != ManagedBrowserSessionLifecycleState.Active ||
+            storedSession.Identity.SessionId != current.SessionId ||
+            storedSession.Identity.InstallationId != current.InstallationId ||
+            storedSession.Identity.AccountId != current.AccountId ||
+            storedSession.Identity.BrowserFamily != current.BrowserFamily ||
+            !string.Equals(storedSession.Identity.StableBaiduUserId,
+                current.Session.StableBaiduUserId, StringComparison.Ordinal) ||
+            !string.Equals(storedSession.Identity.ProfileId,
+                current.ProfileId, StringComparison.Ordinal) ||
+            !string.Equals(storedSession.Identity.ProfileOwnershipId,
+                current.ProfileOwnershipId, StringComparison.Ordinal))
+            return new(ManagedBrowserFamilySwitchStatus.Conflict);
+
+        ManagedBrowserFamilySwitchTransitionResult transition;
+        try
+        {
+            transition = await stateStore.TrySwitchFamilyAsync(
+                new ManagedBrowserFamilySwitchTransitionRequest(
+                    storedInstallation,
+                    storedSession,
+                    targetInstallation,
+                    targetSession,
+                    observation.ObservedStableBaiduUserId),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return new(ManagedBrowserFamilySwitchStatus.Conflict);
+        }
+
+        return new(transition.Status switch
+        {
+            ManagedBrowserFamilySwitchTransitionStatus.Applied => ManagedBrowserFamilySwitchStatus.Switched,
+            ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked =>
+                ManagedBrowserFamilySwitchStatus.ActiveWorkBlocked,
+            _ => ManagedBrowserFamilySwitchStatus.Conflict,
+        });
+    }
 }

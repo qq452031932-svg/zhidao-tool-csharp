@@ -240,6 +240,17 @@ public static class AppBootstrap
         services.AddSingleton(_ => new FileSystemManagedBrowserProfilePolicy(paths.RootDirectory));
         services.AddSingleton<IManagedBrowserProfilePolicy>(sp =>
             sp.GetRequiredService<FileSystemManagedBrowserProfilePolicy>());
+        services.AddSingleton<SqliteManagedBrowserStateStore>();
+        services.AddSingleton<IManagedBrowserStateStore>(sp =>
+            sp.GetRequiredService<SqliteManagedBrowserStateStore>());
+        services.AddSingleton(sp => new FileSystemManagedBrowserProfileStore(
+            paths.RootDirectory,
+            sp.GetRequiredService<IManagedBrowserProfilePolicy>()));
+        services.AddSingleton<IManagedBrowserProfileStore>(sp =>
+            sp.GetRequiredService<FileSystemManagedBrowserProfileStore>());
+        services.AddSingleton<NullManagedBrowserLifecycle>();
+        services.AddSingleton<IManagedBrowserLifecycle>(sp =>
+            sp.GetRequiredService<NullManagedBrowserLifecycle>());
         services.AddSingleton<BrowserSelectionProcessContext>();
         services.AddSingleton<ProcessBrowserSelectionActivityRegistry>();
         services.AddSingleton<IBrowserSelectionActivityRegistry>(sp =>
@@ -323,12 +334,15 @@ public static class AppBootstrap
         services.AddSingleton(sp => new RemoveAccountService(
             sp.GetRequiredService<IUnitOfWorkFactory>(),
             sp.GetRequiredService<IWebViewProfileStore>(),
-            sp.GetRequiredService<IAccountProfilePathPolicy>()));
+            sp.GetRequiredService<IAccountProfilePathPolicy>(),
+            sp.GetRequiredService<IManagedBrowserStateStore>(),
+            sp.GetRequiredService<IManagedBrowserProfileStore>()));
         // 管理窗口只走已在 SQLite 事务中完成凭据清除后的收尾路径。
         services.AddSingleton(sp => new AccountRemovalCoordinator(
             sp.GetRequiredService<IAccountRemovalStore>(),
-            sp.GetRequiredService<IWebViewProfileStore>(),
-            sp.GetRequiredService<IAccountProfilePathPolicy>()));
+            sp.GetRequiredService<RemoveAccountService>(),
+            sp.GetRequiredService<IManagedBrowserLifecycle>(),
+            sp.GetRequiredService<IManagedBrowserProfileStore>()));
         services.AddSingleton<IAccountRemovalOperations, AccountRemovalOperations>();
         services.AddSingleton<IAccountManagementOwnedPrompt, WpfAccountManagementOwnedPrompt>();
         services.AddTransient<Func<IAccountManagementConfirmation, AccountManagementWindow>>(sp =>

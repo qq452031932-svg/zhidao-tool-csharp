@@ -695,6 +695,12 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IAccountRemovalStore>());
         Assert.NotNull(host.Services.GetRequiredService<RemoveAccountService>());
         Assert.NotNull(host.Services.GetRequiredService<AccountRemovalCoordinator>());
+        Assert.IsType<SqliteManagedBrowserStateStore>(
+            host.Services.GetRequiredService<IManagedBrowserStateStore>());
+        Assert.IsType<FileSystemManagedBrowserProfileStore>(
+            host.Services.GetRequiredService<IManagedBrowserProfileStore>());
+        Assert.IsType<NullManagedBrowserLifecycle>(
+            host.Services.GetRequiredService<IManagedBrowserLifecycle>());
         Assert.IsType<AccountRemovalOperations>(
             host.Services.GetRequiredService<IAccountRemovalOperations>());
         Assert.IsType<WpfAccountManagementOwnedPrompt>(

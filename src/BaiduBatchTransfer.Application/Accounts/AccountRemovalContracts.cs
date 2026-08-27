@@ -1,3 +1,6 @@
+using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
+
 namespace BaiduBatchTransfer.Application.Accounts;
 
 public enum AccountExitHistoryMode
@@ -81,11 +84,33 @@ public sealed record AccountRemovalPreparation(
     AccountRemovalPreparationStatus Status,
     Guid AccountId,
     bool DatabasePrepared,
-    string SafeMessage)
+    string SafeMessage,
+    ManagedBrowserProfileCleanupPreparation? ManagedProfileCleanup = null)
 {
     public override string ToString() =>
         $"AccountRemovalPreparation {{ Status = {Status}, DatabasePrepared = {DatabasePrepared}, " +
         "SensitiveData = [REDACTED] }";
+}
+
+public enum ManagedBrowserFamilySwitchStatus
+{
+    Switched = 1,
+    ActiveWorkBlocked = 2,
+    IdentityMismatch = 3,
+    Conflict = 4,
+}
+
+public sealed record ManagedBrowserFamilySwitchObservation(
+    ManagedBrowserLifecycleSession ExpectedCurrent,
+    BrowserInstallationIdentity TargetInstallation,
+    ManagedBrowserSessionReference TargetSession,
+    string ObservedStableBaiduUserId);
+
+public sealed record ManagedBrowserFamilySwitchResult(ManagedBrowserFamilySwitchStatus Status);
+
+public interface IManagedBrowserFamilySwitchFence
+{
+    Task<bool> CanSwitchAsync(Guid accountId, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -118,6 +143,18 @@ public interface IAccountRemovalStore
     Task<AccountRemovalPreparation> PrepareRemovalAsync(
         AccountExitRequest request,
         CancellationToken token);
+
+    Task<AccountRemovalPreparation> PrepareRemovalAsync(
+        AccountExitRequest request,
+        ManagedBrowserProfileCleanupPreparation? managedProfileCleanup,
+        CancellationToken token) =>
+        managedProfileCleanup is null
+            ? PrepareRemovalAsync(request, token)
+            : Task.FromResult(new AccountRemovalPreparation(
+                AccountRemovalPreparationStatus.Failed,
+                request.AccountId,
+                false,
+                "账号退出准备失败。"));
 
     /// <summary>
     /// Completes profile cleanup and tombstoning while holding the database writer lease.

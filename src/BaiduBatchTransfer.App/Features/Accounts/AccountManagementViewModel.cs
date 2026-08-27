@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
+using BaiduBatchTransfer.Core.Abstractions;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -31,6 +32,7 @@ public static class AccountManagementUiText
     public const string Ready = "请核对影响范围后确认退出。";
     public const string Cancelled = "已取消退出操作。";
     public const string ConfirmTitle = "确认退出账号";
+    public const string ConfirmManagedProfileDeletionTitle = "确认删除专用浏览器登录数据";
     public const string PreviousPage = "上一页";
     public const string NextPage = "下一页";
     public const string Cancel = "取消";
@@ -86,6 +88,14 @@ public interface IAccountRemovalOperations
         Guid accountId,
         DateTimeOffset removedAt,
         CancellationToken cancellationToken);
+    Task<ManagedBrowserProfileDeletionPreparation> PrepareManagedProfileDeletionAsync(
+        Guid accountId,
+        CancellationToken cancellationToken);
+    Task<AccountExitPreview> ConfirmManagedProfileDeletionAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        ManagedBrowserProfileDeletionConfirmation confirmation,
+        CancellationToken cancellationToken);
 }
 
 public interface IAccountManagementConfirmation
@@ -120,6 +130,19 @@ public sealed class AccountRemovalOperations(AccountRemovalCoordinator coordinat
         DateTimeOffset removedAt,
         CancellationToken cancellationToken) =>
         coordinator.ResumeCleanupAsync(accountId, removedAt, cancellationToken);
+
+    public Task<ManagedBrowserProfileDeletionPreparation> PrepareManagedProfileDeletionAsync(
+        Guid accountId,
+        CancellationToken cancellationToken) =>
+        coordinator.PrepareManagedProfileDeletionAsync(accountId, cancellationToken);
+
+    public Task<AccountExitPreview> ConfirmManagedProfileDeletionAsync(
+        Guid accountId,
+        DateTimeOffset removedAt,
+        ManagedBrowserProfileDeletionConfirmation confirmation,
+        CancellationToken cancellationToken) =>
+        coordinator.ConfirmManagedProfileDeletionAsync(
+            accountId, removedAt, confirmation, cancellationToken);
 }
 
 public sealed class AccountManagementRowViewModel
@@ -141,7 +164,7 @@ public sealed class AccountManagementRowViewModel
         EnabledStateText = account.IsEnabled ? "已启用" : "已禁用";
         IsCleanupPending = account.IsCleanupPending;
         CanAct = IsCleanupPending || account.IsEnabled;
-        ActionText = IsCleanupPending ? "重试清理" : CanAct ? "退出账号" : "不可操作";
+        ActionText = IsCleanupPending ? "继续清理" : CanAct ? "退出账号" : "不可操作";
         ActionCommand = new AsyncRelayCommand(ExecuteActionAsync, () => CanAct && this.canExecute());
     }
 
@@ -515,9 +538,40 @@ public sealed class AccountManagementViewModel : ObservableObject
         using var linked = CreateOperationTokenSource(cancellationToken);
         try
         {
-            var result = await operations
-                .ResumeCleanupAsync(row.AccountId, timeProvider.GetUtcNow(), linked.Token)
+            var prepared = await operations
+                .PrepareManagedProfileDeletionAsync(row.AccountId, linked.Token)
                 .ConfigureAwait(true);
+            AccountExitPreview result;
+            if (prepared.Status == ManagedBrowserProfileCleanupStatus.Quarantined &&
+                prepared.Confirmation is { } managedConfirmation)
+            {
+                var message = $"将删除账号“{row.DisplayName}”的专用浏览器登录数据。删除后不可恢复，其他账号不受影响。";
+                var confirmed = await confirmation.ConfirmAsync(
+                    AccountManagementUiText.ConfirmManagedProfileDeletionTitle,
+                    message,
+                    linked.Token).ConfigureAwait(true);
+                if (!confirmed)
+                {
+                    StatusMessage = AccountManagementUiText.Cancelled;
+                    return;
+                }
+                result = await operations.ConfirmManagedProfileDeletionAsync(
+                    row.AccountId,
+                    timeProvider.GetUtcNow(),
+                    managedConfirmation,
+                    linked.Token).ConfigureAwait(true);
+            }
+            else if (prepared.Status == ManagedBrowserProfileCleanupStatus.NotFound)
+            {
+                result = await operations
+                    .ResumeCleanupAsync(row.AccountId, timeProvider.GetUtcNow(), linked.Token)
+                    .ConfigureAwait(true);
+            }
+            else
+            {
+                result = new AccountExitPreview(
+                    AccountExitStatus.CleanupPending, string.Empty, 0, 0, 0, string.Empty, string.Empty);
+            }
             if (result.Status == AccountExitStatus.Removed)
             {
                 StatusMessage = AccountManagementUiText.Removed;

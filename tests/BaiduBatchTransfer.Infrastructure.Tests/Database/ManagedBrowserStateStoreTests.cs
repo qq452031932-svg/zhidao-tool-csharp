@@ -351,6 +351,9 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         Assert.NotNull(loaded);
         Assert.Equal(manifest.ManifestId, loaded.Manifest.ManifestId);
         Assert.Equal(manifest.SourceProfilePath, loaded.Manifest.SourceProfilePath);
+        var byAccount = await restarted.LoadLatestCleanupManifestAsync(accountId, default);
+        Assert.Equal(manifest.ManifestId, byAccount!.Manifest.ManifestId);
+        Assert.Null(await restarted.LoadLatestCleanupManifestAsync(otherAccountId, default));
 
         Assert.Equal(ManagedBrowserTransitionStatus.Applied,
             (await store.TryRetireSessionAsync(
@@ -795,6 +798,114 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
                 first.Identity.InstallationId, Guid.NewGuid()), cancelled.Token));
     }
 
+    [Fact]
+    public async Task FamilySwitchExceptionAfterOldRetirementRollsBackEveryVisibleWrite()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var crashing = new SqliteManagedBrowserStateStore(
+            fixture.Factory,
+            _ => throw new InvalidOperationException("simulated crash"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            crashing.TrySwitchFamilyAsync(fixture.Request, default));
+
+        Assert.Equal(BrowserInstallationLifecycleState.Active,
+            (await fixture.Store.LoadInstallationAsync(
+                fixture.OldInstallation.Identity.InstallationId, default))!.State);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Active,
+            (await fixture.Store.LoadSessionAsync(
+                fixture.OldSession.Identity.SessionId, default))!.State);
+        Assert.Null(await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default));
+        Assert.Null(await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default));
+    }
+
+    [Fact]
+    public async Task ConcurrentFamilySwitchHasOneWinnerAndNoLosingRows()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var otherInstallation = Installation(BrowserFamily.Edge, "edge-other", "edge-other-file");
+        var otherSession = Session(
+            otherInstallation.InstallationId,
+            fixture.AccountId,
+            fixture.StableUid,
+            BrowserFamily.Edge,
+            Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"));
+        var otherRequest = new ManagedBrowserFamilySwitchTransitionRequest(
+            fixture.OldInstallation,
+            fixture.OldSession,
+            otherInstallation,
+            otherSession,
+            fixture.StableUid);
+
+        var results = await Task.WhenAll(
+            fixture.Store.TrySwitchFamilyAsync(fixture.Request, default),
+            new SqliteManagedBrowserStateStore(fixture.Factory)
+                .TrySwitchFamilyAsync(otherRequest, default));
+
+        Assert.Single(results, result => result.Status == ManagedBrowserFamilySwitchTransitionStatus.Applied);
+        Assert.Single(results, result => result.Status == ManagedBrowserFamilySwitchTransitionStatus.Conflict);
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM BrowserInstallations;"));
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM ManagedBrowserSessions;"));
+        Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM BrowserInstallations WHERE State='Active';"));
+        Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserSessions WHERE State='Active' AND AccountId=$account;",
+            ("$account", fixture.AccountId.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task RepeatingExactFamilySwitchIntentIsIdempotentlyApplied()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+
+        var first = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+        var targetInstallation = await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default);
+        var targetSession = await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default);
+        var repeated = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, first.Status);
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, repeated.Status);
+        AssertInstallationEqual(targetInstallation!, await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default));
+        AssertSessionEqual(targetSession!, await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default));
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM BrowserInstallations;"));
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM ManagedBrowserSessions;"));
+    }
+
+    [Fact]
+    public async Task RecoveringAttemptBlocksFamilySwitchWithoutChangingSnapshotOrCreatingRows()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var (operationId, _) = await SeedManagedOwnersAsync(
+            fixture.Factory,
+            fixture.Store,
+            fixture.AccountId,
+            fixture.OldInstallation.Identity.InstallationId,
+            fixture.OldSession.Identity);
+
+        var result = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked, result.Status);
+        Assert.Null(await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default));
+        Assert.Null(await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default));
+        AssertInstallationEqual(fixture.OldInstallation,
+            await fixture.Store.LoadInstallationAsync(fixture.OldInstallation.Identity.InstallationId, default));
+        AssertSessionEqual(fixture.OldSession,
+            await fixture.Store.LoadSessionAsync(fixture.OldSession.Identity.SessionId, default));
+        Assert.Equal(fixture.OldSession.Identity.SessionId.ToString("D"), await ScalarTextAsync(
+            fixture.Factory,
+            "SELECT SessionId FROM WebAutomationAttempts WHERE OperationId=$operation;",
+            ("$operation", operationId.ToString("D"))));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
@@ -807,6 +918,76 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         await new DatabaseMigrator(
             factory, new DatabaseBackupService(factory, Path.Combine(root, "backups")), "test").MigrateAsync();
         return (factory, new SqliteManagedBrowserStateStore(factory));
+    }
+
+    private static void AssertInstallationEqual(
+        StoredBrowserInstallation expected,
+        StoredBrowserInstallation? actual)
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(expected.State, actual.State);
+        Assert.Equal(expected.Revision, actual.Revision);
+        Assert.Equal(expected.Identity.InstallationId, actual.Identity.InstallationId);
+        Assert.Equal(expected.Identity.BrowserFamily, actual.Identity.BrowserFamily);
+        Assert.Equal(expected.Identity.InstallationDirectory, actual.Identity.InstallationDirectory);
+        Assert.Equal(expected.Identity.ExecutablePath, actual.Identity.ExecutablePath);
+        Assert.Equal(expected.Identity.Publisher, actual.Identity.Publisher);
+        Assert.Equal(expected.Identity.ProductName, actual.Identity.ProductName);
+        Assert.Equal(expected.Identity.FileIdentity, actual.Identity.FileIdentity);
+    }
+
+    private static void AssertSessionEqual(
+        StoredManagedBrowserSession expected,
+        StoredManagedBrowserSession? actual)
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(expected.State, actual.State);
+        Assert.Equal(expected.Revision, actual.Revision);
+        Assert.Equal(expected.Identity.SessionId, actual.Identity.SessionId);
+        Assert.Equal(expected.Identity.InstallationId, actual.Identity.InstallationId);
+        Assert.Equal(expected.Identity.AccountId, actual.Identity.AccountId);
+        Assert.Equal(expected.Identity.StableBaiduUserId, actual.Identity.StableBaiduUserId);
+        Assert.Equal(expected.Identity.BrowserFamily, actual.Identity.BrowserFamily);
+        Assert.Equal(expected.Identity.ProfileId, actual.Identity.ProfileId);
+        Assert.Equal(expected.Identity.ProfileOwnershipId, actual.Identity.ProfileOwnershipId);
+    }
+
+    private async Task<FamilySwitchFixture> CreateFamilySwitchFixtureAsync()
+    {
+        var (factory, store) = await CreateStoreAsync();
+        var accountId = Guid.NewGuid();
+        var stableUid = $"uid-family-{Guid.NewGuid():N}";
+        await SeedAccountAsync(factory, accountId, stableUid);
+        var oldInstallation = await store.CreateInstallationAsync(
+            Installation(BrowserFamily.Chrome, "chrome-family", "chrome-family-file"), default);
+        oldInstallation = (await store.TryReplaceActiveInstallationAsync(
+            new ManagedBrowserInstallationActivationRequest(null, oldInstallation), default)).Current!;
+        var oldIdentity = Session(
+            oldInstallation.Identity.InstallationId,
+            accountId,
+            stableUid,
+            BrowserFamily.Chrome,
+            Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"));
+        var oldSession = await store.CreateSessionAsync(oldIdentity, default);
+        oldSession = (await store.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, oldSession), default)).Current!;
+        var targetInstallation = Installation(BrowserFamily.Edge, "edge-family", "edge-family-file");
+        var targetSession = Session(
+            targetInstallation.InstallationId,
+            accountId,
+            stableUid,
+            BrowserFamily.Edge,
+            Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"));
+        var request = new ManagedBrowserFamilySwitchTransitionRequest(
+            oldInstallation,
+            oldSession,
+            targetInstallation,
+            targetSession,
+            stableUid);
+        return new FamilySwitchFixture(
+            factory, store, accountId, stableUid, oldInstallation, oldSession, request);
     }
 
     private BrowserInstallationIdentity Installation(BrowserFamily family, string directoryName, string fileIdentity)
@@ -1098,6 +1279,18 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         return Convert.ToInt64(await command.ExecuteScalarAsync());
     }
 
+    private static async Task<string> ScalarTextAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] parameters)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var (name, value) in parameters) command.Parameters.AddWithValue(name, value);
+        return Convert.ToString(await command.ExecuteScalarAsync()) ?? string.Empty;
+    }
+
     private static async Task<int> ExecuteAsync(
         SqliteConnectionFactory factory,
         string sql,
@@ -1127,6 +1320,15 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             Manifest.Manifest.ManifestId,
             Manifest.Revision);
     }
+
+    private sealed record FamilySwitchFixture(
+        SqliteConnectionFactory Factory,
+        SqliteManagedBrowserStateStore Store,
+        Guid AccountId,
+        string StableUid,
+        StoredBrowserInstallation OldInstallation,
+        StoredManagedBrowserSession OldSession,
+        ManagedBrowserFamilySwitchTransitionRequest Request);
 
     private static async Task DeleteManagedOperationAndAttemptAsync(
         SqliteConnectionFactory factory,

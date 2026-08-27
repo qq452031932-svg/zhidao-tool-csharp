@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using Microsoft.Data.Sqlite;
 using System.Diagnostics;
@@ -2167,4 +2168,148 @@ public sealed class AccountRemovalStoreTests : IDisposable
         public static Graph New() => new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
             Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
     }
+}
+
+public sealed class ManagedBrowserAccountRemovalStoreTests : IDisposable
+{
+    private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-managed-removal-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task ManagedPreparationAtomicallyFencesIdentityAndCommitsQuarantineMoveIntent()
+    {
+        var fixture = await CreateAsync();
+        var preview = await fixture.Removal.PreviewAsync(
+            fixture.AccountId, AccountExitHistoryMode.KeepHistory, default);
+        var manifestId = Guid.NewGuid();
+        var source = Path.Combine(root, "managed-browser-profiles", "chrome", fixture.AccountId.ToString("N"));
+        var destination = Path.Combine(root, "managed-browser-quarantine", manifestId.ToString("N"));
+        var lifecycle = new ManagedBrowserLifecycleSession(
+            fixture.Session.Identity,
+            fixture.Installation.Revision,
+            fixture.Session.Revision,
+            source);
+        var cleanup = new ManagedBrowserProfileCleanupPreparation(
+            lifecycle, manifestId, manifestRevision: 0, destination);
+
+        var prepared = await fixture.Removal.PrepareRemovalAsync(
+            new AccountExitRequest(
+                fixture.AccountId,
+                AccountExitHistoryMode.KeepHistory,
+                preview.ConfirmationToken,
+                new DateTimeOffset(2026, 8, 27, 10, 0, 0, TimeSpan.Zero)),
+            cleanup,
+            default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, prepared.Status);
+        Assert.True(prepared.DatabasePrepared);
+        Assert.Equal(manifestId, prepared.ManagedProfileCleanup!.ManifestId);
+        Assert.Equal("Disabled", await ScalarTextAsync(fixture.Factory,
+            "SELECT Status FROM Accounts WHERE Id=$account;", ("$account", fixture.AccountId.ToString("D"))));
+        Assert.Equal(0, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM Accounts WHERE Id=$account AND (IsEnabled<>0 OR EncryptedSession IS NOT NULL OR LastValidatedAt IS NOT NULL);",
+            ("$account", fixture.AccountId.ToString("D"))));
+        Assert.Equal("QuarantinePending", await ScalarTextAsync(fixture.Factory,
+            "SELECT State FROM ManagedBrowserSessions WHERE SessionId=$session;",
+            ("$session", fixture.Session.Identity.SessionId.ToString("D"))));
+        Assert.Equal("QuarantineMoveIntent", await ScalarTextAsync(fixture.Factory,
+            "SELECT State FROM ManagedProfileCleanupManifests WHERE ManifestId=$manifest;",
+            ("$manifest", manifestId.ToString("D"))));
+        Assert.Equal(source, await ScalarTextAsync(fixture.Factory,
+            "SELECT SourceProfilePath FROM ManagedProfileCleanupManifests WHERE ManifestId=$manifest;",
+            ("$manifest", manifestId.ToString("D"))));
+        Assert.Equal(destination, await ScalarTextAsync(fixture.Factory,
+            "SELECT QuarantinePath FROM ManagedProfileCleanupManifests WHERE ManifestId=$manifest;",
+            ("$manifest", manifestId.ToString("D"))));
+        Assert.Equal(fixture.Installation.Identity.InstallationId.ToString("D"),
+            await ScalarTextAsync(fixture.Factory,
+                "SELECT InstallationId FROM ManagedBrowserCleanupClaims WHERE ManifestId=$manifest;",
+                ("$manifest", manifestId.ToString("D"))));
+        Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+            "SELECT Revision FROM ManagedProfileCleanupManifests WHERE ManifestId=$manifest;",
+            ("$manifest", manifestId.ToString("D"))));
+    }
+
+    private async Task<Fixture> CreateAsync()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "state.db"));
+        await new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "backups")),
+            "test").MigrateAsync();
+        var accountId = Guid.NewGuid();
+        await ExecuteAsync(factory, """
+            INSERT INTO Accounts(
+              Id,BaiduUserId,DisplayName,EncryptedSession,WebView2ProfileDirectory,LoginMethod,Status,
+              DailyLimit,DailyExecutedCount,SortOrder,IsEnabled,LastValidatedAt,DailyCountDateKey,IsDeleted)
+            VALUES($account,'managed-uid','Managed Account',X'010203',$legacy,'Cookie','Active',
+              0,0,1,1,$now,'2026-08-27',0);
+            """,
+            ("$account", accountId.ToString("D")),
+            ("$legacy", Path.Combine(root, "legacy-profile")),
+            ("$now", "2026-08-27T09:00:00Z"));
+        var state = new SqliteManagedBrowserStateStore(factory);
+        var directory = Path.Combine(root, "browser");
+        var installationIdentity = new BrowserInstallationIdentity(
+            Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
+            "Google LLC", "Google Chrome", "managed-removal-file");
+        var installation = await state.CreateInstallationAsync(installationIdentity, default);
+        installation = (await state.TryReplaceActiveInstallationAsync(
+            new ManagedBrowserInstallationActivationRequest(null, installation), default)).Current!;
+        var sessionIdentity = new ManagedBrowserSessionReference(
+            Guid.NewGuid(), installation.Identity.InstallationId, accountId, "managed-uid",
+            BrowserFamily.Chrome, Guid.NewGuid().ToString("N"), Guid.NewGuid().ToString("N"));
+        var session = await state.CreateSessionAsync(sessionIdentity, default);
+        session = (await state.TryReplaceActiveSessionAsync(
+            new ManagedBrowserSessionActivationRequest(null, session), default)).Current!;
+        return new Fixture(factory, new SqliteAccountRemovalStore(factory), accountId, installation, session);
+    }
+
+    private static async Task ExecuteAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] values)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var value in values) command.Parameters.AddWithValue(value.Name, value.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string> ScalarTextAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] values)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var value in values) command.Parameters.AddWithValue(value.Name, value.Value);
+        return Convert.ToString(await command.ExecuteScalarAsync()) ?? string.Empty;
+    }
+
+    private static async Task<long> ScalarLongAsync(
+        SqliteConnectionFactory factory,
+        string sql,
+        params (string Name, object Value)[] values)
+    {
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        foreach (var value in values) command.Parameters.AddWithValue(value.Name, value.Value);
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+    }
+
+    private sealed record Fixture(
+        SqliteConnectionFactory Factory,
+        SqliteAccountRemovalStore Removal,
+        Guid AccountId,
+        StoredBrowserInstallation Installation,
+        StoredManagedBrowserSession Session);
 }

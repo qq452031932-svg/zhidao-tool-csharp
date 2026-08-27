@@ -4,9 +4,23 @@ using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory factory) : IManagedBrowserStateStore
+public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
 {
-    private readonly SqliteConnectionFactory factory = factory ?? throw new ArgumentNullException(nameof(factory));
+    private readonly SqliteConnectionFactory factory;
+    private readonly Func<CancellationToken, Task>? afterFamilySwitchOldSessionRetired;
+
+    public SqliteManagedBrowserStateStore(SqliteConnectionFactory factory)
+        : this(factory, null)
+    {
+    }
+
+    internal SqliteManagedBrowserStateStore(
+        SqliteConnectionFactory factory,
+        Func<CancellationToken, Task>? afterFamilySwitchOldSessionRetired)
+    {
+        this.factory = factory ?? throw new ArgumentNullException(nameof(factory));
+        this.afterFamilySwitchOldSessionRetired = afterFamilySwitchOldSessionRetired;
+    }
 
     public async Task<StoredBrowserInstallation> CreateInstallationAsync(
         BrowserInstallationIdentity installation,
@@ -407,6 +421,149 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         }
     }
 
+    public async Task<ManagedBrowserFamilySwitchTransitionResult> TrySwitchFamilyAsync(
+        ManagedBrowserFamilySwitchTransitionRequest request,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        try
+        {
+            var expectedInstallation = await LoadInstallationAsync(
+                connection,
+                transaction,
+                request.ExpectedInstallation.Identity.InstallationId,
+                cancellationToken).ConfigureAwait(false);
+            var expectedSession = await LoadSessionAsync(
+                connection,
+                transaction,
+                request.ExpectedSession.Identity.SessionId,
+                cancellationToken).ConfigureAwait(false);
+            var targetInstallation = await LoadInstallationAsync(
+                connection,
+                transaction,
+                request.TargetInstallation.InstallationId,
+                cancellationToken).ConfigureAwait(false);
+            var targetSession = await LoadSessionAsync(
+                connection,
+                transaction,
+                request.TargetSession.SessionId,
+                cancellationToken).ConfigureAwait(false);
+            var activeInstallation = await LoadActiveInstallationAsync(
+                connection, transaction, cancellationToken).ConfigureAwait(false);
+            var activeTargetFamily = await LoadActiveSessionAsync(
+                connection,
+                transaction,
+                request.TargetSession.AccountId,
+                request.TargetSession.BrowserFamily,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!await AccountUidMatchesAsync(connection, transaction, request, cancellationToken)
+                    .ConfigureAwait(false))
+                return await RollbackFamilySwitchAsync(
+                    transaction, ManagedBrowserFamilySwitchTransitionStatus.Conflict).ConfigureAwait(false);
+
+            if (IsAppliedFamilySwitch(
+                    request,
+                    expectedInstallation,
+                    expectedSession,
+                    targetInstallation,
+                    targetSession,
+                    activeInstallation,
+                    activeTargetFamily))
+            {
+                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                return new(ManagedBrowserFamilySwitchTransitionStatus.Applied);
+            }
+
+            if (!ExactInstallationEquals(expectedInstallation, request.ExpectedInstallation) ||
+                !ExactSessionEquals(expectedSession, request.ExpectedSession) ||
+                !ExactInstallationEquals(activeInstallation, request.ExpectedInstallation) ||
+                activeTargetFamily is not null || targetInstallation is not null || targetSession is not null)
+                return await RollbackFamilySwitchAsync(
+                    transaction, ManagedBrowserFamilySwitchTransitionStatus.Conflict).ConfigureAwait(false);
+
+            if (await HasStartedOrRecoveringWorkAsync(
+                    connection,
+                    transaction,
+                    request.ExpectedInstallation.Identity.InstallationId,
+                    request.ExpectedSession.Identity.SessionId,
+                    cancellationToken).ConfigureAwait(false))
+                return await RollbackFamilySwitchAsync(
+                    transaction, ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked).ConfigureAwait(false);
+
+            var now = DateTimeOffset.UtcNow.ToString("O");
+            await InsertFamilySwitchInstallationAsync(
+                connection, transaction, request.TargetInstallation, now, cancellationToken).ConfigureAwait(false);
+            await InsertFamilySwitchSessionAsync(
+                connection, transaction, request.TargetSession, now, cancellationToken).ConfigureAwait(false);
+
+            if (await UpdateSessionStateAsync(
+                    connection,
+                    transaction,
+                    request.ExpectedSession.Identity.SessionId,
+                    request.ExpectedSession.Revision,
+                    ManagedBrowserSessionLifecycleState.Active,
+                    ManagedBrowserSessionLifecycleState.Retired,
+                    now,
+                    requireActiveAccount: false,
+                    cancellationToken).ConfigureAwait(false) != 1)
+                return await RollbackFamilySwitchAsync(
+                    transaction, ManagedBrowserFamilySwitchTransitionStatus.Conflict).ConfigureAwait(false);
+
+            if (afterFamilySwitchOldSessionRetired is not null)
+                await afterFamilySwitchOldSessionRetired(cancellationToken).ConfigureAwait(false);
+
+            if (await UpdateInstallationStateAsync(
+                    connection,
+                    transaction,
+                    request.ExpectedInstallation.Identity.InstallationId,
+                    request.ExpectedInstallation.Revision,
+                    BrowserInstallationLifecycleState.Active,
+                    BrowserInstallationLifecycleState.Retired,
+                    now,
+                    cancellationToken).ConfigureAwait(false) != 1 ||
+                await UpdateInstallationStateAsync(
+                    connection,
+                    transaction,
+                    request.TargetInstallation.InstallationId,
+                    0,
+                    BrowserInstallationLifecycleState.Retired,
+                    BrowserInstallationLifecycleState.Active,
+                    now,
+                    cancellationToken).ConfigureAwait(false) != 1 ||
+                await UpdateSessionStateAsync(
+                    connection,
+                    transaction,
+                    request.TargetSession.SessionId,
+                    0,
+                    ManagedBrowserSessionLifecycleState.Retired,
+                    ManagedBrowserSessionLifecycleState.Active,
+                    now,
+                    requireActiveAccount: true,
+                    cancellationToken).ConfigureAwait(false) != 1)
+                return await RollbackFamilySwitchAsync(
+                    transaction, ManagedBrowserFamilySwitchTransitionStatus.Conflict).ConfigureAwait(false);
+
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new(ManagedBrowserFamilySwitchTransitionStatus.Applied);
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode == 19)
+        {
+            try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
+            catch { /* Preserve the typed conflict. */ }
+            return new(ManagedBrowserFamilySwitchTransitionStatus.Conflict);
+        }
+        catch
+        {
+            try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
+            catch { /* Preserve the original safe failure. */ }
+            throw;
+        }
+    }
+
     public async Task<ManagedBrowserTransitionResult> TryClaimRetiredIdentityForCleanupAsync(
         ManagedBrowserCleanupClaimRequest request,
         CancellationToken cancellationToken)
@@ -563,6 +720,32 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         return await LoadCleanupManifestAsync(
             connection, null, manifestId, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<StoredManagedProfileCleanupManifest?> LoadLatestCleanupManifestAsync(
+        Guid accountId,
+        CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty)
+            throw new ArgumentException("An account ID is required.", nameof(accountId));
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT ManifestId,AccountId,SessionId,State,SourceProfilePath,QuarantinePath,
+                   ExpectedOwnershipId,ConfirmationTokenHash,Revision
+            FROM ManagedProfileCleanupManifests
+            WHERE AccountId=$account AND State<>'Deleted'
+            ORDER BY CreatedAt DESC,ManifestId DESC LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$account", accountId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+        var current = ReadCleanupManifest(reader);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("Managed profile cleanup lookup returned multiple rows.");
+        return current;
     }
 
     public async Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(
@@ -844,6 +1027,180 @@ public sealed class SqliteManagedBrowserStateStore(SqliteConnectionFactory facto
         command.Parameters.AddWithValue("$session", sessionId.ToString("D"));
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
     }
+
+    private static async Task<ManagedBrowserFamilySwitchTransitionResult> RollbackFamilySwitchAsync(
+        SqliteTransaction transaction,
+        ManagedBrowserFamilySwitchTransitionStatus status)
+    {
+        await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+        return new(status);
+    }
+
+    private static async Task<bool> AccountUidMatchesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ManagedBrowserFamilySwitchTransitionRequest request,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT EXISTS(
+              SELECT 1 FROM Accounts
+              WHERE Id=$account AND BaiduUserId=$uid
+                AND Status='Active' AND IsEnabled=1 AND IsDeleted=0);
+            """;
+        command.Parameters.AddWithValue("$account", request.ExpectedSession.Identity.AccountId.ToString("D"));
+        command.Parameters.AddWithValue("$uid", request.ObservedStableBaiduUserId);
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    private static async Task<bool> HasStartedOrRecoveringWorkAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid installationId,
+        Guid sessionId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT EXISTS(
+              SELECT 1 FROM ManagedBrowserRetentions retention
+              WHERE retention.InstallationId=$installation AND retention.SessionId=$session
+              UNION ALL
+              SELECT 1 FROM WebAutomationAttempts attempt
+              WHERE attempt.ExecutionEngineVersion='ManagedChromium-v1'
+                AND attempt.InstallationId=$installation AND attempt.SessionId=$session
+                AND attempt.State NOT IN ('Succeeded','DefinitelyNotSubmitted')
+              LIMIT 1);
+            """;
+        command.Parameters.AddWithValue("$installation", installationId.ToString("D"));
+        command.Parameters.AddWithValue("$session", sessionId.ToString("D"));
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    private static async Task InsertFamilySwitchInstallationAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BrowserInstallationIdentity installation,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO BrowserInstallations(
+              InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,
+              ProductName,FileIdentity,State,Revision,CreatedAt,UpdatedAt)
+            VALUES($id,$family,$directory,$executable,$publisher,$product,$file,'Retired',0,$now,$now);
+            """;
+        command.Parameters.AddWithValue("$id", installation.InstallationId.ToString("D"));
+        command.Parameters.AddWithValue("$family", FormatFamily(installation.BrowserFamily));
+        command.Parameters.AddWithValue("$directory", installation.InstallationDirectory);
+        command.Parameters.AddWithValue("$executable", installation.ExecutablePath);
+        command.Parameters.AddWithValue("$publisher", installation.Publisher);
+        command.Parameters.AddWithValue("$product", installation.ProductName);
+        command.Parameters.AddWithValue("$file", installation.FileIdentity);
+        command.Parameters.AddWithValue("$now", now);
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidOperationException("Managed browser family switch installation could not be created.");
+    }
+
+    private static async Task InsertFamilySwitchSessionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ManagedBrowserSessionReference session,
+        string now,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO ManagedBrowserSessions(
+              SessionId,AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,
+              ProfileOwnershipId,State,Revision,CreatedAt,UpdatedAt)
+            SELECT $session,$account,$uid,$installation,$family,$profile,$ownership,'Retired',0,$now,$now
+            WHERE EXISTS(
+              SELECT 1 FROM Accounts
+              WHERE Id=$account AND BaiduUserId=$uid AND Status='Active' AND IsEnabled=1 AND IsDeleted=0);
+            """;
+        command.Parameters.AddWithValue("$session", session.SessionId.ToString("D"));
+        command.Parameters.AddWithValue("$account", session.AccountId.ToString("D"));
+        command.Parameters.AddWithValue("$uid", session.StableBaiduUserId);
+        command.Parameters.AddWithValue("$installation", session.InstallationId.ToString("D"));
+        command.Parameters.AddWithValue("$family", FormatFamily(session.BrowserFamily));
+        command.Parameters.AddWithValue("$profile", session.ProfileId);
+        command.Parameters.AddWithValue("$ownership", session.ProfileOwnershipId);
+        command.Parameters.AddWithValue("$now", now);
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidOperationException("Managed browser family switch session could not be created.");
+    }
+
+    private static bool IsAppliedFamilySwitch(
+        ManagedBrowserFamilySwitchTransitionRequest request,
+        StoredBrowserInstallation? expectedInstallation,
+        StoredManagedBrowserSession? expectedSession,
+        StoredBrowserInstallation? targetInstallation,
+        StoredManagedBrowserSession? targetSession,
+        StoredBrowserInstallation? activeInstallation,
+        StoredManagedBrowserSession? activeTargetFamily) =>
+        ExactInstallationEquals(
+            expectedInstallation,
+            new StoredBrowserInstallation(
+                request.ExpectedInstallation.Identity,
+                BrowserInstallationLifecycleState.Retired,
+                checked(request.ExpectedInstallation.Revision + 1))) &&
+        ExactSessionEquals(
+            expectedSession,
+            new StoredManagedBrowserSession(
+                request.ExpectedSession.Identity,
+                ManagedBrowserSessionLifecycleState.Retired,
+                checked(request.ExpectedSession.Revision + 1))) &&
+        ExactInstallationEquals(
+            targetInstallation,
+            new StoredBrowserInstallation(
+                request.TargetInstallation, BrowserInstallationLifecycleState.Active, 1)) &&
+        ExactSessionEquals(
+            targetSession,
+            new StoredManagedBrowserSession(
+                request.TargetSession, ManagedBrowserSessionLifecycleState.Active, 1)) &&
+        ExactInstallationEquals(activeInstallation, targetInstallation!) &&
+        ExactSessionEquals(activeTargetFamily, targetSession!);
+
+    private static bool ExactInstallationEquals(
+        StoredBrowserInstallation? actual,
+        StoredBrowserInstallation expected) =>
+        actual is not null &&
+        actual.State == expected.State &&
+        actual.Revision == expected.Revision &&
+        actual.Identity.InstallationId == expected.Identity.InstallationId &&
+        actual.Identity.BrowserFamily == expected.Identity.BrowserFamily &&
+        string.Equals(actual.Identity.InstallationDirectory,
+            expected.Identity.InstallationDirectory, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(actual.Identity.ExecutablePath,
+            expected.Identity.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(actual.Identity.Publisher, expected.Identity.Publisher, StringComparison.Ordinal) &&
+        string.Equals(actual.Identity.ProductName, expected.Identity.ProductName, StringComparison.Ordinal) &&
+        string.Equals(actual.Identity.FileIdentity, expected.Identity.FileIdentity, StringComparison.Ordinal);
+
+    private static bool ExactSessionEquals(
+        StoredManagedBrowserSession? actual,
+        StoredManagedBrowserSession expected) =>
+        actual is not null &&
+        actual.State == expected.State &&
+        actual.Revision == expected.Revision &&
+        actual.Identity.SessionId == expected.Identity.SessionId &&
+        actual.Identity.InstallationId == expected.Identity.InstallationId &&
+        actual.Identity.AccountId == expected.Identity.AccountId &&
+        actual.Identity.BrowserFamily == expected.Identity.BrowserFamily &&
+        string.Equals(actual.Identity.StableBaiduUserId,
+            expected.Identity.StableBaiduUserId, StringComparison.Ordinal) &&
+        string.Equals(actual.Identity.ProfileId, expected.Identity.ProfileId, StringComparison.Ordinal) &&
+        string.Equals(actual.Identity.ProfileOwnershipId,
+            expected.Identity.ProfileOwnershipId, StringComparison.Ordinal);
 
     private static async Task<StoredBrowserInstallation?> LoadInstallationAsync(
         SqliteConnection connection,

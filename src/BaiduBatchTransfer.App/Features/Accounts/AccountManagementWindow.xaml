@@ -22,6 +22,10 @@
             <TextBlock Text="每次只操作所选账号，其他账号不受影响。"
                        Foreground="{StaticResource MutedBrush}"
                        Margin="0,5,0,0" />
+            <TextBlock Text="退出账号后，专用浏览器登录数据会先进入可恢复区；需要彻底删除时，请点击“继续清理”并再次确认。"
+                       Foreground="{StaticResource MutedBrush}"
+                       TextWrapping="Wrap"
+                       Margin="0,5,0,0" />
         </StackPanel>
 
         <Grid Grid.Row="1">
@@ -49,7 +53,9 @@
                                 <Button Content="{Binding ActionText}"
                                         Command="{Binding ActionCommand}"
                                         IsTabStop="True"
-                                        automation:AutomationProperties.Name="{Binding ActionAutomationName}" />
+                                        ToolTip="删除专用浏览器登录数据前会再次要求确认"
+                                        automation:AutomationProperties.Name="{Binding ActionAutomationName}"
+                                        automation:AutomationProperties.HelpText="删除专用浏览器登录数据前会再次要求确认" />
                             </DataTemplate>
                         </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
