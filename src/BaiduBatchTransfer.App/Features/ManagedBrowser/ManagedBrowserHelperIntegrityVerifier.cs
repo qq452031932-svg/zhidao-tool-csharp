@@ -55,6 +55,26 @@ public enum ManagedBrowserHelperCleanupState
     DeferredCleanupRegistered = 2,
 }
 
+internal enum ManagedBrowserHelperSnapshotPhase
+{
+    ContainerCreated = 0,
+    CopyingPayload = 1,
+    MarkerWritten = 2,
+    PinningSnapshot = 3,
+    SealingAcl = 4,
+}
+
+internal sealed class ManagedBrowserHelperCleanupStatus
+{
+    private int state;
+
+    public ManagedBrowserHelperCleanupState State =>
+        (ManagedBrowserHelperCleanupState)Volatile.Read(ref state);
+
+    public void Set(ManagedBrowserHelperCleanupState value) =>
+        Volatile.Write(ref state, (int)value);
+}
+
 /// <summary>
 /// Owns the exact verified helper snapshot and its identity/cleanup handles. The client must
 /// retain this lease until the helper has exited and redirected output has been fully drained.
@@ -67,7 +87,7 @@ public sealed class VerifiedManagedBrowserHelperBundle : IDisposable
     private readonly string executablePath;
     private readonly string mainScriptPath;
     private readonly string buildIdentity;
-    private int cleanupState;
+    private readonly ManagedBrowserHelperCleanupStatus cleanupStatus;
 
     internal VerifiedManagedBrowserHelperBundle(
         VerifiedHelperSnapshotLease lease,
@@ -79,6 +99,7 @@ public sealed class VerifiedManagedBrowserHelperBundle : IDisposable
         this.executablePath = executablePath;
         this.mainScriptPath = mainScriptPath;
         this.buildIdentity = buildIdentity;
+        cleanupStatus = lease.CleanupStatus;
     }
 
     public string ExecutablePath => IsDisposed
@@ -91,14 +112,13 @@ public sealed class VerifiedManagedBrowserHelperBundle : IDisposable
         ? throw new ObjectDisposedException(nameof(VerifiedManagedBrowserHelperBundle))
         : buildIdentity;
     public bool IsDisposed => lease is null;
-    public ManagedBrowserHelperCleanupState CleanupState =>
-        (ManagedBrowserHelperCleanupState)Volatile.Read(ref cleanupState);
+    public ManagedBrowserHelperCleanupState CleanupState => cleanupStatus.State;
 
     public void Dispose()
     {
         var owned = Interlocked.Exchange(ref lease, null);
         if (owned is null) return;
-        Volatile.Write(ref cleanupState, (int)owned.Release());
+        owned.Release();
     }
 
     internal void AbandonForProcessCrashSimulation()
@@ -106,8 +126,6 @@ public sealed class VerifiedManagedBrowserHelperBundle : IDisposable
         var owned = Interlocked.Exchange(ref lease, null);
         if (owned is null) return;
         owned.AbandonForProcessCrashSimulation();
-        Volatile.Write(ref cleanupState,
-            (int)ManagedBrowserHelperCleanupState.DeferredCleanupRegistered);
     }
 
     public override string ToString() =>
@@ -138,6 +156,9 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
     private readonly ManagedBrowserHelperIntegrityLimits limits;
     private readonly TimeProvider timeProvider;
     private readonly TimeSpan orphanMinimumAge;
+    private readonly string snapshotParent;
+    private readonly Action<ManagedBrowserHelperSnapshotPhase>? snapshotCreationObserver;
+    private readonly Action? cleanupAttemptObserver;
 
     public ManagedBrowserHelperIntegrityVerifier()
         : this(ReadEmbeddedManifest(), ManagedBrowserHelperIntegrityLimits.Default,
@@ -149,7 +170,10 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         byte[] expectedManifestBytes,
         ManagedBrowserHelperIntegrityLimits? limits = null,
         TimeProvider? timeProvider = null,
-        TimeSpan? orphanMinimumAge = null)
+        TimeSpan? orphanMinimumAge = null,
+        string? snapshotParent = null,
+        Action<ManagedBrowserHelperSnapshotPhase>? snapshotCreationObserver = null,
+        Action? cleanupAttemptObserver = null)
     {
         ArgumentNullException.ThrowIfNull(expectedManifestBytes);
         if (expectedManifestBytes.Length is < 1 or > MaximumManifestBytes)
@@ -158,6 +182,10 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         this.limits = limits ?? ManagedBrowserHelperIntegrityLimits.Default;
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.orphanMinimumAge = orphanMinimumAge ?? TimeSpan.FromHours(12);
+        this.snapshotParent = Path.GetFullPath(
+            snapshotParent ?? VerifiedHelperSnapshotLease.SnapshotParentForDiagnostics);
+        this.snapshotCreationObserver = snapshotCreationObserver;
+        this.cleanupAttemptObserver = cleanupAttemptObserver;
         if (this.limits.MaximumTreeEntries < 1 || this.limits.MaximumTreeDepth < 1 ||
             this.limits.MaximumTreeBytes < 1)
             throw new ArgumentOutOfRangeException(nameof(limits));
@@ -198,13 +226,13 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         {
             cancellationToken.ThrowIfCancellationRequested();
             VerifiedHelperSnapshotLease.RecoverExpiredOrphans(
-                limits, timeProvider.GetUtcNow(), orphanMinimumAge, cancellationToken);
+                snapshotParent, limits, timeProvider.GetUtcNow(), orphanMinimumAge, cancellationToken);
             sourceTree = PinnedHelperTree.Capture(helperRoot, limits, cancellationToken);
             VerifyPinnedTree(sourceTree, manifest, cancellationToken);
 
             snapshot = VerifiedHelperSnapshotLease.Create(
-                sourceTree, manifest.BuildIdentity, limits, timeProvider.GetUtcNow(),
-                cancellationToken);
+                snapshotParent, sourceTree, manifest.BuildIdentity, limits, timeProvider.GetUtcNow(),
+                cancellationToken, snapshotCreationObserver, cleanupAttemptObserver);
             sourceTree.Dispose();
             sourceTree = null;
             VerifyPinnedTree(snapshot.Tree, manifest, cancellationToken);
@@ -486,12 +514,14 @@ internal sealed class PinnedHelperTree : IDisposable
         new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
     public IReadOnlyDictionary<string, PinnedHelperEntry> Directories { get; private set; } =
         new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
+    public int HandleCount => entries.Count;
 
     public static PinnedHelperTree Capture(
         string root,
         ManagedBrowserHelperIntegrityLimits limits,
         CancellationToken cancellationToken,
-        bool deleteCapable = false)
+        bool deleteCapable = false,
+        FileShare? shareMode = null)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("Managed browser helper verification requires Windows.");
@@ -503,7 +533,7 @@ internal sealed class PinnedHelperTree : IDisposable
         {
             var files = new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
             var directories = new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
-            var rootEntry = PinnedHelperEntry.Open(canonical, deleteCapable);
+            var rootEntry = PinnedHelperEntry.Open(canonical, deleteCapable, shareMode: shareMode);
             if (!rootEntry.IsDirectory)
                 throw new UnsafeHelperFilesystemException();
             tree.entries.Add(rootEntry);
@@ -536,7 +566,7 @@ internal sealed class PinnedHelperTree : IDisposable
                     var depth = relative.Count(character => character == '/') + 1;
                     if (entryCount > limits.MaximumTreeEntries || depth > limits.MaximumTreeDepth)
                         throw new HelperResourceLimitException();
-                    var entry = PinnedHelperEntry.Open(candidate, deleteCapable);
+                    var entry = PinnedHelperEntry.Open(candidate, deleteCapable, shareMode: shareMode);
                     tree.entries.Add(entry);
                     if (entry.IsDirectory)
                     {
@@ -647,6 +677,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
 {
     private const int OwnershipMarkerVersion = 1;
     private const int MaximumOrphanCandidates = 128;
+    private const int MaximumOrphanCursorParents = 64;
     private const string MarkerFileName = "ownership.json";
     private const string ActiveLockFileName = "active.lock";
     private const string PayloadDirectoryName = "payload";
@@ -654,18 +685,30 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles;
     private const FileSystemRights AllowedRuntimeRights = FileSystemRights.ReadAndExecute |
         FileSystemRights.Synchronize;
-    private static readonly string SnapshotParent = Path.GetFullPath(Path.Combine(
+    private static readonly string DefaultSnapshotParent = Path.GetFullPath(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "BaiduBatchTransfer", "verified-helper-snapshots"));
+    internal const int MaximumDeferredLeaseCount = 4;
+    internal const int MaximumDeferredHandleCount = 4096;
+    internal const int MaximumDeferredCleanupAttempts = 3;
     private static readonly ConcurrentQueue<VerifiedHelperSnapshotLease> DeferredCleanup = new();
+    private static readonly object DeferredCleanupSync = new();
+    private static readonly object OrphanCursorSync = new();
+    private static readonly Dictionary<string, int> OrphanCursorOffsets =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static int deferredLeaseCount;
+    private static int deferredHandleCount;
 
     private readonly object sync = new();
     private readonly string containerPath;
+    private readonly string snapshotParent;
     private readonly string rootPath;
     private readonly string markerPath;
     private readonly string activeLockPath;
     private readonly SecurityIdentifier user;
     private readonly ManagedBrowserHelperIntegrityLimits limits;
+    private readonly Action? cleanupAttemptObserver;
+    private readonly ManagedBrowserHelperCleanupStatus cleanupStatus = new();
     private PinnedHelperEntry? parentFence;
     private PinnedHelperEntry? containerFence;
     private PinnedHelperEntry? markerFence;
@@ -673,9 +716,12 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
     private PinnedHelperTree? tree;
     private IReadOnlyDictionary<string, (uint Volume, string FileId)>? cleanupFileIdentities;
     private IReadOnlyDictionary<string, (uint Volume, string FileId)>? cleanupDirectoryIdentities;
-    private ManagedBrowserHelperCleanupState cleanupState;
+    private int cleanupAttempts;
+    private int retainedDeferredHandleCount;
+    private bool registeredForDeferredCleanup;
 
     private VerifiedHelperSnapshotLease(
+        string snapshotParent,
         string containerPath,
         SecurityIdentifier user,
         PinnedHelperEntry parentFence,
@@ -683,8 +729,10 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         PinnedHelperEntry markerFence,
         PinnedHelperEntry activeLock,
         PinnedHelperTree tree,
-        ManagedBrowserHelperIntegrityLimits limits)
+        ManagedBrowserHelperIntegrityLimits limits,
+        Action? cleanupAttemptObserver)
     {
+        this.snapshotParent = snapshotParent;
         this.containerPath = containerPath;
         rootPath = Path.Combine(containerPath, PayloadDirectoryName);
         markerPath = Path.Combine(containerPath, MarkerFileName);
@@ -696,34 +744,46 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         this.activeLock = activeLock;
         this.tree = tree;
         this.limits = limits;
+        this.cleanupAttemptObserver = cleanupAttemptObserver;
     }
 
-    internal static string SnapshotParentForDiagnostics => SnapshotParent;
+    internal static string SnapshotParentForDiagnostics => DefaultSnapshotParent;
+    internal static int DeferredLeaseCountForDiagnostics => Volatile.Read(ref deferredLeaseCount);
+    internal static int DeferredHandleCountForDiagnostics => Volatile.Read(ref deferredHandleCount);
+    internal ManagedBrowserHelperCleanupStatus CleanupStatus => cleanupStatus;
 
     public PinnedHelperTree Tree => tree ??
         throw new ObjectDisposedException(nameof(VerifiedHelperSnapshotLease));
 
     public static VerifiedHelperSnapshotLease Create(
+        string snapshotParent,
         PinnedHelperTree source,
         string buildIdentity,
         ManagedBrowserHelperIntegrityLimits limits,
         DateTimeOffset createdUtc,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<ManagedBrowserHelperSnapshotPhase>? observer,
+        Action? cleanupAttemptObserver)
     {
         var user = CurrentUser();
-        var parentFence = PrepareSnapshotParent(user);
+        var parentFence = PrepareSnapshotParent(snapshotParent, user);
         var snapshotId = Guid.NewGuid();
-        var container = Path.Combine(SnapshotParent, $"snapshot-{snapshotId:N}");
+        var containerName = $"snapshot-{snapshotId:N}";
+        var container = Path.Combine(snapshotParent, containerName);
         var payload = Path.Combine(container, PayloadDirectoryName);
-        Directory.CreateDirectory(payload);
-        ApplyWritableAcl(container, isDirectory: true, user);
         PinnedHelperEntry? containerFence = null;
         PinnedHelperEntry? markerFence = null;
         PinnedHelperEntry? activeLock = null;
         PinnedHelperTree? pinned = null;
         try
         {
-            containerFence = PinnedHelperEntry.Open(container, deleteCapable: true);
+            containerFence = PinnedHelperEntry.OpenRelativeDirectory(
+                parentFence, containerName, createIfMissing: true, deleteCapable: true);
+            containerFence.ApplyWritableDirectoryAcl(user);
+            using (var payloadFence = PinnedHelperEntry.OpenRelativeDirectory(
+                       containerFence, PayloadDirectoryName, createIfMissing: true))
+                payloadFence.ApplyWritableDirectoryAcl(user);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.ContainerCreated);
             foreach (var relative in source.Directories.Keys.Where(path => path.Length > 0)
                          .OrderBy(path => path.Count(character => character == '/'))
                          .ThenBy(path => path, StringComparer.Ordinal))
@@ -733,6 +793,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             }
             foreach (var pair in source.Files.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
+                observer?.Invoke(ManagedBrowserHelperSnapshotPhase.CopyingPayload);
                 cancellationToken.ThrowIfCancellationRequested();
                 pair.Value.CopyTo(ToSnapshotPath(payload, pair.Key), cancellationToken);
             }
@@ -741,14 +802,17 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
                 buildIdentity, createdUtc.ToUniversalTime(), containerFence.VolumeSerialNumber,
                 containerFence.FileId, user.Value);
             WriteMarker(Path.Combine(container, MarkerFileName), marker);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.MarkerWritten);
             File.WriteAllBytes(Path.Combine(container, ActiveLockFileName), []);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.PinningSnapshot);
             pinned = PinnedHelperTree.Capture(payload, limits, cancellationToken);
             markerFence = PinnedHelperEntry.Open(Path.Combine(container, MarkerFileName), deleteCapable: true);
             activeLock = PinnedHelperEntry.Open(Path.Combine(container, ActiveLockFileName),
                 deleteCapable: true, shareMode: FileShare.None);
+            observer?.Invoke(ManagedBrowserHelperSnapshotPhase.SealingAcl);
             SealTreeReadOnly(container, user);
-            var lease = new VerifiedHelperSnapshotLease(container, user, parentFence,
-                containerFence, markerFence, activeLock, pinned, limits);
+            var lease = new VerifiedHelperSnapshotLease(snapshotParent, container, user, parentFence,
+                containerFence, markerFence, activeLock, pinned, limits, cleanupAttemptObserver);
             parentFence = null!;
             containerFence = null;
             markerFence = null;
@@ -762,6 +826,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             pinned?.Dispose();
             activeLock?.Dispose();
             markerFence?.Dispose();
+            TryDeleteIncompleteSnapshot(container, containerFence, user, limits);
             containerFence?.Dispose();
             parentFence?.Dispose();
             throw;
@@ -777,24 +842,78 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         EnsureReadOnlyAcl(containerPath, true, user);
     }
 
+    private static void TryDeleteIncompleteSnapshot(
+        string container,
+        PinnedHelperEntry? containerFence,
+        SecurityIdentifier user,
+        ManagedBrowserHelperIntegrityLimits limits)
+    {
+        if (containerFence is null) return;
+        try
+        {
+            containerFence.EnsureSameIdentity();
+            var cleanupLimits = new ManagedBrowserHelperIntegrityLimits(
+                checked(limits.MaximumTreeEntries + 8),
+                checked(limits.MaximumTreeDepth + 2),
+                checked(limits.MaximumTreeBytes + 16 * 1024));
+            using (var observed = PinnedHelperTree.Capture(
+                       container, cleanupLimits, CancellationToken.None,
+                       shareMode: FileShare.Read | FileShare.Delete))
+            {
+                foreach (var entry in observed.Files.Values)
+                {
+                    entry.EnsureUnchanged();
+                    ApplyWritableAcl(entry.FullPath, isDirectory: false, user);
+                    entry.EnsureUnchanged();
+                }
+                foreach (var entry in observed.Directories.Values.OrderByDescending(e => e.FullPath.Length))
+                {
+                    entry.EnsureSameIdentity();
+                    ApplyWritableAcl(entry.FullPath, isDirectory: true, user);
+                    entry.EnsureSameIdentity();
+                }
+                observed.EnsureEnumerationUnchanged(CancellationToken.None);
+                containerFence.EnsureSameIdentity();
+            }
+            using var cleanup = PinnedHelperTree.Capture(
+                container, cleanupLimits, CancellationToken.None, deleteCapable: true,
+                shareMode: FileShare.Read | FileShare.Delete);
+            var root = cleanup.Directories[string.Empty];
+            if (root.VolumeSerialNumber != containerFence.VolumeSerialNumber ||
+                !string.Equals(root.FileId, containerFence.FileId, StringComparison.Ordinal))
+                throw new UnsafeHelperFilesystemException();
+            cleanup.DeletePinnedTree();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                           Win32Exception or OverflowException or
+                                           System.Security.SecurityException or ArgumentException)
+        {
+            // A valid marker is preferred for later recovery, but creation failures before the
+            // marker are still cleaned exactly when their pinned identity remains available.
+        }
+    }
+
     public void Dispose() => _ = Release();
 
     public ManagedBrowserHelperCleanupState Release()
     {
         lock (sync)
         {
-            if (cleanupState != ManagedBrowserHelperCleanupState.Active) return cleanupState;
+            if (cleanupStatus.State != ManagedBrowserHelperCleanupState.Active)
+                return cleanupStatus.State;
             try
             {
+                cleanupAttemptObserver?.Invoke();
                 CleanupExact();
-                cleanupState = ManagedBrowserHelperCleanupState.Cleaned;
+                cleanupStatus.Set(ManagedBrowserHelperCleanupState.Cleaned);
             }
             catch
             {
-                cleanupState = ManagedBrowserHelperCleanupState.DeferredCleanupRegistered;
-                DeferredCleanup.Enqueue(this);
+                cleanupAttempts = 1;
+                cleanupStatus.Set(ManagedBrowserHelperCleanupState.DeferredCleanupRegistered);
+                if (!TryRegisterDeferredCleanup()) ReleaseHandlesForOrphanRecovery();
             }
-            return cleanupState;
+            return cleanupStatus.State;
         }
     }
 
@@ -807,11 +926,12 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             markerFence?.Dispose(); markerFence = null;
             containerFence?.Dispose(); containerFence = null;
             parentFence?.Dispose(); parentFence = null;
-            cleanupState = ManagedBrowserHelperCleanupState.DeferredCleanupRegistered;
+            cleanupStatus.Set(ManagedBrowserHelperCleanupState.DeferredCleanupRegistered);
         }
     }
 
     public static void RecoverExpiredOrphans(
+        string snapshotParent,
         ManagedBrowserHelperIntegrityLimits limits,
         DateTimeOffset now,
         TimeSpan minimumAge,
@@ -819,16 +939,55 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
     {
         RetryDeferredCleanup();
         var user = CurrentUser();
-        using var parent = PrepareSnapshotParent(user);
-        var count = 0;
-        foreach (var candidate in Directory.EnumerateDirectories(SnapshotParent, "snapshot-*",
-                     SearchOption.TopDirectoryOnly))
+        using var parent = PrepareSnapshotParent(snapshotParent, user);
+        foreach (var candidate in TakeNextOrphanCandidateWindow(snapshotParent))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (++count > MaximumOrphanCandidates) break;
-            TryRecoverOrphan(candidate, limits, user, now, minimumAge, cancellationToken);
+            TryRecoverOrphan(snapshotParent, candidate, limits, user, now, minimumAge, cancellationToken);
         }
         parent.EnsureSameIdentity();
+    }
+
+    private static IReadOnlyList<string> TakeNextOrphanCandidateWindow(string snapshotParent)
+    {
+        int offset;
+        lock (OrphanCursorSync)
+            offset = OrphanCursorOffsets.TryGetValue(snapshotParent, out var stored) ? stored : 0;
+
+        static IEnumerator<string> Open(string parent) => Directory
+            .EnumerateDirectories(parent, "snapshot-*", SearchOption.TopDirectoryOnly)
+            .GetEnumerator();
+
+        var window = new List<string>(MaximumOrphanCandidates);
+        var enumerator = Open(snapshotParent);
+        try
+        {
+            var skipped = 0;
+            while (skipped < offset && enumerator.MoveNext()) skipped++;
+            if (skipped < offset)
+            {
+                enumerator.Dispose();
+                enumerator = Open(snapshotParent);
+                offset = 0;
+            }
+            while (window.Count < MaximumOrphanCandidates && enumerator.MoveNext())
+                window.Add(enumerator.Current);
+        }
+        finally
+        {
+            enumerator.Dispose();
+        }
+
+        lock (OrphanCursorSync)
+        {
+            if (!OrphanCursorOffsets.ContainsKey(snapshotParent) &&
+                OrphanCursorOffsets.Count >= MaximumOrphanCursorParents)
+                OrphanCursorOffsets.Remove(OrphanCursorOffsets.Keys.First());
+            OrphanCursorOffsets[snapshotParent] = window.Count < MaximumOrphanCandidates
+                ? 0
+                : checked(offset + window.Count);
+        }
+        return window;
     }
 
     private static void RetryDeferredCleanup()
@@ -840,15 +999,83 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             {
                 try
                 {
+                    lease.cleanupAttemptObserver?.Invoke();
                     lease.CleanupExact();
-                    lease.cleanupState = ManagedBrowserHelperCleanupState.Cleaned;
+                    lease.UnregisterDeferredCleanup();
+                    lease.cleanupStatus.Set(ManagedBrowserHelperCleanupState.Cleaned);
                 }
-                catch { DeferredCleanup.Enqueue(lease); }
+                catch
+                {
+                    lease.cleanupAttempts++;
+                    if (lease.cleanupAttempts >= MaximumDeferredCleanupAttempts)
+                    {
+                        lease.UnregisterDeferredCleanup();
+                        lease.ReleaseHandlesForOrphanRecovery();
+                    }
+                    else
+                    {
+                        DeferredCleanup.Enqueue(lease);
+                    }
+                }
             }
         }
     }
 
+    private bool TryRegisterDeferredCleanup()
+    {
+        var handleCount = (tree?.HandleCount ?? 0) +
+            (parentFence is null ? 0 : 1) + (containerFence is null ? 0 : 1) +
+            (markerFence is null ? 0 : 1) + (activeLock is null ? 0 : 1);
+        lock (DeferredCleanupSync)
+        {
+            if (deferredLeaseCount >= MaximumDeferredLeaseCount ||
+                handleCount > MaximumDeferredHandleCount - deferredHandleCount)
+                return false;
+            retainedDeferredHandleCount = handleCount;
+            registeredForDeferredCleanup = true;
+            deferredLeaseCount++;
+            deferredHandleCount += handleCount;
+            DeferredCleanup.Enqueue(this);
+            return true;
+        }
+    }
+
+    private void UnregisterDeferredCleanup()
+    {
+        lock (DeferredCleanupSync)
+        {
+            if (!registeredForDeferredCleanup) return;
+            registeredForDeferredCleanup = false;
+            deferredLeaseCount--;
+            deferredHandleCount -= retainedDeferredHandleCount;
+            retainedDeferredHandleCount = 0;
+        }
+    }
+
+    private void ReleaseHandlesForOrphanRecovery()
+    {
+        try
+        {
+            containerFence?.EnsureSameIdentity();
+            if (Directory.Exists(containerPath)) SealTreeReadOnly(containerPath, user);
+            containerFence?.EnsureSameIdentity();
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
+                                           Win32Exception or OverflowException or
+                                           System.Security.SecurityException or ArgumentException)
+        {
+            // Recovery will leave candidates with invalid or incomplete boundaries untouched.
+        }
+        tree?.Dispose(); tree = null;
+        activeLock?.Dispose(); activeLock = null;
+        markerFence?.Dispose(); markerFence = null;
+        containerFence?.Dispose(); containerFence = null;
+        parentFence?.Dispose(); parentFence = null;
+        cleanupStatus.Set(ManagedBrowserHelperCleanupState.DeferredCleanupRegistered);
+    }
+
     private static void TryRecoverOrphan(
+        string snapshotParent,
         string container,
         ManagedBrowserHelperIntegrityLimits limits,
         SecurityIdentifier user,
@@ -858,7 +1085,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
     {
         try
         {
-            if (!IsOwnedSnapshotBoundary(container) ||
+            if (!IsOwnedSnapshotBoundary(snapshotParent, container) ||
                 (File.GetAttributes(container) & FileAttributes.ReparsePoint) != 0) return;
             using var containerFence = PinnedHelperEntry.Open(
                 container, shareMode: FileShare.Read | FileShare.Delete);
@@ -908,7 +1135,8 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             cleanup.DeletePinnedTree();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or
-                                           Win32Exception or JsonException)
+                                           Win32Exception or JsonException or OverflowException or
+                                           System.Security.SecurityException or ArgumentException)
         {
             // Foreign, active, malformed, or racing candidates are intentionally left untouched.
         }
@@ -992,18 +1220,45 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         }
     }
 
-    private static PinnedHelperEntry PrepareSnapshotParent(SecurityIdentifier user)
+    private static PinnedHelperEntry PrepareSnapshotParent(
+        string snapshotParent,
+        SecurityIdentifier user)
     {
-        var appRoot = Path.GetDirectoryName(SnapshotParent) ??
+        var missing = new Stack<string>();
+        var finalName = Path.GetFileName(snapshotParent.TrimEnd(Path.DirectorySeparatorChar));
+        if (string.IsNullOrEmpty(finalName))
             throw new IOException("The helper snapshot parent is invalid.");
-        Directory.CreateDirectory(appRoot);
-        using (var appRootEntry = PinnedHelperEntry.Open(appRoot))
-            if (!appRootEntry.IsDirectory) throw new UnsafeHelperFilesystemException();
-        Directory.CreateDirectory(SnapshotParent);
-        ApplyWritableAcl(SnapshotParent, isDirectory: true, user);
-        var parentEntry = PinnedHelperEntry.Open(SnapshotParent);
-        if (!parentEntry.IsDirectory) { parentEntry.Dispose(); throw new UnsafeHelperFilesystemException(); }
-        return parentEntry;
+        missing.Push(finalName);
+        var existing = Path.GetDirectoryName(snapshotParent.TrimEnd(Path.DirectorySeparatorChar)) ??
+            throw new IOException("The helper snapshot parent is invalid.");
+        while (!Directory.Exists(existing))
+        {
+            var name = Path.GetFileName(existing);
+            if (string.IsNullOrEmpty(name)) throw new IOException("The helper snapshot parent is invalid.");
+            missing.Push(name);
+            existing = Path.GetDirectoryName(existing) ??
+                throw new IOException("The helper snapshot parent is invalid.");
+        }
+        var current = PinnedHelperEntry.Open(existing);
+        try
+        {
+            while (missing.TryPop(out var name))
+            {
+                var next = PinnedHelperEntry.OpenRelativeDirectory(current, name, createIfMissing: true);
+                current.Dispose();
+                current = next;
+            }
+            if (!string.Equals(current.FullPath.TrimEnd(Path.DirectorySeparatorChar),
+                    snapshotParent.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+                throw new UnsafeHelperFilesystemException();
+            current.ApplyWritableDirectoryAcl(user);
+            return current;
+        }
+        catch
+        {
+            current.Dispose();
+            throw;
+        }
     }
 
     private static string ToSnapshotPath(string root, string relative)
@@ -1122,17 +1377,17 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             security.GetOwner(typeof(SecurityIdentifier)) is SecurityIdentifier owner && owner == user;
     }
 
-    private static bool IsOwnedSnapshotBoundary(string root)
+    private static bool IsOwnedSnapshotBoundary(string snapshotParent, string root)
     {
         var canonical = Path.GetFullPath(root);
         var parent = Path.GetDirectoryName(canonical);
         var name = Path.GetFileName(canonical);
-        return string.Equals(parent, SnapshotParent, StringComparison.OrdinalIgnoreCase) &&
+        return string.Equals(parent, snapshotParent, StringComparison.OrdinalIgnoreCase) &&
             name.StartsWith("snapshot-", StringComparison.Ordinal) && name.Length == 41 &&
             Guid.TryParseExact(name[9..], "N", out _);
     }
 
-    private static bool IsLowerHex64(string value) => value.Length == 64 && value.All(character =>
+    private static bool IsLowerHex64(string? value) => value is { Length: 64 } && value.All(character =>
         character is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     private static SecurityIdentifier CurrentUser()
@@ -1157,11 +1412,23 @@ internal sealed class PinnedHelperEntry : IDisposable
 {
     private const uint GenericRead = 0x80000000;
     private const uint DeleteAccess = 0x00010000;
+    private const uint WriteDac = 0x00040000;
+    private const uint ReadControl = 0x00020000;
+    private const uint Synchronize = 0x00100000;
+    private const uint FileTraverse = 0x00000020;
+    private const uint FileReadAttributes = 0x00000080;
     private const uint OpenExisting = 3;
+    private const uint FileOpenIf = 3;
+    private const uint FileDirectoryFile = 0x00000001;
+    private const uint FileSynchronousIoNonAlert = 0x00000020;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint ObjCaseInsensitive = 0x00000040;
     private const uint FileAttributeDirectory = 0x00000010;
     private const uint FileAttributeReparsePoint = 0x00000400;
+    private const uint SeFileObject = 1;
+    private const uint DaclSecurityInformation = 0x00000004;
+    private const uint ProtectedDaclSecurityInformation = 0x80000000;
     private readonly SafeFileHandle handle;
     private readonly ByHandleFileInformation original;
 
@@ -1187,11 +1454,12 @@ internal sealed class PinnedHelperEntry : IDisposable
     public static PinnedHelperEntry Open(
         string path,
         bool deleteCapable = false,
+        bool writeDac = false,
         FileShare? shareMode = null)
     {
         var handle = CreateFileW(
             path,
-            GenericRead | (deleteCapable ? DeleteAccess : 0),
+            GenericRead | (deleteCapable ? DeleteAccess : 0) | (writeDac ? WriteDac : 0),
             shareMode ?? FileShare.Read,
             IntPtr.Zero,
             OpenExisting,
@@ -1221,6 +1489,92 @@ internal sealed class PinnedHelperEntry : IDisposable
             handle.Dispose();
             throw;
         }
+    }
+
+    public static PinnedHelperEntry OpenRelativeDirectory(
+        PinnedHelperEntry parent,
+        string name,
+        bool createIfMissing,
+        bool deleteCapable = false)
+    {
+        if (!parent.IsDirectory || string.IsNullOrWhiteSpace(name) || name is "." or ".." ||
+            name.Any(char.IsControl) || name.Contains(Path.DirectorySeparatorChar) ||
+            name.Contains(Path.AltDirectorySeparatorChar) || name.Contains(':'))
+            throw new UnsafeHelperFilesystemException();
+        using var relative = new RelativeName(name);
+        var attributes = new ObjectAttributes
+        {
+            Length = Marshal.SizeOf<ObjectAttributes>(),
+            RootDirectory = parent.handle.DangerousGetHandle(),
+            ObjectName = relative.UnicodeStringPointer,
+            Attributes = ObjCaseInsensitive,
+        };
+        var status = NtCreateFile(
+            out var handle,
+            FileReadAttributes | FileTraverse | ReadControl | WriteDac | Synchronize |
+            (deleteCapable ? DeleteAccess : 0),
+            ref attributes,
+            out _,
+            IntPtr.Zero,
+            FileAttributeDirectory,
+            (uint)(FileShare.Read | FileShare.Write | FileShare.Delete),
+            createIfMissing ? FileOpenIf : 1u,
+            FileDirectoryFile | FileSynchronousIoNonAlert | FileFlagOpenReparsePoint,
+            IntPtr.Zero,
+            0);
+        if (status < 0)
+        {
+            handle?.Dispose();
+            throw new Win32Exception(status);
+        }
+        try
+        {
+            if (!GetFileInformationByHandle(handle, out var info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.FileAttributes & FileAttributeDirectory) == 0 ||
+                (info.FileAttributes & FileAttributeReparsePoint) != 0)
+                throw new UnsafeHelperFilesystemException();
+            var expected = Path.GetFullPath(Path.Combine(parent.FullPath, name));
+            var finalPath = ReadFinalPath(handle);
+            if (!string.Equals(expected.TrimEnd(Path.DirectorySeparatorChar),
+                    finalPath.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+                throw new UnsafeHelperFilesystemException();
+            return new PinnedHelperEntry(expected, handle, info, isDirectory: true);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public void ApplyWritableDirectoryAcl(SecurityIdentifier user)
+    {
+        if (!IsDirectory) throw new UnsafeHelperFilesystemException();
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            user, FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None, AccessControlType.Allow));
+        var bytes = security.GetSecurityDescriptorBinaryForm();
+        var pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+        try
+        {
+            if (!GetSecurityDescriptorDacl(
+                    pinned.AddrOfPinnedObject(), out var present, out var dacl, out _) ||
+                !present || dacl == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            var error = SetSecurityInfo(handle, SeFileObject,
+                DaclSecurityInformation | ProtectedDaclSecurityInformation,
+                IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+            if (error != 0) throw new Win32Exception(checked((int)error));
+        }
+        finally
+        {
+            if (pinned.IsAllocated) pinned.Free();
+        }
+        EnsureSameIdentity();
     }
 
     public byte[] ReadAllBytes(int maximumBytes, CancellationToken cancellationToken)
@@ -1387,6 +1741,58 @@ internal sealed class PinnedHelperEntry : IDisposable
         public bool DeleteFile;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UnicodeString
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ObjectAttributes
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        public IntPtr Status;
+        public UIntPtr Information;
+    }
+
+    private sealed class RelativeName : IDisposable
+    {
+        private readonly IntPtr text;
+
+        public RelativeName(string name)
+        {
+            text = Marshal.StringToHGlobalUni(name);
+            var unicode = new UnicodeString
+            {
+                Length = checked((ushort)(name.Length * sizeof(char))),
+                MaximumLength = checked((ushort)((name.Length + 1) * sizeof(char))),
+                Buffer = text,
+            };
+            UnicodeStringPointer = Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
+            Marshal.StructureToPtr(unicode, UnicodeStringPointer, false);
+        }
+
+        public IntPtr UnicodeStringPointer { get; }
+
+        public void Dispose()
+        {
+            Marshal.FreeHGlobal(UnicodeStringPointer);
+            Marshal.FreeHGlobal(text);
+        }
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFileW(
         string fileName,
@@ -1417,6 +1823,38 @@ internal sealed class PinnedHelperEntry : IDisposable
         StringBuilder filePath,
         uint filePathLength,
         uint flags);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(
+        out SafeFileHandle fileHandle,
+        uint desiredAccess,
+        ref ObjectAttributes objectAttributes,
+        out IoStatusBlock ioStatusBlock,
+        IntPtr allocationSize,
+        uint fileAttributes,
+        uint shareAccess,
+        uint createDisposition,
+        uint createOptions,
+        IntPtr eaBuffer,
+        uint eaLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetSecurityDescriptorDacl(
+        IntPtr securityDescriptor,
+        [MarshalAs(UnmanagedType.Bool)] out bool daclPresent,
+        out IntPtr dacl,
+        [MarshalAs(UnmanagedType.Bool)] out bool daclDefaulted);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint SetSecurityInfo(
+        SafeFileHandle handle,
+        uint objectType,
+        uint securityInfo,
+        IntPtr owner,
+        IntPtr group,
+        IntPtr dacl,
+        IntPtr sacl);
 }
 
 internal sealed class UnsafeHelperFilesystemException : IOException
