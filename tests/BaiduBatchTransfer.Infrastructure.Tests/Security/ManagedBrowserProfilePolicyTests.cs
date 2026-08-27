@@ -7,6 +7,10 @@ using Microsoft.Win32.SafeHandles;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Security;
 
+[CollectionDefinition(nameof(ManagedProfileHandleLifetimeCollection), DisableParallelization = true)]
+public sealed class ManagedProfileHandleLifetimeCollection;
+
+[Collection(nameof(ManagedProfileHandleLifetimeCollection))]
 public sealed class ManagedBrowserProfilePolicyTests : IDisposable
 {
     private readonly string root = Path.Combine(
@@ -191,6 +195,48 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
             FileSystemManagedBrowserProfilePolicy.MarkerName));
         Assert.EndsWith("\n", marker, StringComparison.Ordinal);
         Assert.Equal(5, marker.Count(character => character == '\n'));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task RepeatedProfileValidationDoesNotRetainOneTokenHandlePerCall()
+    {
+        var accountId = Guid.NewGuid();
+        var policy = new FileSystemManagedBrowserProfilePolicy(root);
+        var created = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, created.Status);
+        var descriptor = Assert.IsType<ManagedBrowserProfileDescriptor>(created.Profile);
+
+        var warmupReady = await ExerciseProfileValidation(policy, accountId, descriptor, 4);
+        Assert.True(warmupReady);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.True(GC.TryStartNoGCRegion(256L * 1024 * 1024));
+        try
+        {
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            process.Refresh();
+            var before = process.HandleCount;
+            var firstBatchReady = await ExerciseProfileValidation(policy, accountId, descriptor, 64);
+            process.Refresh();
+            var afterFirstBatch = process.HandleCount;
+            var secondBatchReady = await ExerciseProfileValidation(policy, accountId, descriptor, 64);
+            process.Refresh();
+            var afterSecondBatch = process.HandleCount;
+
+            Assert.True(firstBatchReady && secondBatchReady);
+            var firstBatchGrowth = afterFirstBatch - before;
+            var secondBatchGrowth = afterSecondBatch - afterFirstBatch;
+            Assert.True(secondBatchGrowth <= Math.Max(8, firstBatchGrowth / 4),
+                $"Token handles grew with repeated calls: first-batch={firstBatchGrowth}, second-batch={secondBatchGrowth}.");
+        }
+        finally
+        {
+            if (System.Runtime.GCSettings.LatencyMode == System.Runtime.GCLatencyMode.NoGCRegion)
+                GC.EndNoGCRegion();
+        }
     }
 
     [Fact]
@@ -824,6 +870,23 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
             .ToArray();
         Assert.NotEmpty(allowRules);
         Assert.All(allowRules, rule => Assert.Equal(currentUser, rule.IdentityReference));
+    }
+
+    private static async Task<bool> ExerciseProfileValidation(
+        FileSystemManagedBrowserProfilePolicy policy,
+        Guid accountId,
+        ManagedBrowserProfileDescriptor descriptor,
+        int iterations)
+    {
+        var allReady = true;
+        for (var iteration = 0; iteration < iterations; iteration++)
+        {
+            var existing = await policy.OpenExistingAsync(descriptor);
+            var getOrCreate = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+            allReady &= existing.Status == ManagedBrowserProfileStatus.Ready &&
+                getOrCreate.Status == ManagedBrowserProfileStatus.Ready;
+        }
+        return allReady;
     }
 
     [SupportedOSPlatform("windows")]

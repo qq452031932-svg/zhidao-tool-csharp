@@ -680,7 +680,12 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
             {
                 var bytes = new byte[checked((int)NativeMethods.GetSecurityDescriptorLength(pointer))];
                 Marshal.Copy(pointer, bytes, 0, bytes.Length); var descriptor = new RawSecurityDescriptor(bytes, 0);
-                var user = WindowsIdentity.GetCurrent().User;
+                SecurityIdentifier? user;
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    var identityUser = identity.User;
+                    user = identityUser is null ? null : CopySecurityIdentifier(identityUser);
+                }
                 var ownerMatches = user is not null && descriptor.Owner == user;
                 var daclProtected = (descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0;
                 if (descriptor.DiscretionaryAcl is null)
@@ -931,7 +936,13 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
         {
             if (!OperatingSystem.IsWindows())
                 throw Policy(ManagedBrowserProfileIsolationReason.UnsupportedNamespace);
-            var user = WindowsIdentity.GetCurrent().User ?? throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+            SecurityIdentifier user;
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                var identityUser = identity.User ??
+                    throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+                user = CopySecurityIdentifier(identityUser);
+            }
             var key = new SecurityDescriptorCacheKey(user, directory);
             var canonical = Cache.GetOrAdd(key, static item => new Lazy<byte[]>(
                 () => OperatingSystem.IsWindows()
@@ -970,6 +981,14 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
         }
         public void Dispose() { if (pinned.IsAllocated) pinned.Free(); }
         private readonly record struct SecurityDescriptorCacheKey(SecurityIdentifier User, bool Directory);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static SecurityIdentifier CopySecurityIdentifier(SecurityIdentifier source)
+    {
+        var bytes = new byte[source.BinaryLength];
+        source.GetBinaryForm(bytes, 0);
+        return new SecurityIdentifier(bytes, 0);
     }
 
     private static class NativeMethods
