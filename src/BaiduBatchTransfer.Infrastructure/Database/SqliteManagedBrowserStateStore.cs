@@ -72,6 +72,17 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
         return await LoadInstallationAsync(connection, null, installationId, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(
+        string fileIdentity,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fileIdentity);
+        cancellationToken.ThrowIfCancellationRequested();
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return await LoadInstallationByFileIdentityAsync(
+            connection, null, fileIdentity, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<StoredBrowserInstallation?> LoadActiveInstallationAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -441,11 +452,27 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
                 transaction,
                 request.ExpectedSession.Identity.SessionId,
                 cancellationToken).ConfigureAwait(false);
-            var targetInstallation = await LoadInstallationAsync(
+            var observedTargetInstallation = await LoadInstallationAsync(
                 connection,
                 transaction,
                 request.TargetInstallation.InstallationId,
                 cancellationToken).ConfigureAwait(false);
+            var expectedTargetInstallation = request.ExpectedTargetInstallation;
+            var targetInstallation = expectedTargetInstallation is null
+                ? observedTargetInstallation
+                : await LoadInstallationAsync(
+                    connection,
+                    transaction,
+                    expectedTargetInstallation.Identity.InstallationId,
+                    cancellationToken).ConfigureAwait(false);
+            var fileIdentityInstallation = await LoadInstallationByFileIdentityAsync(
+                connection,
+                transaction,
+                request.TargetInstallation.FileIdentity,
+                cancellationToken).ConfigureAwait(false);
+            var effectiveTargetIdentity = expectedTargetInstallation?.Identity ?? request.TargetInstallation;
+            var effectiveTargetSession = RebindInstallation(
+                request.TargetSession, effectiveTargetIdentity.InstallationId);
             var targetSession = await LoadSessionAsync(
                 connection,
                 transaction,
@@ -472,7 +499,10 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
                     targetInstallation,
                     targetSession,
                     activeInstallation,
-                    activeTargetFamily))
+                    activeTargetFamily,
+                    effectiveTargetIdentity,
+                    effectiveTargetSession,
+                    expectedTargetInstallation?.Revision ?? 0))
             {
                 await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
                 return new(ManagedBrowserFamilySwitchTransitionStatus.Applied);
@@ -481,7 +511,14 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
             if (!ExactInstallationEquals(expectedInstallation, request.ExpectedInstallation) ||
                 !ExactSessionEquals(expectedSession, request.ExpectedSession) ||
                 !ExactInstallationEquals(activeInstallation, request.ExpectedInstallation) ||
-                activeTargetFamily is not null || targetInstallation is not null || targetSession is not null)
+                activeTargetFamily is not null || targetSession is not null ||
+                (expectedTargetInstallation is null
+                    ? targetInstallation is not null || fileIdentityInstallation is not null
+                    : !ExactInstallationEquals(targetInstallation, expectedTargetInstallation) ||
+                      !ExactInstallationEquals(fileIdentityInstallation, expectedTargetInstallation) ||
+                      (request.TargetInstallation.InstallationId !=
+                           expectedTargetInstallation.Identity.InstallationId &&
+                       observedTargetInstallation is not null)))
                 return await RollbackFamilySwitchAsync(
                     transaction, ManagedBrowserFamilySwitchTransitionStatus.Conflict).ConfigureAwait(false);
 
@@ -495,10 +532,11 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
                     transaction, ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked).ConfigureAwait(false);
 
             var now = DateTimeOffset.UtcNow.ToString("O");
-            await InsertFamilySwitchInstallationAsync(
-                connection, transaction, request.TargetInstallation, now, cancellationToken).ConfigureAwait(false);
+            if (expectedTargetInstallation is null)
+                await InsertFamilySwitchInstallationAsync(
+                    connection, transaction, effectiveTargetIdentity, now, cancellationToken).ConfigureAwait(false);
             await InsertFamilySwitchSessionAsync(
-                connection, transaction, request.TargetSession, now, cancellationToken).ConfigureAwait(false);
+                connection, transaction, effectiveTargetSession, now, cancellationToken).ConfigureAwait(false);
 
             if (await UpdateSessionStateAsync(
                     connection,
@@ -528,8 +566,8 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
                 await UpdateInstallationStateAsync(
                     connection,
                     transaction,
-                    request.TargetInstallation.InstallationId,
-                    0,
+                    effectiveTargetIdentity.InstallationId,
+                    expectedTargetInstallation?.Revision ?? 0,
                     BrowserInstallationLifecycleState.Retired,
                     BrowserInstallationLifecycleState.Active,
                     now,
@@ -537,7 +575,7 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
                 await UpdateSessionStateAsync(
                     connection,
                     transaction,
-                    request.TargetSession.SessionId,
+                    effectiveTargetSession.SessionId,
                     0,
                     ManagedBrowserSessionLifecycleState.Retired,
                     ManagedBrowserSessionLifecycleState.Active,
@@ -1158,7 +1196,10 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
         StoredBrowserInstallation? targetInstallation,
         StoredManagedBrowserSession? targetSession,
         StoredBrowserInstallation? activeInstallation,
-        StoredManagedBrowserSession? activeTargetFamily) =>
+        StoredManagedBrowserSession? activeTargetFamily,
+        BrowserInstallationIdentity effectiveTargetIdentity,
+        ManagedBrowserSessionReference effectiveTargetSession,
+        long expectedTargetRevision) =>
         ExactInstallationEquals(
             expectedInstallation,
             new StoredBrowserInstallation(
@@ -1174,13 +1215,29 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
         ExactInstallationEquals(
             targetInstallation,
             new StoredBrowserInstallation(
-                request.TargetInstallation, BrowserInstallationLifecycleState.Active, 1)) &&
+                effectiveTargetIdentity,
+                BrowserInstallationLifecycleState.Active,
+                checked(expectedTargetRevision + 1))) &&
         ExactSessionEquals(
             targetSession,
             new StoredManagedBrowserSession(
-                request.TargetSession, ManagedBrowserSessionLifecycleState.Active, 1)) &&
+                effectiveTargetSession, ManagedBrowserSessionLifecycleState.Active, 1)) &&
         ExactInstallationEquals(activeInstallation, targetInstallation!) &&
         ExactSessionEquals(activeTargetFamily, targetSession!);
+
+    private static ManagedBrowserSessionReference RebindInstallation(
+        ManagedBrowserSessionReference session,
+        Guid installationId) =>
+        session.InstallationId == installationId
+            ? session
+            : new ManagedBrowserSessionReference(
+                session.SessionId,
+                installationId,
+                session.AccountId,
+                session.StableBaiduUserId,
+                session.BrowserFamily,
+                session.ProfileId,
+                session.ProfileOwnershipId);
 
     private static bool ExactInstallationEquals(
         StoredBrowserInstallation? actual,
@@ -1228,6 +1285,28 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
             FROM BrowserInstallations WHERE InstallationId=$id;
             """;
         command.Parameters.AddWithValue("$id", installationId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var current = ReadInstallation(reader);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("Managed browser installation state is invalid.");
+        return current;
+    }
+
+    private static async Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string fileIdentity,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,
+                   ProductName,FileIdentity,State,Revision
+            FROM BrowserInstallations WHERE FileIdentity=$file;
+            """;
+        command.Parameters.AddWithValue("$file", fileIdentity);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
         var current = ReadInstallation(reader);

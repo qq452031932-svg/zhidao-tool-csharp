@@ -181,6 +181,46 @@ public sealed class ManagedBrowserContractsTests
                 ManagedBrowserSessionLifecycleState.Retired, 0)));
     }
 
+    [Fact]
+    public void FamilySwitchRequestAcceptsOnlyExactRetiredReusableInstallation()
+    {
+        var currentInstallation = new StoredBrowserInstallation(
+            CreateInstallation(BrowserFamily.Chrome), BrowserInstallationLifecycleState.Active, 7);
+        var currentSession = new StoredManagedBrowserSession(
+            CreateReference(BrowserFamily.Chrome), ManagedBrowserSessionLifecycleState.Active, 8);
+        var retiredEdgeIdentity = new BrowserInstallationIdentity(
+            Guid.Parse("21000000-0000-0000-0000-000000000001"), BrowserFamily.Edge,
+            "C:\\Browsers\\Edge", "C:\\Browsers\\Edge\\msedge.exe",
+            "Microsoft Corporation", "Microsoft Edge", "edge-file");
+        var retiredEdge = new StoredBrowserInstallation(
+            retiredEdgeIdentity, BrowserInstallationLifecycleState.Retired, 4);
+        var observedEdge = new BrowserInstallationIdentity(
+            Guid.Parse("22000000-0000-0000-0000-000000000001"), BrowserFamily.Edge,
+            "c:\\browsers\\edge", "c:\\browsers\\edge\\msedge.exe",
+            "Microsoft Corporation", "Microsoft Edge", "edge-file");
+        var targetSession = new ManagedBrowserSessionReference(
+            Guid.Parse("31000000-0000-0000-0000-000000000001"), observedEdge.InstallationId,
+            AccountId, "stable-uid", BrowserFamily.Edge, "profile-2", "ownership-2");
+
+        var request = new ManagedBrowserFamilySwitchTransitionRequest(
+            currentInstallation, currentSession, observedEdge, targetSession, "stable-uid", retiredEdge);
+
+        Assert.Same(retiredEdge, request.ExpectedTargetInstallation);
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserFamilySwitchTransitionRequest(
+            currentInstallation, currentSession, observedEdge, targetSession, "stable-uid",
+            new StoredBrowserInstallation(
+                retiredEdgeIdentity, BrowserInstallationLifecycleState.Active, retiredEdge.Revision)));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserFamilySwitchTransitionRequest(
+            currentInstallation, currentSession, observedEdge, targetSession, "stable-uid",
+            new StoredBrowserInstallation(
+                new BrowserInstallationIdentity(
+                    retiredEdgeIdentity.InstallationId, BrowserFamily.Edge,
+                    retiredEdgeIdentity.InstallationDirectory, retiredEdgeIdentity.ExecutablePath,
+                    retiredEdgeIdentity.Publisher, retiredEdgeIdentity.ProductName, "different-file"),
+                BrowserInstallationLifecycleState.Retired,
+                retiredEdge.Revision)));
+    }
+
     [Theory]
     [InlineData(" ", "Google Chrome", "file-identity")]
     [InlineData(" Google LLC", "Google Chrome", "file-identity")]
@@ -397,6 +437,8 @@ public sealed class ManagedBrowserContractsTests
         IManagedBrowserStateStore store = new ContractStore();
         Func<BrowserInstallationIdentity, CancellationToken, Task<StoredBrowserInstallation>> createInstallation = store.CreateInstallationAsync;
         Func<Guid, CancellationToken, Task<StoredBrowserInstallation?>> loadInstallation = store.LoadInstallationAsync;
+        Func<string, CancellationToken, Task<StoredBrowserInstallation?>> loadInstallationByFileIdentity =
+            store.LoadInstallationByFileIdentityAsync;
         Func<CancellationToken, Task<StoredBrowserInstallation?>> loadActiveInstallation = store.LoadActiveInstallationAsync;
         Func<ManagedBrowserInstallationActivationRequest, CancellationToken, Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>>> activateInstallation = store.TryReplaceActiveInstallationAsync;
         Func<ManagedBrowserTransitionRequest, CancellationToken, Task<ManagedBrowserTransitionResult>> retireInstallation = store.TryRetireInstallationAsync;
@@ -413,6 +455,7 @@ public sealed class ManagedBrowserContractsTests
 
         Assert.NotNull(createInstallation);
         Assert.NotNull(loadInstallation);
+        Assert.NotNull(loadInstallationByFileIdentity);
         Assert.NotNull(loadActiveInstallation);
         Assert.NotNull(activateInstallation);
         Assert.NotNull(retireInstallation);
@@ -573,6 +616,7 @@ public sealed class ManagedBrowserContractsTests
     {
         public Task<StoredBrowserInstallation> CreateInstallationAsync(BrowserInstallationIdentity installation, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<StoredBrowserInstallation?> LoadInstallationAsync(Guid installationId, CancellationToken cancellationToken) => throw new NotImplementedException();
+        public Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(string fileIdentity, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<StoredBrowserInstallation?> LoadActiveInstallationAsync(CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>> TryReplaceActiveInstallationAsync(ManagedBrowserInstallationActivationRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();
         public Task<ManagedBrowserTransitionResult> TryRetireInstallationAsync(ManagedBrowserTransitionRequest request, CancellationToken cancellationToken) => throw new NotImplementedException();

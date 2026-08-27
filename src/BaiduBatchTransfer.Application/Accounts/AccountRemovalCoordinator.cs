@@ -243,6 +243,9 @@ public sealed class ManagedBrowserFamilySwitchCoordinator(
                 current.ProfileOwnershipId, StringComparison.Ordinal))
             return new(ManagedBrowserFamilySwitchStatus.Conflict);
 
+        var reusableTarget = await stateStore.LoadInstallationByFileIdentityAsync(
+            targetInstallation.FileIdentity, cancellationToken).ConfigureAwait(false);
+
         ManagedBrowserFamilySwitchTransitionResult transition;
         try
         {
@@ -252,7 +255,8 @@ public sealed class ManagedBrowserFamilySwitchCoordinator(
                     storedSession,
                     targetInstallation,
                     targetSession,
-                    observation.ObservedStableBaiduUserId),
+                    observation.ObservedStableBaiduUserId,
+                    reusableTarget),
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)

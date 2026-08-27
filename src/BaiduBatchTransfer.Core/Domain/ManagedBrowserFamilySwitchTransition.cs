@@ -17,7 +17,8 @@ public sealed record ManagedBrowserFamilySwitchTransitionRequest
         StoredManagedBrowserSession expectedSession,
         BrowserInstallationIdentity targetInstallation,
         ManagedBrowserSessionReference targetSession,
-        string observedStableBaiduUserId)
+        string observedStableBaiduUserId,
+        StoredBrowserInstallation? expectedTargetInstallation = null)
     {
         ExpectedInstallation = expectedInstallation ??
             throw new ArgumentNullException(nameof(expectedInstallation));
@@ -45,7 +46,15 @@ public sealed record ManagedBrowserFamilySwitchTransitionRequest
                 observedStableBaiduUserId, StringComparison.Ordinal))
             throw new ArgumentException("The managed browser family switch tuple is invalid.");
 
+        if (expectedTargetInstallation is not null &&
+            (expectedTargetInstallation.State != BrowserInstallationLifecycleState.Retired ||
+             expectedTargetInstallation.Identity.InstallationId == expectedInstallation.Identity.InstallationId ||
+             !SameExecutableIdentity(expectedTargetInstallation.Identity, targetInstallation)))
+            throw new ArgumentException("The reusable target installation is invalid.",
+                nameof(expectedTargetInstallation));
+
         ObservedStableBaiduUserId = observedStableBaiduUserId;
+        ExpectedTargetInstallation = expectedTargetInstallation;
     }
 
     public StoredBrowserInstallation ExpectedInstallation { get; }
@@ -53,7 +62,20 @@ public sealed record ManagedBrowserFamilySwitchTransitionRequest
     public BrowserInstallationIdentity TargetInstallation { get; }
     public ManagedBrowserSessionReference TargetSession { get; }
     public string ObservedStableBaiduUserId { get; }
+    public StoredBrowserInstallation? ExpectedTargetInstallation { get; }
 
     public override string ToString() =>
         "ManagedBrowserFamilySwitchTransitionRequest { Identities = [REDACTED] }";
+
+    private static bool SameExecutableIdentity(
+        BrowserInstallationIdentity left,
+        BrowserInstallationIdentity right) =>
+        left.BrowserFamily == right.BrowserFamily &&
+        string.Equals(left.InstallationDirectory, right.InstallationDirectory,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(left.ExecutablePath, right.ExecutablePath,
+            StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(left.Publisher, right.Publisher, StringComparison.Ordinal) &&
+        string.Equals(left.ProductName, right.ProductName, StringComparison.Ordinal) &&
+        string.Equals(left.FileIdentity, right.FileIdentity, StringComparison.Ordinal);
 }

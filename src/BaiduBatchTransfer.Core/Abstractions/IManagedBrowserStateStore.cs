@@ -12,6 +12,10 @@ public interface IManagedBrowserStateStore
         Guid installationId,
         CancellationToken cancellationToken);
 
+    Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(
+        string fileIdentity,
+        CancellationToken cancellationToken);
+
     Task<StoredBrowserInstallation?> LoadActiveInstallationAsync(CancellationToken cancellationToken);
 
     Task<ManagedBrowserActiveSlotTransitionResult<StoredBrowserInstallation>> TryReplaceActiveInstallationAsync(

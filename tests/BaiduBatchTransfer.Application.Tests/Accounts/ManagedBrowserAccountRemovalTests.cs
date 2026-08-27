@@ -322,6 +322,40 @@ public sealed class ManagedBrowserAccountRemovalTests
     }
 
     [Fact]
+    public async Task FamilySwitchResolvesPreviouslyRetiredExecutableByFileIdentityForAtomicReuse()
+    {
+        var original = Snapshot();
+        var observation = SwitchObservation();
+        var observed = observation.TargetInstallation;
+        var reusableIdentity = new BrowserInstallationIdentity(
+            Guid.Parse("abababab-abab-abab-abab-abababababab"),
+            observed.BrowserFamily,
+            observed.InstallationDirectory,
+            observed.ExecutablePath,
+            observed.Publisher,
+            observed.ProductName,
+            observed.FileIdentity);
+        var reusable = new StoredBrowserInstallation(
+            reusableIdentity, BrowserInstallationLifecycleState.Retired, 4);
+        var state = new RecordingFamilySwitchStateStore(original)
+        {
+            ReusableTarget = reusable,
+        };
+        var coordinator = new ManagedBrowserFamilySwitchCoordinator(
+            state,
+            new FixedFamilySwitchFence(true));
+
+        var result = await coordinator.SwitchAsync(observation, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchStatus.Switched, result.Status);
+        Assert.Same(reusable, state.LastSwitchRequest!.ExpectedTargetInstallation);
+        Assert.Equal(new[]
+        {
+            "load-installation", "load-session", "load-file-installation", "switch-family",
+        }, state.Calls);
+    }
+
+    [Fact]
     public async Task FamilySwitchMapsAtomicStoreFenceWithoutPerformingPartialWrites()
     {
         var state = new RecordingFamilySwitchStateStore(Snapshot())
@@ -514,6 +548,11 @@ public sealed class ManagedBrowserAccountRemovalTests
                     session.InstallationRevision)
                 : null);
 
+        public Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(
+            string fileIdentity,
+            CancellationToken cancellationToken) =>
+            Task.FromResult<StoredBrowserInstallation?>(null);
+
         public Task<ManagedBrowserTransitionResult> TryTransitionCleanupManifestAsync(ManagedProfileCleanupTransitionRequest request, CancellationToken cancellationToken)
         {
             Transitions.Add(request);
@@ -569,6 +608,8 @@ public sealed class ManagedBrowserAccountRemovalTests
         public StoredManagedBrowserSession? ActiveSession { get; private set; }
         public ManagedBrowserFamilySwitchTransitionStatus SwitchStatus { get; set; } =
             ManagedBrowserFamilySwitchTransitionStatus.Applied;
+        public StoredBrowserInstallation? ReusableTarget { get; set; }
+        public ManagedBrowserFamilySwitchTransitionRequest? LastSwitchRequest { get; private set; }
 
         public Task<StoredBrowserInstallation?> LoadInstallationAsync(Guid installationId, CancellationToken cancellationToken)
         {
@@ -583,6 +624,18 @@ public sealed class ManagedBrowserAccountRemovalTests
             Calls.Add("load-session");
             return Task.FromResult<StoredManagedBrowserSession?>(new StoredManagedBrowserSession(
                 original.Session, OldSessionState, original.SessionRevision));
+        }
+
+        public Task<StoredBrowserInstallation?> LoadInstallationByFileIdentityAsync(
+            string fileIdentity,
+            CancellationToken cancellationToken)
+        {
+            if (ReusableTarget is null) return Task.FromResult<StoredBrowserInstallation?>(null);
+            Calls.Add("load-file-installation");
+            return Task.FromResult<StoredBrowserInstallation?>(
+                string.Equals(ReusableTarget.Identity.FileIdentity, fileIdentity, StringComparison.Ordinal)
+                    ? ReusableTarget
+                    : null);
         }
 
         public Task<StoredBrowserInstallation> CreateInstallationAsync(BrowserInstallationIdentity installation, CancellationToken cancellationToken)
@@ -611,6 +664,7 @@ public sealed class ManagedBrowserAccountRemovalTests
             CancellationToken cancellationToken)
         {
             Calls.Add("switch-family");
+            LastSwitchRequest = request;
             if (SwitchStatus == ManagedBrowserFamilySwitchTransitionStatus.Applied)
             {
                 OldSessionState = ManagedBrowserSessionLifecycleState.Retired;

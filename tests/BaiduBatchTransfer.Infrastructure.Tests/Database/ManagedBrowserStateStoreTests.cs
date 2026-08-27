@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
+using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
 
@@ -459,8 +460,12 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
     [Fact]
     public async Task CleanupClaimConflictsWithExistingOwnerWithoutPartiallyUpdatingState()
     {
-        var fixture = await CreateRetiredCleanupFixtureAsync("owner-conflict");
-        _ = await InsertManagedTransferOwnerAsync(fixture);
+        var fixture = await CreateRetiredCleanupFixtureAsync(
+            "owner-conflict",
+            beforeRetirement: async activeFixture =>
+            {
+                _ = await InsertManagedTransferOwnerAsync(activeFixture);
+            });
 
         var claimed = await fixture.Store.TryClaimRetiredIdentityForCleanupAsync(
             fixture.ClaimRequest(), default);
@@ -879,6 +884,127 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task FamilySwitchBackReusesRetiredInstallationAndCreatesFreshOwnedProfile()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied,
+            (await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default)).Status);
+        var edgeInstallation = (await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default))!;
+        var edgeSession = (await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default))!;
+        var retiredChrome = (await fixture.Store.LoadInstallationAsync(
+            fixture.OldInstallation.Identity.InstallationId, default))!;
+        var reobservedChrome = new BrowserInstallationIdentity(
+            Guid.NewGuid(),
+            retiredChrome.Identity.BrowserFamily,
+            retiredChrome.Identity.InstallationDirectory,
+            retiredChrome.Identity.ExecutablePath,
+            retiredChrome.Identity.Publisher,
+            retiredChrome.Identity.ProductName,
+            retiredChrome.Identity.FileIdentity);
+        var freshChromeSession = Session(
+            reobservedChrome.InstallationId,
+            fixture.AccountId,
+            fixture.StableUid,
+            BrowserFamily.Chrome,
+            Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"));
+        var request = new ManagedBrowserFamilySwitchTransitionRequest(
+            edgeInstallation,
+            edgeSession,
+            reobservedChrome,
+            freshChromeSession,
+            fixture.StableUid,
+            expectedTargetInstallation: retiredChrome);
+
+        var result = await fixture.Store.TrySwitchFamilyAsync(request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, result.Status);
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM BrowserInstallations;"));
+        Assert.Equal(3, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM ManagedBrowserSessions;"));
+        var activeChrome = (await fixture.Store.LoadInstallationAsync(
+            retiredChrome.Identity.InstallationId, default))!;
+        Assert.Equal(BrowserInstallationLifecycleState.Active, activeChrome.State);
+        Assert.Equal(retiredChrome.Revision + 1, activeChrome.Revision);
+        var fresh = (await fixture.Store.LoadSessionAsync(freshChromeSession.SessionId, default))!;
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Active, fresh.State);
+        Assert.Equal(retiredChrome.Identity.InstallationId, fresh.Identity.InstallationId);
+        Assert.Equal(freshChromeSession.ProfileId, fresh.Identity.ProfileId);
+        Assert.Equal(freshChromeSession.ProfileOwnershipId, fresh.Identity.ProfileOwnershipId);
+        var originalChromeSession = (await fixture.Store.LoadSessionAsync(
+            fixture.OldSession.Identity.SessionId, default))!;
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired, originalChromeSession.State);
+        Assert.Equal(fixture.OldSession.Identity.ProfileId, originalChromeSession.Identity.ProfileId);
+        Assert.Equal(fixture.OldSession.Identity.ProfileOwnershipId,
+            originalChromeSession.Identity.ProfileOwnershipId);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired,
+            (await fixture.Store.LoadSessionAsync(edgeSession.Identity.SessionId, default))!.State);
+
+        var repeated = await fixture.Store.TrySwitchFamilyAsync(request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, repeated.Status);
+        AssertInstallationEqual(activeChrome, await fixture.Store.LoadInstallationAsync(
+            retiredChrome.Identity.InstallationId, default));
+        AssertSessionEqual(fresh, await fixture.Store.LoadSessionAsync(
+            freshChromeSession.SessionId, default));
+    }
+
+    [Fact]
+    public async Task ConcurrentFamilySwitchBackToRetiredInstallationHasOneWinner()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied,
+            (await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default)).Status);
+        var edgeInstallation = (await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default))!;
+        var edgeSession = (await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default))!;
+        var retiredChrome = (await fixture.Store.LoadInstallationAsync(
+            fixture.OldInstallation.Identity.InstallationId, default))!;
+
+        ManagedBrowserFamilySwitchTransitionRequest Request(string suffix)
+        {
+            var observed = new BrowserInstallationIdentity(
+                Guid.NewGuid(),
+                retiredChrome.Identity.BrowserFamily,
+                retiredChrome.Identity.InstallationDirectory,
+                retiredChrome.Identity.ExecutablePath,
+                retiredChrome.Identity.Publisher,
+                retiredChrome.Identity.ProductName,
+                retiredChrome.Identity.FileIdentity);
+            return new ManagedBrowserFamilySwitchTransitionRequest(
+                edgeInstallation,
+                edgeSession,
+                observed,
+                Session(
+                    observed.InstallationId,
+                    fixture.AccountId,
+                    fixture.StableUid,
+                    BrowserFamily.Chrome,
+                    $"{suffix}{Guid.NewGuid():N}",
+                    Guid.NewGuid().ToString("N")),
+                fixture.StableUid,
+                expectedTargetInstallation: retiredChrome);
+        }
+
+        var results = await Task.WhenAll(
+            fixture.Store.TrySwitchFamilyAsync(Request("a"), default),
+            new SqliteManagedBrowserStateStore(fixture.Factory)
+                .TrySwitchFamilyAsync(Request("b"), default));
+
+        Assert.Single(results, result => result.Status == ManagedBrowserFamilySwitchTransitionStatus.Applied);
+        Assert.Single(results, result => result.Status == ManagedBrowserFamilySwitchTransitionStatus.Conflict);
+        Assert.Equal(2, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM BrowserInstallations;"));
+        Assert.Equal(3, await ScalarLongAsync(fixture.Factory, "SELECT COUNT(*) FROM ManagedBrowserSessions;"));
+        Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM BrowserInstallations WHERE State='Active';"));
+        Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+            "SELECT COUNT(*) FROM ManagedBrowserSessions WHERE State='Active' AND AccountId=$account;",
+            ("$account", fixture.AccountId.ToString("D"))));
+    }
+
+    [Fact]
     public async Task RecoveringAttemptBlocksFamilySwitchWithoutChangingSnapshotOrCreatingRows()
     {
         var fixture = await CreateFamilySwitchFixtureAsync();
@@ -988,6 +1114,97 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             await fixture.Store.LoadInstallationAsync(fixture.OldInstallation.Identity.InstallationId, default));
         AssertSessionEqual(fixture.OldSession,
             await fixture.Store.LoadSessionAsync(fixture.OldSession.Identity.SessionId, default));
+    }
+
+    [Theory]
+    [InlineData(FamilySwitchOwnerKind.Transfer)]
+    [InlineData(FamilySwitchOwnerKind.Share)]
+    [InlineData(FamilySwitchOwnerKind.StandaloneShare)]
+    [InlineData(FamilySwitchOwnerKind.Attempt)]
+    public async Task FamilySwitchCommitFencesEveryNewWriteToRetiredSession(
+        FamilySwitchOwnerKind ownerKind)
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var ids = FamilySwitchOwnerIds.Create();
+        await SeedFamilySwitchOwnerGraphAsync(fixture, ids, $"retired-write-{ownerKind}");
+        if (ownerKind is FamilySwitchOwnerKind.Share or FamilySwitchOwnerKind.Attempt)
+            await SeedTerminalTransferOwnerAsync(fixture, ids, $"retired-parent-{ownerKind}");
+
+        var switched = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, switched.Status);
+        var exception = await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(
+            fixture.Factory,
+            NewRetiredOwnerWriteSql(ownerKind),
+            FamilySwitchOwnerParameters(fixture, ids)));
+        Assert.Equal(19, exception.SqliteErrorCode);
+        Assert.Equal(0, await ScalarLongAsync(fixture.Factory, ownerKind switch
+        {
+            FamilySwitchOwnerKind.Transfer =>
+                "SELECT COUNT(*) FROM TransferOperations WHERE Id=$id;",
+            FamilySwitchOwnerKind.Share =>
+                "SELECT COUNT(*) FROM ShareOperations WHERE Id=$id;",
+            FamilySwitchOwnerKind.StandaloneShare =>
+                "SELECT COUNT(*) FROM StandaloneShareOperations WHERE Id=$id;",
+            FamilySwitchOwnerKind.Attempt =>
+                "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId=$id;",
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        }, ("$id", ownerKind switch
+        {
+            FamilySwitchOwnerKind.Transfer => ids.Transfer.ToString("D"),
+            FamilySwitchOwnerKind.Share => ids.Share.ToString("D"),
+            FamilySwitchOwnerKind.StandaloneShare => ids.Standalone.ToString("D"),
+            FamilySwitchOwnerKind.Attempt => ids.Transfer.ToString("D"),
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        })));
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired,
+            (await fixture.Store.LoadSessionAsync(
+                fixture.OldSession.Identity.SessionId, default))!.State);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Active,
+            (await fixture.Store.LoadSessionAsync(
+                fixture.Request.TargetSession.SessionId, default))!.State);
+    }
+
+    [Fact]
+    public async Task ConcurrentFamilySwitchAndNewManagedWriteHaveOneLinearizedWinner()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var ids = FamilySwitchOwnerIds.Create();
+        await SeedFamilySwitchOwnerGraphAsync(fixture, ids, "switch-write-race");
+
+        var switchTask = fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+        var insertTask = Record.ExceptionAsync(() => ExecuteAsync(
+            fixture.Factory,
+            NewRetiredOwnerWriteSql(FamilySwitchOwnerKind.Transfer),
+            FamilySwitchOwnerParameters(fixture, ids)));
+
+        await Task.WhenAll(switchTask, insertTask);
+
+        var switched = await switchTask;
+        var insertError = await insertTask;
+        if (switched.Status == ManagedBrowserFamilySwitchTransitionStatus.Applied)
+        {
+            Assert.Equal(19, Assert.IsType<SqliteException>(insertError).SqliteErrorCode);
+            Assert.Equal(0, await ScalarLongAsync(fixture.Factory,
+                "SELECT COUNT(*) FROM TransferOperations WHERE Id=$id;",
+                ("$id", ids.Transfer.ToString("D"))));
+            Assert.Equal(ManagedBrowserSessionLifecycleState.Retired,
+                (await fixture.Store.LoadSessionAsync(
+                    fixture.OldSession.Identity.SessionId, default))!.State);
+        }
+        else
+        {
+            Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked, switched.Status);
+            Assert.Null(insertError);
+            Assert.Equal(1, await ScalarLongAsync(fixture.Factory,
+                "SELECT COUNT(*) FROM TransferOperations WHERE Id=$id;",
+                ("$id", ids.Transfer.ToString("D"))));
+            Assert.Equal(ManagedBrowserSessionLifecycleState.Active,
+                (await fixture.Store.LoadSessionAsync(
+                    fixture.OldSession.Identity.SessionId, default))!.State);
+            Assert.Null(await fixture.Store.LoadInstallationAsync(
+                fixture.Request.TargetInstallation.InstallationId, default));
+        }
     }
 
     public void Dispose()
@@ -1110,6 +1327,57 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             """, FamilySwitchOwnerParameters(fixture, ids));
         return ids;
     }
+
+    private static Task SeedTerminalTransferOwnerAsync(
+        FamilySwitchFixture fixture,
+        FamilySwitchOwnerIds ids,
+        string fingerprint) => ExecuteAsync(fixture.Factory, """
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+              OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,
+              TargetSlotState,DailyCountedAt,SubmitStartedAt,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Succeeded','NewTransfer',1,
+              $fingerprint,'{}','request','[]','ResultReceived','Fulfilled',$now,$now,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            FamilySwitchOwnerParameters(fixture, ids)
+                .Append(("$fingerprint", (object)fingerprint))
+                .ToArray());
+
+    private static string NewRetiredOwnerWriteSql(FamilySwitchOwnerKind ownerKind) => ownerKind switch
+    {
+        FamilySwitchOwnerKind.Transfer => """
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Waiting',0,
+              'retired-transfer','NotPrepared','Unoccupied',$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+        FamilySwitchOwnerKind.Share => """
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+              Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account,1,'WaitingShare','retired-share','terminal-settings',1,
+              'Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+        FamilySwitchOwnerKind.StandaloneShare => """
+            INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+              ParentPath,ExactItemSetFingerprint,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($standalone,$standaloneBatch,$account,1,'retired','File','/','retired-item','Queued',
+              'NotStarted','Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+        FamilySwitchOwnerKind.Attempt => """
+            INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+              Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($transfer,$account,1,'Transfer','Preparing',0,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+        _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+    };
 
     private static async Task<IReadOnlyList<ManagedBrowserRetentionReference>>
         SeedNonTerminalFamilySwitchOwnerAsync(
@@ -1320,7 +1588,8 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
 
     private async Task<CleanupFixture> CreateRetiredCleanupFixtureAsync(
         string suffix,
-        bool retireInstallation = true)
+        bool retireInstallation = true,
+        Func<CleanupFixture, Task>? beforeRetirement = null)
     {
         var (factory, store) = await CreateStoreAsync();
         var accountId = Guid.NewGuid();
@@ -1340,6 +1609,9 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             Path.Combine(root, $"source-{suffix}"), Path.Combine(root, $"quarantine-{suffix}"),
             identity.ProfileOwnershipId, null);
         var manifest = await store.CreateCleanupManifestAsync(manifestIdentity, default);
+        if (beforeRetirement is not null)
+            await beforeRetirement(new CleanupFixture(
+                factory, store, accountId, installation, session, manifest));
         var retiredSession = await store.TryRetireSessionAsync(
             new ManagedBrowserTransitionRequest(identity.SessionId, session.Revision), default);
         Assert.Equal(ManagedBrowserTransitionStatus.Applied, retiredSession.Status);
