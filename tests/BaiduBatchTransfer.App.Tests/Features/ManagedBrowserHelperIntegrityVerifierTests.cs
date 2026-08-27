@@ -23,10 +23,21 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         var executablePath = verified.ExecutablePath;
         var mainScriptPath = verified.MainScriptPath;
         var snapshotRoot = Path.GetDirectoryName(executablePath)!;
+        var snapshotContainer = Directory.GetParent(snapshotRoot)!.FullName;
         Assert.EndsWith("python.exe", executablePath, StringComparison.OrdinalIgnoreCase);
         Assert.EndsWith("main.py", mainScriptPath, StringComparison.OrdinalIgnoreCase);
         Assert.NotEqual(Path.GetFullPath(fixture.Root), Path.GetFullPath(snapshotRoot));
         Assert.Equal(fixture.BuildIdentity, verified.BuildIdentity);
+        using (var ownership = JsonDocument.Parse(
+                   ReadAllTextShared(Path.Combine(snapshotContainer, "ownership.json"))))
+        using (var ready = JsonDocument.Parse(
+                   ReadAllTextShared(Path.Combine(snapshotContainer, "ownership.ready.json"))))
+        {
+            Assert.Equal("Incomplete", ownership.RootElement.GetProperty("State").GetString());
+            Assert.Equal("Ready", ready.RootElement.GetProperty("State").GetString());
+            Assert.Equal(ownership.RootElement.GetProperty("SnapshotId").GetString(),
+                ready.RootElement.GetProperty("SnapshotId").GetString());
+        }
         File.WriteAllText(Path.Combine(fixture.Root, "late-injection.pth"), "import injected");
         Assert.False(File.Exists(Path.Combine(snapshotRoot, "late-injection.pth")));
         Assert.Throws<UnauthorizedAccessException>(() =>
@@ -394,11 +405,18 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     }
 
     [Theory]
-    [InlineData("SnapshotId")]
-    [InlineData("BuildIdentity")]
-    [InlineData("FileId")]
-    [InlineData("OwnerSid")]
-    public async Task NullOwnershipMarkerFieldIsIsolatedAndDoesNotBlockVerification(string field)
+    [InlineData("ownership.json", "SnapshotId")]
+    [InlineData("ownership.json", "State")]
+    [InlineData("ownership.json", "BuildIdentity")]
+    [InlineData("ownership.json", "FileId")]
+    [InlineData("ownership.json", "OwnerSid")]
+    [InlineData("ownership.ready.json", "SnapshotId")]
+    [InlineData("ownership.ready.json", "State")]
+    [InlineData("ownership.ready.json", "BuildIdentity")]
+    [InlineData("ownership.ready.json", "FileId")]
+    [InlineData("ownership.ready.json", "OwnerSid")]
+    public async Task NullSnapshotMarkerFieldIsIsolatedAndDoesNotBlockVerification(
+        string markerFileName, string field)
     {
         using var fixture = HelperFixture.Create();
         var snapshotParent = Path.Combine(Path.GetTempPath(),
@@ -411,8 +429,8 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         var orphanContainer = Directory.GetParent(
             Path.GetDirectoryName(crashed.ExecutablePath)!)!.FullName;
         crashed.AbandonForProcessCrashSimulation();
-        MakeWritable(Path.Combine(orphanContainer, "ownership.json"), isDirectory: false);
-        var markerPath = Path.Combine(orphanContainer, "ownership.json");
+        MakeWritable(Path.Combine(orphanContainer, markerFileName), isDirectory: false);
+        var markerPath = Path.Combine(orphanContainer, markerFileName);
         var marker = File.ReadAllText(markerPath);
         marker = System.Text.RegularExpressions.Regex.Replace(
             marker, $"\"{field}\":\"[^\"]*\"", $"\"{field}\":null");
@@ -451,6 +469,52 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
 
         Assert.True(Directory.Exists(snapshotParent));
         Assert.Empty(Directory.EnumerateFileSystemEntries(snapshotParent));
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public async Task LockedCopiedPayloadBecomesRecoverableIncompleteSnapshotAfterCancellation()
+    {
+        using var fixture = HelperFixture.Create(additionalContents: new Dictionary<string, byte[]>
+        {
+            ["_asyncio.pyd"] = [0x4d, 0x5a, 0x01, 0x02],
+        });
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-locked-copy-{Guid.NewGuid():N}", "snapshots");
+        var created = new DateTimeOffset(2026, 8, 27, 0, 0, 0, TimeSpan.Zero);
+        using var cancellation = new CancellationTokenSource();
+        FileStream? lockedPayload = null;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created),
+            orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent,
+            snapshotFileCopiedObserver: (relative, destination) =>
+            {
+                if (!string.Equals(relative, "_asyncio.pyd", StringComparison.Ordinal)) return;
+                lockedPayload = new FileStream(destination, FileMode.Open, FileAccess.Read,
+                    FileShare.None);
+                cancellation.Cancel();
+            });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            verifier.VerifyAsync(fixture.Root, cancellation.Token));
+        var incomplete = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+        using (var marker = JsonDocument.Parse(
+                   File.ReadAllText(Path.Combine(incomplete, "ownership.json"))))
+        {
+            Assert.Equal(2, marker.RootElement.GetProperty("Version").GetInt32());
+            Assert.Equal("Incomplete", marker.RootElement.GetProperty("State").GetString());
+        }
+        Assert.False(File.Exists(Path.Combine(incomplete, "ownership.ready.json")));
+        Assert.NotNull(lockedPayload);
+        lockedPayload.Dispose();
+
+        using var recovered = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, timeProvider: new FixedTimeProvider(created.AddHours(1)),
+                orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+
+        Assert.False(Directory.Exists(incomplete));
+        recovered.Dispose();
         Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
     }
 
@@ -531,6 +595,13 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         }
         foreach (var bundle in bundles) bundle.Dispose();
 
+        Assert.All(bundles.Take(VerifiedHelperSnapshotLease.MaximumDeferredLeaseCount), bundle =>
+            Assert.Equal(ManagedBrowserHelperCleanupState.DeferredCleanupRegistered,
+                bundle.CleanupState));
+        Assert.All(bundles.Skip(VerifiedHelperSnapshotLease.MaximumDeferredLeaseCount), bundle =>
+            Assert.Equal(ManagedBrowserHelperCleanupState.OrphanRecoveryPending,
+                bundle.CleanupState));
+
         Assert.InRange(VerifiedHelperSnapshotLease.DeferredLeaseCountForDiagnostics,
             0, VerifiedHelperSnapshotLease.MaximumDeferredLeaseCount);
         Assert.InRange(VerifiedHelperSnapshotLease.DeferredHandleCountForDiagnostics,
@@ -547,6 +618,8 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         Assert.Equal(0, VerifiedHelperSnapshotLease.DeferredLeaseCountForDiagnostics);
         Assert.Equal(0, VerifiedHelperSnapshotLease.DeferredHandleCountForDiagnostics);
         Assert.All(containers, container => Assert.False(Directory.Exists(container)));
+        Assert.All(bundles, bundle =>
+            Assert.Equal(ManagedBrowserHelperCleanupState.Cleaned, bundle.CleanupState));
         Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
     }
 
@@ -759,6 +832,14 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         MakeWritable(root, isDirectory: true);
     }
 
+    private static string ReadAllTextShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Write | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return reader.ReadToEnd();
+    }
+
     private static void MakeWritable(string path, bool isDirectory)
     {
         using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
@@ -807,7 +888,8 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             string pythonVersion = ManagedBrowserHelperIntegrityVerifier.RequiredPythonVersion,
             bool includeNotices = true,
             string? additionalManifestPath = null,
-            string? buildIdentityOverride = null)
+            string? buildIdentityOverride = null,
+            IReadOnlyDictionary<string, byte[]>? additionalContents = null)
         {
             var root = Path.Combine(Path.GetTempPath(), $"managed-helper-{Guid.NewGuid():N}");
             Directory.CreateDirectory(root);
@@ -821,6 +903,9 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             };
             if (includeNotices)
                 contents["THIRD_PARTY_NOTICES.txt"] = Encoding.UTF8.GetBytes("test notices\n");
+            if (additionalContents is not null)
+                foreach (var pair in additionalContents)
+                    contents.Add(pair.Key, pair.Value);
             foreach (var (path, bytes) in contents)
             {
                 var fullPath = Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar));
