@@ -70,7 +70,8 @@ public sealed class BrowserExecutableVerifierTests
             DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
 
         Assert.Equal(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint, result.ErrorCode);
-        Assert.Equal(new[] { DirectoryPath }, dependencies.Native.OpenedPaths);
+        Assert.Equal(new[] { @"C:\" }, dependencies.Native.OpenedRoots);
+        Assert.Empty(dependencies.Native.OpenedDirectoryComponents);
     }
 
     [Fact]
@@ -86,7 +87,8 @@ public sealed class BrowserExecutableVerifierTests
             DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
 
         Assert.Equal(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint, result.ErrorCode);
-        Assert.Equal(new[] { DirectoryPath }, dependencies.Native.OpenedPaths);
+        Assert.Equal(new[] { @"C:\" }, dependencies.Native.OpenedRoots);
+        Assert.Empty(dependencies.Native.OpenedDirectoryComponents);
     }
 
     [Fact]
@@ -148,7 +150,37 @@ public sealed class BrowserExecutableVerifierTests
             selectedDirectory, BrowserFamily.Chrome, CancellationToken.None);
 
         Assert.Equal(BrowserExecutableVerificationErrorCode.InvalidSelection, result.ErrorCode);
-        Assert.Empty(dependencies.Native.OpenedPaths);
+        Assert.Empty(dependencies.Native.OpenedRoots);
+    }
+
+    [Theory]
+    [InlineData(@"C:\")]
+    [InlineData(@"\\server\share\Browser")]
+    [InlineData(@"\\?\C:\Browser")]
+    public async Task ExplicitlyRejectsUnsupportedDriveRootOrUnpinnedNamespace(string selectedDirectory)
+    {
+        var dependencies = ValidDependencies();
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            selectedDirectory, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.Equal(BrowserExecutableVerificationErrorCode.UnsupportedPathNamespace, result.ErrorCode);
+        Assert.Empty(dependencies.Native.OpenedRoots);
+    }
+
+    [Theory]
+    [InlineData("Selected")]
+    [InlineData("Application")]
+    public async Task RejectsReparsePointAtAnyAncestorComponent(string component)
+    {
+        var dependencies = ValidDependencies();
+        dependencies.Native.ReparseDirectoryComponent = component;
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.Equal(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint, result.ErrorCode);
+        Assert.Empty(dependencies.Native.OpenedExecutableComponents);
     }
 
     [Fact]
@@ -160,7 +192,94 @@ public sealed class BrowserExecutableVerifierTests
             DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
 
         Assert.True(result.IsVerified);
-        Assert.Equal(new[] { DirectoryPath, ChromePath }, dependencies.Native.OpenedPaths);
+        Assert.Equal(new[] { @"C:\" }, dependencies.Native.OpenedRoots);
+        Assert.Equal(new[] { "Selected", "Application" }, dependencies.Native.OpenedDirectoryComponents);
+        Assert.Equal(new[] { "chrome.exe" }, dependencies.Native.OpenedExecutableComponents);
+    }
+
+    [Fact]
+    public async Task PinsEveryPathComponentAndOpensExecutableOnlyRelativeToSelectedDirectoryHandle()
+    {
+        var dependencies = ValidDependencies();
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.True(result.IsVerified);
+        Assert.Equal(new[] { @"C:\" }, dependencies.Native.OpenedRoots);
+        Assert.Equal(new[] { "Selected", "Application" }, dependencies.Native.OpenedDirectoryComponents);
+        Assert.Equal(new[] { "chrome.exe" }, dependencies.Native.OpenedExecutableComponents);
+        Assert.Equal(4, dependencies.Native.Handles.Count);
+    }
+
+    [Fact]
+    public async Task NamespaceSwitchThenRestoreCannotMixPathMetadataWithPinnedBytes()
+    {
+        var dependencies = ValidDependencies();
+        var namespacePayload = "original";
+        dependencies.Signature.OnRead = () => namespacePayload = "attacker";
+        dependencies.Snapshot.ProductName = "Original Product";
+        dependencies.Product.Read = snapshot =>
+        {
+            Assert.Equal("attacker", namespacePayload);
+            namespacePayload = "original";
+            return Assert.IsType<RecordingSnapshot>(snapshot).ProductName;
+        };
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.Equal(BrowserExecutableVerificationErrorCode.ProductMismatch, result.ErrorCode);
+        Assert.Null(result.Identity);
+    }
+
+    [Fact]
+    public async Task SignatureAndProductReadTheSameLockedSnapshotAndItIsDisposedAfterward()
+    {
+        var dependencies = ValidDependencies();
+        dependencies.Signature.OnReadSnapshot = snapshot =>
+            Assert.Same(dependencies.Snapshot.LastSnapshot, snapshot);
+        dependencies.Product.Read = snapshot =>
+        {
+            Assert.Same(dependencies.Snapshot.LastSnapshot, snapshot);
+            Assert.False(Assert.IsType<RecordingSnapshot>(snapshot).IsDisposed);
+            return "Google Chrome";
+        };
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.True(result.IsVerified);
+        Assert.True(dependencies.Snapshot.LastSnapshot!.IsDisposed);
+    }
+
+    [Fact]
+    public async Task SnapshotCreationFailureReturnsTypedSafeErrorAndDisposesPinnedHandles()
+    {
+        var dependencies = ValidDependencies();
+        dependencies.Snapshot.Failure = new IOException(@"secret C:\SafeTemp\snapshot");
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.Equal(BrowserExecutableVerificationErrorCode.SnapshotUnavailable, result.ErrorCode);
+        Assert.All(dependencies.Native.Handles, handle => Assert.True(handle.IsDisposed));
+        Assert.DoesNotContain("SafeTemp", result.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CancellationAfterSnapshotCreationDisposesSnapshotAndAllPinnedHandles()
+    {
+        var dependencies = ValidDependencies();
+        using var cancellation = new CancellationTokenSource();
+        dependencies.Signature.OnRead = cancellation.Cancel;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            dependencies.CreateVerifier().VerifyAsync(
+                DirectoryPath, BrowserFamily.Chrome, cancellation.Token));
+
+        Assert.True(dependencies.Snapshot.LastSnapshot!.IsDisposed);
+        Assert.All(dependencies.Native.Handles, handle => Assert.True(handle.IsDisposed));
     }
 
     [Fact]
@@ -169,7 +288,7 @@ public sealed class BrowserExecutableVerifierTests
         var dependencies = ValidDependencies();
         dependencies.Signature.OnRead = () => Assert.All(dependencies.Native.Handles, handle => Assert.False(handle.IsDisposed));
         dependencies.Product.OnRead = () => Assert.All(dependencies.Native.Handles, handle => Assert.False(handle.IsDisposed));
-        dependencies.Identity.OnHash = () => Assert.All(dependencies.Native.Handles, handle => Assert.False(handle.IsDisposed));
+        dependencies.Snapshot.OnCreate = () => Assert.All(dependencies.Native.Handles, handle => Assert.False(handle.IsDisposed));
 
         var result = await dependencies.CreateVerifier().VerifyAsync(
             DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
@@ -231,7 +350,7 @@ public sealed class BrowserExecutableVerifierTests
             DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
 
         Assert.Equal(BrowserExecutableVerificationErrorCode.FileTooLarge, result.ErrorCode);
-        Assert.Equal(0, dependencies.Identity.HashCount);
+        Assert.Equal(0, dependencies.Snapshot.CreateCount);
     }
 
     [Fact]
@@ -248,7 +367,7 @@ public sealed class BrowserExecutableVerifierTests
         Assert.Equal("Google Chrome", identity.ProductName);
         Assert.DoesNotContain(DirectoryPath, result.ToString(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("volume-a", result.ToString(), StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain(dependencies.Identity.Hash, result.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(dependencies.Snapshot.Hash, result.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -257,7 +376,7 @@ public sealed class BrowserExecutableVerifierTests
         var dependencies = ValidDependencies();
         var verifier = dependencies.CreateVerifier();
         var initial = await verifier.VerifyAsync(DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
-        dependencies.Identity.Hash = new string('b', 64);
+        dependencies.Snapshot.Hash = new string('b', 64);
 
         var launch = await verifier.ReverifyForLaunchAsync(initial.Identity!, CancellationToken.None);
 
@@ -283,7 +402,7 @@ public sealed class BrowserExecutableVerifierTests
     {
         var dependencies = ValidDependencies();
         using var cancellation = new CancellationTokenSource();
-        dependencies.Identity.OnHash = cancellation.Cancel;
+        dependencies.Snapshot.OnCreate = cancellation.Cancel;
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             dependencies.CreateVerifier().VerifyAsync(
@@ -322,16 +441,20 @@ public sealed class BrowserExecutableVerifierTests
     {
         public RecordingNativeHandleReader Native { get; } = new();
         public RecordingIdentityReader Identity { get; } = new();
+        public RecordingSnapshotFactory Snapshot { get; } = new();
         public RecordingSignatureReader Signature { get; } = new();
         public RecordingProductReader Product { get; } = new();
 
         public BrowserExecutableVerifier CreateVerifier() =>
-            new(Native, Identity, Signature, Product, () => Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+            new(Native, Identity, Snapshot, Signature, Product,
+                () => Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
     }
 
-    private sealed class RecordingHandle : IBrowserPinnedHandle
+    private sealed class RecordingHandle(string finalPath, bool isDirectory) : IBrowserPinnedHandle
     {
         public SafeFileHandle SafeHandle { get; } = new(new IntPtr(1), ownsHandle: false);
+        public string FinalPath { get; } = finalPath;
+        public bool IsDirectory { get; } = isDirectory;
         public bool IsDisposed { get; private set; }
         public void Dispose() => IsDisposed = true;
     }
@@ -345,45 +468,71 @@ public sealed class BrowserExecutableVerifierTests
         public int ChangeDirectoryObjectAtRead { get; set; }
         public Exception? DirectoryOpenFailure { get; set; }
         public Exception? ExecutableOpenFailure { get; set; }
+        public string? ReparseDirectoryComponent { get; set; }
         private int directoryInfoReads;
-        public List<string> OpenedPaths { get; } = [];
+        public List<string> OpenedRoots { get; } = [];
+        public List<string> OpenedDirectoryComponents { get; } = [];
+        public List<string> OpenedExecutableComponents { get; } = [];
         public List<RecordingHandle> Handles { get; } = [];
-        private HashSet<RecordingHandle> DirectoryHandles { get; } = [];
 
-        public IBrowserPinnedHandle OpenDirectory(string exactPath)
+        public IBrowserPinnedHandle OpenRoot(string exactRootPath)
         {
-            OpenedPaths.Add(exactPath);
+            OpenedRoots.Add(exactRootPath);
             if (DirectoryOpenFailure is not null) throw DirectoryOpenFailure;
-            var handle = AddHandle();
-            DirectoryHandles.Add(handle);
-            return handle;
+            return AddHandle(exactRootPath, isDirectory: true);
         }
 
-        public IBrowserPinnedHandle OpenExecutable(string exactPath)
+        public IBrowserPinnedHandle OpenDirectoryChild(
+            IBrowserPinnedHandle parentDirectory,
+            string exactComponentName)
         {
-            OpenedPaths.Add(exactPath);
+            OpenedDirectoryComponents.Add(exactComponentName);
+            if (DirectoryOpenFailure is not null) throw DirectoryOpenFailure;
+            var parent = Assert.IsType<RecordingHandle>(parentDirectory);
+            return AddHandle(Path.Combine(parent.FinalPath, exactComponentName), isDirectory: true);
+        }
+
+        public IBrowserPinnedHandle OpenExecutableChild(
+            IBrowserPinnedHandle selectedDirectory,
+            string exactFileName)
+        {
+            OpenedExecutableComponents.Add(exactFileName);
             if (ExecutableOpenFailure is not null) throw ExecutableOpenFailure;
-            return AddHandle();
+            var parent = Assert.IsType<RecordingHandle>(selectedDirectory);
+            return AddHandle(Path.Combine(parent.FinalPath, exactFileName), isDirectory: false);
         }
 
         public BrowserNativeHandleInfo ReadInfo(IBrowserPinnedHandle handle)
         {
-            if (DirectoryHandles.Contains(handle))
+            var recording = Assert.IsType<RecordingHandle>(handle);
+            if (recording.IsDirectory)
             {
                 directoryInfoReads++;
-                return directoryInfoReads == ChangeDirectoryObjectAtRead
-                    ? DirectoryInfo with { ObjectIdentity = "directory-b" }
-                    : DirectoryInfo;
+                var finalPath = DirectoryInfo.FinalPath == DirectoryPath
+                    ? recording.FinalPath
+                    : DirectoryInfo.FinalPath;
+                return new BrowserNativeHandleInfo(
+                    finalPath,
+                    DirectoryInfo.IsReparsePoint ||
+                    string.Equals(Path.GetFileName(recording.FinalPath), ReparseDirectoryComponent,
+                        StringComparison.OrdinalIgnoreCase),
+                    directoryInfoReads == ChangeDirectoryObjectAtRead
+                        ? "directory-b"
+                        : $"directory:{recording.FinalPath}");
             }
             fileInfoReads++;
-            return fileInfoReads == ChangeFileFinalPathAtRead
-                ? FileInfo with { FinalPath = @"C:\Outside\chrome.exe" }
-                : FileInfo;
+            var fileFinalPath = FileInfo.FinalPath == ChromePath
+                ? recording.FinalPath
+                : FileInfo.FinalPath;
+            if (fileInfoReads == ChangeFileFinalPathAtRead)
+                fileFinalPath = @"C:\Outside\chrome.exe";
+            return new BrowserNativeHandleInfo(
+                fileFinalPath, FileInfo.IsReparsePoint, $"file:{recording.FinalPath}");
         }
 
-        private RecordingHandle AddHandle()
+        private RecordingHandle AddHandle(string finalPath, bool isDirectory)
         {
-            var handle = new RecordingHandle();
+            var handle = new RecordingHandle(finalPath, isDirectory);
             Handles.Add(handle);
             return handle;
         }
@@ -394,9 +543,6 @@ public sealed class BrowserExecutableVerifierTests
         private int reads;
         public BrowserFileIdentity Identity { get; set; } = new("volume-a", "file-a", 1024);
         public int ChangeAtRead { get; set; }
-        public string Hash { get; set; } = new('a', 64);
-        public int HashCount { get; private set; }
-        public Action? OnHash { get; set; }
 
         public BrowserFileIdentity Read(IBrowserPinnedHandle handle)
         {
@@ -404,15 +550,47 @@ public sealed class BrowserExecutableVerifierTests
             return reads == ChangeAtRead ? Identity with { FileId = "file-b" } : Identity;
         }
 
-        public Task<string> ComputeSha256Async(
-            IBrowserPinnedHandle handle,
+    }
+
+    private sealed class RecordingSnapshot : IBrowserExecutableSnapshot
+    {
+        public SafeFileHandle SafeHandle { get; } = new(new IntPtr(2), ownsHandle: false);
+        public string SnapshotPath { get; } = @"C:\SafeTemp\random.snapshot";
+        public long Length { get; init; }
+        public string Sha256 { get; init; } = new('a', 64);
+        public string ProductName { get; init; } = "Google Chrome";
+        public bool IsDisposed { get; private set; }
+        public void Dispose() => IsDisposed = true;
+        public override string ToString() =>
+            $"RecordingSnapshot {{ SnapshotPath = [REDACTED], Length = {Length}, Sha256 = [REDACTED] }}";
+    }
+
+    private sealed class RecordingSnapshotFactory : IBrowserExecutableSnapshotFactory
+    {
+        public string Hash { get; set; } = new('a', 64);
+        public string ProductName { get; set; } = "Google Chrome";
+        public int CreateCount { get; private set; }
+        public Action? OnCreate { get; set; }
+        public Exception? Failure { get; set; }
+        public RecordingSnapshot? LastSnapshot { get; private set; }
+
+        public Task<IBrowserExecutableSnapshot> CreateAsync(
+            IBrowserPinnedHandle executable,
+            long expectedLength,
             long maximumBytes,
             CancellationToken cancellationToken)
         {
-            HashCount++;
-            OnHash?.Invoke();
+            CreateCount++;
+            OnCreate?.Invoke();
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.FromResult(Hash);
+            if (Failure is not null) throw Failure;
+            LastSnapshot = new RecordingSnapshot
+            {
+                Length = expectedLength,
+                Sha256 = Hash,
+                ProductName = ProductName,
+            };
+            return Task.FromResult<IBrowserExecutableSnapshot>(LastSnapshot);
         }
     }
 
@@ -421,11 +599,13 @@ public sealed class BrowserExecutableVerifierTests
         public BrowserSignatureVerification Result { get; set; } =
             new(BrowserSignatureTrust.Trusted, "Google LLC");
         public Action? OnRead { get; set; }
+        public Action<IBrowserExecutableSnapshot>? OnReadSnapshot { get; set; }
         public Exception? Failure { get; set; }
 
-        public BrowserSignatureVerification Verify(IBrowserPinnedHandle handle, string retainedFinalPath)
+        public BrowserSignatureVerification Verify(IBrowserExecutableSnapshot snapshot)
         {
             OnRead?.Invoke();
+            OnReadSnapshot?.Invoke(snapshot);
             if (Failure is not null) throw Failure;
             return Result;
         }
@@ -434,12 +614,13 @@ public sealed class BrowserExecutableVerifierTests
     private sealed class RecordingProductReader : IBrowserProductReader
     {
         public string ProductName { get; set; } = "Google Chrome";
+        public Func<IBrowserExecutableSnapshot, string>? Read { get; set; }
         public Action? OnRead { get; set; }
 
-        public string ReadProductName(IBrowserPinnedHandle handle, string retainedFinalPath)
+        public string ReadProductName(IBrowserExecutableSnapshot snapshot)
         {
             OnRead?.Invoke();
-            return ProductName;
+            return Read?.Invoke(snapshot) ?? ProductName;
         }
     }
 }

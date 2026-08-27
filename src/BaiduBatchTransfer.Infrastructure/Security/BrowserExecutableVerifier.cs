@@ -27,6 +27,8 @@ public enum BrowserExecutableVerificationErrorCode
     IdentityChanged = 13,
     LaunchIdentityMismatch = 14,
     VerificationUnavailable = 15,
+    UnsupportedPathNamespace = 16,
+    SnapshotUnavailable = 17,
 }
 
 public enum BrowserSignatureTrust
@@ -139,28 +141,42 @@ public sealed record BrowserSignatureVerification(BrowserSignatureTrust Trust, s
 
 public interface IBrowserNativeHandleReader
 {
-    IBrowserPinnedHandle OpenDirectory(string exactPath);
-    IBrowserPinnedHandle OpenExecutable(string exactPath);
+    IBrowserPinnedHandle OpenRoot(string exactRootPath);
+    IBrowserPinnedHandle OpenDirectoryChild(IBrowserPinnedHandle parentDirectory, string exactComponentName);
+    IBrowserPinnedHandle OpenExecutableChild(IBrowserPinnedHandle selectedDirectory, string exactFileName);
     BrowserNativeHandleInfo ReadInfo(IBrowserPinnedHandle handle);
 }
 
 public interface IBrowserFileIdentityReader
 {
     BrowserFileIdentity Read(IBrowserPinnedHandle handle);
-    Task<string> ComputeSha256Async(
-        IBrowserPinnedHandle handle,
+}
+
+public interface IBrowserExecutableSnapshot : IDisposable
+{
+    SafeFileHandle SafeHandle { get; }
+    string SnapshotPath { get; }
+    long Length { get; }
+    string Sha256 { get; }
+}
+
+public interface IBrowserExecutableSnapshotFactory
+{
+    Task<IBrowserExecutableSnapshot> CreateAsync(
+        IBrowserPinnedHandle executable,
+        long expectedLength,
         long maximumBytes,
         CancellationToken cancellationToken);
 }
 
 public interface IBrowserSignatureReader
 {
-    BrowserSignatureVerification Verify(IBrowserPinnedHandle handle, string retainedFinalPath);
+    BrowserSignatureVerification Verify(IBrowserExecutableSnapshot snapshot);
 }
 
 public interface IBrowserProductReader
 {
-    string ReadProductName(IBrowserPinnedHandle handle, string retainedFinalPath);
+    string ReadProductName(IBrowserExecutableSnapshot snapshot);
 }
 
 public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
@@ -169,6 +185,7 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
 
     private readonly IBrowserNativeHandleReader nativeHandles;
     private readonly IBrowserFileIdentityReader fileIdentities;
+    private readonly IBrowserExecutableSnapshotFactory snapshots;
     private readonly IBrowserSignatureReader signatures;
     private readonly IBrowserProductReader products;
     private readonly Func<Guid> installationIdFactory;
@@ -177,6 +194,7 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         : this(
             new WindowsBrowserNativeHandleReader(),
             new WindowsBrowserFileIdentityReader(),
+            new WindowsBrowserExecutableSnapshotFactory(),
             new WindowsAuthenticodeSignatureReader(),
             new WindowsBrowserProductReader(),
             Guid.NewGuid)
@@ -186,12 +204,14 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
     public BrowserExecutableVerifier(
         IBrowserNativeHandleReader nativeHandles,
         IBrowserFileIdentityReader fileIdentities,
+        IBrowserExecutableSnapshotFactory snapshots,
         IBrowserSignatureReader signatures,
         IBrowserProductReader products,
         Func<Guid>? installationIdFactory = null)
     {
         this.nativeHandles = nativeHandles ?? throw new ArgumentNullException(nameof(nativeHandles));
         this.fileIdentities = fileIdentities ?? throw new ArgumentNullException(nameof(fileIdentities));
+        this.snapshots = snapshots ?? throw new ArgumentNullException(nameof(snapshots));
         this.signatures = signatures ?? throw new ArgumentNullException(nameof(signatures));
         this.products = products ?? throw new ArgumentNullException(nameof(products));
         this.installationIdFactory = installationIdFactory ?? Guid.NewGuid;
@@ -203,27 +223,45 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (family is not (BrowserFamily.Chrome or BrowserFamily.Edge) ||
-            !TryValidateSelectedDirectory(selectedDirectory))
-        {
+        if (family is not (BrowserFamily.Chrome or BrowserFamily.Edge))
             return Failed(BrowserExecutableVerificationErrorCode.InvalidSelection);
-        }
+        var pathError = TryParsePinnedDrivePath(
+            selectedDirectory, out var rootPath, out var directoryComponents);
+        if (pathError != BrowserExecutableVerificationErrorCode.None) return Failed(pathError);
 
+        var directoryHandles = new List<IBrowserPinnedHandle>(directoryComponents.Length + 1);
+        var initialDirectoryInfos = new List<BrowserNativeHandleInfo>(directoryComponents.Length + 1);
+        IBrowserPinnedHandle? executableHandle = null;
         try
         {
-            using var directoryHandle = OpenDirectory(selectedDirectory);
-            var initialDirectory = nativeHandles.ReadInfo(directoryHandle);
+            var rootHandle = OpenRoot(rootPath);
+            directoryHandles.Add(rootHandle);
+            var initialRoot = nativeHandles.ReadInfo(rootHandle);
             cancellationToken.ThrowIfCancellationRequested();
-            if (initialDirectory.IsReparsePoint)
+            if (!PinnedDirectoryMatches(initialRoot, rootPath))
                 return Failed(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint);
-            if (!TryNormalizeFinalPath(initialDirectory.FinalPath, out var finalDirectory))
-                return Failed(BrowserExecutableVerificationErrorCode.VerificationUnavailable);
-            if (!string.Equals(selectedDirectory, finalDirectory, StringComparison.OrdinalIgnoreCase))
-                return Failed(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint);
+            initialDirectoryInfos.Add(initialRoot);
+
+            var expectedDirectory = rootPath;
+            foreach (var component in directoryComponents)
+            {
+                var childHandle = OpenDirectoryChild(directoryHandles[^1], component);
+                directoryHandles.Add(childHandle);
+                expectedDirectory = Path.Combine(expectedDirectory, component);
+                var childInfo = nativeHandles.ReadInfo(childHandle);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!PinnedDirectoryMatches(childInfo, expectedDirectory))
+                    return Failed(BrowserExecutableVerificationErrorCode.DirectoryReparsePoint);
+                initialDirectoryInfos.Add(childInfo);
+            }
+
+            var selectedDirectoryHandle = directoryHandles[^1];
+            var finalDirectory = expectedDirectory;
+            if (!DirectoriesStillSame(directoryHandles, initialDirectoryInfos))
+                return Failed(BrowserExecutableVerificationErrorCode.IdentityChanged);
 
             var executableName = BrowserExecutablePolicy.ExecutableName(family);
-            var exactExecutablePath = Path.Combine(selectedDirectory, executableName);
-            using var executableHandle = OpenExecutable(exactExecutablePath);
+            executableHandle = OpenExecutableChild(selectedDirectoryHandle, executableName);
             var initialExecutable = nativeHandles.ReadInfo(executableHandle);
             cancellationToken.ThrowIfCancellationRequested();
             if (initialExecutable.IsReparsePoint)
@@ -239,10 +277,25 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
             if (initialFileIdentity.Length < 0 || initialFileIdentity.Length > MaximumSupportedExecutableBytes)
                 return Failed(BrowserExecutableVerificationErrorCode.FileTooLarge);
 
-            var signature = signatures.Verify(executableHandle, finalExecutable);
+            using var snapshot = await CreateSnapshotAsync(
+                executableHandle,
+                initialFileIdentity.Length,
+                MaximumSupportedExecutableBytes,
+                cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (snapshot.Length != initialFileIdentity.Length || !IsSha256(snapshot.Sha256) ||
+                !StillSame(
+                    directoryHandles, initialDirectoryInfos,
+                    executableHandle, initialExecutable, initialFileIdentity,
+                    finalDirectory, finalExecutable))
+            {
+                return Failed(BrowserExecutableVerificationErrorCode.IdentityChanged);
+            }
+
+            var signature = signatures.Verify(snapshot);
             cancellationToken.ThrowIfCancellationRequested();
             if (!StillSame(
-                    directoryHandle, initialDirectory,
+                    directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
             {
@@ -253,10 +306,10 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
             if (signature.Trust != BrowserSignatureTrust.Trusted || string.IsNullOrWhiteSpace(signature.Publisher))
                 return Failed(BrowserExecutableVerificationErrorCode.SignatureUntrusted);
 
-            var productName = products.ReadProductName(executableHandle, finalExecutable);
+            var productName = products.ReadProductName(snapshot);
             cancellationToken.ThrowIfCancellationRequested();
             if (!StillSame(
-                    directoryHandle, initialDirectory,
+                    directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
             {
@@ -268,22 +321,16 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
             if (policyError != BrowserExecutableVerificationErrorCode.None)
                 return Failed(policyError);
 
-            var sha256 = await fileIdentities.ComputeSha256Async(
-                executableHandle, MaximumSupportedExecutableBytes, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!IsSha256(sha256) ||
-                !StillSame(
-                    directoryHandle, initialDirectory,
+            if (!StillSame(
+                    directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
-            {
                 return Failed(BrowserExecutableVerificationErrorCode.IdentityChanged);
-            }
 
             var identity = new BrowserInstallationIdentity(
                 installationIdFactory(), family, finalDirectory, finalExecutable,
                 signature.Publisher, productName,
-                $"{initialFileIdentity.VolumeId}:{initialFileIdentity.FileId}:{sha256.ToLowerInvariant()}");
+                $"{initialFileIdentity.VolumeId}:{initialFileIdentity.FileId}:{snapshot.Sha256.ToLowerInvariant()}");
             return BrowserExecutableVerificationResult.Verified(identity);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -298,13 +345,19 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         {
             return Failed(BrowserExecutableVerificationErrorCode.VerificationUnavailable);
         }
+        finally
+        {
+            executableHandle?.Dispose();
+            for (var index = directoryHandles.Count - 1; index >= 0; index--)
+                directoryHandles[index].Dispose();
+        }
     }
 
-    private IBrowserPinnedHandle OpenDirectory(string selectedDirectory)
+    private IBrowserPinnedHandle OpenRoot(string rootPath)
     {
         try
         {
-            return nativeHandles.OpenDirectory(selectedDirectory);
+            return nativeHandles.OpenRoot(rootPath);
         }
         catch
         {
@@ -313,11 +366,50 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         }
     }
 
-    private IBrowserPinnedHandle OpenExecutable(string executablePath)
+    private async Task<IBrowserExecutableSnapshot> CreateSnapshotAsync(
+        IBrowserPinnedHandle executable,
+        long expectedLength,
+        long maximumBytes,
+        CancellationToken cancellationToken)
     {
         try
         {
-            return nativeHandles.OpenExecutable(executablePath);
+            return await snapshots.CreateAsync(
+                executable, expectedLength, maximumBytes, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            throw new VerificationFailureException(
+                BrowserExecutableVerificationErrorCode.SnapshotUnavailable);
+        }
+    }
+
+    private IBrowserPinnedHandle OpenDirectoryChild(
+        IBrowserPinnedHandle parentDirectory,
+        string exactComponentName)
+    {
+        try
+        {
+            return nativeHandles.OpenDirectoryChild(parentDirectory, exactComponentName);
+        }
+        catch
+        {
+            throw new VerificationFailureException(
+                BrowserExecutableVerificationErrorCode.DirectoryUnavailable);
+        }
+    }
+
+    private IBrowserPinnedHandle OpenExecutableChild(
+        IBrowserPinnedHandle selectedDirectory,
+        string exactFileName)
+    {
+        try
+        {
+            return nativeHandles.OpenExecutableChild(selectedDirectory, exactFileName);
         }
         catch
         {
@@ -343,25 +435,34 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
     }
 
     private bool StillSame(
-        IBrowserPinnedHandle directoryHandle,
-        BrowserNativeHandleInfo initialDirectory,
+        IReadOnlyList<IBrowserPinnedHandle> directoryHandles,
+        IReadOnlyList<BrowserNativeHandleInfo> initialDirectoryInfos,
         IBrowserPinnedHandle executableHandle,
         BrowserNativeHandleInfo initialExecutable,
         BrowserFileIdentity initialFileIdentity,
         string finalDirectory,
         string finalExecutable)
     {
-        var currentDirectory = nativeHandles.ReadInfo(directoryHandle);
+        if (!DirectoriesStillSame(directoryHandles, initialDirectoryInfos)) return false;
         var currentExecutable = nativeHandles.ReadInfo(executableHandle);
         var currentFileIdentity = fileIdentities.Read(executableHandle);
-        return currentDirectory == initialDirectory &&
-               currentExecutable == initialExecutable &&
+        return currentExecutable == initialExecutable &&
                currentFileIdentity == initialFileIdentity &&
-               TryNormalizeFinalPath(currentDirectory.FinalPath, out var currentFinalDirectory) &&
                TryNormalizeFinalPath(currentExecutable.FinalPath, out var currentFinalExecutable) &&
-               string.Equals(currentFinalDirectory, finalDirectory, StringComparison.OrdinalIgnoreCase) &&
                string.Equals(currentFinalExecutable, finalExecutable, StringComparison.OrdinalIgnoreCase) &&
-               DirectParentMatches(currentFinalDirectory, currentFinalExecutable);
+               DirectParentMatches(finalDirectory, currentFinalExecutable);
+    }
+
+    private bool DirectoriesStillSame(
+        IReadOnlyList<IBrowserPinnedHandle> handles,
+        IReadOnlyList<BrowserNativeHandleInfo> initialInfos)
+    {
+        if (handles.Count != initialInfos.Count) return false;
+        for (var index = 0; index < handles.Count; index++)
+        {
+            if (nativeHandles.ReadInfo(handles[index]) != initialInfos[index]) return false;
+        }
+        return true;
     }
 
     private static bool SamePersistedIdentity(
@@ -376,24 +477,54 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
             Encoding.UTF8.GetBytes(expected.FileIdentity),
             Encoding.UTF8.GetBytes(current.FileIdentity));
 
-    private static bool TryValidateSelectedDirectory(string value)
+    private static BrowserExecutableVerificationErrorCode TryParsePinnedDrivePath(
+        string value,
+        out string rootPath,
+        out string[] components)
     {
+        rootPath = string.Empty;
+        components = [];
         if (string.IsNullOrWhiteSpace(value) || value != value.Trim() ||
-            value.Any(char.IsControl) || Path.EndsInDirectorySeparator(value) ||
-            !Path.IsPathFullyQualified(value))
+            value.Any(char.IsControl) || value.Contains('/') || !Path.IsPathFullyQualified(value))
         {
-            return false;
+            return BrowserExecutableVerificationErrorCode.InvalidSelection;
         }
+
+        if (value.StartsWith(@"\\", StringComparison.Ordinal) ||
+            value.Length < 3 || !char.IsAsciiLetter(value[0]) || value[1] != ':' || value[2] != '\\')
+            return BrowserExecutableVerificationErrorCode.UnsupportedPathNamespace;
 
         try
         {
-            return string.Equals(value, Path.GetFullPath(value), StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(value, Path.GetFullPath(value), StringComparison.OrdinalIgnoreCase))
+                return BrowserExecutableVerificationErrorCode.InvalidSelection;
         }
         catch
         {
-            return false;
+            return BrowserExecutableVerificationErrorCode.InvalidSelection;
         }
+
+        rootPath = value[..3];
+        if (value.Length == rootPath.Length)
+            return BrowserExecutableVerificationErrorCode.UnsupportedPathNamespace;
+        if (Path.EndsInDirectorySeparator(value))
+            return BrowserExecutableVerificationErrorCode.InvalidSelection;
+
+        components = value[rootPath.Length..].Split('\\', StringSplitOptions.None);
+        if (components.Length == 0 || components.Any(component =>
+                string.IsNullOrWhiteSpace(component) || component is "." or ".." ||
+                component.Any(char.IsControl) || component.IndexOfAny(['\\', '/', ':']) >= 0))
+        {
+            components = [];
+            return BrowserExecutableVerificationErrorCode.InvalidSelection;
+        }
+        return BrowserExecutableVerificationErrorCode.None;
     }
+
+    private static bool PinnedDirectoryMatches(BrowserNativeHandleInfo info, string expectedPath) =>
+        !info.IsReparsePoint &&
+        TryNormalizeFinalPath(info.FinalPath, out var finalPath) &&
+        string.Equals(finalPath, Path.TrimEndingDirectorySeparator(expectedPath), StringComparison.OrdinalIgnoreCase);
 
     private static bool TryNormalizeFinalPath(string value, out string normalized)
     {
@@ -445,20 +576,42 @@ internal sealed class WindowsBrowserPinnedHandle(SafeFileHandle safeHandle) : IB
 
 internal sealed class WindowsBrowserNativeHandleReader : IBrowserNativeHandleReader
 {
-    private const uint GenericRead = 0x80000000;
+    private const uint FileReadData = 0x00000001;
     private const uint FileReadAttributes = 0x80;
+    private const uint Synchronize = 0x00100000;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
-    private const uint FileFlagOverlapped = 0x40000000;
     private const uint FileAttributeReparsePoint = 0x400;
+    private const uint FileAttributeNormal = 0x80;
     private const uint FinalPathFlags = 0;
+    private const uint ObjectCaseInsensitive = 0x40;
+    private const uint FileOpen = 1;
+    private const uint FileDirectoryFile = 0x00000001;
+    private const uint FileNonDirectoryFile = 0x00000040;
+    private const uint FileSynchronousIoNonAlert = 0x00000020;
+    private const uint FileOpenReparsePoint = 0x00200000;
 
-    public IBrowserPinnedHandle OpenDirectory(string exactPath) =>
-        Open(exactPath, FileReadAttributes, FileFlagBackupSemantics | FileFlagOpenReparsePoint);
+    public IBrowserPinnedHandle OpenRoot(string exactRootPath) =>
+        OpenRootPath(exactRootPath);
 
-    public IBrowserPinnedHandle OpenExecutable(string exactPath) =>
-        Open(exactPath, GenericRead, FileFlagOpenReparsePoint | FileFlagOverlapped);
+    public IBrowserPinnedHandle OpenDirectoryChild(
+        IBrowserPinnedHandle parentDirectory,
+        string exactComponentName) =>
+        OpenRelative(
+            parentDirectory, exactComponentName,
+            FileReadAttributes | Synchronize,
+            FileDirectoryFile | FileSynchronousIoNonAlert | FileOpenReparsePoint,
+            (uint)(FileShare.Read | FileShare.Write));
+
+    public IBrowserPinnedHandle OpenExecutableChild(
+        IBrowserPinnedHandle selectedDirectory,
+        string exactFileName) =>
+        OpenRelative(
+            selectedDirectory, exactFileName,
+            FileReadData | FileReadAttributes,
+            FileNonDirectoryFile | FileOpenReparsePoint,
+            (uint)FileShare.Read);
 
     public BrowserNativeHandleInfo ReadInfo(IBrowserPinnedHandle handle)
     {
@@ -473,16 +626,80 @@ internal sealed class WindowsBrowserNativeHandleReader : IBrowserNativeHandleRea
             objectIdentity);
     }
 
-    private static IBrowserPinnedHandle Open(string path, uint desiredAccess, uint flags)
+    private static IBrowserPinnedHandle OpenRootPath(string path)
     {
         var handle = CreateFileW(
-            path, desiredAccess, FileShare.Read, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+            path,
+            FileReadAttributes,
+            FileShare.Read | FileShare.Write,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
         if (handle.IsInvalid)
         {
             handle.Dispose();
             throw SafeIoFailure();
         }
         return new WindowsBrowserPinnedHandle(handle);
+    }
+
+    private static IBrowserPinnedHandle OpenRelative(
+        IBrowserPinnedHandle parent,
+        string component,
+        uint desiredAccess,
+        uint createOptions,
+        uint shareAccess)
+    {
+        if (string.IsNullOrWhiteSpace(component) || component is "." or ".." ||
+            component.Any(char.IsControl) || component.IndexOfAny(['\\', '/', ':']) >= 0)
+        {
+            throw new IOException("Browser verification operation failed.");
+        }
+
+        var componentBuffer = Marshal.StringToHGlobalUni(component);
+        var unicodeStringPointer = IntPtr.Zero;
+        try
+        {
+            var unicodeString = new UnicodeString
+            {
+                Length = checked((ushort)(component.Length * sizeof(char))),
+                MaximumLength = checked((ushort)((component.Length + 1) * sizeof(char))),
+                Buffer = componentBuffer,
+            };
+            unicodeStringPointer = Marshal.AllocHGlobal(Marshal.SizeOf<UnicodeString>());
+            Marshal.StructureToPtr(unicodeString, unicodeStringPointer, false);
+            var attributes = new ObjectAttributes
+            {
+                Length = Marshal.SizeOf<ObjectAttributes>(),
+                RootDirectory = parent.SafeHandle.DangerousGetHandle(),
+                ObjectName = unicodeStringPointer,
+                Attributes = ObjectCaseInsensitive,
+            };
+            var status = NtCreateFile(
+                out var handle,
+                desiredAccess,
+                ref attributes,
+                out _,
+                IntPtr.Zero,
+                FileAttributeNormal,
+                shareAccess,
+                FileOpen,
+                createOptions,
+                IntPtr.Zero,
+                0);
+            if (status < 0 || handle.IsInvalid)
+            {
+                handle.Dispose();
+                throw SafeIoFailure(unchecked((int)RtlNtStatusToDosError(status)));
+            }
+            return new WindowsBrowserPinnedHandle(handle);
+        }
+        finally
+        {
+            if (unicodeStringPointer != IntPtr.Zero) Marshal.FreeHGlobal(unicodeStringPointer);
+            Marshal.FreeHGlobal(componentBuffer);
+        }
     }
 
     private static string ReadFinalPath(SafeFileHandle handle)
@@ -501,6 +718,35 @@ internal sealed class WindowsBrowserNativeHandleReader : IBrowserNativeHandleRea
 
     private static IOException SafeIoFailure() =>
         new("Browser verification operation failed.", new Win32Exception(Marshal.GetLastWin32Error()));
+
+    private static IOException SafeIoFailure(int errorCode) =>
+        new("Browser verification operation failed.", new Win32Exception(errorCode));
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UnicodeString
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ObjectAttributes
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        public IntPtr Status;
+        public UIntPtr Information;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct ByHandleFileInformation
@@ -539,6 +785,23 @@ internal sealed class WindowsBrowserNativeHandleReader : IBrowserNativeHandleRea
         StringBuilder filePath,
         uint filePathLength,
         uint flags);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(
+        out SafeFileHandle fileHandle,
+        uint desiredAccess,
+        ref ObjectAttributes objectAttributes,
+        out IoStatusBlock ioStatusBlock,
+        IntPtr allocationSize,
+        uint fileAttributes,
+        uint shareAccess,
+        uint createDisposition,
+        uint createOptions,
+        IntPtr eaBuffer,
+        uint eaLength);
+
+    [DllImport("ntdll.dll")]
+    private static extern uint RtlNtStatusToDosError(int status);
 }
 
 internal sealed class WindowsBrowserFileIdentityReader : IBrowserFileIdentityReader
@@ -552,36 +815,6 @@ internal sealed class WindowsBrowserFileIdentityReader : IBrowserFileIdentityRea
             information.VolumeSerialNumber.ToString("x8"),
             $"{information.FileIndexHigh:x8}{information.FileIndexLow:x8}",
             length);
-    }
-
-    public async Task<string> ComputeSha256Async(
-        IBrowserPinnedHandle handle,
-        long maximumBytes,
-        CancellationToken cancellationToken)
-    {
-        var identity = Read(handle);
-        if (identity.Length < 0 || identity.Length > maximumBytes)
-            throw new IOException("Browser executable exceeds the supported verification size.");
-
-        using var borrowedHandle = new SafeFileHandle(handle.SafeHandle.DangerousGetHandle(), ownsHandle: false);
-        await using var stream = new FileStream(
-            borrowedHandle, FileAccess.Read, bufferSize: 64 * 1024, isAsync: true);
-        stream.Position = 0;
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[64 * 1024];
-        long total = 0;
-        while (true)
-        {
-            var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read == 0) break;
-            total = checked(total + read);
-            if (total > maximumBytes)
-                throw new IOException("Browser executable exceeds the supported verification size.");
-            hash.AppendData(buffer, 0, read);
-        }
-        if (total != identity.Length)
-            throw new IOException("Browser executable changed during verification.");
-        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -606,13 +839,107 @@ internal sealed class WindowsBrowserFileIdentityReader : IBrowserFileIdentityRea
         out ByHandleFileInformation fileInformation);
 }
 
+internal sealed class WindowsBrowserExecutableSnapshot(
+    FileStream stream,
+    string snapshotPath,
+    long length,
+    string sha256) : IBrowserExecutableSnapshot
+{
+    public SafeFileHandle SafeHandle => stream.SafeFileHandle;
+    public string SnapshotPath { get; } = snapshotPath;
+    public long Length { get; } = length;
+    public string Sha256 { get; } = sha256;
+    public void Dispose() => stream.Dispose();
+    public override string ToString() =>
+        $"WindowsBrowserExecutableSnapshot {{ SnapshotPath = [REDACTED], Length = {Length}, Sha256 = [REDACTED] }}";
+}
+
+internal sealed class WindowsBrowserExecutableSnapshotFactory : IBrowserExecutableSnapshotFactory
+{
+    private const int BufferSize = 64 * 1024;
+
+    public async Task<IBrowserExecutableSnapshot> CreateAsync(
+        IBrowserPinnedHandle executable,
+        long expectedLength,
+        long maximumBytes,
+        CancellationToken cancellationToken)
+    {
+        if (expectedLength < 0 || expectedLength > maximumBytes)
+            throw new IOException("Browser executable exceeds the supported verification size.");
+
+        FileStream? snapshotStream = null;
+        string? snapshotPath = null;
+        try
+        {
+            for (var attempt = 0; attempt < 4 && snapshotStream is null; attempt++)
+            {
+                snapshotPath = Path.Combine(
+                    Path.GetTempPath(),
+                    $"bbt-browser-{Guid.NewGuid():N}.snapshot");
+                try
+                {
+                    snapshotStream = new FileStream(
+                        snapshotPath,
+                        FileMode.CreateNew,
+                        FileAccess.ReadWrite,
+                        FileShare.Read,
+                        BufferSize,
+                        FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose);
+                }
+                catch (IOException) when (attempt < 3)
+                {
+                    // A cryptographically random name collision is retried without inspecting the directory.
+                }
+            }
+            if (snapshotStream is null || snapshotPath is null)
+                throw new IOException("Browser snapshot creation failed.");
+
+            using var borrowedHandle = new SafeFileHandle(
+                executable.SafeHandle.DangerousGetHandle(), ownsHandle: false);
+            await using var source = new FileStream(
+                borrowedHandle, FileAccess.Read, BufferSize, isAsync: true);
+            source.Position = 0;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[BufferSize];
+            long total = 0;
+            while (true)
+            {
+                var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > maximumBytes)
+                    throw new IOException("Browser executable exceeds the supported verification size.");
+                hash.AppendData(buffer, 0, read);
+                await snapshotStream.WriteAsync(buffer.AsMemory(0, read), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            if (total != expectedLength)
+                throw new IOException("Browser executable changed during verification.");
+            await snapshotStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            snapshotStream.Position = 0;
+            var result = new WindowsBrowserExecutableSnapshot(
+                snapshotStream,
+                snapshotPath,
+                total,
+                Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant());
+            snapshotStream = null;
+            return result;
+        }
+        finally
+        {
+            if (snapshotStream is not null)
+                await snapshotStream.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+}
+
 internal sealed class WindowsBrowserProductReader : IBrowserProductReader
 {
-    public string ReadProductName(IBrowserPinnedHandle handle, string retainedFinalPath)
+    public string ReadProductName(IBrowserExecutableSnapshot snapshot)
     {
-        if (handle.SafeHandle.IsInvalid || handle.SafeHandle.IsClosed)
+        if (snapshot.SafeHandle.IsInvalid || snapshot.SafeHandle.IsClosed)
             throw new IOException("Browser verification operation failed.");
-        var productName = FileVersionInfo.GetVersionInfo(retainedFinalPath).ProductName;
+        var productName = FileVersionInfo.GetVersionInfo(snapshot.SnapshotPath).ProductName;
         return string.IsNullOrWhiteSpace(productName)
             ? throw new InvalidDataException("Browser product metadata is unavailable.")
             : productName;
@@ -631,12 +958,12 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
     private const uint CacheOnlyUrlRetrieval = 0x00001000;
     private const int TrustENoSignature = unchecked((int)0x800B0100);
 
-    public BrowserSignatureVerification Verify(IBrowserPinnedHandle handle, string retainedFinalPath)
+    public BrowserSignatureVerification Verify(IBrowserExecutableSnapshot snapshot)
     {
-        if (handle.SafeHandle.IsInvalid || handle.SafeHandle.IsClosed)
+        if (snapshot.SafeHandle.IsInvalid || snapshot.SafeHandle.IsClosed)
             throw new IOException("Browser verification operation failed.");
 
-        var pathPointer = Marshal.StringToCoTaskMemUni(retainedFinalPath);
+        var pathPointer = Marshal.StringToCoTaskMemUni(snapshot.SnapshotPath);
         var fileInfoPointer = IntPtr.Zero;
         var trustDataPointer = IntPtr.Zero;
         try
@@ -645,7 +972,7 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
             {
                 StructSize = (uint)Marshal.SizeOf<WinTrustFileInfo>(),
                 FilePath = pathPointer,
-                FileHandle = handle.SafeHandle.DangerousGetHandle(),
+                FileHandle = snapshot.SafeHandle.DangerousGetHandle(),
                 KnownSubject = IntPtr.Zero,
             };
             fileInfoPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf<WinTrustFileInfo>());
@@ -664,7 +991,8 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
             try
             {
 #pragma warning disable SYSLIB0057
-                using var certificate = new X509Certificate2(X509Certificate.CreateFromSignedFile(retainedFinalPath));
+                using var certificate = new X509Certificate2(
+                    X509Certificate.CreateFromSignedFile(snapshot.SnapshotPath));
 #pragma warning restore SYSLIB0057
                 var publisher = certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false);
                 return string.IsNullOrWhiteSpace(publisher)
