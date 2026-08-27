@@ -18,6 +18,7 @@ PAN_ROOT = "https://pan.baidu.com/"
 PASSPORT_ROOT = "https://passport.baidu.com/"
 SAFE_PROTOCOL_EVENT = "HELPER_PROTOCOL_ERROR"
 SAFE_RUNTIME_EVENT = "HELPER_RUNTIME_ERROR"
+SAFE_SESSION_LIMIT_EVENT = "HELPER_SESSION_LIMIT_REACHED"
 
 
 def classify_route(value: str) -> str:
@@ -75,11 +76,12 @@ def map_identity_fixture(html: str):
     return {"kind": "BrowserUnavailable"}
 
 
-def _fixed_dom_identity(tab):
-    logged_out = tab.ele("css:[data-baidu-login-state=logged-out]", timeout=0.2)
+def _fixed_dom_identity(tab, remaining_seconds):
+    selector_timeout = max(0.001, min(0.2, remaining_seconds))
+    logged_out = tab.ele("css:[data-baidu-login-state=logged-out]", timeout=selector_timeout)
     if logged_out:
         return {"kind": "LoginRequired"}
-    identity = tab.ele("css:[data-baidu-stable-uid]", timeout=0.2)
+    identity = tab.ele("css:[data-baidu-stable-uid]", timeout=selector_timeout)
     if not identity:
         return {"kind": "BrowserUnavailable"}
     uid = identity.attr("data-baidu-stable-uid")
@@ -95,41 +97,105 @@ def observe_bound_target(
         monotonic=time.monotonic,
         sleeper=time.sleep,
         is_cancelled=lambda: False):
-    """Observe one immutable BrowserId/TargetId binding through a tiny adapter."""
+    """Observe one immutable binding with a cooperative soft deadline.
+
+    A synchronous driver call cannot be preempted here. We check before and after every call,
+    pass the remaining budget where DrissionPage accepts one, and discard any result returned
+    after expiry. Task 9's owning C# client supplies the hard bound by killing the helper process
+    and synthesizing the typed timeout/cancellation result.
+    """
     deadline = monotonic() + payload["timeoutMilliseconds"] / 1000.0
-    if connector.browser_id != payload["browserId"]:
-        return {"kind": "BrowserUnavailable"}
+
+    def budget():
+        if is_cancelled():
+            return {"kind": "Cancelled"}, 0.0
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return {"kind": "TimedOut"}, 0.0
+        return None, remaining
+
     try:
-        target = connector.get_target(payload["targetId"])
+        terminal, remaining = budget()
+        if terminal:
+            return terminal
+        browser_id = connector.browser_id
+        terminal, remaining = budget()
+        if terminal:
+            return terminal
+        if browser_id != payload["browserId"]:
+            return {"kind": "BrowserUnavailable"}
+
+        target = connector.get_target(payload["targetId"], remaining)
+        terminal, remaining = budget()
+        if terminal:
+            return terminal
     except Exception:
         return {"kind": "BrowserUnavailable"}
-    if target is None or target.target_id != payload["targetId"]:
+    if target is None:
         return {"kind": "BrowserUnavailable"}
 
     try:
-        route = classify_route(target.current_url())
-        if route != "PanRoot":
-            target.navigate(PAN_ROOT)
+        target_id = target.target_id
+        terminal, remaining = budget()
+        if terminal:
+            return terminal
+        if target_id != payload["targetId"]:
+            return {"kind": "BrowserUnavailable"}
 
-        while monotonic() < deadline:
-            if is_cancelled():
-                return {"kind": "Cancelled"}
-            if connector.browser_id != payload["browserId"]:
+        route = classify_route(target.current_url(remaining))
+        terminal, remaining = budget()
+        if terminal:
+            return terminal
+        if route != "PanRoot":
+            target.navigate(PAN_ROOT, remaining)
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
+
+        while True:
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
+            browser_id = connector.browser_id
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
+            if browser_id != payload["browserId"]:
                 return {"kind": "BrowserUnavailable"}
-            current = connector.get_target(payload["targetId"])
-            if current is None or current is not target or current.target_id != payload["targetId"]:
+            current = connector.get_target(payload["targetId"], remaining)
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
+            if current is None or current is not target:
                 return {"kind": "BrowserUnavailable"}
-            route = classify_route(target.current_url())
+            current_target_id = current.target_id
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
+            if current_target_id != payload["targetId"]:
+                return {"kind": "BrowserUnavailable"}
+            route = classify_route(target.current_url(remaining))
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
             if route == "PanRoot":
-                result = target.observe_identity()
+                result = target.observe_identity(remaining)
+                terminal, remaining = budget()
+                if terminal:
+                    return terminal
                 if result.get("kind") != "LoginRequired":
                     return result
-                sleeper(0.1)
+                sleeper(min(0.1, remaining))
+                terminal, remaining = budget()
+                if terminal:
+                    return terminal
                 continue
             if route != "PassportRoot":
                 return {"kind": "BrowserUnavailable"}
-            sleeper(0.1)
-        return {"kind": "TimedOut"}
+            sleeper(min(0.1, remaining))
+            terminal, remaining = budget()
+            if terminal:
+                return terminal
     except Exception:
         return {"kind": "BrowserUnavailable"}
 
@@ -139,23 +205,27 @@ class _DrissionTarget:
         self._tab = tab
         self.target_id = tab.tab_id
 
-    def current_url(self):
+    def current_url(self, _remaining_seconds):
         return self._tab.url
 
-    def navigate(self, value):
-        self._tab.get(value)
+    def navigate(self, value, remaining_seconds):
+        self._tab.get(value, timeout=remaining_seconds)
 
-    def observe_identity(self):
-        return _fixed_dom_identity(self._tab)
+    def observe_identity(self, remaining_seconds):
+        return _fixed_dom_identity(self._tab, remaining_seconds)
 
 
 class _DrissionConnector:
-    def __init__(self, browser, browser_id):
+    def __init__(self, browser):
         self._browser = browser
-        self.browser_id = browser_id
+        try:
+            import uuid
+            self.browser_id = str(uuid.UUID(str(browser.id)))
+        except (ValueError, TypeError, AttributeError):
+            self.browser_id = ""
         self._targets = {}
 
-    def get_target(self, target_id):
+    def get_target(self, target_id, _remaining_seconds):
         if target_id not in self._browser.tab_ids:
             return None
         target = self._targets.get(target_id)
@@ -176,7 +246,7 @@ def observe_account_identity(payload, is_cancelled=lambda: False):
         browser = Chromium(options)
         return observe_bound_target(
             payload,
-            _DrissionConnector(browser, payload["browserId"]),
+            _DrissionConnector(browser),
             is_cancelled=is_cancelled,
         )
     except Exception:
@@ -190,16 +260,29 @@ def _write_event(error_writer, event_code):
         flush()
 
 
-def run(reader, writer, error_writer, *, helper_pid=None, observer=None):
+def run(
+        reader,
+        writer,
+        error_writer,
+        *,
+        helper_pid=None,
+        parent_pid=None,
+        observer=None,
+        max_requests=protocol.MAX_REQUESTS_PER_SESSION):
     helper_pid = os.getpid() if helper_pid is None else helper_pid
+    parent_pid = os.getppid() if parent_pid is None else parent_pid
     observer = observe_account_identity if observer is None else observer
+    if not 1 <= max_requests <= protocol.MAX_REQUESTS_PER_SESSION:
+        raise ValueError("max_requests is outside the fixed helper session bound")
     handshaken = False
     seen_correlation_ids = set()
+    request_count = 0
     try:
         while True:
             message = protocol.read_message(reader)
             if message is None:
                 return 0
+            request_count += 1
             correlation_id = message["correlationId"]
             if correlation_id in seen_correlation_ids:
                 raise protocol.ProtocolError("DuplicateCorrelationId")
@@ -210,6 +293,8 @@ def run(reader, writer, error_writer, *, helper_pid=None, observer=None):
                 if action != "Handshake":
                     raise protocol.ProtocolError("HandshakeRequired")
                 payload = message["payload"]
+                if payload["parentProcessId"] != parent_pid:
+                    raise protocol.ProtocolError("ParentProcessMismatch")
                 result = {
                     "kind": "HandshakeAccepted",
                     "nonce": payload["nonce"],
@@ -232,6 +317,9 @@ def run(reader, writer, error_writer, *, helper_pid=None, observer=None):
                 raise protocol.ProtocolError("UnknownAction")
 
             protocol.write_message(writer, protocol.response_for(message, result), response=True)
+            if request_count >= max_requests:
+                _write_event(error_writer, SAFE_SESSION_LIMIT_EVENT)
+                return 0
     except protocol.ProtocolError:
         _write_event(error_writer, SAFE_PROTOCOL_EVENT)
         return 2

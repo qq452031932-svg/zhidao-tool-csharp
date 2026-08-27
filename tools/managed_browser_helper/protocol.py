@@ -13,6 +13,7 @@ PROTOCOL_VERSION = 1
 EXECUTION_ENGINE_VERSION = "ManagedChromium-v1"
 MAX_FRAME_BYTES = 65_536
 MAX_OPERATION_TIMEOUT_MILLISECONDS = 120_000
+MAX_REQUESTS_PER_SESSION = 1_024
 REQUIRED_CAPABILITIES = ("Health", "Shutdown", "ObserveAccountIdentity")
 ALLOWED_ACTIONS = ("Handshake",) + REQUIRED_CAPABILITIES
 FORBIDDEN_FIELDS = frozenset(
@@ -103,13 +104,14 @@ def _canonical_uuid(value) -> bool:
 
 
 def _bounded_text(value, maximum=256) -> bool:
-    return (
-        isinstance(value, str)
-        and value
-        and value == value.strip()
-        and len(value) <= maximum
-        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
-    )
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if any(ord(character) <= 0x1f or 0x7f <= ord(character) <= 0x9f for character in value):
+        return False
+    try:
+        return len(value.encode("utf-8", errors="strict")) <= maximum
+    except UnicodeEncodeError:
+        return False
 
 
 def _nonce(value) -> bool:
@@ -131,9 +133,10 @@ def _loopback_endpoint(value) -> bool:
         return False
     return (
         parsed.scheme == "http"
-        and address.is_loopback
+        and str(address) == "127.0.0.1"
         and port is not None
         and 1 <= port <= 65535
+        and port != 80
         and parsed.username is None
         and parsed.password is None
         and parsed.path == "/"
@@ -145,7 +148,7 @@ def _loopback_endpoint(value) -> bool:
 def _validate_common(value, expected_fields) -> str:
     _scan_forbidden(value)
     _exact_object(value, expected_fields)
-    if value["protocolVersion"] != PROTOCOL_VERSION or isinstance(value["protocolVersion"], bool):
+    if type(value["protocolVersion"]) is not int or value["protocolVersion"] != PROTOCOL_VERSION:
         raise _error("ProtocolVersionMismatch")
     if value["executionEngineVersion"] != EXECUTION_ENGINE_VERSION:
         raise _error("ExecutionEngineVersionMismatch")
@@ -329,8 +332,17 @@ def write_message(writer, value, *, response=False):
 
 
 def safe_summary(value) -> str:
-    if not isinstance(value, dict):
-        return "ManagedBrowserMessage { Invalid = true }"
-    action = value.get("action")
-    generation = value.get("generation")
+    try:
+        if not isinstance(value, dict):
+            raise _error("InvalidMessage")
+        if "payload" in value:
+            validate_request(value)
+        elif "result" in value:
+            validate_response(value)
+        else:
+            raise _error("InvalidMessage")
+    except ProtocolError:
+        return "ManagedBrowserMessage { Invalid = true, Identities = [REDACTED], Body = [REDACTED] }"
+    action = value["action"]
+    generation = value["generation"]
     return f"ManagedBrowserMessage {{ Action = {action}, Generation = {generation}, Identities = [REDACTED], Body = [REDACTED] }}"

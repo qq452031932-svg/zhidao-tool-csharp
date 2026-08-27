@@ -120,6 +120,7 @@ public sealed class ManagedBrowserProtocolTests
 
     [Theory]
     [InlineData("\"protocolVersion\":1", "\"protocolVersion\":\"1\"", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
+    [InlineData("\"protocolVersion\":1", "\"protocolVersion\":1.0", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
     [InlineData("\"executionEngineVersion\":\"ManagedChromium-v1\"", "\"executionEngineVersion\":1", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
     [InlineData("\"action\":\"Handshake\"", "\"action\":1", ManagedBrowserProtocolError.UnknownAction)]
     public void MismatchedDiscriminatorTypesUseTheSameTypedErrorsAsPython(
@@ -133,6 +134,26 @@ public sealed class ManagedBrowserProtocolTests
             ManagedBrowserProtocol.DecodeRequest(Encoding.UTF8.GetBytes(json)));
 
         Assert.Equal(expected, error.Error);
+    }
+
+    [Fact]
+    public void InvalidPayloadShapesUseTheCrossLanguageErrorCode()
+    {
+        var valid = HandshakeJson();
+        var payloadStart = valid.IndexOf("\"payload\":", StringComparison.Ordinal);
+        var invalidPayloads = new[]
+        {
+            valid[..payloadStart] + "\"payload\":[]}",
+            valid.Replace("\"parentProcessId\":1234,", "", StringComparison.Ordinal),
+        };
+
+        foreach (var json in invalidPayloads)
+        {
+            var error = Assert.Throws<ManagedBrowserProtocolException>(() =>
+                ManagedBrowserProtocol.DecodeRequest(Encoding.UTF8.GetBytes(json)));
+
+            Assert.Equal(ManagedBrowserProtocolError.InvalidPayload, error.Error);
+        }
     }
 
     [Theory]
@@ -219,6 +240,56 @@ public sealed class ManagedBrowserProtocolTests
         var leakError = Assert.Throws<ManagedBrowserProtocolException>(() =>
             ManagedBrowserProtocol.DecodeResponse(Encoding.UTF8.GetBytes(leaked)));
         Assert.Equal(ManagedBrowserProtocolError.ForbiddenField, leakError.Error);
+    }
+
+    [Fact]
+    public void BoundedTextUsesUnicodeScalarsUtf8BytesAndRejectsC0AndC1Controls()
+    {
+        var endpoint = new Uri("http://127.0.0.1:43127/");
+        var browserId = Guid.NewGuid();
+        _ = new ManagedBrowserObserveAccountIdentityRequest(browserId, string.Concat(Enumerable.Repeat("😀", 64)), endpoint, 1);
+
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserObserveAccountIdentityRequest(
+            browserId, string.Concat(Enumerable.Repeat("😀", 65)), endpoint, 1));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserObserveAccountIdentityRequest(
+            browserId, "target\u0085id", endpoint, 1));
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserObserveAccountIdentityRequest(
+            browserId, "target\0id", endpoint, 1));
+    }
+
+    [Theory]
+    [InlineData("http://127.0.0.1/")]
+    [InlineData("http://127.0.0.1:80/")]
+    [InlineData("http://[::1]:43127/")]
+    [InlineData("http://localhost:43127/")]
+    public void DevToolsEndpointRequiresExplicitNonDefaultIpv4LoopbackPort(string endpoint)
+    {
+        Assert.Throws<ArgumentException>(() => new ManagedBrowserObserveAccountIdentityRequest(
+            Guid.NewGuid(), "target", new Uri(endpoint), 1));
+    }
+
+    [Fact]
+    public void RepeatedRejectedSecretDocumentsLeaveParserUsable()
+    {
+        var invalid = HandshakeJson().Replace(
+            "\"payload\":{", "\"payload\":{\"cookie\":\"secret\",", StringComparison.Ordinal);
+
+        for (var index = 0; index < 2_000; index++)
+        {
+            var error = Assert.Throws<ManagedBrowserProtocolException>(() =>
+                ManagedBrowserProtocol.DecodeRequest(Encoding.UTF8.GetBytes(invalid)));
+            Assert.Equal(ManagedBrowserProtocolError.ForbiddenField, error.Error);
+        }
+
+        Assert.Equal(ManagedBrowserAction.Handshake,
+            ManagedBrowserProtocol.DecodeRequest(
+                ManagedBrowserProtocol.EncodeRequestPayload(HandshakeRequest())).Action);
+    }
+
+    [Fact]
+    public void HelperSessionRequestLimitIsFixedForBothImplementations()
+    {
+        Assert.Equal(1_024, ManagedBrowserProtocol.MaximumRequestsPerSession);
     }
 
     [Theory]

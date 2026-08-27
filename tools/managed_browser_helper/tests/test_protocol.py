@@ -4,6 +4,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import unittest
 import uuid
 
@@ -115,6 +116,8 @@ class ProtocolTests(unittest.TestCase):
     def test_unknown_version_engine_action_and_fields_are_typed_failures(self):
         variants = (
             ({"protocolVersion": 2}, "ProtocolVersionMismatch"),
+            ({"protocolVersion": True}, "ProtocolVersionMismatch"),
+            ({"protocolVersion": 1.0}, "ProtocolVersionMismatch"),
             ({"executionEngineVersion": "WebView2-v1"}, "ExecutionEngineVersionMismatch"),
             ({"action": "ExecuteJavaScript"}, "UnknownAction"),
             ({"unexpected": True}, "UnknownField"),
@@ -124,6 +127,14 @@ class ProtocolTests(unittest.TestCase):
                 value = request()
                 value.update(changes)
                 with self.assertRaisesRegex(protocol.ProtocolError, code):
+                    protocol.validate_request(value)
+
+    def test_invalid_payload_shapes_share_the_csharp_error_code(self):
+        for payload in ([], {"nonce": NONCE, "requiredCapabilities": list(protocol.REQUIRED_CAPABILITIES)}):
+            with self.subTest(payload=payload):
+                value = request()
+                value["payload"] = payload
+                with self.assertRaisesRegex(protocol.ProtocolError, "InvalidPayload"):
                     protocol.validate_request(value)
 
     def test_secret_like_keys_are_rejected_recursively_without_echo(self):
@@ -165,6 +176,32 @@ class ProtocolTests(unittest.TestCase):
         leaked["result"]["pageUrl"] = "https://pan.baidu.com/private"
         with self.assertRaisesRegex(protocol.ProtocolError, "ForbiddenField"):
             protocol.validate_response(leaked)
+
+    def test_text_and_endpoint_negative_corpus_matches_csharp(self):
+        base = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "😀" * 64,
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 1,
+        })
+        protocol.validate_request(base)
+        for target in ("😀" * 65, "target\u0085id", "target\x00id"):
+            with self.subTest(target=repr(target)):
+                invalid = json.loads(json.dumps(base))
+                invalid["payload"]["targetId"] = target
+                with self.assertRaisesRegex(protocol.ProtocolError, "InvalidPayload"):
+                    protocol.validate_request(invalid)
+        for endpoint in (
+            "http://127.0.0.1/",
+            "http://127.0.0.1:80/",
+            "http://[::1]:43127/",
+            "http://localhost:43127/",
+        ):
+            with self.subTest(endpoint=endpoint):
+                invalid = json.loads(json.dumps(base))
+                invalid["payload"]["devToolsEndpoint"] = endpoint
+                with self.assertRaisesRegex(protocol.ProtocolError, "InvalidPayload"):
+                    protocol.validate_request(invalid)
 
     def test_only_exact_https_top_level_routes_are_allowed(self):
         self.assertEqual("PanRoot", main.classify_route("https://pan.baidu.com/"))
@@ -274,6 +311,41 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual({"kind": "Cancelled"}, cancelled)
         self.assertEqual(0, passport.identity_reads)
 
+    def test_soft_deadline_rechecks_after_slow_sync_identity_call_and_discards_observed(self):
+        payload = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 1,
+        })["payload"]
+        target = FakeTarget(
+            "target-1", ["https://pan.baidu.com/"],
+            {"kind": "Observed", "stableBaiduUserId": "must-be-discarded"},
+            identity_delay=0.05,
+        )
+
+        result = main.observe_bound_target(
+            payload, FakeConnector(payload["browserId"], target))
+
+        self.assertEqual({"kind": "TimedOut"}, result)
+
+    def test_drission_connector_uses_actual_browser_id_not_payload_value(self):
+        actual = "44444444-4444-4444-4444-444444444444"
+        supplied = "55555555-5555-5555-5555-555555555555"
+        connector = main._DrissionConnector(FakeChromium(actual))
+
+        self.assertEqual(actual, connector.browser_id)
+        payload = request("ObserveAccountIdentity", {
+            "browserId": supplied,
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 1,
+        })["payload"]
+        self.assertEqual(
+            {"kind": "BrowserUnavailable"},
+            main.observe_bound_target(payload, connector, monotonic=lambda: 0.0, sleeper=lambda _: None),
+        )
+
     def test_server_requires_handshake_rejects_duplicate_ids_and_shuts_down(self):
         health = {**request("Health", {}), "correlationId": str(uuid.uuid4())}
         incoming = b"".join((
@@ -284,7 +356,7 @@ class ProtocolTests(unittest.TestCase):
         output = io.BytesIO()
         events = io.StringIO()
 
-        exit_code = main.run(io.BytesIO(incoming), output, events, helper_pid=9876)
+        exit_code = main.run(io.BytesIO(incoming), output, events, helper_pid=9876, parent_pid=1234)
 
         self.assertEqual(0, exit_code)
         output.seek(0)
@@ -297,12 +369,50 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual("ShuttingDown", shutdown["result"]["kind"])
         self.assertEqual("", events.getvalue())
 
+    def test_handshake_rejects_wrong_parent_pid_without_echoing_authentication(self):
+        output = io.BytesIO()
+        events = io.StringIO()
+
+        exit_code = main.run(
+            io.BytesIO(protocol.encode_message(request())), output, events,
+            helper_pid=9876, parent_pid=4321)
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(b"", output.getvalue())
+        self.assertEqual("HELPER_PROTOCOL_ERROR\n", events.getvalue())
+
+    def test_correlation_tracking_is_bounded_by_fixed_session_request_limit(self):
+        health = {**request("Health", {}), "correlationId": str(uuid.uuid4())}
+        incoming = protocol.encode_message(request()) + protocol.encode_message(health)
+        output = io.BytesIO()
+        events = io.StringIO()
+
+        exit_code = main.run(
+            io.BytesIO(incoming), output, events, helper_pid=9876, parent_pid=1234,
+            max_requests=2)
+
+        self.assertEqual(0, exit_code)
+        output.seek(0)
+        self.assertEqual("HandshakeAccepted", protocol.read_message(output, response=True)["result"]["kind"])
+        self.assertEqual("Healthy", protocol.read_message(output, response=True)["result"]["kind"])
+        self.assertIsNone(protocol.read_message(output, response=True))
+        self.assertEqual("HELPER_SESSION_LIMIT_REACHED\n", events.getvalue())
+        self.assertEqual(1024, protocol.MAX_REQUESTS_PER_SESSION)
+
+    def test_safe_summary_never_echoes_unvalidated_action_or_generation(self):
+        invalid = {"action": "secret-action", "generation": "secret-generation"}
+        self.assertEqual(
+            "ManagedBrowserMessage { Invalid = true, Identities = [REDACTED], Body = [REDACTED] }",
+            protocol.safe_summary(invalid),
+        )
+        self.assertNotIn("secret", protocol.safe_summary(invalid))
+
     def test_server_protocol_failure_emits_only_safe_event_code(self):
         incoming = protocol.encode_message(request("Health", {}))
         output = io.BytesIO()
         events = io.StringIO()
 
-        exit_code = main.run(io.BytesIO(incoming), output, events, helper_pid=9876)
+        exit_code = main.run(io.BytesIO(incoming), output, events, helper_pid=9876, parent_pid=1234)
 
         self.assertEqual(2, exit_code)
         self.assertEqual(b"", output.getvalue())
@@ -324,18 +434,19 @@ class ProtocolTests(unittest.TestCase):
 
 
 class FakeTarget:
-    def __init__(self, target_id, routes, identity_result):
+    def __init__(self, target_id, routes, identity_result, identity_delay=0.0):
         self.target_id = target_id
         self._routes = list(routes)
         self._route_index = 0
         self._identity_results = list(identity_result) if isinstance(identity_result, list) else [identity_result]
         self.navigations = []
         self.identity_reads = 0
+        self.identity_delay = identity_delay
 
-    def current_url(self):
+    def current_url(self, _remaining_seconds=None):
         return self._routes[self._route_index]
 
-    def navigate(self, value):
+    def navigate(self, value, _remaining_seconds=None):
         self.navigations.append(value)
         try:
             self._route_index = self._routes.index(value)
@@ -347,8 +458,10 @@ class FakeTarget:
         if self._route_index + 1 < len(self._routes):
             self._route_index += 1
 
-    def observe_identity(self):
+    def observe_identity(self, _remaining_seconds=None):
         self.identity_reads += 1
+        if self.identity_delay:
+            time.sleep(self.identity_delay)
         index = min(self.identity_reads - 1, len(self._identity_results) - 1)
         return self._identity_results[index]
 
@@ -358,8 +471,14 @@ class FakeConnector:
         self.browser_id = browser_id
         self._target = target
 
-    def get_target(self, target_id):
+    def get_target(self, target_id, _remaining_seconds=None):
         return self._target
+
+
+class FakeChromium:
+    def __init__(self, browser_id):
+        self.id = browser_id
+        self.tab_ids = []
 
 
 if __name__ == "__main__":

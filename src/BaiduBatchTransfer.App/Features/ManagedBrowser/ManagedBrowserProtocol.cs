@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.IO;
-using System.Net;
 using System.Text;
 using System.Text.Json;
 
@@ -302,6 +301,7 @@ public static class ManagedBrowserProtocol
     public const string ExecutionEngineVersion = "ManagedChromium-v1";
     public const int MaximumFrameBytes = 65_536;
     public const int MaximumOperationTimeoutMilliseconds = 120_000;
+    public const int MaximumRequestsPerSession = 1_024;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly string[] Capabilities =
         ["Health", "Shutdown", "ObserveAccountIdentity"];
@@ -346,7 +346,7 @@ public static class ManagedBrowserProtocol
             "operationId", "accountId", "generation", "action", "payload"]);
         ValidateCommon(root, out var correlationId, out var operationId, out var accountId,
             out var generation, out var action);
-        var value = RequireObject(root, "payload");
+        var value = RequireObject(root, "payload", ManagedBrowserProtocolError.InvalidPayload);
         ManagedBrowserRequestPayload requestPayload = action switch
         {
             ManagedBrowserAction.Handshake => ParseHandshakeRequest(value),
@@ -366,7 +366,7 @@ public static class ManagedBrowserProtocol
             "operationId", "accountId", "generation", "action", "result"]);
         ValidateCommon(root, out var correlationId, out var operationId, out var accountId,
             out var generation, out var action);
-        var value = RequireObject(root, "result");
+        var value = RequireObject(root, "result", ManagedBrowserProtocolError.InvalidPayload);
         ManagedBrowserResult result = action switch
         {
             ManagedBrowserAction.Handshake => ParseHandshakeResult(value),
@@ -442,8 +442,9 @@ public static class ManagedBrowserProtocol
     {
         if (string.IsNullOrWhiteSpace(value) ||
             value != value.Trim() ||
-            value.Length > maximumLength ||
-            value.Any(char.IsControl))
+            HasForbiddenScalar(value) ||
+            !TryGetUtf8ByteCount(value, out var byteCount) ||
+            byteCount > maximumLength)
         {
             throw new ArgumentException("A bounded non-empty value is required.", parameterName);
         }
@@ -452,13 +453,37 @@ public static class ManagedBrowserProtocol
     internal static bool IsVerifiedLoopbackEndpoint(Uri uri) =>
         uri.IsAbsoluteUri &&
         string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.Ordinal) &&
-        IPAddress.TryParse(uri.Host, out var address) &&
-        IPAddress.IsLoopback(address) &&
-        uri.Port is >= 1 and <= 65535 &&
+        string.Equals(uri.Host, "127.0.0.1", StringComparison.Ordinal) &&
+        uri.Port is >= 1 and <= 65535 and not 80 &&
         string.IsNullOrEmpty(uri.UserInfo) &&
         string.Equals(uri.AbsolutePath, "/", StringComparison.Ordinal) &&
         string.IsNullOrEmpty(uri.Query) &&
-        string.IsNullOrEmpty(uri.Fragment);
+        string.IsNullOrEmpty(uri.Fragment) &&
+        string.Equals(uri.OriginalString, $"http://127.0.0.1:{uri.Port}/", StringComparison.Ordinal);
+
+    private static bool TryGetUtf8ByteCount(string value, out int byteCount)
+    {
+        try
+        {
+            byteCount = StrictUtf8.GetByteCount(value);
+            return true;
+        }
+        catch (EncoderFallbackException)
+        {
+            byteCount = 0;
+            return false;
+        }
+    }
+
+    private static bool HasForbiddenScalar(string value)
+    {
+        foreach (var rune in value.EnumerateRunes())
+        {
+            if (rune.Value is <= 0x1f or >= 0x7f and <= 0x9f)
+                return true;
+        }
+        return false;
+    }
 
     internal static void ValidateIdentity(
         Guid correlationId, Guid operationId, Guid accountId, long generation,
@@ -556,13 +581,18 @@ public static class ManagedBrowserProtocol
                 CommentHandling = JsonCommentHandling.Disallow,
                 MaxDepth = 16,
             });
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            try
+            {
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                    throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+                ScanForbidden(document.RootElement);
+                return document;
+            }
+            catch
             {
                 document.Dispose();
-                throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+                throw;
             }
-            ScanForbidden(document.RootElement);
-            return document;
         }
         catch (ManagedBrowserProtocolException) { throw; }
         catch (JsonException) { throw Failure(ManagedBrowserProtocolError.MalformedJson); }
@@ -588,16 +618,19 @@ public static class ManagedBrowserProtocol
         }
     }
 
-    private static void ValidateObject(JsonElement element, string[] allowed)
+    private static void ValidateObject(
+        JsonElement element,
+        string[] allowed,
+        ManagedBrowserProtocolError structureError = ManagedBrowserProtocolError.InvalidMessage)
     {
         if (element.ValueKind != JsonValueKind.Object)
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(structureError);
         var allowedSet = new HashSet<string>(allowed, StringComparer.Ordinal);
         foreach (var property in element.EnumerateObject())
             if (!allowedSet.Contains(property.Name))
                 throw Failure(ManagedBrowserProtocolError.UnknownField);
         if (element.EnumerateObject().Count() != allowed.Length)
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(structureError);
     }
 
     private static void ValidateCommon(
@@ -610,8 +643,7 @@ public static class ManagedBrowserProtocol
     {
         if (!root.TryGetProperty("protocolVersion", out var protocolProperty) ||
             protocolProperty.ValueKind != JsonValueKind.Number ||
-            !protocolProperty.TryGetInt32(out var protocolVersion) ||
-            protocolVersion != ProtocolVersion)
+            !string.Equals(protocolProperty.GetRawText(), "1", StringComparison.Ordinal))
             throw Failure(ManagedBrowserProtocolError.ProtocolVersionMismatch);
         if (!root.TryGetProperty("executionEngineVersion", out var engineProperty) ||
             engineProperty.ValueKind != JsonValueKind.String ||
@@ -636,7 +668,7 @@ public static class ManagedBrowserProtocol
 
     private static ManagedBrowserRequestPayload ParseHandshakeRequest(JsonElement value)
     {
-        ValidateObject(value, ["nonce", "parentProcessId", "requiredCapabilities"]);
+        ValidateObject(value, ["nonce", "parentProcessId", "requiredCapabilities"], ManagedBrowserProtocolError.InvalidPayload);
         var capabilities = RequireStringArray(value, "requiredCapabilities");
         if (!CapabilitiesMatch(capabilities))
             throw Failure(ManagedBrowserProtocolError.CapabilityMismatch);
@@ -647,13 +679,13 @@ public static class ManagedBrowserProtocol
 
     private static ManagedBrowserRequestPayload ParseEmptyPayload(JsonElement value)
     {
-        ValidateObject(value, []);
+        ValidateObject(value, [], ManagedBrowserProtocolError.InvalidPayload);
         return ManagedBrowserRequestPayload.Empty;
     }
 
     private static ManagedBrowserRequestPayload ParseObserveRequest(JsonElement value)
     {
-        ValidateObject(value, ["browserId", "targetId", "devToolsEndpoint", "timeoutMilliseconds"]);
+        ValidateObject(value, ["browserId", "targetId", "devToolsEndpoint", "timeoutMilliseconds"], ManagedBrowserProtocolError.InvalidPayload);
         try
         {
             var endpointText = RequireString(value, "devToolsEndpoint");
@@ -668,7 +700,7 @@ public static class ManagedBrowserProtocol
 
     private static ManagedBrowserResult ParseHandshakeResult(JsonElement value)
     {
-        ValidateObject(value, ["kind", "nonce", "parentProcessId", "helperProcessId", "capabilities"]);
+        ValidateObject(value, ["kind", "nonce", "parentProcessId", "helperProcessId", "capabilities"], ManagedBrowserProtocolError.InvalidPayload);
         if (!string.Equals(RequireString(value, "kind"), "HandshakeAccepted", StringComparison.Ordinal))
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
         var capabilities = RequireStringArray(value, "capabilities");
@@ -683,7 +715,7 @@ public static class ManagedBrowserProtocol
     private static ManagedBrowserResult ParseSingletonResult(
         JsonElement value, string expectedKind, ManagedBrowserResult result)
     {
-        ValidateObject(value, ["kind"]);
+        ValidateObject(value, ["kind"], ManagedBrowserProtocolError.InvalidPayload);
         if (!string.Equals(RequireString(value, "kind"), expectedKind, StringComparison.Ordinal))
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
         return result;
@@ -696,7 +728,7 @@ public static class ManagedBrowserProtocol
             !Enum.IsDefined(kind) || kind.ToString() != kindText)
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
         ValidateObject(value, kind == ManagedBrowserIdentityResultKind.Observed
-            ? ["kind", "stableBaiduUserId"] : ["kind"]);
+            ? ["kind", "stableBaiduUserId"] : ["kind"], ManagedBrowserProtocolError.InvalidPayload);
         try { return new ManagedBrowserIdentityResult(
             kind, kind == ManagedBrowserIdentityResultKind.Observed
                 ? RequireString(value, "stableBaiduUserId") : null); }
@@ -807,7 +839,9 @@ public static class ManagedBrowserProtocol
     private static int RequireInt32(JsonElement value, string name)
     {
         if (!value.TryGetProperty(name, out var property) ||
-            property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var result))
+            property.ValueKind != JsonValueKind.Number ||
+            !IsIntegerToken(property) ||
+            !property.TryGetInt32(out var result))
             throw Failure(ManagedBrowserProtocolError.InvalidMessage);
         return result;
     }
@@ -815,15 +849,26 @@ public static class ManagedBrowserProtocol
     private static long RequireInt64(JsonElement value, string name)
     {
         if (!value.TryGetProperty(name, out var property) ||
-            property.ValueKind != JsonValueKind.Number || !property.TryGetInt64(out var result))
+            property.ValueKind != JsonValueKind.Number ||
+            !IsIntegerToken(property) ||
+            !property.TryGetInt64(out var result))
             throw Failure(ManagedBrowserProtocolError.InvalidMessage);
         return result;
     }
 
-    private static JsonElement RequireObject(JsonElement value, string name)
+    private static bool IsIntegerToken(JsonElement value)
+    {
+        var raw = value.GetRawText();
+        return !raw.Contains('.') && !raw.Contains('e') && !raw.Contains('E');
+    }
+
+    private static JsonElement RequireObject(
+        JsonElement value,
+        string name,
+        ManagedBrowserProtocolError structureError)
     {
         if (!value.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.Object)
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(structureError);
         return property;
     }
 
