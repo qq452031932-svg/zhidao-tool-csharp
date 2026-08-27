@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.App.Features.Acceptance;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Threading;
@@ -10,6 +11,11 @@ public interface IDialogService
     Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default);
     Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default);
     Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default);
+    Task<string?> PickBrowserDirectoryAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<string?>(null);
+    }
 }
 
 public interface IUiDispatcher
@@ -52,7 +58,10 @@ public sealed class WpfExcelFileDialog : IExcelFileDialog
     }
 }
 
-public sealed class DialogService(IUiDispatcher dispatcher, IExcelFileDialog excelFileDialog) : IDialogService
+public sealed class DialogService(
+    IUiDispatcher dispatcher,
+    IExcelFileDialog excelFileDialog,
+    IBrowserDirectoryDialog? browserDirectoryDialog = null) : IDialogService
 {
     public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
     {
@@ -70,6 +79,11 @@ public sealed class DialogService(IUiDispatcher dispatcher, IExcelFileDialog exc
 
     public Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default) =>
         dispatcher.InvokeAsync(excelFileDialog.Show, cancellationToken);
+
+    public Task<string?> PickBrowserDirectoryAsync(CancellationToken cancellationToken = default) =>
+        dispatcher.InvokeAsync(
+            (browserDirectoryDialog ?? new BrowserDirectoryDialog()).Show,
+            cancellationToken);
 }
 
 public interface IAccountLoginLauncher

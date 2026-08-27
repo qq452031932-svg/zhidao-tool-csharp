@@ -1,3 +1,4 @@
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Services;
 
 namespace BaiduBatchTransfer.App.Tests.Services;
@@ -34,6 +35,39 @@ public sealed class DialogServiceTests
         Assert.DoesNotContain("private-path", service.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task AsyncBrowserDirectorySelectionAlwaysUsesUiDispatcher()
+    {
+        var dispatcher = new RecordingDispatcher();
+        var fileDialog = new RecordingExcelFileDialog("selected.xlsx");
+        var browserDialog = new RecordingBrowserDirectoryDialog(@"C:\Browser\Application");
+        var service = new DialogService(dispatcher, fileDialog, browserDialog);
+
+        var selected = await Task.Run(() =>
+            service.PickBrowserDirectoryAsync(CancellationToken.None));
+
+        Assert.Equal(@"C:\Browser\Application", selected);
+        Assert.Equal(1, dispatcher.InvocationCount);
+        Assert.Equal(1, browserDialog.InvocationCount);
+    }
+
+    [Fact]
+    public async Task CancelledBrowserDirectorySelectionDoesNotOpenDialog()
+    {
+        var dispatcher = new RecordingDispatcher();
+        var fileDialog = new RecordingExcelFileDialog("selected.xlsx");
+        var browserDialog = new RecordingBrowserDirectoryDialog(@"C:\Private\Browser");
+        var service = new DialogService(dispatcher, fileDialog, browserDialog);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.PickBrowserDirectoryAsync(cancellation.Token));
+
+        Assert.Equal(0, browserDialog.InvocationCount);
+        Assert.DoesNotContain("Private", service.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     private sealed class RecordingDispatcher : IUiDispatcher
     {
         public int InvocationCount { get; private set; }
@@ -47,6 +81,17 @@ public sealed class DialogServiceTests
     }
 
     private sealed class RecordingExcelFileDialog(string selectedPath) : IExcelFileDialog
+    {
+        public int InvocationCount { get; private set; }
+
+        public string? Show()
+        {
+            InvocationCount++;
+            return selectedPath;
+        }
+    }
+
+    private sealed class RecordingBrowserDirectoryDialog(string selectedPath) : IBrowserDirectoryDialog
     {
         public int InvocationCount { get; private set; }
 
