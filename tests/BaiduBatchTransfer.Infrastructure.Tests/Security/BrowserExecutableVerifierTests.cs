@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Win32.SafeHandles;
+using System.Diagnostics;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Security;
 
@@ -267,6 +268,26 @@ public sealed class BrowserExecutableVerifierTests
         Assert.DoesNotContain("SafeTemp", result.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task PinnedExecutableIdentityOrHashChangeAtAnyMetadataBoundaryFailsClosed(
+        int successfulValidationsBeforeChange)
+    {
+        var dependencies = ValidDependencies();
+        for (var index = 0; index < successfulValidationsBeforeChange; index++)
+            dependencies.Snapshot.ValidationResults.Enqueue(true);
+        dependencies.Snapshot.ValidationResults.Enqueue(false);
+
+        var result = await dependencies.CreateVerifier().VerifyAsync(
+            DirectoryPath, BrowserFamily.Chrome, CancellationToken.None);
+
+        Assert.Equal(BrowserExecutableVerificationErrorCode.IdentityChanged, result.ErrorCode);
+        Assert.True(dependencies.Snapshot.LastSnapshot!.IsDisposed);
+    }
+
     [Fact]
     public async Task CancellationAfterSnapshotCreationDisposesSnapshotAndAllPinnedHandles()
     {
@@ -435,6 +456,38 @@ public sealed class BrowserExecutableVerifierTests
         Assert.True(result.IsVerified, result.ErrorCode.ToString());
     }
 
+    [Fact]
+    public async Task WindowsPinnedExecutableSupportsDirectHandleMetadataWithoutTemporaryArtifact()
+    {
+        var processPath = Environment.ProcessPath;
+        Assert.False(string.IsNullOrWhiteSpace(processPath));
+        using var source = new OwnedPinnedHandle(File.OpenHandle(
+            processPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            FileOptions.None));
+        var expectedProduct = FileVersionInfo.GetVersionInfo(processPath).ProductName;
+        var expectedLength = new FileInfo(processPath).Length;
+        var snapshot = await new WindowsBrowserExecutableSnapshotFactory().CreateAsync(
+            source, expectedLength, BrowserExecutableVerifier.MaximumSupportedExecutableBytes,
+            CancellationToken.None);
+        try
+        {
+            Assert.Equal(source.SafeHandle.DangerousGetHandle(), snapshot.SafeHandle.DangerousGetHandle());
+            Assert.Equal(expectedProduct, new WindowsBrowserProductReader().ReadProductName(snapshot));
+            var signature = new WindowsAuthenticodeSignatureReader().Verify(snapshot);
+            Assert.Contains(signature.Trust, Enum.GetValues<BrowserSignatureTrust>());
+            Assert.True(await snapshot.ValidateAsync(CancellationToken.None));
+        }
+        finally
+        {
+            snapshot.Dispose();
+        }
+
+        Assert.True(File.Exists(processPath));
+    }
+
     private static Dependencies ValidDependencies() => new();
 
     private sealed class Dependencies
@@ -457,6 +510,12 @@ public sealed class BrowserExecutableVerifierTests
         public bool IsDirectory { get; } = isDirectory;
         public bool IsDisposed { get; private set; }
         public void Dispose() => IsDisposed = true;
+    }
+
+    private sealed class OwnedPinnedHandle(SafeFileHandle safeHandle) : IBrowserPinnedHandle
+    {
+        public SafeFileHandle SafeHandle { get; } = safeHandle;
+        public void Dispose() => SafeHandle.Dispose();
     }
 
     private sealed class RecordingNativeHandleReader : IBrowserNativeHandleReader
@@ -559,7 +618,13 @@ public sealed class BrowserExecutableVerifierTests
         public long Length { get; init; }
         public string Sha256 { get; init; } = new('a', 64);
         public string ProductName { get; init; } = "Google Chrome";
+        public Queue<bool> ValidationResults { get; init; } = [];
         public bool IsDisposed { get; private set; }
+        public Task<bool> ValidateAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(ValidationResults.TryDequeue(out var result) ? result : true);
+        }
         public void Dispose() => IsDisposed = true;
         public override string ToString() =>
             $"RecordingSnapshot {{ SnapshotPath = [REDACTED], Length = {Length}, Sha256 = [REDACTED] }}";
@@ -572,6 +637,7 @@ public sealed class BrowserExecutableVerifierTests
         public int CreateCount { get; private set; }
         public Action? OnCreate { get; set; }
         public Exception? Failure { get; set; }
+        public Queue<bool> ValidationResults { get; } = [];
         public RecordingSnapshot? LastSnapshot { get; private set; }
 
         public Task<IBrowserExecutableSnapshot> CreateAsync(
@@ -589,6 +655,7 @@ public sealed class BrowserExecutableVerifierTests
                 Length = expectedLength,
                 Sha256 = Hash,
                 ProductName = ProductName,
+                ValidationResults = ValidationResults,
             };
             return Task.FromResult<IBrowserExecutableSnapshot>(LastSnapshot);
         }

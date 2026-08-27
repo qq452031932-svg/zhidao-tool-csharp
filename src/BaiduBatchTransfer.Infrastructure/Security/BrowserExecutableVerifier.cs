@@ -1,7 +1,8 @@
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Win32.SafeHandles;
+using System.Buffers.Binary;
 using System.ComponentModel;
-using System.Diagnostics;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -158,6 +159,7 @@ public interface IBrowserExecutableSnapshot : IDisposable
     string SnapshotPath { get; }
     long Length { get; }
     string Sha256 { get; }
+    Task<bool> ValidateAsync(CancellationToken cancellationToken);
 }
 
 public interface IBrowserExecutableSnapshotFactory
@@ -284,6 +286,7 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
                 cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (snapshot.Length != initialFileIdentity.Length || !IsSha256(snapshot.Sha256) ||
+                !await snapshot.ValidateAsync(cancellationToken).ConfigureAwait(false) ||
                 !StillSame(
                     directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
@@ -294,7 +297,8 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
 
             var signature = signatures.Verify(snapshot);
             cancellationToken.ThrowIfCancellationRequested();
-            if (!StillSame(
+            if (!await snapshot.ValidateAsync(cancellationToken).ConfigureAwait(false) ||
+                !StillSame(
                     directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
@@ -308,7 +312,8 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
 
             var productName = products.ReadProductName(snapshot);
             cancellationToken.ThrowIfCancellationRequested();
-            if (!StillSame(
+            if (!await snapshot.ValidateAsync(cancellationToken).ConfigureAwait(false) ||
+                !StillSame(
                     directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
@@ -321,7 +326,8 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
             if (policyError != BrowserExecutableVerificationErrorCode.None)
                 return Failed(policyError);
 
-            if (!StillSame(
+            if (!await snapshot.ValidateAsync(cancellationToken).ConfigureAwait(false) ||
+                !StillSame(
                     directoryHandles, initialDirectoryInfos,
                     executableHandle, initialExecutable, initialFileIdentity,
                     finalDirectory, finalExecutable))
@@ -609,8 +615,8 @@ internal sealed class WindowsBrowserNativeHandleReader : IBrowserNativeHandleRea
         string exactFileName) =>
         OpenRelative(
             selectedDirectory, exactFileName,
-            FileReadData | FileReadAttributes,
-            FileNonDirectoryFile | FileOpenReparsePoint,
+            FileReadData | FileReadAttributes | Synchronize,
+            FileNonDirectoryFile | FileSynchronousIoNonAlert | FileOpenReparsePoint,
             (uint)FileShare.Read);
 
     public BrowserNativeHandleInfo ReadInfo(IBrowserPinnedHandle handle)
@@ -839,24 +845,102 @@ internal sealed class WindowsBrowserFileIdentityReader : IBrowserFileIdentityRea
         out ByHandleFileInformation fileInformation);
 }
 
-internal sealed class WindowsBrowserExecutableSnapshot(
-    FileStream stream,
-    string snapshotPath,
-    long length,
-    string sha256) : IBrowserExecutableSnapshot
+internal sealed class WindowsBrowserExecutableSnapshot : IBrowserExecutableSnapshot
 {
-    public SafeFileHandle SafeHandle => stream.SafeFileHandle;
-    public string SnapshotPath { get; } = snapshotPath;
-    public long Length { get; } = length;
-    public string Sha256 { get; } = sha256;
-    public void Dispose() => stream.Dispose();
+    private const int BufferSize = 64 * 1024;
+    private readonly IBrowserPinnedHandle executable;
+    private readonly WindowsBrowserNativeHandleReader native;
+    private readonly WindowsBrowserFileIdentityReader identities;
+    private readonly BrowserNativeHandleInfo initialInfo;
+    private readonly BrowserFileIdentity initialIdentity;
+    private int disposed;
+
+    internal WindowsBrowserExecutableSnapshot(
+        IBrowserPinnedHandle executable,
+        WindowsBrowserNativeHandleReader native,
+        WindowsBrowserFileIdentityReader identities,
+        BrowserNativeHandleInfo initialInfo,
+        BrowserFileIdentity initialIdentity,
+        string sha256)
+    {
+        this.executable = executable;
+        this.native = native;
+        this.identities = identities;
+        this.initialInfo = initialInfo;
+        this.initialIdentity = initialIdentity;
+        Sha256 = sha256;
+    }
+
+    public SafeFileHandle SafeHandle => executable.SafeHandle;
+    public string SnapshotPath => initialInfo.FinalPath;
+    public long Length => initialIdentity.Length;
+    public string Sha256 { get; }
+
+    public async Task<bool> ValidateAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (Volatile.Read(ref disposed) != 0)
+            return false;
+        try
+        {
+            if (native.ReadInfo(executable) != initialInfo || identities.Read(executable) != initialIdentity)
+                return false;
+            var currentHash = await ComputeSha256Async(
+                executable, Length, Length, cancellationToken).ConfigureAwait(false);
+            return CryptographicOperations.FixedTimeEquals(
+                Encoding.ASCII.GetBytes(Sha256), Encoding.ASCII.GetBytes(currentHash));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public void Dispose() => Interlocked.Exchange(ref disposed, 1);
+
     public override string ToString() =>
         $"WindowsBrowserExecutableSnapshot {{ SnapshotPath = [REDACTED], Length = {Length}, Sha256 = [REDACTED] }}";
+
+    internal static async Task<string> ComputeSha256Async(
+        IBrowserPinnedHandle handle,
+        long expectedLength,
+        long maximumBytes,
+        CancellationToken cancellationToken)
+    {
+        return await Task.Run(() =>
+        {
+            using var borrowed = new SafeFileHandle(
+                handle.SafeHandle.DangerousGetHandle(), ownsHandle: false);
+            using var stream = new FileStream(borrowed, FileAccess.Read, BufferSize, isAsync: false);
+            stream.Position = 0;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[BufferSize];
+            long total = 0;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = stream.Read(buffer, 0, buffer.Length);
+                if (read == 0) break;
+                total = checked(total + read);
+                if (total > maximumBytes)
+                    throw new IOException("Browser executable exceeds the supported verification size.");
+                hash.AppendData(buffer, 0, read);
+            }
+            if (total != expectedLength)
+                throw new IOException("Browser executable changed during verification.");
+            return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+        }, cancellationToken).ConfigureAwait(false);
+    }
 }
 
 internal sealed class WindowsBrowserExecutableSnapshotFactory : IBrowserExecutableSnapshotFactory
 {
-    private const int BufferSize = 64 * 1024;
+    private readonly WindowsBrowserNativeHandleReader native = new();
+    private readonly WindowsBrowserFileIdentityReader identities = new();
 
     public async Task<IBrowserExecutableSnapshot> CreateAsync(
         IBrowserPinnedHandle executable,
@@ -867,82 +951,215 @@ internal sealed class WindowsBrowserExecutableSnapshotFactory : IBrowserExecutab
         if (expectedLength < 0 || expectedLength > maximumBytes)
             throw new IOException("Browser executable exceeds the supported verification size.");
 
-        FileStream? snapshotStream = null;
-        string? snapshotPath = null;
-        try
-        {
-            for (var attempt = 0; attempt < 4 && snapshotStream is null; attempt++)
-            {
-                snapshotPath = Path.Combine(
-                    Path.GetTempPath(),
-                    $"bbt-browser-{Guid.NewGuid():N}.snapshot");
-                try
-                {
-                    snapshotStream = new FileStream(
-                        snapshotPath,
-                        FileMode.CreateNew,
-                        FileAccess.ReadWrite,
-                        FileShare.Read,
-                        BufferSize,
-                        FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose);
-                }
-                catch (IOException) when (attempt < 3)
-                {
-                    // A cryptographically random name collision is retried without inspecting the directory.
-                }
-            }
-            if (snapshotStream is null || snapshotPath is null)
-                throw new IOException("Browser snapshot creation failed.");
-
-            using var borrowedHandle = new SafeFileHandle(
-                executable.SafeHandle.DangerousGetHandle(), ownsHandle: false);
-            await using var source = new FileStream(
-                borrowedHandle, FileAccess.Read, BufferSize, isAsync: true);
-            source.Position = 0;
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var buffer = new byte[BufferSize];
-            long total = 0;
-            while (true)
-            {
-                var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                if (read == 0) break;
-                total = checked(total + read);
-                if (total > maximumBytes)
-                    throw new IOException("Browser executable exceeds the supported verification size.");
-                hash.AppendData(buffer, 0, read);
-                await snapshotStream.WriteAsync(buffer.AsMemory(0, read), cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            if (total != expectedLength)
-                throw new IOException("Browser executable changed during verification.");
-            await snapshotStream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            snapshotStream.Position = 0;
-            var result = new WindowsBrowserExecutableSnapshot(
-                snapshotStream,
-                snapshotPath,
-                total,
-                Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant());
-            snapshotStream = null;
-            return result;
-        }
-        finally
-        {
-            if (snapshotStream is not null)
-                await snapshotStream.DisposeAsync().ConfigureAwait(false);
-        }
+        var initialInfo = native.ReadInfo(executable);
+        var initialIdentity = identities.Read(executable);
+        if (initialInfo.IsReparsePoint || initialIdentity.Length != expectedLength)
+            throw new IOException("Browser executable changed during verification.");
+        var hash = await WindowsBrowserExecutableSnapshot.ComputeSha256Async(
+            executable, expectedLength, maximumBytes, cancellationToken).ConfigureAwait(false);
+        if (native.ReadInfo(executable) != initialInfo || identities.Read(executable) != initialIdentity)
+            throw new IOException("Browser executable changed during verification.");
+        return new WindowsBrowserExecutableSnapshot(
+            executable, native, identities, initialInfo, initialIdentity, hash);
     }
 }
 
 internal sealed class WindowsBrowserProductReader : IBrowserProductReader
 {
+    private const int MaximumResourceDirectoryBytes = 16 * 1024 * 1024;
+    private const int MaximumVersionResourceBytes = 1024 * 1024;
+    private const uint ResourceDirectoryFlag = 0x80000000;
+    private const uint ResourceOffsetMask = 0x7fffffff;
+    private const uint VersionResourceType = 16;
+
     public string ReadProductName(IBrowserExecutableSnapshot snapshot)
     {
         if (snapshot.SafeHandle.IsInvalid || snapshot.SafeHandle.IsClosed)
             throw new IOException("Browser verification operation failed.");
-        var productName = FileVersionInfo.GetVersionInfo(snapshot.SnapshotPath).ProductName;
+
+        string? productName;
+        try
+        {
+            using var borrowedHandle = new SafeFileHandle(
+                snapshot.SafeHandle.DangerousGetHandle(), ownsHandle: false);
+            using var stream = new FileStream(
+                borrowedHandle, FileAccess.Read, bufferSize: 4096, isAsync: false);
+            stream.Position = 0;
+            using var peReader = new PEReader(stream, PEStreamOptions.LeaveOpen);
+            var directory = peReader.PEHeaders.PEHeader?.ResourceTableDirectory
+                ?? throw new InvalidDataException("Browser product metadata is unavailable.");
+            if (directory.RelativeVirtualAddress == 0 || directory.Size <= 0 ||
+                directory.Size > MaximumResourceDirectoryBytes)
+            {
+                throw new InvalidDataException("Browser product metadata is unavailable.");
+            }
+
+            var directoryBytes = peReader.GetSectionData(directory.RelativeVirtualAddress)
+                .GetContent(0, directory.Size).AsSpan();
+            var dataEntryOffset = FindVersionDataEntry(directoryBytes);
+            var dataRva = ReadUInt32(directoryBytes, dataEntryOffset);
+            var dataSize = ReadUInt32(directoryBytes, checked(dataEntryOffset + 4));
+            if (dataRva > int.MaxValue || dataSize == 0 || dataSize > MaximumVersionResourceBytes)
+                throw new InvalidDataException("Browser product metadata is unavailable.");
+
+            var versionBytes = peReader.GetSectionData(checked((int)dataRva))
+                .GetContent(0, checked((int)dataSize)).AsSpan();
+            productName = FindStringValue(versionBytes, "ProductName", depth: 0);
+        }
+        catch (BadImageFormatException exception)
+        {
+            throw new InvalidDataException("Browser product metadata is unavailable.", exception);
+        }
+        catch (ArgumentOutOfRangeException exception)
+        {
+            throw new InvalidDataException("Browser product metadata is unavailable.", exception);
+        }
+
         return string.IsNullOrWhiteSpace(productName)
             ? throw new InvalidDataException("Browser product metadata is unavailable.")
             : productName;
+    }
+
+    private static int FindVersionDataEntry(ReadOnlySpan<byte> directory)
+    {
+        var typeDirectory = FindChildDirectory(directory, 0, VersionResourceType);
+        var nameDirectory = FindFirstChildDirectory(directory, typeDirectory);
+        return FindFirstDataEntry(directory, nameDirectory);
+    }
+
+    private static int FindChildDirectory(ReadOnlySpan<byte> bytes, int directoryOffset, uint id)
+    {
+        var (entriesOffset, entryCount) = ReadDirectoryHeader(bytes, directoryOffset);
+        for (var index = 0; index < entryCount; index++)
+        {
+            var entryOffset = checked(entriesOffset + (index * 8));
+            EnsureRange(bytes, entryOffset, 8);
+            var name = ReadUInt32(bytes, entryOffset);
+            var target = ReadUInt32(bytes, checked(entryOffset + 4));
+            if ((name & ResourceDirectoryFlag) == 0 && (name & 0xffff) == id &&
+                (target & ResourceDirectoryFlag) != 0)
+            {
+                return checked((int)(target & ResourceOffsetMask));
+            }
+        }
+        throw new InvalidDataException("Browser product metadata is unavailable.");
+    }
+
+    private static int FindFirstChildDirectory(ReadOnlySpan<byte> bytes, int directoryOffset)
+    {
+        var (entriesOffset, entryCount) = ReadDirectoryHeader(bytes, directoryOffset);
+        for (var index = 0; index < entryCount; index++)
+        {
+            var entryOffset = checked(entriesOffset + (index * 8));
+            EnsureRange(bytes, entryOffset, 8);
+            var target = ReadUInt32(bytes, checked(entryOffset + 4));
+            if ((target & ResourceDirectoryFlag) != 0)
+                return checked((int)(target & ResourceOffsetMask));
+        }
+        throw new InvalidDataException("Browser product metadata is unavailable.");
+    }
+
+    private static int FindFirstDataEntry(ReadOnlySpan<byte> bytes, int directoryOffset)
+    {
+        var (entriesOffset, entryCount) = ReadDirectoryHeader(bytes, directoryOffset);
+        for (var index = 0; index < entryCount; index++)
+        {
+            var entryOffset = checked(entriesOffset + (index * 8));
+            EnsureRange(bytes, entryOffset, 8);
+            var target = ReadUInt32(bytes, checked(entryOffset + 4));
+            if ((target & ResourceDirectoryFlag) == 0)
+            {
+                var dataOffset = checked((int)target);
+                EnsureRange(bytes, dataOffset, 16);
+                return dataOffset;
+            }
+        }
+        throw new InvalidDataException("Browser product metadata is unavailable.");
+    }
+
+    private static (int EntriesOffset, int EntryCount) ReadDirectoryHeader(
+        ReadOnlySpan<byte> bytes,
+        int directoryOffset)
+    {
+        EnsureRange(bytes, directoryOffset, 16);
+        var namedCount = ReadUInt16(bytes, checked(directoryOffset + 12));
+        var idCount = ReadUInt16(bytes, checked(directoryOffset + 14));
+        var entryCount = checked(namedCount + idCount);
+        if (entryCount is <= 0 or > 4096)
+            throw new InvalidDataException("Browser product metadata is unavailable.");
+        var entriesOffset = checked(directoryOffset + 16);
+        EnsureRange(bytes, entriesOffset, checked(entryCount * 8));
+        return (entriesOffset, entryCount);
+    }
+
+    private static string? FindStringValue(ReadOnlySpan<byte> bytes, string expectedKey, int depth)
+    {
+        if (depth > 8 || bytes.Length < 6)
+            return null;
+        var blockLength = ReadUInt16(bytes, 0);
+        if (blockLength < 6 || blockLength > bytes.Length)
+            return null;
+        var valueLength = ReadUInt16(bytes, 2);
+        var valueType = ReadUInt16(bytes, 4);
+        var block = bytes[..blockLength];
+        var (key, keyEnd) = ReadUtf16NullTerminated(block, 6);
+        var valueOffset = Align4(keyEnd);
+        var valueBytes = valueType == 1 ? checked(valueLength * sizeof(char)) : valueLength;
+        if (valueOffset > block.Length || valueBytes > block.Length - valueOffset)
+            return null;
+
+        if (string.Equals(key, expectedKey, StringComparison.Ordinal))
+        {
+            if (valueType != 1 || valueBytes == 0)
+                return null;
+            return Encoding.Unicode.GetString(block.Slice(valueOffset, valueBytes)).TrimEnd('\0');
+        }
+
+        var childOffset = Align4(checked(valueOffset + valueBytes));
+        while (childOffset + 6 <= block.Length)
+        {
+            var childLength = ReadUInt16(block, childOffset);
+            if (childLength < 6 || childLength > block.Length - childOffset)
+                break;
+            var found = FindStringValue(block.Slice(childOffset, childLength), expectedKey, depth + 1);
+            if (found is not null)
+                return found;
+            childOffset = Align4(checked(childOffset + childLength));
+        }
+        return null;
+    }
+
+    private static (string Value, int EndOffset) ReadUtf16NullTerminated(
+        ReadOnlySpan<byte> bytes,
+        int offset)
+    {
+        for (var cursor = offset; cursor + 1 < bytes.Length; cursor += sizeof(char))
+        {
+            if (ReadUInt16(bytes, cursor) != 0)
+                continue;
+            return (Encoding.Unicode.GetString(bytes.Slice(offset, cursor - offset)), cursor + sizeof(char));
+        }
+        throw new InvalidDataException("Browser product metadata is unavailable.");
+    }
+
+    private static int Align4(int offset) => checked((offset + 3) & ~3);
+
+    private static ushort ReadUInt16(ReadOnlySpan<byte> bytes, int offset)
+    {
+        EnsureRange(bytes, offset, sizeof(ushort));
+        return BinaryPrimitives.ReadUInt16LittleEndian(bytes.Slice(offset, sizeof(ushort)));
+    }
+
+    private static uint ReadUInt32(ReadOnlySpan<byte> bytes, int offset)
+    {
+        EnsureRange(bytes, offset, sizeof(uint));
+        return BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(offset, sizeof(uint)));
+    }
+
+    private static void EnsureRange(ReadOnlySpan<byte> bytes, int offset, int count)
+    {
+        if (offset < 0 || count < 0 || offset > bytes.Length - count)
+            throw new InvalidDataException("Browser product metadata is unavailable.");
     }
 }
 
@@ -957,6 +1174,7 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
     private const uint StateActionClose = 2;
     private const uint CacheOnlyUrlRetrieval = 0x00001000;
     private const int TrustENoSignature = unchecked((int)0x800B0100);
+    private const int SharingViolation = unchecked((int)0x80070020);
 
     public BrowserSignatureVerification Verify(IBrowserExecutableSnapshot snapshot)
     {
@@ -985,14 +1203,30 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
             var status = WinVerifyTrust(IntPtr.Zero, ref action, trustDataPointer);
             if (status == TrustENoSignature)
                 return new BrowserSignatureVerification(BrowserSignatureTrust.Unsigned, null);
+            if (status == SharingViolation)
+                throw new IOException("Browser signature verification operation failed.");
             if (status != 0)
                 return new BrowserSignatureVerification(BrowserSignatureTrust.Untrusted, null);
 
             try
             {
+                var verifiedData = Marshal.PtrToStructure<WinTrustData>(trustDataPointer);
+                var providerData = WTHelperProvDataFromStateData(verifiedData.StateData);
+                if (providerData == IntPtr.Zero)
+                    return new BrowserSignatureVerification(BrowserSignatureTrust.Invalid, null);
+                var signerPointer = WTHelperGetProvSignerFromChain(
+                    providerData, 0, false, 0);
+                if (signerPointer == IntPtr.Zero)
+                    return new BrowserSignatureVerification(BrowserSignatureTrust.Invalid, null);
+                var signer = Marshal.PtrToStructure<CryptProviderSigner>(signerPointer);
+                if (signer.CertificateChainCount == 0 || signer.CertificateChain == IntPtr.Zero)
+                    return new BrowserSignatureVerification(BrowserSignatureTrust.Invalid, null);
+                var providerCertificate = Marshal.PtrToStructure<CryptProviderCertificate>(
+                    signer.CertificateChain);
+                if (providerCertificate.CertificateContext == IntPtr.Zero)
+                    return new BrowserSignatureVerification(BrowserSignatureTrust.Invalid, null);
 #pragma warning disable SYSLIB0057
-                using var certificate = new X509Certificate2(
-                    X509Certificate.CreateFromSignedFile(snapshot.SnapshotPath));
+                using var certificate = new X509Certificate2(providerCertificate.CertificateContext);
 #pragma warning restore SYSLIB0057
                 var publisher = certificate.GetNameInfo(X509NameType.SimpleName, forIssuer: false);
                 return string.IsNullOrWhiteSpace(publisher)
@@ -1064,9 +1298,54 @@ internal sealed class WindowsAuthenticodeSignatureReader : IBrowserSignatureRead
         public IntPtr SignatureSettings;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CryptProviderSigner
+    {
+        public uint StructSize;
+        public System.Runtime.InteropServices.ComTypes.FILETIME VerifyAsOf;
+        public uint CertificateChainCount;
+        public IntPtr CertificateChain;
+        public uint SignerType;
+        public IntPtr Signer;
+        public uint Error;
+        public uint CounterSignerCount;
+        public IntPtr CounterSigners;
+        public IntPtr ChainContext;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CryptProviderCertificate
+    {
+        public uint StructSize;
+        public IntPtr CertificateContext;
+        [MarshalAs(UnmanagedType.Bool)] public bool Commercial;
+        [MarshalAs(UnmanagedType.Bool)] public bool TrustedRoot;
+        [MarshalAs(UnmanagedType.Bool)] public bool SelfSigned;
+        [MarshalAs(UnmanagedType.Bool)] public bool TestCertificate;
+        public uint RevokedReason;
+        public uint Confidence;
+        public uint Error;
+        public IntPtr TrustListContext;
+        [MarshalAs(UnmanagedType.Bool)] public bool TrustListSignerCertificate;
+        public IntPtr CtlContext;
+        public uint CtlError;
+        [MarshalAs(UnmanagedType.Bool)] public bool IsCyclic;
+        public IntPtr ChainElement;
+    }
+
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
     private static extern int WinVerifyTrust(
         IntPtr windowHandle,
         [In] ref Guid actionId,
         IntPtr trustData);
+
+    [DllImport("wintrust.dll", ExactSpelling = true)]
+    private static extern IntPtr WTHelperProvDataFromStateData(IntPtr stateData);
+
+    [DllImport("wintrust.dll", ExactSpelling = true)]
+    private static extern IntPtr WTHelperGetProvSignerFromChain(
+        IntPtr providerData,
+        uint signerIndex,
+        [MarshalAs(UnmanagedType.Bool)] bool counterSigner,
+        uint counterSignerIndex);
 }
