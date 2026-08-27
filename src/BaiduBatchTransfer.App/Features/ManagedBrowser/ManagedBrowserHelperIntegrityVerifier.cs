@@ -569,7 +569,12 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
 internal sealed class PinnedHelperTree : IDisposable
 {
     private readonly List<PinnedHelperEntry> entries = [];
+    private readonly Dictionary<string, PinnedHelperEntry> files =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PinnedHelperEntry> directories =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly ManagedBrowserHelperIntegrityLimits limits;
+    private long totalBytes;
     private bool disposed;
 
     private PinnedHelperTree(string rootPath, ManagedBrowserHelperIntegrityLimits limits)
@@ -579,10 +584,8 @@ internal sealed class PinnedHelperTree : IDisposable
     }
 
     public string RootPath { get; }
-    public IReadOnlyDictionary<string, PinnedHelperEntry> Files { get; private set; } =
-        new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
-    public IReadOnlyDictionary<string, PinnedHelperEntry> Directories { get; private set; } =
-        new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, PinnedHelperEntry> Files => files;
+    public IReadOnlyDictionary<string, PinnedHelperEntry> Directories => directories;
     public int HandleCount => entries.Count;
 
     public static PinnedHelperTree Capture(
@@ -601,14 +604,12 @@ internal sealed class PinnedHelperTree : IDisposable
         var tree = new PinnedHelperTree(canonical, limits);
         try
         {
-            var files = new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
-            var directories = new Dictionary<string, PinnedHelperEntry>(StringComparer.OrdinalIgnoreCase);
             var rootEntry = PinnedHelperEntry.Open(
                 canonical, deleteCapable, writeDac, shareMode);
             if (!rootEntry.IsDirectory)
                 throw new UnsafeHelperFilesystemException();
             tree.entries.Add(rootEntry);
-            directories.Add(string.Empty, rootEntry);
+            tree.directories.Add(string.Empty, rootEntry);
             var pending = new Queue<(string Relative, string Full)>();
             pending.Enqueue((string.Empty, canonical));
             var entryCount = 0;
@@ -642,7 +643,7 @@ internal sealed class PinnedHelperTree : IDisposable
                     tree.entries.Add(entry);
                     if (entry.IsDirectory)
                     {
-                        if (!directories.TryAdd(relative, entry))
+                        if (!tree.directories.TryAdd(relative, entry))
                             throw new IOException("Duplicate helper directory.");
                         pending.Enqueue((relative, candidate));
                     }
@@ -651,13 +652,12 @@ internal sealed class PinnedHelperTree : IDisposable
                         totalBytes = checked(totalBytes + entry.Length);
                         if (totalBytes > limits.MaximumTreeBytes)
                             throw new HelperResourceLimitException();
-                        if (!files.TryAdd(relative, entry))
+                        if (!tree.files.TryAdd(relative, entry))
                             throw new IOException("Duplicate helper file.");
                     }
                 }
             }
-            tree.Files = files;
-            tree.Directories = directories;
+            tree.totalBytes = totalBytes;
             return tree;
         }
         catch
@@ -665,6 +665,119 @@ internal sealed class PinnedHelperTree : IDisposable
             tree.Dispose();
             throw;
         }
+    }
+
+    public static PinnedHelperTree CreateRelative(
+        PinnedHelperEntry parent,
+        string name,
+        ManagedBrowserHelperIntegrityLimits limits,
+        SecurityIdentifier user)
+    {
+        var root = Path.GetFullPath(Path.Combine(parent.FullPath, name));
+        var tree = new PinnedHelperTree(root, limits);
+        try
+        {
+            var rootEntry = PinnedHelperEntry.OpenRelativeDirectory(
+                parent, name, createIfMissing: false, deleteCapable: false,
+                shareMode: FileShare.Read | FileShare.Write, createNew: true);
+            rootEntry.ApplyWritableAcl(user, inheritToChildren: true);
+            tree.entries.Add(rootEntry);
+            tree.directories.Add(string.Empty, rootEntry);
+            parent.FlushDirectory();
+            return tree;
+        }
+        catch
+        {
+            tree.Dispose();
+            throw;
+        }
+    }
+
+    public void CreateRelativeDirectory(string relative, SecurityIdentifier user)
+    {
+        ThrowIfInvalidNewRelative(relative);
+        EnforceNextEntryLimits(relative, 0);
+        var (parentRelative, name) = SplitRelative(relative);
+        if (!directories.TryGetValue(parentRelative, out var parent))
+            throw new UnsafeHelperFilesystemException();
+        var entry = PinnedHelperEntry.OpenRelativeDirectory(
+            parent, name, createIfMissing: false, deleteCapable: false,
+            shareMode: FileShare.Read | FileShare.Write, createNew: true);
+        var treeOwnsEntry = false;
+        try
+        {
+            entry.ApplyWritableAcl(user, inheritToChildren: true);
+            if (!directories.TryAdd(relative, entry))
+                throw new UnsafeHelperFilesystemException();
+            entries.Add(entry);
+            treeOwnsEntry = true;
+            parent.FlushDirectory();
+        }
+        catch
+        {
+            if (!treeOwnsEntry) entry.Dispose();
+            throw;
+        }
+    }
+
+    public string CopyRelativeFile(
+        PinnedHelperEntry source,
+        string relative,
+        SecurityIdentifier user,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfInvalidNewRelative(relative);
+        EnforceNextEntryLimits(relative, source.Length);
+        var (parentRelative, name) = SplitRelative(relative);
+        if (!directories.TryGetValue(parentRelative, out var parent))
+            throw new UnsafeHelperFilesystemException();
+        var entry = PinnedHelperEntry.CreateRelativeCopy(
+            parent, name, source, cancellationToken, deleteCapable: false,
+            shareMode: FileShare.Read | FileShare.Write);
+        var treeOwnsEntry = false;
+        try
+        {
+            entry.ApplyWritableAcl(user);
+            if (!files.TryAdd(relative, entry))
+                throw new UnsafeHelperFilesystemException();
+            entries.Add(entry);
+            treeOwnsEntry = true;
+            totalBytes = checked(totalBytes + entry.Length);
+            parent.FlushDirectory();
+            return entry.FullPath;
+        }
+        catch
+        {
+            if (!treeOwnsEntry) entry.Dispose();
+            throw;
+        }
+    }
+
+    private void EnforceNextEntryLimits(string relative, long length)
+    {
+        var nextCount = checked(files.Count + directories.Count);
+        var depth = relative.Count(character => character == '/') + 1;
+        var nextBytes = checked(totalBytes + length);
+        if (nextCount > limits.MaximumTreeEntries || depth > limits.MaximumTreeDepth ||
+            nextBytes > limits.MaximumTreeBytes)
+            throw new HelperResourceLimitException();
+    }
+
+    private static (string Parent, string Name) SplitRelative(string relative)
+    {
+        var separator = relative.LastIndexOf('/');
+        return separator < 0
+            ? (string.Empty, relative)
+            : (relative[..separator], relative[(separator + 1)..]);
+    }
+
+    private static void ThrowIfInvalidNewRelative(string relative)
+    {
+        if (string.IsNullOrWhiteSpace(relative) || relative.StartsWith('/') ||
+            relative.EndsWith('/') || relative.Contains('\\') || relative.Contains(':') ||
+            relative.Split('/').Any(segment => string.IsNullOrWhiteSpace(segment) ||
+                segment is "." or ".." || segment.Any(char.IsControl)))
+            throw new UnsafeHelperFilesystemException();
     }
 
     public void EnsureDirectoriesUnchanged()
@@ -870,11 +983,9 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         var snapshotId = Guid.NewGuid();
         var containerName = $"snapshot-{snapshotId:N}";
         var container = Path.Combine(snapshotParent, containerName);
-        var payload = Path.Combine(container, PayloadDirectoryName);
         PinnedHelperEntry? containerFence = null;
         PinnedHelperEntry? markerFence = null;
         PinnedHelperEntry? activeLock = null;
-        PinnedHelperEntry? payloadFence = null;
         PinnedHelperEntry? readyMarkerFence = null;
         PinnedHelperEntry? readyCommitFence = null;
         PinnedHelperTree? pinned = null;
@@ -896,37 +1007,25 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.OwnershipPersisted);
             activeLock = PinnedHelperEntry.CreateRelativeFile(
                 containerFence, ActiveLockFileName, [], FileShare.None, deleteCapable: true);
-            payloadFence = PinnedHelperEntry.OpenRelativeDirectory(
-                containerFence, PayloadDirectoryName, createIfMissing: true,
-                deleteCapable: true);
-            payloadFence.ApplyWritableAcl(user, inheritToChildren: true);
+            pinned = PinnedHelperTree.CreateRelative(
+                containerFence, PayloadDirectoryName, limits, user);
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.ContainerCreated);
             foreach (var relative in source.Directories.Keys.Where(path => path.Length > 0)
                          .OrderBy(path => path.Count(character => character == '/'))
                          .ThenBy(path => path, StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                Directory.CreateDirectory(ToSnapshotPath(payload, relative));
+                pinned.CreateRelativeDirectory(relative, user);
             }
             foreach (var pair in source.Files.OrderBy(pair => pair.Key, StringComparer.Ordinal))
             {
                 observer?.Invoke(ManagedBrowserHelperSnapshotPhase.CopyingPayload);
                 cancellationToken.ThrowIfCancellationRequested();
-                var destination = ToSnapshotPath(payload, pair.Key);
-                pair.Value.CopyTo(destination, cancellationToken);
+                var destination = pinned.CopyRelativeFile(
+                    pair.Value, pair.Key, user, cancellationToken);
                 fileCopiedObserver?.Invoke(pair.Key, destination);
             }
-
-            var payloadVolume = payloadFence.VolumeSerialNumber;
-            var payloadFileId = payloadFence.FileId;
-            payloadFence.Dispose();
-            payloadFence = null;
-            pinned = PinnedHelperTree.Capture(
-                payload, limits, cancellationToken, writeDac: true);
-            var pinnedPayloadRoot = pinned.Directories[string.Empty];
-            if (pinnedPayloadRoot.VolumeSerialNumber != payloadVolume ||
-                !string.Equals(pinnedPayloadRoot.FileId, payloadFileId, StringComparison.Ordinal))
-                throw new UnsafeHelperFilesystemException();
+            pinned.EnsureEnumerationUnchanged(cancellationToken);
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.MarkerWritten);
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.PinningSnapshot);
             observer?.Invoke(ManagedBrowserHelperSnapshotPhase.SealingAcl);
@@ -972,10 +1071,9 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
             readyCommitFence?.Dispose();
             readyCommitFence = null;
             TryDeleteIncompleteSnapshot(
-                containerFence, pinned, payloadFence, activeLock, markerFence,
+                containerFence, pinned, payloadFence: null, activeLock, markerFence,
                 readyMarkerFence, user, limits);
             pinned?.Dispose();
-            payloadFence?.Dispose();
             activeLock?.Dispose();
             markerFence?.Dispose();
             readyMarkerFence?.Dispose();
@@ -1458,16 +1556,6 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         }
     }
 
-    private static string ToSnapshotPath(string root, string relative)
-    {
-        var full = Path.GetFullPath(Path.Combine(
-            root, relative.Replace('/', Path.DirectorySeparatorChar)));
-        var prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            throw new UnsafeHelperFilesystemException();
-        return full;
-    }
-
     private static byte[] SerializeMarker(OwnershipMarker marker)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(marker);
@@ -1626,7 +1714,9 @@ internal sealed class PinnedHelperEntry : IDisposable
         PinnedHelperEntry parent,
         string name,
         bool createIfMissing,
-        bool deleteCapable = false)
+        bool deleteCapable = false,
+        FileShare? shareMode = null,
+        bool createNew = false)
     {
         if (!parent.IsDirectory || string.IsNullOrWhiteSpace(name) || name is "." or ".." ||
             name.Any(char.IsControl) || name.Contains(Path.DirectorySeparatorChar) ||
@@ -1648,8 +1738,8 @@ internal sealed class PinnedHelperEntry : IDisposable
             out _,
             IntPtr.Zero,
             FileAttributeDirectory,
-            (uint)(FileShare.Read | FileShare.Write | FileShare.Delete),
-            createIfMissing ? FileOpenIf : 1u,
+            (uint)(shareMode ?? (FileShare.Read | FileShare.Write | FileShare.Delete)),
+            createNew ? FileCreate : createIfMissing ? FileOpenIf : FileOpen,
             FileDirectoryFile | FileSynchronousIoNonAlert | FileFlagOpenReparsePoint,
             IntPtr.Zero,
             0);
@@ -1671,6 +1761,80 @@ internal sealed class PinnedHelperEntry : IDisposable
                     finalPath.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
                 throw new UnsafeHelperFilesystemException();
             return new PinnedHelperEntry(expected, handle, info, isDirectory: true);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static PinnedHelperEntry CreateRelativeCopy(
+        PinnedHelperEntry parent,
+        string name,
+        PinnedHelperEntry source,
+        CancellationToken cancellationToken,
+        bool deleteCapable = false,
+        FileShare shareMode = FileShare.Read)
+    {
+        if (!parent.IsDirectory || source.IsDirectory || string.IsNullOrWhiteSpace(name) ||
+            name is "." or ".." || name.Any(char.IsControl) ||
+            name.Contains(Path.DirectorySeparatorChar) ||
+            name.Contains(Path.AltDirectorySeparatorChar) || name.Contains(':'))
+            throw new UnsafeHelperFilesystemException();
+        using var relative = new RelativeName(name);
+        var attributes = new ObjectAttributes
+        {
+            Length = Marshal.SizeOf<ObjectAttributes>(),
+            RootDirectory = parent.handle.DangerousGetHandle(),
+            ObjectName = relative.UnicodeStringPointer,
+            Attributes = ObjCaseInsensitive,
+        };
+        var status = NtCreateFile(
+            out var handle,
+            GenericRead | GenericWrite | ReadControl | WriteDac | Synchronize |
+            (deleteCapable ? DeleteAccess : 0),
+            ref attributes,
+            out _,
+            IntPtr.Zero,
+            FileAttributeNormal,
+            (uint)shareMode,
+            FileCreate,
+            FileNonDirectoryFile | FileSynchronousIoNonAlert | FileFlagOpenReparsePoint |
+            FileWriteThrough,
+            IntPtr.Zero,
+            0);
+        if (status < 0)
+        {
+            handle?.Dispose();
+            throw NtStatusException(status);
+        }
+        try
+        {
+            source.CopyToHandle(handle, cancellationToken);
+            if (!GetFileInformationByHandle(handle, out var info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
+                throw new UnsafeHelperFilesystemException();
+            var length = checked(((long)info.FileSizeHigh << 32) | info.FileSizeLow);
+            if (length != source.Length)
+                throw new IOException("Helper file changed while snapshotting.");
+            var expected = Path.GetFullPath(Path.Combine(parent.FullPath, name));
+            var finalPath = ReadFinalPath(handle);
+            if (!string.Equals(expected, finalPath, StringComparison.OrdinalIgnoreCase))
+                throw new UnsafeHelperFilesystemException();
+            var pinned = OpenRelativeFile(
+                parent, name, deleteCapable: false,
+                shareMode: FileShare.Read | FileShare.Write);
+            if (pinned.VolumeSerialNumber != info.VolumeSerialNumber ||
+                !string.Equals(pinned.FileId,
+                    $"{info.FileIndexHigh:x8}{info.FileIndexLow:x8}", StringComparison.Ordinal))
+            {
+                pinned.Dispose();
+                throw new UnsafeHelperFilesystemException();
+            }
+            handle.Dispose();
+            return pinned;
         }
         catch
         {
@@ -1941,14 +2105,15 @@ internal sealed class PinnedHelperEntry : IDisposable
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
-    public void CopyTo(string destination, CancellationToken cancellationToken)
+    private void CopyToHandle(SafeFileHandle destination, CancellationToken cancellationToken)
     {
         if (IsDirectory) throw new IOException("A helper directory cannot be copied as a file.");
-        using var borrowed = new SafeFileHandle(handle.DangerousGetHandle(), ownsHandle: false);
-        using var input = new FileStream(borrowed, FileAccess.Read, 64 * 1024, isAsync: false);
-        using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write,
-            FileShare.None, 64 * 1024, FileOptions.WriteThrough);
+        using var borrowedInput = new SafeFileHandle(handle.DangerousGetHandle(), ownsHandle: false);
+        using var borrowedOutput = new SafeFileHandle(destination.DangerousGetHandle(), ownsHandle: false);
+        using var input = new FileStream(borrowedInput, FileAccess.Read, 64 * 1024, isAsync: false);
+        using var output = new FileStream(borrowedOutput, FileAccess.Write, 64 * 1024, isAsync: false);
         input.Position = 0;
+        output.Position = 0;
         var buffer = new byte[64 * 1024];
         long total = 0;
         while (true)
@@ -1963,6 +2128,20 @@ internal sealed class PinnedHelperEntry : IDisposable
         output.Flush(flushToDisk: true);
         if (total != Length) throw new IOException("Helper file changed while snapshotting.");
         EnsureUnchanged();
+    }
+
+    public void FlushDirectory()
+    {
+        if (!IsDirectory) throw new IOException("A helper file cannot be flushed as a directory.");
+        RandomAccess.FlushToDisk(handle);
+        if (!GetFileInformationByHandle(handle, out var current) ||
+            current.VolumeSerialNumber != original.VolumeSerialNumber ||
+            current.FileIndexHigh != original.FileIndexHigh ||
+            current.FileIndexLow != original.FileIndexLow ||
+            (current.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)) !=
+            (original.FileAttributes & (FileAttributeDirectory | FileAttributeReparsePoint)))
+            throw new IOException("Helper directory identity changed while snapshotting.");
+        original = current;
     }
 
     public void EnsureUnchanged()

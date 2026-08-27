@@ -473,6 +473,112 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     }
 
     [Fact]
+    public async Task PayloadRootReplacementDuringCopyDoesNotWriteOutsideOwnedContainer()
+    {
+        using var fixture = HelperFixture.Create(additionalContents: new Dictionary<string, byte[]>
+        {
+            ["nested/payload.bin"] = [0x10, 0x20, 0x30, 0x40],
+        });
+        var testRoot = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-copy-root-race-{Guid.NewGuid():N}");
+        var snapshotParent = Path.Combine(testRoot, "snapshots");
+        var outside = Path.Combine(testRoot, "outside");
+        Directory.CreateDirectory(outside);
+        var sentinel = Path.Combine(outside, "sentinel.txt");
+        File.WriteAllText(sentinel, "untouched");
+        var outsideAcl = AclSddl(outside, isDirectory: true);
+        var sentinelAcl = AclSddl(sentinel, isDirectory: false);
+        string? container = null;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase != ManagedBrowserHelperSnapshotPhase.ContainerCreated) return;
+                container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                var payload = Path.Combine(container, "payload");
+                Directory.Move(payload, Path.Combine(container, "payload.parked"));
+                CreateDirectoryJunction(payload, outside);
+            });
+
+        await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+
+        var outsideEntries = Directory.EnumerateFileSystemEntries(outside)
+            .Select(path => Path.GetFileName(path)!).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        var sentinelContents = File.ReadAllText(sentinel);
+        var outsideAclAfter = AclSddl(outside, isDirectory: true);
+        var sentinelAclAfter = AclSddl(sentinel, isDirectory: false);
+        Assert.NotNull(container);
+        var junction = Path.Combine(container!, "payload");
+        if (Directory.Exists(junction)) Directory.Delete(junction);
+        if (Directory.Exists(container))
+        {
+            MakeWritableTree(container);
+            Directory.Delete(container, recursive: true);
+        }
+        Directory.Delete(testRoot, recursive: true);
+
+        Assert.Equal(new[] { "sentinel.txt" }, outsideEntries);
+        Assert.Equal("untouched", sentinelContents);
+        Assert.Equal(outsideAcl, outsideAclAfter);
+        Assert.Equal(sentinelAcl, sentinelAclAfter);
+    }
+
+    [Fact]
+    public async Task NestedPayloadDirectoryReplacementDuringCopyDoesNotWriteOutsideOwnedContainer()
+    {
+        using var fixture = HelperFixture.Create(additionalContents: new Dictionary<string, byte[]>
+        {
+            ["nested/payload.bin"] = [0x10, 0x20, 0x30, 0x40],
+        });
+        var testRoot = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-copy-nested-race-{Guid.NewGuid():N}");
+        var snapshotParent = Path.Combine(testRoot, "snapshots");
+        var outside = Path.Combine(testRoot, "outside");
+        Directory.CreateDirectory(outside);
+        var sentinel = Path.Combine(outside, "sentinel.txt");
+        File.WriteAllText(sentinel, "untouched");
+        var outsideAcl = AclSddl(outside, isDirectory: true);
+        var sentinelAcl = AclSddl(sentinel, isDirectory: false);
+        string? container = null;
+        var injected = false;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase != ManagedBrowserHelperSnapshotPhase.CopyingPayload || injected) return;
+                injected = true;
+                container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                var nested = Path.Combine(container, "payload", "nested");
+                Directory.Move(nested, Path.Combine(container, "payload", "nested.parked"));
+                CreateDirectoryJunction(nested, outside);
+            });
+
+        await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+
+        var outsideEntries = Directory.EnumerateFileSystemEntries(outside)
+            .Select(path => Path.GetFileName(path)!).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        var sentinelContents = File.ReadAllText(sentinel);
+        var outsideAclAfter = AclSddl(outside, isDirectory: true);
+        var sentinelAclAfter = AclSddl(sentinel, isDirectory: false);
+        Assert.NotNull(container);
+        var junction = Path.Combine(container!, "payload", "nested");
+        if (Directory.Exists(junction)) Directory.Delete(junction);
+        if (Directory.Exists(container))
+        {
+            MakeWritableTree(container);
+            Directory.Delete(container, recursive: true);
+        }
+        Directory.Delete(testRoot, recursive: true);
+
+        Assert.Equal(new[] { "sentinel.txt" }, outsideEntries);
+        Assert.Equal("untouched", sentinelContents);
+        Assert.Equal(outsideAcl, outsideAclAfter);
+        Assert.Equal(sentinelAcl, sentinelAclAfter);
+    }
+
+    [Fact]
     public async Task LockedCopiedPayloadBecomesRecoverableIncompleteSnapshotAfterCancellation()
     {
         using var fixture = HelperFixture.Create(additionalContents: new Dictionary<string, byte[]>
@@ -491,7 +597,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             {
                 if (!string.Equals(relative, "_asyncio.pyd", StringComparison.Ordinal)) return;
                 lockedPayload = new FileStream(destination, FileMode.Open, FileAccess.Read,
-                    FileShare.None);
+                    FileShare.Read | FileShare.Write);
                 cancellation.Cancel();
             });
 
