@@ -1,7 +1,9 @@
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Win32.SafeHandles;
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Reflection.PortableExecutable;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Security;
 
@@ -443,17 +445,97 @@ public sealed class BrowserExecutableVerifierTests
         Assert.DoesNotContain(ChromePath, result.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
-    [SelectedBrowserFact]
-    public async Task ExplicitlySelectedWindowsInstallationCanBeVerifiedReadOnly()
+    [SelectedBrowserFact(ChromeIntegrationDirectoryVariable)]
+    public Task ExplicitlySelectedChromeCompletesInitialAndLaunchVerification() =>
+        VerifyExplicitBrowserAsync(
+            ChromeIntegrationDirectoryVariable,
+            BrowserFamily.Chrome,
+            expectedPublisher: "Google LLC",
+            expectedProduct: "Google Chrome");
+
+    [SelectedBrowserFact(EdgeIntegrationDirectoryVariable)]
+    public Task ExplicitlySelectedEdgeCompletesInitialAndLaunchVerification() =>
+        VerifyExplicitBrowserAsync(
+            EdgeIntegrationDirectoryVariable,
+            BrowserFamily.Edge,
+            expectedPublisher: "Microsoft Corporation",
+            expectedProduct: "Microsoft Edge");
+
+    [Theory]
+    [InlineData(ChromeIntegrationDirectoryVariable)]
+    [InlineData(EdgeIntegrationDirectoryVariable)]
+    public void RequiredBrowserIntegrationDoesNotSkipAndFailsClearlyWhenDirectoryIsMissing(
+        string directoryVariable)
     {
-        var selectedDirectory = Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_BROWSER_DIRECTORY");
-        var familyText = Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_BROWSER_FAMILY");
-        Assert.True(Enum.TryParse<BrowserFamily>(familyText, ignoreCase: true, out var family));
+        var originalRequired = Environment.GetEnvironmentVariable(
+            "BAIDU_BATCH_REQUIRE_BROWSER_INTEGRATION");
+        var originalDirectory = Environment.GetEnvironmentVariable(directoryVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable("BAIDU_BATCH_REQUIRE_BROWSER_INTEGRATION", "1");
+            Environment.SetEnvironmentVariable(directoryVariable, null);
 
-        var result = await new BrowserExecutableVerifier().VerifyAsync(
-            selectedDirectory!, family, CancellationToken.None);
+            Assert.Null(new SelectedBrowserFactAttribute(directoryVariable).Skip);
+            var failure = Assert.Throws<InvalidOperationException>(() =>
+                RequireExplicitDirectory(directoryVariable, BrowserFamily.Chrome));
+            Assert.Equal("Required explicit browser integration directory is missing.", failure.Message);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(
+                "BAIDU_BATCH_REQUIRE_BROWSER_INTEGRATION", originalRequired);
+            Environment.SetEnvironmentVariable(directoryVariable, originalDirectory);
+        }
+    }
 
-        Assert.True(result.IsVerified, result.ErrorCode.ToString());
+    private const string ChromeIntegrationDirectoryVariable =
+        "BAIDU_BATCH_TRANSFER_TEST_CHROME_DIRECTORY";
+    private const string EdgeIntegrationDirectoryVariable =
+        "BAIDU_BATCH_TRANSFER_TEST_EDGE_DIRECTORY";
+
+    private static async Task VerifyExplicitBrowserAsync(
+        string directoryVariable,
+        BrowserFamily family,
+        string expectedPublisher,
+        string expectedProduct)
+    {
+        var selectedDirectory = RequireExplicitDirectory(directoryVariable, family);
+
+        var verifier = new BrowserExecutableVerifier();
+        var initial = await verifier.VerifyAsync(
+            selectedDirectory, family, CancellationToken.None);
+        Assert.True(
+            initial.IsVerified,
+            $"{family} initial verification failed with {initial.ErrorCode}.");
+        var identity = Assert.IsType<BrowserInstallationIdentity>(initial.Identity);
+        Assert.Equal(family, identity.BrowserFamily);
+        Assert.Equal(expectedPublisher, identity.Publisher);
+        Assert.Equal(expectedProduct, identity.ProductName);
+        Assert.True(HasSha256Suffix(identity.FileIdentity), "Verified identity has no SHA-256 suffix.");
+
+        var launch = await verifier.ReverifyForLaunchAsync(identity, CancellationToken.None);
+        Assert.True(
+            launch.IsVerified,
+            $"{family} launch verification failed with {launch.ErrorCode}.");
+        Assert.Same(identity, launch.Identity);
+    }
+
+    private static bool HasSha256Suffix(string identity)
+    {
+        var separator = identity.LastIndexOf(':');
+        return separator >= 0 && identity[(separator + 1)..] is { Length: 64 } hash &&
+               hash.All(Uri.IsHexDigit);
+    }
+
+    private static string RequireExplicitDirectory(string directoryVariable, BrowserFamily family)
+    {
+        var selectedDirectory = Environment.GetEnvironmentVariable(directoryVariable);
+        if (string.IsNullOrWhiteSpace(selectedDirectory))
+            throw new InvalidOperationException(
+                "Required explicit browser integration directory is missing.");
+        if (family is not (BrowserFamily.Chrome or BrowserFamily.Edge))
+            throw new ArgumentOutOfRangeException(nameof(family));
+        return selectedDirectory;
     }
 
     [Fact]
@@ -488,6 +570,38 @@ public sealed class BrowserExecutableVerifierTests
         Assert.True(File.Exists(processPath));
     }
 
+    [Fact]
+    public void ResourceIdentifierWithVersionOnlyInLowWordIsRejected()
+    {
+        var processPath = Environment.ProcessPath;
+        Assert.False(string.IsNullOrWhiteSpace(processPath));
+        var executableBytes = File.ReadAllBytes(processPath);
+        using (var peReader = new PEReader(new MemoryStream(executableBytes, writable: false)))
+        {
+            var directory = peReader.PEHeaders.PEHeader!.ResourceTableDirectory;
+            var section = Assert.Single(peReader.PEHeaders.SectionHeaders.Where(candidate =>
+                directory.RelativeVirtualAddress >= candidate.VirtualAddress &&
+                directory.RelativeVirtualAddress < candidate.VirtualAddress + candidate.VirtualSize));
+            var directoryOffset = checked(
+                directory.RelativeVirtualAddress - section.VirtualAddress + section.PointerToRawData);
+            var entryCount = BinaryPrimitives.ReadUInt16LittleEndian(
+                                 executableBytes.AsSpan(directoryOffset + 12, 2)) +
+                             BinaryPrimitives.ReadUInt16LittleEndian(
+                                 executableBytes.AsSpan(directoryOffset + 14, 2));
+            var versionEntryOffset = Enumerable.Range(0, entryCount)
+                .Select(index => directoryOffset + 16 + (index * 8))
+                .Single(offset => BinaryPrimitives.ReadUInt32LittleEndian(
+                    executableBytes.AsSpan(offset, 4)) == 16);
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                executableBytes.AsSpan(versionEntryOffset, 4), 0x00010010);
+        }
+
+        using var snapshot = new TemporaryFixtureSnapshot(executableBytes);
+
+        Assert.Throws<InvalidDataException>(() =>
+            new WindowsBrowserProductReader().ReadProductName(snapshot));
+    }
+
     private static Dependencies ValidDependencies() => new();
 
     private sealed class Dependencies
@@ -516,6 +630,30 @@ public sealed class BrowserExecutableVerifierTests
     {
         public SafeFileHandle SafeHandle { get; } = safeHandle;
         public void Dispose() => SafeHandle.Dispose();
+    }
+
+    private sealed class TemporaryFixtureSnapshot : IBrowserExecutableSnapshot
+    {
+        private readonly string path = Path.Combine(
+            Path.GetTempPath(), $"bbt-pe-fixture-{Guid.NewGuid():N}.exe");
+        private readonly FileStream stream;
+
+        public TemporaryFixtureSnapshot(byte[] bytes)
+        {
+            stream = new FileStream(
+                path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read,
+                bufferSize: 4096, FileOptions.DeleteOnClose);
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+            stream.Position = 0;
+        }
+
+        public SafeFileHandle SafeHandle => stream.SafeFileHandle;
+        public string SnapshotPath => path;
+        public long Length => stream.Length;
+        public string Sha256 => new('0', 64);
+        public Task<bool> ValidateAsync(CancellationToken cancellationToken) => Task.FromResult(true);
+        public void Dispose() => stream.Dispose();
     }
 
     private sealed class RecordingNativeHandleReader : IBrowserNativeHandleReader
@@ -694,18 +832,19 @@ public sealed class BrowserExecutableVerifierTests
 
 public sealed class SelectedBrowserFactAttribute : FactAttribute
 {
-    public SelectedBrowserFactAttribute()
+    public SelectedBrowserFactAttribute(string directoryVariable)
     {
-        var selectedDirectory = Environment.GetEnvironmentVariable(
-            "BAIDU_BATCH_TRANSFER_TEST_BROWSER_DIRECTORY");
-        var familyText = Environment.GetEnvironmentVariable(
-            "BAIDU_BATCH_TRANSFER_TEST_BROWSER_FAMILY");
-        if (string.IsNullOrWhiteSpace(selectedDirectory) ||
-            !Enum.TryParse<BrowserFamily>(familyText, ignoreCase: true, out var family) ||
-            family is not (BrowserFamily.Chrome or BrowserFamily.Edge))
+        ArgumentException.ThrowIfNullOrWhiteSpace(directoryVariable);
+        if (string.Equals(
+                Environment.GetEnvironmentVariable("BAIDU_BATCH_REQUIRE_BROWSER_INTEGRATION"),
+                "1",
+                StringComparison.Ordinal))
         {
-            Skip = "Set BAIDU_BATCH_TRANSFER_TEST_BROWSER_DIRECTORY and " +
-                   "BAIDU_BATCH_TRANSFER_TEST_BROWSER_FAMILY to run this read-only integration test.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(directoryVariable)))
+        {
+            Skip = $"Set {directoryVariable} to run this read-only integration test.";
         }
     }
 }

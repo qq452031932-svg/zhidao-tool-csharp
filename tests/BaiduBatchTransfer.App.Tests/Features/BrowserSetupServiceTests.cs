@@ -835,6 +835,69 @@ public sealed class BrowserSetupServiceTests
         Assert.Equal(1, state.SaveAttemptCount);
     }
 
+    [Fact]
+    public async Task BlockedVerifierKeepsIntentActiveUntilCancellationCleanupThenNextCommitIsConsistent()
+    {
+        const string committedDirectory = @"C:\Committed\Browser";
+        using var cancellation = new CancellationTokenSource();
+        var blockingVerifier = new BlockingBrowserExecutableVerifier();
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+        var primary = CreateService(
+            new RecordingBrowserDirectoryPicker(SelectedDirectory),
+            new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+            state,
+            blockingVerifier);
+        var ensurePicker = new RecordingBrowserDirectoryPicker(committedDirectory);
+        var reselectPicker = new RecordingBrowserDirectoryPicker(committedDirectory);
+        var observer = CreateService(
+            ensurePicker,
+            new RecordingBrowserDirectoryFileSystem(Path.Combine(committedDirectory, "msedge.exe")),
+            state);
+        var competingReselect = CreateService(
+            reselectPicker,
+            new RecordingBrowserDirectoryFileSystem(Path.Combine(committedDirectory, "msedge.exe")),
+            state);
+
+        var primaryTask = primary.ReselectAsync(cancellation.Token);
+        await blockingVerifier.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var activeSnapshot = await state.LoadAsync(CancellationToken.None);
+        var activeIntent = Assert.IsType<BrowserDirectorySelectionIntent>(activeSnapshot.PendingIntent);
+
+        var recovery = await observer.RecoverPendingIntentAsync(CancellationToken.None);
+        var ensure = await observer.EnsureSelectedAsync(CancellationToken.None);
+        var reselect = await competingReselect.ReselectAsync(CancellationToken.None);
+        var stillActive = await state.LoadAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserDirectoryRecoveryStatus.ActiveIntent, recovery.Status);
+        Assert.Equal(BrowserSetupStatus.StateChanged, ensure.Status);
+        Assert.Equal(BrowserSetupStatus.StateChanged, reselect.Status);
+        Assert.Equal(0, ensurePicker.BrowserDirectoryShowCount);
+        Assert.Equal(0, reselectPicker.BrowserDirectoryShowCount);
+        Assert.Equal(activeIntent.IntentId, stillActive.PendingIntent?.IntentId);
+        Assert.Equal(0, state.AbandonAttemptCount);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => primaryTask);
+        var cleaned = await state.LoadAsync(CancellationToken.None);
+        Assert.Null(cleaned.PendingIntent);
+        Assert.Equal(SavedDirectory, state.Directory);
+        Assert.Equal(1, state.AbandonAttemptCount);
+        Assert.Equal(0, state.SaveCount);
+
+        var committed = await CreateService(
+                new RecordingBrowserDirectoryPicker(committedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(committedDirectory, "msedge.exe")),
+                state)
+            .ReselectAsync(CancellationToken.None);
+        var committedSnapshot = await state.LoadAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Selected, committed.Status);
+        Assert.Equal(BrowserFamily.Edge, Assert.Single(committed.Candidates).BrowserFamily);
+        Assert.Equal(committedDirectory, state.Directory);
+        Assert.Null(committedSnapshot.PendingIntent);
+        Assert.Equal(1, state.SaveCount);
+    }
+
     private BrowserSetupService CreateService(
         IBrowserDirectoryPicker dialog,
         IBrowserDirectoryFileSystem fileSystem,
@@ -875,6 +938,36 @@ public sealed class BrowserSetupServiceTests
                 $"volume:file:{new string(family == BrowserFamily.Chrome ? 'a' : 'b', 64)}");
             VerifiedIdentities[family] = identity;
             return Task.FromResult(BrowserExecutableVerificationResult.Verified(identity));
+        }
+
+        public Task<BrowserExecutableVerificationResult> ReverifyForLaunchAsync(
+            BrowserInstallationIdentity expectedIdentity,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class BlockingBrowserExecutableVerifier : IBrowserExecutableVerifier
+    {
+        private readonly TaskCompletionSource release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<BrowserExecutableVerificationResult> VerifyAsync(
+            string selectedDirectory,
+            BrowserFamily family,
+            CancellationToken cancellationToken)
+        {
+            Started.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+            var identity = new BrowserInstallationIdentity(
+                Guid.NewGuid(), family, selectedDirectory,
+                Path.Combine(selectedDirectory, family == BrowserFamily.Chrome ? "chrome.exe" : "msedge.exe"),
+                family == BrowserFamily.Chrome ? "Google LLC" : "Microsoft Corporation",
+                family == BrowserFamily.Chrome ? "Google Chrome" : "Microsoft Edge",
+                $"volume:file:{new string(family == BrowserFamily.Chrome ? 'a' : 'b', 64)}");
+            return BrowserExecutableVerificationResult.Verified(identity);
         }
 
         public Task<BrowserExecutableVerificationResult> ReverifyForLaunchAsync(

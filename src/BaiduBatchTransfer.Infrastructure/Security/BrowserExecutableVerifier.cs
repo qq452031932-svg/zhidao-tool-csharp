@@ -1036,7 +1036,7 @@ internal sealed class WindowsBrowserProductReader : IBrowserProductReader
             EnsureRange(bytes, entryOffset, 8);
             var name = ReadUInt32(bytes, entryOffset);
             var target = ReadUInt32(bytes, checked(entryOffset + 4));
-            if ((name & ResourceDirectoryFlag) == 0 && (name & 0xffff) == id &&
+            if ((name & ResourceDirectoryFlag) == 0 && name == id &&
                 (target & ResourceDirectoryFlag) != 0)
             {
                 return checked((int)(target & ResourceOffsetMask));
