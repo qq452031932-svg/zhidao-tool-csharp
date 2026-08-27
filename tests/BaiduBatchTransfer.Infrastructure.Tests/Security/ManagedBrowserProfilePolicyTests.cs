@@ -246,6 +246,21 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     }
 
     [Fact]
+    public async Task Unavailable128BitIdentityFailsBeforeAnyProfileWrite()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var reader = new UnavailableIdentityReader();
+
+        var result = await new FileSystemManagedBrowserProfilePolicy(root, reader)
+            .GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.IdentityUnavailable, result.IsolationReason);
+        Assert.Equal(1, reader.Calls);
+        Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
     public async Task DescriptorAndResultToStringRedactEveryIdentityAndPath()
     {
         var result = await new FileSystemManagedBrowserProfilePolicy(root)
@@ -444,6 +459,30 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Assert.Equal(ManagedBrowserProfileIsolationReason.AccessControlMismatch, result.IsolationReason);
         Assert.True(File.Exists(Path.Combine(initial.Profile!.CanonicalSourcePath,
             FileSystemManagedBrowserProfilePolicy.MarkerName)));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task MarkerIdentityWithSameLow64ButDifferentHigh64IsRejected()
+    {
+        var accountId = Guid.NewGuid();
+        await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        var reader = new HighBitsChangingIdentityReader();
+        var policy = new FileSystemManagedBrowserProfilePolicy(root,
+            new ManagedBrowserProfilePolicyTestHooks
+            {
+                BeforeMarkerPinned = _ => reader.CaptureNextIdentity(),
+                AfterFirstMarkerRead = _ => reader.ChangeOnlyHigh64(),
+            },
+            reader);
+
+        var result = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+
+        Assert.True(reader.CapturedTarget);
+        Assert.True(reader.ReturnedDifferentHigh64);
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.ConcurrentMutation, result.IsolationReason);
     }
 
     [Fact]
@@ -724,6 +763,45 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
             ReceivedValidPinnedHandle = !pinnedVolumeRoot.IsInvalid && !pinnedVolumeRoot.IsClosed;
             if (throwOnRead) throw new IOException("Simulated volume capability failure.");
             return capabilities;
+        }
+    }
+
+    private sealed class UnavailableIdentityReader : IPinnedFileIdentityReader
+    {
+        public int Calls { get; private set; }
+        public bool TryRead(SafeFileHandle handle, out PinnedFileIdentity identity)
+        {
+            Calls++;
+            identity = default;
+            return false;
+        }
+    }
+
+    private sealed class HighBitsChangingIdentityReader : IPinnedFileIdentityReader
+    {
+        private PinnedFileIdentity? target;
+        private bool captureNext;
+        private bool changeHigh64;
+        public bool CapturedTarget => target is not null;
+        public bool ReturnedDifferentHigh64 { get; private set; }
+
+        public void CaptureNextIdentity() => captureNext = true;
+        public void ChangeOnlyHigh64() => changeHigh64 = true;
+
+        public bool TryRead(SafeFileHandle handle, out PinnedFileIdentity identity)
+        {
+            if (!PhysicalPinnedFileIdentityReader.Instance.TryRead(handle, out identity)) return false;
+            if (captureNext)
+            {
+                target = identity;
+                captureNext = false;
+            }
+            if (changeHigh64 && target == identity)
+            {
+                identity = identity with { FileIdHigh = identity.FileIdHigh ^ 1UL };
+                ReturnedDifferentHigh64 = true;
+            }
+            return true;
         }
     }
 
