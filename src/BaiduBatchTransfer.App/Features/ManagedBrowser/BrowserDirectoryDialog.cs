@@ -7,6 +7,11 @@ public interface IBrowserDirectoryDialog
     string? Show();
 }
 
+public interface IBrowserDirectoryPicker
+{
+    Task<string?> PickBrowserDirectoryAsync(CancellationToken cancellationToken = default);
+}
+
 public sealed class BrowserDirectoryDialog : IBrowserDirectoryDialog
 {
     public string? Show()

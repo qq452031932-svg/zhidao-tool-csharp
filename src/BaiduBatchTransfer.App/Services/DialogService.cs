@@ -11,11 +11,6 @@ public interface IDialogService
     Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default);
     Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default);
     Task<string?> PickExcelFileAsync(CancellationToken cancellationToken = default);
-    Task<string?> PickBrowserDirectoryAsync(CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<string?>(null);
-    }
 }
 
 public interface IUiDispatcher
@@ -61,7 +56,7 @@ public sealed class WpfExcelFileDialog : IExcelFileDialog
 public sealed class DialogService(
     IUiDispatcher dispatcher,
     IExcelFileDialog excelFileDialog,
-    IBrowserDirectoryDialog? browserDirectoryDialog = null) : IDialogService
+    IBrowserDirectoryDialog? browserDirectoryDialog = null) : IDialogService, IBrowserDirectoryPicker
 {
     public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default)
     {

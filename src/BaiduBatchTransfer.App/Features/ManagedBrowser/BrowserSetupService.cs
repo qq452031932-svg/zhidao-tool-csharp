@@ -14,6 +14,7 @@ public enum BrowserSetupStatus
     DirectoryUnavailable = 6,
     DialogUnavailable = 7,
     StateUnavailable = 8,
+    StateChanged = 9,
 }
 
 public sealed class BrowserDirectoryCandidate
@@ -62,39 +63,231 @@ public interface IBrowserDirectoryFileSystem
     Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken);
 }
 
-public sealed class BrowserDirectoryFileSystem : IBrowserDirectoryFileSystem
+public interface IExactFileExistenceProbe
 {
-    public Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken)
+    bool Exists(string exactPath);
+}
+
+public sealed class ExactFileExistenceProbe : IExactFileExistenceProbe
+{
+    public bool Exists(string exactPath) => File.Exists(exactPath);
+}
+
+public sealed class BrowserDirectoryFileSystem(IExactFileExistenceProbe? probe = null)
+    : IBrowserDirectoryFileSystem
+{
+    private readonly IExactFileExistenceProbe exactFileProbe = probe ?? new ExactFileExistenceProbe();
+
+    public async Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(exactPath);
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(File.Exists(exactPath));
+        return await Task.Run(
+            () =>
+            {
+                var exists = exactFileProbe.Exists(exactPath);
+                cancellationToken.ThrowIfCancellationRequested();
+                return exists;
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 }
 
 public interface IBrowserDirectoryState
 {
-    Task<string?> LoadAsync(CancellationToken cancellationToken);
-    Task SaveAsync(string selectedDirectory, CancellationToken cancellationToken);
+    Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Atomically and durably advances the revision and records a pending explicit-reselect
+    /// intent before returning. A later call supersedes every earlier pending intent.
+    /// </summary>
+    Task<BrowserDirectoryReselectIntent> BeginReselectAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Atomically commits the directory only when <paramref name="expectedRevision"/> is current.
+    /// An explicit reselect additionally requires its exact still-pending intent. Committed means
+    /// the durable commit point has passed, even if the caller token is cancelled immediately after.
+    /// </summary>
+    Task<BrowserDirectoryStateSaveResult> TrySaveAsync(
+        string selectedDirectory,
+        long expectedRevision,
+        BrowserDirectoryReselectIntent? reselectIntent,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Clears only the exact pending intent and advances the revision; it must not affect a newer intent.
+    /// </summary>
+    Task<bool> TryAbandonReselectAsync(
+        BrowserDirectoryReselectIntent reselectIntent,
+        CancellationToken cancellationToken);
+}
+
+public sealed class BrowserDirectoryReselectIntent
+{
+    public BrowserDirectoryReselectIntent(long revision)
+    {
+        if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        Revision = revision;
+    }
+
+    public long Revision { get; }
+
+    public override string ToString() =>
+        $"BrowserDirectoryReselectIntent {{ Revision = {Revision} }}";
+}
+
+public sealed class BrowserDirectoryStateSnapshot
+{
+    public BrowserDirectoryStateSnapshot(
+        string? directory,
+        long revision,
+        BrowserDirectoryReselectIntent? pendingReselect = null)
+    {
+        if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        Directory = directory;
+        Revision = revision;
+        PendingReselect = pendingReselect;
+    }
+
+    public string? Directory { get; }
+    public long Revision { get; }
+    public BrowserDirectoryReselectIntent? PendingReselect { get; }
+
+    public override string ToString() =>
+        $"BrowserDirectoryStateSnapshot {{ Directory = [REDACTED], Revision = {Revision}, ReselectPending = {PendingReselect is not null} }}";
+}
+
+public enum BrowserDirectoryStateSaveStatus
+{
+    Committed = 1,
+    Conflict = 2,
+}
+
+public sealed class BrowserDirectoryStateSaveResult
+{
+    private BrowserDirectoryStateSaveResult(BrowserDirectoryStateSaveStatus status, long revision)
+    {
+        Status = status;
+        Revision = revision;
+    }
+
+    public BrowserDirectoryStateSaveStatus Status { get; }
+    public long Revision { get; }
+
+    public static BrowserDirectoryStateSaveResult Committed(long revision)
+    {
+        if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        return new BrowserDirectoryStateSaveResult(BrowserDirectoryStateSaveStatus.Committed, revision);
+    }
+
+    public static BrowserDirectoryStateSaveResult Conflict() =>
+        new(BrowserDirectoryStateSaveStatus.Conflict, 0);
 }
 
 public sealed class BrowserSetupService(
-    IDialogService dialogService,
+    IBrowserDirectoryPicker dialogService,
     IBrowserDirectoryFileSystem fileSystem,
     IBrowserDirectoryState state)
 {
     private const string ChromeExecutableName = "chrome.exe";
     private const string EdgeExecutableName = "msedge.exe";
+    private readonly SemaphoreSlim flowGate = new(1, 1);
+
+    private sealed record SelectionAttemptResult(
+        BrowserSetupResult Result,
+        bool ReselectIntentCommitted);
 
     public async Task<BrowserSetupResult> EnsureSelectedAsync(
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-
-        string? savedDirectory;
+        await flowGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            savedDirectory = await state.LoadAsync(cancellationToken).ConfigureAwait(false);
+            return await EnsureSelectedCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            flowGate.Release();
+        }
+    }
+
+    public async Task<BrowserSetupResult> ReselectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await flowGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            BrowserDirectoryReselectIntent intent;
+            try
+            {
+                intent = await state.BeginReselectAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return Result(BrowserSetupStatus.StateUnavailable);
+            }
+
+            var intentCommitted = false;
+            try
+            {
+                var selection = await SelectAndPersistAsync(
+                    intent.Revision, intent, cancellationToken).ConfigureAwait(false);
+                intentCommitted = selection.ReselectIntentCommitted;
+                return selection.Result;
+            }
+            finally
+            {
+                if (!intentCommitted)
+                {
+                    try
+                    {
+                        await state.TryAbandonReselectAsync(intent, CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // A newer intent safely supersedes this one; cleanup is best effort.
+                    }
+                }
+            }
+        }
+        finally
+        {
+            flowGate.Release();
+        }
+    }
+
+    private async Task<BrowserSetupResult> EnsureSelectedCoreAsync(CancellationToken cancellationToken)
+    {
+        var loaded = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
+        if (loaded.Snapshot is null) return loaded.Error!;
+        var snapshot = loaded.Snapshot;
+
+        if (snapshot.PendingReselect is not null)
+            return Result(BrowserSetupStatus.StateChanged);
+
+        if (!string.IsNullOrWhiteSpace(snapshot.Directory))
+        {
+            var saved = await InspectAsync(snapshot.Directory, cancellationToken).ConfigureAwait(false);
+            if (saved.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired)
+                return saved;
+        }
+
+        return (await SelectAndPersistAsync(
+            snapshot.Revision, null, cancellationToken).ConfigureAwait(false)).Result;
+    }
+
+    private async Task<(BrowserDirectoryStateSnapshot? Snapshot, BrowserSetupResult? Error)> TryLoadStateAsync(
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (await state.LoadAsync(cancellationToken).ConfigureAwait(false), null);
         }
         catch (OperationCanceledException)
         {
@@ -102,26 +295,14 @@ public sealed class BrowserSetupService(
         }
         catch
         {
-            return Result(BrowserSetupStatus.StateUnavailable);
+            return (null, Result(BrowserSetupStatus.StateUnavailable));
         }
-
-        if (!string.IsNullOrWhiteSpace(savedDirectory))
-        {
-            var saved = await InspectAsync(savedDirectory, cancellationToken).ConfigureAwait(false);
-            if (saved.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired)
-                return saved;
-        }
-
-        return await SelectAndPersistAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<BrowserSetupResult> ReselectAsync(CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return SelectAndPersistAsync(cancellationToken);
-    }
-
-    private async Task<BrowserSetupResult> SelectAndPersistAsync(CancellationToken cancellationToken)
+    private async Task<SelectionAttemptResult> SelectAndPersistAsync(
+        long expectedRevision,
+        BrowserDirectoryReselectIntent? reselectIntent,
+        CancellationToken cancellationToken)
     {
         string? selectedDirectory;
         try
@@ -136,19 +317,23 @@ public sealed class BrowserSetupService(
         }
         catch
         {
-            return Result(BrowserSetupStatus.DialogUnavailable);
+            return Attempt(BrowserSetupStatus.DialogUnavailable);
         }
 
-        if (selectedDirectory is null) return Result(BrowserSetupStatus.Cancelled);
+        if (selectedDirectory is null) return Attempt(BrowserSetupStatus.Cancelled);
 
         var inspected = await InspectAsync(selectedDirectory, cancellationToken).ConfigureAwait(false);
         if (inspected.Status is not (BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired))
-            return inspected;
+            return new SelectionAttemptResult(inspected, false);
 
         try
         {
-            await state.SaveAsync(selectedDirectory, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
+            var save = await state.TrySaveAsync(
+                selectedDirectory, expectedRevision, reselectIntent, cancellationToken).ConfigureAwait(false);
+            if (save.Status == BrowserDirectoryStateSaveStatus.Committed)
+                return new SelectionAttemptResult(inspected, reselectIntent is not null);
+            return new SelectionAttemptResult(
+                await ResolveStateConflictAsync(cancellationToken).ConfigureAwait(false), false);
         }
         catch (OperationCanceledException)
         {
@@ -156,10 +341,23 @@ public sealed class BrowserSetupService(
         }
         catch
         {
-            return Result(BrowserSetupStatus.StateUnavailable);
+            return Attempt(BrowserSetupStatus.StateUnavailable);
         }
+    }
 
-        return inspected;
+    private async Task<BrowserSetupResult> ResolveStateConflictAsync(CancellationToken cancellationToken)
+    {
+        var reloaded = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
+        if (reloaded.Snapshot is null) return reloaded.Error!;
+        if (reloaded.Snapshot.PendingReselect is not null)
+            return Result(BrowserSetupStatus.StateChanged);
+        if (string.IsNullOrWhiteSpace(reloaded.Snapshot.Directory))
+            return Result(BrowserSetupStatus.StateChanged);
+
+        var current = await InspectAsync(reloaded.Snapshot.Directory, cancellationToken).ConfigureAwait(false);
+        return current.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired
+            ? current
+            : Result(BrowserSetupStatus.StateChanged);
     }
 
     private async Task<BrowserSetupResult> InspectAsync(
@@ -236,4 +434,7 @@ public sealed class BrowserSetupService(
     private static BrowserSetupResult Result(
         BrowserSetupStatus status,
         IReadOnlyList<BrowserDirectoryCandidate>? candidates = null) => new(status, candidates);
+
+    private static SelectionAttemptResult Attempt(BrowserSetupStatus status) =>
+        new(Result(status), false);
 }
