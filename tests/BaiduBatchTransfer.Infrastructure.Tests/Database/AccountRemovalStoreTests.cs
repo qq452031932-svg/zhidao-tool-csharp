@@ -529,12 +529,13 @@ public sealed class AccountRemovalStoreTests : IDisposable
               'account-removal-settings',1,'{}','share-request','Unknown',1,1,NULL,$at,NULL,
               NULL,NULL,0,NULL,NULL,NULL,$at,$at,'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
             INSERT INTO WebAutomationAttempts(
-              OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+              OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,
+              BaselinePersistedAt,Revision,CreatedAt,UpdatedAt,
               ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES
-              ($transfer,$account,1,'Transfer','Preparing',0,$at,$at,
+              ($transfer,$account,1,'Transfer','Succeeded','transfer-removal-baseline',$at,0,$at,$at,
                 'WebView2-v1','LegacyWebView2',$profile,NULL,NULL),
-              ($share,$account,1,'TransferShare','Preparing',0,$at,$at,
+              ($share,$account,1,'TransferShare','Succeeded','share-removal-baseline',$at,0,$at,$at,
                 'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
             INSERT INTO WebAutomationAttemptSourceItems(
               OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
@@ -1797,9 +1798,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         {
             await ExecuteAsync(factory, """
                 INSERT INTO WebAutomationAttempts(
-                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,
+                  BaselinePersistedAt,Revision,CreatedAt,UpdatedAt,
                   ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
-                VALUES($operation,$account,1,'TransferShare','Preparing',0,$at,$at,
+                VALUES($operation,$account,1,'TransferShare','Succeeded','share-removal-baseline',$at,0,$at,$at,
                   'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
                 INSERT INTO WebAutomationAttemptSourceItems(
                   OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
@@ -1860,9 +1862,10 @@ public sealed class AccountRemovalStoreTests : IDisposable
         {
             await ExecuteAsync(factory, """
                 INSERT INTO WebAutomationAttempts(
-                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt,
+                  OperationId,AccountId,Generation,OwnerKind,State,BaselineFingerprint,
+                  BaselinePersistedAt,Revision,CreatedAt,UpdatedAt,
                   ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
-                VALUES($operation,$account,1,'StandaloneShare','Preparing',0,$at,$at,
+                VALUES($operation,$account,1,'StandaloneShare','Succeeded','standalone-removal-baseline',$at,0,$at,$at,
                   'WebView2-v1','LegacyWebView2',$profile,NULL,NULL);
                 INSERT INTO WebAutomationAttemptRemoteItems(
                   OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
@@ -2229,6 +2232,224 @@ public sealed class ManagedBrowserAccountRemovalStoreTests : IDisposable
             ("$manifest", manifestId.ToString("D"))));
     }
 
+    [Fact]
+    public async Task TerminalManagedHistoryAndRetentionsAllowExactProfileRemovalWithoutRewritingSnapshots()
+    {
+        var fixture = await CreateAsync();
+        var owners = await SeedManagedTerminalHistoryAsync(fixture);
+        var before = await ReadManagedHistorySnapshotAsync(fixture.Factory, owners);
+        Assert.Equal(6, await ScalarLongAsync(fixture.Factory, """
+            SELECT COUNT(*) FROM ManagedBrowserRetentions
+            WHERE InstallationId=$installation AND SessionId=$session;
+            """,
+            ("$installation", fixture.Installation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.Session.Identity.SessionId.ToString("D"))));
+        var preview = await fixture.Removal.PreviewAsync(
+            fixture.AccountId, AccountExitHistoryMode.KeepHistory, default);
+        Assert.Equal(AccountExitStatus.Ready, preview.Status);
+        var cleanup = Cleanup(fixture, Guid.NewGuid());
+
+        var prepared = await fixture.Removal.PrepareRemovalAsync(
+            new AccountExitRequest(
+                fixture.AccountId,
+                AccountExitHistoryMode.KeepHistory,
+                preview.ConfirmationToken,
+                new DateTimeOffset(2026, 8, 27, 10, 0, 0, TimeSpan.Zero)),
+            cleanup,
+            default);
+
+        Assert.Equal(AccountRemovalPreparationStatus.Prepared, prepared.Status);
+        Assert.Equal(before, await ReadManagedHistorySnapshotAsync(fixture.Factory, owners));
+        Assert.Equal("QuarantinePending", await ScalarTextAsync(fixture.Factory,
+            "SELECT State FROM ManagedBrowserSessions WHERE SessionId=$session;",
+            ("$session", fixture.Session.Identity.SessionId.ToString("D"))));
+    }
+
+    [Theory]
+    [InlineData(ManagedRemovalOwnerKind.Transfer)]
+    [InlineData(ManagedRemovalOwnerKind.Share)]
+    [InlineData(ManagedRemovalOwnerKind.StandaloneShare)]
+    [InlineData(ManagedRemovalOwnerKind.Attempt)]
+    public async Task ReleasedRetentionCannotBypassNonTerminalManagedRemovalFence(
+        ManagedRemovalOwnerKind ownerKind)
+    {
+        var fixture = await CreateAsync();
+        var owners = await SeedManagedTerminalHistoryAsync(fixture);
+        await ExecuteAsync(fixture.Factory, ownerKind switch
+        {
+            ManagedRemovalOwnerKind.Transfer =>
+                "UPDATE TransferOperations SET Status='Waiting' WHERE Id=$id;",
+            ManagedRemovalOwnerKind.Share =>
+                "UPDATE ShareOperations SET Status='WaitingShare' WHERE Id=$id;",
+            ManagedRemovalOwnerKind.StandaloneShare =>
+                "UPDATE StandaloneShareOperations SET Status='Queued' WHERE Id=$id;",
+            ManagedRemovalOwnerKind.Attempt =>
+                "UPDATE WebAutomationAttempts SET State='Preparing' WHERE OperationId=$id;",
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        }, ("$id", (ownerKind switch
+        {
+            ManagedRemovalOwnerKind.Transfer => owners.Transfer,
+            ManagedRemovalOwnerKind.Share => owners.Share,
+            ManagedRemovalOwnerKind.StandaloneShare => owners.Standalone,
+            ManagedRemovalOwnerKind.Attempt => owners.Transfer,
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        }).ToString("D")));
+        await ReleaseAllManagedHistoryRetentionsAsync(fixture, owners);
+        Assert.Equal(0, await ScalarLongAsync(fixture.Factory, """
+            SELECT COUNT(*) FROM ManagedBrowserRetentions
+            WHERE InstallationId=$installation AND SessionId=$session;
+            """,
+            ("$installation", fixture.Installation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.Session.Identity.SessionId.ToString("D"))));
+        var before = await ReadManagedRemovalFenceSnapshotAsync(fixture.Factory, fixture.AccountId);
+
+        var preview = await fixture.Removal.PreviewAsync(
+            fixture.AccountId, AccountExitHistoryMode.KeepHistory, default);
+        var prepared = await fixture.Removal.PrepareRemovalAsync(
+            new AccountExitRequest(
+                fixture.AccountId,
+                AccountExitHistoryMode.KeepHistory,
+                string.Empty,
+                new DateTimeOffset(2026, 8, 27, 10, 0, 0, TimeSpan.Zero)),
+            Cleanup(fixture, Guid.NewGuid()),
+            default);
+
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, preview.Status);
+        Assert.Equal(AccountRemovalPreparationStatus.ActiveWorkBlocked, prepared.Status);
+        Assert.Equal(before, await ReadManagedRemovalFenceSnapshotAsync(fixture.Factory, fixture.AccountId));
+    }
+
+    private ManagedBrowserProfileCleanupPreparation Cleanup(Fixture fixture, Guid manifestId)
+    {
+        var source = Path.Combine(root, "managed-browser-profiles", "chrome", fixture.AccountId.ToString("N"));
+        var destination = Path.Combine(root, "managed-browser-quarantine", manifestId.ToString("N"));
+        return new ManagedBrowserProfileCleanupPreparation(
+            new ManagedBrowserLifecycleSession(
+                fixture.Session.Identity,
+                fixture.Installation.Revision,
+                fixture.Session.Revision,
+                source),
+            manifestId,
+            manifestRevision: 0,
+            destination);
+    }
+
+    private static async Task<ManagedHistoryOwners> SeedManagedTerminalHistoryAsync(Fixture fixture)
+    {
+        var owners = ManagedHistoryOwners.Create();
+        var now = "2026-08-27T09:30:00Z";
+        await ExecuteAsync(fixture.Factory, """
+            INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
+              OperationCount,ShareOperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,
+              ValidationMode,Status,CreatedAt,QueueOrder)
+            VALUES($batch,'managed-history','Text','Distribution','TaskCount','ProportionalReduction',1,
+              1,1,'/','None','Skip','Immediate','Completed',$now,1);
+            INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+              FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES($resource,$batch,1,'https://pan.baidu.com/s/managed-history','managed-history','1111',
+              'None','Valid','Expanded',$now,$now);
+            INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,
+              FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','managed-settings',$now);
+            INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,
+              PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'managed-history',1,1,1);
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,
+              TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,
+              OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,
+              RemoteItemIdsJson,SubmitState,TargetSlotState,DailyCountedAt,SubmitStartedAt,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Succeeded','NewTransfer',1,
+              'managed-transfer','{}','request','[]','ResultReceived','Fulfilled',$now,$now,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+              Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account,1,'Succeeded','managed-items','managed-settings',1,
+              'Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO StandaloneShareBatches(Id,DraftFingerprint,ResultDirectoryReference,Status,
+              OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES($standaloneBatch,'managed-draft','managed-results','Completed',1,0,$now,$now);
+            INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+              ParentPath,ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($standalone,$standaloneBatch,$account,1,'managed','File','/','managed-item',1,'Succeeded',
+              'Completed','Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+              BaselineFingerprint,BaselinePersistedAt,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES
+              ($transfer,$account,1,'Transfer','Succeeded','transfer-baseline',$now,0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session),
+              ($share,$account,1,'TransferShare','Succeeded','share-baseline',$now,0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session),
+              ($standalone,$account,1,'StandaloneShare','DefinitelyNotSubmitted',NULL,NULL,0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """,
+            ("$batch", owners.Batch.ToString("D")),
+            ("$resource", owners.Resource.ToString("D")),
+            ("$transfer", owners.Transfer.ToString("D")),
+            ("$share", owners.Share.ToString("D")),
+            ("$standaloneBatch", owners.StandaloneBatch.ToString("D")),
+            ("$standalone", owners.Standalone.ToString("D")),
+            ("$account", fixture.AccountId.ToString("D")),
+            ("$family", fixture.Session.Identity.BrowserFamily.ToString()),
+            ("$profile", fixture.Session.Identity.ProfileId),
+            ("$installation", fixture.Installation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.Session.Identity.SessionId.ToString("D")),
+            ("$now", now));
+        return owners;
+    }
+
+    private static async Task ReleaseAllManagedHistoryRetentionsAsync(
+        Fixture fixture,
+        ManagedHistoryOwners owners)
+    {
+        foreach (var owner in new[] { owners.Transfer, owners.Share, owners.Standalone })
+        {
+            await fixture.State.ReleaseRetentionAsync(new ManagedBrowserRetentionReference(
+                ManagedBrowserRetentionOwnerKind.Operation,
+                owner,
+                fixture.Installation.Identity.InstallationId,
+                fixture.Session.Identity.SessionId), default);
+            await fixture.State.ReleaseRetentionAsync(new ManagedBrowserRetentionReference(
+                ManagedBrowserRetentionOwnerKind.Attempt,
+                owner,
+                fixture.Installation.Identity.InstallationId,
+                fixture.Session.Identity.SessionId), default);
+        }
+    }
+
+    private static Task<string> ReadManagedHistorySnapshotAsync(
+        SqliteConnectionFactory factory,
+        ManagedHistoryOwners owners) => ScalarTextAsync(factory, """
+            SELECT
+              (SELECT Status || ':' || BrowserFamily || ':' || ProfileId || ':' || InstallationId || ':' || SessionId
+               FROM TransferOperations WHERE Id=$transfer)
+              || '|' ||
+              (SELECT Status || ':' || BrowserFamily || ':' || ProfileId || ':' || InstallationId || ':' || SessionId
+               FROM ShareOperations WHERE Id=$share)
+              || '|' ||
+              (SELECT Status || ':' || BrowserFamily || ':' || ProfileId || ':' || InstallationId || ':' || SessionId
+               FROM StandaloneShareOperations WHERE Id=$standalone)
+              || '|' ||
+              (SELECT group_concat(State, ',') FROM (
+                 SELECT State FROM WebAutomationAttempts
+                 WHERE OperationId IN ($transfer,$share,$standalone) ORDER BY OperationId));
+            """,
+            ("$transfer", owners.Transfer.ToString("D")),
+            ("$share", owners.Share.ToString("D")),
+            ("$standalone", owners.Standalone.ToString("D")));
+
+    private static Task<string> ReadManagedRemovalFenceSnapshotAsync(
+        SqliteConnectionFactory factory,
+        Guid accountId) => ScalarTextAsync(factory, """
+            SELECT Status || ':' || IsEnabled || ':' || COALESCE(RemovalState,'') || ':' ||
+              (SELECT COUNT(*) FROM ManagedProfileCleanupManifests WHERE AccountId=$account) || ':' ||
+              (SELECT COUNT(*) FROM ManagedBrowserCleanupClaims WHERE AccountId=$account)
+            FROM Accounts WHERE Id=$account;
+            """, ("$account", accountId.ToString("D")));
+
     private async Task<Fixture> CreateAsync()
     {
         Directory.CreateDirectory(root);
@@ -2262,7 +2483,7 @@ public sealed class ManagedBrowserAccountRemovalStoreTests : IDisposable
         var session = await state.CreateSessionAsync(sessionIdentity, default);
         session = (await state.TryReplaceActiveSessionAsync(
             new ManagedBrowserSessionActivationRequest(null, session), default)).Current!;
-        return new Fixture(factory, new SqliteAccountRemovalStore(factory), accountId, installation, session);
+        return new Fixture(factory, new SqliteAccountRemovalStore(factory), state, accountId, installation, session);
     }
 
     private static async Task ExecuteAsync(
@@ -2309,7 +2530,29 @@ public sealed class ManagedBrowserAccountRemovalStoreTests : IDisposable
     private sealed record Fixture(
         SqliteConnectionFactory Factory,
         SqliteAccountRemovalStore Removal,
+        SqliteManagedBrowserStateStore State,
         Guid AccountId,
         StoredBrowserInstallation Installation,
         StoredManagedBrowserSession Session);
+
+    private sealed record ManagedHistoryOwners(
+        Guid Batch,
+        Guid Resource,
+        Guid Transfer,
+        Guid Share,
+        Guid StandaloneBatch,
+        Guid Standalone)
+    {
+        public static ManagedHistoryOwners Create() => new(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
+    }
+
+    public enum ManagedRemovalOwnerKind
+    {
+        Transfer,
+        Share,
+        StandaloneShare,
+        Attempt,
+    }
 }

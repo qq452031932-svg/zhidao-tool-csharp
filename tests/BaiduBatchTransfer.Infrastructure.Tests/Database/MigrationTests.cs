@@ -38,10 +38,10 @@ public sealed class MigrationTests : IDisposable
         await migrator.MigrateAsync();
 
         await using var upgraded = await factory.OpenConnectionAsync();
-        Assert.Equal(16L, await ScalarAsync<long>(upgraded, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(17L, await ScalarAsync<long>(upgraded, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(1L, await ScalarAsync<long>(upgraded,
             "SELECT COUNT(*) FROM SchemaVersions WHERE Version=16;"));
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 16)).IsValid);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 17)).IsValid);
 
         foreach (var table in new[]
                  {
@@ -346,7 +346,7 @@ public sealed class MigrationTests : IDisposable
             .MigrateAsync();
 
         await using var upgraded = await factory.OpenConnectionAsync();
-        Assert.Equal(16L, await ScalarAsync<long>(upgraded,
+        Assert.Equal(17L, await ScalarAsync<long>(upgraded,
             "SELECT MAX(Version) FROM SchemaVersions;"));
         foreach (var orphan in new[]
                  {
@@ -733,6 +733,58 @@ public sealed class MigrationTests : IDisposable
     }
 
     [Fact]
+    public async Task VersionSeventeenUpgradeReplacesManagedLifecycleTriggersAndIsIdempotent()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v16-to-v17.db");
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 16; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+
+            Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 16)).IsValid);
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        var backup = new DatabaseBackupService(factory, Path.Combine(root, "v17-backups"));
+        var migrator = new DatabaseMigrator(factory, backup, "new");
+
+        await migrator.MigrateAsync();
+        await migrator.MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal(17L, await ScalarAsync<long>(upgraded,
+            "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM SchemaVersions WHERE Version=17;"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 17)).IsValid);
+
+        foreach (var trigger in new[]
+                 {
+                     "TR_TransferOperations_RejectCleanupClaim_Insert",
+                     "TR_ShareOperations_RejectCleanupClaim_Insert",
+                     "TR_StandaloneShareOperations_RejectCleanupClaim_Insert",
+                     "TR_WebAutomationAttempts_RejectCleanupClaim_Insert",
+                 })
+        {
+            var sql = await ScalarAsync<string>(upgraded,
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=$name;",
+                ("$name", trigger));
+            Assert.Contains("session.State='Active'", sql, StringComparison.Ordinal);
+        }
+
+        var preserved = Assert.Single(await backup.ListValidatedBackupsAsync());
+        Assert.Equal(16, preserved.SchemaVersion);
+        Assert.True(preserved.IsValid);
+    }
+
+    [Fact]
     public async Task VersionSixteenCorruptIdentityRollsBackWithoutReplacingVersionFifteenRows()
     {
         Directory.CreateDirectory(root);
@@ -821,7 +873,7 @@ public sealed class MigrationTests : IDisposable
             .MigrateAsync();
 
         await using var live = await factory.OpenConnectionAsync();
-        Assert.Equal(16L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(17L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(0L, await ScalarAsync<long>(live, """
             SELECT COUNT(*) FROM WebAutomationAttempts
             WHERE OperationId=$operation AND Generation=1;
@@ -1506,7 +1558,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(16, DatabaseMigrator.LatestVersion);
+        Assert.Equal(17, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -1555,7 +1607,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(16, DatabaseMigrator.LatestVersion);
+        Assert.Equal(17, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));

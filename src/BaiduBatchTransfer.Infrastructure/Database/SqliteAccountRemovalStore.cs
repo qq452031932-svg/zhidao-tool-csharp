@@ -372,26 +372,27 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
         if (exactIdentityCount != 1)
             return AccountRemovalPreparationStatus.StaleConfirmation;
 
-        var retainedOwners = await ScalarLongAsync(connection, transaction, """
+        var activeOwners = await ScalarLongAsync(connection, transaction, """
             SELECT
-              (SELECT COUNT(*) FROM TransferOperations
-                WHERE InstallationId=$installation AND SessionId=$session)
+              (SELECT COUNT(*) FROM TransferOperations operation
+                WHERE operation.InstallationId=$installation AND operation.SessionId=$session
+                  AND operation.Status NOT IN ('Succeeded','Failed','Cancelled'))
               +
-              (SELECT COUNT(*) FROM ShareOperations
-                WHERE InstallationId=$installation AND SessionId=$session)
+              (SELECT COUNT(*) FROM ShareOperations operation
+                WHERE operation.InstallationId=$installation AND operation.SessionId=$session
+                  AND operation.Status NOT IN ('Succeeded','Failed','ReusedExisting','Cancelled'))
               +
-              (SELECT COUNT(*) FROM StandaloneShareOperations
-                WHERE InstallationId=$installation AND SessionId=$session)
+              (SELECT COUNT(*) FROM StandaloneShareOperations operation
+                WHERE operation.InstallationId=$installation AND operation.SessionId=$session
+                  AND operation.Status NOT IN ('Succeeded','Failed','Cancelled'))
               +
-              (SELECT COUNT(*) FROM WebAutomationAttempts
-                WHERE InstallationId=$installation AND SessionId=$session)
-              +
-              (SELECT COUNT(*) FROM ManagedBrowserRetentions
-                WHERE InstallationId=$installation AND SessionId=$session);
+              (SELECT COUNT(*) FROM WebAutomationAttempts attempt
+                WHERE attempt.InstallationId=$installation AND attempt.SessionId=$session
+                  AND attempt.State NOT IN ('Succeeded','DefinitelyNotSubmitted'));
             """, token,
             ("$installation", Id(session.InstallationId)),
             ("$session", Id(session.SessionId))).ConfigureAwait(false);
-        if (retainedOwners != 0)
+        if (activeOwners != 0)
             return AccountRemovalPreparationStatus.ActiveWorkBlocked;
 
         var now = DateTimeOffset.UtcNow.ToString("O");
@@ -643,6 +644,10 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
               +
               (SELECT COUNT(*) FROM RemoteSelectionSessions selection
                 WHERE selection.AccountId=$account AND selection.State IN ('Active','NeedsDecision'))
+              +
+              (SELECT COUNT(*) FROM WebAutomationAttempts attempt
+                WHERE attempt.AccountId=$account
+                  AND attempt.State NOT IN ('Succeeded','DefinitelyNotSubmitted'))
               +
               (SELECT COUNT(*) FROM WebAutomationAttempts attempt
                 WHERE attempt.AccountId=$account AND attempt.OwnerKind='RemoteSelection'

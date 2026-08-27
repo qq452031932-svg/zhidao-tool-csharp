@@ -4,7 +4,7 @@ namespace BaiduBatchTransfer.Infrastructure.Database;
 
 public sealed class DatabaseMigrator
 {
-    public const int LatestVersion = 16;
+    public const int LatestVersion = 17;
     private readonly SqliteConnectionFactory factory;
     private readonly DatabaseBackupService backupService;
     private readonly DatabaseIntegrityService integrityService;
