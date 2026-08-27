@@ -28,6 +28,8 @@ $helperSource = Join-Path $repoRoot 'tools\managed_browser_helper'
 $requirementsPath = Join-Path $helperSource 'requirements.lock'
 $embeddedManifestPath = Join-Path $helperSource 'helper-manifest.json'
 $noticeSourcePath = Join-Path $helperSource 'THIRD_PARTY_NOTICES.txt'
+$mplLicenseSourcePath = Join-Path $helperSource 'license-inputs\MPL-2.0.txt'
+$mplLicenseSha256 = '3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04'
 $outputPath = [IO.Path]::GetFullPath($OutputDirectory)
 if ([string]::IsNullOrWhiteSpace($PackageCacheDirectory)) {
     $PackageCacheDirectory = Join-Path $repoRoot '.artifacts\managed-browser-helper-cache'
@@ -41,12 +43,20 @@ if (Test-Path -LiteralPath $outputPath) {
     throw "OutputDirectory must not already exist: $outputPath"
 }
 foreach ($requiredSource in @($requirementsPath, $noticeSourcePath,
-        (Join-Path $helperSource 'main.py'), (Join-Path $helperSource 'protocol.py'))) {
+        $mplLicenseSourcePath, (Join-Path $helperSource 'main.py'),
+        (Join-Path $helperSource 'protocol.py'))) {
     if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
         throw "Required helper input is missing: $requiredSource"
     }
 }
+if ((Get-FileHash -LiteralPath $mplLicenseSourcePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+        $mplLicenseSha256) {
+    throw 'The reviewed MPL-2.0 source input digest does not match the locked value.'
+}
 [IO.Directory]::CreateDirectory($cachePath) | Out-Null
+if (([IO.File]::GetAttributes($cachePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'The package cache directory must not be a reparse point.'
+}
 
 function Get-LowerSha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -98,6 +108,9 @@ function Get-VerifiedDownload(
     [string]$Destination,
     [string]$ExpectedSha256) {
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        if (([IO.File]::GetAttributes($Destination) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Cached input must not be a reparse point: $Destination"
+        }
         if ((Get-LowerSha256 $Destination) -eq $ExpectedSha256) { return $Destination }
         throw "Cached input digest mismatch: $Destination"
     }
@@ -112,6 +125,31 @@ function Get-VerifiedDownload(
     }
     finally {
         if (Test-Path -LiteralPath $partial) { [IO.File]::Delete($partial) }
+    }
+    return $Destination
+}
+
+function Copy-VerifiedInputToPrivateStaging(
+    [string]$Source,
+    [string]$Destination,
+    [string]$ExpectedSha256) {
+    if (([IO.File]::GetAttributes($Source) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Build input must not be a reparse point: $Source"
+    }
+    $input = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    $output = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $input.CopyTo($output)
+        $output.Flush($true)
+    }
+    finally {
+        $output.Dispose()
+        $input.Dispose()
+    }
+    if ((Get-LowerSha256 $Destination) -ne $ExpectedSha256) {
+        throw "Private staged build input digest mismatch: $Destination"
     }
     return $Destination
 }
@@ -195,8 +233,19 @@ foreach ($requirement in $requirements) {
 $outputParent = [IO.Path]::GetDirectoryName($outputPath)
 [IO.Directory]::CreateDirectory($outputParent) | Out-Null
 $staging = Join-Path $outputParent ('.managed-helper-staging-' + [Guid]::NewGuid().ToString('N'))
+$inputStaging = Join-Path $outputParent ('.managed-helper-inputs-' + [Guid]::NewGuid().ToString('N'))
 try {
     [IO.Directory]::CreateDirectory($staging) | Out-Null
+    [IO.Directory]::CreateDirectory($inputStaging) | Out-Null
+    $pythonArchive = Copy-VerifiedInputToPrivateStaging $pythonArchive `
+        (Join-Path $inputStaging $pythonArchiveName) $pythonArchiveSha256
+    $privateWheels = @()
+    for ($index = 0; $index -lt $wheels.Count; $index++) {
+        $privateWheels += Copy-VerifiedInputToPrivateStaging $wheels[$index] `
+            (Join-Path $inputStaging ([IO.Path]::GetFileName($wheels[$index]))) `
+            $requirements[$index].Hash
+    }
+    $wheels = $privateWheels
     Expand-SafeZip $pythonArchive $staging
     $sitePackages = Join-Path $staging 'site-packages'
     [IO.Directory]::CreateDirectory($sitePackages) | Out-Null
@@ -211,7 +260,6 @@ try {
     $pthLines = @([IO.File]::ReadAllLines($pthPath) | Where-Object { $_ -notmatch '^#?import site$' })
     $pthLines += '.'
     $pthLines += 'site-packages'
-    $pthLines += 'import site'
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($pthPath, (($pthLines -join "`n") + "`n"), $utf8NoBom)
 
@@ -227,15 +275,11 @@ try {
     }
     $noticeParts.Add($generatedNoticeMarker)
     $noticeParts.Add(([IO.File]::ReadAllText($pythonLicense).Replace("`r`n", "`n")))
-    $licenseFiles = [string[]]@([IO.Directory]::EnumerateFiles($sitePackages, '*', [IO.SearchOption]::AllDirectories) |
-        Where-Object {
-            $leaf = [IO.Path]::GetFileName($_)
-            $leaf -match '^(LICENSE|LICENCE|COPYING|NOTICE)(\..*)?$'
-        })
-    [Array]::Sort($licenseFiles, [StringComparer]::Ordinal)
+    $declaredLicenseFiles = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($requirement in $requirements) {
         $normalizedRequiredName = ($requirement.Name -replace '[-_.]+', '-').ToLowerInvariant()
         $matchingMetadataDirectory = $null
+        $matchingMetadataText = $null
         foreach ($metadataFile in [IO.Directory]::EnumerateFiles(
                 $sitePackages, 'METADATA', [IO.SearchOption]::AllDirectories)) {
             if (-not ([IO.Path]::GetDirectoryName($metadataFile).EndsWith('.dist-info',
@@ -253,21 +297,42 @@ try {
                     throw "Duplicate distribution metadata for $($requirement.Name)==$($requirement.Version)."
                 }
                 $matchingMetadataDirectory = [IO.Path]::GetDirectoryName($metadataFile)
+                $matchingMetadataText = $metadataText
             }
         }
         if ($null -eq $matchingMetadataDirectory) {
             throw "Distribution metadata is missing for $($requirement.Name)==$($requirement.Version)."
         }
-        $packageLicense = @($licenseFiles | Where-Object {
-            $_.StartsWith($matchingMetadataDirectory.TrimEnd('\') + '\',
-                [StringComparison]::OrdinalIgnoreCase)
-        })
-        if ($packageLicense.Count -eq 0) {
-            throw "Bundled license text is missing for $($requirement.Name)==$($requirement.Version)."
+        $licenseDeclarations = @([Text.RegularExpressions.Regex]::Matches(
+            $matchingMetadataText, '^License-File:\s*(.+?)\s*$',
+            [Text.RegularExpressions.RegexOptions]::Multiline) | ForEach-Object {
+                $_.Groups[1].Value
+            })
+        if ($licenseDeclarations.Count -eq 0) {
+            throw "METADATA License-File is missing for $($requirement.Name)==$($requirement.Version)."
+        }
+        foreach ($declaration in $licenseDeclarations) {
+            $declaredRelative = $declaration.Replace('\', '/')
+            if (-not (Test-SafeRelativePath $declaredRelative)) {
+                throw "Unsafe METADATA License-File for $($requirement.Name)==$($requirement.Version)."
+            }
+            $candidates = @(@(
+                    (Join-Path $matchingMetadataDirectory ($declaredRelative.Replace('/', '\'))),
+                    (Join-Path (Join-Path $matchingMetadataDirectory 'licenses') `
+                        ($declaredRelative.Replace('/', '\')))
+                ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+            if ($candidates.Count -ne 1) {
+                throw "Declared license text is missing or ambiguous for $($requirement.Name)==$($requirement.Version): $declaration"
+            }
+            [void]$declaredLicenseFiles.Add([IO.Path]::GetFullPath($candidates[0]))
         }
     }
+    $licenseFiles = [string[]]@($declaredLicenseFiles)
+    [Array]::Sort($licenseFiles, [StringComparer]::Ordinal)
+    $noticeParts.Add("`n===== Locked MPL-2.0 complete license text =====`n")
+    $noticeParts.Add(([IO.File]::ReadAllText($mplLicenseSourcePath).Replace("`r`n", "`n")))
     foreach ($licenseFile in $licenseFiles) {
-            $relativeLicense = (Get-RelativeChildPath $sitePackages $licenseFile).Replace('\', '/')
+        $relativeLicense = (Get-RelativeChildPath $sitePackages $licenseFile).Replace('\', '/')
         $noticeParts.Add("`n===== $relativeLicense =====`n")
         $noticeParts.Add(([IO.File]::ReadAllText($licenseFile).Replace("`r`n", "`n")))
     }
@@ -318,5 +383,8 @@ try {
 finally {
     if ($null -ne $staging -and (Test-Path -LiteralPath $staging)) {
         [IO.Directory]::Delete($staging, $true)
+    }
+    if (Test-Path -LiteralPath $inputStaging) {
+        [IO.Directory]::Delete($inputStaging, $true)
     }
 }

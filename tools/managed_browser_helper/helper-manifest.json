@@ -4,7 +4,7 @@
     "executionEngineVersion":  "ManagedChromium-v1",
     "pythonVersion":  "3.14.0",
     "distributionMode":  "PersonalNonCommercial",
-    "buildIdentity":  "ba1d03a0f99d1065aaa774da2d80604eb4f340cc85d8b95e5a3a960afb887460",
+    "buildIdentity":  "982899894d253307eb38456f9596e4cd6ffe212779a4f38797417682ca7c141e",
     "files":  [
                   {
                       "path":  "LICENSE.txt",
@@ -13,8 +13,8 @@
                   },
                   {
                       "path":  "THIRD_PARTY_NOTICES.txt",
-                      "length":  95335,
-                      "sha256":  "2b05ef1a8ad2f7598644ade26ff0c9e0b452ffc862af95d9c1e3cc1e3dcd0343"
+                      "length":  118749,
+                      "sha256":  "a5ce1bdafca726d66295cc0959645184121187f487745f0c1ef9d86ae2243e69"
                   },
                   {
                       "path":  "_asyncio.pyd",
@@ -123,8 +123,8 @@
                   },
                   {
                       "path":  "main.py",
-                      "length":  11808,
-                      "sha256":  "f1d5772e4207354e0726968d799d5471a28542c037e44a6a5baf6f396e5db30d"
+                      "length":  12031,
+                      "sha256":  "f67ea28e16edfc16e26b1fb3938e1a2575e22cf15046c86c280666a58fa95d9e"
                   },
                   {
                       "path":  "protocol.py",
@@ -153,8 +153,8 @@
                   },
                   {
                       "path":  "python314._pth",
-                      "length":  90,
-                      "sha256":  "aedbf501df20305724efd28c71d7f5b2b61755ba5dac030c01d9c61ea1648230"
+                      "length":  78,
+                      "sha256":  "b889d012b13bcaaac4acdbfaddd8a11234824a97865c8e619139667db17c6840"
                   },
                   {
                       "path":  "python314.dll",

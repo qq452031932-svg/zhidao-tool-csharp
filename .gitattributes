@@ -1,1 +1,8 @@
-tools/managed_browser_helper/THIRD_PARTY_NOTICES.txt whitespace=-blank-at-eol,-blank-at-eof
+scripts/build_managed_browser_helper.ps1 text eol=lf
+scripts/verify_managed_browser_helper_package.ps1 text eol=lf
+tools/managed_browser_helper/main.py text eol=lf
+tools/managed_browser_helper/protocol.py text eol=lf
+tools/managed_browser_helper/requirements.lock text eol=lf
+tools/managed_browser_helper/helper-manifest.json text eol=lf
+tools/managed_browser_helper/license-inputs/* text eol=lf
+tools/managed_browser_helper/THIRD_PARTY_NOTICES.txt text eol=lf whitespace=-blank-at-eol,-blank-at-eof

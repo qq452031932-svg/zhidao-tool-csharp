@@ -67,6 +67,9 @@ class FragmentedReader:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_entrypoint_disables_bytecode_writes_before_runtime_imports(self):
+        self.assertTrue(sys.dont_write_bytecode)
+
     def test_frame_is_big_endian_utf8_and_round_trips(self):
         encoded = protocol.encode_message(request())
         self.assertEqual(len(encoded) - 4, struct.unpack(">I", encoded[:4])[0])

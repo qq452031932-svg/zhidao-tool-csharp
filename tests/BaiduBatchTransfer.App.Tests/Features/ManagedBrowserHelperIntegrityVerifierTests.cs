@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -11,20 +12,29 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         "BAIDU_BATCH_TRANSFER_TEST_HELPER_DIRECTORY";
 
     [Fact]
-    public async Task ValidExactBundleIsPinnedForLaunch()
+    public async Task ValidExactBundleIsCopiedToPrivateReadOnlySnapshotForLaunch()
     {
         using var fixture = HelperFixture.Create();
         var verifier = new ManagedBrowserHelperIntegrityVerifier(fixture.ManifestBytes);
 
-        var verified = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        using var verified = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
 
-        Assert.EndsWith("python.exe", verified.ExecutablePath, StringComparison.OrdinalIgnoreCase);
-        Assert.EndsWith("main.py", verified.MainScriptPath, StringComparison.OrdinalIgnoreCase);
+        var executablePath = verified.ExecutablePath;
+        var mainScriptPath = verified.MainScriptPath;
+        var snapshotRoot = Path.GetDirectoryName(executablePath)!;
+        Assert.EndsWith("python.exe", executablePath, StringComparison.OrdinalIgnoreCase);
+        Assert.EndsWith("main.py", mainScriptPath, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual(Path.GetFullPath(fixture.Root), Path.GetFullPath(snapshotRoot));
         Assert.Equal(fixture.BuildIdentity, verified.BuildIdentity);
-        Assert.ThrowsAny<IOException>(() =>
-            File.WriteAllText(Path.Combine(fixture.Root, "main.py"), "replacement"));
+        File.WriteAllText(Path.Combine(fixture.Root, "late-injection.pth"), "import injected");
+        Assert.False(File.Exists(Path.Combine(snapshotRoot, "late-injection.pth")));
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            File.WriteAllText(mainScriptPath, "replacement"));
+        Assert.Throws<UnauthorizedAccessException>(() =>
+            File.WriteAllText(Path.Combine(snapshotRoot, "late-injection.pth"), "import injected"));
         verified.Dispose();
-        File.WriteAllText(Path.Combine(fixture.Root, "main.py"), "replacement after disposal");
+        Assert.False(Directory.Exists(snapshotRoot));
+        Assert.Throws<ObjectDisposedException>(() => _ = verified.ExecutablePath);
     }
 
     [Fact]
@@ -113,6 +123,23 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             verifier.VerifyAsync(fixture.Root, CancellationToken.None));
 
         Assert.Equal(ManagedBrowserHelperIntegrityError.UnlistedPayload, error.Error);
+    }
+
+    [Fact]
+    public async Task TreeEntryLimitIsEnforcedWhileEnumerating()
+    {
+        using var fixture = HelperFixture.Create();
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes,
+            new ManagedBrowserHelperIntegrityLimits(
+                MaximumTreeEntries: 3,
+                MaximumTreeDepth: 8,
+                MaximumTreeBytes: 1024 * 1024));
+
+        var error = await Assert.ThrowsAsync<ManagedBrowserHelperIntegrityException>(() =>
+            verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+
+        Assert.Equal(ManagedBrowserHelperIntegrityError.ResourceLimitExceeded, error.Error);
     }
 
     [Theory]
@@ -248,6 +275,102 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         Assert.False(verified.IsDisposed);
         Assert.Matches("^[0-9a-f]{64}$", verified.BuildIdentity);
     }
+
+    [SelectedManagedHelperPackageFact(HelperIntegrationDirectoryVariable)]
+    public void PackagedRuntimeDisablesSiteAndCarriesCompleteLockedLicenseCorpus()
+    {
+        var root = RequiredIntegrationRoot();
+        var pth = File.ReadAllText(Path.Combine(root, "python314._pth"));
+        var notices = File.ReadAllText(Path.Combine(root, "THIRD_PARTY_NOTICES.txt"));
+
+        Assert.DoesNotContain("import site", pth, StringComparison.Ordinal);
+        Assert.Contains("===== Locked MPL-2.0 complete license text =====", notices,
+            StringComparison.Ordinal);
+        Assert.Contains("2.1. Grants", notices, StringComparison.Ordinal);
+        Assert.Contains("===== lxml-6.1.2.dist-info/licenses/LICENSES.txt =====", notices,
+            StringComparison.Ordinal);
+        Assert.Contains("**zlib**: zlib-license", notices, StringComparison.Ordinal);
+        Assert.Contains("**iconv**: LGPL 2.1", notices, StringComparison.Ordinal);
+        Assert.Contains("**libxml2**: MIT", notices, StringComparison.Ordinal);
+        Assert.Contains("**libxslt**: MIT", notices, StringComparison.Ordinal);
+        Assert.Contains("**libexslt**: MIT", notices, StringComparison.Ordinal);
+        var mplMarker = "===== Locked MPL-2.0 complete license text =====\n";
+        var mplStart = notices.IndexOf(mplMarker, StringComparison.Ordinal) + mplMarker.Length;
+        var mplEnd = notices.IndexOf("\n===== ", mplStart, StringComparison.Ordinal);
+        Assert.True(mplStart >= mplMarker.Length && mplEnd > mplStart);
+        var mplBytes = Encoding.UTF8.GetBytes(notices[mplStart..mplEnd]);
+        Assert.Equal(
+            "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+            Convert.ToHexString(SHA256.HashData(mplBytes)).ToLowerInvariant());
+
+        foreach (var inventoryMarker in new[]
+                 {
+                     "certifi-2026.7.22.dist-info/licenses/LICENSE",
+                     "charset_normalizer-3.5.1.dist-info/licenses/LICENSE",
+                     "click-8.5.0.dist-info/licenses/LICENSE.txt",
+                     "cssselect-1.5.0.dist-info/licenses/LICENSE",
+                     "drissionget-1.2.1.dist-info/licenses/LICENSE",
+                     "drissionpage-4.1.1.4.dist-info/licenses/LICENSE",
+                     "drissionrecord-2.0.1.dist-info/licenses/LICENSE",
+                     "et_xmlfile-2.0.0.dist-info/LICENCE.python",
+                     "filelock-3.32.4.dist-info/licenses/LICENSE",
+                     "idna-3.19.dist-info/licenses/LICENSE.md",
+                     "lxml-6.1.2.dist-info/licenses/LICENSES.txt",
+                     "openpyxl-3.1.5.dist-info/LICENCE.rst",
+                     "psutil-7.2.2.dist-info/LICENSE",
+                     "requests_file-3.0.1.dist-info/licenses/LICENSE",
+                     "requests-2.34.2.dist-info/licenses/NOTICE",
+                     "tldextract-5.3.2.dist-info/licenses/LICENSE",
+                     "urllib3-2.7.0.dist-info/licenses/LICENSE.txt",
+                     "websocket_client-1.9.0.dist-info/licenses/LICENSE",
+                 })
+            Assert.Contains($"===== {inventoryMarker} =====", notices, StringComparison.Ordinal);
+    }
+
+    [SelectedManagedHelperPackageFact(HelperIntegrationDirectoryVariable)]
+    public async Task PackagedRuntimeImportCreatesNoFilesAndSnapshotCanBeVerifiedAgain()
+    {
+        var verifier = new ManagedBrowserHelperIntegrityVerifier();
+        using var verified = await verifier.VerifyAsync(
+            RequiredIntegrationRoot(), CancellationToken.None);
+        var snapshotRoot = Path.GetDirectoryName(verified.ExecutablePath)!;
+        var before = EnumerateRelativeEntries(snapshotRoot);
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = verified.ExecutablePath,
+            WorkingDirectory = snapshotRoot,
+            UseShellExecute = false,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
+            ArgumentList =
+            {
+                "-I",
+                "-c",
+                "scope={'__name__':'managed_helper_import_test'}; " +
+                "exec(compile(open('main.py','rb').read(),'main.py','exec'), scope); " +
+                "import DrissionPage",
+            },
+        }) ?? throw new InvalidOperationException("The packaged helper runtime did not start.");
+        await process.WaitForExitAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+
+        Assert.Equal(0, process.ExitCode);
+        Assert.Equal(string.Empty, error);
+        Assert.Equal(before, EnumerateRelativeEntries(snapshotRoot));
+        using var verifiedAgain = await verifier.VerifyAsync(snapshotRoot, CancellationToken.None);
+        Assert.False(verifiedAgain.IsDisposed);
+    }
+
+    private static string RequiredIntegrationRoot() =>
+        Environment.GetEnvironmentVariable(HelperIntegrationDirectoryVariable) is { Length: > 0 } root
+            ? root
+            : throw new InvalidOperationException("Required managed helper package directory is missing.");
+
+    private static string[] EnumerateRelativeEntries(string root) =>
+        Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(root, path).Replace('\\', '/'))
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
 
     private sealed class HelperFixture : IDisposable
     {

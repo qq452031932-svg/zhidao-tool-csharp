@@ -5,9 +5,14 @@ stdout is protocol-only. stderr is restricted to the fixed event codes below.
 
 from __future__ import annotations
 
+import sys
+
+# The verified helper snapshot is deliberately read-only for its entire process lifetime.
+# Set this before importing protocol or any third-party module so imports never attempt pyc writes.
+sys.dont_write_bytecode = True
+
 import io
 import os
-import sys
 import time
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
