@@ -243,7 +243,7 @@ public sealed class BrowserSetupServiceTests
     }
 
     [Fact]
-    public async Task StaleEnsureCannotOverwriteReselectFromAnotherService()
+    public async Task EnsurePromptClaimPreventsConcurrentReselectFromOverwritingIt()
     {
         const string reselectedDirectory = @"C:\Reselected\Browser";
         var staleDialog = new ControlledBrowserDirectoryPicker(1);
@@ -252,8 +252,8 @@ public sealed class BrowserSetupServiceTests
             Path.Combine(reselectedDirectory, "msedge.exe"));
         var state = new RecordingBrowserDirectoryState();
         var staleEnsure = CreateService(staleDialog, fileSystem, state);
-        var reselect = CreateService(
-            new RecordingBrowserDirectoryPicker(reselectedDirectory), fileSystem, state);
+        var reselectDialog = new RecordingBrowserDirectoryPicker(reselectedDirectory);
+        var reselect = CreateService(reselectDialog, fileSystem, state);
 
         var staleResultTask = staleEnsure.EnsureSelectedAsync(CancellationToken.None);
         await staleDialog.WaitUntilStartedAsync(0);
@@ -261,11 +261,12 @@ public sealed class BrowserSetupServiceTests
         staleDialog.Complete(0, SelectedDirectory);
         var staleResult = await staleResultTask;
 
-        Assert.Equal(BrowserFamily.Edge, Assert.Single(reselectResult.Candidates).BrowserFamily);
-        Assert.Equal(BrowserFamily.Edge, Assert.Single(staleResult.Candidates).BrowserFamily);
-        Assert.Equal(reselectedDirectory, state.Directory);
+        Assert.Equal(BrowserSetupStatus.StateChanged, reselectResult.Status);
+        Assert.Equal(0, reselectDialog.BrowserDirectoryShowCount);
+        Assert.Equal(BrowserFamily.Chrome, Assert.Single(staleResult.Candidates).BrowserFamily);
+        Assert.Equal(SelectedDirectory, state.Directory);
         Assert.Equal(1, state.SaveCount);
-        Assert.Equal(2, state.SaveAttemptCount);
+        Assert.Equal(1, state.SaveAttemptCount);
     }
 
     [Fact]
@@ -293,7 +294,7 @@ public sealed class BrowserSetupServiceTests
     }
 
     [Fact]
-    public async Task OlderExplicitReselectCannotOverwriteNewerReselectAcrossServices()
+    public async Task PendingExplicitReselectPreventsSecondReselectPicker()
     {
         const string newerDirectory = @"C:\Newer\Browser";
         var olderDialog = new ControlledBrowserDirectoryPicker(1);
@@ -302,8 +303,8 @@ public sealed class BrowserSetupServiceTests
             Path.Combine(newerDirectory, "msedge.exe"));
         var state = new RecordingBrowserDirectoryState(SavedDirectory);
         var olderService = CreateService(olderDialog, fileSystem, state);
-        var newerService = CreateService(
-            new RecordingBrowserDirectoryPicker(newerDirectory), fileSystem, state);
+        var newerDialog = new RecordingBrowserDirectoryPicker(newerDirectory);
+        var newerService = CreateService(newerDialog, fileSystem, state);
 
         var olderResultTask = olderService.ReselectAsync(CancellationToken.None);
         await olderDialog.WaitUntilStartedAsync(0);
@@ -311,9 +312,10 @@ public sealed class BrowserSetupServiceTests
         olderDialog.Complete(0, SelectedDirectory);
         var olderResult = await olderResultTask;
 
-        Assert.Equal(BrowserFamily.Edge, Assert.Single(newerResult.Candidates).BrowserFamily);
-        Assert.Equal(BrowserFamily.Edge, Assert.Single(olderResult.Candidates).BrowserFamily);
-        Assert.Equal(newerDirectory, state.Directory);
+        Assert.Equal(BrowserSetupStatus.StateChanged, newerResult.Status);
+        Assert.Equal(0, newerDialog.BrowserDirectoryShowCount);
+        Assert.Equal(BrowserFamily.Chrome, Assert.Single(olderResult.Candidates).BrowserFamily);
+        Assert.Equal(SelectedDirectory, state.Directory);
         Assert.Equal(1, state.SaveCount);
     }
 
@@ -397,6 +399,149 @@ public sealed class BrowserSetupServiceTests
         Assert.Equal(BrowserFamily.Edge, Assert.Single(replacementResult.Candidates).BrowserFamily);
         Assert.Equal(BrowserFamily.Edge, Assert.Single(staleResult.Candidates).BrowserFamily);
         Assert.Equal(replacementDirectory, state.Directory);
+    }
+
+    [Fact]
+    public async Task ReselectClaimedAfterEnsureFinalLoadPreventsEnsureFromOpeningPicker()
+    {
+        const string replacementDirectory = @"C:\ClaimedByReselect\Browser";
+        var ensurePicker = new RecordingBrowserDirectoryPicker(SelectedDirectory);
+        var reselectPicker = new ControlledBrowserDirectoryPicker(1);
+        var fileSystem = new RecordingBrowserDirectoryFileSystem(
+            Path.Combine(replacementDirectory, "msedge.exe"));
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            PauseLoadNumber = 2,
+        };
+        var ensureService = CreateService(ensurePicker, fileSystem, state);
+        var reselectService = CreateService(reselectPicker, fileSystem, state);
+
+        var ensureTask = ensureService.EnsureSelectedAsync(CancellationToken.None);
+        await state.WaitUntilPausedLoadAsync();
+        var reselectTask = reselectService.ReselectAsync(CancellationToken.None);
+        await reselectPicker.WaitUntilStartedAsync(0);
+        state.ReleasePausedLoad();
+        var ensureResult = await ensureTask;
+
+        Assert.Equal(BrowserSetupStatus.StateChanged, ensureResult.Status);
+        Assert.Equal(0, ensurePicker.BrowserDirectoryShowCount);
+
+        reselectPicker.Complete(0, replacementDirectory);
+        Assert.Equal(BrowserSetupStatus.Selected, (await reselectTask).Status);
+        Assert.Equal(replacementDirectory, state.Directory);
+    }
+
+    [Fact]
+    public async Task EnsurePromptClaimPreventsReselectFromOpeningSecondPicker()
+    {
+        var ensurePicker = new ControlledBrowserDirectoryPicker(1);
+        var reselectPicker = new RecordingBrowserDirectoryPicker(SelectedDirectory);
+        var fileSystem = new RecordingBrowserDirectoryFileSystem(
+            Path.Combine(SelectedDirectory, "chrome.exe"));
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+        var ensureService = CreateService(ensurePicker, fileSystem, state);
+        var reselectService = CreateService(reselectPicker, fileSystem, state);
+
+        var ensureTask = ensureService.EnsureSelectedAsync(CancellationToken.None);
+        await ensurePicker.WaitUntilStartedAsync(0);
+        var reselectResult = await reselectService.ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.StateChanged, reselectResult.Status);
+        Assert.Equal(0, reselectPicker.BrowserDirectoryShowCount);
+
+        ensurePicker.Complete(0, SelectedDirectory);
+        Assert.Equal(BrowserSetupStatus.Selected, (await ensureTask).Status);
+        Assert.Equal(SelectedDirectory, state.Directory);
+    }
+
+    [Fact]
+    public async Task PersistentAbandonFailureReturnsCleanupFailedInsteadOfCancellation()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            AbandonFailuresBeforeMutation = int.MaxValue,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(null),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.CleanupFailed, result.Status);
+        Assert.True((await state.LoadAsync(CancellationToken.None)).PendingIntent is not null);
+    }
+
+    [Fact]
+    public async Task TransientAbandonFailureRetriesAndReturnsOriginalCancellation()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            AbandonFailuresBeforeMutation = 1,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(null),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Cancelled, result.Status);
+        Assert.Null((await state.LoadAsync(CancellationToken.None)).PendingIntent);
+        Assert.Equal(2, state.AbandonAttemptCount);
+    }
+
+    [Fact]
+    public async Task AbandonMutationFollowedByExceptionIsConfirmedAsSafe()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            ThrowAfterAbandonMutation = true,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(null),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Cancelled, result.Status);
+        Assert.Null((await state.LoadAsync(CancellationToken.None)).PendingIntent);
+    }
+
+    [Fact]
+    public async Task AbandonOfOldIntentDoesNotClearNewIntent()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            ReplacePendingBeforeAbandon = true,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(null),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+        var snapshot = await state.LoadAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Cancelled, result.Status);
+        Assert.NotNull(snapshot.PendingIntent);
+        Assert.Equal(state.Revision, snapshot.PendingIntent!.Revision);
+    }
+
+    [Fact]
+    public async Task ContinuallyChangingRevisionReturnsStateChangedAfterBoundedObservations()
+    {
+        var fileSystem = new RecordingBrowserDirectoryFileSystem(
+            Path.Combine(SavedDirectory, "chrome.exe"));
+        var state = new ChurningBrowserDirectoryState(SavedDirectory);
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory), fileSystem, state)
+            .EnsureSelectedAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.StateChanged, result.Status);
+        Assert.Equal(5, state.LoadCount);
     }
 
     [Fact]
@@ -533,7 +678,7 @@ public sealed class BrowserSetupServiceTests
     private sealed class RecordingBrowserDirectoryState(string? directory = null) : IBrowserDirectoryState
     {
         private readonly object sync = new();
-        private long? pendingReselectRevision;
+        private BrowserDirectorySelectionIntent? pendingIntent;
 
         public string? Directory { get; private set; } = directory;
         public int LoadCount { get; private set; }
@@ -545,35 +690,72 @@ public sealed class BrowserSetupServiceTests
         public string? ConflictDirectory { get; set; }
         public Action? BeforeSave { get; set; }
         public Action? AfterCommit { get; set; }
+        public int? PauseLoadNumber { get; set; }
+        public int AbandonFailuresBeforeMutation { get; set; }
+        public bool ThrowAfterAbandonMutation { get; set; }
+        public bool ReplacePendingBeforeAbandon { get; set; }
+        public int AbandonAttemptCount { get; private set; }
+        private readonly TaskCompletionSource<bool> pausedLoadStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> pausedLoadReleased =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken)
+        public Task WaitUntilPausedLoadAsync() => pausedLoadStarted.Task;
+        public void ReleasePausedLoad() => pausedLoadReleased.TrySetResult(true);
+
+        public async Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            BrowserDirectoryStateSnapshot snapshot;
+            int loadNumber;
             lock (sync)
             {
                 LoadCount++;
-                var pending = pendingReselectRevision is long value
-                    ? new BrowserDirectoryReselectIntent(value)
-                    : null;
-                return Task.FromResult(new BrowserDirectoryStateSnapshot(Directory, Revision, pending));
+                loadNumber = LoadCount;
+                snapshot = new BrowserDirectoryStateSnapshot(Directory, Revision, pendingIntent);
             }
+            if (PauseLoadNumber == loadNumber)
+            {
+                pausedLoadStarted.TrySetResult(true);
+                await pausedLoadReleased.Task.WaitAsync(cancellationToken);
+            }
+            return snapshot;
         }
 
-        public Task<BrowserDirectoryReselectIntent> BeginReselectAsync(CancellationToken cancellationToken)
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
+            long expectedRevision,
+            CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             lock (sync)
             {
+                if (expectedRevision != Revision || pendingIntent is not null)
+                    return Task.FromResult(BrowserDirectoryIntentBeginResult.Conflict());
                 Revision++;
-                pendingReselectRevision = Revision;
-                return Task.FromResult(new BrowserDirectoryReselectIntent(Revision));
+                pendingIntent = new BrowserDirectorySelectionIntent(
+                    Revision, BrowserDirectorySelectionIntentKind.EnsurePrompt);
+                return Task.FromResult(BrowserDirectoryIntentBeginResult.Acquired(pendingIntent));
+            }
+        }
+
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (sync)
+            {
+                if (pendingIntent is not null)
+                    return Task.FromResult(BrowserDirectoryIntentBeginResult.Conflict());
+                Revision++;
+                pendingIntent = new BrowserDirectorySelectionIntent(
+                    Revision, BrowserDirectorySelectionIntentKind.ExplicitReselect);
+                return Task.FromResult(BrowserDirectoryIntentBeginResult.Acquired(pendingIntent));
             }
         }
 
         public Task<BrowserDirectoryStateSaveResult> TrySaveAsync(
             string selectedDirectory,
             long expectedRevision,
-            BrowserDirectoryReselectIntent? reselectIntent,
+            BrowserDirectorySelectionIntent selectionIntent,
             CancellationToken cancellationToken)
         {
             lock (sync) SaveAttemptCount++;
@@ -586,37 +768,88 @@ public sealed class BrowserSetupServiceTests
                     ConflictsRemaining--;
                     Directory = ConflictDirectory;
                     Revision++;
-                    pendingReselectRevision = null;
+                    pendingIntent = null;
                     return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
                 }
                 if (expectedRevision != Revision)
                     return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
-                if (reselectIntent is null && pendingReselectRevision is not null)
-                    return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
-                if (reselectIntent is not null && pendingReselectRevision != reselectIntent.Revision)
+                if (pendingIntent is null ||
+                    pendingIntent.Revision != selectionIntent.Revision ||
+                    pendingIntent.Kind != selectionIntent.Kind)
                     return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
                 SaveCount++;
                 Directory = selectedDirectory;
                 Revision++;
-                pendingReselectRevision = null;
+                pendingIntent = null;
                 AfterCommit?.Invoke();
                 return Task.FromResult(BrowserDirectoryStateSaveResult.Committed(Revision));
             }
         }
 
-        public Task<bool> TryAbandonReselectAsync(
-            BrowserDirectoryReselectIntent reselectIntent,
+        public Task<bool> TryAbandonSelectionAsync(
+            BrowserDirectorySelectionIntent selectionIntent,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             lock (sync)
             {
-                if (pendingReselectRevision != reselectIntent.Revision)
+                AbandonAttemptCount++;
+                if (AbandonFailuresBeforeMutation > 0)
+                {
+                    AbandonFailuresBeforeMutation--;
+                    throw new IOException("simulated abandon failure");
+                }
+                if (ReplacePendingBeforeAbandon)
+                {
+                    ReplacePendingBeforeAbandon = false;
+                    Revision++;
+                    pendingIntent = new BrowserDirectorySelectionIntent(
+                        Revision, BrowserDirectorySelectionIntentKind.ExplicitReselect);
+                }
+                if (pendingIntent is null ||
+                    pendingIntent.Revision != selectionIntent.Revision ||
+                    pendingIntent.Kind != selectionIntent.Kind)
                     return Task.FromResult(false);
-                pendingReselectRevision = null;
+                pendingIntent = null;
                 Revision++;
+                if (ThrowAfterAbandonMutation)
+                {
+                    ThrowAfterAbandonMutation = false;
+                    throw new IOException("simulated post-mutation abandon failure");
+                }
                 return Task.FromResult(true);
             }
         }
+    }
+
+    private sealed class ChurningBrowserDirectoryState(string directory) : IBrowserDirectoryState
+    {
+        private long revision;
+        public int LoadCount { get; private set; }
+
+        public Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            LoadCount++;
+            revision++;
+            return Task.FromResult(new BrowserDirectoryStateSnapshot(directory, revision));
+        }
+
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
+            long expectedRevision,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<BrowserDirectoryStateSaveResult> TrySaveAsync(
+            string selectedDirectory,
+            long expectedRevision,
+            BrowserDirectorySelectionIntent selectionIntent,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+
+        public Task<bool> TryAbandonSelectionAsync(
+            BrowserDirectorySelectionIntent selectionIntent,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 }

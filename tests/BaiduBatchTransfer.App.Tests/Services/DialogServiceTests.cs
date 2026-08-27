@@ -99,10 +99,11 @@ public sealed class DialogServiceTests
             @"C:\Browser\Application\chrome.exe", cancellation.Token);
         Assert.True(probe.WaitUntilEntered());
         cancellation.Cancel();
-        Assert.False(probeTask.IsCompleted);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            probeTask.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.False(probe.HasExited);
         probe.Release();
-
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+        Assert.True(probe.WaitUntilExited());
         Assert.Equal(@"C:\Browser\Application\chrome.exe", probe.ExactPath);
     }
 
@@ -162,9 +163,11 @@ public sealed class DialogServiceTests
     {
         private readonly ManualResetEventSlim entered = new(false);
         private readonly ManualResetEventSlim release = new(false);
+        private readonly ManualResetEventSlim exited = new(false);
 
         public string? ExactPath { get; private set; }
         public int InvocationThreadId { get; private set; }
+        public bool HasExited => exited.IsSet;
 
         public bool Exists(string exactPath)
         {
@@ -172,17 +175,20 @@ public sealed class DialogServiceTests
             InvocationThreadId = Environment.CurrentManagedThreadId;
             entered.Set();
             release.Wait(TimeSpan.FromSeconds(5));
+            exited.Set();
             return result;
         }
 
         public bool WaitUntilEntered() => entered.Wait(TimeSpan.FromSeconds(5));
         public void Release() => release.Set();
+        public bool WaitUntilExited() => exited.Wait(TimeSpan.FromSeconds(5));
 
         public void Dispose()
         {
             release.Set();
             entered.Dispose();
             release.Dispose();
+            exited.Dispose();
         }
     }
 }

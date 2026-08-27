@@ -15,6 +15,7 @@ public enum BrowserSetupStatus
     DialogUnavailable = 7,
     StateUnavailable = 8,
     StateChanged = 9,
+    CleanupFailed = 10,
 }
 
 public sealed class BrowserDirectoryCandidate
@@ -82,14 +83,28 @@ public sealed class BrowserDirectoryFileSystem(IExactFileExistenceProbe? probe =
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(exactPath);
         cancellationToken.ThrowIfCancellationRequested();
-        return await Task.Run(
-            () =>
-            {
-                var exists = exactFileProbe.Exists(exactPath);
-                cancellationToken.ThrowIfCancellationRequested();
-                return exists;
-            },
-            cancellationToken).ConfigureAwait(false);
+        var probeTask = Task.Run(() => exactFileProbe.Exists(exactPath), CancellationToken.None);
+        try
+        {
+            return await probeTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _ = ObserveProbeCompletionAsync(probeTask);
+            throw;
+        }
+    }
+
+    private static async Task ObserveProbeCompletionAsync(Task probeTask)
+    {
+        try
+        {
+            await probeTask.ConfigureAwait(false);
+        }
+        catch
+        {
+            // The caller has already observed cancellation; the read-only probe is only drained.
+        }
     }
 }
 
@@ -98,42 +113,87 @@ public interface IBrowserDirectoryState
     Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Atomically and durably advances the revision and records a pending explicit-reselect
-    /// intent before returning. A later call supersedes every earlier pending intent.
+    /// Atomically claims the shared prompt slot only when the revision is current and no intent
+    /// is pending. The stored directory is not changed.
     /// </summary>
-    Task<BrowserDirectoryReselectIntent> BeginReselectAsync(CancellationToken cancellationToken);
+    Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
+        long expectedRevision,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Atomically claims the shared prompt slot only when no intent is pending. The stored
+    /// directory is not changed; a conflict must not open another picker.
+    /// </summary>
+    Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// Atomically commits the directory only when <paramref name="expectedRevision"/> is current.
-    /// An explicit reselect additionally requires its exact still-pending intent. Committed means
-    /// the durable commit point has passed, even if the caller token is cancelled immediately after.
+    /// Every save requires its exact still-pending prompt intent. Committed means the durable commit
+    /// point has passed, even if the caller token is cancelled immediately after.
     /// </summary>
     Task<BrowserDirectoryStateSaveResult> TrySaveAsync(
         string selectedDirectory,
         long expectedRevision,
-        BrowserDirectoryReselectIntent? reselectIntent,
+        BrowserDirectorySelectionIntent selectionIntent,
         CancellationToken cancellationToken);
 
     /// <summary>
     /// Clears only the exact pending intent and advances the revision; it must not affect a newer intent.
     /// </summary>
-    Task<bool> TryAbandonReselectAsync(
-        BrowserDirectoryReselectIntent reselectIntent,
+    Task<bool> TryAbandonSelectionAsync(
+        BrowserDirectorySelectionIntent selectionIntent,
         CancellationToken cancellationToken);
 }
 
-public sealed class BrowserDirectoryReselectIntent
+public enum BrowserDirectorySelectionIntentKind
 {
-    public BrowserDirectoryReselectIntent(long revision)
+    EnsurePrompt = 1,
+    ExplicitReselect = 2,
+}
+
+public sealed class BrowserDirectorySelectionIntent
+{
+    public BrowserDirectorySelectionIntent(
+        long revision,
+        BrowserDirectorySelectionIntentKind kind)
     {
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
+        if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
         Revision = revision;
+        Kind = kind;
     }
 
     public long Revision { get; }
+    public BrowserDirectorySelectionIntentKind Kind { get; }
 
     public override string ToString() =>
-        $"BrowserDirectoryReselectIntent {{ Revision = {Revision} }}";
+        $"BrowserDirectorySelectionIntent {{ Revision = {Revision}, Kind = {Kind} }}";
+}
+
+public enum BrowserDirectoryIntentBeginStatus
+{
+    Acquired = 1,
+    Conflict = 2,
+}
+
+public sealed class BrowserDirectoryIntentBeginResult
+{
+    private BrowserDirectoryIntentBeginResult(
+        BrowserDirectoryIntentBeginStatus status,
+        BrowserDirectorySelectionIntent? intent)
+    {
+        Status = status;
+        Intent = intent;
+    }
+
+    public BrowserDirectoryIntentBeginStatus Status { get; }
+    public BrowserDirectorySelectionIntent? Intent { get; }
+
+    public static BrowserDirectoryIntentBeginResult Acquired(BrowserDirectorySelectionIntent intent) =>
+        new(BrowserDirectoryIntentBeginStatus.Acquired, intent ?? throw new ArgumentNullException(nameof(intent)));
+
+    public static BrowserDirectoryIntentBeginResult Conflict() =>
+        new(BrowserDirectoryIntentBeginStatus.Conflict, null);
 }
 
 public sealed class BrowserDirectoryStateSnapshot
@@ -141,20 +201,20 @@ public sealed class BrowserDirectoryStateSnapshot
     public BrowserDirectoryStateSnapshot(
         string? directory,
         long revision,
-        BrowserDirectoryReselectIntent? pendingReselect = null)
+        BrowserDirectorySelectionIntent? pendingIntent = null)
     {
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         Directory = directory;
         Revision = revision;
-        PendingReselect = pendingReselect;
+        PendingIntent = pendingIntent;
     }
 
     public string? Directory { get; }
     public long Revision { get; }
-    public BrowserDirectoryReselectIntent? PendingReselect { get; }
+    public BrowserDirectorySelectionIntent? PendingIntent { get; }
 
     public override string ToString() =>
-        $"BrowserDirectoryStateSnapshot {{ Directory = [REDACTED], Revision = {Revision}, ReselectPending = {PendingReselect is not null} }}";
+        $"BrowserDirectoryStateSnapshot {{ Directory = [REDACTED], Revision = {Revision}, SelectionPending = {PendingIntent is not null} }}";
 }
 
 public enum BrowserDirectoryStateSaveStatus
@@ -192,11 +252,12 @@ public sealed class BrowserSetupService(
     private const string ChromeExecutableName = "chrome.exe";
     private const string EdgeExecutableName = "msedge.exe";
     private const int MaximumStableObservationAttempts = 3;
+    private const int MaximumIntentCleanupAttempts = 3;
     private readonly SemaphoreSlim flowGate = new(1, 1);
 
     private sealed record SelectionAttemptResult(
         BrowserSetupResult Result,
-        bool ReselectIntentCommitted);
+        bool IntentCommitted);
 
     public async Task<BrowserSetupResult> EnsureSelectedAsync(
         CancellationToken cancellationToken = default)
@@ -219,10 +280,10 @@ public sealed class BrowserSetupService(
         await flowGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            BrowserDirectoryReselectIntent intent;
+            BrowserDirectoryIntentBeginResult begin;
             try
             {
-                intent = await state.BeginReselectAsync(cancellationToken).ConfigureAwait(false);
+                begin = await state.TryBeginReselectAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -232,30 +293,9 @@ public sealed class BrowserSetupService(
             {
                 return Result(BrowserSetupStatus.StateUnavailable);
             }
-
-            var intentCommitted = false;
-            try
-            {
-                var selection = await SelectAndPersistAsync(
-                    intent.Revision, intent, cancellationToken).ConfigureAwait(false);
-                intentCommitted = selection.ReselectIntentCommitted;
-                return selection.Result;
-            }
-            finally
-            {
-                if (!intentCommitted)
-                {
-                    try
-                    {
-                        await state.TryAbandonReselectAsync(intent, CancellationToken.None)
-                            .ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        // A newer intent safely supersedes this one; cleanup is best effort.
-                    }
-                }
-            }
+            if (begin.Status == BrowserDirectoryIntentBeginStatus.Conflict || begin.Intent is null)
+                return Result(BrowserSetupStatus.StateChanged);
+            return await RunClaimedSelectionAsync(begin.Intent, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -269,7 +309,7 @@ public sealed class BrowserSetupService(
         if (loaded.Snapshot is null) return loaded.Error!;
         var snapshot = loaded.Snapshot;
 
-        if (snapshot.PendingReselect is not null)
+        if (snapshot.PendingIntent is not null)
             return Result(BrowserSetupStatus.StateChanged);
 
         if (!string.IsNullOrWhiteSpace(snapshot.Directory))
@@ -289,8 +329,24 @@ public sealed class BrowserSetupService(
             }
         }
 
-        return (await SelectAndPersistAsync(
-            snapshot.Revision, null, cancellationToken).ConfigureAwait(false)).Result;
+        BrowserDirectoryIntentBeginResult begin;
+        try
+        {
+            begin = await state.TryBeginEnsurePromptAsync(snapshot.Revision, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return Result(BrowserSetupStatus.StateUnavailable);
+        }
+
+        if (begin.Status == BrowserDirectoryIntentBeginStatus.Conflict || begin.Intent is null)
+            return Result(BrowserSetupStatus.StateChanged);
+        return await RunClaimedSelectionAsync(begin.Intent, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<(BrowserDirectoryStateSnapshot? Snapshot, BrowserSetupResult? Error)> TryLoadStateAsync(
@@ -310,9 +366,28 @@ public sealed class BrowserSetupService(
         }
     }
 
+    private async Task<BrowserSetupResult> RunClaimedSelectionAsync(
+        BrowserDirectorySelectionIntent intent,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var selection = await SelectAndPersistAsync(intent, cancellationToken).ConfigureAwait(false);
+            if (selection.IntentCommitted) return selection.Result;
+            return await CleanupIntentAsync(intent).ConfigureAwait(false)
+                ? selection.Result
+                : Result(BrowserSetupStatus.CleanupFailed);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!await CleanupIntentAsync(intent).ConfigureAwait(false))
+                return Result(BrowserSetupStatus.CleanupFailed);
+            throw;
+        }
+    }
+
     private async Task<SelectionAttemptResult> SelectAndPersistAsync(
-        long expectedRevision,
-        BrowserDirectoryReselectIntent? reselectIntent,
+        BrowserDirectorySelectionIntent intent,
         CancellationToken cancellationToken)
     {
         string? selectedDirectory;
@@ -340,9 +415,9 @@ public sealed class BrowserSetupService(
         try
         {
             var save = await state.TrySaveAsync(
-                selectedDirectory, expectedRevision, reselectIntent, cancellationToken).ConfigureAwait(false);
+                selectedDirectory, intent.Revision, intent, cancellationToken).ConfigureAwait(false);
             if (save.Status == BrowserDirectoryStateSaveStatus.Committed)
-                return new SelectionAttemptResult(inspected, reselectIntent is not null);
+                return new SelectionAttemptResult(inspected, true);
             return new SelectionAttemptResult(
                 await ResolveStateConflictAsync(cancellationToken).ConfigureAwait(false), false);
         }
@@ -354,6 +429,42 @@ public sealed class BrowserSetupService(
         {
             return Attempt(BrowserSetupStatus.StateUnavailable);
         }
+    }
+
+    private async Task<bool> CleanupIntentAsync(BrowserDirectorySelectionIntent intent)
+    {
+        for (var attempt = 0; attempt < MaximumIntentCleanupAttempts; attempt++)
+        {
+            try
+            {
+                if (await state.TryAbandonSelectionAsync(intent, CancellationToken.None)
+                        .ConfigureAwait(false))
+                {
+                    return true;
+                }
+                break;
+            }
+            catch
+            {
+                // Confirm the durable state below after bounded retries.
+            }
+        }
+
+        for (var attempt = 0; attempt < MaximumIntentCleanupAttempts; attempt++)
+        {
+            try
+            {
+                var snapshot = await state.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+                if (snapshot.PendingIntent is null || !SameIntent(snapshot.PendingIntent, intent))
+                    return true;
+            }
+            catch
+            {
+                // A later read may still confirm whether the exact intent remains.
+            }
+        }
+
+        return false;
     }
 
     private async Task<BrowserSetupResult> ResolveStateConflictAsync(CancellationToken cancellationToken)
@@ -370,7 +481,7 @@ public sealed class BrowserSetupService(
     {
         for (var attempt = 0; attempt < MaximumStableObservationAttempts; attempt++)
         {
-            if (snapshot.PendingReselect is not null || string.IsNullOrWhiteSpace(snapshot.Directory))
+            if (snapshot.PendingIntent is not null || string.IsNullOrWhiteSpace(snapshot.Directory))
                 return Result(BrowserSetupStatus.StateChanged);
 
             var observed = await InspectAsync(snapshot.Directory, cancellationToken).ConfigureAwait(false);
@@ -473,5 +584,12 @@ public sealed class BrowserSetupService(
         BrowserDirectoryStateSnapshot actual) =>
         expected.Revision == actual.Revision &&
         string.Equals(expected.Directory, actual.Directory, StringComparison.Ordinal) &&
-        expected.PendingReselect?.Revision == actual.PendingReselect?.Revision;
+        SameIntent(expected.PendingIntent, actual.PendingIntent);
+
+    private static bool SameIntent(
+        BrowserDirectorySelectionIntent? expected,
+        BrowserDirectorySelectionIntent? actual) =>
+        expected is null
+            ? actual is null
+            : actual is not null && expected.Revision == actual.Revision && expected.Kind == actual.Kind;
 }
