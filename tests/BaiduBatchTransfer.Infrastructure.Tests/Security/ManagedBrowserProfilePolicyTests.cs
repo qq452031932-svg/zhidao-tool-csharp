@@ -373,6 +373,41 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
 
     [Fact]
     [SupportedOSPlatform("windows")]
+    public async Task ConcurrentPoliciesRejectExistingSharedDirectoryAclWithoutRepair()
+    {
+        var initial = await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, initial.Status);
+        var familyRoot = Path.Combine(root, "managed-browser-profiles", "chrome");
+        AddEveryoneReadAcl(familyRoot);
+        var securityBefore = new DirectoryInfo(familyRoot)
+            .GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner)
+            .GetSecurityDescriptorBinaryForm();
+        const int policyCount = 8;
+        using var barrier = new Barrier(policyCount);
+        var policies = Enumerable.Range(0, policyCount).Select(_ =>
+            new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+            {
+                AfterTrustedNamespacePinned = () =>
+                    Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(15))),
+            })).ToArray();
+
+        var results = await Task.WhenAll(policies.Select(policy => Task.Run(() =>
+            policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome))));
+
+        Assert.All(results, result =>
+        {
+            Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+            Assert.Equal(ManagedBrowserProfileIsolationReason.AccessControlMismatch, result.IsolationReason);
+        });
+        var securityAfter = new DirectoryInfo(familyRoot)
+            .GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner)
+            .GetSecurityDescriptorBinaryForm();
+        Assert.Equal(securityBefore, securityAfter);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
     public async Task AclChangedAfterAccountPinFailsClosed()
     {
         if (!OperatingSystem.IsWindows()) return;
@@ -610,22 +645,71 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     public async Task SimultaneousNamespaceCreationStillProducesOneCanonicalWinner()
     {
         if (!OperatingSystem.IsWindows()) return;
-        var accountId = Guid.NewGuid();
-        using var barrier = new Barrier(2);
-        ManagedBrowserProfilePolicyTestHooks Hooks() => new()
+        for (var round = 0; round < 12; round++)
         {
-            AfterTrustedNamespacePinned = () => barrier.SignalAndWait(TimeSpan.FromSeconds(5)),
-        };
-        var firstPolicy = new FileSystemManagedBrowserProfilePolicy(root, Hooks());
-        var secondPolicy = new FileSystemManagedBrowserProfilePolicy(root, Hooks());
+            var roundRoot = Path.Combine(root, $"round-{round}");
+            var accountId = Guid.NewGuid();
+            using var barrier = new Barrier(2);
+            ManagedBrowserProfilePolicyTestHooks Hooks() => new()
+            {
+                AfterTrustedNamespacePinned = () =>
+                    Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(5))),
+            };
+            var firstPolicy = new FileSystemManagedBrowserProfilePolicy(roundRoot, Hooks());
+            var secondPolicy = new FileSystemManagedBrowserProfilePolicy(roundRoot, Hooks());
 
-        var results = await Task.WhenAll(
-            Task.Run(() => firstPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)),
-            Task.Run(() => secondPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)));
+            var results = await Task.WhenAll(
+                Task.Run(() => firstPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)),
+                Task.Run(() => secondPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)));
 
-        Assert.All(results, result => Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status));
-        Assert.Single(results.Select(result => result.Profile!.ProfileId).Distinct());
-        Assert.Single(results.Select(result => result.Profile!.OwnershipId).Distinct());
+            Assert.All(results, result => Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status));
+            Assert.Single(results.Select(result => result.Profile!.ProfileId).Distinct());
+            Assert.Single(results.Select(result => result.Profile!.OwnershipId).Distinct());
+            Assert.Single(Directory.GetDirectories(
+                Path.Combine(roundRoot, "managed-browser-profiles", "chrome"), accountId.ToString("N")));
+        }
+    }
+
+    [Theory]
+    [InlineData("managed-browser-profiles")]
+    [InlineData("chrome")]
+    [SupportedOSPlatform("windows")]
+    public async Task SharedDirectoryAclIsValidBeforeCreatorContinuesAfterNativeCreate(string targetName)
+    {
+        var accountId = Guid.NewGuid();
+        var managedCreated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCreator = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var creator = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            AfterSharedDirectoryCreated = name =>
+            {
+                if (name != targetName) return;
+                managedCreated.TrySetResult();
+                releaseCreator.Task.GetAwaiter().GetResult();
+            },
+        });
+        var observer = new FileSystemManagedBrowserProfilePolicy(root);
+
+        var creatorTask = Task.Run(() => creator.GetOrCreateAsync(accountId, BrowserFamily.Chrome));
+        await managedCreated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        ManagedBrowserProfileResult observerResult;
+        try
+        {
+            observerResult = await Task.Run(() => observer.GetOrCreateAsync(accountId, BrowserFamily.Chrome))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            releaseCreator.TrySetResult();
+        }
+        var creatorResult = await creatorTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(observerResult.Status == ManagedBrowserProfileStatus.Ready,
+            observerResult.IsolationReason.ToString());
+        Assert.True(creatorResult.Status == ManagedBrowserProfileStatus.Ready,
+            creatorResult.IsolationReason.ToString());
+        Assert.Equal(observerResult.Profile!.ProfileId, creatorResult.Profile!.ProfileId);
+        Assert.Equal(observerResult.Profile.OwnershipId, creatorResult.Profile.OwnershipId);
     }
 
     [Fact]
