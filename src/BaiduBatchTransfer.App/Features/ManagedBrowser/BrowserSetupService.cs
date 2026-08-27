@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Domain;
+using System.Collections.Concurrent;
 using System.IO;
 
 namespace BaiduBatchTransfer.App.Features.ManagedBrowser;
@@ -74,37 +75,75 @@ public sealed class ExactFileExistenceProbe : IExactFileExistenceProbe
     public bool Exists(string exactPath) => File.Exists(exactPath);
 }
 
-public sealed class BrowserDirectoryFileSystem(IExactFileExistenceProbe? probe = null)
-    : IBrowserDirectoryFileSystem
+internal sealed class BrowserFileProbeScheduler(int maximumConcurrency)
 {
-    private readonly IExactFileExistenceProbe exactFileProbe = probe ?? new ExactFileExistenceProbe();
+    private readonly SemaphoreSlim slots = new(
+        maximumConcurrency > 0 ? maximumConcurrency :
+        throw new ArgumentOutOfRangeException(nameof(maximumConcurrency)));
 
-    public async Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken)
+    public async Task<bool> RunAsync(Func<bool> probe, CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(exactPath);
-        cancellationToken.ThrowIfCancellationRequested();
-        var probeTask = Task.Run(() => exactFileProbe.Exists(exactPath), CancellationToken.None);
+        await slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var probeTask = Task.Run(() =>
+        {
+            try
+            {
+                return probe();
+            }
+            finally
+            {
+                slots.Release();
+            }
+        }, CancellationToken.None);
+
         try
         {
             return await probeTask.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _ = ObserveProbeCompletionAsync(probeTask);
+            _ = ObserveCompletionAsync(probeTask);
             throw;
         }
     }
 
-    private static async Task ObserveProbeCompletionAsync(Task probeTask)
+    private static async Task ObserveCompletionAsync(Task task)
     {
         try
         {
-            await probeTask.ConfigureAwait(false);
+            await task.ConfigureAwait(false);
         }
         catch
         {
-            // The caller has already observed cancellation; the read-only probe is only drained.
+            // The cancelled caller is gone; drain a read-only probe failure.
         }
+    }
+}
+
+public sealed class BrowserDirectoryFileSystem : IBrowserDirectoryFileSystem
+{
+    private static readonly BrowserFileProbeScheduler SharedScheduler = new(maximumConcurrency: 4);
+    private readonly IExactFileExistenceProbe exactFileProbe;
+    private readonly BrowserFileProbeScheduler scheduler;
+
+    public BrowserDirectoryFileSystem(IExactFileExistenceProbe? probe = null)
+        : this(probe, SharedScheduler)
+    {
+    }
+
+    internal BrowserDirectoryFileSystem(
+        IExactFileExistenceProbe? probe,
+        BrowserFileProbeScheduler scheduler)
+    {
+        exactFileProbe = probe ?? new ExactFileExistenceProbe();
+        this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
+    }
+
+    public Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(exactPath);
+        cancellationToken.ThrowIfCancellationRequested();
+        return scheduler.RunAsync(() => exactFileProbe.Exists(exactPath), cancellationToken);
     }
 }
 
@@ -118,13 +157,16 @@ public interface IBrowserDirectoryState
     /// </summary>
     Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
         long expectedRevision,
+        BrowserDirectoryIntentClaim claim,
         CancellationToken cancellationToken);
 
     /// <summary>
     /// Atomically claims the shared prompt slot only when no intent is pending. The stored
     /// directory is not changed; a conflict must not open another picker.
     /// </summary>
-    Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken);
+    Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(
+        BrowserDirectoryIntentClaim claim,
+        CancellationToken cancellationToken);
 
     /// <summary>
     /// Atomically commits the directory only when <paramref name="expectedRevision"/> is current.
@@ -151,23 +193,122 @@ public enum BrowserDirectorySelectionIntentKind
     ExplicitReselect = 2,
 }
 
+public sealed class BrowserDirectoryIntentClaim
+{
+    public BrowserDirectoryIntentClaim(
+        BrowserDirectorySelectionIntentKind kind,
+        Guid ownerEpoch,
+        Guid intentId)
+    {
+        if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
+        if (ownerEpoch == Guid.Empty) throw new ArgumentException("An owner epoch is required.", nameof(ownerEpoch));
+        if (intentId == Guid.Empty) throw new ArgumentException("An intent id is required.", nameof(intentId));
+        Kind = kind;
+        OwnerEpoch = ownerEpoch;
+        IntentId = intentId;
+    }
+
+    public BrowserDirectorySelectionIntentKind Kind { get; }
+    public Guid OwnerEpoch { get; }
+    public Guid IntentId { get; }
+
+    public override string ToString() =>
+        $"BrowserDirectoryIntentClaim {{ Kind = {Kind}, OwnerEpoch = [REDACTED], IntentId = [REDACTED] }}";
+}
+
 public sealed class BrowserDirectorySelectionIntent
 {
     public BrowserDirectorySelectionIntent(
         long revision,
-        BrowserDirectorySelectionIntentKind kind)
+        BrowserDirectorySelectionIntentKind kind,
+        Guid ownerEpoch,
+        Guid intentId)
     {
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
+        if (ownerEpoch == Guid.Empty) throw new ArgumentException("An owner epoch is required.", nameof(ownerEpoch));
+        if (intentId == Guid.Empty) throw new ArgumentException("An intent id is required.", nameof(intentId));
         Revision = revision;
         Kind = kind;
+        OwnerEpoch = ownerEpoch;
+        IntentId = intentId;
     }
 
     public long Revision { get; }
     public BrowserDirectorySelectionIntentKind Kind { get; }
+    public Guid OwnerEpoch { get; }
+    public Guid IntentId { get; }
 
     public override string ToString() =>
-        $"BrowserDirectorySelectionIntent {{ Revision = {Revision}, Kind = {Kind} }}";
+        $"BrowserDirectorySelectionIntent {{ Revision = {Revision}, Kind = {Kind}, OwnerEpoch = [REDACTED], IntentId = [REDACTED] }}";
+}
+
+public sealed class BrowserSelectionProcessContext
+{
+    public BrowserSelectionProcessContext() : this(Guid.NewGuid())
+    {
+    }
+
+    public BrowserSelectionProcessContext(Guid ownerEpoch)
+    {
+        if (ownerEpoch == Guid.Empty) throw new ArgumentException("An owner epoch is required.", nameof(ownerEpoch));
+        OwnerEpoch = ownerEpoch;
+    }
+
+    public Guid OwnerEpoch { get; }
+    public override string ToString() => "BrowserSelectionProcessContext { OwnerEpoch = [REDACTED] }";
+}
+
+public interface IBrowserSelectionActivityRegistry
+{
+    IDisposable Register(Guid ownerEpoch, Guid intentId);
+    bool IsActive(Guid ownerEpoch, Guid intentId);
+}
+
+public sealed class ProcessBrowserSelectionActivityRegistry : IBrowserSelectionActivityRegistry
+{
+    private readonly ConcurrentDictionary<(Guid OwnerEpoch, Guid IntentId), byte> active = new();
+
+    public IDisposable Register(Guid ownerEpoch, Guid intentId)
+    {
+        if (ownerEpoch == Guid.Empty) throw new ArgumentException("An owner epoch is required.", nameof(ownerEpoch));
+        if (intentId == Guid.Empty) throw new ArgumentException("An intent id is required.", nameof(intentId));
+        var key = (ownerEpoch, intentId);
+        if (!active.TryAdd(key, 0))
+            throw new InvalidOperationException("The selection intent is already active.");
+        return new Registration(active, key);
+    }
+
+    public bool IsActive(Guid ownerEpoch, Guid intentId) => active.ContainsKey((ownerEpoch, intentId));
+
+    private sealed class Registration(
+        ConcurrentDictionary<(Guid OwnerEpoch, Guid IntentId), byte> active,
+        (Guid OwnerEpoch, Guid IntentId) key) : IDisposable
+    {
+        private int disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0)
+                active.TryRemove(key, out _);
+        }
+    }
+}
+
+public enum BrowserDirectoryRecoveryStatus
+{
+    Ready = 1,
+    ActiveIntent = 2,
+    StateUnavailable = 3,
+    CleanupFailed = 4,
+    StateChanged = 5,
+}
+
+public sealed class BrowserDirectoryRecoveryResult
+{
+    internal BrowserDirectoryRecoveryResult(BrowserDirectoryRecoveryStatus status) => Status = status;
+    public BrowserDirectoryRecoveryStatus Status { get; }
+    public override string ToString() => $"BrowserDirectoryRecoveryResult {{ Status = {Status} }}";
 }
 
 public enum BrowserDirectoryIntentBeginStatus
@@ -247,7 +388,9 @@ public sealed class BrowserDirectoryStateSaveResult
 public sealed class BrowserSetupService(
     IBrowserDirectoryPicker dialogService,
     IBrowserDirectoryFileSystem fileSystem,
-    IBrowserDirectoryState state)
+    IBrowserDirectoryState state,
+    BrowserSelectionProcessContext processContext,
+    IBrowserSelectionActivityRegistry activityRegistry)
 {
     private const string ChromeExecutableName = "chrome.exe";
     private const string EdgeExecutableName = "msedge.exe";
@@ -258,6 +401,10 @@ public sealed class BrowserSetupService(
     private sealed record SelectionAttemptResult(
         BrowserSetupResult Result,
         bool IntentCommitted);
+
+    private sealed record RecoveryObservation(
+        BrowserDirectoryRecoveryStatus Status,
+        BrowserDirectoryStateSnapshot? Snapshot = null);
 
     public async Task<BrowserSetupResult> EnsureSelectedAsync(
         CancellationToken cancellationToken = default)
@@ -280,22 +427,29 @@ public sealed class BrowserSetupService(
         await flowGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            BrowserDirectoryIntentBeginResult begin;
-            try
-            {
-                begin = await state.TryBeginReselectAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-                return Result(BrowserSetupStatus.StateUnavailable);
-            }
-            if (begin.Status == BrowserDirectoryIntentBeginStatus.Conflict || begin.Intent is null)
-                return Result(BrowserSetupStatus.StateChanged);
-            return await RunClaimedSelectionAsync(begin.Intent, cancellationToken).ConfigureAwait(false);
+            var recovery = await RecoverPendingIntentCoreAsync(cancellationToken).ConfigureAwait(false);
+            if (recovery.Status != BrowserDirectoryRecoveryStatus.Ready)
+                return RecoveryError(recovery.Status);
+            return await BeginAndRunSelectionAsync(
+                BrowserDirectorySelectionIntentKind.ExplicitReselect,
+                expectedRevision: null,
+                cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            flowGate.Release();
+        }
+    }
+
+    public async Task<BrowserDirectoryRecoveryResult> RecoverPendingIntentAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await flowGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var observation = await RecoverPendingIntentCoreAsync(cancellationToken).ConfigureAwait(false);
+            return new BrowserDirectoryRecoveryResult(observation.Status);
         }
         finally
         {
@@ -305,12 +459,10 @@ public sealed class BrowserSetupService(
 
     private async Task<BrowserSetupResult> EnsureSelectedCoreAsync(CancellationToken cancellationToken)
     {
-        var loaded = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
-        if (loaded.Snapshot is null) return loaded.Error!;
-        var snapshot = loaded.Snapshot;
-
-        if (snapshot.PendingIntent is not null)
-            return Result(BrowserSetupStatus.StateChanged);
+        var recovery = await RecoverPendingIntentCoreAsync(cancellationToken).ConfigureAwait(false);
+        if (recovery.Status != BrowserDirectoryRecoveryStatus.Ready || recovery.Snapshot is null)
+            return RecoveryError(recovery.Status);
+        var snapshot = recovery.Snapshot;
 
         if (!string.IsNullOrWhiteSpace(snapshot.Directory))
         {
@@ -329,24 +481,112 @@ public sealed class BrowserSetupService(
             }
         }
 
+        return await BeginAndRunSelectionAsync(
+            BrowserDirectorySelectionIntentKind.EnsurePrompt,
+            snapshot.Revision,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<BrowserSetupResult> BeginAndRunSelectionAsync(
+        BrowserDirectorySelectionIntentKind kind,
+        long? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        var claim = new BrowserDirectoryIntentClaim(
+            kind, processContext.OwnerEpoch, Guid.NewGuid());
+        using var activity = activityRegistry.Register(claim.OwnerEpoch, claim.IntentId);
+
         BrowserDirectoryIntentBeginResult begin;
         try
         {
-            begin = await state.TryBeginEnsurePromptAsync(snapshot.Revision, cancellationToken)
-                .ConfigureAwait(false);
+            begin = kind == BrowserDirectorySelectionIntentKind.EnsurePrompt
+                ? await state.TryBeginEnsurePromptAsync(
+                    expectedRevision!.Value, claim, cancellationToken).ConfigureAwait(false)
+                : await state.TryBeginReselectAsync(claim, cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (Exception exception)
         {
-            throw;
-        }
-        catch
-        {
-            return Result(BrowserSetupStatus.StateUnavailable);
+            var confirmation = await ConfirmBeginAsync(claim).ConfigureAwait(false);
+            if (confirmation.Intent is not null)
+            {
+                begin = BrowserDirectoryIntentBeginResult.Acquired(confirmation.Intent);
+            }
+            else if (confirmation.CouldNotConfirm)
+            {
+                return Result(BrowserSetupStatus.CleanupFailed);
+            }
+            else
+            {
+                if (exception is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                    throw;
+                return Result(BrowserSetupStatus.StateUnavailable);
+            }
         }
 
         if (begin.Status == BrowserDirectoryIntentBeginStatus.Conflict || begin.Intent is null)
             return Result(BrowserSetupStatus.StateChanged);
         return await RunClaimedSelectionAsync(begin.Intent, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<(BrowserDirectorySelectionIntent? Intent, bool CouldNotConfirm)> ConfirmBeginAsync(
+        BrowserDirectoryIntentClaim claim)
+    {
+        var successfulLoad = false;
+        for (var attempt = 0; attempt < MaximumIntentCleanupAttempts; attempt++)
+        {
+            try
+            {
+                var snapshot = await state.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+                successfulLoad = true;
+                if (snapshot.PendingIntent is not null && SameClaim(claim, snapshot.PendingIntent))
+                    return (snapshot.PendingIntent, false);
+                return (null, false);
+            }
+            catch
+            {
+                // A later bounded read may identify whether the durable claim exists.
+            }
+        }
+        return (null, !successfulLoad);
+    }
+
+    private async Task<RecoveryObservation> RecoverPendingIntentCoreAsync(
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < MaximumStableObservationAttempts; attempt++)
+        {
+            BrowserDirectoryStateSnapshot snapshot;
+            try
+            {
+                snapshot = await state.LoadAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                return new RecoveryObservation(BrowserDirectoryRecoveryStatus.StateUnavailable);
+            }
+
+            var pending = snapshot.PendingIntent;
+            if (pending is null)
+                return new RecoveryObservation(BrowserDirectoryRecoveryStatus.Ready, snapshot);
+
+            if (pending.OwnerEpoch == processContext.OwnerEpoch &&
+                activityRegistry.IsActive(pending.OwnerEpoch, pending.IntentId))
+            {
+                return new RecoveryObservation(BrowserDirectoryRecoveryStatus.ActiveIntent, snapshot);
+            }
+
+            // Startup acquires WindowsMutexSingleInstanceGuard before app recovery. Therefore an
+            // intent from another owner epoch cannot still have a live writer in this process.
+            // A same-epoch intent absent from the shared activity registry is likewise orphaned.
+            if (!await CleanupIntentAsync(pending).ConfigureAwait(false))
+                return new RecoveryObservation(BrowserDirectoryRecoveryStatus.CleanupFailed, snapshot);
+        }
+
+        return new RecoveryObservation(BrowserDirectoryRecoveryStatus.StateChanged);
     }
 
     private async Task<(BrowserDirectoryStateSnapshot? Snapshot, BrowserSetupResult? Error)> TryLoadStateAsync(
@@ -579,6 +819,16 @@ public sealed class BrowserSetupService(
     private static SelectionAttemptResult Attempt(BrowserSetupStatus status) =>
         new(Result(status), false);
 
+    private static BrowserSetupResult RecoveryError(BrowserDirectoryRecoveryStatus status) =>
+        Result(status switch
+        {
+            BrowserDirectoryRecoveryStatus.ActiveIntent => BrowserSetupStatus.StateChanged,
+            BrowserDirectoryRecoveryStatus.StateUnavailable => BrowserSetupStatus.StateUnavailable,
+            BrowserDirectoryRecoveryStatus.CleanupFailed => BrowserSetupStatus.CleanupFailed,
+            BrowserDirectoryRecoveryStatus.StateChanged => BrowserSetupStatus.StateChanged,
+            _ => BrowserSetupStatus.StateUnavailable,
+        });
+
     private static bool SameSnapshot(
         BrowserDirectoryStateSnapshot expected,
         BrowserDirectoryStateSnapshot actual) =>
@@ -591,5 +841,16 @@ public sealed class BrowserSetupService(
         BrowserDirectorySelectionIntent? actual) =>
         expected is null
             ? actual is null
-            : actual is not null && expected.Revision == actual.Revision && expected.Kind == actual.Kind;
+            : actual is not null &&
+              expected.Revision == actual.Revision &&
+              expected.Kind == actual.Kind &&
+              expected.OwnerEpoch == actual.OwnerEpoch &&
+              expected.IntentId == actual.IntentId;
+
+    private static bool SameClaim(
+        BrowserDirectoryIntentClaim claim,
+        BrowserDirectorySelectionIntent intent) =>
+        claim.Kind == intent.Kind &&
+        claim.OwnerEpoch == intent.OwnerEpoch &&
+        claim.IntentId == intent.IntentId;
 }

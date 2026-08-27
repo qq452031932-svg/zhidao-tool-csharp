@@ -8,6 +8,8 @@ public sealed class BrowserSetupServiceTests
 {
     private const string SelectedDirectory = @"C:\Browser\Application";
     private const string SavedDirectory = @"C:\Saved\Browser";
+    private readonly BrowserSelectionProcessContext processContext = new(Guid.NewGuid());
+    private readonly ProcessBrowserSelectionActivityRegistry activityRegistry = new();
 
     [Fact]
     public async Task FirstUsePromptsInsteadOfScanning()
@@ -473,6 +475,163 @@ public sealed class BrowserSetupServiceTests
     }
 
     [Fact]
+    public async Task CleanupFailureCanBeRecoveredByNextCallInSameProcess()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            AbandonFailuresBeforeMutation = int.MaxValue,
+        };
+
+        var failed = await CreateService(
+                new RecordingBrowserDirectoryPicker(null),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+        Assert.Equal(BrowserSetupStatus.CleanupFailed, failed.Status);
+
+        state.AbandonFailuresBeforeMutation = 0;
+        var recovered = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Selected, recovered.Status);
+        Assert.Equal(SelectedDirectory, state.Directory);
+        Assert.Null((await state.LoadAsync(CancellationToken.None)).PendingIntent);
+    }
+
+    [Fact]
+    public async Task DifferentOwnerEpochRecoversCrashedIntentBeforeSelecting()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+        state.SeedPendingIntent(new BrowserDirectorySelectionIntent(
+            revision: 1,
+            BrowserDirectorySelectionIntentKind.ExplicitReselect,
+            ownerEpoch: Guid.NewGuid(),
+            intentId: Guid.NewGuid()));
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Selected, result.Status);
+        Assert.Equal(SelectedDirectory, state.Directory);
+        Assert.True(state.AbandonAttemptCount >= 1);
+    }
+
+    [Fact]
+    public async Task LiveIntentInCurrentEpochIsNotRecovered()
+    {
+        var intent = new BrowserDirectorySelectionIntent(
+            revision: 1,
+            BrowserDirectorySelectionIntentKind.ExplicitReselect,
+            processContext.OwnerEpoch,
+            Guid.NewGuid());
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+        state.SeedPendingIntent(intent);
+        using var activity = activityRegistry.Register(intent.OwnerEpoch, intent.IntentId);
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .EnsureSelectedAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.StateChanged, result.Status);
+        Assert.Equal(0, state.AbandonAttemptCount);
+        Assert.Equal(intent.IntentId,
+            (await state.LoadAsync(CancellationToken.None)).PendingIntent!.IntentId);
+    }
+
+    [Fact]
+    public async Task RecoveryOfOldIntentCannotClearReplacementIntent()
+    {
+        var oldIntent = new BrowserDirectorySelectionIntent(
+            revision: 1,
+            BrowserDirectorySelectionIntentKind.ExplicitReselect,
+            Guid.NewGuid(),
+            Guid.NewGuid());
+        var replacementIntent = new BrowserDirectorySelectionIntent(
+            revision: 2,
+            BrowserDirectorySelectionIntentKind.ExplicitReselect,
+            processContext.OwnerEpoch,
+            Guid.NewGuid());
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            ReplacementPendingIntent = replacementIntent,
+        };
+        state.SeedPendingIntent(oldIntent);
+        using var activity = activityRegistry.Register(
+            replacementIntent.OwnerEpoch, replacementIntent.IntentId);
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .RecoverPendingIntentAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserDirectoryRecoveryStatus.ActiveIntent, result.Status);
+        Assert.Equal(replacementIntent.IntentId,
+            (await state.LoadAsync(CancellationToken.None)).PendingIntent!.IntentId);
+    }
+
+    [Fact]
+    public async Task BeginMutationFollowedByExceptionIsConfirmedAndCompleted()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            ThrowAfterBeginMutation = true,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.Selected, result.Status);
+        Assert.Equal(SelectedDirectory, state.Directory);
+        Assert.Null((await state.LoadAsync(CancellationToken.None)).PendingIntent);
+    }
+
+    [Fact]
+    public async Task BeginFailureBeforeMutationDoesNotLeaveUnknownClaim()
+    {
+        var state = new RecordingBrowserDirectoryState(SavedDirectory)
+        {
+            ThrowBeforeBeginMutation = true,
+        };
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(),
+                state)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.StateUnavailable, result.Status);
+        Assert.Null((await state.LoadAsync(CancellationToken.None)).PendingIntent);
+    }
+
+    [Fact]
+    public void IntentDiagnosticsRedactOwnerEpochAndIntentId()
+    {
+        var ownerEpoch = Guid.NewGuid();
+        var intentId = Guid.NewGuid();
+        var claim = new BrowserDirectoryIntentClaim(
+            BrowserDirectorySelectionIntentKind.EnsurePrompt, ownerEpoch, intentId);
+        var intent = new BrowserDirectorySelectionIntent(
+            1, claim.Kind, ownerEpoch, intentId);
+
+        Assert.DoesNotContain(ownerEpoch.ToString(), claim.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(intentId.ToString(), claim.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(ownerEpoch.ToString(), intent.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(intentId.ToString(), intent.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task TransientAbandonFailureRetriesAndReturnsOriginalCancellation()
     {
         var state = new RecordingBrowserDirectoryState(SavedDirectory)
@@ -585,10 +744,11 @@ public sealed class BrowserSetupServiceTests
         Assert.Equal(1, state.SaveAttemptCount);
     }
 
-    private static BrowserSetupService CreateService(
+    private BrowserSetupService CreateService(
         IBrowserDirectoryPicker dialog,
         IBrowserDirectoryFileSystem fileSystem,
-        IBrowserDirectoryState state) => new(dialog, fileSystem, state);
+        IBrowserDirectoryState state) =>
+        new(dialog, fileSystem, state, processContext, activityRegistry);
 
     private static string[] ExpectedProbes(string directory) =>
         [Path.Combine(directory, "chrome.exe"), Path.Combine(directory, "msedge.exe")];
@@ -694,6 +854,9 @@ public sealed class BrowserSetupServiceTests
         public int AbandonFailuresBeforeMutation { get; set; }
         public bool ThrowAfterAbandonMutation { get; set; }
         public bool ReplacePendingBeforeAbandon { get; set; }
+        public BrowserDirectorySelectionIntent? ReplacementPendingIntent { get; set; }
+        public bool ThrowBeforeBeginMutation { get; set; }
+        public bool ThrowAfterBeginMutation { get; set; }
         public int AbandonAttemptCount { get; private set; }
         private readonly TaskCompletionSource<bool> pausedLoadStarted =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -702,6 +865,15 @@ public sealed class BrowserSetupServiceTests
 
         public Task WaitUntilPausedLoadAsync() => pausedLoadStarted.Task;
         public void ReleasePausedLoad() => pausedLoadReleased.TrySetResult(true);
+
+        public void SeedPendingIntent(BrowserDirectorySelectionIntent intent)
+        {
+            lock (sync)
+            {
+                pendingIntent = intent;
+                Revision = intent.Revision;
+            }
+        }
 
         public async Task<BrowserDirectoryStateSnapshot> LoadAsync(CancellationToken cancellationToken)
         {
@@ -724,30 +896,41 @@ public sealed class BrowserSetupServiceTests
 
         public Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
             long expectedRevision,
+            BrowserDirectoryIntentClaim claim,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             lock (sync)
             {
+                if (ThrowBeforeBeginMutation)
+                    throw new IOException("simulated pre-mutation begin failure");
                 if (expectedRevision != Revision || pendingIntent is not null)
                     return Task.FromResult(BrowserDirectoryIntentBeginResult.Conflict());
                 Revision++;
                 pendingIntent = new BrowserDirectorySelectionIntent(
-                    Revision, BrowserDirectorySelectionIntentKind.EnsurePrompt);
+                    Revision, claim.Kind, claim.OwnerEpoch, claim.IntentId);
+                if (ThrowAfterBeginMutation)
+                    throw new IOException("simulated post-mutation begin failure");
                 return Task.FromResult(BrowserDirectoryIntentBeginResult.Acquired(pendingIntent));
             }
         }
 
-        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken)
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(
+            BrowserDirectoryIntentClaim claim,
+            CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             lock (sync)
             {
+                if (ThrowBeforeBeginMutation)
+                    throw new IOException("simulated pre-mutation begin failure");
                 if (pendingIntent is not null)
                     return Task.FromResult(BrowserDirectoryIntentBeginResult.Conflict());
                 Revision++;
                 pendingIntent = new BrowserDirectorySelectionIntent(
-                    Revision, BrowserDirectorySelectionIntentKind.ExplicitReselect);
+                    Revision, claim.Kind, claim.OwnerEpoch, claim.IntentId);
+                if (ThrowAfterBeginMutation)
+                    throw new IOException("simulated post-mutation begin failure");
                 return Task.FromResult(BrowserDirectoryIntentBeginResult.Acquired(pendingIntent));
             }
         }
@@ -775,7 +958,9 @@ public sealed class BrowserSetupServiceTests
                     return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
                 if (pendingIntent is null ||
                     pendingIntent.Revision != selectionIntent.Revision ||
-                    pendingIntent.Kind != selectionIntent.Kind)
+                    pendingIntent.Kind != selectionIntent.Kind ||
+                    pendingIntent.OwnerEpoch != selectionIntent.OwnerEpoch ||
+                    pendingIntent.IntentId != selectionIntent.IntentId)
                     return Task.FromResult(BrowserDirectoryStateSaveResult.Conflict());
                 SaveCount++;
                 Directory = selectedDirectory;
@@ -804,11 +989,20 @@ public sealed class BrowserSetupServiceTests
                     ReplacePendingBeforeAbandon = false;
                     Revision++;
                     pendingIntent = new BrowserDirectorySelectionIntent(
-                        Revision, BrowserDirectorySelectionIntentKind.ExplicitReselect);
+                        Revision, BrowserDirectorySelectionIntentKind.ExplicitReselect,
+                        Guid.NewGuid(), Guid.NewGuid());
+                }
+                else if (ReplacementPendingIntent is not null)
+                {
+                    pendingIntent = ReplacementPendingIntent;
+                    Revision = pendingIntent.Revision;
+                    ReplacementPendingIntent = null;
                 }
                 if (pendingIntent is null ||
                     pendingIntent.Revision != selectionIntent.Revision ||
-                    pendingIntent.Kind != selectionIntent.Kind)
+                    pendingIntent.Kind != selectionIntent.Kind ||
+                    pendingIntent.OwnerEpoch != selectionIntent.OwnerEpoch ||
+                    pendingIntent.IntentId != selectionIntent.IntentId)
                     return Task.FromResult(false);
                 pendingIntent = null;
                 Revision++;
@@ -837,9 +1031,12 @@ public sealed class BrowserSetupServiceTests
 
         public Task<BrowserDirectoryIntentBeginResult> TryBeginEnsurePromptAsync(
             long expectedRevision,
+            BrowserDirectoryIntentClaim claim,
             CancellationToken cancellationToken) => throw new NotSupportedException();
 
-        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(CancellationToken cancellationToken) =>
+        public Task<BrowserDirectoryIntentBeginResult> TryBeginReselectAsync(
+            BrowserDirectoryIntentClaim claim,
+            CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
         public Task<BrowserDirectoryStateSaveResult> TrySaveAsync(

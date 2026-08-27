@@ -107,6 +107,30 @@ public sealed class DialogServiceTests
         Assert.Equal(@"C:\Browser\Application\chrome.exe", probe.ExactPath);
     }
 
+    [Fact]
+    public async Task CancelledBlockingProbesRespectSharedWorkerLimit()
+    {
+        using var probe = new CountingBlockingExactFileExistenceProbe();
+        var scheduler = new BrowserFileProbeScheduler(maximumConcurrency: 2);
+        var fileSystem = new BrowserDirectoryFileSystem(probe, scheduler);
+        using var cancellation = new CancellationTokenSource();
+
+        var tasks = Enumerable.Range(0, 20)
+            .Select(index => fileSystem.FileExistsAsync(
+                $@"C:\Browser\Application\probe-{index}.exe", cancellation.Token))
+            .ToArray();
+        Assert.True(probe.WaitUntilInvocationCount(2));
+
+        cancellation.Cancel();
+        await Task.WhenAll(tasks.Select(async task =>
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task)));
+
+        Assert.Equal(2, probe.MaximumConcurrentInvocations);
+        Assert.Equal(2, probe.InvocationCount);
+        probe.Release();
+        Assert.True(probe.WaitUntilAllExited());
+    }
+
     private sealed class RecordingDispatcher : IUiDispatcher
     {
         private readonly AsyncLocal<int> invocationDepth = new();
@@ -189,6 +213,54 @@ public sealed class DialogServiceTests
             entered.Dispose();
             release.Dispose();
             exited.Dispose();
+        }
+    }
+
+    private sealed class CountingBlockingExactFileExistenceProbe : IExactFileExistenceProbe, IDisposable
+    {
+        private readonly ManualResetEventSlim release = new(false);
+        private readonly ManualResetEventSlim allExited = new(false);
+        private int activeInvocations;
+        private int invocationCount;
+        private int maximumConcurrentInvocations;
+
+        public int InvocationCount => Volatile.Read(ref invocationCount);
+        public int MaximumConcurrentInvocations => Volatile.Read(ref maximumConcurrentInvocations);
+
+        public bool Exists(string exactPath)
+        {
+            var active = Interlocked.Increment(ref activeInvocations);
+            Interlocked.Increment(ref invocationCount);
+            UpdateMaximum(active);
+            release.Wait(TimeSpan.FromSeconds(5));
+            if (Interlocked.Decrement(ref activeInvocations) == 0)
+                allExited.Set();
+            return false;
+        }
+
+        public bool WaitUntilInvocationCount(int expected) =>
+            SpinWait.SpinUntil(() => InvocationCount >= expected, TimeSpan.FromSeconds(5));
+
+        public void Release() => release.Set();
+        public bool WaitUntilAllExited() => allExited.Wait(TimeSpan.FromSeconds(5));
+
+        private void UpdateMaximum(int value)
+        {
+            var observed = Volatile.Read(ref maximumConcurrentInvocations);
+            while (value > observed)
+            {
+                var exchanged = Interlocked.CompareExchange(
+                    ref maximumConcurrentInvocations, value, observed);
+                if (exchanged == observed) return;
+                observed = exchanged;
+            }
+        }
+
+        public void Dispose()
+        {
+            release.Set();
+            release.Dispose();
+            allExited.Dispose();
         }
     }
 }
