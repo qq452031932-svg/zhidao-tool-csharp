@@ -191,6 +191,7 @@ public sealed class BrowserSetupService(
 {
     private const string ChromeExecutableName = "chrome.exe";
     private const string EdgeExecutableName = "msedge.exe";
+    private const int MaximumStableObservationAttempts = 3;
     private readonly SemaphoreSlim flowGate = new(1, 1);
 
     private sealed record SelectionAttemptResult(
@@ -274,8 +275,18 @@ public sealed class BrowserSetupService(
         if (!string.IsNullOrWhiteSpace(snapshot.Directory))
         {
             var saved = await InspectAsync(snapshot.Directory, cancellationToken).ConfigureAwait(false);
-            if (saved.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired)
-                return saved;
+            var validated = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
+            if (validated.Snapshot is null) return validated.Error!;
+            if (SameSnapshot(snapshot, validated.Snapshot))
+            {
+                if (saved.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired)
+                    return saved;
+            }
+            else
+            {
+                return await ObserveStableCurrentSelectionAsync(
+                    validated.Snapshot, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         return (await SelectAndPersistAsync(
@@ -349,15 +360,34 @@ public sealed class BrowserSetupService(
     {
         var reloaded = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
         if (reloaded.Snapshot is null) return reloaded.Error!;
-        if (reloaded.Snapshot.PendingReselect is not null)
-            return Result(BrowserSetupStatus.StateChanged);
-        if (string.IsNullOrWhiteSpace(reloaded.Snapshot.Directory))
-            return Result(BrowserSetupStatus.StateChanged);
+        return await ObserveStableCurrentSelectionAsync(
+            reloaded.Snapshot, cancellationToken).ConfigureAwait(false);
+    }
 
-        var current = await InspectAsync(reloaded.Snapshot.Directory, cancellationToken).ConfigureAwait(false);
-        return current.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired
-            ? current
-            : Result(BrowserSetupStatus.StateChanged);
+    private async Task<BrowserSetupResult> ObserveStableCurrentSelectionAsync(
+        BrowserDirectoryStateSnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < MaximumStableObservationAttempts; attempt++)
+        {
+            if (snapshot.PendingReselect is not null || string.IsNullOrWhiteSpace(snapshot.Directory))
+                return Result(BrowserSetupStatus.StateChanged);
+
+            var observed = await InspectAsync(snapshot.Directory, cancellationToken).ConfigureAwait(false);
+            var validated = await TryLoadStateAsync(cancellationToken).ConfigureAwait(false);
+            if (validated.Snapshot is null) return validated.Error!;
+
+            if (SameSnapshot(snapshot, validated.Snapshot))
+            {
+                return observed.Status is BrowserSetupStatus.Selected or BrowserSetupStatus.BrowserFamilyChoiceRequired
+                    ? observed
+                    : Result(BrowserSetupStatus.StateChanged);
+            }
+
+            snapshot = validated.Snapshot;
+        }
+
+        return Result(BrowserSetupStatus.StateChanged);
     }
 
     private async Task<BrowserSetupResult> InspectAsync(
@@ -437,4 +467,11 @@ public sealed class BrowserSetupService(
 
     private static SelectionAttemptResult Attempt(BrowserSetupStatus status) =>
         new(Result(status), false);
+
+    private static bool SameSnapshot(
+        BrowserDirectoryStateSnapshot expected,
+        BrowserDirectoryStateSnapshot actual) =>
+        expected.Revision == actual.Revision &&
+        string.Equals(expected.Directory, actual.Directory, StringComparison.Ordinal) &&
+        expected.PendingReselect?.Revision == actual.PendingReselect?.Revision;
 }

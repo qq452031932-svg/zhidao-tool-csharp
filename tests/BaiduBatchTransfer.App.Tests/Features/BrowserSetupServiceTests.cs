@@ -345,6 +345,61 @@ public sealed class BrowserSetupServiceTests
     }
 
     [Fact]
+    public async Task SavedDirectoryProbeCannotReturnASelectionReplacedWhileProbeWasRunning()
+    {
+        const string replacementDirectory = @"C:\Replacement\Browser";
+        var fileSystem = new BlockingBrowserDirectoryFileSystem(
+            Path.Combine(SavedDirectory, "chrome.exe"),
+            Path.Combine(SavedDirectory, "chrome.exe"),
+            Path.Combine(replacementDirectory, "msedge.exe"));
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+        var staleEnsure = CreateService(
+            new RecordingBrowserDirectoryPicker(null), fileSystem, state);
+        var replacement = CreateService(
+            new RecordingBrowserDirectoryPicker(replacementDirectory), fileSystem, state);
+
+        var staleResultTask = staleEnsure.EnsureSelectedAsync(CancellationToken.None);
+        await fileSystem.WaitUntilBlockedProbeStartedAsync();
+        var replacementResult = await replacement.ReselectAsync(CancellationToken.None);
+        fileSystem.ReleaseBlockedProbe();
+        var staleResult = await staleResultTask;
+
+        Assert.Equal(BrowserFamily.Edge, Assert.Single(replacementResult.Candidates).BrowserFamily);
+        Assert.Equal(BrowserFamily.Edge, Assert.Single(staleResult.Candidates).BrowserFamily);
+        Assert.Equal(replacementDirectory, state.Directory);
+    }
+
+    [Fact]
+    public async Task ConflictAdoptionProbeCannotReturnASelectionReplacedWhileProbeWasRunning()
+    {
+        const string replacementDirectory = @"C:\ConflictReplacement\Browser";
+        var fileSystem = new BlockingBrowserDirectoryFileSystem(
+            Path.Combine(SavedDirectory, "chrome.exe"),
+            Path.Combine(SelectedDirectory, "chrome.exe"),
+            Path.Combine(SavedDirectory, "chrome.exe"),
+            Path.Combine(replacementDirectory, "msedge.exe"));
+        var state = new RecordingBrowserDirectoryState
+        {
+            ConflictsRemaining = 1,
+            ConflictDirectory = SavedDirectory,
+        };
+        var staleEnsure = CreateService(
+            new RecordingBrowserDirectoryPicker(SelectedDirectory), fileSystem, state);
+        var replacement = CreateService(
+            new RecordingBrowserDirectoryPicker(replacementDirectory), fileSystem, state);
+
+        var staleResultTask = staleEnsure.EnsureSelectedAsync(CancellationToken.None);
+        await fileSystem.WaitUntilBlockedProbeStartedAsync();
+        var replacementResult = await replacement.ReselectAsync(CancellationToken.None);
+        fileSystem.ReleaseBlockedProbe();
+        var staleResult = await staleResultTask;
+
+        Assert.Equal(BrowserFamily.Edge, Assert.Single(replacementResult.Candidates).BrowserFamily);
+        Assert.Equal(BrowserFamily.Edge, Assert.Single(staleResult.Candidates).BrowserFamily);
+        Assert.Equal(replacementDirectory, state.Directory);
+    }
+
+    [Fact]
     public async Task CancellationAfterDurableCommitReturnsCommittedResult()
     {
         using var cancellation = new CancellationTokenSource();
@@ -447,6 +502,31 @@ public sealed class BrowserSetupServiceTests
             AccessedPaths.Add(exactPath);
             if (Failure is not null) throw Failure;
             return Task.FromResult(existing.Contains(exactPath));
+        }
+    }
+
+    private sealed class BlockingBrowserDirectoryFileSystem(
+        string blockedPath,
+        params string[] existingPaths) : IBrowserDirectoryFileSystem
+    {
+        private readonly HashSet<string> existing = new(existingPaths, StringComparer.OrdinalIgnoreCase);
+        private readonly TaskCompletionSource<bool> blockedProbeStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> blockedProbeReleased =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task WaitUntilBlockedProbeStartedAsync() => blockedProbeStarted.Task;
+        public void ReleaseBlockedProbe() => blockedProbeReleased.TrySetResult(true);
+
+        public async Task<bool> FileExistsAsync(string exactPath, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.Equals(exactPath, blockedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                blockedProbeStarted.TrySetResult(true);
+                await blockedProbeReleased.Task.WaitAsync(cancellationToken);
+            }
+            return existing.Contains(exactPath);
         }
     }
 
