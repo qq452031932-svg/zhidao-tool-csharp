@@ -142,7 +142,15 @@ def _loopback_endpoint(value) -> bool:
         and parsed.path == "/"
         and parsed.query == ""
         and parsed.fragment == ""
+        and value == f"http://127.0.0.1:{port}/"
     )
+
+
+def _validate_capabilities(value) -> None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _error("InvalidPayload")
+    if tuple(value) != REQUIRED_CAPABILITIES:
+        raise _error("CapabilityMismatch")
 
 
 def _validate_common(value, expected_fields) -> str:
@@ -169,9 +177,7 @@ def validate_request(value) -> None:
         _exact_object(payload, ("nonce", "parentProcessId", "requiredCapabilities"), body=True)
         if not _nonce(payload["nonce"]) or not _integer(payload["parentProcessId"], maximum=(2 ** 31) - 1):
             raise _error("InvalidPayload")
-        capabilities = payload["requiredCapabilities"]
-        if not isinstance(capabilities, list) or tuple(capabilities) != REQUIRED_CAPABILITIES:
-            raise _error("CapabilityMismatch")
+        _validate_capabilities(payload["requiredCapabilities"])
     elif action in ("Health", "Shutdown"):
         _exact_object(payload, (), body=True)
     elif action == "ObserveAccountIdentity":
@@ -207,8 +213,7 @@ def validate_response(value) -> None:
         if (not _integer(result["parentProcessId"], maximum=(2 ** 31) - 1)
                 or not _integer(result["helperProcessId"], maximum=(2 ** 31) - 1)):
             raise _error("InvalidPayload")
-        if not isinstance(result["capabilities"], list) or tuple(result["capabilities"]) != REQUIRED_CAPABILITIES:
-            raise _error("CapabilityMismatch")
+        _validate_capabilities(result["capabilities"])
     elif action == "Health":
         _exact_object(result, ("kind",), body=True)
         if result["kind"] != "Healthy":

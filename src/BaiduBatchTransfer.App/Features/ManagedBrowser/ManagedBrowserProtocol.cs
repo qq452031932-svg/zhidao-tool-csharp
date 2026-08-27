@@ -669,12 +669,16 @@ public static class ManagedBrowserProtocol
     private static ManagedBrowserRequestPayload ParseHandshakeRequest(JsonElement value)
     {
         ValidateObject(value, ["nonce", "parentProcessId", "requiredCapabilities"], ManagedBrowserProtocolError.InvalidPayload);
-        var capabilities = RequireStringArray(value, "requiredCapabilities");
+        var nonce = RequireString(value, "nonce", ManagedBrowserProtocolError.InvalidPayload);
+        var parentProcessId = RequireInt32(
+            value, "parentProcessId", ManagedBrowserProtocolError.InvalidPayload);
+        var capabilities = RequireStringArray(
+            value, "requiredCapabilities", ManagedBrowserProtocolError.InvalidPayload);
+        if (!IsNonce(nonce) || parentProcessId <= 0)
+            throw Failure(ManagedBrowserProtocolError.InvalidPayload);
         if (!CapabilitiesMatch(capabilities))
             throw Failure(ManagedBrowserProtocolError.CapabilityMismatch);
-        try { return new ManagedBrowserHandshakeRequest(
-            RequireString(value, "nonce"), RequireInt32(value, "parentProcessId"), capabilities); }
-        catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
+        return new ManagedBrowserHandshakeRequest(nonce, parentProcessId, capabilities);
     }
 
     private static ManagedBrowserRequestPayload ParseEmptyPayload(JsonElement value)
@@ -688,12 +692,14 @@ public static class ManagedBrowserProtocol
         ValidateObject(value, ["browserId", "targetId", "devToolsEndpoint", "timeoutMilliseconds"], ManagedBrowserProtocolError.InvalidPayload);
         try
         {
-            var endpointText = RequireString(value, "devToolsEndpoint");
+            var endpointText = RequireString(
+                value, "devToolsEndpoint", ManagedBrowserProtocolError.InvalidPayload);
             if (!Uri.TryCreate(endpointText, UriKind.Absolute, out var endpoint))
                 throw new ArgumentException("Invalid endpoint.");
             return new ManagedBrowserObserveAccountIdentityRequest(
-                RequireGuid(value, "browserId"), RequireString(value, "targetId"), endpoint,
-                RequireInt32(value, "timeoutMilliseconds"));
+                RequireGuid(value, "browserId", ManagedBrowserProtocolError.InvalidPayload),
+                RequireString(value, "targetId", ManagedBrowserProtocolError.InvalidPayload), endpoint,
+                RequireInt32(value, "timeoutMilliseconds", ManagedBrowserProtocolError.InvalidPayload));
         }
         catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
     }
@@ -701,29 +707,37 @@ public static class ManagedBrowserProtocol
     private static ManagedBrowserResult ParseHandshakeResult(JsonElement value)
     {
         ValidateObject(value, ["kind", "nonce", "parentProcessId", "helperProcessId", "capabilities"], ManagedBrowserProtocolError.InvalidPayload);
-        if (!string.Equals(RequireString(value, "kind"), "HandshakeAccepted", StringComparison.Ordinal))
+        var kind = RequireString(value, "kind", ManagedBrowserProtocolError.InvalidPayload);
+        var nonce = RequireString(value, "nonce", ManagedBrowserProtocolError.InvalidPayload);
+        var parentProcessId = RequireInt32(
+            value, "parentProcessId", ManagedBrowserProtocolError.InvalidPayload);
+        var helperProcessId = RequireInt32(
+            value, "helperProcessId", ManagedBrowserProtocolError.InvalidPayload);
+        var capabilities = RequireStringArray(
+            value, "capabilities", ManagedBrowserProtocolError.InvalidPayload);
+        if (!string.Equals(kind, "HandshakeAccepted", StringComparison.Ordinal) ||
+            !IsNonce(nonce) || parentProcessId <= 0 || helperProcessId <= 0)
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
-        var capabilities = RequireStringArray(value, "capabilities");
         if (!CapabilitiesMatch(capabilities))
             throw Failure(ManagedBrowserProtocolError.CapabilityMismatch);
-        try { return new ManagedBrowserHandshakeResult(
-            RequireString(value, "nonce"), RequireInt32(value, "parentProcessId"),
-            RequireInt32(value, "helperProcessId"), capabilities); }
-        catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
+        return new ManagedBrowserHandshakeResult(
+            nonce, parentProcessId, helperProcessId, capabilities);
     }
 
     private static ManagedBrowserResult ParseSingletonResult(
         JsonElement value, string expectedKind, ManagedBrowserResult result)
     {
         ValidateObject(value, ["kind"], ManagedBrowserProtocolError.InvalidPayload);
-        if (!string.Equals(RequireString(value, "kind"), expectedKind, StringComparison.Ordinal))
+        if (!string.Equals(RequireString(
+                value, "kind", ManagedBrowserProtocolError.InvalidPayload),
+                expectedKind, StringComparison.Ordinal))
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
         return result;
     }
 
     private static ManagedBrowserResult ParseIdentityResult(JsonElement value)
     {
-        var kindText = RequireString(value, "kind");
+        var kindText = RequireString(value, "kind", ManagedBrowserProtocolError.InvalidPayload);
         if (!Enum.TryParse(kindText, ignoreCase: false, out ManagedBrowserIdentityResultKind kind) ||
             !Enum.IsDefined(kind) || kind.ToString() != kindText)
             throw Failure(ManagedBrowserProtocolError.InvalidPayload);
@@ -731,7 +745,8 @@ public static class ManagedBrowserProtocol
             ? ["kind", "stableBaiduUserId"] : ["kind"], ManagedBrowserProtocolError.InvalidPayload);
         try { return new ManagedBrowserIdentityResult(
             kind, kind == ManagedBrowserIdentityResultKind.Observed
-                ? RequireString(value, "stableBaiduUserId") : null); }
+                ? RequireString(value, "stableBaiduUserId", ManagedBrowserProtocolError.InvalidPayload)
+                : null); }
         catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
     }
 
@@ -820,29 +835,38 @@ public static class ManagedBrowserProtocol
         writer.WriteEndArray();
     }
 
-    private static string RequireString(JsonElement value, string name)
+    private static string RequireString(
+        JsonElement value,
+        string name,
+        ManagedBrowserProtocolError bodyError = ManagedBrowserProtocolError.InvalidMessage)
     {
         if (!value.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.String)
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(bodyError);
         return property.GetString()!;
     }
 
-    private static Guid RequireGuid(JsonElement value, string name)
+    private static Guid RequireGuid(
+        JsonElement value,
+        string name,
+        ManagedBrowserProtocolError bodyError = ManagedBrowserProtocolError.InvalidMessage)
     {
-        var text = RequireString(value, name);
+        var text = RequireString(value, name, bodyError);
         if (!Guid.TryParseExact(text, "D", out var result) ||
             !string.Equals(text, result.ToString("D"), StringComparison.Ordinal))
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(bodyError);
         return result;
     }
 
-    private static int RequireInt32(JsonElement value, string name)
+    private static int RequireInt32(
+        JsonElement value,
+        string name,
+        ManagedBrowserProtocolError bodyError = ManagedBrowserProtocolError.InvalidMessage)
     {
         if (!value.TryGetProperty(name, out var property) ||
             property.ValueKind != JsonValueKind.Number ||
             !IsIntegerToken(property) ||
             !property.TryGetInt32(out var result))
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(bodyError);
         return result;
     }
 
@@ -872,15 +896,18 @@ public static class ManagedBrowserProtocol
         return property;
     }
 
-    private static string[] RequireStringArray(JsonElement value, string name)
+    private static string[] RequireStringArray(
+        JsonElement value,
+        string name,
+        ManagedBrowserProtocolError bodyError = ManagedBrowserProtocolError.InvalidMessage)
     {
         if (!value.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.Array)
-            throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+            throw Failure(bodyError);
         var result = new List<string>();
         foreach (var item in property.EnumerateArray())
         {
             if (item.ValueKind != JsonValueKind.String)
-                throw Failure(ManagedBrowserProtocolError.InvalidMessage);
+                throw Failure(bodyError);
             result.Add(item.GetString()!);
         }
         return result.ToArray();

@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using System.Buffers.Binary;
 using System.Text;
+using System.Text.Json.Nodes;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -156,6 +157,69 @@ public sealed class ManagedBrowserProtocolTests
         }
     }
 
+    [Fact]
+    public void EveryBodyFieldTypeAndFormatFailureUsesCrossLanguageErrorParity()
+    {
+        var requestHandshake = HandshakeJson();
+        var requestObserve = ObserveJson();
+        var responseHandshake = HandshakeResponseJson();
+        var responseHealth = HealthResponseJson();
+        var responseShutdown = ShutdownResponseJson();
+        var responseObserved = ObservedResponseJson();
+        var cases = new (string Name, bool Response, string Json, ManagedBrowserProtocolError Error)[]
+        {
+            ("request nonce type", false, WithBodyValue(requestHandshake, "payload", "nonce", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request nonce format", false, WithBodyValue(requestHandshake, "payload", "nonce", "\"short\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request parent pid type", false, WithBodyValue(requestHandshake, "payload", "parentProcessId", "\"1234\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request parent pid format", false, WithBodyValue(requestHandshake, "payload", "parentProcessId", "0"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request capabilities type", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "\"Health\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request capabilities item type", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Health\",1,\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request capabilities set", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("request capabilities order", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Shutdown\",\"Health\",\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("request invalid schema precedes capability mismatch", false, WithBodyValue(WithBodyValue(requestHandshake, "payload", "nonce", "\"short\""), "payload", "requiredCapabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request browser id type", false, WithBodyValue(requestObserve, "payload", "browserId", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request browser id format", false, WithBodyValue(requestObserve, "payload", "browserId", "\"not-a-guid\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request target id type", false, WithBodyValue(requestObserve, "payload", "targetId", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request target id format", false, WithBodyValue(requestObserve, "payload", "targetId", "\"\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request endpoint type", false, WithBodyValue(requestObserve, "payload", "devToolsEndpoint", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request endpoint format", false, WithBodyValue(requestObserve, "payload", "devToolsEndpoint", "\"http://localhost:43127/\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request timeout type", false, WithBodyValue(requestObserve, "payload", "timeoutMilliseconds", "\"1\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("request timeout numeric type", false, WithBodyValue(requestObserve, "payload", "timeoutMilliseconds", "1.0"), ManagedBrowserProtocolError.InvalidPayload),
+            ("request timeout format", false, WithBodyValue(requestObserve, "payload", "timeoutMilliseconds", "0"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response handshake kind type", true, WithBodyValue(responseHandshake, "result", "kind", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response handshake kind format", true, WithBodyValue(responseHandshake, "result", "kind", "\"Healthy\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response nonce type", true, WithBodyValue(responseHandshake, "result", "nonce", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response nonce format", true, WithBodyValue(responseHandshake, "result", "nonce", "\"short\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response parent pid type", true, WithBodyValue(responseHandshake, "result", "parentProcessId", "\"1234\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response parent pid format", true, WithBodyValue(responseHandshake, "result", "parentProcessId", "0"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response helper pid type", true, WithBodyValue(responseHandshake, "result", "helperProcessId", "\"9876\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response helper pid format", true, WithBodyValue(responseHandshake, "result", "helperProcessId", "0"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response capabilities type", true, WithBodyValue(responseHandshake, "result", "capabilities", "\"Health\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response capabilities item type", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Health\",1,\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response capabilities set", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("response capabilities order", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Shutdown\",\"Health\",\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("response invalid schema precedes capability mismatch", true, WithBodyValue(WithBodyValue(responseHandshake, "result", "nonce", "\"short\""), "result", "capabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response health kind type", true, WithBodyValue(responseHealth, "result", "kind", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response health kind format", true, WithBodyValue(responseHealth, "result", "kind", "\"ShuttingDown\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response shutdown kind type", true, WithBodyValue(responseShutdown, "result", "kind", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response shutdown kind format", true, WithBodyValue(responseShutdown, "result", "kind", "\"Healthy\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response observed kind type", true, WithBodyValue(responseObserved, "result", "kind", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response observed kind format", true, WithBodyValue(responseObserved, "result", "kind", "\"Unknown\""), ManagedBrowserProtocolError.InvalidPayload),
+            ("response uid type", true, WithBodyValue(responseObserved, "result", "stableBaiduUserId", "1"), ManagedBrowserProtocolError.InvalidPayload),
+            ("response uid format", true, WithBodyValue(responseObserved, "result", "stableBaiduUserId", "\"\""), ManagedBrowserProtocolError.InvalidPayload),
+        };
+
+        foreach (var testCase in cases)
+        {
+            var error = Assert.Throws<ManagedBrowserProtocolException>(() =>
+                testCase.Response
+                    ? ManagedBrowserProtocol.DecodeResponse(Encoding.UTF8.GetBytes(testCase.Json))
+                    : ManagedBrowserProtocol.DecodeRequest(Encoding.UTF8.GetBytes(testCase.Json)));
+            Assert.True(testCase.Error == error.Error,
+                $"{testCase.Name}: expected {testCase.Error}, got {error.Error}");
+        }
+    }
+
     [Theory]
     [InlineData("unexpected")]
     [InlineData("cookie")]
@@ -262,6 +326,8 @@ public sealed class ManagedBrowserProtocolTests
     [InlineData("http://127.0.0.1:80/")]
     [InlineData("http://[::1]:43127/")]
     [InlineData("http://localhost:43127/")]
+    [InlineData("HTTP://127.0.0.1:43127/")]
+    [InlineData("http://127.000.000.001:43127/")]
     public void DevToolsEndpointRequiresExplicitNonDefaultIpv4LoopbackPort(string endpoint)
     {
         Assert.Throws<ArgumentException>(() => new ManagedBrowserObserveAccountIdentityRequest(
@@ -343,6 +409,52 @@ public sealed class ManagedBrowserProtocolTests
 
     private static string HandshakeJson() =>
         Encoding.UTF8.GetString(ManagedBrowserProtocol.EncodeRequestPayload(HandshakeRequest()));
+
+    private static string ObserveJson() => Encoding.UTF8.GetString(
+        ManagedBrowserProtocol.EncodeRequestPayload(Request(
+            ManagedBrowserAction.ObserveAccountIdentity,
+            new ManagedBrowserObserveAccountIdentityRequest(
+                Guid.Parse("44444444-4444-4444-4444-444444444444"),
+                "target-1", new Uri("http://127.0.0.1:43127/"), 30_000))));
+
+    private static string HandshakeResponseJson() => Encoding.UTF8.GetString(
+        ManagedBrowserProtocol.EncodeResponsePayload(ManagedBrowserResponse.For(
+            HandshakeRequest(), new ManagedBrowserHandshakeResult(
+                Nonce, 1234, 9876, ManagedBrowserProtocol.RequiredCapabilities))));
+
+    private static string HealthResponseJson()
+    {
+        var request = Request(ManagedBrowserAction.Health, ManagedBrowserRequestPayload.Empty);
+        return Encoding.UTF8.GetString(ManagedBrowserProtocol.EncodeResponsePayload(
+            ManagedBrowserResponse.For(request, ManagedBrowserHealthResult.Healthy)));
+    }
+
+    private static string ShutdownResponseJson()
+    {
+        var request = Request(ManagedBrowserAction.Shutdown, ManagedBrowserRequestPayload.Empty);
+        return Encoding.UTF8.GetString(ManagedBrowserProtocol.EncodeResponsePayload(
+            ManagedBrowserResponse.For(request, ManagedBrowserShutdownResult.ShuttingDown)));
+    }
+
+    private static string ObservedResponseJson()
+    {
+        var request = Request(
+            ManagedBrowserAction.ObserveAccountIdentity,
+            new ManagedBrowserObserveAccountIdentityRequest(
+                Guid.Parse("44444444-4444-4444-4444-444444444444"),
+                "target-1", new Uri("http://127.0.0.1:43127/"), 30_000));
+        return Encoding.UTF8.GetString(ManagedBrowserProtocol.EncodeResponsePayload(
+            ManagedBrowserResponse.For(request, new ManagedBrowserIdentityResult(
+                ManagedBrowserIdentityResultKind.Observed, "stable-uid"))));
+    }
+
+    private static string WithBodyValue(
+        string json, string bodyName, string fieldName, string rawJsonValue)
+    {
+        var root = JsonNode.Parse(json)!.AsObject();
+        root[bodyName]!.AsObject()[fieldName] = JsonNode.Parse(rawJsonValue);
+        return root.ToJsonString();
+    }
 
     private static MemoryStream Frame(byte[] payload)
     {

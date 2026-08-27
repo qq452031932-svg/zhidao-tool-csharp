@@ -41,6 +41,13 @@ def request(action="Handshake", payload=None):
     }
 
 
+def response(action, result):
+    value = request(action, {})
+    value.pop("payload")
+    value["result"] = result
+    return value
+
+
 class FragmentedReader:
     def __init__(self, data, chunks=(1, 2, 3, 5, 8)):
         self._data = data
@@ -137,6 +144,81 @@ class ProtocolTests(unittest.TestCase):
                 with self.assertRaisesRegex(protocol.ProtocolError, "InvalidPayload"):
                     protocol.validate_request(value)
 
+    def test_every_body_field_type_and_format_failure_matches_csharp(self):
+        handshake_request = request()
+        observe_request = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 30000,
+        })
+        handshake_response = response("Handshake", {
+            "kind": "HandshakeAccepted",
+            "nonce": NONCE,
+            "parentProcessId": 1234,
+            "helperProcessId": 9876,
+            "capabilities": list(protocol.REQUIRED_CAPABILITIES),
+        })
+        health_response = response("Health", {"kind": "Healthy"})
+        shutdown_response = response("Shutdown", {"kind": "ShuttingDown"})
+        observed_response = response("ObserveAccountIdentity", {
+            "kind": "Observed", "stableBaiduUserId": "stable-uid",
+        })
+        request_invalid_before_capabilities = json.loads(json.dumps(handshake_request))
+        request_invalid_before_capabilities["payload"]["nonce"] = "short"
+        response_invalid_before_capabilities = json.loads(json.dumps(handshake_response))
+        response_invalid_before_capabilities["result"]["nonce"] = "short"
+        cases = (
+            ("request nonce type", handshake_request, "payload", "nonce", 1, "InvalidPayload"),
+            ("request nonce format", handshake_request, "payload", "nonce", "short", "InvalidPayload"),
+            ("request parent pid type", handshake_request, "payload", "parentProcessId", "1234", "InvalidPayload"),
+            ("request parent pid format", handshake_request, "payload", "parentProcessId", 0, "InvalidPayload"),
+            ("request capabilities type", handshake_request, "payload", "requiredCapabilities", "Health", "InvalidPayload"),
+            ("request capabilities item type", handshake_request, "payload", "requiredCapabilities", ["Health", 1, "ObserveAccountIdentity"], "InvalidPayload"),
+            ("request capabilities set", handshake_request, "payload", "requiredCapabilities", ["Health", "Shutdown"], "CapabilityMismatch"),
+            ("request capabilities order", handshake_request, "payload", "requiredCapabilities", ["Shutdown", "Health", "ObserveAccountIdentity"], "CapabilityMismatch"),
+            ("request invalid schema precedes capability mismatch", request_invalid_before_capabilities, "payload", "requiredCapabilities", ["Health", "Shutdown"], "InvalidPayload"),
+            ("request browser id type", observe_request, "payload", "browserId", 1, "InvalidPayload"),
+            ("request browser id format", observe_request, "payload", "browserId", "not-a-guid", "InvalidPayload"),
+            ("request target id type", observe_request, "payload", "targetId", 1, "InvalidPayload"),
+            ("request target id format", observe_request, "payload", "targetId", "", "InvalidPayload"),
+            ("request endpoint type", observe_request, "payload", "devToolsEndpoint", 1, "InvalidPayload"),
+            ("request endpoint format", observe_request, "payload", "devToolsEndpoint", "http://localhost:43127/", "InvalidPayload"),
+            ("request timeout type", observe_request, "payload", "timeoutMilliseconds", "1", "InvalidPayload"),
+            ("request timeout numeric type", observe_request, "payload", "timeoutMilliseconds", 1.0, "InvalidPayload"),
+            ("request timeout format", observe_request, "payload", "timeoutMilliseconds", 0, "InvalidPayload"),
+            ("response handshake kind type", handshake_response, "result", "kind", 1, "InvalidPayload"),
+            ("response handshake kind format", handshake_response, "result", "kind", "Healthy", "InvalidPayload"),
+            ("response nonce type", handshake_response, "result", "nonce", 1, "InvalidPayload"),
+            ("response nonce format", handshake_response, "result", "nonce", "short", "InvalidPayload"),
+            ("response parent pid type", handshake_response, "result", "parentProcessId", "1234", "InvalidPayload"),
+            ("response parent pid format", handshake_response, "result", "parentProcessId", 0, "InvalidPayload"),
+            ("response helper pid type", handshake_response, "result", "helperProcessId", "9876", "InvalidPayload"),
+            ("response helper pid format", handshake_response, "result", "helperProcessId", 0, "InvalidPayload"),
+            ("response capabilities type", handshake_response, "result", "capabilities", "Health", "InvalidPayload"),
+            ("response capabilities item type", handshake_response, "result", "capabilities", ["Health", 1, "ObserveAccountIdentity"], "InvalidPayload"),
+            ("response capabilities set", handshake_response, "result", "capabilities", ["Health", "Shutdown"], "CapabilityMismatch"),
+            ("response capabilities order", handshake_response, "result", "capabilities", ["Shutdown", "Health", "ObserveAccountIdentity"], "CapabilityMismatch"),
+            ("response invalid schema precedes capability mismatch", response_invalid_before_capabilities, "result", "capabilities", ["Health", "Shutdown"], "InvalidPayload"),
+            ("response health kind type", health_response, "result", "kind", 1, "InvalidPayload"),
+            ("response health kind format", health_response, "result", "kind", "ShuttingDown", "InvalidPayload"),
+            ("response shutdown kind type", shutdown_response, "result", "kind", 1, "InvalidPayload"),
+            ("response shutdown kind format", shutdown_response, "result", "kind", "Healthy", "InvalidPayload"),
+            ("response observed kind type", observed_response, "result", "kind", 1, "InvalidPayload"),
+            ("response observed kind format", observed_response, "result", "kind", "Unknown", "InvalidPayload"),
+            ("response uid type", observed_response, "result", "stableBaiduUserId", 1, "InvalidPayload"),
+            ("response uid format", observed_response, "result", "stableBaiduUserId", "", "InvalidPayload"),
+        )
+
+        for name, template, body_name, field, invalid_value, expected in cases:
+            with self.subTest(name=name):
+                value = json.loads(json.dumps(template))
+                value[body_name][field] = invalid_value
+                validator = protocol.validate_response if body_name == "result" else protocol.validate_request
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    validator(value)
+                self.assertEqual(expected, caught.exception.code)
+
     def test_secret_like_keys_are_rejected_recursively_without_echo(self):
         for key in ("cookie", "Authorization", "extractionCode"):
             with self.subTest(key=key):
@@ -196,6 +278,8 @@ class ProtocolTests(unittest.TestCase):
             "http://127.0.0.1:80/",
             "http://[::1]:43127/",
             "http://localhost:43127/",
+            "HTTP://127.0.0.1:43127/",
+            "http://127.000.000.001:43127/",
         ):
             with self.subTest(endpoint=endpoint):
                 invalid = json.loads(json.dumps(base))
@@ -346,6 +430,16 @@ class ProtocolTests(unittest.TestCase):
             main.observe_bound_target(payload, connector, monotonic=lambda: 0.0, sleeper=lambda _: None),
         )
 
+    def test_drission_navigation_disables_driver_retries_and_intervals(self):
+        tab = FakeDrissionTab()
+
+        main._DrissionTarget(tab).navigate(main.PAN_ROOT, 0.125)
+
+        self.assertEqual(
+            [(main.PAN_ROOT, {"timeout": 0.125, "retry": 0, "interval": 0})],
+            tab.get_calls,
+        )
+
     def test_server_requires_handshake_rejects_duplicate_ids_and_shuts_down(self):
         health = {**request("Health", {}), "correlationId": str(uuid.uuid4())}
         incoming = b"".join((
@@ -479,6 +573,16 @@ class FakeChromium:
     def __init__(self, browser_id):
         self.id = browser_id
         self.tab_ids = []
+
+
+class FakeDrissionTab:
+    tab_id = "target-1"
+
+    def __init__(self):
+        self.get_calls = []
+
+    def get(self, value, **kwargs):
+        self.get_calls.append((value, kwargs))
 
 
 if __name__ == "__main__":

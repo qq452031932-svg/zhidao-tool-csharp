@@ -209,7 +209,7 @@ class _DrissionTarget:
         return self._tab.url
 
     def navigate(self, value, remaining_seconds):
-        self._tab.get(value, timeout=remaining_seconds)
+        self._tab.get(value, timeout=remaining_seconds, retry=0, interval=0)
 
     def observe_identity(self, remaining_seconds):
         return _fixed_dom_identity(self._tab, remaining_seconds)
