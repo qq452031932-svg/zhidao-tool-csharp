@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Features.Transfers;
@@ -17,6 +18,7 @@ using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using BaiduBatchTransfer.Infrastructure.Excel;
+using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -27,6 +29,23 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class AppBootstrapTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void ManagedBrowserProfilePolicyAndBrowserSelectionProcessDependenciesAreSharedSingletons()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        var concretePolicy = host.Services.GetRequiredService<FileSystemManagedBrowserProfilePolicy>();
+        var policy = host.Services.GetRequiredService<IManagedBrowserProfilePolicy>();
+        var firstContext = host.Services.GetRequiredService<BrowserSelectionProcessContext>();
+        var secondContext = host.Services.GetRequiredService<BrowserSelectionProcessContext>();
+        var concreteRegistry = host.Services.GetRequiredService<ProcessBrowserSelectionActivityRegistry>();
+        var registry = host.Services.GetRequiredService<IBrowserSelectionActivityRegistry>();
+
+        Assert.Same(concretePolicy, policy);
+        Assert.Same(firstContext, secondContext);
+        Assert.Same(concreteRegistry, registry);
+    }
 
     [Fact]
     public void HostCompositionRegistersUiServicesButNeverAFakeBaiduAdapter()
@@ -826,9 +845,11 @@ public sealed class AppBootstrapTests : IDisposable
             VALUES($resource,$batch,1,'https://pan.baidu.com/s/test','test','a1b2','None','Valid','Expanded',$now,$now);
             INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
               NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
-              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($operation,$resource,$batch,1,1,'/target','/target','',$account,'Automatic','Waiting',$generation,
-              'transfer-fingerprint','NotPrepared','Unoccupied',$now,$now);
+              'transfer-fingerprint','NotPrepared','Unoccupied',$now,$now,
+              'WebView2-v1','LegacyWebView2','legacy-webview2-account-' || lower(replace($account,'-','')),NULL,NULL);
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$uid", baiduUserId);

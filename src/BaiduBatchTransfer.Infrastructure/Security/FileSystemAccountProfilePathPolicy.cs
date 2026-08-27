@@ -85,6 +85,25 @@ public sealed class FileSystemAccountProfilePathPolicy : IAccountProfilePathPoli
 internal interface IProfilePathFileSystem
 {
     FileAttributes GetAttributes(string path);
+
+    bool TryGetAttributes(string path, out FileAttributes attributes)
+    {
+        try
+        {
+            attributes = GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            attributes = default;
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            attributes = default;
+            return false;
+        }
+    }
 }
 
 internal sealed class PhysicalProfilePathFileSystem : IProfilePathFileSystem

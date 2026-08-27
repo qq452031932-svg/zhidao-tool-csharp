@@ -8,6 +8,7 @@ using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
@@ -236,6 +237,13 @@ public static class AppBootstrap
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
         services.AddSingleton<EncryptedBaiduSessionStore>();
         services.AddSingleton<IBaiduSessionStore>(sp => sp.GetRequiredService<EncryptedBaiduSessionStore>());
+        services.AddSingleton(_ => new FileSystemManagedBrowserProfilePolicy(paths.RootDirectory));
+        services.AddSingleton<IManagedBrowserProfilePolicy>(sp =>
+            sp.GetRequiredService<FileSystemManagedBrowserProfilePolicy>());
+        services.AddSingleton<BrowserSelectionProcessContext>();
+        services.AddSingleton<ProcessBrowserSelectionActivityRegistry>();
+        services.AddSingleton<IBrowserSelectionActivityRegistry>(sp =>
+            sp.GetRequiredService<ProcessBrowserSelectionActivityRegistry>());
         services.AddSingleton(_ => new FileSystemAccountProfilePathPolicy(paths.ProfileDirectory));
         services.AddSingleton<IAccountProfilePathPolicy>(sp =>
             sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
