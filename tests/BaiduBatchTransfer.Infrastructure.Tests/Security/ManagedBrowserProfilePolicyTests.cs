@@ -165,6 +165,19 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(root, "managed-browser-profiles")));
     }
 
+    [Theory]
+    [InlineData(@"\\server\share\bbt-app-data")]
+    [InlineData(@"\\?\C:\bbt-app-data")]
+    public async Task UnpinnableNamespacesAreRejectedWithoutFallback(string appDataRoot)
+    {
+        var policy = new FileSystemManagedBrowserProfilePolicy(appDataRoot);
+
+        var result = await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.UnsupportedNamespace, result.IsolationReason);
+    }
+
     [Fact]
     public async Task DescriptorAndResultToStringRedactEveryIdentityAndPath()
     {
@@ -277,6 +290,24 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     }
 
     [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task AclChangedAfterAccountPinFailsClosed()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var accountId = Guid.NewGuid();
+        var initial = await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, null,
+            profilePath => AddEveryoneReadAcl(profilePath));
+
+        var result = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.AccessControlMismatch, result.IsolationReason);
+        Assert.True(Directory.Exists(initial.Profile!.CanonicalSourcePath));
+    }
+
+    [Fact]
     public async Task ReplacementAfterValidationIsDetectedBeforeMarkerAccess()
     {
         var accountId = Guid.NewGuid();
@@ -332,6 +363,130 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Assert.True(File.Exists(Path.Combine(replacement, FileSystemManagedBrowserProfilePolicy.MarkerName)));
     }
 
+    [Fact]
+    public async Task OverlappingWritersCannotExposeAPartialCanonicalMarker()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var accountId = Guid.NewGuid();
+        var markerPrefixFlushed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWriter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writer = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            AfterMarkerPrefixFlushed = () =>
+            {
+                markerPrefixFlushed.TrySetResult();
+                releaseWriter.Task.GetAwaiter().GetResult();
+            },
+        });
+        var reader = new FileSystemManagedBrowserProfilePolicy(root);
+
+        var firstTask = Task.Run(() => writer.GetOrCreateAsync(accountId, BrowserFamily.Chrome));
+        await markerPrefixFlushed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondTask = Task.Run(() => reader.GetOrCreateAsync(accountId, BrowserFamily.Chrome));
+        ManagedBrowserProfileResult second;
+        try
+        {
+            second = await secondTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            releaseWriter.TrySetResult();
+        }
+        var first = await firstTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, first.Status);
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, second.Status);
+        Assert.Equal(first.Profile!.ProfileId, second.Profile!.ProfileId);
+        Assert.Equal(first.Profile.OwnershipId, second.Profile.OwnershipId);
+    }
+
+    [Fact]
+    public async Task SimultaneousNamespaceCreationStillProducesOneCanonicalWinner()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var accountId = Guid.NewGuid();
+        using var barrier = new Barrier(2);
+        ManagedBrowserProfilePolicyTestHooks Hooks() => new()
+        {
+            AfterTrustedNamespacePinned = () => barrier.SignalAndWait(TimeSpan.FromSeconds(5)),
+        };
+        var firstPolicy = new FileSystemManagedBrowserProfilePolicy(root, Hooks());
+        var secondPolicy = new FileSystemManagedBrowserProfilePolicy(root, Hooks());
+
+        var results = await Task.WhenAll(
+            Task.Run(() => firstPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)),
+            Task.Run(() => secondPolicy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)));
+
+        Assert.All(results, result => Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status));
+        Assert.Single(results.Select(result => result.Profile!.ProfileId).Distinct());
+        Assert.Single(results.Select(result => result.Profile!.OwnershipId).Distinct());
+    }
+
+    [Fact]
+    public async Task CrashBeforePublishLeavesOnlyOpaqueStagingAndNextRunPublishesCanonical()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var accountId = Guid.NewGuid();
+        var crashing = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            BeforePublish = () => throw new SimulatedCrashException(),
+        });
+
+        await Assert.ThrowsAsync<SimulatedCrashException>(() =>
+            crashing.GetOrCreateAsync(accountId, BrowserFamily.Edge));
+        var familyRoot = Path.Combine(root, "managed-browser-profiles", "edge");
+        Assert.False(Directory.Exists(ProfilePath(accountId, BrowserFamily.Edge)));
+        var staging = Assert.Single(Directory.EnumerateDirectories(familyRoot));
+        Assert.StartsWith(".staging-", Path.GetFileName(staging), StringComparison.Ordinal);
+
+        var result = await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Edge);
+
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status);
+        Assert.True(Directory.Exists(staging));
+        Assert.True(Directory.Exists(result.Profile!.CanonicalSourcePath));
+    }
+
+    [Fact]
+    public async Task AppDataRootReplacementAfterPinCausesZeroWritesThroughReplacement()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        Directory.CreateDirectory(root);
+        var displaced = root + ".trusted";
+        var outside = root + ".outside";
+        Directory.CreateDirectory(outside);
+        var canary = Path.Combine(outside, "must-survive.txt");
+        await File.WriteAllTextAsync(canary, "outside");
+        var switched = false;
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            AfterTrustedNamespacePinned = () =>
+            {
+                Directory.Move(root, displaced);
+                CreateDirectoryLink(root, outside);
+                switched = true;
+            },
+        });
+
+        try
+        {
+            var result = await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+            Assert.True(switched);
+            Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+            Assert.Equal(ManagedBrowserProfileIsolationReason.ConcurrentMutation, result.IsolationReason);
+            Assert.Equal("outside", await File.ReadAllTextAsync(canary));
+            Assert.False(Directory.Exists(Path.Combine(outside, "managed-browser-profiles")));
+        }
+        finally
+        {
+            if (Directory.Exists(root) && (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+                Directory.Delete(root, recursive: false);
+            if (Directory.Exists(displaced)) Directory.Delete(displaced, recursive: true);
+            if (Directory.Exists(outside)) Directory.Delete(outside, recursive: true);
+        }
+    }
+
     [SupportedOSPlatform("windows")]
     private static void AssertCurrentUserOnlyAcl(string path, SecurityIdentifier currentUser)
     {
@@ -379,6 +534,8 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         process.WaitForExit();
         if (process.ExitCode != 0) throw new IOException("Could not create the test junction.");
     }
+
+    private sealed class SimulatedCrashException : Exception;
 
     private string ProfilePath(Guid accountId, BrowserFamily family) => Path.Combine(
         Path.GetFullPath(root),

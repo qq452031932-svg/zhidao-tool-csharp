@@ -1,48 +1,31 @@
-using System.Text;
 using System.ComponentModel;
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 using BaiduBatchTransfer.Core.Domain;
 using Microsoft.Win32.SafeHandles;
 
 namespace BaiduBatchTransfer.Infrastructure.Security;
 
-public enum ManagedBrowserProfileStatus
-{
-    Ready = 1,
-    IsolationRequired = 2,
-}
+public enum ManagedBrowserProfileStatus { Ready = 1, IsolationRequired = 2 }
 
 public enum ManagedBrowserProfileIsolationReason
 {
-    None = 0,
-    MissingMarker = 1,
-    InvalidMarker = 2,
-    IdentityMismatch = 3,
-    UnsafePath = 4,
-    AccessControlMismatch = 5,
-    ConcurrentMutation = 6,
+    None = 0, MissingMarker = 1, InvalidMarker = 2, IdentityMismatch = 3,
+    UnsafePath = 4, AccessControlMismatch = 5, ConcurrentMutation = 6,
+    UnsupportedNamespace = 7,
 }
 
 public sealed class ManagedBrowserProfileDescriptor
 {
-    internal ManagedBrowserProfileDescriptor(
-        Guid accountId,
-        BrowserFamily family,
-        Guid profileId,
-        Guid ownershipId,
-        string canonicalSourcePath)
+    internal ManagedBrowserProfileDescriptor(Guid accountId, BrowserFamily family, Guid profileId,
+        Guid ownershipId, string canonicalSourcePath)
     {
-        AccountId = accountId;
-        Family = family;
-        ProfileId = profileId;
-        OwnershipId = ownershipId;
-        CanonicalSourcePath = canonicalSourcePath;
+        AccountId = accountId; Family = family; ProfileId = profileId;
+        OwnershipId = ownershipId; CanonicalSourcePath = canonicalSourcePath;
     }
-
     public Guid AccountId { get; }
     public BrowserFamily Family { get; }
     public BrowserFamily BrowserFamily => Family;
@@ -50,7 +33,6 @@ public sealed class ManagedBrowserProfileDescriptor
     public Guid OwnershipId { get; }
     public Guid ProfileOwnershipId => OwnershipId;
     public string CanonicalSourcePath { get; }
-
     public override string ToString() =>
         $"ManagedBrowserProfileDescriptor {{ AccountId = [REDACTED], Family = {Family}, " +
         "ProfileId = [REDACTED], OwnershipId = [REDACTED], CanonicalSourcePath = [REDACTED] }";
@@ -58,26 +40,16 @@ public sealed class ManagedBrowserProfileDescriptor
 
 public sealed class ManagedBrowserProfileResult
 {
-    private ManagedBrowserProfileResult(
-        ManagedBrowserProfileStatus status,
-        ManagedBrowserProfileDescriptor? profile,
-        ManagedBrowserProfileIsolationReason isolationReason)
-    {
-        Status = status;
-        Profile = profile;
-        IsolationReason = isolationReason;
-    }
-
+    private ManagedBrowserProfileResult(ManagedBrowserProfileStatus status,
+        ManagedBrowserProfileDescriptor? profile, ManagedBrowserProfileIsolationReason isolationReason)
+    { Status = status; Profile = profile; IsolationReason = isolationReason; }
     public ManagedBrowserProfileStatus Status { get; }
     public ManagedBrowserProfileDescriptor? Profile { get; }
     public ManagedBrowserProfileIsolationReason IsolationReason { get; }
-
     internal static ManagedBrowserProfileResult Ready(ManagedBrowserProfileDescriptor profile) =>
         new(ManagedBrowserProfileStatus.Ready, profile, ManagedBrowserProfileIsolationReason.None);
-
     internal static ManagedBrowserProfileResult IsolationRequired(ManagedBrowserProfileIsolationReason reason) =>
         new(ManagedBrowserProfileStatus.IsolationRequired, null, reason);
-
     public override string ToString() =>
         $"ManagedBrowserProfileResult {{ Status = {Status}, Profile = " +
         (Profile is null ? "null" : "[REDACTED]") + $", IsolationReason = {IsolationReason} }}";
@@ -85,368 +57,225 @@ public sealed class ManagedBrowserProfileResult
 
 public interface IManagedBrowserProfilePolicy
 {
-    Task<ManagedBrowserProfileResult> GetOrCreateAsync(
-        Guid accountId,
-        BrowserFamily family,
+    Task<ManagedBrowserProfileResult> GetOrCreateAsync(Guid accountId, BrowserFamily family,
         CancellationToken cancellationToken = default);
+    Task<ManagedBrowserProfileResult> OpenExistingAsync(ManagedBrowserProfileDescriptor expected,
+        CancellationToken cancellationToken = default);
+}
 
-    Task<ManagedBrowserProfileResult> OpenExistingAsync(
-        ManagedBrowserProfileDescriptor expected,
-        CancellationToken cancellationToken = default);
+internal sealed class ManagedBrowserProfilePolicyTestHooks
+{
+    public Action? AfterTrustedNamespacePinned { get; init; }
+    public Action? AfterMarkerPrefixFlushed { get; init; }
+    public Action? BeforePublish { get; init; }
 }
 
 public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfilePolicy
 {
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> CreationGates =
-        new(StringComparer.OrdinalIgnoreCase);
     internal const string MarkerName = ".bbt-managed-profile-owner.v1";
-    private const string RootName = "managed-browser-profiles";
+    private const string ManagedRootName = "managed-browser-profiles";
     private readonly string appDataRoot;
-    private readonly string managedRoot;
+    [SupportedOSPlatformGuard("windows")]
+    private readonly bool supportedNamespace;
     private readonly Action<string>? beforeMarkerOpen;
     private readonly Action<string>? afterDirectoryPin;
-    private readonly IProfilePathFileSystem fileSystem;
+    private readonly ManagedBrowserProfilePolicyTestHooks? testHooks;
 
     public FileSystemManagedBrowserProfilePolicy(string appDataRoot) :
-        this(appDataRoot, PhysicalProfilePathFileSystem.Instance, null)
-    {
-    }
-
+        this(appDataRoot, PhysicalProfilePathFileSystem.Instance)
+    { }
     internal FileSystemManagedBrowserProfilePolicy(string appDataRoot, Action<string>? beforeMarkerOpen) :
-        this(appDataRoot, PhysicalProfilePathFileSystem.Instance, beforeMarkerOpen, null)
-    {
-    }
-
-    internal FileSystemManagedBrowserProfilePolicy(
-        string appDataRoot,
-        Action<string>? beforeMarkerOpen,
+        this(appDataRoot, PhysicalProfilePathFileSystem.Instance, beforeMarkerOpen)
+    { }
+    internal FileSystemManagedBrowserProfilePolicy(string appDataRoot, Action<string>? beforeMarkerOpen,
         Action<string>? afterDirectoryPin) :
         this(appDataRoot, PhysicalProfilePathFileSystem.Instance, beforeMarkerOpen, afterDirectoryPin)
-    {
-    }
-
-    internal FileSystemManagedBrowserProfilePolicy(
-        string appDataRoot,
-        IProfilePathFileSystem fileSystem,
-        Action<string>? beforeMarkerOpen = null,
-        Action<string>? afterDirectoryPin = null)
+    { }
+    internal FileSystemManagedBrowserProfilePolicy(string appDataRoot,
+        ManagedBrowserProfilePolicyTestHooks testHooks) :
+        this(appDataRoot, PhysicalProfilePathFileSystem.Instance)
+    { this.testHooks = testHooks ?? throw new ArgumentNullException(nameof(testHooks)); }
+    internal FileSystemManagedBrowserProfilePolicy(string appDataRoot, IProfilePathFileSystem fileSystem,
+        Action<string>? beforeMarkerOpen = null, Action<string>? afterDirectoryPin = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(appDataRoot);
+        ArgumentNullException.ThrowIfNull(fileSystem);
         this.appDataRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(appDataRoot));
-        if (string.Equals(Path.GetPathRoot(this.appDataRoot), this.appDataRoot, StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("The application data root cannot be a filesystem root.", nameof(appDataRoot));
-        this.fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
-        managedRoot = Path.Combine(this.appDataRoot, RootName);
+        supportedNamespace = OperatingSystem.IsWindows() && IsSupportedLocalDrivePath(this.appDataRoot);
         this.beforeMarkerOpen = beforeMarkerOpen;
         this.afterDirectoryPin = afterDirectoryPin;
-        _ = new FileSystemAccountProfilePathPolicy(managedRoot, fileSystem);
+        if (supportedNamespace)
+            _ = new FileSystemAccountProfilePathPolicy(Path.Combine(this.appDataRoot, ManagedRootName), fileSystem);
     }
 
-    public Task<ManagedBrowserProfileResult> GetOrCreateAsync(
-        Guid accountId,
-        BrowserFamily family,
+    public Task<ManagedBrowserProfileResult> GetOrCreateAsync(Guid accountId, BrowserFamily family,
         CancellationToken cancellationToken = default)
     {
         ValidateArguments(accountId, family);
         cancellationToken.ThrowIfCancellationRequested();
-        var path = GetCanonicalPath(accountId, family);
-        var gate = CreationGates.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
-        gate.Wait(cancellationToken);
+        if (!supportedNamespace) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.UnsupportedNamespace));
         try
         {
-            var existed = Directory.Exists(path);
-            bool accessControlValid;
-            try
+            using var ns = PinnedNamespace.Open(appDataRoot, createAppRoot: true);
+            testHooks?.AfterTrustedNamespacePinned?.Invoke();
+            if (!ns.Revalidate()) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation));
+            cancellationToken.ThrowIfCancellationRequested();
+            var managed = ns.OpenOrCreateOwnedDirectory(PinnedNamespace.AppRootKey, ManagedRootName);
+            var familyName = FamilyName(family);
+            var familyRoot = ns.OpenOrCreateOwnedDirectory(ManagedRootName, familyName);
+            var accountName = accountId.ToString("N");
+            var canonicalPath = Path.Combine(appDataRoot, ManagedRootName, familyName, accountName);
+            beforeMarkerOpen?.Invoke(canonicalPath);
+            if (!ns.Revalidate())
+                return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation));
+            var existing = ns.TryOpenOwnedDirectory(familyRoot, accountName);
+            if (existing is not null)
             {
-                accessControlValid = TryEnsureDirectoryTree(path, cancellationToken);
+                using (existing)
+                {
+                    ns.TrackOwned(canonicalPath, existing);
+                    afterDirectoryPin?.Invoke(canonicalPath);
+                    if (!ns.RelativeIdentityMatches(familyRoot, accountName, existing))
+                        return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation));
+                    var result = ReadExistingProfile(existing, accountId, family, canonicalPath, null, cancellationToken);
+                    return Task.FromResult(ns.Revalidate() ? result :
+                        Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation));
+                }
             }
-            catch (IOException)
-            {
-                return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.UnsafePath));
-            }
-            if (!accessControlValid)
-                return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.AccessControlMismatch));
-            EnsureSafePath(path);
-            beforeMarkerOpen?.Invoke(path);
-            try
-            {
-                EnsureSafePath(path);
-            }
-            catch (IOException)
-            {
-                return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.UnsafePath));
-            }
-            using var pinnedDirectories = PinnedDirectoryChain.Open(path);
-            afterDirectoryPin?.Invoke(path);
-            if (!pinnedDirectories.MatchesFinalPath(path))
-                return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.ConcurrentMutation));
-            var markerPath = Path.Combine(path, MarkerName);
-            if (fileSystem.TryGetAttributes(markerPath, out var markerAttributes))
-            {
-                if (!IsOrdinaryMarker(markerAttributes))
-                    return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                        ManagedBrowserProfileIsolationReason.UnsafePath));
-                return Task.FromResult(ReadExistingMarker(markerPath, accountId, family, path, null));
-            }
-            if (existed)
-                return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.MissingMarker));
-
-            var marker = new Marker(accountId, family, Guid.NewGuid(), Guid.NewGuid());
-            using (var markerFile = PinnedMarker.TryCreate(markerPath))
-            {
-                if (markerFile is null)
-                    return Task.FromResult(ReadExistingMarker(markerPath, accountId, family, path, null));
-                markerFile.WriteText(Format(marker));
-                SetCurrentUserOnlyAcl(markerPath, directory: false);
-            }
-
-            return Task.FromResult(ManagedBrowserProfileResult.Ready(ToDescriptor(marker, path)));
+            return Task.FromResult(CreateAndPublish(ns, familyRoot, accountName, accountId, family,
+                canonicalPath, cancellationToken));
         }
-        catch (UnauthorizedAccessException)
-        {
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.AccessControlMismatch));
-        }
-        catch (IOException)
-        {
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.UnsafePath));
-        }
-        finally
-        {
-            gate.Release();
-        }
+        catch (ManagedProfilePolicyException exception) { return Task.FromResult(Isolation(exception.Reason)); }
+        catch (UnauthorizedAccessException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.AccessControlMismatch)); }
+        catch (IOException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.UnsafePath)); }
     }
 
-    public Task<ManagedBrowserProfileResult> OpenExistingAsync(
-        ManagedBrowserProfileDescriptor expected,
+    public Task<ManagedBrowserProfileResult> OpenExistingAsync(ManagedBrowserProfileDescriptor expected,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(expected);
         ValidateArguments(expected.AccountId, expected.Family);
         cancellationToken.ThrowIfCancellationRequested();
+        if (!supportedNamespace) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.UnsupportedNamespace));
+        var familyName = FamilyName(expected.Family);
+        var canonicalPath = Path.Combine(appDataRoot, ManagedRootName, familyName, expected.AccountId.ToString("N"));
+        if (!string.Equals(canonicalPath, expected.CanonicalSourcePath, StringComparison.OrdinalIgnoreCase))
+            return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.IdentityMismatch));
         try
         {
-            return OpenExistingCore(expected, cancellationToken);
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.AccessControlMismatch));
-        }
-        catch (IOException)
-        {
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.UnsafePath));
-        }
-    }
-
-    private Task<ManagedBrowserProfileResult> OpenExistingCore(
-        ManagedBrowserProfileDescriptor expected,
-        CancellationToken cancellationToken)
-    {
-        var path = GetCanonicalPath(expected.AccountId, expected.Family);
-        if (!string.Equals(path, expected.CanonicalSourcePath, StringComparison.OrdinalIgnoreCase))
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.IdentityMismatch));
-        if (!Directory.Exists(path))
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.MissingMarker));
-        bool accessControlValid;
-        try
-        {
-            accessControlValid = TryEnsureDirectoryTree(path, cancellationToken);
-        }
-        catch (IOException)
-        {
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.UnsafePath));
-        }
-        if (!accessControlValid)
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.AccessControlMismatch));
-        EnsureSafePath(path);
-        using var pinnedDirectories = PinnedDirectoryChain.Open(path);
-        afterDirectoryPin?.Invoke(path);
-        if (!pinnedDirectories.MatchesFinalPath(path))
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.ConcurrentMutation));
-        var markerPath = Path.Combine(path, MarkerName);
-        if (!fileSystem.TryGetAttributes(markerPath, out var markerAttributes))
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.MissingMarker));
-        if (!IsOrdinaryMarker(markerAttributes))
-            return Task.FromResult(ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.UnsafePath));
-        return Task.FromResult(ReadExistingMarker(
-            markerPath, expected.AccountId, expected.Family, path, expected));
-    }
-
-    private ManagedBrowserProfileResult ReadExistingMarker(
-        string markerPath,
-        Guid accountId,
-        BrowserFamily family,
-        string path,
-        ManagedBrowserProfileDescriptor? expected)
-    {
-        using var markerFile = PinnedMarker.TryOpen(markerPath);
-        if (markerFile is null)
-            return ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.ConcurrentMutation);
-        if (!markerFile.IsOrdinaryFile)
-            return ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.UnsafePath);
-        if (!HasCurrentUserOnlyAcl(markerPath, directory: false))
-            return ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.AccessControlMismatch);
-        try
-        {
-            var marker = Parse(markerFile.ReadText());
-            if (marker.AccountId != accountId || marker.Family != family ||
-                expected is not null && (marker.ProfileId != expected.ProfileId || marker.OwnershipId != expected.OwnershipId))
-                return ManagedBrowserProfileResult.IsolationRequired(
-                    ManagedBrowserProfileIsolationReason.IdentityMismatch);
-            return ManagedBrowserProfileResult.Ready(ToDescriptor(marker, path));
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FormatException)
-        {
-            return ManagedBrowserProfileResult.IsolationRequired(
-                ManagedBrowserProfileIsolationReason.InvalidMarker);
-        }
-    }
-
-    private string GetCanonicalPath(Guid accountId, BrowserFamily family) => Path.Combine(
-        managedRoot,
-        family == BrowserFamily.Chrome ? "chrome" : "edge",
-        accountId.ToString("N"));
-
-    private void EnsureSafePath(string path)
-    {
-        var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
-        var prefix = appDataRoot + Path.DirectorySeparatorChar;
-        if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("The managed browser profile path escaped its application data root.");
-        string? current = full;
-        while (!string.IsNullOrEmpty(current))
-        {
-            var attributes = fileSystem.GetAttributes(current);
-            if ((attributes & FileAttributes.ReparsePoint) != 0 ||
-                (attributes & FileAttributes.Directory) == 0)
-                throw new IOException("The managed browser profile path is unsafe.");
-            if (string.Equals(current, appDataRoot, StringComparison.OrdinalIgnoreCase)) break;
-            current = Path.GetDirectoryName(current);
-        }
-        if (!string.Equals(current, appDataRoot, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("The managed browser profile path escaped its application data root.");
-    }
-
-    private bool TryEnsureDirectoryTree(string accountPath, CancellationToken cancellationToken)
-    {
-        Directory.CreateDirectory(appDataRoot);
-        foreach (var path in new[] { managedRoot, Path.GetDirectoryName(accountPath)!, accountPath })
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var existed = Directory.Exists(path);
-            Directory.CreateDirectory(path);
-            EnsureSafePath(path);
-            if (OperatingSystem.IsWindows())
+            using var ns = PinnedNamespace.Open(appDataRoot, createAppRoot: false);
+            var managed = ns.TryOpenOwnedDirectory(ns.AppRoot, ManagedRootName);
+            if (managed is null) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.MissingMarker));
+            using (managed)
             {
-                if (existed && !HasCurrentUserOnlyAcl(path, directory: true)) return false;
-                if (!existed) SetCurrentUserOnlyAcl(path, directory: true);
+                var managedPath = Path.Combine(appDataRoot, ManagedRootName);
+                ns.TrackOwned(managedPath, managed);
+                var familyRoot = ns.TryOpenOwnedDirectory(managed, familyName);
+                if (familyRoot is null) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.MissingMarker));
+                using (familyRoot)
+                {
+                    ns.TrackOwned(Path.Combine(managedPath, familyName), familyRoot);
+                    var account = ns.TryOpenOwnedDirectory(familyRoot, expected.AccountId.ToString("N"));
+                    if (account is null) return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.MissingMarker));
+                    using (account)
+                    {
+                        ns.TrackOwned(canonicalPath, account);
+                        var result = ReadExistingProfile(account, expected.AccountId, expected.Family,
+                            canonicalPath, expected, cancellationToken);
+                        return Task.FromResult(ns.Revalidate() ? result :
+                            Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation));
+                    }
+                }
             }
         }
-        return true;
+        catch (ManagedProfilePolicyException exception) { return Task.FromResult(Isolation(exception.Reason)); }
+        catch (UnauthorizedAccessException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.AccessControlMismatch)); }
+        catch (IOException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.UnsafePath)); }
     }
 
-    private static bool HasCurrentUserOnlyAcl(string path, bool directory)
+    private ManagedBrowserProfileResult CreateAndPublish(PinnedNamespace ns, PinnedEntry familyRoot,
+        string accountName, Guid accountId, BrowserFamily family, string canonicalPath,
+        CancellationToken cancellationToken)
     {
-        if (!OperatingSystem.IsWindows()) return true;
-        return HasCurrentUserOnlyAclWindows(path, directory);
+        var marker = new Marker(accountId, family, Guid.NewGuid(), Guid.NewGuid());
+        using var staging = ns.CreateOwnedDirectory(familyRoot, ".staging-" + Guid.NewGuid().ToString("N"), true);
+        cancellationToken.ThrowIfCancellationRequested();
+        using (var markerFile = ns.CreateOwnedMarker(staging, MarkerName))
+        {
+            markerFile.WriteCanonicalText(Format(marker), testHooks?.AfterMarkerPrefixFlushed);
+            if (!markerFile.HasCurrentUserOnlyAcl()) throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+            if (TryParse(markerFile.ReadCanonicalText()) != marker) throw Policy(ManagedBrowserProfileIsolationReason.InvalidMarker);
+        }
+        testHooks?.BeforePublish?.Invoke();
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!ns.TryPublish(staging, familyRoot, accountName))
+        {
+            var winner = ns.TryOpenOwnedDirectory(familyRoot, accountName);
+            if (winner is null) return Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+            using (winner)
+            {
+                ns.TrackOwned(canonicalPath, winner);
+                var result = ReadExistingProfile(winner, accountId, family, canonicalPath, null, cancellationToken);
+                return ns.Revalidate() ? result : Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+            }
+        }
+        if (!ns.RelativeIdentityMatches(familyRoot, accountName, staging))
+            return Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+        using (var publishedMarker = ns.TryOpenMarker(staging, MarkerName))
+        {
+            if (publishedMarker is null || !publishedMarker.IsOrdinaryFile || !publishedMarker.HasCurrentUserOnlyAcl())
+                return Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+            if (TryParse(publishedMarker.ReadCanonicalText()) != marker)
+                return Isolation(ManagedBrowserProfileIsolationReason.InvalidMarker);
+            if (!PinnedNamespace.RelativeIdentityMatchesStatic(staging, MarkerName, publishedMarker))
+                return Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+        }
+        ns.TrackPublished(canonicalPath, staging);
+        return ns.Revalidate()
+            ? ManagedBrowserProfileResult.Ready(ToDescriptor(marker, canonicalPath))
+            : Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
     }
 
-    private static bool IsOrdinaryMarker(FileAttributes attributes) =>
-        (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
-
-    [SupportedOSPlatform("windows")]
-    private static bool HasCurrentUserOnlyAclWindows(string path, bool directory)
+    private static ManagedBrowserProfileResult ReadExistingProfile(PinnedEntry account, Guid accountId,
+        BrowserFamily family, string path, ManagedBrowserProfileDescriptor? expected,
+        CancellationToken cancellationToken)
     {
-        try
-        {
-            var currentUser = WindowsIdentity.GetCurrent().User;
-            if (currentUser is null) return false;
-            FileSystemSecurity security = directory
-                ? new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner)
-                : new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
-            if (!security.AreAccessRulesProtected ||
-                !currentUser.Equals(security.GetOwner(typeof(SecurityIdentifier)))) return false;
-            var rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier))
-                .Cast<FileSystemAccessRule>().ToArray();
-            return rules.Length > 0 && rules.All(rule =>
-                !rule.IsInherited &&
-                rule.AccessControlType == AccessControlType.Allow &&
-                currentUser.Equals(rule.IdentityReference) &&
-                (rule.FileSystemRights & FileSystemRights.FullControl) == FileSystemRights.FullControl);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
+        cancellationToken.ThrowIfCancellationRequested();
+        using var markerFile = PinnedNamespace.TryOpenMarkerStatic(account, MarkerName);
+        if (markerFile is null) return Isolation(ManagedBrowserProfileIsolationReason.MissingMarker);
+        if (!markerFile.IsOrdinaryFile) return Isolation(ManagedBrowserProfileIsolationReason.UnsafePath);
+        if (!markerFile.HasCurrentUserOnlyAcl()) return Isolation(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+        var marker = TryParse(markerFile.ReadCanonicalText());
+        if (marker is null) return Isolation(ManagedBrowserProfileIsolationReason.InvalidMarker);
+        if (!PinnedNamespace.RelativeIdentityMatchesStatic(account, MarkerName, markerFile))
+            return Isolation(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+        if (marker.AccountId != accountId || marker.Family != family || expected is not null &&
+            (marker.ProfileId != expected.ProfileId || marker.OwnershipId != expected.OwnershipId))
+            return Isolation(ManagedBrowserProfileIsolationReason.IdentityMismatch);
+        return ManagedBrowserProfileResult.Ready(ToDescriptor(marker, path));
     }
 
-    private static void SetCurrentUserOnlyAcl(string path, bool directory)
+    private static string FamilyName(BrowserFamily family) => family == BrowserFamily.Chrome ? "chrome" : "edge";
+    private static bool IsSupportedLocalDrivePath(string path)
     {
-        if (OperatingSystem.IsWindows()) SetCurrentUserOnlyAclWindows(path, directory);
+        if (path.StartsWith(@"\\", StringComparison.Ordinal) || path.StartsWith(@"\\?\", StringComparison.Ordinal) ||
+            path.StartsWith(@"\\.\", StringComparison.Ordinal)) return false;
+        var root = Path.GetPathRoot(path);
+        return root is { Length: 3 } && char.IsAsciiLetter(root[0]) && root[1] == ':' &&
+            root[2] == Path.DirectorySeparatorChar && !string.Equals(Path.TrimEndingDirectorySeparator(path),
+                Path.TrimEndingDirectorySeparator(root), StringComparison.OrdinalIgnoreCase);
     }
-
-    [SupportedOSPlatform("windows")]
-    private static void SetCurrentUserOnlyAclWindows(string path, bool directory)
-    {
-        var currentUser = WindowsIdentity.GetCurrent().User ??
-            throw new IOException("The current Windows user identity is unavailable.");
-        if (directory)
-        {
-            var security = new DirectorySecurity();
-            security.SetOwner(currentUser);
-            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            security.AddAccessRule(new FileSystemAccessRule(
-                currentUser,
-                FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
-                PropagationFlags.None,
-                AccessControlType.Allow));
-            new DirectoryInfo(path).SetAccessControl(security);
-        }
-        else
-        {
-            var security = new FileSecurity();
-            security.SetOwner(currentUser);
-            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            security.AddAccessRule(new FileSystemAccessRule(
-                currentUser,
-                FileSystemRights.FullControl,
-                AccessControlType.Allow));
-            new FileInfo(path).SetAccessControl(security);
-        }
-    }
-
     private static void ValidateArguments(Guid accountId, BrowserFamily family)
     {
         if (accountId == Guid.Empty) throw new ArgumentException("A local account ID is required.", nameof(accountId));
         if (family is not (BrowserFamily.Chrome or BrowserFamily.Edge))
             throw new ArgumentOutOfRangeException(nameof(family), family, "A managed browser family is required.");
     }
-
     private static string Format(Marker marker) =>
         $"bbt-managed-browser-profile:1\naccount-id={marker.AccountId:N}\n" +
         $"browser-family={marker.Family}\nprofile-id={marker.ProfileId:N}\n" +
         $"profile-ownership-id={marker.OwnershipId:N}\n";
-
-    private static Marker Parse(string text)
+    private static Marker? TryParse(string text)
     {
         var lines = text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         if (lines.Length != 6 || lines[0] != "bbt-managed-browser-profile:1" || lines[5].Length != 0 ||
@@ -455,329 +284,397 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
             !lines[3].StartsWith("profile-id=", StringComparison.Ordinal) ||
             !lines[4].StartsWith("profile-ownership-id=", StringComparison.Ordinal) ||
             !Guid.TryParseExact(lines[1]["account-id=".Length..], "N", out var accountId) ||
-            !Enum.TryParse<BrowserFamily>(lines[2]["browser-family=".Length..], ignoreCase: false, out var family) ||
+            !Enum.TryParse<BrowserFamily>(lines[2]["browser-family=".Length..], false, out var family) ||
             family is not (BrowserFamily.Chrome or BrowserFamily.Edge) ||
             !Guid.TryParseExact(lines[3]["profile-id=".Length..], "N", out var profileId) ||
             !Guid.TryParseExact(lines[4]["profile-ownership-id=".Length..], "N", out var ownershipId) ||
-            accountId == Guid.Empty || profileId == Guid.Empty || ownershipId == Guid.Empty)
-            throw new FormatException("The managed profile ownership marker is invalid.");
+            accountId == Guid.Empty || profileId == Guid.Empty || ownershipId == Guid.Empty) return null;
         var marker = new Marker(accountId, family, profileId, ownershipId);
-        if (!string.Equals(text, Format(marker), StringComparison.Ordinal))
-            throw new FormatException("The managed profile ownership marker is not canonical.");
-        return marker;
+        return text == Format(marker) ? marker : null;
     }
-
     private static ManagedBrowserProfileDescriptor ToDescriptor(Marker marker, string path) =>
         new(marker.AccountId, marker.Family, marker.ProfileId, marker.OwnershipId, path);
-
+    private static ManagedBrowserProfileResult Isolation(ManagedBrowserProfileIsolationReason reason) =>
+        ManagedBrowserProfileResult.IsolationRequired(reason);
+    private static ManagedProfilePolicyException Policy(ManagedBrowserProfileIsolationReason reason) => new(reason);
     private sealed record Marker(Guid AccountId, BrowserFamily Family, Guid ProfileId, Guid OwnershipId);
+    private sealed class ManagedProfilePolicyException(ManagedBrowserProfileIsolationReason reason) :
+        IOException("The managed browser profile namespace is not safe.")
+    { public ManagedBrowserProfileIsolationReason Reason { get; } = reason; }
 
-    private sealed class PinnedDirectoryChain : IDisposable
+    private sealed class PinnedNamespace : IDisposable
     {
-        private readonly List<SafeFileHandle> handles;
-        private readonly NativeMethods.ByHandleFileInformation finalInformation;
+        internal const string AppRootKey = "app";
+        private readonly Dictionary<string, PinnedEntry> named = new(StringComparer.OrdinalIgnoreCase);
+        private readonly List<(string Path, PinnedEntry Entry, bool RequireOwnedAcl)> tracked = [];
+        private readonly List<PinnedEntry> owned = [];
+        private PinnedNamespace(PinnedEntry appRoot) { AppRoot = appRoot; named[AppRootKey] = appRoot; }
+        public PinnedEntry AppRoot { get; private set; }
 
-        private PinnedDirectoryChain(
-            List<SafeFileHandle> handles,
-            NativeMethods.ByHandleFileInformation finalInformation)
+        public static PinnedNamespace Open(string appDataRoot, bool createAppRoot)
         {
-            this.handles = handles;
-            this.finalInformation = finalInformation;
-        }
-
-        public static PinnedDirectoryChain Open(string canonicalPath)
-        {
-            if (!OperatingSystem.IsWindows()) return new PinnedDirectoryChain([], default);
-            var root = Path.GetPathRoot(canonicalPath) ??
-                throw new IOException("The managed browser profile root is not fully qualified.");
-            var paths = new List<string> { root };
-            var current = root;
-            var relative = Path.GetRelativePath(root, canonicalPath);
-            foreach (var component in relative.Split(
-                         Path.DirectorySeparatorChar,
-                         StringSplitOptions.RemoveEmptyEntries))
-            {
-                current = Path.Combine(current, component);
-                paths.Add(current);
-            }
-
-            var handles = new List<SafeFileHandle>(paths.Count);
-            NativeMethods.ByHandleFileInformation finalInformation = default;
+            var driveRoot = Path.GetPathRoot(appDataRoot) ?? throw Policy(ManagedBrowserProfileIsolationReason.UnsupportedNamespace);
+            var drive = OpenAbsoluteDirectory(driveRoot);
+            var ns = new PinnedNamespace(drive);
+            ns.owned.Add(drive); ns.tracked.Add((driveRoot, drive, false));
+            var currentPath = driveRoot; var parent = drive;
             try
             {
-                foreach (var path in paths)
+                foreach (var component in Path.GetRelativePath(driveRoot, appDataRoot).Split(
+                    Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
                 {
-                    var handle = NativeMethods.CreateFileW(
-                        path,
-                        NativeMethods.FileReadAttributes,
-                        NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
-                        IntPtr.Zero,
-                        NativeMethods.OpenExisting,
-                        NativeMethods.FileFlagBackupSemantics | NativeMethods.FileFlagOpenReparsePoint,
-                        IntPtr.Zero);
-                    if (handle.IsInvalid)
+                    ValidateRelativeName(component);
+                    var child = TryOpenRelativeDirectory(parent, component, false);
+                    if (child is null)
                     {
-                        var error = Marshal.GetLastWin32Error();
-                        handle.Dispose();
-                        throw new IOException(
-                            "A managed browser profile ancestor could not be pinned safely.",
-                            new Win32Exception(error));
+                        if (!createAppRoot) throw Policy(ManagedBrowserProfileIsolationReason.MissingMarker);
+                        try { child = CreateRelativeDirectory(parent, component, false); }
+                        catch (ManagedProfilePolicyException exception) when (
+                            exception.Reason == ManagedBrowserProfileIsolationReason.ConcurrentMutation)
+                        {
+                            child = TryOpenRelativeDirectory(parent, component, true) ??
+                                throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+                        }
                     }
-                    if (!NativeMethods.GetFileInformationByHandle(handle, out var information))
-                    {
-                        var error = Marshal.GetLastWin32Error();
-                        handle.Dispose();
-                        throw new IOException(
-                            "A managed browser profile ancestor could not be inspected safely.",
-                            new Win32Exception(error));
-                    }
-                    if ((information.FileAttributes & FileAttributes.Directory) == 0 ||
-                        (information.FileAttributes & FileAttributes.ReparsePoint) != 0)
-                    {
-                        handle.Dispose();
-                        throw new IOException("A managed browser profile ancestor is unsafe.");
-                    }
-                    handles.Add(handle);
-                    finalInformation = information;
+                    currentPath = Path.Combine(currentPath, component);
+                    ns.owned.Add(child); ns.tracked.Add((currentPath, child, false)); parent = child;
                 }
-                return new PinnedDirectoryChain(handles, finalInformation);
+                ns.AppRoot = parent; ns.named[AppRootKey] = parent;
+                return ns;
             }
-            catch
-            {
-                foreach (var handle in handles) handle.Dispose();
-                throw;
-            }
+            catch { ns.Dispose(); throw; }
         }
 
-        public bool MatchesFinalPath(string path)
+        public PinnedEntry OpenOrCreateOwnedDirectory(string parentKey, string name)
         {
-            if (!OperatingSystem.IsWindows()) return true;
-            var handle = NativeMethods.CreateFileW(
-                path,
-                NativeMethods.FileReadAttributes,
-                NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
-                IntPtr.Zero,
-                NativeMethods.OpenExisting,
-                NativeMethods.FileFlagBackupSemantics | NativeMethods.FileFlagOpenReparsePoint,
-                IntPtr.Zero);
-            if (handle.IsInvalid)
+            var parent = named[parentKey];
+            var entry = TryOpenRelativeDirectory(parent, name, true);
+            if (entry is null)
             {
-                handle.Dispose();
-                return false;
+                try { entry = CreateRelativeDirectory(parent, name, false); }
+                catch (ManagedProfilePolicyException exception) when (
+                    exception.Reason == ManagedBrowserProfileIsolationReason.ConcurrentMutation)
+                {
+                    entry = TryOpenRelativeDirectory(parent, name, true) ??
+                        throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+                }
             }
-            using (handle)
-            {
-                return NativeMethods.GetFileInformationByHandle(handle, out var current) &&
-                       (current.FileAttributes & FileAttributes.Directory) != 0 &&
-                       (current.FileAttributes & FileAttributes.ReparsePoint) == 0 &&
-                       current.VolumeSerialNumber == finalInformation.VolumeSerialNumber &&
-                       current.FileIndexHigh == finalInformation.FileIndexHigh &&
-                       current.FileIndexLow == finalInformation.FileIndexLow;
-            }
+            named[name] = entry; owned.Add(entry);
+            var parentPath = tracked.First(x => ReferenceEquals(x.Entry, parent)).Path;
+            tracked.Add((Path.Combine(parentPath, name), entry, true)); return entry;
+        }
+        public PinnedEntry CreateOwnedDirectory(PinnedEntry parent, string name, bool rename) =>
+            CreateRelativeDirectory(parent, name, rename);
+        public PinnedEntry? TryOpenOwnedDirectory(PinnedEntry parent, string name) =>
+            TryOpenRelativeDirectory(parent, name, true);
+        public PinnedEntry CreateOwnedMarker(PinnedEntry parent, string name) => CreateRelativeMarker(parent, name);
+        public PinnedEntry? TryOpenMarker(PinnedEntry parent, string name) => TryOpenMarkerStatic(parent, name);
+        public static PinnedEntry? TryOpenMarkerStatic(PinnedEntry parent, string name) =>
+            OpenRelative(parent, name, NativeMethods.GenericRead | NativeMethods.ReadControl | NativeMethods.Synchronize,
+                NativeMethods.FileOpen, NativeMethods.FileNonDirectoryFile | NativeMethods.FileSynchronousIoNonAlert |
+                NativeMethods.FileOpenReparsePoint, null, true, false, false);
+
+        public static bool RelativeIdentityMatchesStatic(PinnedEntry parent, string name, PinnedEntry expected)
+        {
+            var current = TryOpenMarkerStatic(parent, name);
+            if (current is null) return false;
+            using (current) return current.SameIdentity(expected);
         }
 
-        public void Dispose()
+        public bool TryPublish(PinnedEntry staging, PinnedEntry familyRoot, string accountName)
         {
-            for (var index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+            ValidateRelativeName(accountName);
+            var bytes = Encoding.Unicode.GetBytes(accountName);
+            var offset = Marshal.OffsetOf<NativeMethods.FileRenameInformation>(nameof(NativeMethods.FileRenameInformation.FileName)).ToInt32();
+            var size = offset + bytes.Length; var buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                for (var i = 0; i < size; i++) Marshal.WriteByte(buffer, i, 0);
+                Marshal.WriteIntPtr(buffer, Marshal.OffsetOf<NativeMethods.FileRenameInformation>(
+                    nameof(NativeMethods.FileRenameInformation.RootDirectory)).ToInt32(), familyRoot.Handle.DangerousGetHandle());
+                Marshal.WriteInt32(buffer, Marshal.OffsetOf<NativeMethods.FileRenameInformation>(
+                    nameof(NativeMethods.FileRenameInformation.FileNameLength)).ToInt32(), bytes.Length);
+                Marshal.Copy(bytes, 0, IntPtr.Add(buffer, offset), bytes.Length);
+                var status = NativeMethods.NtSetInformationFile(staging.Handle, out _, buffer, (uint)size,
+                    NativeMethods.FileRenameInformationClass);
+                if (status >= 0) return true;
+                var existing = TryOpenRelativeDirectory(familyRoot, accountName, false);
+                existing?.Dispose(); return existing is not null ? false :
+                    throw Policy(status == NativeMethods.StatusAccessDenied
+                        ? ManagedBrowserProfileIsolationReason.AccessControlMismatch
+                        : ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
         }
+        public bool RelativeIdentityMatches(PinnedEntry parent, string name, PinnedEntry expected)
+        {
+            var current = TryOpenRelativeDirectory(parent, name, false); if (current is null) return false;
+            using (current) return current.SameIdentity(expected);
+        }
+        public void TrackPublished(string path, PinnedEntry published) => TrackOwned(path, published);
+        public void TrackOwned(string path, PinnedEntry entry) => tracked.Add((path, entry, true));
+        public bool Revalidate()
+        {
+            foreach (var item in tracked)
+            {
+                if (item.RequireOwnedAcl && !item.Entry.HasCurrentUserOnlyAcl())
+                    throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+                PinnedEntry? current;
+                try { current = TryOpenAbsoluteDirectory(item.Path); }
+                catch (ManagedProfilePolicyException) { return false; }
+                if (current is null) return false;
+                using (current) if (!current.SameIdentity(item.Entry)) return false;
+            }
+            return true;
+        }
+        public void Dispose() { for (var i = owned.Count - 1; i >= 0; i--) owned[i].Dispose(); }
     }
 
-    private sealed class PinnedMarker : IDisposable
+    private sealed class PinnedEntry : IDisposable
     {
-        private const int MaximumMarkerBytes = 512;
-        private readonly SafeFileHandle handle;
-        private readonly FileStream? managedStream;
+        private const int MaxMarkerBytes = 512;
         private readonly NativeMethods.ByHandleFileInformation information;
-
-        private PinnedMarker(
-            SafeFileHandle handle,
-            NativeMethods.ByHandleFileInformation information,
-            FileStream? managedStream = null)
+        public PinnedEntry(SafeFileHandle handle, NativeMethods.ByHandleFileInformation information)
         {
-            this.handle = handle;
+            Handle = handle;
             this.information = information;
-            this.managedStream = managedStream;
         }
+        public SafeFileHandle Handle { get; }
+        public bool IsDirectory => (information.FileAttributes & FileAttributes.Directory) != 0;
+        public bool IsReparsePoint => (information.FileAttributes & FileAttributes.ReparsePoint) != 0;
+        public bool IsOrdinaryFile => !IsDirectory && !IsReparsePoint;
+        public bool SameIdentity(PinnedEntry other) => information.VolumeSerialNumber == other.information.VolumeSerialNumber &&
+            information.FileIndexHigh == other.information.FileIndexHigh && information.FileIndexLow == other.information.FileIndexLow;
+        public bool HasCurrentUserOnlyAcl()
+        {
+            if (!OperatingSystem.IsWindows()) return false;
+            var result = NativeMethods.GetSecurityInfo(Handle, NativeMethods.SeFileObject,
+                NativeMethods.OwnerSecurityInformation | NativeMethods.DaclSecurityInformation,
+                out _, out _, out _, out _, out var pointer);
+            if (result != 0 || pointer == IntPtr.Zero) return false;
+            try
+            {
+                var bytes = new byte[checked((int)NativeMethods.GetSecurityDescriptorLength(pointer))];
+                Marshal.Copy(pointer, bytes, 0, bytes.Length); var descriptor = new RawSecurityDescriptor(bytes, 0);
+                var user = WindowsIdentity.GetCurrent().User;
+                if (user is null || descriptor.Owner != user ||
+                    (descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
+                    descriptor.DiscretionaryAcl is null) return false;
+                var count = 0;
+                foreach (GenericAce generic in descriptor.DiscretionaryAcl)
+                {
+                    if (generic is not CommonAce ace || ace.AceQualifier != AceQualifier.AccessAllowed ||
+                        ace.SecurityIdentifier != user || (ace.AccessMask & NativeMethods.FileAllAccess) != NativeMethods.FileAllAccess)
+                        return false;
+                    count++;
+                }
+                return count > 0;
+            }
+            finally { NativeMethods.LocalFree(pointer); }
+        }
+        public void WriteCanonicalText(string text, Action? hook)
+        {
+            var bytes = Encoding.ASCII.GetBytes(text); var prefix = bytes.Length / 2;
+            Write(bytes.AsSpan(0, prefix).ToArray());
+            if (!NativeMethods.FlushFileBuffers(Handle)) ThrowNative("marker flush");
+            hook?.Invoke(); Write(bytes.AsSpan(prefix).ToArray());
+            if (!NativeMethods.FlushFileBuffers(Handle)) ThrowNative("marker flush");
+        }
+        public string ReadCanonicalText()
+        {
+            if (!NativeMethods.SetFilePointerEx(Handle, 0, out _, NativeMethods.FileBegin)) ThrowNative("marker seek");
+            var buffer = new byte[MaxMarkerBytes + 1];
+            if (!NativeMethods.ReadFile(Handle, buffer, (uint)buffer.Length, out var read, IntPtr.Zero)) ThrowNative("marker read");
+            if (read > MaxMarkerBytes) throw Policy(ManagedBrowserProfileIsolationReason.InvalidMarker);
+            return Encoding.ASCII.GetString(buffer, 0, checked((int)read));
+        }
+        private void Write(byte[] bytes)
+        {
+            if (!NativeMethods.WriteFile(Handle, bytes, (uint)bytes.Length, out var written, IntPtr.Zero) || written != bytes.Length)
+                ThrowNative("marker write");
+        }
+        public void Dispose() => Handle.Dispose();
+    }
 
-        public bool IsOrdinaryFile =>
-            (information.FileAttributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0;
+    private static PinnedEntry OpenAbsoluteDirectory(string path) => TryOpenAbsoluteDirectory(path) ??
+        throw Policy(ManagedBrowserProfileIsolationReason.UnsafePath);
+    private static PinnedEntry? TryOpenAbsoluteDirectory(string path)
+    {
+        var handle = NativeMethods.CreateFileW(path, NativeMethods.FileReadAttributes | NativeMethods.ReadControl,
+            NativeMethods.FileShareRead | NativeMethods.FileShareWrite, IntPtr.Zero, NativeMethods.OpenExisting,
+            NativeMethods.FileFlagBackupSemantics | NativeMethods.FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error(); handle.Dispose();
+            if (error is NativeMethods.ErrorFileNotFound or NativeMethods.ErrorPathNotFound) return null;
+            throw Policy(error == NativeMethods.ErrorAccessDenied ? ManagedBrowserProfileIsolationReason.AccessControlMismatch :
+                ManagedBrowserProfileIsolationReason.UnsafePath);
+        }
+        return Inspect(handle, true);
+    }
+    private static PinnedEntry? TryOpenRelativeDirectory(PinnedEntry parent, string name, bool owned) =>
+        OpenRelative(parent, name, NativeMethods.FileReadAttributes | NativeMethods.ReadControl | NativeMethods.Synchronize,
+            NativeMethods.FileOpen, NativeMethods.FileDirectoryFile | NativeMethods.FileSynchronousIoNonAlert |
+            NativeMethods.FileOpenReparsePoint, null, true, true, owned);
+    private static PinnedEntry CreateRelativeDirectory(PinnedEntry parent, string name, bool rename)
+    {
+        using var security = SecurityDescriptorBuffer.Create(true);
+        var access = NativeMethods.FileReadAttributes | NativeMethods.ReadControl | NativeMethods.Synchronize |
+            (rename ? NativeMethods.Delete : 0);
+        return OpenRelative(parent, name, access, NativeMethods.FileCreate,
+            NativeMethods.FileDirectoryFile | NativeMethods.FileSynchronousIoNonAlert | NativeMethods.FileOpenReparsePoint,
+            security, false, true, true) ?? throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+    }
+    private static PinnedEntry CreateRelativeMarker(PinnedEntry parent, string name)
+    {
+        using var security = SecurityDescriptorBuffer.Create(false);
+        return OpenRelative(parent, name, NativeMethods.GenericRead | NativeMethods.GenericWrite | NativeMethods.ReadControl |
+            NativeMethods.Synchronize, NativeMethods.FileCreate, NativeMethods.FileNonDirectoryFile |
+            NativeMethods.FileSynchronousIoNonAlert | NativeMethods.FileOpenReparsePoint | NativeMethods.FileWriteThrough,
+            security, false, false, true) ?? throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+    }
+    private static PinnedEntry? OpenRelative(PinnedEntry parent, string name, uint access, uint disposition,
+        uint options, SecurityDescriptorBuffer? security, bool missingNull, bool directory, bool owned)
+    {
+        ValidateRelativeName(name); using var relative = new RelativeName(name);
+        var attributes = new NativeMethods.ObjectAttributes
+        {
+            Length = Marshal.SizeOf<NativeMethods.ObjectAttributes>(),
+            RootDirectory = parent.Handle.DangerousGetHandle(),
+            ObjectName = relative.UnicodeStringPointer,
+            Attributes = NativeMethods.ObjCaseInsensitive,
+            SecurityDescriptor = security?.Pointer ?? IntPtr.Zero
+        };
+        var status = NativeMethods.NtCreateFile(out var handle, access, ref attributes, out _, IntPtr.Zero,
+            directory ? NativeMethods.FileAttributeDirectory : NativeMethods.FileAttributeNormal,
+            NativeMethods.FileShareRead | NativeMethods.FileShareWrite, disposition, options, IntPtr.Zero, 0);
+        if (status < 0)
+        {
+            handle?.Dispose();
+            if (missingNull && status is NativeMethods.StatusObjectNameNotFound or NativeMethods.StatusObjectPathNotFound) return null;
+            throw Policy(status == NativeMethods.StatusAccessDenied ? ManagedBrowserProfileIsolationReason.AccessControlMismatch :
+                status == NativeMethods.StatusObjectNameCollision ? ManagedBrowserProfileIsolationReason.ConcurrentMutation :
+                ManagedBrowserProfileIsolationReason.UnsafePath);
+        }
+        var entry = Inspect(handle, directory);
+        if (owned && !entry.HasCurrentUserOnlyAcl()) { entry.Dispose(); throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch); }
+        return entry;
+    }
+    private static PinnedEntry Inspect(SafeFileHandle handle, bool directory)
+    {
+        if (!NativeMethods.GetFileInformationByHandle(handle, out var info)) { handle.Dispose(); ThrowNative("entry inspection"); }
+        var entry = new PinnedEntry(handle, info);
+        if (entry.IsReparsePoint || entry.IsDirectory != directory) { entry.Dispose(); throw Policy(ManagedBrowserProfileIsolationReason.UnsafePath); }
+        return entry;
+    }
+    private static void ValidateRelativeName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.Any(char.IsControl) ||
+            name.Contains(Path.DirectorySeparatorChar) || name.Contains(Path.AltDirectorySeparatorChar) || name.Contains(':'))
+            throw Policy(ManagedBrowserProfileIsolationReason.UnsupportedNamespace);
+    }
+    private static void ThrowNative(string operation) => throw new IOException(
+        $"The managed browser profile {operation} failed.", new Win32Exception(Marshal.GetLastWin32Error()));
 
-        public static PinnedMarker? TryOpen(string path) => Open(path, createNew: false);
-
-        public static PinnedMarker? TryCreate(string path) => Open(path, createNew: true);
-
-        private static PinnedMarker? Open(string path, bool createNew)
+    private sealed class RelativeName : IDisposable
+    {
+        private readonly IntPtr text;
+        public RelativeName(string name)
+        {
+            text = Marshal.StringToHGlobalUni(name); var unicode = new NativeMethods.UnicodeString
+            {
+                Length = checked((ushort)(name.Length * 2)),
+                MaximumLength = checked((ushort)((name.Length + 1) * 2)),
+                Buffer = text
+            };
+            UnicodeStringPointer = Marshal.AllocHGlobal(Marshal.SizeOf<NativeMethods.UnicodeString>());
+            Marshal.StructureToPtr(unicode, UnicodeStringPointer, false);
+        }
+        public IntPtr UnicodeStringPointer { get; }
+        public void Dispose() { Marshal.FreeHGlobal(UnicodeStringPointer); Marshal.FreeHGlobal(text); }
+    }
+    private sealed class SecurityDescriptorBuffer : IDisposable
+    {
+        private readonly GCHandle pinned;
+        private SecurityDescriptorBuffer(byte[] bytes) { pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned); Pointer = pinned.AddrOfPinnedObject(); }
+        public IntPtr Pointer { get; }
+        public static SecurityDescriptorBuffer Create(bool directory)
         {
             if (!OperatingSystem.IsWindows())
-            {
-                try
-                {
-                    var stream = new FileStream(
-                        path,
-                        createNew ? FileMode.CreateNew : FileMode.Open,
-                        createNew ? FileAccess.Write : FileAccess.Read,
-                        FileShare.Read);
-                    var attributes = File.GetAttributes(path);
-                    return new PinnedMarker(stream.SafeFileHandle, new NativeMethods.ByHandleFileInformation
-                    {
-                        FileAttributes = attributes,
-                    }, stream);
-                }
-                catch (IOException) when (createNew || !File.Exists(path))
-                {
-                    return null;
-                }
-            }
-
-            var handle = NativeMethods.CreateFileW(
-                path,
-                createNew ? NativeMethods.GenericWrite | NativeMethods.FileReadAttributes :
-                    NativeMethods.GenericRead | NativeMethods.FileReadAttributes,
-                NativeMethods.FileShareRead,
-                IntPtr.Zero,
-                createNew ? NativeMethods.CreateNew : NativeMethods.OpenExisting,
-                NativeMethods.FileFlagOpenReparsePoint,
-                IntPtr.Zero);
-            if (handle.IsInvalid)
-            {
-                var error = Marshal.GetLastWin32Error();
-                handle.Dispose();
-                if (error is NativeMethods.ErrorFileNotFound or NativeMethods.ErrorPathNotFound ||
-                    createNew && error is NativeMethods.ErrorFileExists or NativeMethods.ErrorAlreadyExists)
-                    return null;
-                throw new IOException(
-                    "The managed browser profile marker could not be opened safely.",
-                    new Win32Exception(error));
-            }
-            if (!NativeMethods.GetFileInformationByHandle(handle, out var information))
-            {
-                var error = Marshal.GetLastWin32Error();
-                handle.Dispose();
-                throw new IOException(
-                    "The managed browser profile marker could not be inspected safely.",
-                    new Win32Exception(error));
-            }
-            return new PinnedMarker(handle, information);
+                throw Policy(ManagedBrowserProfileIsolationReason.UnsupportedNamespace);
+            var user = WindowsIdentity.GetCurrent().User ?? throw Policy(ManagedBrowserProfileIsolationReason.AccessControlMismatch);
+            FileSystemSecurity security = directory ? new DirectorySecurity() : new FileSecurity();
+            security.SetOwner(user); security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(directory ? new FileSystemAccessRule(user, FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow) :
+                new FileSystemAccessRule(user, FileSystemRights.FullControl, AccessControlType.Allow));
+            return new SecurityDescriptorBuffer(security.GetSecurityDescriptorBinaryForm());
         }
-
-        public string ReadText()
-        {
-            var buffer = new byte[MaximumMarkerBytes + 1];
-            int length;
-            if (managedStream is not null)
-            {
-                length = managedStream.Read(buffer);
-            }
-            else
-            {
-                if (!NativeMethods.ReadFile(handle, buffer, (uint)buffer.Length, out var bytesRead, IntPtr.Zero))
-                    throw new IOException(
-                        "The managed browser profile marker could not be read safely.",
-                        new Win32Exception(Marshal.GetLastWin32Error()));
-                length = checked((int)bytesRead);
-            }
-            if (length > MaximumMarkerBytes)
-                throw new FormatException("The managed profile ownership marker is too large.");
-            return Encoding.ASCII.GetString(buffer, 0, length);
-        }
-
-        public void WriteText(string text)
-        {
-            var bytes = Encoding.ASCII.GetBytes(text);
-            if (managedStream is not null)
-            {
-                managedStream.Write(bytes);
-                managedStream.Flush(flushToDisk: true);
-                return;
-            }
-            if (!NativeMethods.WriteFile(handle, bytes, (uint)bytes.Length, out var bytesWritten, IntPtr.Zero) ||
-                bytesWritten != bytes.Length || !NativeMethods.FlushFileBuffers(handle))
-                throw new IOException(
-                    "The managed browser profile marker could not be written safely.",
-                    new Win32Exception(Marshal.GetLastWin32Error()));
-        }
-
-        public void Dispose()
-        {
-            if (managedStream is not null) managedStream.Dispose();
-            else handle.Dispose();
-        }
+        public void Dispose() { if (pinned.IsAllocated) pinned.Free(); }
     }
 
     private static class NativeMethods
     {
-        internal const uint GenericRead = 0x80000000;
-        internal const uint GenericWrite = 0x40000000;
-        internal const uint FileReadAttributes = 0x00000080;
-        internal const uint FileShareRead = 0x00000001;
-        internal const uint FileShareWrite = 0x00000002;
-        internal const uint OpenExisting = 3;
-        internal const uint CreateNew = 1;
-        internal const uint FileFlagBackupSemantics = 0x02000000;
-        internal const uint FileFlagOpenReparsePoint = 0x00200000;
-        internal const int ErrorFileNotFound = 2;
-        internal const int ErrorPathNotFound = 3;
-        internal const int ErrorFileExists = 80;
-        internal const int ErrorAlreadyExists = 183;
-
+        internal const uint GenericRead = 0x80000000, GenericWrite = 0x40000000, Delete = 0x00010000,
+            ReadControl = 0x00020000, Synchronize = 0x00100000, FileReadAttributes = 0x80,
+            FileShareRead = 1, FileShareWrite = 2, OpenExisting = 3, FileFlagBackupSemantics = 0x02000000,
+            FileFlagOpenReparsePoint = 0x00200000, FileCreate = 2, FileOpen = 1, FileDirectoryFile = 1,
+            FileWriteThrough = 2, FileSynchronousIoNonAlert = 0x20, FileNonDirectoryFile = 0x40,
+            FileOpenReparsePoint = 0x00200000, FileAttributeDirectory = 0x10, FileAttributeNormal = 0x80,
+            ObjCaseInsensitive = 0x40, OwnerSecurityInformation = 1, DaclSecurityInformation = 4, FileBegin = 0;
+        internal const int StatusObjectNameNotFound = unchecked((int)0xC0000034),
+            StatusObjectPathNotFound = unchecked((int)0xC000003A), StatusObjectNameCollision = unchecked((int)0xC0000035),
+            StatusAccessDenied = unchecked((int)0xC0000022), ErrorFileNotFound = 2, ErrorPathNotFound = 3,
+            ErrorAccessDenied = 5, FileAllAccess = 0x001F01FF, SeFileObject = 1;
+        internal const int FileRenameInformationClass = 10;
+        [StructLayout(LayoutKind.Sequential)] internal struct UnicodeString { public ushort Length, MaximumLength; public IntPtr Buffer; }
         [StructLayout(LayoutKind.Sequential)]
-        internal struct FileTime
-        {
-            public uint LowDateTime;
-            public uint HighDateTime;
-        }
-
+        internal struct ObjectAttributes
+        { public int Length; public IntPtr RootDirectory, ObjectName; public uint Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
+        [StructLayout(LayoutKind.Sequential)] internal struct IoStatusBlock { public IntPtr Status; public UIntPtr Information; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct FileRenameInformation
+        { public int ReplaceIfExists; public IntPtr RootDirectory; public uint FileNameLength; public char FileName; }
+        [StructLayout(LayoutKind.Sequential)] internal struct FileTime { public uint LowDateTime, HighDateTime; }
         [StructLayout(LayoutKind.Sequential)]
         internal struct ByHandleFileInformation
         {
-            public FileAttributes FileAttributes;
-            public FileTime CreationTime;
-            public FileTime LastAccessTime;
-            public FileTime LastWriteTime;
-            public uint VolumeSerialNumber;
-            public uint FileSizeHigh;
-            public uint FileSizeLow;
-            public uint NumberOfLinks;
-            public uint FileIndexHigh;
-            public uint FileIndexLow;
+            public FileAttributes FileAttributes; public FileTime CreationTime, LastAccessTime, LastWriteTime;
+            public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
         }
-
+        [DllImport("ntdll.dll")]
+        internal static extern int NtCreateFile(out SafeFileHandle fileHandle, uint desiredAccess,
+            ref ObjectAttributes objectAttributes, out IoStatusBlock ioStatusBlock, IntPtr allocationSize,
+            uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
+        [DllImport("ntdll.dll")]
+        internal static extern int NtSetInformationFile(SafeFileHandle fileHandle,
+            out IoStatusBlock ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern SafeFileHandle CreateFileW(
-            string fileName,
-            uint desiredAccess,
-            uint shareMode,
-            IntPtr securityAttributes,
-            uint creationDisposition,
-            uint flagsAndAttributes,
-            IntPtr templateFile);
-
+            string fileName, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition,
+            uint flagsAndAttributes, IntPtr templateFile);
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetFileInformationByHandle(
-            SafeFileHandle file,
-            out ByHandleFileInformation fileInformation);
-
+            SafeFileHandle file, out ByHandleFileInformation information);
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool ReadFile(
-            SafeFileHandle file,
-            byte[] buffer,
-            uint bytesToRead,
-            out uint bytesRead,
-            IntPtr overlapped);
-
+            SafeFileHandle file, byte[] buffer, uint bytesToRead, out uint bytesRead, IntPtr overlapped);
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool WriteFile(
-            SafeFileHandle file,
-            byte[] buffer,
-            uint bytesToWrite,
-            out uint bytesWritten,
-            IntPtr overlapped);
-
+            SafeFileHandle file, byte[] buffer, uint bytesToWrite, out uint bytesWritten, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)][return: MarshalAs(UnmanagedType.Bool)] internal static extern bool FlushFileBuffers(SafeFileHandle file);
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        internal static extern bool FlushFileBuffers(SafeFileHandle file);
+        internal static extern bool SetFilePointerEx(
+            SafeFileHandle file, long distance, out long newPointer, uint method);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        internal static extern uint GetSecurityInfo(SafeFileHandle handle,
+            int objectType, uint securityInfo, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl,
+            out IntPtr securityDescriptor);
+        [DllImport("advapi32.dll")] internal static extern uint GetSecurityDescriptorLength(IntPtr securityDescriptor);
+        [DllImport("kernel32.dll")] internal static extern IntPtr LocalFree(IntPtr memory);
     }
 }
