@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Infrastructure.Security;
 using System.Collections.Concurrent;
 using System.IO;
 
@@ -17,47 +18,64 @@ public enum BrowserSetupStatus
     StateUnavailable = 8,
     StateChanged = 9,
     CleanupFailed = 10,
+    ExecutableVerificationFailed = 11,
 }
 
 public sealed class BrowserDirectoryCandidate
 {
     public BrowserDirectoryCandidate(
-        BrowserFamily browserFamily,
-        string directoryPath,
-        string executablePath)
+        BrowserInstallationIdentity identity)
     {
-        if (browserFamily is not (BrowserFamily.Chrome or BrowserFamily.Edge))
-            throw new ArgumentOutOfRangeException(nameof(browserFamily));
-        ArgumentException.ThrowIfNullOrWhiteSpace(directoryPath);
-        ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
-        BrowserFamily = browserFamily;
-        DirectoryPath = directoryPath;
-        ExecutablePath = executablePath;
+        Identity = identity ?? throw new ArgumentNullException(nameof(identity));
     }
 
-    public BrowserFamily BrowserFamily { get; }
-    public string DirectoryPath { get; }
-    public string ExecutablePath { get; }
+    public BrowserInstallationIdentity Identity { get; }
+    public BrowserFamily BrowserFamily => Identity.BrowserFamily;
+    public string DirectoryPath => Identity.InstallationDirectory;
+    public string ExecutablePath => Identity.ExecutablePath;
 
     public override string ToString() =>
         $"BrowserDirectoryCandidate {{ BrowserFamily = {BrowserFamily}, DirectoryPath = [REDACTED], ExecutablePath = [REDACTED] }}";
+}
+
+public sealed class BrowserCandidateVerificationFailure
+{
+    public BrowserCandidateVerificationFailure(
+        BrowserFamily browserFamily,
+        BrowserExecutableVerificationErrorCode errorCode)
+    {
+        if (browserFamily is not (BrowserFamily.Chrome or BrowserFamily.Edge))
+            throw new ArgumentOutOfRangeException(nameof(browserFamily));
+        if (errorCode == BrowserExecutableVerificationErrorCode.None)
+            throw new ArgumentOutOfRangeException(nameof(errorCode));
+        BrowserFamily = browserFamily;
+        ErrorCode = errorCode;
+    }
+
+    public BrowserFamily BrowserFamily { get; }
+    public BrowserExecutableVerificationErrorCode ErrorCode { get; }
+    public override string ToString() =>
+        $"BrowserCandidateVerificationFailure {{ BrowserFamily = {BrowserFamily}, ErrorCode = {ErrorCode} }}";
 }
 
 public sealed class BrowserSetupResult
 {
     internal BrowserSetupResult(
         BrowserSetupStatus status,
-        IReadOnlyList<BrowserDirectoryCandidate>? candidates = null)
+        IReadOnlyList<BrowserDirectoryCandidate>? candidates = null,
+        IReadOnlyList<BrowserCandidateVerificationFailure>? failures = null)
     {
         Status = status;
         Candidates = candidates ?? Array.Empty<BrowserDirectoryCandidate>();
+        Failures = failures ?? Array.Empty<BrowserCandidateVerificationFailure>();
     }
 
     public BrowserSetupStatus Status { get; }
     public IReadOnlyList<BrowserDirectoryCandidate> Candidates { get; }
+    public IReadOnlyList<BrowserCandidateVerificationFailure> Failures { get; }
 
     public override string ToString() =>
-        $"BrowserSetupResult {{ Status = {Status}, CandidateCount = {Candidates.Count} }}";
+        $"BrowserSetupResult {{ Status = {Status}, CandidateCount = {Candidates.Count}, FailureCount = {Failures.Count} }}";
 }
 
 public interface IBrowserDirectoryFileSystem
@@ -390,7 +408,8 @@ public sealed class BrowserSetupService(
     IBrowserDirectoryFileSystem fileSystem,
     IBrowserDirectoryState state,
     BrowserSelectionProcessContext processContext,
-    IBrowserSelectionActivityRegistry activityRegistry)
+    IBrowserSelectionActivityRegistry activityRegistry,
+    IBrowserExecutableVerifier executableVerifier)
 {
     private const string ChromeExecutableName = "chrome.exe";
     private const string EdgeExecutableName = "msedge.exe";
@@ -654,8 +673,9 @@ public sealed class BrowserSetupService(
 
         try
         {
+            var verifiedDirectory = inspected.Candidates[0].DirectoryPath;
             var save = await state.TrySaveAsync(
-                selectedDirectory, intent.Revision, intent, cancellationToken).ConfigureAwait(false);
+                verifiedDirectory, intent.Revision, intent, cancellationToken).ConfigureAwait(false);
             if (save.Status == BrowserDirectoryStateSaveStatus.Committed)
                 return new SelectionAttemptResult(inspected, true);
             return new SelectionAttemptResult(
@@ -772,19 +792,59 @@ public sealed class BrowserSetupService(
         }
 
         var candidates = new List<BrowserDirectoryCandidate>(2);
+        var failures = new List<BrowserCandidateVerificationFailure>(2);
         if (chromeExists)
-            candidates.Add(new BrowserDirectoryCandidate(
-                BrowserFamily.Chrome, canonicalDirectory, chromePath));
+            await VerifyCandidateAsync(
+                canonicalDirectory, BrowserFamily.Chrome, candidates, failures, cancellationToken)
+                .ConfigureAwait(false);
         if (edgeExists)
-            candidates.Add(new BrowserDirectoryCandidate(
-                BrowserFamily.Edge, canonicalDirectory, edgePath));
+            await VerifyCandidateAsync(
+                canonicalDirectory, BrowserFamily.Edge, candidates, failures, cancellationToken)
+                .ConfigureAwait(false);
 
         return candidates.Count switch
         {
-            0 => Result(BrowserSetupStatus.NoSupportedBrowser),
-            1 => Result(BrowserSetupStatus.Selected, candidates),
-            _ => Result(BrowserSetupStatus.BrowserFamilyChoiceRequired, candidates),
+            0 when failures.Count == 0 => Result(BrowserSetupStatus.NoSupportedBrowser),
+            0 => Result(BrowserSetupStatus.ExecutableVerificationFailed, failures: failures),
+            1 => Result(BrowserSetupStatus.Selected, candidates, failures),
+            _ => Result(BrowserSetupStatus.BrowserFamilyChoiceRequired, candidates, failures),
         };
+    }
+
+    private async Task VerifyCandidateAsync(
+        string canonicalDirectory,
+        BrowserFamily family,
+        List<BrowserDirectoryCandidate> candidates,
+        List<BrowserCandidateVerificationFailure> failures,
+        CancellationToken cancellationToken)
+    {
+        BrowserExecutableVerificationResult verification;
+        try
+        {
+            verification = await executableVerifier.VerifyAsync(
+                canonicalDirectory, family, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch
+        {
+            verification = BrowserExecutableVerificationResult.Failed(
+                BrowserExecutableVerificationErrorCode.VerificationUnavailable);
+        }
+
+        if (verification.IsVerified && verification.Identity is not null)
+        {
+            candidates.Add(new BrowserDirectoryCandidate(verification.Identity));
+            return;
+        }
+
+        failures.Add(new BrowserCandidateVerificationFailure(
+            family,
+            verification.ErrorCode == BrowserExecutableVerificationErrorCode.None
+                ? BrowserExecutableVerificationErrorCode.VerificationUnavailable
+                : verification.ErrorCode));
     }
 
     private static bool TryGetCanonicalDirectory(string value, out string canonicalDirectory)
@@ -814,7 +874,9 @@ public sealed class BrowserSetupService(
 
     private static BrowserSetupResult Result(
         BrowserSetupStatus status,
-        IReadOnlyList<BrowserDirectoryCandidate>? candidates = null) => new(status, candidates);
+        IReadOnlyList<BrowserDirectoryCandidate>? candidates = null,
+        IReadOnlyList<BrowserCandidateVerificationFailure>? failures = null) =>
+        new(status, candidates, failures);
 
     private static SelectionAttemptResult Attempt(BrowserSetupStatus status) =>
         new(Result(status), false);

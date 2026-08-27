@@ -1,6 +1,7 @@
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Infrastructure.Security;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -10,6 +11,96 @@ public sealed class BrowserSetupServiceTests
     private const string SavedDirectory = @"C:\Saved\Browser";
     private readonly BrowserSelectionProcessContext processContext = new(Guid.NewGuid());
     private readonly ProcessBrowserSelectionActivityRegistry activityRegistry = new();
+
+    [Fact]
+    public async Task VerificationFailureDoesNotOverwriteSavedDirectory()
+    {
+        var verifier = new RecordingBrowserExecutableVerifier
+        {
+            ChromeError = BrowserExecutableVerificationErrorCode.SignatureUntrusted,
+        };
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                state,
+                verifier)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.ExecutableVerificationFailed, result.Status);
+        Assert.Empty(result.Candidates);
+        Assert.Equal(BrowserExecutableVerificationErrorCode.SignatureUntrusted, Assert.Single(result.Failures).ErrorCode);
+        Assert.Equal(SavedDirectory, state.Directory);
+        Assert.Equal(0, state.SaveCount);
+    }
+
+    [Fact]
+    public async Task BothExecutablesAreVerifiedIndependentlyAndOnlyPassingCandidateIsReturned()
+    {
+        var verifier = new RecordingBrowserExecutableVerifier
+        {
+            EdgeError = BrowserExecutableVerificationErrorCode.ProductMismatch,
+        };
+        var fileSystem = new RecordingBrowserDirectoryFileSystem(
+            Path.Combine(SelectedDirectory, "chrome.exe"),
+            Path.Combine(SelectedDirectory, "msedge.exe"));
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                fileSystem,
+                new RecordingBrowserDirectoryState(),
+                verifier)
+            .EnsureSelectedAsync(CancellationToken.None);
+
+        var candidate = Assert.Single(result.Candidates);
+        Assert.Equal(BrowserSetupStatus.Selected, result.Status);
+        Assert.Equal(BrowserFamily.Chrome, candidate.BrowserFamily);
+        Assert.Same(verifier.VerifiedIdentities[BrowserFamily.Chrome], candidate.Identity);
+        Assert.Equal(BrowserExecutableVerificationErrorCode.ProductMismatch, Assert.Single(result.Failures).ErrorCode);
+        Assert.Equal(new[] { BrowserFamily.Chrome, BrowserFamily.Edge }, verifier.Families);
+    }
+
+    [Fact]
+    public async Task VerificationCancellationPropagatesWithoutOverwritingSavedDirectory()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var verifier = new RecordingBrowserExecutableVerifier { BeforeVerify = cancellation.Cancel };
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            CreateService(
+                    new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                    new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                    state,
+                    verifier)
+                .ReselectAsync(cancellation.Token));
+
+        Assert.Equal(SavedDirectory, state.Directory);
+        Assert.Equal(0, state.SaveCount);
+    }
+
+    [Fact]
+    public async Task VerifierExceptionBecomesSafeFailureWithoutOverwritingSavedDirectory()
+    {
+        var verifier = new RecordingBrowserExecutableVerifier
+        {
+            Failure = new IOException($"sensitive {SelectedDirectory}"),
+        };
+        var state = new RecordingBrowserDirectoryState(SavedDirectory);
+
+        var result = await CreateService(
+                new RecordingBrowserDirectoryPicker(SelectedDirectory),
+                new RecordingBrowserDirectoryFileSystem(Path.Combine(SelectedDirectory, "chrome.exe")),
+                state,
+                verifier)
+            .ReselectAsync(CancellationToken.None);
+
+        Assert.Equal(BrowserSetupStatus.ExecutableVerificationFailed, result.Status);
+        Assert.Equal(BrowserExecutableVerificationErrorCode.VerificationUnavailable, Assert.Single(result.Failures).ErrorCode);
+        Assert.DoesNotContain(SelectedDirectory, result.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(SavedDirectory, state.Directory);
+    }
 
     [Fact]
     public async Task FirstUsePromptsInsteadOfScanning()
@@ -747,11 +838,50 @@ public sealed class BrowserSetupServiceTests
     private BrowserSetupService CreateService(
         IBrowserDirectoryPicker dialog,
         IBrowserDirectoryFileSystem fileSystem,
-        IBrowserDirectoryState state) =>
-        new(dialog, fileSystem, state, processContext, activityRegistry);
+        IBrowserDirectoryState state,
+        IBrowserExecutableVerifier? verifier = null) =>
+        new(dialog, fileSystem, state, processContext, activityRegistry,
+            verifier ?? new RecordingBrowserExecutableVerifier());
 
     private static string[] ExpectedProbes(string directory) =>
         [Path.Combine(directory, "chrome.exe"), Path.Combine(directory, "msedge.exe")];
+
+    private sealed class RecordingBrowserExecutableVerifier : IBrowserExecutableVerifier
+    {
+        public BrowserExecutableVerificationErrorCode ChromeError { get; init; }
+        public BrowserExecutableVerificationErrorCode EdgeError { get; init; }
+        public Action? BeforeVerify { get; init; }
+        public Exception? Failure { get; init; }
+        public List<BrowserFamily> Families { get; } = [];
+        public Dictionary<BrowserFamily, BrowserInstallationIdentity> VerifiedIdentities { get; } = [];
+
+        public Task<BrowserExecutableVerificationResult> VerifyAsync(
+            string selectedDirectory,
+            BrowserFamily family,
+            CancellationToken cancellationToken)
+        {
+            BeforeVerify?.Invoke();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Failure is not null) throw Failure;
+            Families.Add(family);
+            var error = family == BrowserFamily.Chrome ? ChromeError : EdgeError;
+            if (error != BrowserExecutableVerificationErrorCode.None)
+                return Task.FromResult(BrowserExecutableVerificationResult.Failed(error));
+            var identity = new BrowserInstallationIdentity(
+                Guid.NewGuid(), family, selectedDirectory,
+                Path.Combine(selectedDirectory, family == BrowserFamily.Chrome ? "chrome.exe" : "msedge.exe"),
+                family == BrowserFamily.Chrome ? "Google LLC" : "Microsoft Corporation",
+                family == BrowserFamily.Chrome ? "Google Chrome" : "Microsoft Edge",
+                $"volume:file:{new string(family == BrowserFamily.Chrome ? 'a' : 'b', 64)}");
+            VerifiedIdentities[family] = identity;
+            return Task.FromResult(BrowserExecutableVerificationResult.Verified(identity));
+        }
+
+        public Task<BrowserExecutableVerificationResult> ReverifyForLaunchAsync(
+            BrowserInstallationIdentity expectedIdentity,
+            CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
 
     private sealed class RecordingBrowserDirectoryPicker(
         string? selectedDirectory,
