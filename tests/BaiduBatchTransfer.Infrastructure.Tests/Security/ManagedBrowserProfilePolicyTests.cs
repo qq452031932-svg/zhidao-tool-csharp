@@ -3,6 +3,7 @@ using BaiduBatchTransfer.Infrastructure.Security;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Runtime.Versioning;
+using Microsoft.Win32.SafeHandles;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Security;
 
@@ -135,10 +136,19 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     public async Task ConcurrentFirstCreationHasOneCompleteCanonicalWinner()
     {
         var accountId = Guid.NewGuid();
-        var policy = new FileSystemManagedBrowserProfilePolicy(root);
+        const int writerCount = 16;
+        using var barrier = new Barrier(writerCount);
+        var policies = Enumerable.Range(0, writerCount)
+            .Select(_ => new FileSystemManagedBrowserProfilePolicy(root,
+                new ManagedBrowserProfilePolicyTestHooks
+                {
+                    AfterTrustedNamespacePinned = () =>
+                        Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(15))),
+                }))
+            .ToArray();
 
-        var results = await Task.WhenAll(Enumerable.Range(0, 16)
-            .Select(_ => policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome)));
+        var results = await Task.WhenAll(policies.Select(policy => Task.Run(() =>
+            policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome))));
 
         Assert.All(results, result => Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status));
         Assert.Single(results.Select(result => result.Profile!.ProfileId).Distinct());
@@ -176,6 +186,63 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
 
         Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
         Assert.Equal(ManagedBrowserProfileIsolationReason.UnsupportedNamespace, result.IsolationReason);
+    }
+
+    [Theory]
+    [InlineData(2, true, true, true)]
+    [InlineData(3, true, true, true)]
+    [InlineData(1, false, true, true)]
+    [InlineData(1, true, false, true)]
+    [InlineData(1, true, true, false)]
+    public async Task UnsupportedPinnedVolumeFailsBeforeAnyProfileWrite(
+        int driveKind,
+        bool persistentAcls,
+        bool stableFileIds,
+        bool atomicRename)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var reader = new StubVolumeCapabilityReader(new(
+            (ManagedProfileDriveKind)driveKind, persistentAcls, stableFileIds, atomicRename));
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, reader);
+
+        var result = await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.UnsupportedVolume, result.IsolationReason);
+        Assert.Equal(1, reader.Calls);
+        Assert.True(reader.ReceivedValidPinnedHandle);
+        Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
+    public async Task SupportedPinnedLocalVolumeIsCheckedBeforeCreation()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var reader = new StubVolumeCapabilityReader(new(
+            ManagedProfileDriveKind.Fixed, true, true, true));
+
+        var result = await new FileSystemManagedBrowserProfilePolicy(root, reader)
+            .GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status);
+        Assert.Equal(1, reader.Calls);
+        Assert.True(reader.ReceivedValidPinnedHandle);
+    }
+
+    [Fact]
+    public async Task VolumeCapabilityReadFailureIsTypedAndWritesNothing()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var reader = new StubVolumeCapabilityReader(new(
+            ManagedProfileDriveKind.Fixed, true, true, true), throwOnRead: true);
+
+        var result = await new FileSystemManagedBrowserProfilePolicy(root, reader)
+            .GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.UnsupportedVolume, result.IsolationReason);
+        Assert.Equal(1, reader.Calls);
+        Assert.False(Directory.Exists(root));
     }
 
     [Fact]
@@ -305,6 +372,106 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
         Assert.Equal(ManagedBrowserProfileIsolationReason.AccessControlMismatch, result.IsolationReason);
         Assert.True(Directory.Exists(initial.Profile!.CanonicalSourcePath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [SupportedOSPlatform("windows")]
+    public async Task MarkerChangedInPlaceAfterFirstReadNeverReturnsReady(bool truncate)
+    {
+        var accountId = Guid.NewGuid();
+        var initial = await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        var markerPath = Path.Combine(initial.Profile!.CanonicalSourcePath,
+            FileSystemManagedBrowserProfilePolicy.MarkerName);
+        var original = await File.ReadAllTextAsync(markerPath);
+        var replacement = original.Replace(
+            $"profile-id={initial.Profile.ProfileId:N}",
+            $"profile-id={Guid.NewGuid():N}",
+            StringComparison.Ordinal);
+        FileStream? writer = null;
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            BeforeMarkerPinned = path => writer = new FileStream(
+                path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite),
+            AfterFirstMarkerRead = _ =>
+            {
+                writer!.Position = 0;
+                if (truncate)
+                {
+                    writer.SetLength(1);
+                }
+                else
+                {
+                    var bytes = System.Text.Encoding.ASCII.GetBytes(replacement);
+                    writer.Write(bytes);
+                    writer.SetLength(bytes.Length);
+                }
+                writer.Flush(flushToDisk: true);
+            },
+        });
+
+        ManagedBrowserProfileResult result;
+        try
+        {
+            result = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        }
+        finally
+        {
+            writer?.Dispose();
+        }
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.ConcurrentMutation, result.IsolationReason);
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task MarkerAclChangedAfterFirstReadFailsClosed()
+    {
+        var accountId = Guid.NewGuid();
+        var initial = await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Edge);
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            AfterFirstMarkerRead = AddEveryoneReadAcl,
+        });
+
+        var result = await policy.GetOrCreateAsync(accountId, BrowserFamily.Edge);
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.AccessControlMismatch, result.IsolationReason);
+        Assert.True(File.Exists(Path.Combine(initial.Profile!.CanonicalSourcePath,
+            FileSystemManagedBrowserProfilePolicy.MarkerName)));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public async Task CompetingMarkerWriteHandlePreventsPinnedRead()
+    {
+        var accountId = Guid.NewGuid();
+        await new FileSystemManagedBrowserProfilePolicy(root)
+            .GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        FileStream? writer = null;
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, new ManagedBrowserProfilePolicyTestHooks
+        {
+            BeforeMarkerPinned = path => writer = new FileStream(
+                path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite),
+        });
+
+        ManagedBrowserProfileResult result;
+        try
+        {
+            result = await policy.GetOrCreateAsync(accountId, BrowserFamily.Chrome);
+        }
+        finally
+        {
+            writer?.Dispose();
+        }
+
+        Assert.Equal(ManagedBrowserProfileStatus.IsolationRequired, result.Status);
+        Assert.Equal(ManagedBrowserProfileIsolationReason.ConcurrentMutation, result.IsolationReason);
     }
 
     [Fact]
@@ -506,14 +673,20 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     [SupportedOSPlatform("windows")]
     private static void AddEveryoneReadAcl(string path)
     {
-        var security = new DirectoryInfo(path).GetAccessControl();
+        var directory = (File.GetAttributes(path) & FileAttributes.Directory) != 0;
+        FileSystemSecurity security = directory
+            ? new DirectoryInfo(path).GetAccessControl()
+            : new FileInfo(path).GetAccessControl();
         security.AddAccessRule(new FileSystemAccessRule(
             new SecurityIdentifier(WellKnownSidType.WorldSid, null),
             FileSystemRights.Read,
             InheritanceFlags.None,
             PropagationFlags.None,
             AccessControlType.Allow));
-        new DirectoryInfo(path).SetAccessControl(security);
+        if (directory)
+            new DirectoryInfo(path).SetAccessControl((DirectorySecurity)security);
+        else
+            new FileInfo(path).SetAccessControl((FileSecurity)security);
     }
 
     private static void CreateDirectoryLink(string link, string target)
@@ -536,6 +709,23 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     }
 
     private sealed class SimulatedCrashException : Exception;
+
+    private sealed class StubVolumeCapabilityReader(
+        ManagedProfileVolumeCapabilities capabilities,
+        bool throwOnRead = false) :
+        IManagedProfileVolumeCapabilityReader
+    {
+        public int Calls { get; private set; }
+        public bool ReceivedValidPinnedHandle { get; private set; }
+
+        public ManagedProfileVolumeCapabilities Read(SafeFileHandle pinnedVolumeRoot, string driveRoot)
+        {
+            Calls++;
+            ReceivedValidPinnedHandle = !pinnedVolumeRoot.IsInvalid && !pinnedVolumeRoot.IsClosed;
+            if (throwOnRead) throw new IOException("Simulated volume capability failure.");
+            return capabilities;
+        }
+    }
 
     private string ProfilePath(Guid accountId, BrowserFamily family) => Path.Combine(
         Path.GetFullPath(root),
