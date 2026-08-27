@@ -2,4 +2,5 @@
 **/bin/
 **/obj/
 **/artifacts/
+**/.artifacts/
 **/__pycache__/

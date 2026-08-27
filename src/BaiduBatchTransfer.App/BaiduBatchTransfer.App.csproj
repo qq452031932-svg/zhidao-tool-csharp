@@ -6,6 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\artifacts\managed-browser-helper</ManagedBrowserHelperPackageDirectory>
+    <ManagedBrowserHelperManifestSource>$(MSBuildProjectDirectory)\..\..\tools\managed_browser_helper\helper-manifest.json</ManagedBrowserHelperManifestSource>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,5 +22,36 @@
     <ProjectReference Include="..\BaiduBatchTransfer.Infrastructure\BaiduBatchTransfer.Infrastructure.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.BaiduAdapter\BaiduBatchTransfer.BaiduAdapter.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(ManagedBrowserHelperManifestSource)"
+                      LogicalName="BaiduBatchTransfer.ManagedBrowserHelper.helper-manifest.json" />
+    <Content Include="$(ManagedBrowserHelperPackageDirectory)\**\*"
+             Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
+             Link="managed-browser-helper\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="ValidateManagedBrowserHelperReleasePackage"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(Configuration)' == 'Release'">
+    <Error Condition="!Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
+           Text="A Release build requires a deterministic managed-browser-helper package. Run scripts/build_managed_browser_helper.ps1 and set ManagedBrowserHelperPackageDirectory if needed." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\python.exe')"
+           Text="The managed-browser-helper Release package is missing python.exe." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\python314.dll')"
+           Text="The managed-browser-helper Release package is missing python314.dll." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\main.py')"
+           Text="The managed-browser-helper Release package is missing main.py." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\protocol.py')"
+           Text="The managed-browser-helper Release package is missing protocol.py." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\requirements.lock')"
+           Text="The managed-browser-helper Release package is missing requirements.lock." />
+    <Error Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json') and !Exists('$(ManagedBrowserHelperPackageDirectory)\THIRD_PARTY_NOTICES.txt')"
+           Text="The managed-browser-helper Release package is missing THIRD_PARTY_NOTICES.txt." />
+    <Exec Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
+          Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -Command &quot;if ([Convert]::ToBase64String([IO.File]::ReadAllBytes('$(ManagedBrowserHelperManifestSource)')) -ne [Convert]::ToBase64String([IO.File]::ReadAllBytes('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json'))) { throw 'Managed browser helper manifest does not match the embedded manifest source.' }&quot;" />
+  </Target>
 
 </Project>
