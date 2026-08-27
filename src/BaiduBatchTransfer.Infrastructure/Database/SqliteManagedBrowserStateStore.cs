@@ -1067,8 +1067,20 @@ public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
         command.Transaction = transaction;
         command.CommandText = """
             SELECT EXISTS(
-              SELECT 1 FROM ManagedBrowserRetentions retention
-              WHERE retention.InstallationId=$installation AND retention.SessionId=$session
+              SELECT 1 FROM TransferOperations operation
+              WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                AND operation.InstallationId=$installation AND operation.SessionId=$session
+                AND operation.Status NOT IN ('Succeeded','Failed','Cancelled')
+              UNION ALL
+              SELECT 1 FROM ShareOperations operation
+              WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                AND operation.InstallationId=$installation AND operation.SessionId=$session
+                AND operation.Status NOT IN ('Succeeded','Failed','ReusedExisting','Cancelled')
+              UNION ALL
+              SELECT 1 FROM StandaloneShareOperations operation
+              WHERE operation.ExecutionEngineVersion='ManagedChromium-v1'
+                AND operation.InstallationId=$installation AND operation.SessionId=$session
+                AND operation.Status NOT IN ('Succeeded','Failed','Cancelled')
               UNION ALL
               SELECT 1 FROM WebAutomationAttempts attempt
               WHERE attempt.ExecutionEngineVersion='ManagedChromium-v1'

@@ -906,6 +906,90 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
             ("$operation", operationId.ToString("D"))));
     }
 
+    [Fact]
+    public async Task TerminalManagedHistoryAndItsRetentionsDoNotBlockFamilySwitchOrRewriteSnapshots()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var ownerIds = await SeedTerminalFamilySwitchHistoryAsync(fixture);
+
+        var result = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.Applied, result.Status);
+        Assert.Equal(3, await ScalarLongAsync(fixture.Factory, """
+            SELECT COUNT(*) FROM WebAutomationAttempts
+            WHERE OperationId IN ($transfer,$share,$standalone)
+              AND State='DefinitelyNotSubmitted'
+              AND BrowserFamily=$family AND ProfileId=$profile
+              AND InstallationId=$installation AND SessionId=$session;
+            """,
+            ("$transfer", ownerIds.Transfer.ToString("D")),
+            ("$share", ownerIds.Share.ToString("D")),
+            ("$standalone", ownerIds.Standalone.ToString("D")),
+            ("$family", fixture.OldSession.Identity.BrowserFamily.ToString()),
+            ("$profile", fixture.OldSession.Identity.ProfileId),
+            ("$installation", fixture.OldInstallation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.OldSession.Identity.SessionId.ToString("D"))));
+        Assert.Equal(3, await ScalarLongAsync(fixture.Factory, """
+            SELECT
+              (SELECT COUNT(*) FROM TransferOperations WHERE Id=$transfer AND Status='Succeeded'
+                AND BrowserFamily=$family AND ProfileId=$profile
+                AND InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM ShareOperations WHERE Id=$share AND Status='Succeeded'
+                AND BrowserFamily=$family AND ProfileId=$profile
+                AND InstallationId=$installation AND SessionId=$session)
+              +
+              (SELECT COUNT(*) FROM StandaloneShareOperations WHERE Id=$standalone AND Status='Succeeded'
+                AND BrowserFamily=$family AND ProfileId=$profile
+                AND InstallationId=$installation AND SessionId=$session);
+            """,
+            ("$transfer", ownerIds.Transfer.ToString("D")),
+            ("$share", ownerIds.Share.ToString("D")),
+            ("$standalone", ownerIds.Standalone.ToString("D")),
+            ("$family", fixture.OldSession.Identity.BrowserFamily.ToString()),
+            ("$profile", fixture.OldSession.Identity.ProfileId),
+            ("$installation", fixture.OldInstallation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.OldSession.Identity.SessionId.ToString("D"))));
+        Assert.Equal(6, await ScalarLongAsync(fixture.Factory, """
+            SELECT COUNT(*) FROM ManagedBrowserRetentions
+            WHERE InstallationId=$installation AND SessionId=$session;
+            """,
+            ("$installation", fixture.OldInstallation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.OldSession.Identity.SessionId.ToString("D"))));
+    }
+
+    [Theory]
+    [InlineData(FamilySwitchOwnerKind.Transfer)]
+    [InlineData(FamilySwitchOwnerKind.Share)]
+    [InlineData(FamilySwitchOwnerKind.StandaloneShare)]
+    [InlineData(FamilySwitchOwnerKind.Attempt)]
+    public async Task FamilySwitchCannotBypassNonTerminalOwnerFenceAfterRetentionRelease(
+        FamilySwitchOwnerKind ownerKind)
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        var retentions = await SeedNonTerminalFamilySwitchOwnerAsync(fixture, ownerKind);
+        foreach (var retention in retentions)
+            await fixture.Store.ReleaseRetentionAsync(retention, default);
+        Assert.Equal(0, await ScalarLongAsync(fixture.Factory, """
+            SELECT COUNT(*) FROM ManagedBrowserRetentions
+            WHERE InstallationId=$installation AND SessionId=$session;
+            """,
+            ("$installation", fixture.OldInstallation.Identity.InstallationId.ToString("D")),
+            ("$session", fixture.OldSession.Identity.SessionId.ToString("D"))));
+
+        var result = await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+
+        Assert.Equal(ManagedBrowserFamilySwitchTransitionStatus.ActiveWorkBlocked, result.Status);
+        Assert.Null(await fixture.Store.LoadInstallationAsync(
+            fixture.Request.TargetInstallation.InstallationId, default));
+        Assert.Null(await fixture.Store.LoadSessionAsync(
+            fixture.Request.TargetSession.SessionId, default));
+        AssertInstallationEqual(fixture.OldInstallation,
+            await fixture.Store.LoadInstallationAsync(fixture.OldInstallation.Identity.InstallationId, default));
+        AssertSessionEqual(fixture.OldSession,
+            await fixture.Store.LoadSessionAsync(fixture.OldSession.Identity.SessionId, default));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
@@ -989,6 +1073,169 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         return new FamilySwitchFixture(
             factory, store, accountId, stableUid, oldInstallation, oldSession, request);
     }
+
+    private static async Task<FamilySwitchOwnerIds> SeedTerminalFamilySwitchHistoryAsync(
+        FamilySwitchFixture fixture)
+    {
+        var ids = FamilySwitchOwnerIds.Create();
+        await SeedFamilySwitchOwnerGraphAsync(fixture, ids, "terminal");
+        await ExecuteAsync(fixture.Factory, """
+            INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+              NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+              OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,
+              TargetSlotState,DailyCountedAt,SubmitStartedAt,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Succeeded','NewTransfer',2,
+              'terminal-transfer','{}','request','[]','ResultReceived','Fulfilled',$now,$now,$now,$now,
+              'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+              Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($share,$transfer,$resource,$batch,$account,1,'Succeeded','terminal-items','terminal-settings',2,
+              'Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+              ParentPath,ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES($standalone,$standaloneBatch,$account,1,'terminal','File','/','terminal-item',2,'Succeeded',
+              'Completed','Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+            INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+              Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES
+              ($transfer,$account,1,'Transfer','DefinitelyNotSubmitted',0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session),
+              ($share,$account,1,'TransferShare','DefinitelyNotSubmitted',0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session),
+              ($standalone,$account,1,'StandaloneShare','DefinitelyNotSubmitted',0,$now,$now,
+                'ManagedChromium-v1',$family,$profile,$installation,$session);
+            """, FamilySwitchOwnerParameters(fixture, ids));
+        return ids;
+    }
+
+    private static async Task<IReadOnlyList<ManagedBrowserRetentionReference>>
+        SeedNonTerminalFamilySwitchOwnerAsync(
+            FamilySwitchFixture fixture,
+            FamilySwitchOwnerKind ownerKind)
+    {
+        var ids = FamilySwitchOwnerIds.Create();
+        await SeedFamilySwitchOwnerGraphAsync(fixture, ids, $"active-{ownerKind}");
+        var sql = ownerKind switch
+        {
+            FamilySwitchOwnerKind.Transfer => """
+                INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+                  NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
+                  OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Waiting',0,
+                  'active-transfer','NotPrepared','Unoccupied',$now,$now,
+                  'ManagedChromium-v1',$family,$profile,$installation,$session);
+                """,
+            FamilySwitchOwnerKind.Share => """
+                INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+                  NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+                  OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,DailyCountedAt,
+                  SubmitStartedAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Succeeded','NewTransfer',1,
+                  'share-parent','{}','ResultReceived','Fulfilled',$now,$now,$now,$now,
+                  'ManagedChromium-v1',$family,$profile,$installation,$session);
+                INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
+                  Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($share,$transfer,$resource,$batch,$account,1,'WaitingShare','active-share','terminal-settings',1,
+                  'Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+                """,
+            FamilySwitchOwnerKind.StandaloneShare => """
+                INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+                  ParentPath,ExactItemSetFingerprint,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($standalone,$standaloneBatch,$account,1,'active','File','/','active-item','Queued',
+                  'NotStarted','Unknown',$now,$now,'ManagedChromium-v1',$family,$profile,$installation,$session);
+                """,
+            FamilySwitchOwnerKind.Attempt => """
+                INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
+                  NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,
+                  OperationFingerprint,ConfirmationDescriptorJson,SubmitState,TargetSlotState,DailyCountedAt,
+                  SubmitStartedAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($transfer,$resource,$batch,1,1,'/','/','',$account,'Fixture','Succeeded','NewTransfer',2,
+                  'attempt-parent','{}','ResultReceived','Fulfilled',$now,$now,$now,$now,
+                  'ManagedChromium-v1',$family,$profile,$installation,$session);
+                INSERT INTO WebAutomationAttempts(OperationId,AccountId,Generation,OwnerKind,State,
+                  Revision,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+                VALUES($transfer,$account,1,'Transfer','Preparing',0,$now,$now,
+                  'ManagedChromium-v1',$family,$profile,$installation,$session);
+                """,
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        };
+        await ExecuteAsync(fixture.Factory, sql, FamilySwitchOwnerParameters(fixture, ids));
+        var operationIds = ownerKind switch
+        {
+            FamilySwitchOwnerKind.Transfer => new[] { ids.Transfer },
+            FamilySwitchOwnerKind.Share => new[] { ids.Transfer, ids.Share },
+            FamilySwitchOwnerKind.StandaloneShare => new[] { ids.Standalone },
+            FamilySwitchOwnerKind.Attempt => new[] { ids.Transfer },
+            _ => throw new ArgumentOutOfRangeException(nameof(ownerKind)),
+        };
+        var retentions = operationIds.Select(id => new ManagedBrowserRetentionReference(
+            ManagedBrowserRetentionOwnerKind.Operation,
+            id,
+            fixture.OldInstallation.Identity.InstallationId,
+            fixture.OldSession.Identity.SessionId)).ToList();
+        if (ownerKind == FamilySwitchOwnerKind.Attempt)
+            retentions.Add(new ManagedBrowserRetentionReference(
+                ManagedBrowserRetentionOwnerKind.Attempt,
+                ids.Transfer,
+                fixture.OldInstallation.Identity.InstallationId,
+                fixture.OldSession.Identity.SessionId));
+        return retentions;
+    }
+
+    private static async Task SeedFamilySwitchOwnerGraphAsync(
+        FamilySwitchFixture fixture,
+        FamilySwitchOwnerIds ids,
+        string suffix)
+    {
+        await ExecuteAsync(fixture.Factory, """
+            INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
+              OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
+            VALUES($batch,$name,'Text','Distribution','TaskCount','ProportionalReduction',1,1,'/','None','Skip',
+              'Immediate','Queued',$now,1);
+            INSERT INTO ResourceItems(Id,BatchJobId,CandidateSequence,ShareUrl,NormalizedShareId,ExtractionCode,
+              FolderCreationModeOverride,GlobalValidityStatus,CandidateStatus,CreatedAt,UpdatedAt)
+            VALUES($resource,$batch,1,'https://pan.baidu.com/s/family-owner',$normalized,'1111','None','Valid','Expanded',$now,$now);
+            INSERT INTO BatchShareSettings(BatchJobId,IsPermanent,IsAccessUnlimited,ExtractionCodeMode,
+              FixedExtractionCode,ExistingSharePolicy,SettingsFingerprint,CreatedAt)
+            VALUES($batch,1,1,'Random',NULL,'Reuse','terminal-settings',$now);
+            INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,
+              PlannedTransferCount,PlannedShareCount,ShareEnabled)
+            VALUES($batch,$account,1,'family-owner',1,1,1);
+            INSERT INTO StandaloneShareBatches(Id,DraftFingerprint,ResultDirectoryReference,Status,
+              OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES($standaloneBatch,$draft,$result,'Active',1,0,$now,$now);
+            """,
+            FamilySwitchOwnerParameters(fixture, ids)
+                .Append(("$name", (object)$"family-{suffix}"))
+                .Append(("$normalized", $"family-{suffix}"))
+                .Append(("$draft", $"draft-{suffix}"))
+                .Append(("$result", $"result-{suffix}"))
+                .ToArray());
+    }
+
+    private static (string Name, object Value)[] FamilySwitchOwnerParameters(
+        FamilySwitchFixture fixture,
+        FamilySwitchOwnerIds ids) =>
+    [
+        ("$batch", ids.Batch.ToString("D")),
+        ("$resource", ids.Resource.ToString("D")),
+        ("$transfer", ids.Transfer.ToString("D")),
+        ("$share", ids.Share.ToString("D")),
+        ("$standaloneBatch", ids.StandaloneBatch.ToString("D")),
+        ("$standalone", ids.Standalone.ToString("D")),
+        ("$account", fixture.AccountId.ToString("D")),
+        ("$family", fixture.OldSession.Identity.BrowserFamily.ToString()),
+        ("$profile", fixture.OldSession.Identity.ProfileId),
+        ("$installation", fixture.OldInstallation.Identity.InstallationId.ToString("D")),
+        ("$session", fixture.OldSession.Identity.SessionId.ToString("D")),
+        ("$now", DateTimeOffset.UtcNow.ToString("O")),
+    ];
 
     private BrowserInstallationIdentity Installation(BrowserFamily family, string directoryName, string fileIdentity)
     {
@@ -1329,6 +1576,31 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         StoredBrowserInstallation OldInstallation,
         StoredManagedBrowserSession OldSession,
         ManagedBrowserFamilySwitchTransitionRequest Request);
+
+    public enum FamilySwitchOwnerKind
+    {
+        Transfer,
+        Share,
+        StandaloneShare,
+        Attempt,
+    }
+
+    private sealed record FamilySwitchOwnerIds(
+        Guid Batch,
+        Guid Resource,
+        Guid Transfer,
+        Guid Share,
+        Guid StandaloneBatch,
+        Guid Standalone)
+    {
+        public static FamilySwitchOwnerIds Create() => new(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Guid.NewGuid());
+    }
 
     private static async Task DeleteManagedOperationAndAttemptAsync(
         SqliteConnectionFactory factory,
