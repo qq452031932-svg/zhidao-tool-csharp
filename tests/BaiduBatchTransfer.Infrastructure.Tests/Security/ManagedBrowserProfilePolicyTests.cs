@@ -133,17 +133,20 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     }
 
     [Fact]
-    public async Task ConcurrentFirstCreationHasOneCompleteCanonicalWinner()
+    [SupportedOSPlatform("windows")]
+    public async Task ColdStartConcurrentFirstCreationHasOneCompleteCanonicalWinner()
     {
         var accountId = Guid.NewGuid();
         const int writerCount = 16;
         using var barrier = new Barrier(writerCount);
+        var diagnostics = new System.Collections.Concurrent.ConcurrentQueue<ManagedProfilePolicyDiagnostic>();
         var policies = Enumerable.Range(0, writerCount)
             .Select(_ => new FileSystemManagedBrowserProfilePolicy(root,
                 new ManagedBrowserProfilePolicyTestHooks
                 {
                     AfterTrustedNamespacePinned = () =>
                         Assert.True(barrier.SignalAndWait(TimeSpan.FromSeconds(15))),
+                    Diagnostic = diagnostics.Enqueue,
                 }))
             .ToArray();
 
@@ -153,6 +156,36 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Assert.All(results, result => Assert.Equal(ManagedBrowserProfileStatus.Ready, result.Status));
         Assert.Single(results.Select(result => result.Profile!.ProfileId).Distinct());
         Assert.Single(results.Select(result => result.Profile!.OwnershipId).Distinct());
+        Assert.Contains(diagnostics, item =>
+            item.Component == ManagedProfileDiagnosticComponent.NamespaceAncestor &&
+            item.Operation == ManagedProfileDiagnosticOperation.NativeOpenOrCreate);
+        Assert.Contains(diagnostics, item =>
+            item.Component == ManagedProfileDiagnosticComponent.AppDataRoot &&
+            item.Operation == ManagedProfileDiagnosticOperation.AclValidation);
+        Assert.DoesNotContain(diagnostics, item =>
+            item.Operation == ManagedProfileDiagnosticOperation.NativeOpenOrCreate &&
+            item.NativeStatus == unchecked((int)0xC0000022));
+        Assert.Single(diagnostics, item =>
+            item.Component == ManagedProfileDiagnosticComponent.ManagedRoot &&
+            item.Operation == ManagedProfileDiagnosticOperation.NativeOpenOrCreate &&
+            item.NativeStatus >= 0 && item.CreateInformation == 2);
+        Assert.Single(diagnostics, item =>
+            item.Component == ManagedProfileDiagnosticComponent.BrowserFamily &&
+            item.Operation == ManagedProfileDiagnosticOperation.NativeOpenOrCreate &&
+            item.NativeStatus >= 0 && item.CreateInformation == 2);
+        Assert.All(diagnostics.Where(item => item.Operation == ManagedProfileDiagnosticOperation.AclValidation), item =>
+        {
+            Assert.True(item.OwnerMatches);
+            Assert.True(item.DaclProtected);
+            Assert.Equal(1, item.AceCount);
+            Assert.Equal(1, item.AllowedAceCount);
+            Assert.Equal(0, item.UnexpectedAceCount);
+            Assert.Equal(0x001F01FFu, item.AccessMask);
+        });
+        var diagnosticText = string.Join(Environment.NewLine, diagnostics);
+        Assert.DoesNotContain(root, diagnosticText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(accountId.ToString("N"), diagnosticText, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(WindowsIdentity.GetCurrent().User!.Value, diagnosticText, StringComparison.Ordinal);
         var marker = await File.ReadAllTextAsync(Path.Combine(
             results[0].Profile!.CanonicalSourcePath,
             FileSystemManagedBrowserProfilePolicy.MarkerName));
