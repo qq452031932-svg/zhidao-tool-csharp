@@ -4,12 +4,66 @@ using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
 using System.Windows;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class AccountManagementViewModelTests
 {
     private static readonly DateTimeOffset Now = new(2026, 8, 20, 12, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public async Task ReloginOnlyUsesClickedActiveRowAndRefreshesPageWithoutRemovalEvent()
+    {
+        var id = Guid.NewGuid();
+        var operations = new FakeOperations { Pages = { [1] = new AccountPage(
+            [new(Guid.NewGuid(), "其他账号", "Active", true), new(id, "所选账号", "Active", true),
+             new(Guid.NewGuid(), "待清理", "Disabled", false, true)], 1, 100, 3) } };
+        var login = new FakeRelogin();
+        var vm = new AccountManagementViewModel(operations, new FakeConfirmation(), reloginLauncher: login);
+        var boundEvents = 0;
+        var removalEvents = 0;
+        vm.LoginBound += (_, _) => boundEvents++;
+        vm.RefreshRequested += (_, _) => removalEvents++;
+        await vm.LoadFirstPageAsync();
+        Assert.False(vm.Accounts[2].ReloginCommand.CanExecute(null));
+        await vm.Accounts[1].ReloginCommand.ExecuteAsync(null);
+        Assert.Equal(id, Assert.Single(login.AccountIds));
+        Assert.Equal(2, operations.PageRequests.Count);
+        Assert.Equal(1, boundEvents);
+        Assert.Equal(0, removalEvents);
+        Assert.Empty(operations.PreviewRequests);
+        Assert.False(vm.IsLifetimeEnded);
+    }
+
+    [Theory]
+    [InlineData(ManagedBrowserLoginStatus.AccountIdentityMismatch)]
+    [InlineData(ManagedBrowserLoginStatus.Cancelled)]
+    public async Task UnboundReloginDoesNotRefreshOrPretendRemoval(ManagedBrowserLoginStatus status)
+    {
+        var operations = new FakeOperations { Pages = { [1] = new AccountPage(
+            [new(Guid.NewGuid(), "账号", "Active", true)], 1, 100, 1) } };
+        var login = new FakeRelogin { Status = status };
+        var vm = new AccountManagementViewModel(operations, new FakeConfirmation(), reloginLauncher: login);
+        var boundEvents = 0;
+        vm.LoginBound += (_, _) => boundEvents++;
+        await vm.LoadFirstPageAsync();
+        await vm.Accounts[0].ReloginCommand.ExecuteAsync(null);
+        Assert.Equal(new ManagedBrowserLoginResult(status).SafeMessage, vm.StatusMessage);
+        Assert.Single(operations.PageRequests);
+        Assert.Equal(0, boundEvents);
+    }
+
+    private sealed class FakeRelogin : IAccountReloginLauncher
+    {
+        public List<Guid> AccountIds { get; } = [];
+        public ManagedBrowserLoginStatus Status { get; set; } = ManagedBrowserLoginStatus.Bound;
+        public Task<ManagedBrowserLoginResult> ReloginAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            AccountIds.Add(accountId);
+            return Task.FromResult(new ManagedBrowserLoginResult(Status));
+        }
+    }
 
     [Fact]
     public async Task FirstPageIsBoundedAndRowsExposeOnlySafeChineseDisplayFields()

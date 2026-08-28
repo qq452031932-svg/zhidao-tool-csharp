@@ -23,6 +23,7 @@ public partial class AccountManagementWindow : Window
         Closing += OnClosing;
         Closed += OnClosed;
         viewModel.RefreshRequested += OnRefreshRequested;
+        viewModel.LoginBound += OnLoginBound;
         viewModel.PropertyChanged += OnViewModelPropertyChanged;
     }
 
@@ -44,6 +45,9 @@ public partial class AccountManagementWindow : Window
         CloseWhenIdle();
     }
 
+    private void OnLoginBound(object? sender, EventArgs e) =>
+        RefreshResult = new AccountManagementRefreshResult(true, null);
+
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (allowClose) return;
@@ -61,6 +65,7 @@ public partial class AccountManagementWindow : Window
     {
         lifetime.Cancel();
         viewModel.RefreshRequested -= OnRefreshRequested;
+        viewModel.LoginBound -= OnLoginBound;
         viewModel.PropertyChanged -= OnViewModelPropertyChanged;
         viewModel.DetachLifetime();
         lifetime.Dispose();

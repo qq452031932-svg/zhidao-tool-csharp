@@ -38,7 +38,7 @@ internal interface IManagedBrowserLoginHelper : IAsyncDisposable
     Task<ManagedBrowserResponse> SendAsync(ManagedBrowserRequest request, CancellationToken token);
 }
 
-public sealed class ManagedBrowserLoginLauncher
+public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
 {
     private readonly BrowserSetupService setup;
     private readonly IManagedBrowserProfilePolicy profiles;

@@ -73,7 +73,15 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.False(capability.TransferValidated);
         Assert.False(capability.ShareValidated);
         Assert.IsType<UnavailableAdapterAvailability>(host.Services.GetRequiredService<IAdapterAvailability>());
-        Assert.IsType<BaiduAccountLoginLauncher>(host.Services.GetRequiredService<IAccountLoginLauncher>());
+        Assert.Equal("ManagedBrowserAccountLoginLauncher", host.Services.GetRequiredService<IAccountLoginLauncher>().GetType().Name);
+        Assert.Same(host.Services.GetRequiredService<IAccountLoginLauncher>(), host.Services.GetRequiredService<IAccountReloginLauncher>());
+        Assert.IsType<ManagedBrowserLoginWindowPresenter>(host.Services.GetRequiredService<IManagedBrowserLoginWindowPresenter>());
+        Assert.Same(host.Services.GetRequiredService<ManagedBrowserLoginLauncher>(), host.Services.GetRequiredService<IManagedBrowserLoginOperations>());
+        Assert.Same(host.Services.GetRequiredService<IDialogService>(), host.Services.GetRequiredService<IBrowserDirectoryPicker>());
+        Assert.IsType<SqliteBrowserDirectoryState>(host.Services.GetRequiredService<IBrowserDirectoryState>());
+        Assert.NotNull(host.Services.GetRequiredService<BrowserSetupService>());
+        Assert.NotNull(host.Services.GetRequiredService<RetiredBrowserFamilySlotCoordinator>());
+        Assert.IsType<BaiduLoginWindowPresenter>(host.Services.GetRequiredService<IBaiduLoginWindowPresenter>());
         Assert.IsType<LocalImportWorkflow>(host.Services.GetRequiredService<IImportWorkflow>());
         Assert.IsType<ExcelColumnMappingPresenter>(host.Services.GetRequiredService<IExcelColumnMappingPresenter>());
         Assert.NotNull(host.Services.GetRequiredService<OpenXmlWorkbookInspector>());

@@ -94,7 +94,7 @@ public sealed class MainWindowViewModel : ObservableObject
             }
             catch (Exception)
             {
-                StatusMessage = "账号登录已完成，但列表刷新失败，请重试刷新。";
+                StatusMessage = "账号登录窗口已关闭，但列表刷新失败，请重试刷新。";
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -123,15 +123,17 @@ public sealed class MainWindowViewModel : ObservableObject
         try
         {
             var result = await accountManagementLauncher.OpenAsync(cancellationToken).ConfigureAwait(true);
-            if (result.RefreshRequired &&
-                result.Status is AccountExitStatus.Removed or AccountExitStatus.CleanupPending)
+            if (result.RefreshRequired)
             {
                 try
                 {
                     await RefreshAccountsAsync(cancellationToken).ConfigureAwait(true);
-                    StatusMessage = result.Status == AccountExitStatus.Removed
-                        ? "账号已退出，账号列表已刷新。"
-                        : "账号已退出，本机登录数据待继续清理；账号列表已刷新。";
+                    StatusMessage = result.Status switch
+                    {
+                        AccountExitStatus.Removed => "账号已退出，账号列表已刷新。",
+                        AccountExitStatus.CleanupPending => "账号已退出，本机登录数据待继续清理；账号列表已刷新。",
+                        _ => "账号身份已核验，账号列表已刷新。",
+                    };
                 }
                 catch (Exception)
                 {

@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Core.Abstractions;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -153,7 +154,8 @@ public sealed class AccountManagementRowViewModel
     internal AccountManagementRowViewModel(
         AccountListItem account,
         Func<AccountManagementRowViewModel, CancellationToken, Task> action,
-        Func<bool> canExecute)
+        Func<bool> canExecute,
+        Func<AccountManagementRowViewModel, CancellationToken, Task>? relogin = null)
     {
         ArgumentNullException.ThrowIfNull(account);
         this.action = action ?? throw new ArgumentNullException(nameof(action));
@@ -166,17 +168,23 @@ public sealed class AccountManagementRowViewModel
         CanAct = IsCleanupPending || account.IsEnabled;
         ActionText = IsCleanupPending ? "继续清理" : CanAct ? "退出账号" : "不可操作";
         ActionCommand = new AsyncRelayCommand(ExecuteActionAsync, () => CanAct && this.canExecute());
+        CanRelogin = account.IsEnabled && account.Status == "Active" && !account.IsCleanupPending && relogin is not null;
+        ReloginCommand = new AsyncRelayCommand(token => relogin?.Invoke(this, token) ?? Task.CompletedTask,
+            () => CanRelogin && this.canExecute());
     }
 
     internal Guid AccountId { get; }
     internal bool IsCleanupPending { get; }
     internal bool CanAct { get; }
+    internal bool CanRelogin { get; }
     public string DisplayName { get; }
     public string LoginStatusText { get; }
     public string EnabledStateText { get; }
     public string ActionText { get; }
     public string ActionAutomationName => $"{ActionText}：{DisplayName}";
     public IAsyncRelayCommand ActionCommand { get; }
+    public IAsyncRelayCommand ReloginCommand { get; }
+    public string ReloginAutomationName => $"重新登录：{DisplayName}";
 
     public override string ToString() =>
         $"账号行：{DisplayName}，{LoginStatusText}，{EnabledStateText}，操作为{ActionText}";
@@ -184,7 +192,11 @@ public sealed class AccountManagementRowViewModel
     private Task ExecuteActionAsync(CancellationToken cancellationToken) =>
         action(this, cancellationToken);
 
-    internal void NotifyCanExecuteChanged() => ActionCommand.NotifyCanExecuteChanged();
+    internal void NotifyCanExecuteChanged()
+    {
+        ActionCommand.NotifyCanExecuteChanged();
+        ReloginCommand.NotifyCanExecuteChanged();
+    }
 
     private static string MapLoginStatus(string status) => status switch
     {
@@ -202,6 +214,7 @@ public sealed class AccountManagementViewModel : ObservableObject
     private readonly IAccountRemovalOperations operations;
     private readonly IAccountManagementConfirmation confirmation;
     private readonly TimeProvider timeProvider;
+    private readonly IAccountReloginLauncher? reloginLauncher;
     private CancellationToken lifetimeToken;
     private CancellationTokenRegistration lifetimeRegistration;
     private bool lifetimeAttached;
@@ -226,11 +239,13 @@ public sealed class AccountManagementViewModel : ObservableObject
     public AccountManagementViewModel(
         IAccountRemovalOperations operations,
         IAccountManagementConfirmation confirmation,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IAccountReloginLauncher? reloginLauncher = null)
     {
         this.operations = operations ?? throw new ArgumentNullException(nameof(operations));
         this.confirmation = confirmation ?? throw new ArgumentNullException(nameof(confirmation));
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.reloginLauncher = reloginLauncher;
         LoadFirstPageCommand = new AsyncRelayCommand(LoadFirstPageAsync, () => !IsBusy && !IsLifetimeEnded);
         LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanLoadNextPage && !IsBusy && !IsLifetimeEnded);
         LoadPreviousPageCommand = new AsyncRelayCommand(LoadPreviousPageAsync, () => PageNumber > 1 && !IsBusy && !IsLifetimeEnded);
@@ -240,6 +255,7 @@ public sealed class AccountManagementViewModel : ObservableObject
     }
 
     public event EventHandler<AccountManagementRefreshEventArgs>? RefreshRequested;
+    public event EventHandler? LoginBound;
 
     public ObservableCollection<AccountManagementRowViewModel> Accounts { get; } = [];
     public string WindowTitle => AccountManagementUiText.WindowTitle;
@@ -447,6 +463,30 @@ public sealed class AccountManagementViewModel : ObservableObject
         }
     }
 
+    private async Task ReloginAsync(AccountManagementRowViewModel row, CancellationToken token)
+    {
+        if (IsBusy || IsLifetimeEnded || !row.CanRelogin || !Accounts.Contains(row) || reloginLauncher is null) return;
+        InvalidatePreview(clearSelection: true);
+        SelectedAccount = row;
+        IsBusy = true;
+        using var linked = CreateOperationTokenSource(token);
+        var bound = false;
+        try
+        {
+            var result = await reloginLauncher.ReloginAsync(row.AccountId, linked.Token).ConfigureAwait(true);
+            StatusMessage = result.SafeMessage;
+            bound = result.Status == ManagedBrowserLoginStatus.Bound;
+            if (bound) LoginBound?.Invoke(this, EventArgs.Empty);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!IsLifetimeEnded) StatusMessage = new ManagedBrowserLoginResult(ManagedBrowserLoginStatus.Cancelled).SafeMessage;
+        }
+        catch (Exception) { StatusMessage = AccountManagementUiText.OperationFailed; }
+        finally { IsBusy = false; }
+        if (bound && !IsLifetimeEnded) await LoadPageAsync(PageNumber, token).ConfigureAwait(true);
+    }
+
     public async Task ConfirmRemovalAsync(CancellationToken cancellationToken = default)
     {
         if (!CanConfirm || selectedAccount is null || preview is null) return;
@@ -504,7 +544,8 @@ public sealed class AccountManagementViewModel : ObservableObject
                 Accounts.Add(new AccountManagementRowViewModel(
                     account,
                     (row, token) => BeginAccountActionAsync(row, token),
-                    () => !IsBusy && !IsLifetimeEnded));
+                    () => !IsBusy && !IsLifetimeEnded,
+                    reloginLauncher is null ? null : ReloginAsync));
             PageNumber = Math.Max(1, page.PageNumber);
             TotalCount = Math.Max(0, page.TotalCount);
             StatusMessage = Accounts.Count == 0 ? AccountManagementUiText.Empty : string.Empty;

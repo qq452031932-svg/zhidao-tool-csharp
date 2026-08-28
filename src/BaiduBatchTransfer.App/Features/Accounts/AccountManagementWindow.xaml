@@ -47,15 +47,20 @@
                     <DataGridTextColumn Header="账号名称" Binding="{Binding DisplayName}" Width="*" />
                     <DataGridTextColumn Header="登录状态" Binding="{Binding LoginStatusText}" Width="130" />
                     <DataGridTextColumn Header="启用状态" Binding="{Binding EnabledStateText}" Width="130" />
-                    <DataGridTemplateColumn Header="操作" Width="140">
+                    <DataGridTemplateColumn Header="操作" Width="240">
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
+                                <StackPanel Orientation="Horizontal">
+                                <Button Content="重新登录" Command="{Binding ReloginCommand}"
+                                        Margin="0,0,8,0"
+                                        automation:AutomationProperties.Name="{Binding ReloginAutomationName}" />
                                 <Button Content="{Binding ActionText}"
                                         Command="{Binding ActionCommand}"
                                         IsTabStop="True"
                                         ToolTip="删除专用浏览器登录数据前会再次要求确认"
                                         automation:AutomationProperties.Name="{Binding ActionAutomationName}"
                                         automation:AutomationProperties.HelpText="删除专用浏览器登录数据前会再次要求确认" />
+                                </StackPanel>
                             </DataTemplate>
                         </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>

@@ -10,6 +10,17 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class MainWindowViewModelTests
 {
     [Fact]
+    public async Task ManagedReloginRefreshDoesNotPretendTheAccountWasRemoved()
+    {
+        var management = new FakeManagementLauncher { Result = new AccountManagementRefreshResult(true, null) };
+        var refreshes = 0;
+        var vm = new MainWindowViewModel(new object(), new object(), new FakeLoginLauncher(), management,
+            (apply, _) => { refreshes++; apply(2); return Task.CompletedTask; });
+        await vm.OpenAccountManagementAsync();
+        Assert.Equal(1, refreshes);
+        Assert.Equal("账号身份已核验，账号列表已刷新。", vm.StatusMessage);
+    }
+    [Fact]
     public void ShellExposesOnlyTransferAndShareWorkspaces()
     {
         var login = new FakeLoginLauncher();
@@ -211,7 +222,7 @@ public sealed class MainWindowViewModelTests
 
         await vm.OpenAccountLoginAsync();
 
-        Assert.Equal("账号登录已完成，但列表刷新失败，请重试刷新。", vm.StatusMessage);
+        Assert.Equal("账号登录窗口已关闭，但列表刷新失败，请重试刷新。", vm.StatusMessage);
         Assert.Equal(1, login.OpenCalls);
         Assert.True(vm.RefreshAccountsCommand.CanExecute(null));
 

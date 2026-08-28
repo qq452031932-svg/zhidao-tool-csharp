@@ -263,6 +263,30 @@ public static class AppBootstrap
         services.AddSingleton<ProcessBrowserSelectionActivityRegistry>();
         services.AddSingleton<IBrowserSelectionActivityRegistry>(sp =>
             sp.GetRequiredService<ProcessBrowserSelectionActivityRegistry>());
+        services.AddSingleton<IBrowserDirectoryState, SqliteBrowserDirectoryState>();
+        services.AddSingleton<IBrowserDirectoryFileSystem, BrowserDirectoryFileSystem>();
+        services.AddSingleton<IBrowserExecutableVerifier, BrowserExecutableVerifier>();
+        services.AddSingleton<BrowserSetupService>();
+        services.AddSingleton<IManagedBrowserLoginStore>(sp => sp.GetRequiredService<SqliteManagedBrowserStateStore>());
+        services.AddSingleton<ManagedBrowserAccountService>();
+        services.AddSingleton(sp => new RetiredBrowserFamilySlotCoordinator(
+            sp.GetRequiredService<IManagedBrowserStateStore>(),
+            sp.GetRequiredService<ManagedChromiumProcessManager>(),
+            sp.GetRequiredService<IManagedBrowserProfilePolicy>(),
+            sp.GetRequiredService<IManagedBrowserProfileStore>(),
+            sp.GetRequiredService<RemoveAccountService>(), paths.RootDirectory));
+        services.AddSingleton(sp => new ManagedBrowserLoginLauncher(
+            sp.GetRequiredService<BrowserSetupService>(),
+            sp.GetRequiredService<IManagedBrowserProfilePolicy>(),
+            sp.GetRequiredService<ManagedChromiumProcessManager>(),
+            sp.GetRequiredService<ManagedBrowserLifecycleCoordinator>(),
+            sp.GetRequiredService<IManagedBrowserStateStore>(),
+            sp.GetRequiredService<IUnitOfWorkFactory>(),
+            sp.GetRequiredService<ManagedBrowserAccountService>(),
+            sp.GetRequiredService<ManagedBrowserFamilySwitchCoordinator>(),
+            sp.GetRequiredService<RetiredBrowserFamilySlotCoordinator>(),
+            Path.Combine(AppContext.BaseDirectory, "managed-browser-helper")));
+        services.AddSingleton<IManagedBrowserLoginOperations>(sp => sp.GetRequiredService<ManagedBrowserLoginLauncher>());
         services.AddSingleton(_ => new FileSystemAccountProfilePathPolicy(paths.ProfileDirectory));
         services.AddSingleton<IAccountProfilePathPolicy>(sp =>
             sp.GetRequiredService<FileSystemAccountProfilePathPolicy>());
@@ -334,7 +358,19 @@ public static class AppBootstrap
         services.AddSingleton<LoginProfileBootstrapper>();
         services.AddSingleton<AddAccountService>();
         services.AddSingleton<IBaiduLoginWindowPresenter, BaiduLoginWindowPresenter>();
-        services.AddSingleton<IAccountLoginLauncher, BaiduAccountLoginLauncher>();
+        services.AddSingleton<IManagedBrowserLoginWindowPresenter>(sp => new ManagedBrowserLoginWindowPresenter(
+            sp.GetRequiredService<IManagedBrowserLoginOperations>(),
+            sp.GetRequiredService<IUiDispatcher>(),
+            vm => new ManagedBrowserLoginWindow(vm)
+            {
+                Owner = System.Windows.Application.Current?.Windows.OfType<System.Windows.Window>().FirstOrDefault(window => window.IsActive)
+                    ?? System.Windows.Application.Current?.MainWindow,
+            },
+            async (accountId, token) => (await sp.GetRequiredService<ManagedBrowserLifecycleCoordinator>()
+                .LoadPersistedAsync(accountId, token).ConfigureAwait(false))?.BrowserFamily));
+        services.AddSingleton<ManagedBrowserAccountLoginLauncher>();
+        services.AddSingleton<IAccountLoginLauncher>(sp => sp.GetRequiredService<ManagedBrowserAccountLoginLauncher>());
+        services.AddSingleton<IAccountReloginLauncher>(sp => sp.GetRequiredService<ManagedBrowserAccountLoginLauncher>());
 
         services.AddSingleton<SqliteAccountRemovalStore>();
         services.AddSingleton<IAccountRemovalStore>(sp =>
@@ -356,7 +392,8 @@ public static class AppBootstrap
         services.AddTransient<Func<IAccountManagementConfirmation, AccountManagementWindow>>(sp =>
             confirmation => new AccountManagementWindow(new AccountManagementViewModel(
                 sp.GetRequiredService<IAccountRemovalOperations>(),
-                confirmation)));
+                confirmation,
+                reloginLauncher: sp.GetRequiredService<IAccountReloginLauncher>())));
         services.AddSingleton<IAccountManagementWindowPresenter, AccountManagementWindowPresenter>();
         services.AddSingleton<IAccountManagementLauncher, AccountManagementLauncher>();
 
@@ -405,7 +442,9 @@ public static class AppBootstrap
         services.AddSingleton<IExcelFileDialog, WpfExcelFileDialog>();
         services.AddSingleton<IFolderDialog, WpfFolderDialog>();
         services.AddSingleton<IResultSaveDialog, ResultSaveDialog>();
-        services.AddSingleton<IDialogService, DialogService>();
+        services.AddSingleton<DialogService>();
+        services.AddSingleton<IDialogService>(sp => sp.GetRequiredService<DialogService>());
+        services.AddSingleton<IBrowserDirectoryPicker>(sp => sp.GetRequiredService<DialogService>());
         services.AddSingleton<DurableTransferResultDestinationSink>();
         services.AddSingleton<ITransferResultDestinationSink>(sp =>
             sp.GetRequiredService<DurableTransferResultDestinationSink>());

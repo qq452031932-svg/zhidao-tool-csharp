@@ -1,0 +1,24 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.ManagedBrowser.ManagedBrowserLoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="{Binding Title}" Width="650" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner">
+    <StackPanel Margin="24">
+        <TextBlock Text="{Binding Title}" FontSize="22" FontWeight="SemiBold" />
+        <TextBlock Text="{Binding Instructions}" TextWrapping="Wrap" Margin="0,16,0,12" />
+        <TextBlock Text="{Binding CapabilityNotice}" TextWrapping="Wrap" Foreground="#B54708" Margin="0,0,0,16" />
+        <TextBlock Text="浏览器类型（目录中同时存在 Chrome 和 Edge 时必须选择）" TextWrapping="Wrap" />
+        <ComboBox ItemsSource="{Binding BrowserFamilies}" DisplayMemberPath="DisplayName"
+                  SelectedValuePath="Family" SelectedValue="{Binding SelectedFamily}"
+                  IsEnabled="{Binding CanEdit}" Margin="0,8,0,16" />
+        <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" MinHeight="48"
+                   AutomationProperties.LiveSetting="Polite" />
+        <TextBlock Text="取消等待或关闭此窗口不会关闭已打开的专用浏览器。" TextWrapping="Wrap" Margin="0,8,0,16" />
+        <WrapPanel HorizontalAlignment="Right">
+            <Button Content="重新选择目录" Command="{Binding ReselectDirectoryCommand}" Margin="0,0,8,8" Padding="10,6" />
+            <Button Content="打开 / 检查登录" Command="{Binding CheckLoginCommand}" Margin="0,0,8,8" Padding="10,6" />
+            <Button Content="取消等待" Command="{Binding CancelPendingCommand}" Margin="0,0,8,8" Padding="10,6" />
+            <Button Content="关闭" Click="OnCloseClick" Margin="0,0,0,8" Padding="10,6" />
+        </WrapPanel>
+    </StackPanel>
+</Window>

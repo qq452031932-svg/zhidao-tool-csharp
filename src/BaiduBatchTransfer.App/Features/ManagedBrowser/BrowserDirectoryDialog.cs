@@ -21,7 +21,8 @@ public sealed class BrowserDirectoryDialog : IBrowserDirectoryDialog
             Title = "选择 Chrome 或 Edge 安装目录",
             Multiselect = false,
         };
-        var owner = System.Windows.Application.Current?.MainWindow;
+        var owner = System.Windows.Application.Current?.Windows.OfType<System.Windows.Window>()
+            .FirstOrDefault(window => window.IsActive) ?? System.Windows.Application.Current?.MainWindow;
         var accepted = owner is null ? dialog.ShowDialog() : dialog.ShowDialog(owner);
         return accepted == true ? dialog.FolderName : null;
     }
