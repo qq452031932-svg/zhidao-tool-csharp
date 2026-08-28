@@ -781,6 +781,14 @@ git commit -m "feat: launch app-owned local browser"
 
 ### Task 11: Add browser setup/login entry without switching adapters
 
+**Implementation checkpoints (2026-08-28):** Integration inspection found no production `IBrowserDirectoryState` implementation and a legacy-only Cookie-dependent account-add service. Keep the approved Task 11 requirements below, but implement and review these cohesive checkpoints in order:
+
+- [x] **11A:** Shared-database migration 18 for the browser-directory prompt state, exact intent/revision persistence, and atomic Cookie-free add/relogin binding with real SQLite tests. Committed `dffd5f9`; independent spec/quality reviews passed. Main verification: Debug App 129/129, Release Infrastructure 74/74, Release solution build/gate passed; Release App 126/127 with one unchanged DEBUG-only acceptance test expectation, documented in the handoff. Production login UI, adapters, and lifecycle remain unchanged at this checkpoint.
+- [ ] **11B:** Connect the existing helper and managed process owner; handle pending-target browser ownership, typed identity outcomes, account removal, and family switching.
+- [ ] **11C:** Wire directory selection/reselection and explicit add-versus-selected-account login into the UI/DI, then run composition and behavior tests.
+
+Real logged-in identity recognition is not yet accepted: Task 7's helper currently targets fixture attributes and exact root routes. Do not equate mocked identity tests or the user-confirmed logged-out landing page with real account recognition. See `docs/testing/managed-browser-task11-handoff.md`.
+
 **Files:**
 - Create: `src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserLoginLauncher.cs`
 - Modify: `src/BaiduBatchTransfer.App/AppBootstrap.cs`
