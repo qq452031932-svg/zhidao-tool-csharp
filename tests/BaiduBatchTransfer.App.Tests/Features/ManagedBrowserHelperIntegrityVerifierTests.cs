@@ -1,5 +1,7 @@
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
+using Microsoft.Win32.SafeHandles;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Text;
@@ -471,6 +473,153 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         Assert.Empty(Directory.EnumerateFileSystemEntries(snapshotParent));
         Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
     }
+
+    [Theory]
+    [InlineData("main.py")]
+    [InlineData("python.exe")]
+    public async Task CopiedPayloadCannotAcquireAWriterBeforeAclSeal(string fileName)
+    {
+        using var fixture = HelperFixture.Create();
+        FileStream? writer = null;
+        IOException? rejection = null;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes,
+            snapshotFileCopiedObserver: (relative, destination) =>
+            {
+                if (relative != fileName) return;
+                try { writer = new FileStream(destination, FileMode.Open, FileAccess.Write,
+                    FileShare.Read | FileShare.Write); }
+                catch (IOException exception) { rejection = exception; }
+            });
+        using var bundle = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        var writerWasOpened = writer is not null;
+        if (writer is not null)
+        {
+            writer.WriteByte(0x42);
+            writer.Flush(flushToDisk: true);
+            writer.Dispose();
+        }
+
+        Assert.False(writerWasOpened);
+        Assert.NotNull(rejection);
+        Assert.Equal(32, rejection.HResult & 0xffff);
+    }
+
+    [Fact]
+    public async Task PayloadDirectoryCannotAcquireAWriterBeforeAclSeal()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-directory-writer-{Guid.NewGuid():N}", "snapshots");
+        SafeFileHandle? writer = null;
+        var error = 0;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, snapshotParent: snapshotParent,
+            snapshotCreationObserver: phase =>
+            {
+                if (phase != ManagedBrowserHelperSnapshotPhase.ContainerCreated) return;
+                var container = Assert.Single(Directory.EnumerateDirectories(snapshotParent));
+                writer = OpenDirectoryWriter(Path.Combine(container, "payload"));
+                error = Marshal.GetLastWin32Error();
+            });
+        using var bundle = await verifier.VerifyAsync(fixture.Root, CancellationToken.None);
+        Assert.NotNull(writer);
+        var rejected = writer.IsInvalid;
+        writer.Dispose();
+        bundle.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+
+        Assert.True(rejected);
+        Assert.Equal(32, error);
+    }
+
+    [Fact]
+    public async Task WriterRacingCopyHandleHandoffPreventsBundleReturn()
+    {
+        using var fixture = HelperFixture.Create();
+        var snapshotParent = Path.Combine(Path.GetTempPath(),
+            $"managed-helper-handoff-writer-{Guid.NewGuid():N}", "snapshots");
+        FileStream? writer = null;
+        VerifiedManagedBrowserHelperBundle? bundle = null;
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            fixture.ManifestBytes, orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent,
+            snapshotCopyHandoffObserver: destination =>
+            {
+                if (Path.GetFileName(destination) == "main.py")
+                    writer = new FileStream(destination, FileMode.Open, FileAccess.Write,
+                        FileShare.Read | FileShare.Write);
+            });
+        var exception = await Record.ExceptionAsync(async () =>
+            bundle = await verifier.VerifyAsync(fixture.Root, CancellationToken.None));
+        var incomplete = Directory.EnumerateDirectories(snapshotParent).SingleOrDefault();
+        writer?.Dispose();
+        bundle?.Dispose();
+
+        Assert.NotNull(writer);
+        Assert.IsType<ManagedBrowserHelperIntegrityException>(exception);
+        Assert.Null(bundle);
+        Assert.NotNull(incomplete);
+        using var recovered = await new ManagedBrowserHelperIntegrityVerifier(
+                fixture.ManifestBytes, orphanMinimumAge: TimeSpan.Zero, snapshotParent: snapshotParent)
+            .VerifyAsync(fixture.Root, CancellationToken.None);
+        Assert.False(Directory.Exists(incomplete));
+        recovered.Dispose();
+        Directory.Delete(Path.GetDirectoryName(snapshotParent)!, recursive: true);
+    }
+
+    [Fact]
+    public void CreateRelativeRootAclFailureReleasesOpenedHandleImmediately()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"managed-helper-acl-owner-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        using var parent = PinnedHelperEntry.Open(root);
+        using var process = Process.GetCurrentProcess();
+        var handlesBefore = process.HandleCount;
+        Assert.Throws<IOException>(() => PinnedHelperTree.CreateRelative(
+            parent, "payload", ManagedBrowserHelperIntegrityLimits.Default, identity.User!,
+            beforeRootAcl: () => throw new IOException("injected ACL failure")));
+        process.Refresh();
+        var handleDelta = process.HandleCount - handlesBefore;
+        var payload = Path.Combine(root, "payload");
+        var deletion = Record.Exception(() => Directory.Delete(payload));
+        parent.Dispose();
+        if (deletion is null) Directory.Delete(root);
+
+        Assert.Null(deletion);
+        Assert.InRange(handleDelta, -2, 2);
+    }
+
+    [Fact]
+    public void CaptureRootTypeRaceReleasesOpenedHandleImmediately()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"managed-helper-type-owner-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        using var process = Process.GetCurrentProcess();
+        var handlesBefore = process.HandleCount;
+        Assert.Throws<UnsafeHelperFilesystemException>(() => PinnedHelperTree.Capture(
+            root, ManagedBrowserHelperIntegrityLimits.Default, CancellationToken.None,
+            beforeRootOpen: () =>
+            {
+                Directory.Delete(root);
+                File.WriteAllText(root, "replacement");
+            }));
+        process.Refresh();
+        var handleDelta = process.HandleCount - handlesBefore;
+        var deletion = Record.Exception(() => File.Delete(root));
+
+        Assert.Null(deletion);
+        Assert.InRange(handleDelta, -2, 2);
+    }
+
+    private static SafeFileHandle OpenDirectoryWriter(string path) => CreateFileW(
+        path, 0x40000000, FileShare.Read | FileShare.Write | FileShare.Delete,
+        IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string path, uint desiredAccess, FileShare shareMode, IntPtr securityAttributes,
+        uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
 
     [Fact]
     public async Task PayloadRootReplacementDuringCopyDoesNotWriteOutsideOwnedContainer()

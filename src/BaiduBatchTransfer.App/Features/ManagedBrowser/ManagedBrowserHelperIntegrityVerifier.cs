@@ -223,6 +223,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
     private readonly Action<string, string>? snapshotFileCopiedObserver;
     private readonly Action? cleanupAttemptObserver;
     private readonly Action<ManagedBrowserHelperCleanupPhase>? snapshotCleanupObserver;
+    private readonly Action<string>? snapshotCopyHandoffObserver;
 
     public ManagedBrowserHelperIntegrityVerifier()
         : this(ReadEmbeddedManifest(), ManagedBrowserHelperIntegrityLimits.Default,
@@ -239,7 +240,8 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         Action<ManagedBrowserHelperSnapshotPhase>? snapshotCreationObserver = null,
         Action<string, string>? snapshotFileCopiedObserver = null,
         Action? cleanupAttemptObserver = null,
-        Action<ManagedBrowserHelperCleanupPhase>? snapshotCleanupObserver = null)
+        Action<ManagedBrowserHelperCleanupPhase>? snapshotCleanupObserver = null,
+        Action<string>? snapshotCopyHandoffObserver = null)
     {
         ArgumentNullException.ThrowIfNull(expectedManifestBytes);
         if (expectedManifestBytes.Length is < 1 or > MaximumManifestBytes)
@@ -254,6 +256,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         this.snapshotFileCopiedObserver = snapshotFileCopiedObserver;
         this.cleanupAttemptObserver = cleanupAttemptObserver;
         this.snapshotCleanupObserver = snapshotCleanupObserver;
+        this.snapshotCopyHandoffObserver = snapshotCopyHandoffObserver;
         if (this.limits.MaximumTreeEntries < 1 || this.limits.MaximumTreeDepth < 1 ||
             this.limits.MaximumTreeBytes < 1)
             throw new ArgumentOutOfRangeException(nameof(limits));
@@ -301,7 +304,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
             snapshot = VerifiedHelperSnapshotLease.Create(
                 snapshotParent, sourceTree, manifest.BuildIdentity, limits, timeProvider.GetUtcNow(),
                 cancellationToken, snapshotCreationObserver, snapshotFileCopiedObserver,
-                cleanupAttemptObserver, snapshotCleanupObserver);
+                cleanupAttemptObserver, snapshotCleanupObserver, snapshotCopyHandoffObserver);
             sourceTree.Dispose();
             sourceTree = null;
             VerifyPinnedTree(snapshot.Tree, manifest, cancellationToken);
@@ -594,7 +597,8 @@ internal sealed class PinnedHelperTree : IDisposable
         CancellationToken cancellationToken,
         bool deleteCapable = false,
         FileShare? shareMode = null,
-        bool writeDac = false)
+        bool writeDac = false,
+        Action? beforeRootOpen = null)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("Managed browser helper verification requires Windows.");
@@ -604,11 +608,12 @@ internal sealed class PinnedHelperTree : IDisposable
         var tree = new PinnedHelperTree(canonical, limits);
         try
         {
+            beforeRootOpen?.Invoke();
             var rootEntry = PinnedHelperEntry.Open(
                 canonical, deleteCapable, writeDac, shareMode);
+            tree.entries.Add(rootEntry);
             if (!rootEntry.IsDirectory)
                 throw new UnsafeHelperFilesystemException();
-            tree.entries.Add(rootEntry);
             tree.directories.Add(string.Empty, rootEntry);
             var pending = new Queue<(string Relative, string Full)>();
             pending.Enqueue((string.Empty, canonical));
@@ -671,7 +676,8 @@ internal sealed class PinnedHelperTree : IDisposable
         PinnedHelperEntry parent,
         string name,
         ManagedBrowserHelperIntegrityLimits limits,
-        SecurityIdentifier user)
+        SecurityIdentifier user,
+        Action? beforeRootAcl = null)
     {
         var root = Path.GetFullPath(Path.Combine(parent.FullPath, name));
         var tree = new PinnedHelperTree(root, limits);
@@ -679,10 +685,11 @@ internal sealed class PinnedHelperTree : IDisposable
         {
             var rootEntry = PinnedHelperEntry.OpenRelativeDirectory(
                 parent, name, createIfMissing: false, deleteCapable: false,
-                shareMode: FileShare.Read | FileShare.Write, createNew: true);
-            rootEntry.ApplyWritableAcl(user, inheritToChildren: true);
+                shareMode: FileShare.Read, createNew: true);
             tree.entries.Add(rootEntry);
             tree.directories.Add(string.Empty, rootEntry);
+            beforeRootAcl?.Invoke();
+            rootEntry.ApplyWritableAcl(user, inheritToChildren: true);
             parent.FlushDirectory();
             return tree;
         }
@@ -702,7 +709,7 @@ internal sealed class PinnedHelperTree : IDisposable
             throw new UnsafeHelperFilesystemException();
         var entry = PinnedHelperEntry.OpenRelativeDirectory(
             parent, name, createIfMissing: false, deleteCapable: false,
-            shareMode: FileShare.Read | FileShare.Write, createNew: true);
+            shareMode: FileShare.Read, createNew: true);
         var treeOwnsEntry = false;
         try
         {
@@ -724,7 +731,8 @@ internal sealed class PinnedHelperTree : IDisposable
         PinnedHelperEntry source,
         string relative,
         SecurityIdentifier user,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? handoffObserver = null)
     {
         ThrowIfInvalidNewRelative(relative);
         EnforceNextEntryLimits(relative, source.Length);
@@ -732,8 +740,7 @@ internal sealed class PinnedHelperTree : IDisposable
         if (!directories.TryGetValue(parentRelative, out var parent))
             throw new UnsafeHelperFilesystemException();
         var entry = PinnedHelperEntry.CreateRelativeCopy(
-            parent, name, source, cancellationToken, deleteCapable: false,
-            shareMode: FileShare.Read | FileShare.Write);
+            parent, name, source, cancellationToken, handoffObserver);
         var treeOwnsEntry = false;
         try
         {
@@ -976,7 +983,8 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
         Action<ManagedBrowserHelperSnapshotPhase>? observer,
         Action<string, string>? fileCopiedObserver,
         Action? cleanupAttemptObserver,
-        Action<ManagedBrowserHelperCleanupPhase>? cleanupObserver)
+        Action<ManagedBrowserHelperCleanupPhase>? cleanupObserver,
+        Action<string>? copyHandoffObserver)
     {
         var user = CurrentUser();
         var parentFence = PrepareSnapshotParent(snapshotParent, user);
@@ -1022,7 +1030,7 @@ internal sealed class VerifiedHelperSnapshotLease : IDisposable
                 observer?.Invoke(ManagedBrowserHelperSnapshotPhase.CopyingPayload);
                 cancellationToken.ThrowIfCancellationRequested();
                 var destination = pinned.CopyRelativeFile(
-                    pair.Value, pair.Key, user, cancellationToken);
+                    pair.Value, pair.Key, user, cancellationToken, copyHandoffObserver);
                 fileCopiedObserver?.Invoke(pair.Key, destination);
             }
             pinned.EnsureEnumerationUnchanged(cancellationToken);
@@ -1774,8 +1782,7 @@ internal sealed class PinnedHelperEntry : IDisposable
         string name,
         PinnedHelperEntry source,
         CancellationToken cancellationToken,
-        bool deleteCapable = false,
-        FileShare shareMode = FileShare.Read)
+        Action<string>? handoffObserver = null)
     {
         if (!parent.IsDirectory || source.IsDirectory || string.IsNullOrWhiteSpace(name) ||
             name is "." or ".." || name.Any(char.IsControl) ||
@@ -1792,13 +1799,12 @@ internal sealed class PinnedHelperEntry : IDisposable
         };
         var status = NtCreateFile(
             out var handle,
-            GenericRead | GenericWrite | ReadControl | WriteDac | Synchronize |
-            (deleteCapable ? DeleteAccess : 0),
+            GenericRead | GenericWrite | ReadControl | WriteDac | Synchronize,
             ref attributes,
             out _,
             IntPtr.Zero,
             FileAttributeNormal,
-            (uint)shareMode,
+            (uint)FileShare.Read,
             FileCreate,
             FileNonDirectoryFile | FileSynchronousIoNonAlert | FileFlagOpenReparsePoint |
             FileWriteThrough,
@@ -1809,6 +1815,8 @@ internal sealed class PinnedHelperEntry : IDisposable
             handle?.Dispose();
             throw NtStatusException(status);
         }
+        PinnedHelperEntry? temporaryReadFence = null;
+        PinnedHelperEntry? finalReadFence = null;
         try
         {
             source.CopyToHandle(handle, cancellationToken);
@@ -1823,21 +1831,31 @@ internal sealed class PinnedHelperEntry : IDisposable
             var finalPath = ReadFinalPath(handle);
             if (!string.Equals(expected, finalPath, StringComparison.OrdinalIgnoreCase))
                 throw new UnsafeHelperFilesystemException();
-            var pinned = OpenRelativeFile(
+            temporaryReadFence = OpenRelativeFile(
                 parent, name, deleteCapable: false,
                 shareMode: FileShare.Read | FileShare.Write);
-            if (pinned.VolumeSerialNumber != info.VolumeSerialNumber ||
-                !string.Equals(pinned.FileId,
+            if (temporaryReadFence.VolumeSerialNumber != info.VolumeSerialNumber ||
+                !string.Equals(temporaryReadFence.FileId,
                     $"{info.FileIndexHigh:x8}{info.FileIndexLow:x8}", StringComparison.Ordinal))
-            {
-                pinned.Dispose();
                 throw new UnsafeHelperFilesystemException();
-            }
+            // The original writer denies external writers until it closes. The temporary
+            // read fence continuously denies replacement. A racing writer after this close
+            // must make the final no-write-share open fail; there is deliberately no retry.
             handle.Dispose();
-            return pinned;
+            handoffObserver?.Invoke(expected);
+            finalReadFence = OpenRelativeFile(
+                parent, name, deleteCapable: false, shareMode: FileShare.Read);
+            if (finalReadFence.VolumeSerialNumber != temporaryReadFence.VolumeSerialNumber ||
+                !string.Equals(finalReadFence.FileId, temporaryReadFence.FileId,
+                    StringComparison.Ordinal) || finalReadFence.Length != source.Length)
+                throw new UnsafeHelperFilesystemException();
+            temporaryReadFence.Dispose();
+            return finalReadFence;
         }
         catch
         {
+            finalReadFence?.Dispose();
+            temporaryReadFence?.Dispose();
             handle.Dispose();
             throw;
         }
