@@ -12,7 +12,7 @@
 
 ## Execution checkpoint — 2026-08-28
 
-Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`: fresh real-helper integrity tests 76/76 (0 skipped), Python tests 28/28, Release `-warnaserror` build and manifest gate pass; independent spec and quality re-reviews both passed. See `docs/testing/managed-browser-task8-handoff.md` for evidence and the cleanup incident's unresolved historical ACL uncertainty. Task 9 is next; Tasks 10–12 and the follow-on transfer/share write plans are not yet complete.
+Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`; its evidence and the cleanup incident's unresolved historical ACL uncertainty are recorded in `docs/testing/managed-browser-task8-handoff.md`. Task 9 is complete through `ccb64e8`: fresh Release client+protocol tests 77/77, client-only tests 35/35 repeated three times, integrity tests 76/76 (all 0 skipped, actual helper package enabled), Python tests 28/28, solution Release `-warnaserror` build and manifest gate pass. Independent spec and quality reviews both passed; one non-blocking environment-sensitive test assertion is recorded in `docs/testing/managed-browser-task9-handoff.md`. Task 10 is next; Tasks 10–12 and the follow-on transfer/share write plans are not yet complete.
 
 ---
 
@@ -682,31 +682,31 @@ git commit -m "build: package verified browser helper"
 - Create: `src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserHelperClient.cs`
 - Create: `tests/BaiduBatchTransfer.App.Tests/Features/ManagedBrowserHelperClientTests.cs`
 
-- [ ] **Step 1: Write RED tests with a fake child process**
+- [x] **Step 1: Write RED tests with a fake child process**
 
 Cover successful nonce/parent-PID/helper-PID/protocol/engine handshake, stderr safe event codes, unexpected stdout bytes, timeout, cancellation, child exit, late response, repeated correlation ID, and bounded graceful shutdown followed by kill.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ManagedBrowserHelperClientTests`
 
 Expected: FAIL because the client does not exist.
 
-- [ ] **Step 3: Implement process bootstrap and handshake**
+- [x] **Step 3: Implement process bootstrap and handshake**
 
 Use redirected stdin/stdout as the only protocol transport. Generate a 256-bit nonce per process and send it in the first length-framed message after the child is created; never put it in an environment variable, command line, named pipe, or file. The helper must echo it together with the expected parent PID, its actual helper PID, protocol version, and `ManagedChromium-v1`; reject any mismatch before accepting later commands. Never place URLs, Cookie values, extraction codes, UID, or page text in stderr.
 
-- [ ] **Step 4: Implement bounded request correlation and cancellation**
+- [x] **Step 4: Implement bounded request correlation and cancellation**
 
 Permit one response for each live correlation ID, discard and safely report late/duplicate responses, propagate cancellation as a typed request cancellation, and on disposal attempt `Shutdown` before killing only the owned helper PID.
 
-- [ ] **Step 5: Run focused tests**
+- [x] **Step 5: Run focused tests**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ManagedBrowserHelperClientTests`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserHelperClient.cs tests/BaiduBatchTransfer.App.Tests/Features/ManagedBrowserHelperClientTests.cs
