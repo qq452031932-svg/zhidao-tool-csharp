@@ -4,7 +4,7 @@ using Microsoft.Data.Sqlite;
 
 namespace BaiduBatchTransfer.Infrastructure.Database;
 
-public sealed class SqliteManagedBrowserStateStore : IManagedBrowserStateStore
+public sealed partial class SqliteManagedBrowserStateStore : IManagedBrowserStateStore, IManagedBrowserLoginStore
 {
     private readonly SqliteConnectionFactory factory;
     private readonly Func<CancellationToken, Task>? afterFamilySwitchOldSessionRetired;
