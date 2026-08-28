@@ -475,6 +475,63 @@ public sealed class ManagedChromiumProcessManagerTests
     public void NativeArgumentEncodingQuotesWithoutShellInterpretation(string value, string expected) =>
         Assert.Equal(expected, WindowsJobObject.EncodeArgumentList([value]));
 
+    [Fact]
+    public async Task ExactProfileStopWorksBeforeTargetExistsAndRetainsPinsUntilConfirmedExit()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var manager = fixture.Manager;
+        fixture.Targets.Page = new Uri("about:blank");
+        Assert.Null((await manager.LaunchAsync(fixture.Installation, fixture.Profile)).Session);
+        fixture.Processes.Process.ExitConfirmed = false;
+        var blocked = await manager.StopOwnedProfileAsync(fixture.Profile);
+        Assert.Equal(BaiduBatchTransfer.Core.Abstractions.ManagedBrowserStopStatus.Blocked, blocked);
+        Assert.False(fixture.ProfileLease.Disposed);
+        fixture.Processes.Process.ExitConfirmed = true;
+        var stopped = await manager.StopOwnedProfileAsync(fixture.Profile);
+        Assert.Equal(BaiduBatchTransfer.Core.Abstractions.ManagedBrowserStopStatus.Stopped, stopped);
+        Assert.True(fixture.ProfileLease.Disposed);
+    }
+
+    [Fact]
+    public async Task CancellationWhileWaitingForInitialTargetKeepsVisibleOwnedBrowser()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var manager = fixture.Manager;
+        using var cancelled = new CancellationTokenSource();
+        fixture.Targets.OnRead = cancelled.Cancel;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => manager.LaunchAsync(fixture.Installation, fixture.Profile, cancelled.Token));
+        Assert.Equal(0, fixture.Processes.Process.Terminations);
+        Assert.False(fixture.ProfileLease.Disposed);
+    }
+
+    [Fact]
+    public async Task MissingPortDeadlineRetainsVisibleProcessAndRetryUsesSameOwnedTuple()
+    {
+        var f = await Fixture.CreateAsync();
+        using var manager = f.Manager;
+        f.ProfileLease.PortMissing = true;
+        await Assert.ThrowsAnyAsync<Exception>(() => manager.LaunchAsync(f.Installation, f.Profile));
+        Assert.Equal(0, f.Processes.Process.Terminations);
+        Assert.False(f.ProfileLease.Disposed);
+        f.ProfileLease.PortMissing = false;
+        Assert.NotNull((await manager.LaunchAsync(f.Installation, f.Profile)).Session);
+        Assert.Equal(1, f.Processes.LaunchCount);
+    }
+
+    [Fact]
+    public async Task ExactProfileStopRejectsDifferentOwnershipTupleWithoutTerminatingAnything()
+    {
+        var f = await Fixture.CreateAsync();
+        using var manager = f.Manager;
+        var handle = (await manager.LaunchAsync(f.Installation, f.Profile)).Session!;
+        var root = Directory.GetParent(Directory.GetParent(Directory.GetParent(f.Profile.CanonicalSourcePath)!.FullName)!.FullName)!.FullName;
+        var forged = ManagedBrowserProfileDescriptor.FromStoredSession(new ManagedBrowserSessionReference(Guid.NewGuid(), f.Installation.InstallationId,
+            f.Profile.AccountId, "123", f.Profile.Family, f.Profile.ProfileId.ToString("D"), Guid.NewGuid().ToString("D")), root);
+        Assert.Equal(BaiduBatchTransfer.Core.Abstractions.ManagedBrowserStopStatus.Blocked, await manager.StopOwnedProfileAsync(forged));
+        Assert.Equal(0, f.Processes.Process.Terminations);
+        Assert.Same(handle, (await manager.ReconnectAsync(handle)).Session);
+    }
+
     private sealed class Fixture
     {
         public required ManagedBrowserProfileDescriptor Profile { get; init; }
@@ -500,7 +557,7 @@ public sealed class ManagedChromiumProcessManagerTests
         }
     }
 
-    private sealed class FakeExecutable(BrowserInstallationIdentity identity) : IBrowserExecutableLaunchLease
+    internal sealed class FakeExecutable(BrowserInstallationIdentity identity) : IBrowserExecutableLaunchLease
     {
         public bool Valid = true, Disposed;
         public BrowserInstallationIdentity Identity => identity;
@@ -508,12 +565,12 @@ public sealed class ManagedChromiumProcessManagerTests
         public bool MatchesExecutablePath(string path) => Validate() && path == identity.ExecutablePath;
         public void Dispose() => Disposed = true;
     }
-    private sealed class FakeProfile(ManagedBrowserProfileDescriptor profile) : IManagedBrowserProfileLease
+    internal sealed class FakeProfile(ManagedBrowserProfileDescriptor profile) : IManagedBrowserProfileLease
     {
-        public bool Valid = true, PortValid = true, Disposed;
+        public bool Valid = true, PortValid = true, Disposed, PortMissing;
         public ManagedBrowserProfileDescriptor Profile => profile;
         public bool Validate() => Valid && !Disposed;
-        public IManagedBrowserPortFileLease? OpenDevToolsActivePort() => new PortFile(this);
+        public IManagedBrowserPortFileLease? OpenDevToolsActivePort() => PortMissing ? null : new PortFile(this);
         public void Dispose() => Disposed = true;
         private sealed class PortFile(FakeProfile profile) : IManagedBrowserPortFileLease
         {
@@ -523,7 +580,7 @@ public sealed class ManagedChromiumProcessManagerTests
             public void Dispose() { }
         }
     }
-    private sealed class FakeProcesses : IManagedChromiumProcessFactory
+    internal sealed class FakeProcesses : IManagedChromiumProcessFactory
     {
         public FakeProcess Process = new();
         public int LaunchCount;
@@ -536,7 +593,7 @@ public sealed class ManagedChromiumProcessManagerTests
             return Process;
         }
     }
-    private sealed class FakeProcess : IManagedChromiumProcess
+    internal sealed class FakeProcess : IManagedChromiumProcess
     {
         public int RootProcessId => 123;
         public DateTimeOffset StartedAtUtc => DateTimeOffset.UtcNow.AddSeconds(-1);
@@ -557,12 +614,12 @@ public sealed class ManagedChromiumProcessManagerTests
         public bool WaitForExit(TimeSpan timeout) => ExitConfirmed;
         public void Dispose() { }
     }
-    private sealed class FakeListeners : IWindowsTcpOwnerTable
+    internal sealed class FakeListeners : IWindowsTcpOwnerTable
     {
         public int Owner = 123, Count = 1;
         public IReadOnlyList<TcpListenerOwner> ReadListeners() => Enumerable.Range(0, Count).Select(_ => new TcpListenerOwner(IPAddress.Loopback, 49152, Owner)).ToArray();
     }
-    private sealed class FakeTargets : IManagedBrowserTargetProbe
+    internal sealed class FakeTargets : IManagedBrowserTargetProbe
     {
         public static readonly Guid FixedBrowserId = Guid.Parse("76df3c18-1013-45fd-a989-2fbb60477286");
         public Guid BrowserId = FixedBrowserId;

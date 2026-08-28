@@ -1212,6 +1212,26 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
     }
 
+    [Fact]
+    public async Task FamilySwitchReadinessReadsRealRecoveringWorkBeforeAnyBrowserStop()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        Assert.True(await fixture.Store.CanSwitchFamilyAsync(fixture.AccountId, default));
+        await SeedManagedOwnersAsync(fixture.Factory, fixture.Store, fixture.AccountId,
+            fixture.OldInstallation.Identity.InstallationId, fixture.OldSession.Identity);
+        Assert.False(await fixture.Store.CanSwitchFamilyAsync(fixture.AccountId, default));
+        AssertSessionEqual(fixture.OldSession, await fixture.Store.LoadSessionAsync(fixture.OldSession.Identity.SessionId, default));
+    }
+
+    [Fact]
+    public async Task FamilySwitchReadinessAllowsTerminalHistoryWithoutRewritingIt()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        await SeedTerminalFamilySwitchHistoryAsync(fixture);
+        Assert.True(await fixture.Store.CanSwitchFamilyAsync(fixture.AccountId, default));
+        AssertSessionEqual(fixture.OldSession, await fixture.Store.LoadSessionAsync(fixture.OldSession.Identity.SessionId, default));
+    }
+
     private async Task<(SqliteConnectionFactory Factory, SqliteManagedBrowserStateStore Store)> CreateStoreAsync()
     {
         Directory.CreateDirectory(root);

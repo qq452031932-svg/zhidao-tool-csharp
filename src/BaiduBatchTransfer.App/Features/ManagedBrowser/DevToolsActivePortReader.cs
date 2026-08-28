@@ -18,6 +18,7 @@ public sealed class DevToolsActivePortReader
     {
         if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(30)) throw new ArgumentOutOfRangeException(nameof(timeout));
         var elapsed = Stopwatch.StartNew();
+        var observedFile = false;
         do
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -28,6 +29,7 @@ public sealed class DevToolsActivePortReader
                 file = profile.OpenDevToolsActivePort();
                 if (file is not null)
                 {
+                    observedFile = true;
                     var port = Parse(file.ReadBounded(MaximumBytes), file.LastWriteTimeUtc, process.StartedAtUtc, IPAddress.Loopback);
                     if (!file.Validate()) throw new IOException("The port file changed.");
                     return (port, file);
@@ -39,6 +41,7 @@ public sealed class DevToolsActivePortReader
             if (remaining <= TimeSpan.Zero) break;
             await Task.Delay(remaining < TimeSpan.FromMilliseconds(50) ? remaining : TimeSpan.FromMilliseconds(50), cancellationToken).ConfigureAwait(false);
         } while (elapsed.Elapsed < timeout);
+        if (!observedFile) throw new TimeoutException("The owned browser has not published its port file yet.");
         throw new IOException("The owned browser did not publish a valid port file in time.");
     }
     public static DevToolsActivePort Parse(ReadOnlySpan<byte> bytes, DateTimeOffset lastWrite,

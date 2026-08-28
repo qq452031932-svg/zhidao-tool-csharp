@@ -699,8 +699,11 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IManagedBrowserStateStore>());
         Assert.IsType<FileSystemManagedBrowserProfileStore>(
             host.Services.GetRequiredService<IManagedBrowserProfileStore>());
-        Assert.IsType<NullManagedBrowserLifecycle>(
+        Assert.IsType<ManagedBrowserLifecycleCoordinator>(
             host.Services.GetRequiredService<IManagedBrowserLifecycle>());
+        Assert.Same(host.Services.GetRequiredService<IManagedBrowserLifecycle>(), host.Services.GetRequiredService<IManagedBrowserAccountLifecycle>());
+        Assert.IsType<ManagedBrowserFamilySwitchReadinessFence>(host.Services.GetRequiredService<IManagedBrowserFamilySwitchFence>());
+        Assert.NotNull(host.Services.GetRequiredService<ManagedBrowserFamilySwitchCoordinator>());
         Assert.IsType<AccountRemovalOperations>(
             host.Services.GetRequiredService<IAccountRemovalOperations>());
         Assert.IsType<WpfAccountManagementOwnedPrompt>(

@@ -51,7 +51,7 @@ internal interface IManagedBrowserHelperProcess : IDisposable
 /// Dispose is bounded; if exit or pipe completion cannot be confirmed, the background cleanup
 /// task continues owning the verified lease. No browser process is attached to or terminated.
 /// </summary>
-public sealed class ManagedBrowserHelperClient : IAsyncDisposable
+public sealed class ManagedBrowserHelperClient : IAsyncDisposable, IManagedBrowserLoginHelper
 {
     private readonly object sync = new();
     private readonly IManagedBrowserHelperProcess process;

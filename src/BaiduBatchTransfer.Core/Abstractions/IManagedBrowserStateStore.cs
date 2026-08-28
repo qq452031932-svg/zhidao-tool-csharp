@@ -4,6 +4,8 @@ namespace BaiduBatchTransfer.Core.Abstractions;
 
 public interface IManagedBrowserStateStore
 {
+    Task<bool> CanSwitchFamilyAsync(Guid accountId, CancellationToken cancellationToken) => Task.FromResult(false);
+
     Task<StoredBrowserInstallation> CreateInstallationAsync(
         BrowserInstallationIdentity installation,
         CancellationToken cancellationToken);

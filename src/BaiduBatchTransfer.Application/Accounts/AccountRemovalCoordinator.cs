@@ -68,6 +68,13 @@ public sealed class AccountRemovalCoordinator
         AccountRemovalPreparation preparation;
         try
         {
+            var accountLifecycle = managedLifecycle as IManagedBrowserAccountLifecycle;
+            using var accountLease = accountLifecycle is null ? null :
+                await accountLifecycle.AcquireAccountLeaseAsync(request.AccountId, cancellationToken).ConfigureAwait(false);
+            if (accountLifecycle is not null &&
+                await accountLifecycle.PreparePendingRemovalAsync(request.AccountId, cancellationToken).ConfigureAwait(false) == ManagedBrowserStopStatus.Blocked)
+                return Result(AccountExitStatus.ActiveWorkBlocked,
+                    "专用浏览器或遗留登录目录尚未安全处理，暂不能退出账号。");
             ManagedBrowserProfileCleanupPreparation? managedCleanup = null;
             if (managedLifecycle is not null)
             {
@@ -196,6 +203,9 @@ public sealed class ManagedBrowserFamilySwitchCoordinator(
     private readonly IManagedBrowserFamilySwitchFence fence =
         fence ?? throw new ArgumentNullException(nameof(fence));
 
+    public Task<bool> CanSwitchAsync(Guid accountId, CancellationToken cancellationToken) =>
+        fence.CanSwitchAsync(accountId, cancellationToken);
+
     public async Task<ManagedBrowserFamilySwitchResult> SwitchAsync(
         ManagedBrowserFamilySwitchObservation observation,
         CancellationToken cancellationToken)
@@ -272,4 +282,10 @@ public sealed class ManagedBrowserFamilySwitchCoordinator(
             _ => ManagedBrowserFamilySwitchStatus.Conflict,
         });
     }
+}
+
+public sealed class ManagedBrowserFamilySwitchReadinessFence(IManagedBrowserStateStore store) : IManagedBrowserFamilySwitchFence
+{
+    public Task<bool> CanSwitchAsync(Guid accountId, CancellationToken cancellationToken) =>
+        store.CanSwitchFamilyAsync(accountId, cancellationToken);
 }

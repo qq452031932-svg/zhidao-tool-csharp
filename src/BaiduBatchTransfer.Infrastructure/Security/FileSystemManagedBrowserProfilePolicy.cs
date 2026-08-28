@@ -10,6 +10,7 @@ using Microsoft.Win32.SafeHandles;
 namespace BaiduBatchTransfer.Infrastructure.Security;
 
 public enum ManagedBrowserProfileStatus { Ready = 1, IsolationRequired = 2 }
+public enum ManagedBrowserProfilePresence { Absent, Present, Uncertain }
 
 public enum ManagedBrowserProfileIsolationReason
 {
@@ -33,6 +34,22 @@ public sealed class ManagedBrowserProfileDescriptor
     public Guid OwnershipId { get; }
     public Guid ProfileOwnershipId => OwnershipId;
     public string CanonicalSourcePath { get; }
+
+    /// <summary>Reconstructs an expected tuple only; callers must still pin/verify it before use.</summary>
+    public static ManagedBrowserProfileDescriptor FromStoredSession(ManagedBrowserSessionReference session, string appDataRoot)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentException.ThrowIfNullOrWhiteSpace(appDataRoot);
+        if (!Path.IsPathFullyQualified(appDataRoot) ||
+            !Guid.TryParse(session.ProfileId, out var profileId) || profileId == Guid.Empty ||
+            !Guid.TryParse(session.ProfileOwnershipId, out var ownershipId) || ownershipId == Guid.Empty)
+            throw new ArgumentException("A canonical managed profile identity is required.");
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(appDataRoot));
+        if (!string.Equals(root, Path.TrimEndingDirectorySeparator(appDataRoot), StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("A canonical managed root is required.");
+        return new(session.AccountId, session.BrowserFamily, profileId, ownershipId,
+            Path.Combine(root, "managed-browser-profiles", session.BrowserFamily == BrowserFamily.Chrome ? "chrome" : "edge", session.AccountId.ToString("N")));
+    }
     public override string ToString() =>
         $"ManagedBrowserProfileDescriptor {{ AccountId = [REDACTED], Family = {Family}, " +
         "ProfileId = [REDACTED], OwnershipId = [REDACTED], CanonicalSourcePath = [REDACTED] }";
@@ -57,6 +74,7 @@ public sealed class ManagedBrowserProfileResult
 
 public interface IManagedBrowserProfilePolicy
 {
+    Task<ManagedBrowserProfilePresence> ProbeExistingAsync(Guid accountId, BrowserFamily family, CancellationToken cancellationToken = default);
     Task<ManagedBrowserProfileResult> GetOrCreateAsync(Guid accountId, BrowserFamily family,
         CancellationToken cancellationToken = default);
     Task<ManagedBrowserProfileResult> OpenExistingAsync(ManagedBrowserProfileDescriptor expected,
@@ -448,6 +466,39 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
         catch (ManagedProfilePolicyException exception) { return Task.FromResult(Isolation(exception.Reason)); }
         catch (UnauthorizedAccessException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.AccessControlMismatch)); }
         catch (IOException) { return Task.FromResult(Isolation(ManagedBrowserProfileIsolationReason.UnsafePath)); }
+    }
+
+    /// <summary>Exact account/family presence only: no create, marker adoption, credential read or directory enumeration.</summary>
+    public Task<ManagedBrowserProfilePresence> ProbeExistingAsync(Guid accountId, BrowserFamily family, CancellationToken cancellationToken = default)
+    {
+        ValidateArguments(accountId, family);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!supportedNamespace) return Task.FromResult(ManagedBrowserProfilePresence.Uncertain);
+        try
+        {
+            using var ns = PinnedNamespace.Open(appDataRoot, createAppRoot: false,
+                volumeCapabilityReader, identityReader, testHooks?.Diagnostic);
+            using var managed = ns.TryOpenOwnedDirectory(ns.AppRoot, ManagedRootName);
+            if (managed is null) return Presence(ns, false);
+            var managedPath = Path.Combine(appDataRoot, ManagedRootName);
+            ns.TrackOwned(managedPath, managed);
+            using var familyRoot = ns.TryOpenOwnedDirectory(managed, FamilyName(family));
+            if (familyRoot is null) return Presence(ns, false);
+            var familyPath = Path.Combine(managedPath, FamilyName(family));
+            ns.TrackOwned(familyPath, familyRoot);
+            using var account = ns.TryOpenOwnedDirectory(familyRoot, accountId.ToString("N"));
+            if (account is null) return Presence(ns, false);
+            ns.TrackOwned(Path.Combine(familyPath, accountId.ToString("N")), account);
+            return Presence(ns, true);
+        }
+        catch (ManagedProfilePolicyException exception) when (exception.Reason == ManagedBrowserProfileIsolationReason.MissingMarker)
+        { return Task.FromResult(ManagedBrowserProfilePresence.Absent); }
+        catch (Exception exception) when (exception is ManagedProfilePolicyException or UnauthorizedAccessException or IOException)
+        { return Task.FromResult(ManagedBrowserProfilePresence.Uncertain); }
+
+        static Task<ManagedBrowserProfilePresence> Presence(PinnedNamespace ns, bool present) =>
+            Task.FromResult(!ns.Revalidate() ? ManagedBrowserProfilePresence.Uncertain :
+                present ? ManagedBrowserProfilePresence.Present : ManagedBrowserProfilePresence.Absent);
     }
 
     public Task<ManagedBrowserProfileResult> OpenExistingAsync(ManagedBrowserProfileDescriptor expected,

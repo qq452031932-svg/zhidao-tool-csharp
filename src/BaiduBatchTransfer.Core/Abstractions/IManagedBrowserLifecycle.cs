@@ -60,3 +60,15 @@ public interface IManagedBrowserLifecycle
         ManagedBrowserLifecycleSession exactSession,
         CancellationToken cancellationToken);
 }
+
+/// <summary>
+/// Process-local coordination under the app's single-instance guard. Callers hold this account lease
+/// across login observation/binding or removal's durable preparation; SQLite remains the CAS authority.
+/// Pending ownership is separate from persisted identity: it must never be represented by a fake UID.
+/// </summary>
+public interface IManagedBrowserAccountLifecycle : IManagedBrowserLifecycle
+{
+    Task<IDisposable> AcquireAccountLeaseAsync(Guid accountId, CancellationToken cancellationToken);
+    Task<ManagedBrowserStopStatus> StopPendingAsync(Guid accountId, CancellationToken cancellationToken);
+    Task<ManagedBrowserStopStatus> PreparePendingRemovalAsync(Guid accountId, CancellationToken cancellationToken);
+}

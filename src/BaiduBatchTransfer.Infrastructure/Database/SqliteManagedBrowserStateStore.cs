@@ -8,6 +8,25 @@ public sealed partial class SqliteManagedBrowserStateStore : IManagedBrowserStat
 {
     private readonly SqliteConnectionFactory factory;
     private readonly Func<CancellationToken, Task>? afterFamilySwitchOldSessionRetired;
+    /// <summary>Read-only preflight before stopping an owned browser; TrySwitchFamilyAsync repeats the durable fence.</summary>
+    public async Task<bool> CanSwitchFamilyAsync(Guid accountId, CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty) return false;
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var account = await new Repositories.SqliteAccountRepository(connection, transaction)
+            .GetByIdAsync(accountId, cancellationToken).ConfigureAwait(false);
+        if (account is not { Status: "Active", IsEnabled: true, IsDeleted: false }) return false;
+        var chrome = await LoadActiveSessionAsync(connection, transaction, accountId, BrowserFamily.Chrome, cancellationToken).ConfigureAwait(false);
+        var edge = await LoadActiveSessionAsync(connection, transaction, accountId, BrowserFamily.Edge, cancellationToken).ConfigureAwait(false);
+        if ((chrome is null) == (edge is null)) return false;
+        var session = (chrome ?? edge)!;
+        if (session.Identity.StableBaiduUserId != account.BaiduUserId) return false;
+        var installation = await LoadInstallationAsync(connection, transaction, session.Identity.InstallationId, cancellationToken).ConfigureAwait(false);
+        return installation is { State: BrowserInstallationLifecycleState.Active } &&
+            !await HasStartedOrRecoveringWorkAsync(connection, transaction, session.Identity.InstallationId,
+                session.Identity.SessionId, cancellationToken).ConfigureAwait(false);
+    }
 
     public SqliteManagedBrowserStateStore(SqliteConnectionFactory factory)
         : this(factory, null)

@@ -389,6 +389,29 @@ public sealed class ManagedBrowserAccountRemovalTests
             lifecycle,
             profiles);
 
+    [Fact]
+    public async Task PendingUnpersistedBrowserBlocksRemovalBeforeDatabasePreparation()
+    {
+        var store = new RecordingRemovalStore();
+        var lifecycle = new RecordingLifecycle(null, ManagedBrowserStopStatus.NotRunning)
+        { PendingStatus = ManagedBrowserStopStatus.Blocked };
+        var result = await Create(store, lifecycle, new RecordingProfileStore(Plan())).ApplyAsync(Request(), default);
+        Assert.Equal(AccountExitStatus.ActiveWorkBlocked, result.Status);
+        Assert.Empty(store.ManagedPrepareRequests);
+        Assert.False(lifecycle.LeaseHeld);
+    }
+
+    [Fact]
+    public async Task AccountLeaseCoversPendingStopAndPersistedSnapshotThroughDurablePreparation()
+    {
+        var lifecycle = new RecordingLifecycle(Snapshot(), ManagedBrowserStopStatus.Stopped);
+        var store = new RecordingRemovalStore { OnPrepare = () => Assert.True(lifecycle.LeaseHeld) };
+        await Create(store, lifecycle, new RecordingProfileStore(Plan())).ApplyAsync(Request(), default);
+        Assert.True(lifecycle.PendingStopUnderLease);
+        Assert.False(lifecycle.LeaseHeld);
+        Assert.Equal(1, lifecycle.LeaseDisposals);
+    }
+
     private static AccountExitRequest Request() =>
         new(AccountId, AccountExitHistoryMode.KeepHistory, "confirmation", RemovedAt);
 
@@ -440,8 +463,24 @@ public sealed class ManagedBrowserAccountRemovalTests
 
     private sealed class RecordingLifecycle(
         ManagedBrowserLifecycleSession? session,
-        ManagedBrowserStopStatus stopStatus) : IManagedBrowserLifecycle
+        ManagedBrowserStopStatus stopStatus) : IManagedBrowserAccountLifecycle
     {
+        public bool LeaseHeld, PendingStopUnderLease;
+        public int LeaseDisposals;
+        public ManagedBrowserStopStatus PendingStatus = ManagedBrowserStopStatus.NotRunning;
+        public Task<IDisposable> AcquireAccountLeaseAsync(Guid id, CancellationToken token)
+        {
+            LeaseHeld = true;
+            return Task.FromResult<IDisposable>(new Lease(this));
+        }
+        public Task<ManagedBrowserStopStatus> StopPendingAsync(Guid id, CancellationToken token)
+        {
+            PendingStopUnderLease = LeaseHeld;
+            return Task.FromResult(PendingStatus);
+        }
+        public Task<ManagedBrowserStopStatus> PreparePendingRemovalAsync(Guid id, CancellationToken token) => StopPendingAsync(id, token);
+        private sealed class Lease(RecordingLifecycle owner) : IDisposable
+        { public void Dispose() { owner.LeaseHeld = false; owner.LeaseDisposals++; } }
         public List<ManagedBrowserLifecycleSession> StopRequests { get; } = [];
 
         public Task<ManagedBrowserLifecycleSession?> LoadActiveSessionAsync(
@@ -706,6 +745,7 @@ public sealed class ManagedBrowserAccountRemovalTests
 
     private sealed class RecordingRemovalStore : IAccountRemovalStore
     {
+        public Action? OnPrepare;
         public List<(AccountExitRequest Request, ManagedBrowserProfileCleanupPreparation? Cleanup)> ManagedPrepareRequests { get; } = [];
         public int CompletionCalls { get; private set; }
         public AccountRemovalPreparation ManagedPrepareResult { get; set; } =
@@ -731,6 +771,7 @@ public sealed class ManagedBrowserAccountRemovalTests
             ManagedBrowserProfileCleanupPreparation? cleanup,
             CancellationToken token)
         {
+            OnPrepare?.Invoke();
             ManagedPrepareRequests.Add((request, cleanup));
             return Task.FromResult(ManagedPrepareResult);
         }

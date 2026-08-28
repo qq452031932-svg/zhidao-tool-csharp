@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Infrastructure.Security;
 using System.IO;
 using System.Text.Json;
@@ -197,7 +198,11 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
             {
                 if (!SameInstallation(entry.Executable.Identity, installation) || !SameProfile(entry.Profile.Profile, profile))
                     throw new IOException("This account already owns a different browser/profile tuple.");
-                if (entry.Process.IsAlive) return await BindAsync(entry, token).ConfigureAwait(false);
+                if (entry.Process.IsAlive)
+                {
+                    await ReadPortAsync(entry, token).ConfigureAwait(false);
+                    return await BindAsync(entry, token).ConfigureAwait(false);
+                }
                 if (!Remove(entry)) throw new IOException("The previous owned browser job has not fully exited.");
             }
 
@@ -223,9 +228,17 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                 }
                 if (launchFailed) throw new IOException("Browser launch failed; its owned job remains tracked until confirmed exit.");
                 RequireRoot(entry);
-                (entry.Port, entry.PortFile) = await new DevToolsActivePortReader().ReadAsync(
-                    entry.Profile, entry.Process, startupTimeout, token).ConfigureAwait(false);
+                await ReadPortAsync(entry, token).ConfigureAwait(false);
                 return await BindAsync(entry, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (entry is not null && !stopping.IsCancellationRequested)
+            {
+                // Ending the login wait is not an explicit browser shutdown. Keep the exact job and pins.
+                throw;
+            }
+            catch (TimeoutException) when (entry is not null && !stopping.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {
@@ -235,6 +248,14 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
             }
         }
         finally { serial.Release(); }
+    }
+
+    private async Task ReadPortAsync(OwnedBrowser entry, CancellationToken token)
+    {
+        RequireRoot(entry);
+        if (entry.Port is null)
+            (entry.Port, entry.PortFile) = await new DevToolsActivePortReader().ReadAsync(
+                entry.Profile, entry.Process, startupTimeout, token).ConfigureAwait(false);
     }
 
     public async Task<ManagedChromiumLaunchResult> ReconnectAsync(ManagedChromiumSessionHandle exactSession,
@@ -333,6 +354,33 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                 .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false); }
             catch (TimeoutException) { }
             return await Task.Run(() => Remove(entry), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally { serial.Release(); }
+    }
+
+    /// <summary>Stops only the currently owned exact profile tuple, including pre-target startup.</summary>
+    public async Task<ManagedBrowserStopStatus> StopOwnedProfileAsync(ManagedBrowserProfileDescriptor exactProfile,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(exactProfile);
+        await serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            OwnedBrowser? entry;
+            lock (gate)
+            {
+                if (!owned.TryGetValue(exactProfile.AccountId, out entry)) return ManagedBrowserStopStatus.NotRunning;
+                if (!SameProfile(entry.Profile.Profile, exactProfile)) return ManagedBrowserStopStatus.Blocked;
+            }
+            try
+            {
+                await entry.Process.CloseGracefullyAsync(TimeSpan.FromSeconds(2), cancellationToken)
+                    .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException) { }
+            catch (IOException) { return ManagedBrowserStopStatus.Blocked; }
+            return await Task.Run(() => Remove(entry), CancellationToken.None).ConfigureAwait(false)
+                ? ManagedBrowserStopStatus.Stopped : ManagedBrowserStopStatus.Blocked;
         }
         finally { serial.Release(); }
     }

@@ -37,6 +37,28 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadOnlyPresenceProbeNeverCreatesMissingAccountOrFamilyDirectories()
+    {
+        var policy = new FileSystemManagedBrowserProfilePolicy(root);
+        var id = Guid.NewGuid();
+        Assert.Equal(ManagedBrowserProfilePresence.Absent, await policy.ProbeExistingAsync(id, BrowserFamily.Chrome));
+        Assert.False(Directory.Exists(root));
+        await policy.GetOrCreateAsync(id, BrowserFamily.Chrome);
+        Assert.Equal(ManagedBrowserProfilePresence.Present, await policy.ProbeExistingAsync(id, BrowserFamily.Chrome));
+        Assert.Equal(ManagedBrowserProfilePresence.Absent, await policy.ProbeExistingAsync(id, BrowserFamily.Edge));
+        Assert.False(Directory.Exists(Path.Combine(root, "managed-browser-profiles", "edge")));
+        Assert.Equal(ManagedBrowserProfilePresence.Absent, await policy.ProbeExistingAsync(Guid.NewGuid(), BrowserFamily.Chrome));
+    }
+
+    [Fact]
+    public async Task ReadOnlyPresenceProbeTreatsUnavailableIdentityAsUncertainNotAbsent()
+    {
+        var policy = new FileSystemManagedBrowserProfilePolicy(root, new UnavailableIdentityReader());
+        Assert.Equal(ManagedBrowserProfilePresence.Uncertain, await policy.ProbeExistingAsync(Guid.NewGuid(), BrowserFamily.Chrome));
+        Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
     public async Task LaunchLeaseRejectsMismatchedProfileIdentity()
     {
         var policy = new FileSystemManagedBrowserProfilePolicy(root);

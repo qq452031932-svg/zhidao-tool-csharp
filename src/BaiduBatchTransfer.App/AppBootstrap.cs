@@ -248,10 +248,17 @@ public static class AppBootstrap
             sp.GetRequiredService<IManagedBrowserProfilePolicy>()));
         services.AddSingleton<IManagedBrowserProfileStore>(sp =>
             sp.GetRequiredService<FileSystemManagedBrowserProfileStore>());
-        services.AddSingleton<NullManagedBrowserLifecycle>();
         services.AddSingleton<ManagedChromiumProcessManager>();
+        services.AddSingleton(sp => new ManagedBrowserLifecycleCoordinator(
+            sp.GetRequiredService<IManagedBrowserStateStore>(),
+            sp.GetRequiredService<ManagedChromiumProcessManager>(), paths.RootDirectory,
+            sp.GetRequiredService<IManagedBrowserProfilePolicy>()));
         services.AddSingleton<IManagedBrowserLifecycle>(sp =>
-            sp.GetRequiredService<NullManagedBrowserLifecycle>());
+            sp.GetRequiredService<ManagedBrowserLifecycleCoordinator>());
+        services.AddSingleton<IManagedBrowserAccountLifecycle>(sp =>
+            sp.GetRequiredService<ManagedBrowserLifecycleCoordinator>());
+        services.AddSingleton<IManagedBrowserFamilySwitchFence, ManagedBrowserFamilySwitchReadinessFence>();
+        services.AddSingleton<ManagedBrowserFamilySwitchCoordinator>();
         services.AddSingleton<BrowserSelectionProcessContext>();
         services.AddSingleton<ProcessBrowserSelectionActivityRegistry>();
         services.AddSingleton<IBrowserSelectionActivityRegistry>(sp =>
@@ -457,7 +464,7 @@ public sealed class WizardAccountProvider(IUnitOfWorkFactory unitOfWorkFactory) 
                 .ConfigureAwait(false);
             foreach (var account in page.Items)
             {
-                if (account.Status != "Active" || !account.IsEnabled || account.IsDeleted) continue;
+                if (account.Status != "Active" || !account.IsEnabled || account.IsDeleted || account.LoginMethod == "ManagedChromium") continue;
                 result.Add(new WizardAccountOption(
                     account.Id,
                     account.DisplayName,
