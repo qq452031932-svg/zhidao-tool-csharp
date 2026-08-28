@@ -12,7 +12,9 @@
 
 ## Execution checkpoint — 2026-08-28
 
-Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`; its evidence and the cleanup incident's unresolved historical ACL uncertainty are recorded in `docs/testing/managed-browser-task8-handoff.md`. Task 9 is complete through `ccb64e8`: fresh Release client+protocol tests 77/77, client-only tests 35/35 repeated three times, integrity tests 76/76 (all 0 skipped, actual helper package enabled), Python tests 28/28, solution Release `-warnaserror` build and manifest gate pass. Independent spec and quality reviews both passed; one non-blocking environment-sensitive test assertion is recorded in `docs/testing/managed-browser-task9-handoff.md`. Task 10 is next; Tasks 10–12 and the follow-on transfer/share write plans are not yet complete.
+Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`; its evidence and the cleanup incident's unresolved historical ACL uncertainty are recorded in `docs/testing/managed-browser-task8-handoff.md`. Task 9 is complete through `ccb64e8`: fresh Release client+protocol tests 77/77, client-only tests 35/35 repeated three times, integrity tests 76/76 (all 0 skipped, actual helper package enabled), Python tests 28/28, solution Release `-warnaserror` build and manifest gate pass. Independent spec and quality reviews both passed; one non-blocking environment-sensitive test assertion is recorded in `docs/testing/managed-browser-task9-handoff.md`.
+
+Task 10 code is committed in `670b125` with termination-retry correction `3142321`. Main-agent Release verification: App Task 10 + helper/protocol 147 passed / 1 skipped, Infrastructure verifier/profile 98 passed / 2 skipped; solution `-warnaserror` build and manifest gate pass. Spec re-review passed after fixing the failed-termination retry gap; independent quality review also passed with no P1/P2 blockers. Evidence and the explicitly selected, no-account real-browser smoke check are tracked in `docs/testing/managed-browser-task10-handoff.md`. Step 9 remains pending until the user supplies the browser directory and the real visible-window check runs. Do not mark Task 10, Tasks 11–12, or the follow-on transfer/share write plans complete.
 
 ---
 
@@ -715,6 +717,8 @@ git commit -m "feat: manage private browser helper lifecycle"
 
 ### Task 10: Launch and own a visible local Chromium process
 
+Code and automated checks are complete; the real-browser smoke step below remains pending. Initial launch accepts installation/profile identities without a pre-login UID. Approved narrow extensions retain the existing executable/profile verifier pins and register/pass the manager to app shutdown; `NullManagedBrowserLifecycle` and production adapters remain unchanged until their later tasks.
+
 **Files:**
 - Create: `src/BaiduBatchTransfer.App/Features/ManagedBrowser/DevToolsActivePortReader.cs`
 - Create: `src/BaiduBatchTransfer.App/Features/ManagedBrowser/WindowsTcpOwnerTable.cs`
@@ -726,37 +730,37 @@ git commit -m "feat: manage private browser helper lifecycle"
 - Create: `tests/BaiduBatchTransfer.App.Tests/Features/ManagedChromiumProcessManagerTests.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/ApplicationShutdownCoordinatorTests.cs`
 
-- [ ] **Step 1: Write parser and lifecycle RED tests**
+- [x] **Step 1: Write parser and lifecycle RED tests**
 
 Cover truncated/oversized/stale `DevToolsActivePort` and non-loopback endpoints.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~DevToolsActivePortReaderTests|FullyQualifiedName~ManagedChromiumProcessManagerTests"`
 
 Expected: FAIL because the process manager does not exist.
 
-- [ ] **Step 3: Implement the bounded port-file parser**
+- [x] **Step 3: Implement the bounded port-file parser**
 
 Read `DevToolsActivePort` only through a pinned handle beneath the exact app-owned profile, cap byte count and wait duration, reject stale timestamps/extra lines/path replacement, and accept loopback ports only. Run `DevToolsActivePortReaderTests` and expect PASS.
 
-- [ ] **Step 4: Write owned-launch RED tests**
+- [x] **Step 4: Write owned-launch RED tests**
 
 Cover profile mismatch, wrong/replaced executable identity, unowned-launch race, missing/ambiguous TCP listener owner, listener owned by an unrelated process, user-closed process, arbitrary-port reattach rejection, one process per account, restart/reconnect of the same account/family/profile, and shutdown affecting only app-owned processes.
 
-- [ ] **Step 5: Implement race-free owned process launch**
+- [x] **Step 5: Implement race-free owned process launch**
 
 Immediately before launch, repeat the complete pinned browser directory/executable verification from Task 4. Use Windows `CreateProcess` suspended, assign the root process to an app Job Object before resuming it, then generate an argument list (not a concatenated command string) containing the verified executable, managed `--user-data-dir`, literal `--remote-debugging-port=0` (Chromium chooses the free port), and `https://pan.baidu.com/`. Do not preselect or probe a port and do not hide the browser window. Record root PID, BrowserId, family, ProfileId, profile ownership ID, canonical profile path, and selected executable file identity.
 
-- [ ] **Step 6: Implement TCP listener ownership validation**
+- [x] **Step 6: Implement TCP listener ownership validation**
 
 `WindowsTcpOwnerTable` uses `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER)` to resolve the actual PID listening on the `DevToolsActivePort` loopback port. Require exactly one listener, prove that PID is the root/descendant in the recorded Job/process tree, and re-open that PID's executable to match the verified file identity. Add race tests in which the port owner exits or changes between lookup and attachment; fail closed.
 
-- [ ] **Step 7: Implement endpoint and target ownership validation**
+- [x] **Step 7: Implement endpoint and target ownership validation**
 
 Do not treat `/json/version` as proof by itself. Before returning a session handle, require all of: loopback endpoint from the pinned profile's `DevToolsActivePort`; the listener-PID proof from Step 6; matching executable file identity and browser family; matching canonical profile path and ownership marker; expected BrowserId; and a selected TargetId whose current route is in the exact HTTPS allowlist. On restart, reconnect only when the same profile/ownership/identity tuple and listener ownership are proven; otherwise launch a fresh owned process. Never attach merely because a port is open.
 
-- [ ] **Step 8: Integrate owned shutdown and run tests**
+- [x] **Step 8: Integrate owned shutdown and run tests**
 
 Register the manager with `ApplicationShutdownCoordinator`. Gracefully close helper/browser, then terminate only PIDs in the owned Job after a bounded timeout. Preserve unowned Chrome/Edge windows.
 
@@ -768,7 +772,7 @@ Expected: PASS.
 
 The smoke test may open the app-owned Chrome/Edge window but must not log in, navigate to a share link, or execute any remote write.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/BaiduBatchTransfer.App/Features/ManagedBrowser src/BaiduBatchTransfer.App/ApplicationShutdownCoordinator.cs tests/BaiduBatchTransfer.App.Tests/Features tests/BaiduBatchTransfer.App.Tests/ApplicationShutdownCoordinatorTests.cs
