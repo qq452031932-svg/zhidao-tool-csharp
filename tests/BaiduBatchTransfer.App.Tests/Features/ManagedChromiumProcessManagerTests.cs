@@ -216,6 +216,40 @@ public sealed class ManagedChromiumProcessManagerTests
         await provider.GetRequiredService<ManagedChromiumProcessManager>().DisposeAsync();
     }
 
+    [Task10ManualBrowserFact]
+    public async Task ManualRealBrowserStaysOpenUntilUserClosesIt()
+    {
+        var directory = Environment.GetEnvironmentVariable("BAIDU_BATCH_TASK10_BROWSER_DIRECTORY");
+        Assert.False(string.IsNullOrWhiteSpace(directory));
+        var verification = await new BrowserExecutableVerifier().VerifyAsync(directory!, BrowserFamily.Chrome, CancellationToken.None);
+        Assert.True(verification.IsVerified);
+        var policy = new FileSystemManagedBrowserProfilePolicy(Path.Combine(Path.GetTempPath(), "task10-manual-browser-" + Guid.NewGuid().ToString("N")));
+        var profile = (await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome)).Profile!;
+        await using var manager = new ManagedChromiumProcessManager(policy);
+        var launched = await manager.LaunchAsync(verification.Identity!, profile);
+        Assert.Equal(ManagedChromiumLaunchStatus.Ready, launched.Status);
+        using var process = Process.GetProcessById(launched.Session!.RootProcessId);
+
+        // Process readiness is not visual acceptance. The user must inspect the window;
+        // this manual-only diagnostic has no 15-second auto-close or automated login.
+        var statusFile = Path.Combine(Path.GetTempPath(), "task10-manual-browser-status.json");
+        await File.WriteAllTextAsync(statusFile, JsonSerializer.Serialize(new
+        {
+            state = "WaitingForUserWindowConfirmation",
+            rootProcessId = process.Id,
+            processStartedAtUtc = process.StartTime.ToUniversalTime(),
+            visualAcceptance = "NotConfirmed"
+        }));
+        await process.WaitForExitAsync();
+        await manager.DisposeAsync();
+        await File.WriteAllTextAsync(statusFile, JsonSerializer.Serialize(new
+        {
+            state = "BrowserClosed",
+            rootProcessId = process.Id,
+            visualAcceptance = "NotConfirmed"
+        }));
+    }
+
     [Task10BrowserFact]
     public async Task OptInRealBrowserRemainsVisibleForFifteenSecondsAndOnlyOwnedJobIsClosed()
     {
@@ -609,5 +643,14 @@ public sealed class Task10BrowserFactAttribute : FactAttribute
     {
         if (Environment.GetEnvironmentVariable("BAIDU_BATCH_REQUIRE_TASK10_BROWSER") != "1")
             Skip = "Opt-in real browser smoke; run only with an explicitly approved browser directory.";
+    }
+}
+
+public sealed class Task10ManualBrowserFactAttribute : FactAttribute
+{
+    public Task10ManualBrowserFactAttribute()
+    {
+        if (Environment.GetEnvironmentVariable("BAIDU_BATCH_MANUAL_TASK10_BROWSER") != "1")
+            Skip = "Manual-only window check; requires an approved directory and the user to close the test browser.";
     }
 }

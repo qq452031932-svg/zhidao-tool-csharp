@@ -14,7 +14,7 @@
 
 Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`; its evidence and the cleanup incident's unresolved historical ACL uncertainty are recorded in `docs/testing/managed-browser-task8-handoff.md`. Task 9 is complete through `ccb64e8`: fresh Release client+protocol tests 77/77, client-only tests 35/35 repeated three times, integrity tests 76/76 (all 0 skipped, actual helper package enabled), Python tests 28/28, solution Release `-warnaserror` build and manifest gate pass. Independent spec and quality reviews both passed; one non-blocking environment-sensitive test assertion is recorded in `docs/testing/managed-browser-task9-handoff.md`.
 
-Task 10 code is committed in `670b125` with termination-retry correction `3142321`. Main-agent Release verification: App Task 10 + helper/protocol 147 passed / 1 skipped, Infrastructure verifier/profile 98 passed / 2 skipped; solution `-warnaserror` build and manifest gate pass. Spec re-review passed after fixing the failed-termination retry gap; independent quality review also passed with no P1/P2 blockers. Evidence and the explicitly selected, no-account real-browser smoke check are tracked in `docs/testing/managed-browser-task10-handoff.md`. Step 9 remains pending until the user supplies the browser directory and the real visible-window check runs. Do not mark Task 10, Tasks 11–12, or the follow-on transfer/share write plans complete.
+Task 10 code is committed in `670b125` with termination-retry correction `3142321`. Main-agent Release verification: App Task 10 + helper/protocol 147 passed / 1 skipped, Infrastructure verifier/profile 98 passed / 2 skipped; solution `-warnaserror` build and manifest gate pass. Spec re-review passed after fixing the failed-termination retry gap; independent quality review also passed with no P1/P2 blockers. Step 9 is now complete: the user explicitly selected `C:\Program Files\Google\Chrome\Application`, screenshot-confirmed the visible logged-out Baidu landing page, then manually closed the dedicated window; the manual test passed 1/1 in about 3m5s with exit 0 and `BrowserClosed`. The test does not infer visual acceptance; that evidence comes from the user. The manual addendum regression passed 53/2 skipped and both independent reviews passed. Full evidence is in `docs/testing/managed-browser-task10-handoff.md`. Continue Task 11; Tasks 11–12 and follow-on transfer/share write plans are not complete.
 
 ---
 
@@ -717,7 +717,7 @@ git commit -m "feat: manage private browser helper lifecycle"
 
 ### Task 10: Launch and own a visible local Chromium process
 
-Code and automated checks are complete; the real-browser smoke step below remains pending. Initial launch accepts installation/profile identities without a pre-login UID. Approved narrow extensions retain the existing executable/profile verifier pins and register/pass the manager to app shutdown; `NullManagedBrowserLifecycle` and production adapters remain unchanged until their later tasks.
+Code, automated checks, and the user-confirmed no-account visible-window smoke step are complete. Initial launch accepts installation/profile identities without a pre-login UID. Approved narrow extensions retain the existing executable/profile verifier pins and register/pass the manager to app shutdown; `NullManagedBrowserLifecycle` and production adapters remain unchanged until their later tasks.
 
 **Files:**
 - Create: `src/BaiduBatchTransfer.App/Features/ManagedBrowser/DevToolsActivePortReader.cs`
@@ -768,7 +768,7 @@ Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Test
 
 Expected: PASS.
 
-- [ ] **Step 9: Perform a manual no-account smoke test**
+- [x] **Step 9: Perform a manual no-account smoke test**
 
 The smoke test may open the app-owned Chrome/Edge window but must not log in, navigate to a share link, or execute any remote write.
 
