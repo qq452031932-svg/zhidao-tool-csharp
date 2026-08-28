@@ -204,6 +204,7 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                     return await BindAsync(entry, token).ConfigureAwait(false);
                 }
                 if (!Remove(entry)) throw new IOException("The previous owned browser job has not fully exited.");
+                entry = null; // New pins are not owned by the removed browser, even if acquisition is cancelled.
             }
 
             IManagedBrowserProfileLease? profileLease = null;
@@ -354,6 +355,26 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                 .WaitAsync(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false); }
             catch (TimeoutException) { }
             return await Task.Run(() => Remove(entry), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally { serial.Release(); }
+    }
+
+    // This classifies only this manager's held tuples, never arbitrary external processes.
+    internal async Task<ManagedProfileOwnership> ClassifyOwnedProfileAsync(ManagedBrowserProfileDescriptor exactProfile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(exactProfile);
+        await serial.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            lock (gate)
+            {
+                ObjectDisposedException.ThrowIf(disposed, this);
+                if (!owned.TryGetValue(exactProfile.AccountId, out var entry)) return ManagedProfileOwnership.None;
+                if (SameProfile(entry.Profile.Profile, exactProfile)) return ManagedProfileOwnership.Matching;
+                return entry.Profile.Profile.Family != exactProfile.Family
+                    ? ManagedProfileOwnership.DifferentFamily : ManagedProfileOwnership.Conflict;
+            }
         }
         finally { serial.Release(); }
     }

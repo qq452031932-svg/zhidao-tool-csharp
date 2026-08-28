@@ -453,6 +453,36 @@ public sealed class ManagedChromiumProcessManagerTests
     }
 
     [Fact]
+    public async Task CancelledRestartAfterProfileRepinDisposesNewLeaseWithoutLaunchingBrowser()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var unusedManager = fixture.Manager;
+        using var cancelled = new CancellationTokenSource();
+        var pinCount = 0;
+        await using var manager = new ManagedChromiumProcessManager((_, token) =>
+        {
+            if (++pinCount == 2)
+            {
+                cancelled.Cancel();
+                token.ThrowIfCancellationRequested();
+            }
+            return Task.FromResult<IBrowserExecutableLaunchLease>(fixture.Executable);
+        }, (_, _) => Task.FromResult<IManagedBrowserProfileLease>(fixture.ProfileLease),
+            fixture.Processes, fixture.Listeners, fixture.Targets, TimeSpan.FromMilliseconds(50));
+        await manager.LaunchAsync(fixture.Installation, fixture.Profile);
+        var oldProfileLease = fixture.ProfileLease;
+        fixture.Processes.Process.Alive = false;
+        fixture.ProfileLease = new FakeProfile(fixture.Profile);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            manager.LaunchAsync(fixture.Installation, fixture.Profile, cancelled.Token));
+
+        Assert.True(oldProfileLease.Disposed);
+        Assert.True(fixture.ProfileLease.Disposed);
+        Assert.Equal(1, fixture.Processes.LaunchCount);
+    }
+
+    [Fact]
     public async Task AsyncThenSynchronousDisposalGracefullyClosesAndTerminatesOwnedJobOnlyOnce()
     {
         var fixture = await Fixture.CreateAsync();
@@ -490,6 +520,28 @@ public sealed class ManagedChromiumProcessManagerTests
         var stopped = await manager.StopOwnedProfileAsync(fixture.Profile);
         Assert.Equal(BaiduBatchTransfer.Core.Abstractions.ManagedBrowserStopStatus.Stopped, stopped);
         Assert.True(fixture.ProfileLease.Disposed);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task OwnershipClassificationNeverStopsOrAdoptsAnyBrowser(int kind)
+    {
+        var fixture = await Fixture.CreateAsync();
+        await using var manager = fixture.Manager;
+        if (kind != 0) await manager.LaunchAsync(fixture.Installation, fixture.Profile);
+        var exact = fixture.Profile;
+        if (kind is 2 or 3)
+        {
+            var policy = new FileSystemManagedBrowserProfilePolicy(Path.Combine(Path.GetTempPath(), "task11b-classify-" + Guid.NewGuid().ToString("N")));
+            exact = (await policy.GetOrCreateAsync(exact.AccountId, kind == 2 ? BrowserFamily.Edge : BrowserFamily.Chrome)).Profile!;
+        }
+        Assert.Equal((ManagedProfileOwnership)kind, await manager.ClassifyOwnedProfileAsync(exact, default));
+        Assert.Equal(kind == 0 ? 0 : 1, fixture.Processes.LaunchCount);
+        Assert.Equal(0, fixture.Processes.Process.Terminations);
+        Assert.False(fixture.ProfileLease.Disposed);
     }
 
     [Fact]

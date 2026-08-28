@@ -36,6 +36,10 @@ public interface IManagedBrowserStateStore
         Guid sessionId,
         CancellationToken cancellationToken);
 
+    Task<StoredManagedBrowserSession?> LoadRetainedFamilySlotAsync(
+        Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken) =>
+        Task.FromResult<StoredManagedBrowserSession?>(null);
+
     Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(
         Guid accountId,
         BrowserFamily browserFamily,

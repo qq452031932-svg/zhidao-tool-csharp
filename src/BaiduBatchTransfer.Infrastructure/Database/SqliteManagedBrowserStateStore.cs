@@ -304,6 +304,29 @@ public sealed partial class SqliteManagedBrowserStateStore : IManagedBrowserStat
         return await LoadSessionAsync(connection, null, sessionId, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<StoredManagedBrowserSession?> LoadRetainedFamilySlotAsync(
+        Guid accountId, BrowserFamily browserFamily, CancellationToken cancellationToken)
+    {
+        if (accountId == Guid.Empty) throw new ArgumentException("An account ID is required.", nameof(accountId));
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT SessionId,InstallationId,AccountId,BaiduUserId,BrowserFamily,ProfileId,
+                   ProfileOwnershipId,State,Revision
+            FROM ManagedBrowserSessions
+            WHERE AccountId=$account AND BrowserFamily=$family
+              AND State IN ('Retired','QuarantinePending','CleanupPending');
+            """;
+        command.Parameters.AddWithValue("$account", accountId.ToString("D"));
+        command.Parameters.AddWithValue("$family", FormatFamily(browserFamily));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var current = ReadSession(reader);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("The retained browser profile slot is ambiguous.");
+        return current;
+    }
+
     public async Task<StoredManagedBrowserSession?> LoadActiveSessionAsync(
         Guid accountId,
         BrowserFamily browserFamily,

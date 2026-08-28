@@ -193,6 +193,158 @@ public sealed class ManagedBrowserLoginLifecycleTests
         Assert.NotNull(await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Chrome, default));
     }
 
+    [Theory]
+    [InlineData("123", ManagedBrowserLoginStatus.Bound)]
+    [InlineData("different", ManagedBrowserLoginStatus.AccountIdentityMismatch)]
+    public async Task FamilyRoundtripQuarantinesRetiredProfileAndUsesFreshIdentity(string uid, ManagedBrowserLoginStatus expected)
+    {
+        await using var f = await Fixture.CreateAsync();
+        f.Files.Both = true;
+        var id = Guid.NewGuid();
+        Assert.Equal(ManagedBrowserLoginStatus.Bound, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome)).Status);
+        var chrome = (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Chrome, default))!;
+        Assert.Equal(ManagedBrowserLoginStatus.Bound, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Edge)).Status);
+        var edge = (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Edge, default))!;
+        f.Helper.Identity = new(ManagedBrowserIdentityResultKind.Observed, uid);
+
+        Assert.Equal(expected, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Chrome)).Status);
+
+        var preserved = (await f.Store.LoadSessionAsync(chrome.Identity.SessionId, default))!;
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Quarantined, preserved.State);
+        Assert.Equal(chrome.Identity.ProfileId, preserved.Identity.ProfileId);
+        var manifest = (await f.Store.LoadLatestCleanupManifestAsync(id, default))!;
+        Assert.Equal(ManagedProfileCleanupState.Quarantined, manifest.State);
+        Assert.True(Directory.Exists(manifest.Manifest.QuarantinePath));
+        Assert.True((await f.ReadAccountAsync(id))!.IsEnabled);
+        var fresh = f.Lifecycle.Pending(id)!;
+        Assert.NotEqual(chrome.Identity.ProfileId, fresh.Profile.ProfileId.ToString("N"));
+        Assert.NotEqual(chrome.Identity.ProfileOwnershipId, fresh.Profile.OwnershipId.ToString("N"));
+        if (expected == ManagedBrowserLoginStatus.Bound)
+        {
+            var active = (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Chrome, default))!;
+            Assert.NotEqual(chrome.Identity.SessionId, active.Identity.SessionId);
+            Assert.Equal(chrome.Identity.InstallationId, active.Identity.InstallationId);
+        }
+        else
+        {
+            var active = (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Edge, default))!;
+            Assert.Equal(edge.Identity.SessionId, active.Identity.SessionId);
+            Assert.Equal(edge.Revision, active.Revision);
+        }
+    }
+
+    [Fact]
+    public async Task FamilySwitchUnknownTargetProfileBlocksBeforeCurrentBrowserStops()
+    {
+        await using var f = await Fixture.CreateAsync();
+        f.Files.Both = true;
+        var id = Guid.NewGuid();
+        await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+        var unknown = (await new FileSystemManagedBrowserProfilePolicy(f.Root).GetOrCreateAsync(id, BrowserFamily.Edge)).Profile!;
+        var current = f.Processes.Process;
+
+        Assert.Equal(ManagedBrowserLoginStatus.ActiveWorkBlocked,
+            (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Edge)).Status);
+
+        Assert.Equal(0, current.Terminations);
+        Assert.Equal(1, f.Processes.LaunchCount);
+        Assert.True(Directory.Exists(unknown.CanonicalSourcePath));
+        Assert.Null(await f.Store.LoadLatestCleanupManifestAsync(id, default));
+    }
+
+    [Theory]
+    [InlineData(0)] // Prepared, before durable claim.
+    [InlineData(1)] // Move intent, before rename.
+    [InlineData(2)] // Rename completed, before durable completion.
+    [InlineData(3)] // CleanupPending remains fail-closed.
+    public async Task RetiredTargetSlotResumesExactManifestWithoutStoppingCurrentBrowser(int crashStage)
+    {
+        await using var f = await Fixture.CreateAsync();
+        f.Files.Both = true;
+        var id = Guid.NewGuid();
+        await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+        await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Edge);
+        var current = (await f.Lifecycle.LoadPersistedAsync(id, default))!;
+        var retained = (await f.Store.LoadRetainedFamilySlotAsync(id, BrowserFamily.Chrome, default))!;
+        var installation = (await f.Store.LoadInstallationAsync(retained.Identity.InstallationId, default))!;
+        var profiles = new FileSystemManagedBrowserProfilePolicy(f.Root);
+        var cleanupProfiles = new FileSystemManagedBrowserProfileStore(f.Root, profiles);
+        var descriptor = ManagedBrowserProfileDescriptor.FromStoredSession(retained.Identity, f.Root);
+        var preparation = cleanupProfiles.PrepareRemoval(new(retained.Identity, installation.Revision,
+            retained.Revision, descriptor.CanonicalSourcePath));
+        await f.Store.CreateCleanupManifestAsync(new(preparation.ManifestId, id, retained.Identity.SessionId,
+            preparation.SourceProfilePath, preparation.QuarantinePath, retained.Identity.ProfileOwnershipId, null), default);
+        if (crashStage > 0)
+            Assert.Equal(ManagedBrowserTransitionStatus.Applied, (await f.Store.TryClaimRetiredIdentityForCleanupAsync(
+                new(installation.Identity.InstallationId, retained.Identity.SessionId, id, installation.Revision,
+                    retained.Revision, preparation.ManifestId, 0), default)).Status);
+        if (crashStage == 2)
+            Assert.Equal(ManagedBrowserProfileMoveStatus.Moved, await cleanupProfiles.MoveToQuarantineAsync(preparation, default));
+        if (crashStage == 3)
+            await f.Store.TryTransitionCleanupManifestAsync(new(preparation.ManifestId, 1,
+                ManagedProfileCleanupState.QuarantineMoveIntent, ManagedProfileCleanupState.CleanupPending), default);
+
+        var restarted = new RetiredBrowserFamilySlotCoordinator(f.Store, f.Manager, profiles,
+            cleanupProfiles, f.CreateCleanupService(), f.Root);
+        using (await f.Lifecycle.AcquireAccountLeaseAsync(id, default))
+            Assert.Equal(crashStage != 3, await restarted.PrepareAsync(current, BrowserFamily.Chrome, default));
+
+        Assert.True(f.Processes.Process.IsAlive);
+        Assert.Equal(0, f.Processes.Process.Terminations);
+        Assert.Equal(2, f.Processes.LaunchCount);
+        Assert.Equal(current.SessionId, (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Edge, default))!.Identity.SessionId);
+        var manifest = (await f.Store.LoadCleanupManifestAsync(preparation.ManifestId, default))!;
+        Assert.Equal(crashStage == 3 ? ManagedProfileCleanupState.CleanupPending : ManagedProfileCleanupState.Quarantined, manifest.State);
+        Assert.Equal(1L, await f.ScalarAsync("SELECT COUNT(*) FROM ManagedProfileCleanupManifests;"));
+        if (crashStage != 3)
+            Assert.Equal(ManagedBrowserLoginStatus.Bound, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Chrome)).Status);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RetiredTargetHistoryIsPreservedAndNonterminalWorkBlocksBeforeCurrentStop(bool recovering)
+    {
+        await using var f = await Fixture.CreateAsync();
+        f.Files.Both = true;
+        var id = Guid.NewGuid();
+        await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+        var chrome = (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Chrome, default))!;
+        await using var connection = await f.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO StandaloneShareBatches(Id,DraftFingerprint,ResultDirectoryReference,Status,OperationCount,Revision,CreatedAt,UpdatedAt)
+            VALUES('history-batch','history-draft','history-result','Active',1,0,$now,$now);
+            INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
+              ParentPath,ExactItemSetFingerprint,Status,SubmissionState,SubmissionAcceptance,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            VALUES('history-operation','history-batch',$account,1,'retained','File','/','history-item','Cancelled',
+              'NotStarted','Unknown',$now,$now,'ManagedChromium-v1','Chrome',$profile,$installation,$session);
+            """;
+        command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$account", id.ToString("D"));
+        command.Parameters.AddWithValue("$profile", chrome.Identity.ProfileId);
+        command.Parameters.AddWithValue("$installation", chrome.Identity.InstallationId.ToString("D"));
+        command.Parameters.AddWithValue("$session", chrome.Identity.SessionId.ToString("D"));
+        await command.ExecuteNonQueryAsync();
+        Assert.Equal(ManagedBrowserLoginStatus.Bound, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Edge)).Status);
+        if (recovering)
+        {
+            command.CommandText = "UPDATE StandaloneShareOperations SET Status='Queued' WHERE Id='history-operation';";
+            await command.ExecuteNonQueryAsync();
+        }
+        var edgeProcess = f.Processes.Process;
+
+        Assert.Equal(recovering ? ManagedBrowserLoginStatus.ActiveWorkBlocked : ManagedBrowserLoginStatus.Bound,
+            (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.ReloginExisting(id), BrowserFamily.Chrome)).Status);
+
+        Assert.Equal(recovering ? 0 : 1, edgeProcess.Terminations);
+        command.CommandText = "SELECT SessionId FROM StandaloneShareOperations WHERE Id='history-operation';";
+        Assert.Equal(chrome.Identity.SessionId.ToString("D"), await command.ExecuteScalarAsync());
+        if (recovering)
+            Assert.Equal(ManagedBrowserSessionLifecycleState.Retired, (await f.Store.LoadSessionAsync(chrome.Identity.SessionId, default))!.State);
+    }
+
     [Fact]
     public async Task HelperCleanupFailureCannotReportUnchangedAfterCommittingAnAccount()
     {
@@ -444,6 +596,8 @@ public sealed class ManagedBrowserLoginLifecycleTests
             f.Launcher = new ManagedBrowserLoginLauncher(setup, profiles, manager, lifecycle, store,
                 new SqliteUnitOfWorkFactory(factory), new ManagedBrowserAccountService(store),
                 new ManagedBrowserFamilySwitchCoordinator(store, f.Fence),
+                new RetiredBrowserFamilySlotCoordinator(store, manager, profiles,
+                    new FileSystemManagedBrowserProfileStore(root, profiles), f.CreateCleanupService(), root),
                 _ => { f.HelperStarts++; return Task.FromResult<IManagedBrowserLoginHelper>(f.Helper); });
             return f;
         }
@@ -459,6 +613,20 @@ public sealed class ManagedBrowserLoginLifecycleTests
             await unit.CommitAsync();
         }
         public ValueTask DisposeAsync() => Manager.DisposeAsync();
+        public async Task<long> ScalarAsync(string sql)
+        {
+            await using var connection = await Factory.OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            return Convert.ToInt64(await command.ExecuteScalarAsync());
+        }
+        public RemoveAccountService CreateCleanupService()
+        {
+            var paths = new FileSystemAccountProfilePathPolicy(Path.Combine(Root, "legacy"));
+            return new(new SqliteUnitOfWorkFactory(Factory),
+                new FileSystemWebViewProfileStore(paths, new NoBrowserCloser()), paths, Store,
+                new FileSystemManagedBrowserProfileStore(Root, new FileSystemManagedBrowserProfilePolicy(Root)));
+        }
         public AccountRemovalCoordinator CreateRemoval()
         {
             var paths = new FileSystemAccountProfilePathPolicy(Path.Combine(Root, "legacy"));

@@ -48,19 +48,20 @@ public sealed class ManagedBrowserLoginLauncher
     private readonly IUnitOfWorkFactory units;
     private readonly ManagedBrowserAccountService accounts;
     private readonly ManagedBrowserFamilySwitchCoordinator familySwitch;
+    private readonly RetiredBrowserFamilySlotCoordinator retiredSlots;
     private readonly Func<CancellationToken, Task<IManagedBrowserLoginHelper>> startHelper;
 
     public ManagedBrowserLoginLauncher(BrowserSetupService setup, IManagedBrowserProfilePolicy profiles,
         ManagedChromiumProcessManager manager, ManagedBrowserLifecycleCoordinator lifecycle,
         IManagedBrowserStateStore store, IUnitOfWorkFactory units, ManagedBrowserAccountService accounts,
-        ManagedBrowserFamilySwitchCoordinator familySwitch, string helperRoot)
-        : this(setup, profiles, manager, lifecycle, store, units, accounts, familySwitch,
+        ManagedBrowserFamilySwitchCoordinator familySwitch, RetiredBrowserFamilySlotCoordinator retiredSlots, string helperRoot)
+        : this(setup, profiles, manager, lifecycle, store, units, accounts, familySwitch, retiredSlots,
             async token => await ManagedBrowserHelperClient.StartAsync(helperRoot, token).ConfigureAwait(false)) { }
 
     internal ManagedBrowserLoginLauncher(BrowserSetupService setup, IManagedBrowserProfilePolicy profiles,
         ManagedChromiumProcessManager manager, ManagedBrowserLifecycleCoordinator lifecycle,
         IManagedBrowserStateStore store, IUnitOfWorkFactory units, ManagedBrowserAccountService accounts,
-        ManagedBrowserFamilySwitchCoordinator familySwitch,
+        ManagedBrowserFamilySwitchCoordinator familySwitch, RetiredBrowserFamilySlotCoordinator retiredSlots,
         Func<CancellationToken, Task<IManagedBrowserLoginHelper>> startHelper)
     {
         this.setup = setup ?? throw new ArgumentNullException(nameof(setup));
@@ -71,6 +72,7 @@ public sealed class ManagedBrowserLoginLauncher
         this.units = units ?? throw new ArgumentNullException(nameof(units));
         this.accounts = accounts ?? throw new ArgumentNullException(nameof(accounts));
         this.familySwitch = familySwitch ?? throw new ArgumentNullException(nameof(familySwitch));
+        this.retiredSlots = retiredSlots ?? throw new ArgumentNullException(nameof(retiredSlots));
         this.startHelper = startHelper ?? throw new ArgumentNullException(nameof(startHelper));
     }
 
@@ -129,6 +131,9 @@ public sealed class ManagedBrowserLoginLauncher
         if (switching && !await familySwitch.CanSwitchAsync(request.AccountId, token).ConfigureAwait(false))
             return Result(ManagedBrowserLoginStatus.ActiveWorkBlocked);
         var pending = lifecycle.Pending(request.AccountId);
+        if (switching && (pending is null || !SameExecutable(pending.Installation, installation)) &&
+            !await retiredSlots.PrepareAsync(current!, installation.BrowserFamily, token).ConfigureAwait(false))
+            return Result(ManagedBrowserLoginStatus.ActiveWorkBlocked);
         if (pending is not null && !SameExecutable(pending.Installation, installation))
         {
             if (await lifecycle.StopPendingAsync(request.AccountId, token).ConfigureAwait(false) == ManagedBrowserStopStatus.Blocked)

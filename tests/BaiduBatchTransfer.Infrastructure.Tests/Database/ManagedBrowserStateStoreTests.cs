@@ -951,6 +951,25 @@ public sealed class ManagedBrowserStateStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RetainedFamilySlotLookupIsExactAndRejectsAmbiguousRetiredIdentities()
+    {
+        var fixture = await CreateFamilySwitchFixtureAsync();
+        Assert.Null(await fixture.Store.LoadRetainedFamilySlotAsync(fixture.AccountId, BrowserFamily.Chrome, default));
+        await fixture.Store.TrySwitchFamilyAsync(fixture.Request, default);
+        var retained = await fixture.Store.LoadRetainedFamilySlotAsync(fixture.AccountId, BrowserFamily.Chrome, default);
+        Assert.Equal(fixture.OldSession.Identity.SessionId, retained!.Identity.SessionId);
+        Assert.Equal(ManagedBrowserSessionLifecycleState.Retired, retained.State);
+        Assert.Null(await fixture.Store.LoadRetainedFamilySlotAsync(fixture.AccountId, BrowserFamily.Edge, default));
+        Assert.Null(await fixture.Store.LoadRetainedFamilySlotAsync(Guid.NewGuid(), BrowserFamily.Chrome, default));
+        await fixture.Store.CreateSessionAsync(Session(fixture.OldInstallation.Identity.InstallationId,
+            fixture.AccountId, fixture.StableUid, BrowserFamily.Chrome, Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N")), default);
+        var failure = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            fixture.Store.LoadRetainedFamilySlotAsync(fixture.AccountId, BrowserFamily.Chrome, default));
+        Assert.DoesNotContain(fixture.StableUid, failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ConcurrentFamilySwitchBackToRetiredInstallationHasOneWinner()
     {
         var fixture = await CreateFamilySwitchFixtureAsync();
