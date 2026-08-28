@@ -12,6 +12,64 @@ namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class ManagedChromiumProcessManagerTests
 {
+    [Fact]
+    public async Task FailedTerminationRetainsPinsAndStopRetriesTheOwnedProcess()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var manager = fixture.Manager;
+        var session = (await manager.LaunchAsync(fixture.Installation, fixture.Profile)).Session!;
+        fixture.Processes.Process.FailTerminationOnce = true;
+
+        Assert.False(await manager.StopAsync(session));
+        Assert.True(fixture.Processes.Process.IsAlive);
+        Assert.False(fixture.ProfileLease.Disposed);
+        Assert.False(fixture.Executable.Disposed);
+        Assert.True(await manager.StopAsync(session));
+        Assert.Equal(2, fixture.Processes.Process.Terminations);
+        Assert.True(fixture.ProfileLease.Disposed);
+        Assert.True(fixture.Executable.Disposed);
+        manager.Dispose();
+        Assert.Equal(2, fixture.Processes.Process.Terminations);
+    }
+
+    [Fact]
+    public async Task NativeJobTerminationFailureCanBeRetriedWithoutReleasingHandles()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var manager = fixture.Manager;
+        var native = new FakeNative { FailJobTerminationOnce = true };
+        using var process = new WindowsJobObject(native).Launch(fixture.Executable, fixture.ProfileLease);
+
+        Assert.Throws<IOException>(process.Terminate);
+        Assert.True(process.IsAlive);
+        Assert.False(native.Job.IsClosed);
+        process.Terminate();
+        Assert.False(process.IsAlive);
+        Assert.True(process.WaitForExit(TimeSpan.FromMilliseconds(20)));
+        process.Dispose();
+        Assert.Equal(2, native.Events.Count(item => item == "terminate-job"));
+    }
+
+    [Fact]
+    public async Task FailedUnassignedRootTerminationReturnsOwnedHandlesForRetry()
+    {
+        var fixture = await Fixture.CreateAsync();
+        using var manager = fixture.Manager;
+        var native = new FakeNative { AssignSucceeds = false, FailRootTerminationOnce = true };
+        var failure = Assert.Throws<OwnedChromiumLaunchException>(() =>
+            new WindowsJobObject(native).Launch(fixture.Executable, fixture.ProfileLease));
+        using var process = failure.Process;
+        Assert.False(native.Root.IsClosed);
+        Assert.False(native.Job.IsClosed);
+        Assert.DoesNotContain("resume", native.Events);
+        process.Terminate();
+        Assert.True(process.WaitForExit(TimeSpan.FromMilliseconds(20)));
+        process.Dispose();
+        Assert.True(native.Root.IsClosed);
+        Assert.True(native.Job.IsClosed);
+        Assert.Equal(2, native.Events.Count(item => item == "terminate-root"));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -450,12 +508,18 @@ public sealed class ManagedChromiumProcessManagerTests
         public DateTimeOffset StartedAtUtc => DateTimeOffset.UtcNow.AddSeconds(-1);
         public bool Alive = true, Owned = true, ExecutableMatches = true, ExitConfirmed = true;
         public int AdditionalOwnedPid;
+        public bool FailTerminationOnce;
         public bool IsAlive => Alive;
         public int Terminations, GracefulCloses;
         public bool OwnsProcess(int processId) => Owned && (processId == 123 || processId == AdditionalOwnedPid);
         public bool VerifyExecutable(int processId, IBrowserExecutableLaunchLease executable) => ExecutableMatches && executable.Validate();
         public Task CloseGracefullyAsync(TimeSpan timeout, CancellationToken cancellationToken) { GracefulCloses++; return Task.CompletedTask; }
-        public void Terminate() { Terminations++; Alive = false; }
+        public void Terminate()
+        {
+            Terminations++;
+            if (FailTerminationOnce) { FailTerminationOnce = false; throw new IOException("Termination failed."); }
+            Alive = false;
+        }
         public bool WaitForExit(TimeSpan timeout) => ExitConfirmed;
         public void Dispose() { }
     }
@@ -489,7 +553,7 @@ public sealed class ManagedChromiumProcessManagerTests
     {
         public List<string> Events = [];
         public IReadOnlyList<string> Arguments = [];
-        public bool AssignSucceeds = true;
+        public bool AssignSucceeds = true, FailJobTerminationOnce, FailRootTerminationOnce;
         private bool alive = true;
         public SafeFileHandle Job = new(new IntPtr(1), false);
         public SafeProcessHandle Root = new(new IntPtr(2), false);
@@ -505,8 +569,20 @@ public sealed class ManagedChromiumProcessManagerTests
         public string ReadImagePath(SafeProcessHandle process) => @"C:\Browser\chrome.exe";
         public SafeProcessHandle OpenProcess(int processId) => new(new IntPtr(4), false);
         public void CloseWindows(SafeFileHandle job) { }
-        public void TerminateJob(SafeFileHandle job) { Events.Add("terminate-job"); alive = false; }
-        public void TerminateProcess(SafeProcessHandle process) { Events.Add("terminate-root"); alive = false; }
+        public bool TerminateJob(SafeFileHandle job)
+        {
+            Events.Add("terminate-job");
+            if (FailJobTerminationOnce) { FailJobTerminationOnce = false; return false; }
+            if (AssignSucceeds) alive = false;
+            return true;
+        }
+        public bool TerminateProcess(SafeProcessHandle process)
+        {
+            Events.Add("terminate-root");
+            if (FailRootTerminationOnce) { FailRootTerminationOnce = false; return false; }
+            alive = false;
+            return true;
+        }
     }
 
     private sealed class FakeTargetTransport(DevToolsActivePort port, string scenario) : IChromiumTargetTransport

@@ -419,7 +419,12 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
             lock (disposalGate)
             {
                 if (disposed) return true;
-                if (!terminationRequested) { Process.Terminate(); terminationRequested = true; }
+                if (!terminationRequested)
+                {
+                    try { Process.Terminate(); }
+                    catch (IOException) { return false; } // Preserve the entry and both pins for an explicit retry.
+                    terminationRequested = true;
+                }
                 if (!Process.WaitForExit(TimeSpan.FromSeconds(2))) return false;
                 disposed = true;
                 Process.Dispose(); PortFile?.Dispose(); Profile.Dispose(); Executable.Dispose();

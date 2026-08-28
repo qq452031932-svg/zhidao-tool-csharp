@@ -61,7 +61,8 @@ internal sealed class WindowsJobObject : IManagedChromiumProcessFactory
             if (root is not null)
             {
                 var failed = new OwnedJob(native, job, root, terminateRoot: true);
-                failed.Terminate();
+                try { failed.Terminate(); }
+                catch (IOException) { /* Keep the held root/job available for a later termination attempt. */ }
                 if (!failed.WaitForExit(TimeSpan.FromSeconds(2)))
                     throw new OwnedChromiumLaunchException(failed); // Transfer retained handles to the manager's cleanup path.
                 failed.Dispose();
@@ -97,7 +98,8 @@ internal sealed class WindowsJobObject : IManagedChromiumProcessFactory
     private sealed class OwnedJob(IWindowsChromiumNativeApi native, SafeFileHandle job, SuspendedChromiumProcess root, bool terminateRoot = false)
         : IManagedChromiumProcess
     {
-        private int terminated;
+        private readonly object terminationGate = new();
+        private bool terminated;
         public int RootProcessId => root.ProcessId;
         public DateTimeOffset StartedAtUtc => root.StartedAtUtc;
         public bool IsAlive => !root.Process.IsClosed && !job.IsClosed && native.IsAlive(root.Process);
@@ -126,9 +128,17 @@ internal sealed class WindowsJobObject : IManagedChromiumProcessFactory
         }
         public void Terminate()
         {
-            if (Interlocked.Exchange(ref terminated, 1) != 0) return;
-            if (terminateRoot && !root.Process.IsClosed) native.TerminateProcess(root.Process);
-            if (!job.IsClosed) native.TerminateJob(job);
+            lock (terminationGate)
+            {
+                if (terminated) return;
+                if (terminateRoot && !root.Process.IsClosed && native.IsAlive(root.Process) &&
+                    !native.TerminateProcess(root.Process) && native.IsAlive(root.Process))
+                    throw new IOException("The owned browser root could not be terminated; retry is required.");
+                if (!job.IsClosed && !native.TerminateJob(job))
+                    throw new IOException("The owned browser job could not be terminated; retry is required.");
+                // Failed native calls must never consume the retry; successful requests remain idempotent.
+                terminated = true;
+            }
         }
         public bool WaitForExit(TimeSpan timeout)
         {
@@ -163,8 +173,8 @@ internal interface IWindowsChromiumNativeApi
     string ReadImagePath(SafeProcessHandle process);
     SafeProcessHandle OpenProcess(int processId);
     void CloseWindows(SafeFileHandle job);
-    void TerminateJob(SafeFileHandle job);
-    void TerminateProcess(SafeProcessHandle process);
+    bool TerminateJob(SafeFileHandle job);
+    bool TerminateProcess(SafeProcessHandle process);
 }
 
 internal sealed class WindowsChromiumNativeApi : IWindowsChromiumNativeApi
@@ -219,8 +229,10 @@ internal sealed class WindowsChromiumNativeApi : IWindowsChromiumNativeApi
             return true;
         }, IntPtr.Zero);
     }
-    public void TerminateJob(SafeFileHandle job) { if (!job.IsClosed && !job.IsInvalid) Native.TerminateJobObject(job, 1); }
-    public void TerminateProcess(SafeProcessHandle process) { if (!process.IsClosed && !process.IsInvalid) Native.TerminateProcess(process, 1); }
+    public bool TerminateJob(SafeFileHandle job) =>
+        !job.IsClosed && !job.IsInvalid && Native.TerminateJobObject(job, 1);
+    public bool TerminateProcess(SafeProcessHandle process) =>
+        !process.IsClosed && !process.IsInvalid && Native.TerminateProcess(process, 1);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimitInformation
