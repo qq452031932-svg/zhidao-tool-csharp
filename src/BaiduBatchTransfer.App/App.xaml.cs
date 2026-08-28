@@ -2,6 +2,7 @@ using System.Windows;
 using System.IO;
 using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
+using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 #if DEBUG
@@ -40,7 +41,8 @@ public partial class App : System.Windows.Application
             shutdownCoordinator = new ApplicationShutdownCoordinator(
                 configuredHost.Services.GetRequiredService<VisibleWebAutomationQueue>(),
                 _ => configuredHost.StopAsync(TimeSpan.FromSeconds(5)),
-                configuredHost);
+                configuredHost,
+                configuredHost.Services.GetRequiredService<ManagedChromiumProcessManager>());
             MainWindow.Closing += OnMainWindowClosing;
             MainWindow.Show();
 #if DEBUG

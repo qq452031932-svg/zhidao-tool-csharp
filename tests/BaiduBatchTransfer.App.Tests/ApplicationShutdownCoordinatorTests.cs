@@ -5,6 +5,51 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class ApplicationShutdownCoordinatorTests
 {
     [Fact]
+    public async Task ManagedBrowserStopsAfterQueueFencesAndBeforeHostDisposal()
+    {
+        var events = new List<string>();
+        var coordinator = new ApplicationShutdownCoordinator(new RecordingAsyncDisposable(events),
+            _ => { events.Add("host-stopped"); return Task.CompletedTask; }, new RecordingDisposable(events),
+            new BrowserShutdown(events));
+        Assert.True(await coordinator.ShutdownAsync(TimeSpan.FromSeconds(1)));
+        Assert.Equal(["queue-disposed", "browser-stopped", "host-stopped", "host-disposed"], events);
+    }
+
+    [Fact]
+    public async Task UnconfirmedBrowserExitKeepsHostAliveAndAllowsRetry()
+    {
+        var events = new List<string>();
+        var browser = new BrowserShutdown(events) { Fail = true };
+        var coordinator = new ApplicationShutdownCoordinator(new RecordingAsyncDisposable(events),
+            _ => { events.Add("host-stopped"); return Task.CompletedTask; }, new RecordingDisposable(events), browser);
+        Assert.False(await coordinator.ShutdownAsync(TimeSpan.FromSeconds(1)));
+        Assert.DoesNotContain("host-disposed", events);
+        browser.Fail = false;
+        Assert.True(await coordinator.ShutdownAsync(TimeSpan.FromSeconds(1)));
+        Assert.Equal(1, events.Count(value => value == "queue-disposed"));
+    }
+
+    [Fact]
+    public void ApplicationRegistersManagedProcessManagerAndPassesItToRealShutdownCoordinator()
+    {
+        var root = FindRepositoryRoot();
+        var bootstrap = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "AppBootstrap.cs"));
+        var app = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "App.xaml.cs"));
+        Assert.Contains("AddSingleton<ManagedChromiumProcessManager>", bootstrap, StringComparison.Ordinal);
+        Assert.Contains("GetRequiredService<ManagedChromiumProcessManager>()", app, StringComparison.Ordinal);
+    }
+
+    private sealed class BrowserShutdown(List<string> events) : IAsyncDisposable
+    {
+        public bool Fail;
+        public ValueTask DisposeAsync()
+        {
+            if (Fail) throw new IOException("Unconfirmed owned job exit.");
+            events.Add("browser-stopped");
+            return ValueTask.CompletedTask;
+        }
+    }
+    [Fact]
     public void ApplicationDefersMainWindowCloseUntilAsyncCoordinatorCompletes()
     {
         var source = File.ReadAllText(Path.Combine(

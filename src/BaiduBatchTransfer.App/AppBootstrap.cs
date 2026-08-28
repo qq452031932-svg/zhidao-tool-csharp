@@ -249,6 +249,7 @@ public static class AppBootstrap
         services.AddSingleton<IManagedBrowserProfileStore>(sp =>
             sp.GetRequiredService<FileSystemManagedBrowserProfileStore>());
         services.AddSingleton<NullManagedBrowserLifecycle>();
+        services.AddSingleton<ManagedChromiumProcessManager>();
         services.AddSingleton<IManagedBrowserLifecycle>(sp =>
             sp.GetRequiredService<NullManagedBrowserLifecycle>());
         services.AddSingleton<BrowserSelectionProcessContext>();

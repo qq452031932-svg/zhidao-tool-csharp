@@ -63,6 +63,20 @@ public interface IManagedBrowserProfilePolicy
         CancellationToken cancellationToken = default);
 }
 
+public interface IManagedBrowserProfileLease : IDisposable
+{
+    ManagedBrowserProfileDescriptor Profile { get; }
+    bool Validate();
+    IManagedBrowserPortFileLease? OpenDevToolsActivePort();
+}
+
+public interface IManagedBrowserPortFileLease : IDisposable
+{
+    DateTimeOffset LastWriteTimeUtc { get; }
+    byte[] ReadBounded(int maximumBytes);
+    bool Validate();
+}
+
 internal sealed class ManagedBrowserProfilePolicyTestHooks
 {
     public Action? AfterTrustedNamespacePinned { get; init; }
@@ -242,6 +256,100 @@ internal sealed class PhysicalManagedProfileVolumeCapabilityReader : IManagedPro
 
 public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfilePolicy
 {
+    public async Task<IManagedBrowserProfileLease> PinExistingAsync(ManagedBrowserProfileDescriptor expected,
+        CancellationToken cancellationToken = default)
+    {
+        if ((await OpenExistingAsync(expected, cancellationToken).ConfigureAwait(false)).Status != ManagedBrowserProfileStatus.Ready)
+            throw new IOException("The managed profile cannot be pinned.");
+        var ns = PinnedNamespace.Open(appDataRoot, false, volumeCapabilityReader, identityReader, testHooks?.Diagnostic);
+        PinnedEntry? marker = null;
+        try
+        {
+            var parent = ns.AppRoot;
+            var path = appDataRoot;
+            foreach (var component in new[] { ManagedRootName, FamilyName(expected.Family), expected.AccountId.ToString("N") })
+            {
+                var child = ns.TryOpenOwnedDirectory(parent, component) ?? throw new IOException("Managed profile missing.");
+                path = Path.Combine(path, component);
+                ns.OwnAndTrack(path, child);
+                parent = child;
+            }
+            ns.PinDirectoriesAgainstReplacement();
+            marker = PinnedNamespace.TryOpenMarkerStatic(parent, MarkerName) ?? throw new IOException("Managed profile marker missing.");
+            var account = parent;
+            bool Validate() => ns.Revalidate() && ReadExistingProfile(ns, account, expected.AccountId,
+                expected.Family, expected.CanonicalSourcePath, expected, CancellationToken.None).Status == ManagedBrowserProfileStatus.Ready;
+            if (!Validate()) throw new IOException("Managed profile changed.");
+            cancellationToken.ThrowIfCancellationRequested();
+            return new ProfileLease(expected, ns, account, marker, Validate);
+        }
+        catch { marker?.Dispose(); ns.Dispose(); throw; }
+    }
+
+    private sealed class ProfileLease(ManagedBrowserProfileDescriptor profile, PinnedNamespace ns,
+        PinnedEntry account, PinnedEntry marker, Func<bool> validate) : IManagedBrowserProfileLease
+    {
+        private bool disposed;
+        public ManagedBrowserProfileDescriptor Profile => profile;
+        public bool Validate()
+        {
+            if (disposed) return false;
+            try { return validate(); } catch (IOException) { return false; }
+        }
+        public IManagedBrowserPortFileLease? OpenDevToolsActivePort()
+        {
+            if (!Validate()) throw new IOException("Managed profile changed.");
+            var file = PinnedNamespace.TryOpenMarkerStatic(account, "DevToolsActivePort");
+            if (file is null) return null;
+            if (!file.IsOrdinaryFile) { file.Dispose(); throw new IOException("Unsafe port file."); }
+            try
+            {
+                return new PortFileLease(file, () => Validate() &&
+                    PinnedNamespace.RelativeIdentityMatchesStatic(account, "DevToolsActivePort", file));
+            }
+            catch { file.Dispose(); throw; }
+        }
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            marker.Dispose();
+            ns.Dispose();
+        }
+    }
+
+    private sealed class PortFileLease : IManagedBrowserPortFileLease
+    {
+        private readonly PinnedEntry file;
+        private readonly Func<bool> validate;
+        private bool disposed;
+        public PortFileLease(PinnedEntry file, Func<bool> validate)
+        {
+            this.file = file;
+            this.validate = validate;
+            LastWriteTimeUtc = File.GetLastWriteTimeUtc(file.Handle);
+        }
+        public DateTimeOffset LastWriteTimeUtc { get; }
+        public bool Validate() => !disposed && validate() && File.GetLastWriteTimeUtc(file.Handle) == LastWriteTimeUtc.UtcDateTime;
+        public byte[] ReadBounded(int maximumBytes)
+        {
+            if (maximumBytes is < 1 or > 65536) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+            if (!Validate()) throw new IOException("Port file changed.");
+            var buffer = new byte[maximumBytes + 1];
+            var count = 0;
+            while (count < buffer.Length)
+            {
+                var read = RandomAccess.Read(file.Handle, buffer.AsSpan(count), count);
+                if (read == 0) break;
+                count += read;
+            }
+            if (count > maximumBytes) throw new InvalidDataException("Port file is too large.");
+            if (!Validate()) throw new IOException("Port file changed.");
+            return buffer[..count];
+        }
+        public void Dispose() { if (disposed) return; disposed = true; file.Dispose(); }
+    }
+
     internal const string MarkerName = ".bbt-managed-profile-owner.v1";
     private const string ManagedRootName = "managed-browser-profiles";
     private readonly string appDataRoot;
@@ -632,6 +740,17 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
             using (current) return current.SameIdentity(expected);
         }
         public void TrackPublished(string path, PinnedEntry published) => TrackOwned(path, published);
+        public void OwnAndTrack(string path, PinnedEntry entry) { owned.Add(entry); TrackOwned(path, entry); }
+        public void PinDirectoriesAgainstReplacement()
+        {
+            foreach (var item in tracked)
+            {
+                var pin = TryOpenAbsoluteDirectory(item.Path, item.Entry.IdentityReader, allowDelete: false);
+                if (pin is null) throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+                owned.Add(pin);
+                if (!pin.SameIdentity(item.Entry)) throw Policy(ManagedBrowserProfileIsolationReason.ConcurrentMutation);
+            }
+        }
         public void TrackOwned(string path, PinnedEntry entry) => tracked.Add((path, entry, true));
         public bool Revalidate()
         {
@@ -754,11 +873,11 @@ public sealed class FileSystemManagedBrowserProfilePolicy : IManagedBrowserProfi
     private static PinnedEntry OpenAbsoluteDirectory(string path, IPinnedFileIdentityReader identityReader) =>
         TryOpenAbsoluteDirectory(path, identityReader) ??
         throw Policy(ManagedBrowserProfileIsolationReason.UnsafePath);
-    private static PinnedEntry? TryOpenAbsoluteDirectory(string path, IPinnedFileIdentityReader identityReader)
+    private static PinnedEntry? TryOpenAbsoluteDirectory(string path, IPinnedFileIdentityReader identityReader, bool allowDelete = true)
     {
         var handle = NativeMethods.CreateFileW(path,
             NativeMethods.FileReadAttributes | NativeMethods.FileTraverse,
-            NativeMethods.FileShareRead | NativeMethods.FileShareWrite | NativeMethods.FileShareDelete,
+            NativeMethods.FileShareRead | NativeMethods.FileShareWrite | (allowDelete ? NativeMethods.FileShareDelete : 0),
             IntPtr.Zero, NativeMethods.OpenExisting,
             NativeMethods.FileFlagBackupSemantics | NativeMethods.FileFlagOpenReparsePoint, IntPtr.Zero);
         if (handle.IsInvalid)

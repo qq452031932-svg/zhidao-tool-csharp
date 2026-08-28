@@ -6,17 +6,21 @@ public sealed class ApplicationShutdownCoordinator
     private readonly IAsyncDisposable queue;
     private readonly Func<CancellationToken, Task> stopHostAsync;
     private readonly IDisposable host;
+    private readonly IAsyncDisposable? managedBrowser;
     private Task? queueDisposal;
-    private Task? finalization;
+    private Task<bool>? finalization;
+    private Task? browserDisposal;
 
     public ApplicationShutdownCoordinator(
         IAsyncDisposable queue,
         Func<CancellationToken, Task> stopHostAsync,
-        IDisposable host)
+        IDisposable host,
+        IAsyncDisposable? managedBrowser = null)
     {
         this.queue = queue ?? throw new ArgumentNullException(nameof(queue));
         this.stopHostAsync = stopHostAsync ?? throw new ArgumentNullException(nameof(stopHostAsync));
         this.host = host ?? throw new ArgumentNullException(nameof(host));
+        this.managedBrowser = managedBrowser;
     }
 
     public async Task<bool> ShutdownAsync(
@@ -41,22 +45,39 @@ public sealed class ApplicationShutdownCoordinator
             return false;
         }
 
-        Task finalize;
+        Task<bool> finalize;
         lock (gate)
             finalize = finalization ??= FinalizeHostAsync();
-        await finalize.WaitAsync(cancellationToken).ConfigureAwait(false);
-        return true;
+        var completed = await finalize.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!completed)
+            lock (gate)
+                if (ReferenceEquals(finalization, finalize)) finalization = null;
+        return completed;
     }
 
     private async Task DisposeQueueAsync() => await queue.DisposeAsync().ConfigureAwait(false);
 
-    private async Task FinalizeHostAsync()
+    private async Task<bool> FinalizeHostAsync()
     {
+        if (managedBrowser is not null)
+        {
+            try
+            {
+                browserDisposal ??= managedBrowser.DisposeAsync().AsTask();
+                await browserDisposal.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                if (browserDisposal?.IsFaulted == true || browserDisposal?.IsCanceled == true) browserDisposal = null;
+                return false; // Do not dispose persistence/profile dependencies while owned exit is unconfirmed.
+            }
+        }
         try { await stopHostAsync(CancellationToken.None).ConfigureAwait(false); }
         catch (Exception)
         {
             // Stopping is best-effort during shutdown; disposal still releases the host.
         }
         finally { host.Dispose(); }
+        return true;
     }
 }

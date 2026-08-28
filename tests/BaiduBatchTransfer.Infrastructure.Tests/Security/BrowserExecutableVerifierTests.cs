@@ -12,6 +12,48 @@ public sealed class BrowserExecutableVerifierTests
     private const string DirectoryPath = @"C:\Selected\Application";
     private const string ChromePath = @"C:\Selected\Application\chrome.exe";
 
+    [Fact]
+    public async Task LaunchLeaseReopensExecutableIdentityForEachProcessProof()
+    {
+        var dependencies = ValidDependencies();
+        var verifier = dependencies.CreateVerifier();
+        var identity = (await verifier.VerifyAsync(DirectoryPath, BrowserFamily.Chrome, CancellationToken.None)).Identity!;
+        using var lease = await verifier.PinForLaunchAsync(identity, CancellationToken.None);
+        var opens = dependencies.Native.OpenedExecutableComponents.Count;
+        Assert.True(lease.MatchesExecutablePath(ChromePath));
+        Assert.Equal(opens + 1, dependencies.Native.OpenedExecutableComponents.Count);
+    }
+
+    [Fact]
+    public async Task LaunchLeaseRetainsVerifiedDirectoryAndExecutablePinsUntilDisposed()
+    {
+        var dependencies = ValidDependencies();
+        var verifier = dependencies.CreateVerifier();
+        var identity = (await verifier.VerifyAsync(DirectoryPath, BrowserFamily.Chrome, CancellationToken.None)).Identity!;
+        dependencies.Native.Handles.Clear();
+        using (var lease = await verifier.PinForLaunchAsync(identity, CancellationToken.None))
+        {
+            Assert.Same(identity, lease.Identity);
+            Assert.True(lease.Validate());
+            var retained = dependencies.Native.Handles.ToArray();
+            Assert.True(lease.MatchesExecutablePath(ChromePath));
+            Assert.False(lease.MatchesExecutablePath(@"C:\Outside\chrome.exe"));
+            Assert.All(retained, handle => Assert.False(handle.IsDisposed));
+        }
+        Assert.All(dependencies.Native.Handles, handle => Assert.True(handle.IsDisposed));
+    }
+
+    [Fact]
+    public async Task LaunchLeaseRejectsReplacedExecutableAndDisposesPins()
+    {
+        var dependencies = ValidDependencies();
+        var verifier = dependencies.CreateVerifier();
+        var identity = (await verifier.VerifyAsync(DirectoryPath, BrowserFamily.Chrome, CancellationToken.None)).Identity!;
+        dependencies.Native.FileInfo = new(@"C:\Outside\chrome.exe", false);
+        await Assert.ThrowsAsync<IOException>(() => verifier.PinForLaunchAsync(identity, CancellationToken.None));
+        Assert.All(dependencies.Native.Handles, handle => Assert.True(handle.IsDisposed));
+    }
+
     [Theory]
     [InlineData(BrowserFamily.Chrome, "chrome.exe", "Google LLC", "Google Chrome")]
     [InlineData(BrowserFamily.Edge, "msedge.exe", "Microsoft Corporation", "Microsoft Edge")]

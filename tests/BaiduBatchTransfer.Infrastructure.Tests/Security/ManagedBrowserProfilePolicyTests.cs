@@ -17,6 +17,36 @@ public sealed class ManagedBrowserProfilePolicyTests : IDisposable
         Path.GetTempPath(), $"bbt-managed-profile-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task LaunchLeasePinsProfileMarkerAndBoundedPortFileUntilDisposed()
+    {
+        var policy = new FileSystemManagedBrowserProfilePolicy(root);
+        var profile = (await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome)).Profile!;
+        var portPath = Path.Combine(profile.CanonicalSourcePath, "DevToolsActivePort");
+        await File.WriteAllTextAsync(portPath, "49152\n/devtools/browser/76df3c18-1013-45fd-a989-2fbb60477286");
+        using var lease = await policy.PinExistingAsync(profile);
+        Assert.True(lease.Validate());
+        Assert.Throws<IOException>(() => Directory.Move(profile.CanonicalSourcePath, profile.CanonicalSourcePath + "-moved"));
+        using var port = lease.OpenDevToolsActivePort();
+        Assert.NotNull(port);
+        Assert.True(port.Validate());
+        Assert.True(port.LastWriteTimeUtc > DateTimeOffset.UtcNow.AddMinutes(-1));
+        Assert.Contains((byte)'4', port.ReadBounded(512));
+        Assert.Throws<InvalidDataException>(() => port.ReadBounded(3));
+        Assert.Throws<IOException>(() => File.Move(portPath, portPath + "-moved"));
+        Assert.Throws<IOException>(() => File.WriteAllText(portPath, "replacement"));
+    }
+
+    [Fact]
+    public async Task LaunchLeaseRejectsMismatchedProfileIdentity()
+    {
+        var policy = new FileSystemManagedBrowserProfilePolicy(root);
+        var profile = (await policy.GetOrCreateAsync(Guid.NewGuid(), BrowserFamily.Chrome)).Profile!;
+        var changed = new ManagedBrowserProfileDescriptor(profile.AccountId, profile.Family,
+            Guid.NewGuid(), profile.OwnershipId, profile.CanonicalSourcePath);
+        await Assert.ThrowsAsync<IOException>(() => policy.PinExistingAsync(changed));
+    }
+
+    [Fact]
     public async Task CreatesOpaqueCanonicalAccountPathAndReusesMarkerIdentityAfterRestart()
     {
         var accountId = Guid.Parse("CB75EC33-9A9C-4215-A2A7-4AC72CDF21AA");

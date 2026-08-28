@@ -119,6 +119,13 @@ public interface IBrowserPinnedHandle : IDisposable
     SafeFileHandle SafeHandle { get; }
 }
 
+public interface IBrowserExecutableLaunchLease : IDisposable
+{
+    BrowserInstallationIdentity Identity { get; }
+    bool Validate();
+    bool MatchesExecutablePath(string path);
+}
+
 public sealed record BrowserNativeHandleInfo(
     string FinalPath,
     bool IsReparsePoint,
@@ -183,6 +190,47 @@ public interface IBrowserProductReader
 
 public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
 {
+    public async Task<IBrowserExecutableLaunchLease> PinForLaunchAsync(BrowserInstallationIdentity expectedIdentity,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(expectedIdentity);
+        IBrowserExecutableLaunchLease? lease = null;
+        var result = await VerifyCoreAsync(expectedIdentity.InstallationDirectory, expectedIdentity.BrowserFamily,
+            cancellationToken, (identity, validate, matchesPath, release) =>
+            {
+                if (!SamePersistedIdentity(expectedIdentity, identity))
+                    throw new IOException("The browser installation changed before launch.");
+                lease = new LaunchLease(expectedIdentity, validate, matchesPath, release);
+            }).ConfigureAwait(false);
+        if (!result.IsVerified || lease is null)
+            throw new IOException("The browser installation could not be pinned for launch.");
+        return lease;
+    }
+
+    private sealed class LaunchLease(BrowserInstallationIdentity identity, Func<bool> validate, Func<string, bool> matchesPath, Action release)
+        : IBrowserExecutableLaunchLease
+    {
+        private bool disposed;
+        public BrowserInstallationIdentity Identity => identity;
+        public bool Validate()
+        {
+            if (disposed) return false;
+            try { return validate(); }
+            catch { return false; }
+        }
+        public bool MatchesExecutablePath(string path)
+        {
+            if (!Validate() || !string.Equals(path, identity.ExecutablePath, StringComparison.OrdinalIgnoreCase)) return false;
+            try { return matchesPath(path); } catch { return false; }
+        }
+        public void Dispose()
+        {
+            if (disposed) return;
+            disposed = true;
+            release();
+        }
+    }
+
     public const long MaximumSupportedExecutableBytes = 512L * 1024 * 1024;
 
     private readonly IBrowserNativeHandleReader nativeHandles;
@@ -219,10 +267,14 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         this.installationIdFactory = installationIdFactory ?? Guid.NewGuid;
     }
 
-    public async Task<BrowserExecutableVerificationResult> VerifyAsync(
+    public Task<BrowserExecutableVerificationResult> VerifyAsync(
         string selectedDirectory,
         BrowserFamily family,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) => VerifyCoreAsync(selectedDirectory, family, cancellationToken, null);
+
+    private async Task<BrowserExecutableVerificationResult> VerifyCoreAsync(
+        string selectedDirectory, BrowserFamily family, CancellationToken cancellationToken,
+        Action<BrowserInstallationIdentity, Func<bool>, Func<string, bool>, Action>? retainPins)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (family is not (BrowserFamily.Chrome or BrowserFamily.Edge))
@@ -234,6 +286,7 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         var directoryHandles = new List<IBrowserPinnedHandle>(directoryComponents.Length + 1);
         var initialDirectoryInfos = new List<BrowserNativeHandleInfo>(directoryComponents.Length + 1);
         IBrowserPinnedHandle? executableHandle = null;
+        var transferred = false;
         try
         {
             var rootHandle = OpenRoot(rootPath);
@@ -337,6 +390,27 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
                 installationIdFactory(), family, finalDirectory, finalExecutable,
                 signature.Publisher, productName,
                 $"{initialFileIdentity.VolumeId}:{initialFileIdentity.FileId}:{snapshot.Sha256.ToLowerInvariant()}");
+            if (retainPins is not null)
+            {
+                retainPins(identity, () => StillSame(directoryHandles, initialDirectoryInfos,
+                    executableHandle, initialExecutable, initialFileIdentity, finalDirectory, finalExecutable),
+                    path =>
+                    {
+                        if (!string.Equals(path, finalExecutable, StringComparison.OrdinalIgnoreCase)) return false;
+                        using var reopened = nativeHandles.OpenExecutableChild(selectedDirectoryHandle, executableName);
+                        return nativeHandles.ReadInfo(reopened) == initialExecutable &&
+                            fileIdentities.Read(reopened) == initialFileIdentity &&
+                            StillSame(directoryHandles, initialDirectoryInfos, executableHandle,
+                                initialExecutable, initialFileIdentity, finalDirectory, finalExecutable);
+                    },
+                    () =>
+                    {
+                        executableHandle.Dispose();
+                        for (var index = directoryHandles.Count - 1; index >= 0; index--)
+                            directoryHandles[index].Dispose();
+                    });
+                transferred = true;
+            }
             return BrowserExecutableVerificationResult.Verified(identity);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -353,9 +427,12 @@ public sealed class BrowserExecutableVerifier : IBrowserExecutableVerifier
         }
         finally
         {
-            executableHandle?.Dispose();
-            for (var index = directoryHandles.Count - 1; index >= 0; index--)
-                directoryHandles[index].Dispose();
+            if (!transferred)
+            {
+                executableHandle?.Dispose();
+                for (var index = directoryHandles.Count - 1; index >= 0; index--)
+                    directoryHandles[index].Dispose();
+            }
         }
     }
 
