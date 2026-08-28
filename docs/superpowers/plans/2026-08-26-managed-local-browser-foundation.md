@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-26-local-browser-automation-migration-design.md`
 
+## Execution checkpoint — 2026-08-28
+
+Tasks 1–7 were completed previously. Task 8 is complete through `babb1ff`: fresh real-helper integrity tests 76/76 (0 skipped), Python tests 28/28, Release `-warnaserror` build and manifest gate pass; independent spec and quality re-reviews both passed. See `docs/testing/managed-browser-task8-handoff.md` for evidence and the cleanup incident's unresolved historical ACL uncertainty. Task 9 is next; Tasks 10–12 and the follow-on transfer/share write plans are not yet complete.
+
 ---
 
 ## Scope boundary
@@ -599,21 +603,21 @@ git commit -m "feat: define managed browser helper protocol"
 - Modify: `src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj`
 - Create: `tests/BaiduBatchTransfer.App.Tests/Features/ManagedBrowserHelperIntegrityVerifierTests.cs`
 
-- [ ] **Step 1: Write manifest parser RED tests**
+- [x] **Step 1: Write manifest parser RED tests**
 
 Cover missing file, altered byte, extra unlisted executable, old protocol/runtime version, path escape, duplicate manifest path, absent license notice, and a valid fixture. Tests must prove launch is not attempted after verification failure.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ManagedBrowserHelperIntegrityVerifierTests`
 
 Expected: FAIL because the manifest verifier does not exist.
 
-- [ ] **Step 3: Implement the runtime manifest verifier**
+- [x] **Step 3: Implement the runtime manifest verifier**
 
 Embed the expected manifest bytes in the signed .NET application, reject unexpected executable/library files, and verify every listed file's length and SHA-256 before process creation. Run the focused test and expect PASS.
 
-- [ ] **Step 4: Add the exact locked helper build inputs**
+- [x] **Step 4: Add the exact locked helper build inputs**
 
 Use the official CPython embeddable archive and fail on any digest mismatch:
 
@@ -647,11 +651,11 @@ websocket-client==1.9.0 --hash=sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e
 
 `THIRD_PARTY_NOTICES.txt` must include the complete license texts and this inventory: CPython/PSF-2.0; DrissionPage/custom personal and legal non-profit license; certifi/MPL-2.0; charset-normalizer, DrissionRecord, et-xmlfile, filelock, openpyxl, urllib3/MIT; click, cssselect, idna, lxml, psutil, tldextract/BSD-3-Clause; DrissionGet/BSD; requests-file, requests, websocket-client/Apache-2.0. Because DrissionPage's bundled license prohibits commercial use without authorization, the build must require an explicit `-DistributionMode PersonalNonCommercial`; any commercial/distributable build is blocked until written authorization is recorded or the helper library is replaced.
 
-- [ ] **Step 5: Implement self-contained packaging**
+- [x] **Step 5: Implement self-contained packaging**
 
 The build script extracts the pinned CPython embeddable runtime into an isolated staging directory, installs only the hashed locked wheels into its private `site-packages`, copies the helper source/notices, and removes caches/tests. The external `helper-manifest.json` is UTF-8 without BOM with LF endings and contains `manifestVersion`, `protocolVersion`, `executionEngineVersion`, `pythonVersion`, `distributionMode`, followed by every other direct-child/descendant regular file as a forward-slash relative path, byte length, and lowercase SHA-256 sorted by ordinal path. The manifest explicitly excludes itself. At runtime, first compare the external manifest bytes to the manifest embedded in the signed .NET executable; only then verify every listed payload file and reject absolute paths, `..`, duplicate case-insensitive paths, reparse points, and unlisted files. The target computer must not need Python or pip.
 
-- [ ] **Step 6: Build twice in independent directories and compare**
+- [x] **Step 6: Build twice in independent directories and compare**
 
 Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_managed_browser_helper.ps1 -DistributionMode PersonalNonCommercial -OutputDirectory artifacts\helper-build-a`
 
@@ -661,7 +665,7 @@ Run: `Get-FileHash artifacts\helper-build-a\helper-manifest.json; Get-FileHash a
 
 Expected: the two manifest payloads are byte-identical for identical inputs.
 
-- [ ] **Step 7: Run integrity tests and commit**
+- [x] **Step 7: Run integrity tests and commit**
 
 Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~ManagedBrowserHelperIntegrityVerifierTests`
 
