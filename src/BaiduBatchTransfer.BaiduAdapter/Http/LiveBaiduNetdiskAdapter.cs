@@ -21,7 +21,7 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
 
     public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(
         AccountSession session,
-        CancellationToken cancellationToken) => NotValidated<AccountCapacity>(session, cancellationToken);
+        CancellationToken cancellationToken) => identityClient.GetCapacityAsync(session, cancellationToken);
 
     public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(
         AccountSession session,

@@ -41,6 +41,102 @@ public sealed class BaiduSessionIdentityClientTests
         Assert.Equal("账号甲", result.Value.DisplayName);
     }
 
+    [Fact]
+    public async Task StableCapacityIsReadFromBoundedOfficialSameOriginResponse()
+    {
+        var handler = new RecordingHandler(HttpStatusCode.OK,
+            """{"errno":0,"total":2199023255552,"used":549755813888}""");
+        using var client = new BaiduSessionIdentityClient(handler);
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+
+        var result = await adapter.GetCapacityAsync(Session(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(2199023255552, result.Value!.TotalBytes);
+        Assert.Equal(549755813888, result.Value.UsedBytes);
+        Assert.Equal("https", handler.RequestUri!.Scheme);
+        Assert.Equal("pan.baidu.com", handler.RequestUri.IdnHost);
+        Assert.Equal("/api/quota", handler.RequestUri.AbsolutePath);
+        Assert.Contains("BDUSS=secret-a", handler.CookieHeader, StringComparison.Ordinal);
+        Assert.DoesNotContain("STOKEN=secret-b", handler.CookieHeader, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("{\"errno\":0,\"used\":1}")]
+    [InlineData("{\"errno\":0,\"total\":2}")]
+    [InlineData("{\"errno\":0,\"total\":-1,\"used\":0}")]
+    [InlineData("{\"errno\":0,\"total\":1,\"used\":2}")]
+    [InlineData("{\"errno\":-6,\"total\":2,\"used\":1}")]
+    [InlineData("not-json")]
+    public async Task MissingOrInvalidCapacityNeverSucceeds(string body)
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(HttpStatusCode.OK, body));
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+
+        var result = await adapter.GetCapacityAsync(Session(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized, BaiduErrorKind.ExpiredLogin)]
+    [InlineData(HttpStatusCode.Forbidden, BaiduErrorKind.VerificationRequired)]
+    [InlineData(HttpStatusCode.TooManyRequests, BaiduErrorKind.TransientService)]
+    [InlineData(HttpStatusCode.InternalServerError, BaiduErrorKind.TransientService)]
+    public async Task CapacityHttpFailuresMapToTypedSafeErrors(HttpStatusCode status, BaiduErrorKind expected)
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(status, "secret-response"));
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+
+        var result = await adapter.GetCapacityAsync(Session(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(expected, result.ErrorKind);
+        Assert.DoesNotContain("secret", result.SafeMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CapacityBusinessLoginFailureMapsToExpiredLogin()
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(
+            HttpStatusCode.OK,
+            """{"errno":-6,"total":2,"used":1}"""));
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+
+        var result = await adapter.GetCapacityAsync(Session(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.ExpiredLogin, result.ErrorKind);
+    }
+
+    [Fact]
+    public async Task OversizedCapacityResponseIsRejected()
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(
+            HttpStatusCode.OK,
+            new string('x', 64 * 1024 + 1)));
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+
+        var result = await adapter.GetCapacityAsync(Session(), CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.UnknownResponse, result.ErrorKind);
+    }
+
+    [Fact]
+    public async Task CapacityReadHonorsCallerCancellation()
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(
+            HttpStatusCode.OK,
+            """{"errno":0,"total":2,"used":1}"""));
+        var adapter = new LiveBaiduNetdiskAdapter(client);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            adapter.GetCapacityAsync(Session(), cancellation.Token));
+    }
+
     [Theory]
     [InlineData(HttpStatusCode.Unauthorized, BaiduErrorKind.ExpiredLogin)]
     [InlineData(HttpStatusCode.Forbidden, BaiduErrorKind.VerificationRequired)]
@@ -85,6 +181,7 @@ public sealed class BaiduSessionIdentityClientTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             RequestUri = request.RequestUri;
             CookieHeader = request.Headers.TryGetValues("Cookie", out var values) ? string.Join(";", values) : string.Empty;
             return Task.FromResult(new HttpResponseMessage(status)
