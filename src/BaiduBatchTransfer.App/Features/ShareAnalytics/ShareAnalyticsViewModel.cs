@@ -2,6 +2,7 @@ using BaiduBatchTransfer.Application.ShareAnalytics;
 using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using System.Globalization;
 
 namespace BaiduBatchTransfer.App.Features.ShareAnalytics;
 
@@ -10,17 +11,20 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromHours(23);
     private static readonly TimeSpan StaleRetryDelay = TimeSpan.FromHours(1);
     private const string RefreshFailureMessage = "分享数据获取失败，请稍后重试。";
+    private const string InvalidRangeMessage = "请输入有效的选取范围。";
 
     private readonly IShareAnalyticsWorkspaceService service;
     private readonly AccountShareAnalyticsProjector projector;
     private readonly IShareLinkLauncher launcher;
     private readonly TimeProvider timeProvider;
     private readonly IShareAnalyticsDelay delay;
+    private readonly IShareAnalyticsBulkScheduler bulkScheduler;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object refreshSync = new();
-    private readonly HashSet<string> selectedShareIds = new(StringComparer.Ordinal);
+    private HashSet<string> selectedShareIds = new(StringComparer.Ordinal);
     private CancellationTokenSource? activation;
     private CancellationTokenSource? pendingDelay;
+    private CancellationTokenSource? selectionOperation;
     private RefreshFlight? currentRefresh;
     private Guid? currentRefreshAccount;
     private long currentRefreshSelection;
@@ -37,9 +41,14 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private bool isRefreshing;
     private bool isActive;
     private string statusMessage = "请选择左侧账号。";
+    private string rangeStartText = "1";
+    private string rangeEndText = "50";
     private IReadOnlyList<ShareAnalyticsRow> visibleItems = [];
     private int currentVisibleSelectedCount;
+    private bool isSelectionBusy;
     private long selectionGeneration;
+    private long snapshotGeneration;
+    private long selectionOperationGeneration;
     private long navigationGeneration;
     private long delayGeneration;
 
@@ -48,18 +57,33 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         AccountShareAnalyticsProjector projector,
         IShareLinkLauncher launcher,
         TimeProvider timeProvider,
-        IShareAnalyticsDelay delay)
+        IShareAnalyticsDelay delay,
+        IShareAnalyticsBulkScheduler? bulkScheduler = null)
     {
         this.service = service ?? throw new ArgumentNullException(nameof(service));
         this.projector = projector ?? throw new ArgumentNullException(nameof(projector));
         this.launcher = launcher ?? throw new ArgumentNullException(nameof(launcher));
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
+        this.bulkScheduler = bulkScheduler ?? new ThreadPoolShareAnalyticsBulkScheduler();
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => accountId is not null && isActive);
         SelectMetricCommand = new RelayCommand<AccountShareMetric>(SelectMetric);
         SortCommand = new RelayCommand<AccountShareSortColumn>(Sort);
         OpenCommand = new RelayCommand<ShareAnalyticsRow>(Open, row => row is not null);
         ExportCommand = new RelayCommand(static () => { }, static () => false);
+        SelectRangeCommand = new AsyncRelayCommand(SelectRangeAsync, CanExecuteRangeSelection);
+        SelectAllCommand = new AsyncRelayCommand(
+            token => RunBulkSelectionAsync(BulkSelectionKind.SelectAll, null, token),
+            CanExecuteBulkSelection);
+        InvertSelectionCommand = new AsyncRelayCommand(
+            token => RunBulkSelectionAsync(BulkSelectionKind.Invert, null, token),
+            CanExecuteBulkSelection);
+        ClearSelectionCommand = new AsyncRelayCommand(
+            token => RunBulkSelectionAsync(BulkSelectionKind.Clear, null, token),
+            CanExecuteBulkSelection);
+        ToggleHeaderSelectionCommand = new AsyncRelayCommand(
+            token => RunBulkSelectionAsync(BulkSelectionKind.ToggleHeader, null, token),
+            CanExecuteBulkSelection);
         StatusFilterOptions =
         [
             new(ShareAnalyticsStatusFilter.All, "全部状态"),
@@ -75,6 +99,11 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public IRelayCommand<AccountShareSortColumn> SortCommand { get; }
     public IRelayCommand<ShareAnalyticsRow> OpenCommand { get; }
     public IRelayCommand ExportCommand { get; }
+    public IAsyncRelayCommand SelectRangeCommand { get; }
+    public IAsyncRelayCommand SelectAllCommand { get; }
+    public IAsyncRelayCommand InvertSelectionCommand { get; }
+    public IAsyncRelayCommand ClearSelectionCommand { get; }
+    public IAsyncRelayCommand ToggleHeaderSelectionCommand { get; }
     public IReadOnlyList<ShareAnalyticsRow> VisibleItems { get => visibleItems; private set => SetProperty(ref visibleItems, value); }
     public IReadOnlyList<ShareAnalyticsStatusOption> StatusFilterOptions { get; }
     public ShareAnalyticsStatusOption SelectedStatusOption
@@ -88,6 +117,10 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     }
     public string CurrentAccountName { get => currentAccountName; private set => SetProperty(ref currentAccountName, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
+    public string RangeStartText { get => rangeStartText; set => SetProperty(ref rangeStartText, value ?? string.Empty); }
+    public string RangeEndText { get => rangeEndText; set => SetProperty(ref rangeEndText, value ?? string.Empty); }
+    public bool IsSelectionBusy => isSelectionBusy;
+    public bool IsHeaderSelectionEnabled => CanExecuteBulkSelection();
     public bool IsRefreshing
     {
         get => isRefreshing;
@@ -157,6 +190,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     {
         if (selectedAccountId == Guid.Empty) selectedAccountId = null;
         var accountChanged = accountId != selectedAccountId;
+        InvalidateBulkSelection();
+        Interlocked.Increment(ref snapshotGeneration);
         CancelPendingDelay();
         activation?.Cancel();
         IsRefreshing = false;
@@ -189,6 +224,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         isActive = true;
         var navigation = Interlocked.Increment(ref navigationGeneration);
         RefreshCommand.NotifyCanExecuteChanged();
+        NotifyBulkSelectionCanExecuteChanged();
+        OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
         if (accountId is not { } selected) return;
         var selection = Volatile.Read(ref selectionGeneration);
         CancelPendingDelay();
@@ -227,16 +264,20 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public void Leave()
     {
         isActive = false;
+        InvalidateBulkSelection();
         Interlocked.Increment(ref navigationGeneration);
         CancelPendingDelay();
         activation?.Cancel();
         IsRefreshing = false;
         RefreshCommand.NotifyCanExecuteChanged();
+        NotifyBulkSelectionCanExecuteChanged();
+        OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
     }
 
     private async Task RefreshAsync(CancellationToken cancellationToken)
     {
         if (!isActive || accountId is not { } selected) return;
+        InvalidateBulkSelection();
         var selection = Volatile.Read(ref selectionGeneration);
         var navigation = Volatile.Read(ref navigationGeneration);
         var token = activation?.Token ?? lifetime.Token;
@@ -402,6 +443,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private void Apply(AccountShareCachedSnapshot value)
     {
         if (value.AccountId != accountId) return;
+        InvalidateBulkSelection();
+        Interlocked.Increment(ref snapshotGeneration);
         var selectionChanged = false;
         if (selectedShareIds.Count > 0)
         {
@@ -416,7 +459,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CacheStatusText));
         UpdateDateLabels();
         UpdateSummary();
-        Rebuild();
+        Rebuild(invalidateBulkSelection: false);
         if (selectionChanged)
         {
             OnPropertyChanged(nameof(SelectedCount));
@@ -434,8 +477,9 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(InvalidCount));
     }
 
-    private void Rebuild()
+    private void Rebuild(bool invalidateBulkSelection = true)
     {
+        if (invalidateBulkSelection) InvalidateBulkSelection();
         if (snapshot is null)
         {
             ReplaceVisibleItems([]);
@@ -478,6 +522,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
 
     private void OnRowSelectionChanged(string shareId, bool selected)
     {
+        InvalidateBulkSelection();
         var changed = selected ? selectedShareIds.Add(shareId) : selectedShareIds.Remove(shareId);
         if (!changed) return;
         currentVisibleSelectedCount += selected ? 1 : -1;
@@ -490,11 +535,174 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     {
         OnPropertyChanged(nameof(CurrentResultCount));
         OnPropertyChanged(nameof(HeaderSelectionState));
+        OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
+        NotifyBulkSelectionCanExecuteChanged();
     }
 
     private void NotifySelectionDependentCanExecuteChanged()
     {
         ExportCommand.NotifyCanExecuteChanged();
+    }
+
+    private bool CanExecuteBulkSelection() =>
+        isActive && accountId is not null && snapshot is not null && VisibleItems.Count > 0 && !isSelectionBusy;
+
+    private bool CanExecuteRangeSelection() =>
+        isActive && accountId is not null && snapshot is not null && !isSelectionBusy;
+
+    private async Task SelectRangeAsync(CancellationToken cancellationToken)
+    {
+        if (!TryGetRange(out var range))
+        {
+            StatusMessage = InvalidRangeMessage;
+            return;
+        }
+
+        await RunBulkSelectionAsync(BulkSelectionKind.Range, range, cancellationToken);
+    }
+
+    private bool TryGetRange(out SelectionRange range)
+    {
+        range = default;
+        if (!int.TryParse(RangeStartText, NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
+            !int.TryParse(RangeEndText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
+            start <= 0 || end <= 0 || start > end || start > CurrentResultCount)
+            return false;
+        range = new(start - 1, Math.Min(end, CurrentResultCount));
+        return range.StartIndex < range.EndExclusive;
+    }
+
+    private async Task RunBulkSelectionAsync(
+        BulkSelectionKind kind,
+        SelectionRange? range,
+        CancellationToken cancellationToken)
+    {
+        if (!CanExecuteBulkSelection() || accountId is not { } selectedAccount) return;
+        var generation = Interlocked.Increment(ref selectionOperationGeneration);
+        var fence = new SelectionFence(
+            selectedAccount,
+            Volatile.Read(ref snapshotGeneration),
+            SelectedMetric,
+            SearchText,
+            StatusFilter,
+            sortColumn,
+            sortDescending,
+            generation);
+        var projectedRows = VisibleItems.Select(row => row.Projected).ToArray();
+        var selectedIds = selectedShareIds.ToArray();
+        var source = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var operationToken = source.Token;
+        selectionOperation = source;
+        SetSelectionBusy(true);
+        try
+        {
+            var result = await bulkScheduler.RunAsync(
+                () => BuildBulkSelection(kind, range, projectedRows, selectedIds),
+                operationToken);
+            if (operationToken.IsCancellationRequested || !CanApply(fence)) return;
+
+            selectedShareIds = result.SelectedShareIds;
+            ReplaceVisibleItems(result.Rows);
+            OnPropertyChanged(nameof(SelectedCount));
+            OnPropertyChanged(nameof(CurrentResultCount));
+            OnPropertyChanged(nameof(HeaderSelectionState));
+            NotifySelectionDependentCanExecuteChanged();
+        }
+        catch (OperationCanceledException) when (operationToken.IsCancellationRequested) { }
+        finally
+        {
+            if (generation == Volatile.Read(ref selectionOperationGeneration) &&
+                ReferenceEquals(selectionOperation, source))
+            {
+                selectionOperation = null;
+                source.Dispose();
+                SetSelectionBusy(false);
+            }
+        }
+    }
+
+    private BulkSelectionResult BuildBulkSelection(
+        BulkSelectionKind kind,
+        SelectionRange? range,
+        IReadOnlyList<AccountShareProjectedRow> projectedRows,
+        IReadOnlyList<string> selectedIds)
+    {
+        var replacementSelection = new HashSet<string>(selectedIds, StringComparer.Ordinal);
+        switch (kind)
+        {
+            case BulkSelectionKind.Range:
+                var selectedRange = range!.Value;
+                for (var index = selectedRange.StartIndex; index < selectedRange.EndExclusive; index++)
+                    replacementSelection.Add(projectedRows[index].ShareId);
+                break;
+            case BulkSelectionKind.SelectAll:
+                replacementSelection.UnionWith(projectedRows.Select(row => row.ShareId));
+                break;
+            case BulkSelectionKind.Invert:
+                foreach (var row in projectedRows)
+                {
+                    if (!replacementSelection.Remove(row.ShareId)) replacementSelection.Add(row.ShareId);
+                }
+                break;
+            case BulkSelectionKind.Clear:
+                replacementSelection.ExceptWith(projectedRows.Select(row => row.ShareId));
+                break;
+            case BulkSelectionKind.ToggleHeader:
+                if (projectedRows.All(row => replacementSelection.Contains(row.ShareId)))
+                    replacementSelection.ExceptWith(projectedRows.Select(row => row.ShareId));
+                else
+                    replacementSelection.UnionWith(projectedRows.Select(row => row.ShareId));
+                break;
+        }
+
+        var rows = projectedRows
+            .Select((row, index) => new ShareAnalyticsRow(
+                row,
+                index + 1,
+                replacementSelection.Contains(row.ShareId),
+                OnRowSelectionChanged))
+            .ToArray();
+        return new(replacementSelection, rows);
+    }
+
+    private bool CanApply(SelectionFence fence) =>
+        isActive &&
+        accountId == fence.AccountId &&
+        Volatile.Read(ref snapshotGeneration) == fence.SnapshotGeneration &&
+        SelectedMetric == fence.Metric &&
+        string.Equals(SearchText, fence.Search, StringComparison.Ordinal) &&
+        StatusFilter == fence.Status &&
+        sortColumn == fence.Sort &&
+        sortDescending == fence.Descending &&
+        Volatile.Read(ref selectionOperationGeneration) == fence.OperationGeneration;
+
+    private void InvalidateBulkSelection()
+    {
+        Interlocked.Increment(ref selectionOperationGeneration);
+        var source = selectionOperation;
+        selectionOperation = null;
+        if (source is not null)
+        {
+            source.Cancel();
+            source.Dispose();
+        }
+        SetSelectionBusy(false);
+    }
+
+    private void SetSelectionBusy(bool value)
+    {
+        if (!SetProperty(ref isSelectionBusy, value, nameof(IsSelectionBusy))) return;
+        OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
+        NotifyBulkSelectionCanExecuteChanged();
+    }
+
+    private void NotifyBulkSelectionCanExecuteChanged()
+    {
+        SelectRangeCommand.NotifyCanExecuteChanged();
+        SelectAllCommand.NotifyCanExecuteChanged();
+        InvertSelectionCommand.NotifyCanExecuteChanged();
+        ClearSelectionCommand.NotifyCanExecuteChanged();
+        ToggleHeaderSelectionCommand.NotifyCanExecuteChanged();
     }
 
     private void SelectMetric(AccountShareMetric metric)
@@ -549,6 +757,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         isActive = false;
+        InvalidateBulkSelection();
         Interlocked.Increment(ref navigationGeneration);
         Interlocked.Increment(ref selectionGeneration);
         IsRefreshing = false;
@@ -577,6 +786,37 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         public Task Task { get; set; } = Task.CompletedTask;
         public bool HasManualIntent => Volatile.Read(ref manualIntent) != 0;
         public void AddManualIntent() => Volatile.Write(ref manualIntent, 1);
+    }
+
+    private enum BulkSelectionKind
+    {
+        Range,
+        SelectAll,
+        Invert,
+        Clear,
+        ToggleHeader,
+    }
+
+    private readonly record struct SelectionRange(int StartIndex, int EndExclusive);
+
+    private sealed record SelectionFence(
+        Guid AccountId,
+        long SnapshotGeneration,
+        AccountShareMetric Metric,
+        string Search,
+        ShareAnalyticsStatusFilter Status,
+        AccountShareSortColumn Sort,
+        bool Descending,
+        long OperationGeneration);
+
+    private sealed record BulkSelectionResult(
+        HashSet<string> SelectedShareIds,
+        IReadOnlyList<ShareAnalyticsRow> Rows);
+
+    private sealed class ThreadPoolShareAnalyticsBulkScheduler : IShareAnalyticsBulkScheduler
+    {
+        public Task<T> RunAsync<T>(Func<T> operation, CancellationToken cancellationToken) =>
+            Task.Run(operation, cancellationToken);
     }
 
     private static async void ObserveActivation(Task operation)

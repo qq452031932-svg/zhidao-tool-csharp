@@ -26,6 +26,11 @@ public interface IShareAnalyticsDelay
     Task WaitAsync(TimeSpan delay, CancellationToken token);
 }
 
+public interface IShareAnalyticsBulkScheduler
+{
+    Task<T> RunAsync<T>(Func<T> operation, CancellationToken cancellationToken);
+}
+
 public sealed class ShareAnalyticsRow : ObservableObject
 {
     private readonly AccountShareProjectedRow projected;
