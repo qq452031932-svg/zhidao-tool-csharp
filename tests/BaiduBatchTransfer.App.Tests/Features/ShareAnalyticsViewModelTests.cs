@@ -229,6 +229,28 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public async Task DisposePreventsNonCooperativeInFlightSyncFromApplyingRowsOrStatus()
+    {
+        var account = Guid.NewGuid();
+        var service = new BlockingSync(
+            account,
+            new AccountShareCachedSnapshot(account, null, []),
+            Snapshot(account, "fresh", Now));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        var entering = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+        var statusBeforeDispose = viewModel.StatusMessage;
+
+        viewModel.Dispose();
+        service.Release.TrySetResult();
+        await entering;
+
+        Assert.Empty(viewModel.VisibleItems);
+        Assert.Equal(statusBeforeDispose, viewModel.StatusMessage);
+    }
+
+    [Fact]
     public async Task ManualRefreshJoinsRunningAutomaticRefreshWithoutSecondSync()
     {
         var account = Guid.NewGuid();
@@ -424,14 +446,17 @@ public sealed class ShareAnalyticsViewModelTests
             await WaitUntilAsync(() => SyncCalls >= expected);
     }
 
-    private sealed class BlockingSync(Guid account, AccountShareCachedSnapshot snapshot) : IShareAnalyticsWorkspaceService
+    private sealed class BlockingSync(Guid account, params AccountShareCachedSnapshot[] snapshots) : IShareAnalyticsWorkspaceService
     {
+        private int load;
         public TaskCompletionSource SyncStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int SyncCalls { get; private set; }
         public bool ThrowOnRelease { get; init; }
         public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default) =>
-            Task.FromResult(accountId == account ? snapshot : new AccountShareCachedSnapshot(accountId, null, []));
+            Task.FromResult(accountId == account
+                ? snapshots[Math.Min(load++, snapshots.Length - 1)]
+                : new AccountShareCachedSnapshot(accountId, null, []));
         public async Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
         {
             SyncCalls++;

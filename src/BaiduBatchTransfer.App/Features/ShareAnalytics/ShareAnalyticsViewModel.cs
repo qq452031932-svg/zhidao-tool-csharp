@@ -419,6 +419,10 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
+        isActive = false;
+        Interlocked.Increment(ref navigationGeneration);
+        Interlocked.Increment(ref selectionGeneration);
+        RefreshCommand.NotifyCanExecuteChanged();
         CancelPendingDelay();
         lifetime.Cancel();
         activation?.Cancel();
