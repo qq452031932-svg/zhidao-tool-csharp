@@ -31,6 +31,151 @@ public sealed class BaiduAccountShareAnalyticsClientTests
     }
 
     [Fact]
+    public async Task TypicalPathTakesPriorityAndUsesItsLastNonEmptyNormalizedSegment()
+    {
+        var handler = new ScriptedHandler(Json("""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":"lower-priority-name","typicalPath":"  /folder//nested\\preferred-title///  ",
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("preferred-title", Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Fact]
+    public async Task TypicalPathRemovesTrailingBackslashSeparators()
+    {
+        var handler = new ScriptedHandler(Json("""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":"lower-priority-name","typicalPath":"  \\folder\\preferred-title\\\\  ",
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("preferred-title", Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Theory]
+    [InlineData("{\"ignored\":true}")]
+    [InlineData("[\"ignored\"]")]
+    [InlineData("123")]
+    [InlineData("\" 0 \"")]
+    [InlineData("\"/0/\"")]
+    [InlineData("\"bad\\u0001title\"")]
+    public async Task InvalidTypicalPathFallsBackToValidName(string typicalPathJson)
+    {
+        var payload = $$"""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":"fallback-name","typicalPath":{{typicalPathJson}},
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """;
+        var handler = new ScriptedHandler(Json(payload));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("fallback-name", Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Theory]
+    [InlineData("{\"ignored\":true}")]
+    [InlineData("[\"ignored\"]")]
+    [InlineData("123")]
+    public async Task InvalidNameJsonKindsUseStableShareId(string nameJson)
+    {
+        var payload = $$"""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":{{nameJson}},"typicalPath":null,
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """;
+        var handler = new ScriptedHandler(Json(payload));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("10001", Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Fact]
+    public async Task OversizedTypicalPathFallsBackToValidName()
+    {
+        var oversized = new string('x', 4097);
+        var payload = $$"""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":"fallback-name","typicalPath":"{{oversized}}",
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """;
+        var handler = new ScriptedHandler(Json(payload));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("fallback-name", Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Theory]
+    [InlineData("\"00\"", "00")]
+    [InlineData("\"42\"", "42")]
+    [InlineData("\"/123/\"", "123")]
+    public async Task NumericTitlesOtherThanExactZeroRemainValid(string typicalPathJson, string expected)
+    {
+        var payload = $$"""
+            {"errno":0,"count":1,"nextpage":0,"list":[{
+              "shareId":10001,"name":"fallback-name","typicalPath":{{typicalPathJson}},
+              "shortlink":"https://pan.baidu.com/s/synthetic","ctime":1788278400,"status":0
+            }]}
+            """;
+        var handler = new ScriptedHandler(Json(payload));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(expected, Assert.Single(result.Value!.Items).Title);
+    }
+
+    [Fact]
+    public async Task InvalidTitleFieldsUseStableShareIdWithoutDiscardingOtherPageItems()
+    {
+        var handler = new ScriptedHandler(Json("""
+            {"errno":0,"count":2,"nextpage":0,"list":[
+              {
+                "shareId":10001,"name":" 0 ","typicalPath":{"ignored":true},
+                "shortlink":"https://pan.baidu.com/s/invalid-title","ctime":1788278400,"status":0
+              },
+              {
+                "shareId":10002,"name":"valid-title","typicalPath":["ignored"],
+                "shortlink":"https://pan.baidu.com/s/valid-title","ctime":1788278400,"status":0
+              }
+            ]}
+            """));
+        using var client = new BaiduAccountShareAnalyticsClient(handler);
+
+        var result = await client.ReadPageAsync(Session(), null, default);
+
+        Assert.True(result.IsSuccess);
+        Assert.Collection(
+            result.Value!.Items,
+            item => Assert.Equal("10001", item.Title),
+            item => Assert.Equal("valid-title", item.Title));
+    }
+
+    [Fact]
     public async Task GeneratesOnlyTheFrozenBodyFreeGetRouteAndApplicableCookies()
     {
         var handler = new ScriptedHandler(Json("""{"errno":0,"count":0,"nextpage":0,"list":[]}"""));

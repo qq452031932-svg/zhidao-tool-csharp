@@ -28,7 +28,9 @@ public interface IShareAnalyticsDelay
 public sealed class ShareAnalyticsRow(AccountShareProjectedRow projected)
 {
     public string ShareId => projected.ShareId;
-    public string Title => projected.Title;
+    public string Title => string.Equals(projected.Title.Trim(), "0", StringComparison.Ordinal)
+        ? projected.ShareId
+        : projected.Title;
     public Uri ShareUri => projected.ShareUri;
     public DateTimeOffset SharedAtUtc => projected.SharedAtUtc;
     public string SharedAtText => projected.SharedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm");

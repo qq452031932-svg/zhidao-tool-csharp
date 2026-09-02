@@ -178,9 +178,11 @@ public sealed class BaiduAccountShareAnalyticsClient : IAccountShareAnalyticsCli
     {
         item = null;
         if (element.ValueKind != JsonValueKind.Object ||
-            !TryReadPositiveIdentifier(element, "shareId", out var shareId) ||
-            !TryReadTitle(element, out var title) ||
-            !TryReadShareUri(element, out var shareUri) ||
+            !TryReadPositiveIdentifier(element, "shareId", out var shareId))
+            return false;
+
+        var title = ReadTitle(element, shareId);
+        if (!TryReadShareUri(element, out var shareUri) ||
             !TryReadInt64(element, "ctime", out var seconds) || seconds < 0 ||
             !TryReadInt64(element, "status", out var statusNumber))
             return false;
@@ -228,12 +230,23 @@ public sealed class BaiduAccountShareAnalyticsClient : IAccountShareAnalyticsCli
             (value.ValueKind != JsonValueKind.String || identifier.All(char.IsDigit));
     }
 
-    private static bool TryReadTitle(JsonElement root, out string title)
+    private static string ReadTitle(JsonElement root, string shareId)
     {
-        title = ReadBoundedString(root, "name") ??
-            ReadBoundedString(root, "typicalPath") ?? string.Empty;
-        return title.Length > 0;
+        var typicalPath = ReadBoundedString(root, "typicalPath");
+        if (typicalPath is not null)
+        {
+            var segment = typicalPath.Split(
+                ['/', '\\'],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault();
+            if (IsValidTitleCandidate(segment)) return segment!;
+        }
+
+        var name = ReadBoundedString(root, "name");
+        return IsValidTitleCandidate(name) ? name! : shareId;
     }
+
+    private static bool IsValidTitleCandidate(string? candidate) =>
+        candidate is not null && !string.Equals(candidate.Trim(), "0", StringComparison.Ordinal);
 
     private static bool TryReadShareUri(JsonElement root, out Uri? uri)
     {

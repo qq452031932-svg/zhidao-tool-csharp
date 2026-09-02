@@ -32,6 +32,25 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public void LegacyZeroPlaceholderTitleDisplaysStableShareId()
+    {
+        var row = ProjectRow("stable-share-id", " 0 ");
+
+        Assert.Equal("stable-share-id", row.Title);
+    }
+
+    [Theory]
+    [InlineData("00")]
+    [InlineData("42")]
+    [InlineData("123456")]
+    public void OtherNumericTitlesRemainUnchanged(string title)
+    {
+        var row = ProjectRow("stable-share-id", title);
+
+        Assert.Equal(title, row.Title);
+    }
+
+    [Fact]
     public void ShareAnalyticsColumnsUseCompactFixedWidthsInsteadOfCollapsingTheTitle()
     {
         var root = FindRepositoryRoot();
@@ -680,6 +699,21 @@ public sealed class ShareAnalyticsViewModelTests
         Enum.GetValues<AccountShareMetric>().Select(metric => new AccountShareMetricHistory(
             metric, total + (long)metric,
             new Dictionary<DateOnly, long?> { [new(2026, 9, 1)] = total, [new(2026, 9, 2)] = total + 2 })).ToArray());
+
+    private static ShareAnalyticsRow ProjectRow(string shareId, string title)
+    {
+        var source = new AccountShareCachedRecord(
+            shareId,
+            title,
+            new Uri("https://pan.baidu.com/s/synthetic"),
+            Now,
+            AccountShareRemoteStatus.Valid,
+            Enum.GetValues<AccountShareMetric>()
+                .Select(metric => new AccountShareMetricHistory(metric, 1))
+                .ToArray());
+        var projected = new AccountShareAnalyticsProjector().Project(source, AccountShareMetric.Transfer, Now);
+        return new ShareAnalyticsRow(projected);
+    }
 
     private sealed class FakeSync(Guid account, params AccountShareCachedSnapshot[] snapshots) : IShareAnalyticsWorkspaceService
     {
