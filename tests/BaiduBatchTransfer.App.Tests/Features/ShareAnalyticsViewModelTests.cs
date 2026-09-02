@@ -1,0 +1,469 @@
+using BaiduBatchTransfer.App.Features.ShareAnalytics;
+using BaiduBatchTransfer.Application.ShareAnalytics;
+using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
+
+namespace BaiduBatchTransfer.App.Tests.Features;
+
+public sealed class ShareAnalyticsViewModelTests
+{
+    private static readonly DateTimeOffset Now = new(2026, 9, 2, 4, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void ShareAnalyticsViewUsesOnlyDeclaredNamedThemeStyles()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+        var theme = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Styles", "SuperPanTheme.xaml"));
+        foreach (var key in new[] { "PrimaryButton", "SecondaryButtonStyle", "BorderedPanelStyle" })
+        {
+            Assert.Contains($"StaticResource {key}", view, StringComparison.Ordinal);
+            Assert.Contains($"x:Key=\"{key}\"", theme, StringComparison.Ordinal);
+        }
+        Assert.DoesNotContain("PrimaryButtonStyle", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void StatusOptionRendersItsChineseLabelInTheComboBoxSelection()
+    {
+        var option = new ShareAnalyticsStatusOption(ShareAnalyticsStatusFilter.All, "全部状态");
+
+        Assert.Equal("全部状态", option.ToString());
+    }
+
+    [Fact]
+    public void ShareAnalyticsColumnsUseCompactFixedWidthsInsteadOfCollapsingTheTitle()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+
+        Assert.DoesNotContain("<DataGridTemplateColumn Width=\"2*\">", view, StringComparison.Ordinal);
+        Assert.Contains("<DataGridTemplateColumn Width=\"160\">", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FreshTwentyTwoHourCacheIsAppliedAndSchedulesExactRemainingHourWithoutSync()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号甲");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal(new[] { "cached" }, service.AppliedLoadTitles);
+        Assert.Equal(0, service.SyncCalls);
+        Assert.Equal(TimeSpan.FromHours(1), Assert.Single(delay.Requests).Delay);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
+        Assert.Equal("账号甲", viewModel.CurrentAccountName);
+    }
+
+    [Fact]
+    public async Task CacheWithoutSuccessfulTimestampSyncsImmediately()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(
+            account,
+            SnapshotWithoutSync(account, "cached"),
+            Snapshot(account, "fresh", Now));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal(1, service.SyncCalls);
+        Assert.Equal("fresh", Assert.Single(viewModel.VisibleItems).Title);
+        Assert.Equal(TimeSpan.FromHours(23), Assert.Single(delay.Requests).Delay);
+    }
+
+    [Fact]
+    public async Task CacheExactlyTwentyThreeHoursOldSyncsImmediately()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(
+            account,
+            Snapshot(account, "cached", Now.AddHours(-23)),
+            Snapshot(account, "fresh", Now));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal(1, service.SyncCalls);
+        Assert.Equal("fresh", Assert.Single(viewModel.VisibleItems).Title);
+    }
+
+    [Fact]
+    public async Task CompletingFreshCacheDelayStartsExactlyOneSync()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(
+            account,
+            Snapshot(account, "cached", Now.AddHours(-22)),
+            Snapshot(account, "fresh", Now));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        delay.Complete(0);
+        await service.WaitForSyncCallsAsync(1);
+        await WaitUntilAsync(() => delay.Requests.Count == 2);
+
+        Assert.Equal(1, service.SyncCalls);
+        Assert.Equal("fresh", Assert.Single(viewModel.VisibleItems).Title);
+        Assert.Equal(TimeSpan.FromHours(23), delay.Requests[1].Delay);
+    }
+
+    [Fact]
+    public async Task LeaveCancelsPendingDelayAndPreventsItsRemoteWork()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        viewModel.Leave();
+
+        Assert.True(delay.Requests[0].Token.IsCancellationRequested);
+        Assert.Equal(0, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task AccountSwitchCancelsPreviousPendingDelay()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var service = new MultiAccountSync(
+            Snapshot(accountA, "a", Now.AddHours(-22)),
+            Snapshot(accountB, "b", Now.AddHours(-22)));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(accountA, "甲");
+        await viewModel.EnterAsync();
+
+        viewModel.SelectAccount(accountB, "乙");
+        await WaitUntilAsync(() => delay.Requests.Count == 2);
+
+        Assert.True(delay.Requests[0].Token.IsCancellationRequested);
+        Assert.Equal(0, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task ReturningToSameAccountDoesNotJoinCanceledPreviousActivation()
+    {
+        var account = Guid.NewGuid();
+        var service = new BlockingSync(account, SnapshotWithoutSync(account, "cached"));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        var firstEntry = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+
+        viewModel.SelectAccount(null, null);
+        viewModel.SelectAccount(account, "账号");
+
+        Assert.Equal(2, service.SyncCalls);
+        service.Release.TrySetResult();
+        await firstEntry;
+    }
+
+    [Fact]
+    public async Task DisposeCancelsPendingDelayAndPreventsItsRemoteWork()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        viewModel.Dispose();
+
+        Assert.True(delay.Requests[0].Token.IsCancellationRequested);
+        Assert.Equal(0, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task ManualRefreshJoinsRunningAutomaticRefreshWithoutSecondSync()
+    {
+        var account = Guid.NewGuid();
+        var service = new BlockingSync(account, Snapshot(account, "cached", Now.AddHours(-23)));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        var entering = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+
+        var manual = viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.False(manual.IsCompleted);
+        Assert.Equal(1, service.SyncCalls);
+        service.Release.TrySetResult();
+        await Task.WhenAll(entering, manual);
+        Assert.Equal(1, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task FailedFreshManualRefreshRestoresOriginalDueTimeAndPreservesCache()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        {
+            SyncResults = [FailureResult]
+        };
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.True(delay.Requests[0].Token.IsCancellationRequested);
+        Assert.Equal(TimeSpan.FromHours(1), delay.Requests[1].Delay);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
+        Assert.Equal(Now.ToLocalTime().AddHours(-22).ToString("yyyy-MM-dd HH:mm"), viewModel.LastSuccessfulSyncText);
+        Assert.Equal("分享数据获取失败，请稍后重试。", viewModel.StatusMessage);
+    }
+
+    [Fact]
+    public async Task FailedStaleManualRefreshSchedulesOneHourRetryOnlyOnce()
+    {
+        var account = Guid.NewGuid();
+        var time = new MutableTimeProvider(Now);
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        {
+            SyncResults = [FailureResult, FailureResult]
+        };
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay, time);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        time.Advance(TimeSpan.FromHours(2));
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Equal(TimeSpan.FromHours(1), delay.Requests[1].Delay);
+        delay.Complete(1);
+        await service.WaitForSyncCallsAsync(2);
+        await WaitUntilAsync(() => !viewModel.IsRefreshing);
+        Assert.Equal(2, delay.Requests.Count);
+    }
+
+    [Fact]
+    public async Task SuccessfulManualRefreshSchedulesNewTwentyThreeHourDelay()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(
+            account,
+            Snapshot(account, "cached", Now.AddHours(-22)),
+            Snapshot(account, "fresh", Now));
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.True(delay.Requests[0].Token.IsCancellationRequested);
+        Assert.Equal(TimeSpan.FromHours(23), delay.Requests[1].Delay);
+        Assert.Equal("fresh", Assert.Single(viewModel.VisibleItems).Title);
+    }
+
+    [Fact]
+    public async Task FirstSyncAndThrownRefreshFailureUseStableChineseMessagesWithoutLeaking()
+    {
+        var account = Guid.NewGuid();
+        var service = new BlockingSync(account, SnapshotWithoutSync(account, "cached")) { ThrowOnRelease = true };
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        var entering = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+
+        Assert.Equal("正在首次同步分享数据…", viewModel.StatusMessage);
+        service.Release.TrySetResult();
+        await entering;
+
+        Assert.Equal("分享数据获取失败，请稍后重试。", viewModel.StatusMessage);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
+    }
+
+    [Fact]
+    public async Task MetricFilterSearchAndNumericSortRebuildReadOnlyRows()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Invalid, 30),
+        ]);
+        var service = new FakeSync(account, snapshot, snapshot);
+        var viewModel = Create(service);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        viewModel.StatusFilter = ShareAnalyticsStatusFilter.Invalid;
+        Assert.Equal("beta", Assert.Single(viewModel.VisibleItems).Title);
+        viewModel.SearchText = "beta";
+        Assert.Equal("beta", Assert.Single(viewModel.VisibleItems).Title);
+        viewModel.SelectMetricCommand.Execute(AccountShareMetric.View);
+        Assert.Equal(AccountShareMetric.View, Assert.Single(viewModel.VisibleItems).Metric);
+        viewModel.SortCommand.Execute(AccountShareSortColumn.HistoricalTotal);
+
+        var row = Assert.Single(viewModel.VisibleItems);
+        Assert.Equal("beta", row.Title);
+        Assert.Equal(AccountShareMetric.View, row.Metric);
+        Assert.Equal(31, row.HistoricalTotal);
+        Assert.Equal(2, viewModel.TotalCount);
+        Assert.Equal(1, viewModel.InvalidCount);
+    }
+
+    [Fact]
+    public async Task LeavingOrChangingAccountPreventsOldRefreshFromApplying()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var service = new BlockingSync(accountA, SnapshotWithoutSync(accountA, "a"));
+        var viewModel = Create(service);
+        viewModel.SelectAccount(accountA, "甲");
+        var entering = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+        viewModel.Leave();
+        viewModel.SelectAccount(accountB, "乙");
+        service.Release.TrySetResult();
+        await entering;
+        Assert.Empty(viewModel.VisibleItems);
+    }
+
+    private static readonly AccountShareSyncResult FailureResult =
+        new(AccountShareSyncDisposition.TemporarilyUnavailable, "分享数据获取失败，请稍后重试。");
+
+    private static ShareAnalyticsViewModel Create(
+        IShareAnalyticsWorkspaceService service,
+        IShareAnalyticsDelay? delay = null,
+        TimeProvider? timeProvider = null) =>
+        new(service, new AccountShareAnalyticsProjector(), new FakeLauncher(),
+            timeProvider ?? new FrozenTimeProvider(Now), delay ?? new FakeDelay());
+
+    private static AccountShareCachedSnapshot Snapshot(Guid account, string title, DateTimeOffset? syncedAt = null) =>
+        new(account, syncedAt ?? Now, [Record(title, AccountShareRemoteStatus.Valid, 10)]);
+
+    private static AccountShareCachedSnapshot SnapshotWithoutSync(Guid account, string title) =>
+        new(account, null, [Record(title, AccountShareRemoteStatus.Valid, 10)]);
+
+    private static AccountShareCachedRecord Record(string title, AccountShareRemoteStatus status, long total) => new(
+        title, title, new Uri($"https://pan.baidu.com/s/{title}"), Now.AddDays(-1), status,
+        Enum.GetValues<AccountShareMetric>().Select(metric => new AccountShareMetricHistory(
+            metric, total + (long)metric,
+            new Dictionary<DateOnly, long?> { [new(2026, 9, 1)] = total, [new(2026, 9, 2)] = total + 2 })).ToArray());
+
+    private sealed class FakeSync(Guid account, params AccountShareCachedSnapshot[] snapshots) : IShareAnalyticsWorkspaceService
+    {
+        private int load;
+        public int SyncCalls { get; private set; }
+        public IReadOnlyList<AccountShareSyncResult> SyncResults { get; init; } =
+            [new(AccountShareSyncDisposition.Updated, "分享数据已更新。")];
+        public List<string> AppliedLoadTitles { get; } = [];
+        public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            Assert.Equal(account, accountId);
+            var value = snapshots[Math.Min(load++, snapshots.Length - 1)];
+            AppliedLoadTitles.Add(value.Items.First().Title);
+            return Task.FromResult(value);
+        }
+        public Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            SyncCalls++;
+            return Task.FromResult(SyncResults[Math.Min(SyncCalls - 1, SyncResults.Count - 1)]);
+        }
+
+        public async Task WaitForSyncCallsAsync(int expected) =>
+            await WaitUntilAsync(() => SyncCalls >= expected);
+    }
+
+    private sealed class BlockingSync(Guid account, AccountShareCachedSnapshot snapshot) : IShareAnalyticsWorkspaceService
+    {
+        public TaskCompletionSource SyncStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int SyncCalls { get; private set; }
+        public bool ThrowOnRelease { get; init; }
+        public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(accountId == account ? snapshot : new AccountShareCachedSnapshot(accountId, null, []));
+        public async Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            SyncCalls++;
+            SyncStarted.TrySetResult();
+            await Release.Task;
+            if (ThrowOnRelease) throw new InvalidOperationException("sensitive detail");
+            return new(AccountShareSyncDisposition.Updated, "ok");
+        }
+    }
+
+    private sealed class MultiAccountSync(params AccountShareCachedSnapshot[] snapshots) : IShareAnalyticsWorkspaceService
+    {
+        private readonly Dictionary<Guid, AccountShareCachedSnapshot> values = snapshots.ToDictionary(value => value.AccountId);
+        public int SyncCalls { get; private set; }
+        public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(values[accountId]);
+        public Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            SyncCalls++;
+            return Task.FromResult(new AccountShareSyncResult(AccountShareSyncDisposition.Updated, "ok"));
+        }
+    }
+
+    private sealed class FakeDelay : IShareAnalyticsDelay
+    {
+        public List<DelayRequest> Requests { get; } = [];
+
+        public Task WaitAsync(TimeSpan delay, CancellationToken token)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var request = new DelayRequest(delay, token, completion);
+            Requests.Add(request);
+            token.Register(() => completion.TrySetCanceled(token));
+            return completion.Task;
+        }
+
+        public void Complete(int index) => Requests[index].Completion.TrySetResult();
+
+        public sealed record DelayRequest(TimeSpan Delay, CancellationToken Token, TaskCompletionSource Completion);
+    }
+
+    private sealed class FakeLauncher : IShareLinkLauncher
+    {
+        public bool TryOpen(Uri uri, out string safeMessage) { safeMessage = "ok"; return true; }
+    }
+
+    private sealed class FrozenTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+    }
+
+    private sealed class MutableTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        private DateTimeOffset now = now;
+        public override DateTimeOffset GetUtcNow() => now;
+        public void Advance(TimeSpan duration) => now += duration;
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> predicate)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!predicate()) await Task.Delay(10, timeout.Token);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var current = new DirectoryInfo(AppContext.BaseDirectory);
+        while (current is not null)
+        {
+            if (File.Exists(Path.Combine(current.FullName, "BaiduBatchTransfer.sln"))) return current.FullName;
+            current = current.Parent;
+        }
+        throw new InvalidOperationException("Repository root not found.");
+    }
+}
