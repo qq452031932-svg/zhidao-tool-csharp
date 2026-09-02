@@ -14,8 +14,8 @@
             <Setter Property="Background" Value="#F3F4F6" />
             <Setter Property="BorderBrush" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-            <Setter Property="VerticalContentAlignment" Value="Stretch" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
         </Style>
 
         <Style x:Key="ShareAnalyticsSortButtonStyle" TargetType="Button">
@@ -112,6 +112,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
                 <Grid>
                     <Grid.ColumnDefinitions>
@@ -153,6 +154,29 @@
                                HorizontalAlignment="Right" VerticalAlignment="Center"
                                Foreground="{StaticResource MutedBrush}" FontSize="11" />
                 </Grid>
+                <StackPanel x:Name="SelectionToolbar" Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0"
+                            VerticalAlignment="Center">
+                    <TextBlock Text="{Binding SelectedCount, StringFormat=已选 {0:N0} 条}" VerticalAlignment="Center" />
+                    <TextBlock Text=" / 共 " Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding CurrentResultCount, StringFormat={}{0:N0} 条}" VerticalAlignment="Center" />
+                    <TextBlock Text="　｜　从" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                    <TextBox Width="54" Text="{Binding RangeStartText, UpdateSourceTrigger=PropertyChanged}"
+                             TextAlignment="Center" Padding="5,3" />
+                    <TextBlock Text="到" Margin="6,0" VerticalAlignment="Center" />
+                    <TextBox Width="54" Text="{Binding RangeEndText, UpdateSourceTrigger=PropertyChanged}"
+                             TextAlignment="Center" Padding="5,3" />
+                    <TextBlock Text="　｜　" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                    <Button Content="选取" Command="{Binding SelectRangeCommand}"
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="0" />
+                    <Button Content="全选" Command="{Binding SelectAllCommand}"
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
+                    <Button Content="反选" Command="{Binding InvertSelectionCommand}"
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
+                    <Button Content="清空选择" Command="{Binding ClearSelectionCommand}"
+                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
+                    <Button Content="导出表格" Command="{Binding ExportCommand}"
+                            Style="{StaticResource PrimaryButton}" Padding="14,4" Margin="12,0,0,0" />
+                </StackPanel>
             </Grid>
         </Border>
 
@@ -163,38 +187,35 @@
                       CellStyle="{StaticResource ShareAnalyticsCellStyle}"
                       GridLinesVisibility="All"
                       HorizontalGridLinesBrush="#E5E7EB" VerticalGridLinesBrush="#E5E7EB"
+                      ScrollViewer.HorizontalScrollBarVisibility="Visible"
                       EnableRowVirtualization="True" EnableColumnVirtualization="True"
                       VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
                 <DataGrid.Columns>
-                    <DataGridTemplateColumn Width="160">
+                    <DataGridTemplateColumn Width="44">
                         <DataGridTemplateColumn.Header>
-                            <TextBlock Text="标题" />
+                            <CheckBox AutomationProperties.Name="选择"
+                                      IsThreeState="True"
+                                      IsChecked="{Binding DataContext.HeaderSelectionState, RelativeSource={RelativeSource AncestorType=DataGrid}, Mode=OneWay}"
+                                      Command="{Binding DataContext.ToggleHeaderSelectionCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" />
                         </DataGridTemplateColumn.Header>
-                        <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Title}" TextTrimming="CharacterEllipsis" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <CheckBox HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          IsChecked="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTextColumn Header="状态" Binding="{Binding StatusText}" Width="52" />
-                    <DataGridTemplateColumn Width="90">
-                        <DataGridTemplateColumn.CellStyle>
-                            <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding DataContext.SortColumn, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                                 Value="{x:Static analytics:AccountShareSortColumn.SharedAt}">
-                                        <Setter Property="Background" Value="{StaticResource ShareAnalyticsSortedCellBrush}" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </DataGridTemplateColumn.CellStyle>
+                    <DataGridTemplateColumn Width="58">
                         <DataGridTemplateColumn.Header>
-                            <Button Content="分享时间"
-                                    AutomationProperties.Name="分享时间"
-                                    Style="{StaticResource ShareAnalyticsSortButtonStyle}"
-                                    Tag="{Binding DataContext.SharedAtSortGlyph, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    Command="{Binding DataContext.SortCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                    CommandParameter="{x:Static analytics:AccountShareSortColumn.SharedAt}" />
+                            <TextBlock Text="序号" AutomationProperties.Name="序号" />
                         </DataGridTemplateColumn.Header>
-                        <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding SharedAtText}" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Sequence}" TextAlignment="Right" Margin="6,0" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="70">
+                    <DataGridTemplateColumn Width="110">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -215,7 +236,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding HistoricalTotalText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="54">
+                    <DataGridTemplateColumn Width="82">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -236,7 +257,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding NewText}" Foreground="{Binding NewForeground}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="52">
+                    <DataGridTemplateColumn Width="82">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -257,7 +278,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding TodayText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="52">
+                    <DataGridTemplateColumn Width="82">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -278,7 +299,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding YesterdayText}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="58">
+                    <DataGridTemplateColumn Width="100">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -299,7 +320,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay2Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="58">
+                    <DataGridTemplateColumn Width="100">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -320,7 +341,7 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay3Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="58">
+                    <DataGridTemplateColumn Width="100">
                         <DataGridTemplateColumn.CellStyle>
                             <Style TargetType="DataGridCell" BasedOn="{StaticResource ShareAnalyticsSortCellStyle}">
                                 <Style.Triggers>
@@ -341,8 +362,30 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay4Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Header="链接" Width="56">
+                    <DataGridTemplateColumn Header="链接" Width="76">
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><Button Content="打开" Command="{Binding DataContext.OpenCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" CommandParameter="{Binding}" Padding="8,2" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTemplateColumn Width="260">
+                        <DataGridTemplateColumn.Header>
+                            <TextBlock Text="标题" AutomationProperties.Name="标题" />
+                        </DataGridTemplateColumn.Header>
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Title}" TextAlignment="Left"
+                                           TextTrimming="CharacterEllipsis" ToolTip="{Binding Title}"
+                                           Margin="6,0" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTemplateColumn Width="90">
+                        <DataGridTemplateColumn.Header>
+                            <TextBlock Text="状态" AutomationProperties.Name="状态" />
+                        </DataGridTemplateColumn.Header>
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding StatusText}" TextAlignment="Center" Margin="6,0" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                 </DataGrid.Columns>
             </DataGrid>

@@ -359,13 +359,13 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
-    public void ShareAnalyticsColumnsUseCompactFixedWidthsInsteadOfCollapsingTheTitle()
+    public void ShareAnalyticsColumnsReserveAReadableFixedWidthForTheTitle()
     {
         var root = FindRepositoryRoot();
         var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
 
         Assert.DoesNotContain("<DataGridTemplateColumn Width=\"2*\">", view, StringComparison.Ordinal);
-        Assert.Contains("<DataGridTemplateColumn Width=\"160\">", view, StringComparison.Ordinal);
+        Assert.Contains("<DataGridTemplateColumn Width=\"260\">", view, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -383,8 +383,8 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Contains("Text=\"{TemplateBinding Tag}\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"↑\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"↓\"", view, StringComparison.Ordinal);
-        Assert.Contains("Tag=\"{Binding DataContext.SharedAtSortGlyph", view, StringComparison.Ordinal);
-        Assert.Contains("AutomationProperties.Name=\"分享时间\"", view, StringComparison.Ordinal);
+        Assert.DoesNotContain("Tag=\"{Binding DataContext.SharedAtSortGlyph", view, StringComparison.Ordinal);
+        Assert.DoesNotContain("AutomationProperties.Name=\"分享时间\"", view, StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.Name=\"历史累计\"", view, StringComparison.Ordinal);
     }
 
@@ -396,9 +396,9 @@ public sealed class ShareAnalyticsViewModelTests
 
         Assert.Contains("x:Key=\"ShareAnalyticsSortedCellBrush\" Color=\"#FFF9E3\"", view, StringComparison.Ordinal);
         Assert.Contains("x:Key=\"ShareAnalyticsSortCellStyle\"", view, StringComparison.Ordinal);
-        Assert.Equal(8, view.Split("<DataGridTemplateColumn.CellStyle>", StringSplitOptions.None).Length - 1);
-        Assert.Equal(8, view.Split("Binding DataContext.SortColumn", StringSplitOptions.None).Length - 1);
-        Assert.Contains("Value=\"{x:Static analytics:AccountShareSortColumn.SharedAt}\"", view, StringComparison.Ordinal);
+        Assert.Equal(7, view.Split("<DataGridTemplateColumn.CellStyle>", StringSplitOptions.None).Length - 1);
+        Assert.Equal(7, view.Split("Binding DataContext.SortColumn", StringSplitOptions.None).Length - 1);
+        Assert.DoesNotContain("Value=\"{x:Static analytics:AccountShareSortColumn.SharedAt}\"", view, StringComparison.Ordinal);
         Assert.Contains("Value=\"{x:Static analytics:AccountShareSortColumn.PriorDay4}\"", view, StringComparison.Ordinal);
         Assert.Contains("IsReadOnly=\"True\"", view, StringComparison.Ordinal);
         Assert.Contains("EnableRowVirtualization=\"True\" EnableColumnVirtualization=\"True\"", view, StringComparison.Ordinal);
