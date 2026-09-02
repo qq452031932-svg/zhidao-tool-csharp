@@ -12,6 +12,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private static readonly TimeSpan StaleRetryDelay = TimeSpan.FromHours(1);
     private const string RefreshFailureMessage = "分享数据获取失败，请稍后重试。";
     private const string InvalidRangeMessage = "请输入有效的选取范围。";
+    private const string SelectionFailureMessage = "选择操作失败，请重试。";
 
     private readonly IShareAnalyticsWorkspaceService service;
     private readonly AccountShareAnalyticsProjector projector;
@@ -597,7 +598,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         try
         {
             var result = await bulkScheduler.RunAsync(
-                () => BuildBulkSelection(kind, range, projectedRows, selectedIds),
+                token => BuildBulkSelection(kind, range, projectedRows, selectedIds, token),
                 operationToken);
             if (operationToken.IsCancellationRequested || !CanApply(fence)) return;
 
@@ -608,7 +609,12 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(HeaderSelectionState));
             NotifySelectionDependentCanExecuteChanged();
         }
-        catch (OperationCanceledException) when (operationToken.IsCancellationRequested) { }
+        catch (OperationCanceledException) { }
+        catch
+        {
+            if (CanApply(fence) && !operationToken.IsCancellationRequested)
+                StatusMessage = SelectionFailureMessage;
+        }
         finally
         {
             if (generation == Volatile.Read(ref selectionOperationGeneration) &&
@@ -625,44 +631,84 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         BulkSelectionKind kind,
         SelectionRange? range,
         IReadOnlyList<AccountShareProjectedRow> projectedRows,
-        IReadOnlyList<string> selectedIds)
+        IReadOnlyList<string> selectedIds,
+        CancellationToken cancellationToken)
     {
-        var replacementSelection = new HashSet<string>(selectedIds, StringComparer.Ordinal);
+        cancellationToken.ThrowIfCancellationRequested();
+        var replacementSelection = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < selectedIds.Count; index++)
+        {
+            ThrowIfCancellationRequested(cancellationToken, index);
+            replacementSelection.Add(selectedIds[index]);
+        }
         switch (kind)
         {
             case BulkSelectionKind.Range:
                 var selectedRange = range!.Value;
                 for (var index = selectedRange.StartIndex; index < selectedRange.EndExclusive; index++)
+                {
+                    ThrowIfCancellationRequested(cancellationToken, index - selectedRange.StartIndex);
                     replacementSelection.Add(projectedRows[index].ShareId);
+                }
                 break;
             case BulkSelectionKind.SelectAll:
-                replacementSelection.UnionWith(projectedRows.Select(row => row.ShareId));
+                for (var index = 0; index < projectedRows.Count; index++)
+                {
+                    ThrowIfCancellationRequested(cancellationToken, index);
+                    replacementSelection.Add(projectedRows[index].ShareId);
+                }
                 break;
             case BulkSelectionKind.Invert:
-                foreach (var row in projectedRows)
+                for (var index = 0; index < projectedRows.Count; index++)
                 {
+                    ThrowIfCancellationRequested(cancellationToken, index);
+                    var row = projectedRows[index];
                     if (!replacementSelection.Remove(row.ShareId)) replacementSelection.Add(row.ShareId);
                 }
                 break;
             case BulkSelectionKind.Clear:
-                replacementSelection.ExceptWith(projectedRows.Select(row => row.ShareId));
+                for (var index = 0; index < projectedRows.Count; index++)
+                {
+                    ThrowIfCancellationRequested(cancellationToken, index);
+                    replacementSelection.Remove(projectedRows[index].ShareId);
+                }
                 break;
             case BulkSelectionKind.ToggleHeader:
-                if (projectedRows.All(row => replacementSelection.Contains(row.ShareId)))
-                    replacementSelection.ExceptWith(projectedRows.Select(row => row.ShareId));
-                else
-                    replacementSelection.UnionWith(projectedRows.Select(row => row.ShareId));
+                var allSelected = true;
+                for (var index = 0; index < projectedRows.Count; index++)
+                {
+                    ThrowIfCancellationRequested(cancellationToken, index);
+                    if (replacementSelection.Contains(projectedRows[index].ShareId)) continue;
+                    allSelected = false;
+                    break;
+                }
+                for (var index = 0; index < projectedRows.Count; index++)
+                {
+                    ThrowIfCancellationRequested(cancellationToken, index);
+                    if (allSelected) replacementSelection.Remove(projectedRows[index].ShareId);
+                    else replacementSelection.Add(projectedRows[index].ShareId);
+                }
                 break;
         }
 
-        var rows = projectedRows
-            .Select((row, index) => new ShareAnalyticsRow(
+        var rows = new ShareAnalyticsRow[projectedRows.Count];
+        for (var index = 0; index < projectedRows.Count; index++)
+        {
+            ThrowIfCancellationRequested(cancellationToken, index);
+            var row = projectedRows[index];
+            rows[index] = new ShareAnalyticsRow(
                 row,
                 index + 1,
                 replacementSelection.Contains(row.ShareId),
-                OnRowSelectionChanged))
-            .ToArray();
+                OnRowSelectionChanged);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
         return new(replacementSelection, rows);
+    }
+
+    private static void ThrowIfCancellationRequested(CancellationToken cancellationToken, int index)
+    {
+        if ((index & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
     }
 
     private bool CanApply(SelectionFence fence) =>
@@ -815,8 +861,10 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
 
     private sealed class ThreadPoolShareAnalyticsBulkScheduler : IShareAnalyticsBulkScheduler
     {
-        public Task<T> RunAsync<T>(Func<T> operation, CancellationToken cancellationToken) =>
-            Task.Run(operation, cancellationToken);
+        public Task<T> RunAsync<T>(
+            Func<CancellationToken, T> operation,
+            CancellationToken cancellationToken) =>
+            Task.Run(() => operation(cancellationToken), cancellationToken);
     }
 
     private static async void ObserveActivation(Task operation)

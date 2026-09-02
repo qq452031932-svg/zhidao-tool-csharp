@@ -983,6 +983,35 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Equal(1, changed.Count(name => name == nameof(ShareAnalyticsViewModel.CurrentResultCount)));
         Assert.Equal(1, changed.Count(name => name == nameof(ShareAnalyticsViewModel.HeaderSelectionState)));
         Assert.Equal(1, exportCanExecuteChanged);
+        Assert.Equal(1, scheduler.OperationInvocations);
+    }
+
+    [Fact]
+    public async Task BulkSchedulerFailureKeepsSelectionAndRowsAndShowsOnlyStableMessage()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Valid, 20),
+        ]);
+        var scheduler = new ThrowingBulkScheduler();
+        var viewModel = Create(new FakeSync(account, snapshot), bulkScheduler: scheduler);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        viewModel.VisibleItems[0].IsSelected = true;
+        var originalRows = viewModel.VisibleItems;
+        var originalState = originalRows.Select(row => (row.ShareId, row.IsSelected)).ToArray();
+
+        var exception = await Xunit.Record.ExceptionAsync(() => viewModel.InvertSelectionCommand.ExecuteAsync(null));
+
+        Assert.Null(exception);
+        Assert.Same(originalRows, viewModel.VisibleItems);
+        Assert.Equal(originalState, viewModel.VisibleItems.Select(row => (row.ShareId, row.IsSelected)));
+        Assert.Equal(1, viewModel.SelectedCount);
+        Assert.False(viewModel.IsSelectionBusy);
+        Assert.Equal("选择操作失败，请重试。", viewModel.StatusMessage);
+        Assert.DoesNotContain("sensitive", viewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -1055,13 +1084,14 @@ public sealed class ShareAnalyticsViewModelTests
         var expectedState = expectedRows.Select(row => (row.ShareId, row.IsSelected)).ToArray();
         var expectedSelectedCount = viewModel.SelectedCount;
 
-        scheduler.Release.TrySetResult();
+        await scheduler.CancellationObserved.Task;
         await selecting;
 
         Assert.Same(expectedRows, viewModel.VisibleItems);
         Assert.Equal(expectedState, viewModel.VisibleItems.Select(row => (row.ShareId, row.IsSelected)));
         Assert.Equal(expectedSelectedCount, viewModel.SelectedCount);
         Assert.False(viewModel.IsSelectionBusy);
+        Assert.Equal(0, scheduler.OperationInvocations);
     }
 
     [Fact]
@@ -1364,13 +1394,34 @@ public sealed class ShareAnalyticsViewModelTests
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource CancellationObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int OperationInvocations { get; private set; }
 
-        public async Task<T> RunAsync<T>(Func<T> operation, CancellationToken cancellationToken)
+        public async Task<T> RunAsync<T>(
+            Func<CancellationToken, T> operation,
+            CancellationToken cancellationToken)
         {
             Started.TrySetResult();
-            await Release.Task;
-            return operation();
+            try
+            {
+                await Release.Task.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                CancellationObserved.TrySetResult();
+                throw;
+            }
+            OperationInvocations++;
+            return operation(cancellationToken);
         }
+    }
+
+    private sealed class ThrowingBulkScheduler : IShareAnalyticsBulkScheduler
+    {
+        public Task<T> RunAsync<T>(
+            Func<CancellationToken, T> operation,
+            CancellationToken cancellationToken) =>
+            Task.FromException<T>(new InvalidOperationException("sensitive C:\\private\\selection.txt"));
     }
 
     public enum BulkInvalidation

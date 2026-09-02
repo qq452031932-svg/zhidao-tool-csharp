@@ -28,7 +28,7 @@ public interface IShareAnalyticsDelay
 
 public interface IShareAnalyticsBulkScheduler
 {
-    Task<T> RunAsync<T>(Func<T> operation, CancellationToken cancellationToken);
+    Task<T> RunAsync<T>(Func<CancellationToken, T> operation, CancellationToken cancellationToken);
 }
 
 public sealed class ShareAnalyticsRow : ObservableObject
