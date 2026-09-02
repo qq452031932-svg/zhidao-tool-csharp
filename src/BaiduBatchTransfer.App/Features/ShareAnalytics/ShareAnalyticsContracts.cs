@@ -68,9 +68,9 @@ public sealed class ShareAnalyticsRow : ObservableObject
         selectionChanged = null;
     }
     public string ShareId => projected.ShareId;
-    public string Title => string.Equals(projected.Title.Trim(), "0", StringComparison.Ordinal)
-        ? projected.ShareId
-        : projected.Title;
+    public string Title => ResolveDisplayTitle(projected.Title, projected.ShareId);
+    internal static string ResolveDisplayTitle(string title, string shareId) =>
+        string.Equals(title.Trim(), "0", StringComparison.Ordinal) ? shareId : title;
     public Uri ShareUri => projected.ShareUri;
     public DateTimeOffset SharedAtUtc => projected.SharedAtUtc;
     public string SharedAtText => projected.SharedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm");

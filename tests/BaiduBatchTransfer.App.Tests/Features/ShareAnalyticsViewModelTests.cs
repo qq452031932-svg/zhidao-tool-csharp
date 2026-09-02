@@ -310,15 +310,17 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.False(viewModel.IsExporting);
     }
 
-    [Fact]
-    public async Task ExportUsesShareIdForAnExactLegacyZeroTitle()
+    [Theory]
+    [InlineData("0")]
+    [InlineData(" 0 ")]
+    public async Task ExportUsesShareIdForALegacyZeroPlaceholderTitle(string cachedTitle)
     {
         var account = Guid.NewGuid();
         var exporter = new RecordingExporter();
         var snapshot = new AccountShareCachedSnapshot(account, Now,
         [
             new AccountShareCachedRecord(
-                "stable-id", "0", new Uri("https://pan.baidu.com/s/stable-id"), Now,
+                "stable-id", cachedTitle, new Uri("https://pan.baidu.com/s/stable-id"), Now,
                 AccountShareRemoteStatus.Valid,
                 Enum.GetValues<AccountShareMetric>()
                     .Select(metric => new AccountShareMetricHistory(metric, 1))

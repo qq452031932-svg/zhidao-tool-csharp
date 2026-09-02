@@ -644,7 +644,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             .Select(item => projector.Project(item, metric, projectedAt));
         var ordered = projector.Sort(projected, currentSort, currentSortDescending);
         var rows = ordered.Select(item => new ShareAnalyticsWorkbookExportRow(
-                string.Equals(item.Title, "0", StringComparison.Ordinal) ? item.ShareId : item.Title,
+                ShareAnalyticsRow.ResolveDisplayTitle(item.Title, item.ShareId),
                 item.ShareUri.AbsoluteUri,
                 item.Status,
                 item.HistoricalTotal,
