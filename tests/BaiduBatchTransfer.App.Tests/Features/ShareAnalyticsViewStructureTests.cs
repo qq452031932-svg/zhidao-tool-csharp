@@ -17,6 +17,8 @@ public sealed class ShareAnalyticsViewStructureTests
         Assert.Equal(
             ["选择", "序号", "历史累计", "新增", "今天", "昨天", "动态日期2", "动态日期3", "动态日期4", "链接", "标题", "状态"],
             columns.Select(ColumnSemantic));
+        var sequenceColumn = columns.Single(column => ColumnSemantic(column) == "序号");
+        Assert.Equal("44", Attribute(sequenceColumn, "Width"));
         Assert.Equal("Visible", Attribute(grid, "ScrollViewer.HorizontalScrollBarVisibility"));
         Assert.Equal("True", Attribute(grid, "EnableRowVirtualization"));
         Assert.Equal("True", Attribute(grid, "EnableColumnVirtualization"));

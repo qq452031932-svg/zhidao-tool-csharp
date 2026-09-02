@@ -214,7 +214,7 @@
                             </DataTemplate>
                         </DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Width="58">
+                    <DataGridTemplateColumn Width="44">
                         <DataGridTemplateColumn.Header>
                             <Grid>
                                 <TextBlock Text="序号" AutomationProperties.Name="序号"
