@@ -42,6 +42,64 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public void ShareAnalyticsSortableHeadersAreFlatAndExposeCurrentDirection()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+
+        Assert.Contains("x:Key=\"ShareAnalyticsColumnHeaderStyle\"", view, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ShareAnalyticsSortButtonStyle\"", view, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ShareAnalyticsSortedHeaderBrush\" Color=\"#FFF3C4\"", view, StringComparison.Ordinal);
+        Assert.Contains("ColumnHeaderStyle=\"{StaticResource ShareAnalyticsColumnHeaderStyle}\"", view, StringComparison.Ordinal);
+        Assert.Contains("BorderThickness\" Value=\"0\"", view, StringComparison.Ordinal);
+        Assert.Contains("Background\" Value=\"#F3F4F6\"", view, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{TemplateBinding Tag}\"", view, StringComparison.Ordinal);
+        Assert.Contains("Value=\"↑\"", view, StringComparison.Ordinal);
+        Assert.Contains("Value=\"↓\"", view, StringComparison.Ordinal);
+        Assert.Contains("Tag=\"{Binding DataContext.SharedAtSortGlyph", view, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"分享时间\"", view, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"历史累计\"", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SortCommandPublishesCurrentColumnAndDirectionForTheHeader()
+    {
+        var sortColumnProperty = typeof(ShareAnalyticsViewModel).GetProperty("SortColumn");
+        var sortDescendingProperty = typeof(ShareAnalyticsViewModel).GetProperty("SortDescending");
+        var sharedAtGlyphProperty = typeof(ShareAnalyticsViewModel).GetProperty("SharedAtSortGlyph");
+        var todayGlyphProperty = typeof(ShareAnalyticsViewModel).GetProperty("TodaySortGlyph");
+
+        Assert.NotNull(sortColumnProperty);
+        Assert.NotNull(sortDescendingProperty);
+        Assert.NotNull(sharedAtGlyphProperty);
+        Assert.NotNull(todayGlyphProperty);
+
+        var account = Guid.NewGuid();
+        var viewModel = Create(new FakeSync(account, new AccountShareCachedSnapshot(account, null, [])));
+        var changed = new List<string?>();
+        viewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        viewModel.SortCommand.Execute(AccountShareSortColumn.SharedAt);
+
+        Assert.Equal(AccountShareSortColumn.SharedAt, sortColumnProperty.GetValue(viewModel));
+        Assert.Equal(false, sortDescendingProperty.GetValue(viewModel));
+        Assert.Equal("↑", sharedAtGlyphProperty.GetValue(viewModel));
+        Assert.Equal(string.Empty, todayGlyphProperty.GetValue(viewModel));
+        Assert.Contains("SortColumn", changed);
+        Assert.Contains("SortDescending", changed);
+
+        changed.Clear();
+        viewModel.SortCommand.Execute(AccountShareSortColumn.Today);
+
+        Assert.Equal(AccountShareSortColumn.Today, sortColumnProperty.GetValue(viewModel));
+        Assert.Equal(true, sortDescendingProperty.GetValue(viewModel));
+        Assert.Equal(string.Empty, sharedAtGlyphProperty.GetValue(viewModel));
+        Assert.Equal("↓", todayGlyphProperty.GetValue(viewModel));
+        Assert.Contains("SortColumn", changed);
+        Assert.Contains("SortDescending", changed);
+    }
+
+    [Fact]
     public async Task FreshTwentyTwoHourCacheIsAppliedAndSchedulesExactRemainingHourWithoutSync()
     {
         var account = Guid.NewGuid();

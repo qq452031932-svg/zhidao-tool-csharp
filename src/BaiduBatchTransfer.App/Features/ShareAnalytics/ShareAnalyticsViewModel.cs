@@ -125,6 +125,16 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public string PriorDay2Header { get; private set; } = string.Empty;
     public string PriorDay3Header { get; private set; } = string.Empty;
     public string PriorDay4Header { get; private set; } = string.Empty;
+    public AccountShareSortColumn SortColumn => sortColumn;
+    public bool SortDescending => sortDescending;
+    public string SharedAtSortGlyph => SortGlyph(AccountShareSortColumn.SharedAt);
+    public string HistoricalTotalSortGlyph => SortGlyph(AccountShareSortColumn.HistoricalTotal);
+    public string NewValueSortGlyph => SortGlyph(AccountShareSortColumn.NewValue);
+    public string TodaySortGlyph => SortGlyph(AccountShareSortColumn.Today);
+    public string YesterdaySortGlyph => SortGlyph(AccountShareSortColumn.Yesterday);
+    public string PriorDay2SortGlyph => SortGlyph(AccountShareSortColumn.PriorDay2);
+    public string PriorDay3SortGlyph => SortGlyph(AccountShareSortColumn.PriorDay3);
+    public string PriorDay4SortGlyph => SortGlyph(AccountShareSortColumn.PriorDay4);
 
     public void SelectAccount(Guid? selectedAccountId, string? displayName)
     {
@@ -407,7 +417,25 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         if (!Enum.IsDefined(column)) return;
         if (sortColumn == column) sortDescending = !sortDescending;
         else { sortColumn = column; sortDescending = true; }
+        NotifySortStateChanged();
         Rebuild();
+    }
+
+    private string SortGlyph(AccountShareSortColumn column) =>
+        sortColumn == column ? sortDescending ? "↓" : "↑" : string.Empty;
+
+    private void NotifySortStateChanged()
+    {
+        OnPropertyChanged(nameof(SortColumn));
+        OnPropertyChanged(nameof(SortDescending));
+        OnPropertyChanged(nameof(SharedAtSortGlyph));
+        OnPropertyChanged(nameof(HistoricalTotalSortGlyph));
+        OnPropertyChanged(nameof(NewValueSortGlyph));
+        OnPropertyChanged(nameof(TodaySortGlyph));
+        OnPropertyChanged(nameof(YesterdaySortGlyph));
+        OnPropertyChanged(nameof(PriorDay2SortGlyph));
+        OnPropertyChanged(nameof(PriorDay3SortGlyph));
+        OnPropertyChanged(nameof(PriorDay4SortGlyph));
     }
 
     private void Open(ShareAnalyticsRow? row)
