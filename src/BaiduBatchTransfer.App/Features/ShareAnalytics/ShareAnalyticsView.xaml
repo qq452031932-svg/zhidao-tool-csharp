@@ -14,8 +14,8 @@
             <Setter Property="Background" Value="#F3F4F6" />
             <Setter Property="BorderBrush" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="HorizontalContentAlignment" Value="Center" />
-            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="VerticalContentAlignment" Value="Stretch" />
         </Style>
 
         <Style x:Key="ShareAnalyticsSortButtonStyle" TargetType="Button">
@@ -26,6 +26,7 @@
             <Setter Property="BorderBrush" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="HorizontalAlignment" Value="Stretch" />
+            <Setter Property="VerticalAlignment" Value="Stretch" />
             <Setter Property="HorizontalContentAlignment" Value="Center" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Template">
@@ -160,10 +161,12 @@
                     <TextBlock Text=" / 共 " Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding CurrentResultCount, StringFormat={}{0:N0} 条}" VerticalAlignment="Center" />
                     <TextBlock Text="　｜　从" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
-                    <TextBox Width="54" Text="{Binding RangeStartText, UpdateSourceTrigger=PropertyChanged}"
+                    <TextBox Width="54" AutomationProperties.Name="选取起始序号"
+                             Text="{Binding RangeStartText, UpdateSourceTrigger=PropertyChanged}"
                              TextAlignment="Center" Padding="5,3" />
                     <TextBlock Text="到" Margin="6,0" VerticalAlignment="Center" />
-                    <TextBox Width="54" Text="{Binding RangeEndText, UpdateSourceTrigger=PropertyChanged}"
+                    <TextBox Width="54" AutomationProperties.Name="选取结束序号"
+                             Text="{Binding RangeEndText, UpdateSourceTrigger=PropertyChanged}"
                              TextAlignment="Center" Padding="5,3" />
                     <TextBlock Text="　｜　" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
                     <Button Content="选取" Command="{Binding SelectRangeCommand}"
@@ -193,10 +196,16 @@
                 <DataGrid.Columns>
                     <DataGridTemplateColumn Width="44">
                         <DataGridTemplateColumn.Header>
-                            <CheckBox AutomationProperties.Name="选择"
-                                      IsThreeState="True"
-                                      IsChecked="{Binding DataContext.HeaderSelectionState, RelativeSource={RelativeSource AncestorType=DataGrid}, Mode=OneWay}"
-                                      Command="{Binding DataContext.ToggleHeaderSelectionCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" />
+                            <Button AutomationProperties.Name="选择当前结果"
+                                    Command="{Binding DataContext.ToggleHeaderSelectionCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                                    Background="Transparent" BorderBrush="Transparent" BorderThickness="0" Padding="0">
+                                <CheckBox AutomationProperties.Name="选择"
+                                          IsHitTestVisible="False" Focusable="False"
+                                          IsThreeState="True"
+                                          IsChecked="{Binding DataContext.HeaderSelectionState, RelativeSource={RelativeSource AncestorType=DataGrid}, Mode=OneWay}" />
+                            </Button>
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
@@ -207,7 +216,10 @@
                     </DataGridTemplateColumn>
                     <DataGridTemplateColumn Width="58">
                         <DataGridTemplateColumn.Header>
-                            <TextBlock Text="序号" AutomationProperties.Name="序号" />
+                            <Grid>
+                                <TextBlock Text="序号" AutomationProperties.Name="序号"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Grid>
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
@@ -362,12 +374,21 @@
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding PriorDay4Text}" TextAlignment="Right" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
-                    <DataGridTemplateColumn Header="链接" Width="76">
+                    <DataGridTemplateColumn Width="76">
+                        <DataGridTemplateColumn.Header>
+                            <Grid>
+                                <TextBlock Text="链接" AutomationProperties.Name="链接"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Grid>
+                        </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate><DataTemplate><Button Content="打开" Command="{Binding DataContext.OpenCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" CommandParameter="{Binding}" Padding="8,2" /></DataTemplate></DataGridTemplateColumn.CellTemplate>
                     </DataGridTemplateColumn>
                     <DataGridTemplateColumn Width="260">
                         <DataGridTemplateColumn.Header>
-                            <TextBlock Text="标题" AutomationProperties.Name="标题" />
+                            <Grid>
+                                <TextBlock Text="标题" AutomationProperties.Name="标题"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Grid>
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>
@@ -379,7 +400,10 @@
                     </DataGridTemplateColumn>
                     <DataGridTemplateColumn Width="90">
                         <DataGridTemplateColumn.Header>
-                            <TextBlock Text="状态" AutomationProperties.Name="状态" />
+                            <Grid>
+                                <TextBlock Text="状态" AutomationProperties.Name="状态"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Grid>
                         </DataGridTemplateColumn.Header>
                         <DataGridTemplateColumn.CellTemplate>
                             <DataTemplate>

@@ -38,21 +38,33 @@ public sealed class ShareAnalyticsViewStructureTests
     }
 
     [Fact]
-    public void ColumnHeadersShareOneCenteredThirtySixPixelBaseline()
+    public void ColumnHeadersStretchTheirHitSurfaceWhileKeepingOrdinaryContentCentered()
     {
-        var (document, grid, _) = LoadView();
+        var (document, grid, columns) = LoadView();
         var headerStyle = document.Descendants(Presentation + "Style")
             .Single(style => Attribute(style, Xaml + "Key") == "ShareAnalyticsColumnHeaderStyle");
 
         Assert.Equal("36", SetterValue(headerStyle, "Height"));
-        Assert.Equal("Center", SetterValue(headerStyle, "HorizontalContentAlignment"));
-        Assert.Equal("Center", SetterValue(headerStyle, "VerticalContentAlignment"));
+        Assert.Equal("Stretch", SetterValue(headerStyle, "HorizontalContentAlignment"));
+        Assert.Equal("Stretch", SetterValue(headerStyle, "VerticalContentAlignment"));
         Assert.Equal("{StaticResource ShareAnalyticsColumnHeaderStyle}", Attribute(grid, "ColumnHeaderStyle"));
 
         var sortButtonStyle = document.Descendants(Presentation + "Style")
             .Single(style => Attribute(style, Xaml + "Key") == "ShareAnalyticsSortButtonStyle");
+        Assert.Equal("Stretch", SetterValue(sortButtonStyle, "HorizontalAlignment"));
+        Assert.Equal("Stretch", SetterValue(sortButtonStyle, "VerticalAlignment"));
         Assert.Equal("Center", SetterValue(sortButtonStyle, "HorizontalContentAlignment"));
         Assert.Equal("Center", SetterValue(sortButtonStyle, "VerticalContentAlignment"));
+
+        var bySemantic = columns.ToDictionary(ColumnSemantic);
+        foreach (var semantic in new[] { "序号", "链接", "标题", "状态" })
+        {
+            var header = HeaderElement(bySemantic[semantic]);
+            Assert.NotNull(header.Element(Presentation + "Grid"));
+            var text = header.Descendants(Presentation + "TextBlock").Single();
+            Assert.Equal("Center", Attribute(text, "HorizontalAlignment"));
+            Assert.Equal("Center", Attribute(text, "VerticalAlignment"));
+        }
     }
 
     [Fact]
@@ -81,19 +93,35 @@ public sealed class ShareAnalyticsViewStructureTests
     }
 
     [Fact]
-    public void HeaderAndRowsExposeTriStateAndImmediateSelectionBindings()
+    public void HeaderSelectionUsesAFullSurfaceCommandButtonAndANonInteractiveTriStateDisplay()
     {
         var (_, _, columns) = LoadView();
         var selectionColumn = columns.Single(column => ColumnSemantic(column) == "选择");
         var checkBoxes = selectionColumn.Descendants(Presentation + "CheckBox").ToArray();
         Assert.Equal(2, checkBoxes.Length);
 
-        var header = checkBoxes.Single(checkBox => Attribute(checkBox, "IsThreeState") == "True");
-        Assert.Contains("HeaderSelectionState", Attribute(header, "IsChecked"), StringComparison.Ordinal);
-        Assert.Contains("Mode=OneWay", Attribute(header, "IsChecked"), StringComparison.Ordinal);
-        Assert.Contains("ToggleHeaderSelectionCommand", Attribute(header, "Command"), StringComparison.Ordinal);
+        var display = checkBoxes.Single(checkBox => Attribute(checkBox, "IsThreeState") == "True");
+        Assert.Contains("HeaderSelectionState", Attribute(display, "IsChecked"), StringComparison.Ordinal);
+        Assert.Contains("Mode=OneWay", Attribute(display, "IsChecked"), StringComparison.Ordinal);
+        Assert.Equal("False", Attribute(display, "IsHitTestVisible"));
+        Assert.Equal("False", Attribute(display, "Focusable"));
+        Assert.Empty(Attribute(display, "Command"));
 
-        var row = checkBoxes.Single(checkBox => !ReferenceEquals(checkBox, header));
+        var commandButton = display.Ancestors(Presentation + "Button").Single();
+        Assert.Contains("ToggleHeaderSelectionCommand", Attribute(commandButton, "Command"), StringComparison.Ordinal);
+        Assert.Equal("Stretch", Attribute(commandButton, "HorizontalAlignment"));
+        Assert.Equal("Stretch", Attribute(commandButton, "VerticalAlignment"));
+        Assert.Equal("选择当前结果", Attribute(commandButton, "AutomationProperties.Name"));
+    }
+
+    [Fact]
+    public void RowSelectionStillPublishesImmediateTwoWayChanges()
+    {
+        var (_, _, columns) = LoadView();
+        var selectionColumn = columns.Single(column => ColumnSemantic(column) == "选择");
+        var row = selectionColumn.Descendants(Presentation + "CheckBox")
+            .Single(checkBox => Attribute(checkBox, "IsThreeState") != "True");
+
         Assert.Contains("IsSelected", Attribute(row, "IsChecked"), StringComparison.Ordinal);
         Assert.Contains("Mode=TwoWay", Attribute(row, "IsChecked"), StringComparison.Ordinal);
         Assert.Contains("UpdateSourceTrigger=PropertyChanged", Attribute(row, "IsChecked"), StringComparison.Ordinal);
@@ -119,6 +147,12 @@ public sealed class ShareAnalyticsViewStructureTests
         {
             Assert.Contains(toolbar.Descendants(Presentation + "Button"), button => Attribute(button, "Content") == caption);
         }
+
+        var rangeInputs = toolbar.Descendants(Presentation + "TextBox").ToArray();
+        var startInput = rangeInputs.Single(textBox => Attribute(textBox, "Text").Contains("RangeStartText", StringComparison.Ordinal));
+        var endInput = rangeInputs.Single(textBox => Attribute(textBox, "Text").Contains("RangeEndText", StringComparison.Ordinal));
+        Assert.Equal("选取起始序号", Attribute(startInput, "AutomationProperties.Name"));
+        Assert.Equal("选取结束序号", Attribute(endInput, "AutomationProperties.Name"));
     }
 
     private static (XDocument Document, XElement Grid, IReadOnlyList<XElement> Columns) LoadView()
@@ -143,21 +177,26 @@ public sealed class ShareAnalyticsViewStructureTests
 
         var headerElement = column.Elements().SingleOrDefault(element => element.Name.LocalName.EndsWith(".Header", StringComparison.Ordinal));
         if (headerElement is null) return string.Empty;
-        var header = headerElement.Descendants().FirstOrDefault();
-        if (header is null) return string.Empty;
-        var automationName = Attribute(header, "AutomationProperties.Name");
-        if (automationName is "选择" or "序号" or "历史累计" or "新增" or "今天" or "昨天" or "链接" or "标题" or "状态")
-            return automationName;
-        var content = Attribute(header, "Content");
-        if (!string.IsNullOrEmpty(content) && !content.StartsWith("{Binding", StringComparison.Ordinal)) return content;
-        var text = Attribute(header, "Text");
-        if (!string.IsNullOrEmpty(text) && !text.StartsWith("{Binding", StringComparison.Ordinal)) return text;
-        var parameter = Attribute(header, "CommandParameter");
+        var headerNodes = headerElement.Descendants().ToArray();
+        var automationName = headerNodes.Select(node => Attribute(node, "AutomationProperties.Name"))
+            .FirstOrDefault(name => name is "选择" or "序号" or "历史累计" or "新增" or "今天" or "昨天" or "链接" or "标题" or "状态");
+        if (!string.IsNullOrEmpty(automationName)) return automationName;
+        var content = headerNodes.Select(node => Attribute(node, "Content"))
+            .FirstOrDefault(value => !string.IsNullOrEmpty(value) && !value.StartsWith("{Binding", StringComparison.Ordinal));
+        if (!string.IsNullOrEmpty(content)) return content;
+        var text = headerNodes.Select(node => Attribute(node, "Text"))
+            .FirstOrDefault(value => !string.IsNullOrEmpty(value) && !value.StartsWith("{Binding", StringComparison.Ordinal));
+        if (!string.IsNullOrEmpty(text)) return text;
+        var parameter = headerNodes.Select(node => Attribute(node, "CommandParameter"))
+            .FirstOrDefault(value => !string.IsNullOrEmpty(value)) ?? string.Empty;
         if (parameter.Contains("PriorDay2", StringComparison.Ordinal)) return "动态日期2";
         if (parameter.Contains("PriorDay3", StringComparison.Ordinal)) return "动态日期3";
         if (parameter.Contains("PriorDay4", StringComparison.Ordinal)) return "动态日期4";
         return string.Empty;
     }
+
+    private static XElement HeaderElement(XElement column) =>
+        column.Elements().Single(element => element.Name.LocalName.EndsWith(".Header", StringComparison.Ordinal));
 
     private static XElement FindBoundTextBlock(XElement column) =>
         column.Descendants(Presentation + "TextBlock")
