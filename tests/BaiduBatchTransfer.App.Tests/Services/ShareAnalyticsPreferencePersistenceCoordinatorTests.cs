@@ -101,4 +101,60 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinatorTests
         Assert.True(await coordinator.FlushAsync(TimeSpan.FromSeconds(1)));
         Assert.Equal(accountId, await completed.Task.WaitAsync(TimeSpan.FromSeconds(1)));
     }
+
+    [Fact]
+    public async Task FailedSaveCannotReportSuccessfulSealAndFlush()
+    {
+        using var coordinator = new ShareAnalyticsPreferencePersistenceCoordinator(
+            (_, _) => throw new IOException("secret persistence failure"));
+        coordinator.RequestSave(Guid.NewGuid());
+
+        Assert.False(await coordinator.SealAndFlushAsync(TimeSpan.FromSeconds(1)));
+    }
+
+    [Fact]
+    public async Task ResumeAfterFailedShutdownRetriesTheLastFailedValue()
+    {
+        var accountId = Guid.NewGuid();
+        var attempts = 0;
+        using var coordinator = new ShareAnalyticsPreferencePersistenceCoordinator((id, _) =>
+        {
+            Assert.Equal(accountId, id);
+            if (Interlocked.Increment(ref attempts) == 1)
+                throw new IOException("first attempt fails");
+            return Task.CompletedTask;
+        });
+        coordinator.RequestSave(accountId);
+        Assert.False(await coordinator.SealAndFlushAsync(TimeSpan.FromSeconds(1)));
+
+        coordinator.ResumeAfterFailedShutdown();
+
+        Assert.True(await coordinator.SealAndFlushAsync(TimeSpan.FromSeconds(1)));
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task SealAtomicallyRejectsNewRequestsAndFlushesItsFinalVersion()
+    {
+        var sealedAccount = Guid.NewGuid();
+        var rejectedAccount = Guid.NewGuid();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var persisted = new List<Guid?>();
+        using var coordinator = new ShareAnalyticsPreferencePersistenceCoordinator(async (id, token) =>
+        {
+            started.TrySetResult();
+            await release.Task.WaitAsync(token);
+            persisted.Add(id);
+        });
+        coordinator.RequestSave(sealedAccount);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var flush = coordinator.SealAndFlushAsync(TimeSpan.FromSeconds(1));
+        Assert.False(coordinator.RequestSave(rejectedAccount));
+        release.TrySetResult();
+
+        Assert.True(await flush);
+        Assert.Equal([sealedAccount], persisted);
+    }
 }

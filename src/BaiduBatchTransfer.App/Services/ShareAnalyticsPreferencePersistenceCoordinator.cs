@@ -13,9 +13,11 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
     private TaskCompletionSource<long> progress = NewProgressSource();
     private Guid? pendingAccountId;
     private long requestedVersion;
-    private long completedVersion;
+    private long processedVersion;
+    private long persistedVersion;
     private int signalPending;
     private bool disposeRequested;
+    private bool sealedForShutdown;
 
     public ShareAnalyticsPreferencePersistenceCoordinator(
         Func<Guid?, CancellationToken, Task> save,
@@ -26,15 +28,16 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
         worker = Task.Run(RunAsync);
     }
 
-    public void RequestSave(Guid? accountId)
+    public bool RequestSave(Guid? accountId)
     {
         lock (gate)
         {
-            if (disposeRequested) return;
+            if (disposeRequested || sealedForShutdown) return false;
             pendingAccountId = accountId;
             requestedVersion++;
         }
         WakeWorker();
+        return true;
     }
 
     public async Task<bool> FlushAsync(
@@ -44,15 +47,57 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
         if (timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(timeout));
 
-        var stopwatch = Stopwatch.StartNew();
         long targetVersion;
         lock (gate) targetVersion = requestedVersion;
+        return await WaitForTargetAsync(targetVersion, timeout, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<bool> SealAndFlushAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+
+        long targetVersion;
+        lock (gate)
+        {
+            if (disposeRequested) return Task.FromResult(false);
+            sealedForShutdown = true;
+            targetVersion = requestedVersion;
+        }
+        return WaitForTargetAsync(targetVersion, timeout, cancellationToken);
+    }
+
+    public void ResumeAfterFailedShutdown()
+    {
+        var retryFailedVersion = false;
+        lock (gate)
+        {
+            if (disposeRequested) return;
+            sealedForShutdown = false;
+            if (processedVersion >= requestedVersion && persistedVersion < requestedVersion)
+            {
+                requestedVersion++;
+                retryFailedVersion = true;
+            }
+        }
+        if (retryFailedVersion) WakeWorker();
+    }
+
+    private async Task<bool> WaitForTargetAsync(
+        long targetVersion,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
         while (true)
         {
             Task<long> progressTask;
             lock (gate)
             {
-                if (completedVersion >= targetVersion) return true;
+                if (persistedVersion >= targetVersion) return true;
+                if (processedVersion >= targetVersion) return false;
                 progressTask = progress.Task;
             }
 
@@ -75,6 +120,7 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
         {
             if (disposeRequested) return;
             disposeRequested = true;
+            sealedForShutdown = true;
         }
         WakeWorker();
         _ = CompleteDisposalAsync();
@@ -92,7 +138,7 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
                 long version;
                 lock (gate)
                 {
-                    if (completedVersion >= requestedVersion)
+                    if (processedVersion >= requestedVersion)
                     {
                         if (disposeRequested) return;
                         break;
@@ -101,9 +147,11 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
                     version = requestedVersion;
                 }
 
+                var persisted = false;
                 try
                 {
                     await save(accountId, lifetime.Token).ConfigureAwait(false);
+                    persisted = true;
                 }
                 catch
                 {
@@ -114,11 +162,13 @@ public sealed class ShareAnalyticsPreferencePersistenceCoordinator : IDisposable
                 TaskCompletionSource<long> completedProgress;
                 lock (gate)
                 {
-                    completedVersion = Math.Max(completedVersion, version);
+                    processedVersion = Math.Max(processedVersion, version);
+                    if (persisted)
+                        persistedVersion = Math.Max(persistedVersion, version);
                     completedProgress = progress;
                     progress = NewProgressSource();
                 }
-                completedProgress.TrySetResult(completedVersion);
+                completedProgress.TrySetResult(processedVersion);
             }
         }
     }
