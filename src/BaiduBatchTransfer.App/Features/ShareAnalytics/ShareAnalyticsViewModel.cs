@@ -18,6 +18,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private readonly IShareAnalyticsDelay delay;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object refreshSync = new();
+    private readonly HashSet<string> selectedShareIds = new(StringComparer.Ordinal);
     private CancellationTokenSource? activation;
     private CancellationTokenSource? pendingDelay;
     private RefreshFlight? currentRefresh;
@@ -57,6 +58,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         SelectMetricCommand = new RelayCommand<AccountShareMetric>(SelectMetric);
         SortCommand = new RelayCommand<AccountShareSortColumn>(Sort);
         OpenCommand = new RelayCommand<ShareAnalyticsRow>(Open, row => row is not null);
+        ExportCommand = new RelayCommand(static () => { }, static () => false);
         StatusFilterOptions =
         [
             new(ShareAnalyticsStatusFilter.All, "全部状态"),
@@ -71,6 +73,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public IRelayCommand<AccountShareMetric> SelectMetricCommand { get; }
     public IRelayCommand<AccountShareSortColumn> SortCommand { get; }
     public IRelayCommand<ShareAnalyticsRow> OpenCommand { get; }
+    public IRelayCommand ExportCommand { get; }
     public IReadOnlyList<ShareAnalyticsRow> VisibleItems { get => visibleItems; private set => SetProperty(ref visibleItems, value); }
     public IReadOnlyList<ShareAnalyticsStatusOption> StatusFilterOptions { get; }
     public ShareAnalyticsStatusOption SelectedStatusOption
@@ -121,6 +124,18 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public int TotalCount { get; private set; }
     public int ValidCount { get; private set; }
     public int InvalidCount { get; private set; }
+    public int SelectedCount => selectedShareIds.Count;
+    public int CurrentResultCount => VisibleItems.Count;
+    public bool? HeaderSelectionState
+    {
+        get
+        {
+            if (VisibleItems.Count == 0) return false;
+            var selectedVisibleCount = VisibleItems.Count(row => selectedShareIds.Contains(row.ShareId));
+            if (selectedVisibleCount == 0) return false;
+            return selectedVisibleCount == VisibleItems.Count ? true : null;
+        }
+    }
     public string LastSuccessfulSyncText { get; private set; } = "尚未同步";
     public string CacheStatusText => snapshot?.LastSuccessfulSyncAtUtc is { } updatedAt
         ? $"本地缓存｜更新于 {updatedAt.ToLocalTime():yyyy-MM-dd HH:mm}｜{snapshot.Items.Count:N0} 条"
@@ -142,6 +157,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public void SelectAccount(Guid? selectedAccountId, string? displayName)
     {
         if (selectedAccountId == Guid.Empty) selectedAccountId = null;
+        var accountChanged = accountId != selectedAccountId;
         CancelPendingDelay();
         activation?.Cancel();
         IsRefreshing = false;
@@ -152,6 +168,13 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             : displayName.Trim();
         snapshot = null;
         VisibleItems = [];
+        NotifyCurrentResultsChanged();
+        if (accountChanged && selectedShareIds.Count > 0)
+        {
+            selectedShareIds.Clear();
+            OnPropertyChanged(nameof(SelectedCount));
+            NotifySelectionDependentCanExecuteChanged();
+        }
         LastSuccessfulSyncText = "尚未同步";
         OnPropertyChanged(nameof(LastSuccessfulSyncText));
         OnPropertyChanged(nameof(CacheStatusText));
@@ -380,6 +403,14 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private void Apply(AccountShareCachedSnapshot value)
     {
         if (value.AccountId != accountId) return;
+        var selectionChanged = false;
+        if (selectedShareIds.Count > 0)
+        {
+            var availableShareIds = value.Items
+                .Select(item => item.ShareId)
+                .ToHashSet(StringComparer.Ordinal);
+            selectionChanged = selectedShareIds.RemoveWhere(shareId => !availableShareIds.Contains(shareId)) > 0;
+        }
         snapshot = value;
         LastSuccessfulSyncText = value.LastSuccessfulSyncAtUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "尚未同步";
         OnPropertyChanged(nameof(LastSuccessfulSyncText));
@@ -387,6 +418,11 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         UpdateDateLabels();
         UpdateSummary();
         Rebuild();
+        if (selectionChanged)
+        {
+            OnPropertyChanged(nameof(SelectedCount));
+            NotifySelectionDependentCanExecuteChanged();
+        }
     }
 
     private void UpdateSummary()
@@ -401,7 +437,12 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
 
     private void Rebuild()
     {
-        if (snapshot is null) { VisibleItems = []; return; }
+        if (snapshot is null)
+        {
+            VisibleItems = [];
+            NotifyCurrentResultsChanged();
+            return;
+        }
         IEnumerable<AccountShareCachedRecord> source = snapshot.Items;
         if (!string.IsNullOrWhiteSpace(SearchText))
             source = source.Where(item => item.Title.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
@@ -411,8 +452,37 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             ShareAnalyticsStatusFilter.Invalid => source.Where(item => item.Status == AccountShareRemoteStatus.Invalid),
             _ => source,
         };
-        var projected = source.Select(item => projector.Project(item, SelectedMetric, timeProvider.GetUtcNow()));
-        VisibleItems = projector.Sort(projected, sortColumn, sortDescending).Select(item => new ShareAnalyticsRow(item)).ToArray();
+        var projectedAt = timeProvider.GetUtcNow();
+        var projected = source.Select(item => projector.Project(item, SelectedMetric, projectedAt));
+        var ordered = projector.Sort(projected, sortColumn, sortDescending).ToArray();
+        VisibleItems = ordered
+            .Select((item, index) => new ShareAnalyticsRow(
+                item,
+                index + 1,
+                selectedShareIds.Contains(item.ShareId),
+                OnRowSelectionChanged))
+            .ToArray();
+        NotifyCurrentResultsChanged();
+    }
+
+    private void OnRowSelectionChanged(string shareId, bool selected)
+    {
+        var changed = selected ? selectedShareIds.Add(shareId) : selectedShareIds.Remove(shareId);
+        if (!changed) return;
+        OnPropertyChanged(nameof(SelectedCount));
+        OnPropertyChanged(nameof(HeaderSelectionState));
+        NotifySelectionDependentCanExecuteChanged();
+    }
+
+    private void NotifyCurrentResultsChanged()
+    {
+        OnPropertyChanged(nameof(CurrentResultCount));
+        OnPropertyChanged(nameof(HeaderSelectionState));
+    }
+
+    private void NotifySelectionDependentCanExecuteChanged()
+    {
+        ExportCommand.NotifyCanExecuteChanged();
     }
 
     private void SelectMetric(AccountShareMetric metric)

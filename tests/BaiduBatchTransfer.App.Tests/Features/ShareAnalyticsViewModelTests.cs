@@ -51,6 +51,33 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public void RowPublishesSequenceAndTwoWaySelectionCallback()
+    {
+        var projected = ProjectRow("stable-share-id", "标题").Projected;
+        var constructor = typeof(ShareAnalyticsRow).GetConstructor(
+        [
+            typeof(AccountShareProjectedRow),
+            typeof(int),
+            typeof(bool),
+            typeof(Action<string, bool>),
+        ]);
+
+        Assert.NotNull(constructor);
+        var callbacks = new List<(string ShareId, bool IsSelected)>();
+        var row = Assert.IsType<ShareAnalyticsRow>(constructor.Invoke(
+            [projected, 7, false, (Action<string, bool>)((shareId, selected) => callbacks.Add((shareId, selected)))]));
+        var changed = new List<string?>();
+        row.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        row.IsSelected = true;
+
+        Assert.Equal(7, row.Sequence);
+        Assert.True(row.IsSelected);
+        Assert.Equal([("stable-share-id", true)], callbacks);
+        Assert.Equal([nameof(ShareAnalyticsRow.IsSelected)], changed);
+    }
+
+    [Fact]
     public void ShareAnalyticsColumnsUseCompactFixedWidthsInsteadOfCollapsingTheTitle()
     {
         var root = FindRepositoryRoot();
@@ -659,6 +686,133 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Equal(31, row.HistoricalTotal);
         Assert.Equal(2, viewModel.TotalCount);
         Assert.Equal(1, viewModel.InvalidCount);
+    }
+
+    [Fact]
+    public async Task RebuildRenumbersCurrentResultsAndRestoresSelectionByShareId()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Invalid, 30),
+            Record("gamma", AccountShareRemoteStatus.Valid, 20),
+        ]);
+        var viewModel = Create(new FakeSync(account, snapshot));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Equal(Enumerable.Range(1, 3), viewModel.VisibleItems.Select(row => row.Sequence));
+        var originalRows = viewModel.VisibleItems;
+        originalRows.Single(row => row.ShareId == "beta").IsSelected = true;
+
+        viewModel.SortCommand.Execute(AccountShareSortColumn.Today);
+        Assert.NotSame(originalRows, viewModel.VisibleItems);
+        Assert.Equal(Enumerable.Range(1, 3), viewModel.VisibleItems.Select(row => row.Sequence));
+        Assert.True(viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected);
+
+        viewModel.SelectMetricCommand.Execute(AccountShareMetric.View);
+        Assert.Equal(Enumerable.Range(1, 3), viewModel.VisibleItems.Select(row => row.Sequence));
+        Assert.True(viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected);
+
+        viewModel.StatusFilter = ShareAnalyticsStatusFilter.Invalid;
+        var filtered = Assert.Single(viewModel.VisibleItems);
+        Assert.Equal(1, filtered.Sequence);
+        Assert.True(filtered.IsSelected);
+        viewModel.SearchText = "different";
+        Assert.Empty(viewModel.VisibleItems);
+        viewModel.SearchText = string.Empty;
+        Assert.True(Assert.Single(viewModel.VisibleItems).IsSelected);
+
+        Assert.Equal(1, viewModel.SelectedCount);
+        Assert.Equal(1, viewModel.CurrentResultCount);
+        Assert.True(viewModel.HeaderSelectionState);
+    }
+
+    [Fact]
+    public async Task SingleRowToggleUpdatesSelectionNotificationsOnceWithoutRebuildingRows()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Valid, 20),
+        ]);
+        var viewModel = Create(new FakeSync(account, snapshot));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        var visibleItems = viewModel.VisibleItems;
+        var changed = new List<string?>();
+        var exportCanExecuteChanged = 0;
+        viewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        viewModel.ExportCommand.CanExecuteChanged += (_, _) => exportCanExecuteChanged++;
+
+        visibleItems[0].IsSelected = true;
+
+        Assert.Same(visibleItems, viewModel.VisibleItems);
+        Assert.Equal(1, changed.Count(name => name == nameof(ShareAnalyticsViewModel.SelectedCount)));
+        Assert.Equal(1, changed.Count(name => name == nameof(ShareAnalyticsViewModel.HeaderSelectionState)));
+        Assert.DoesNotContain(nameof(ShareAnalyticsViewModel.CurrentResultCount), changed);
+        Assert.DoesNotContain(nameof(ShareAnalyticsViewModel.VisibleItems), changed);
+        Assert.Equal(1, exportCanExecuteChanged);
+        Assert.False(viewModel.ExportCommand.CanExecute(null));
+        Assert.Null(viewModel.HeaderSelectionState);
+    }
+
+    [Fact]
+    public async Task SelectingDifferentAccountClearsAllSelectedShareIds()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var service = new MultiAccountSync(
+            Snapshot(accountA, "alpha", Now),
+            Snapshot(accountB, "beta", Now));
+        var viewModel = Create(service);
+        viewModel.SelectAccount(accountA, "甲");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+        Assert.Equal(1, viewModel.SelectedCount);
+
+        viewModel.SelectAccount(accountB, "乙");
+
+        Assert.Equal(0, viewModel.SelectedCount);
+        Assert.False(viewModel.HeaderSelectionState);
+        await WaitUntilAsync(() => viewModel.VisibleItems.Count == 1);
+        Assert.Equal("beta", Assert.Single(viewModel.VisibleItems).ShareId);
+        Assert.False(Assert.Single(viewModel.VisibleItems).IsSelected);
+    }
+
+    [Fact]
+    public async Task SameAccountRefreshRetainsOnlySelectedIdsStillInSnapshot()
+    {
+        var account = Guid.NewGuid();
+        var cached = new AccountShareCachedSnapshot(account, Now.AddHours(-22),
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Valid, 20),
+        ]);
+        var refreshed = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("beta", AccountShareRemoteStatus.Valid, 30),
+            Record("gamma", AccountShareRemoteStatus.Valid, 40),
+        ]);
+        var viewModel = Create(new FakeSync(account, cached, refreshed), new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        foreach (var row in viewModel.VisibleItems) row.IsSelected = true;
+        var changed = new List<string?>();
+        var exportCanExecuteChanged = 0;
+        viewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        viewModel.ExportCommand.CanExecuteChanged += (_, _) => exportCanExecuteChanged++;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, viewModel.SelectedCount);
+        Assert.Equal(1, changed.Count(name => name == nameof(ShareAnalyticsViewModel.SelectedCount)));
+        Assert.Equal(1, exportCanExecuteChanged);
+        Assert.Equal(["beta", "gamma"], viewModel.VisibleItems.Select(row => row.ShareId).Order());
+        Assert.True(viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected);
+        Assert.False(viewModel.VisibleItems.Single(row => row.ShareId == "gamma").IsSelected);
+        Assert.Null(viewModel.HeaderSelectionState);
     }
 
     [Fact]

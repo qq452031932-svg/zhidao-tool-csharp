@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.Application.ShareAnalytics;
 using BaiduBatchTransfer.Core.Domain;
+using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace BaiduBatchTransfer.App.Features.ShareAnalytics;
 
@@ -25,8 +26,34 @@ public interface IShareAnalyticsDelay
     Task WaitAsync(TimeSpan delay, CancellationToken token);
 }
 
-public sealed class ShareAnalyticsRow(AccountShareProjectedRow projected)
+public sealed class ShareAnalyticsRow : ObservableObject
 {
+    private readonly AccountShareProjectedRow projected;
+    private readonly Action<string, bool>? selectionChanged;
+    private bool isSelected;
+
+    public ShareAnalyticsRow(
+        AccountShareProjectedRow projected,
+        int sequence = 0,
+        bool isSelected = false,
+        Action<string, bool>? selectionChanged = null)
+    {
+        this.projected = projected;
+        this.selectionChanged = selectionChanged;
+        Sequence = sequence;
+        this.isSelected = isSelected;
+    }
+
+    public int Sequence { get; }
+    public bool IsSelected
+    {
+        get => isSelected;
+        set
+        {
+            if (!SetProperty(ref isSelected, value)) return;
+            selectionChanged?.Invoke(ShareId, value);
+        }
+    }
     public string ShareId => projected.ShareId;
     public string Title => string.Equals(projected.Title.Trim(), "0", StringComparison.Ordinal)
         ? projected.ShareId
