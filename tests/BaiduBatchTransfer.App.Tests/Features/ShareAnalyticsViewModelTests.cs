@@ -97,6 +97,25 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public async Task FailedInitialRefreshDoesNotScheduleRetry()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, SnapshotWithoutSync(account, "cached"))
+        {
+            SyncResults = [FailureResult]
+        };
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal(1, service.SyncCalls);
+        Assert.Empty(delay.Requests);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
+    }
+
+    [Fact]
     public async Task CompletingFreshCacheDelayStartsExactlyOneSync()
     {
         var account = Guid.NewGuid();
@@ -116,6 +135,27 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Equal(1, service.SyncCalls);
         Assert.Equal("fresh", Assert.Single(viewModel.VisibleItems).Title);
         Assert.Equal(TimeSpan.FromHours(23), delay.Requests[1].Delay);
+    }
+
+    [Fact]
+    public async Task FailedAutomaticDueRefreshDoesNotScheduleRetry()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        {
+            SyncResults = [FailureResult]
+        };
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        delay.Complete(0);
+        await service.WaitForSyncCallsAsync(1);
+        await WaitUntilAsync(() => !viewModel.IsRefreshing);
+
+        Assert.Single(delay.Requests);
+        Assert.Equal("分享数据获取失败，请稍后重试。", viewModel.StatusMessage);
     }
 
     [Fact]

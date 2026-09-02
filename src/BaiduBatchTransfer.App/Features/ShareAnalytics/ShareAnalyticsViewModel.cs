@@ -280,7 +280,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         CancellationToken token,
         RefreshOrigin origin)
     {
-        if (origin == RefreshOrigin.Retry) return;
+        if (origin != RefreshOrigin.Manual) return;
         if (snapshot?.LastSuccessfulSyncAtUtc is { } lastSuccess)
         {
             var remaining = RemainingLifetime(lastSuccess);
