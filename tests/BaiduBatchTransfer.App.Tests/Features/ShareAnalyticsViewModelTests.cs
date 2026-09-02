@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.App.Features.ShareAnalytics;
+using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.ShareAnalytics;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
@@ -48,6 +49,292 @@ public sealed class ShareAnalyticsViewModelTests
         var row = ProjectRow("stable-share-id", title);
 
         Assert.Equal(title, row.Title);
+    }
+
+    [Fact]
+    public async Task ExportIsDisabledWithoutASelectionAndEnabledForAnActiveAccountSelection()
+    {
+        var account = Guid.NewGuid();
+        var viewModel = Create(new FakeSync(account, Snapshot(account, "alpha", Now)));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        Assert.False(viewModel.ExportCommand.CanExecute(null));
+
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        Assert.True(viewModel.ExportCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ExportDisablesReentryWhileDirectoryChoiceIsPending()
+    {
+        var account = Guid.NewGuid();
+        var dialog = new GateSaveDialog();
+        var exporter = new RecordingExporter();
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "alpha", Now)),
+            exportService: exporter,
+            saveDialog: dialog);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        var exporting = viewModel.ExportCommand.ExecuteAsync(null);
+        await dialog.Started.Task;
+
+        Assert.True(viewModel.IsExporting);
+        Assert.False(viewModel.ExportCommand.CanExecute(null));
+        dialog.Complete(null);
+        await exporting;
+        Assert.False(viewModel.IsExporting);
+        Assert.Empty(exporter.Requests);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task CancelingTheDestinationDialogDoesNotCallTheExporter(string? directory)
+    {
+        var account = Guid.NewGuid();
+        var exporter = new RecordingExporter();
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "alpha", Now)),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog(directory));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+        var originalStatus = viewModel.StatusMessage;
+
+        await viewModel.ExportCommand.ExecuteAsync(null);
+
+        Assert.Empty(exporter.Requests);
+        Assert.Equal(originalStatus, viewModel.StatusMessage);
+        Assert.False(viewModel.IsExporting);
+    }
+
+    [Fact]
+    public async Task SuccessfulExportReportsOnlyTheCountAndASanitizedBoundedFileName()
+    {
+        var account = Guid.NewGuid();
+        var unsafeFileName = new string('x', 300) + "\u0001.xlsx";
+        var exporter = new RecordingExporter((_, _) => Task.FromResult(
+            new ShareAnalyticsWorkbookExportResult(
+                Path.Combine(@"C:\private\account-session", unsafeFileName), 1, 1)));
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "alpha", Now)),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog(@"C:\private\account-session"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        await viewModel.ExportCommand.ExecuteAsync(null);
+
+        Assert.Contains("1", viewModel.StatusMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain(@"C:\private", viewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("account-session", viewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain('\u0001', viewModel.StatusMessage);
+        Assert.InRange(viewModel.StatusMessage.Length, 1, 180);
+    }
+
+    [Fact]
+    public async Task ExportFailureIsContainedAndUsesOnlyTheStableMessage()
+    {
+        var account = Guid.NewGuid();
+        var exporter = new RecordingExporter((_, _) =>
+            Task.FromException<ShareAnalyticsWorkbookExportResult>(
+                new InvalidOperationException(@"private C:\secret\output.xlsx session=abc")));
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "alpha", Now)),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog(@"C:\secret"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        var error = await Xunit.Record.ExceptionAsync(() => viewModel.ExportCommand.ExecuteAsync(null));
+
+        Assert.Null(error);
+        Assert.Equal("导出失败，请重试。", viewModel.StatusMessage);
+        Assert.False(viewModel.IsExporting);
+    }
+
+    [Fact]
+    public async Task ExportIncludesSelectionsHiddenBySearchAndStatusAndUsesCurrentStableSort()
+    {
+        var account = Guid.NewGuid();
+        var date = new DateOnly(2026, 9, 2);
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            ExportRecord("zeta", "Z", AccountShareRemoteStatus.Invalid, Now.AddHours(-2), date, transferTotal: 40, transferToday: 20),
+            ExportRecord("alpha", "A", AccountShareRemoteStatus.Valid, Now.AddHours(-1), date, transferTotal: 40, transferToday: 20),
+            ExportRecord("beta", "B", AccountShareRemoteStatus.Valid, Now.AddHours(-1), date, transferTotal: 40, transferToday: 20),
+        ]);
+        var exporter = new RecordingExporter();
+        var viewModel = Create(
+            new FakeSync(account, snapshot),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog("exports"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        foreach (var row in viewModel.VisibleItems) row.IsSelected = true;
+        viewModel.SortCommand.Execute(AccountShareSortColumn.Today);
+        viewModel.StatusFilter = ShareAnalyticsStatusFilter.Valid;
+        viewModel.SearchText = "A";
+
+        await viewModel.ExportCommand.ExecuteAsync(null);
+
+        var request = Assert.Single(exporter.Requests);
+        Assert.Equal(3, request.SelectedRows.Length);
+        Assert.Equal(
+            ["https://pan.baidu.com/s/alpha", "https://pan.baidu.com/s/beta", "https://pan.baidu.com/s/zeta"],
+            request.SelectedRows.Select(row => row.ShareLink));
+    }
+
+    [Fact]
+    public async Task ExportFreezesClockSnapshotMetricValuesIdsAndOrderBeforeAwaitingTheDialog()
+    {
+        var account = Guid.NewGuid();
+        var initialDate = new DateOnly(2026, 9, 1);
+        var initial = new AccountShareCachedSnapshot(account, Now,
+        [
+            ExportRecord("alpha", "old alpha", AccountShareRemoteStatus.Valid, Now.AddHours(-2), initialDate, 100, 10),
+            ExportRecord("beta", "old beta", AccountShareRemoteStatus.Valid, Now.AddHours(-1), initialDate, 200, 30),
+        ]);
+        var refreshed = new AccountShareCachedSnapshot(account, Now.AddMinutes(1),
+        [
+            ExportRecord("alpha", "new alpha", AccountShareRemoteStatus.Valid, Now.AddHours(2), initialDate.AddDays(1), 900, 90),
+            ExportRecord("beta", "new beta", AccountShareRemoteStatus.Valid, Now.AddHours(1), initialDate.AddDays(1), 800, 80),
+        ]);
+        var time = new MutableTimeProvider(new DateTimeOffset(2026, 9, 1, 15, 59, 0, TimeSpan.Zero));
+        var dialog = new GateSaveDialog();
+        var exporter = new RecordingExporter();
+        var viewModel = Create(
+            new FakeSync(account, initial, refreshed),
+            timeProvider: time,
+            exportService: exporter,
+            saveDialog: dialog);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        foreach (var row in viewModel.VisibleItems) row.IsSelected = true;
+        viewModel.SortCommand.Execute(AccountShareSortColumn.Today);
+
+        var exporting = viewModel.ExportCommand.ExecuteAsync(null);
+        await dialog.Started.Task;
+        time.Advance(TimeSpan.FromMinutes(2));
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        viewModel.SelectMetricCommand.Execute(AccountShareMetric.View);
+        viewModel.SortCommand.Execute(AccountShareSortColumn.HistoricalTotal);
+        dialog.Complete("exports");
+        await exporting;
+
+        var request = Assert.Single(exporter.Requests);
+        Assert.Equal(AccountShareMetric.Transfer, request.Metric);
+        Assert.Equal(
+            new[] { new DateOnly(2026, 9, 1), new(2026, 8, 31), new(2026, 8, 30), new(2026, 8, 29), new(2026, 8, 28) },
+            request.Dates.ToArray());
+        Assert.Equal(["old beta", "old alpha"], request.SelectedRows.Select(row => row.Title));
+        Assert.Equal([30L, 10L], request.SelectedRows.Select(row => row.DailyValues[0]));
+        Assert.Equal(
+            ["https://pan.baidu.com/s/beta", "https://pan.baidu.com/s/alpha"],
+            request.SelectedRows.Select(row => row.ShareLink));
+    }
+
+    [Theory]
+    [InlineData(ExportInvalidation.AccountSwitch)]
+    [InlineData(ExportInvalidation.Leave)]
+    [InlineData(ExportInvalidation.Dispose)]
+    public async Task LifecycleBoundaryCancelsExportAndRejectsLateCompletion(ExportInvalidation invalidation)
+    {
+        var account = Guid.NewGuid();
+        var otherAccount = Guid.NewGuid();
+        var exporter = new GateExporter();
+        var viewModel = Create(
+            new MultiAccountSync(Snapshot(account, "alpha", Now), Snapshot(otherAccount, "other", Now)),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog("exports"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        var exporting = viewModel.ExportCommand.ExecuteAsync(null);
+        await exporter.Started.Task;
+        switch (invalidation)
+        {
+            case ExportInvalidation.AccountSwitch:
+                viewModel.SelectAccount(otherAccount, "其他账号");
+                await WaitUntilAsync(() => viewModel.VisibleItems.Count == 1 &&
+                    viewModel.VisibleItems[0].ShareId == "other");
+                Assert.Single(viewModel.VisibleItems).IsSelected = true;
+                Assert.True(viewModel.ExportCommand.CanExecute(null));
+                break;
+            case ExportInvalidation.Leave:
+                viewModel.Leave();
+                break;
+            case ExportInvalidation.Dispose:
+                viewModel.Dispose();
+                break;
+        }
+        var expectedStatus = viewModel.StatusMessage;
+        Assert.True(exporter.CancellationToken.IsCancellationRequested);
+        Assert.False(viewModel.IsExporting);
+
+        exporter.Complete(new ShareAnalyticsWorkbookExportResult(@"C:\private\late.xlsx", 999, 1));
+        await exporting;
+
+        Assert.Equal(expectedStatus, viewModel.StatusMessage);
+        Assert.False(viewModel.IsExporting);
+    }
+
+    [Fact]
+    public async Task OperationCanceledExportDoesNotShowFailure()
+    {
+        var account = Guid.NewGuid();
+        var exporter = new RecordingExporter((_, _) =>
+            Task.FromCanceled<ShareAnalyticsWorkbookExportResult>(new CancellationToken(canceled: true)));
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "alpha", Now)),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog("exports"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+        var expectedStatus = viewModel.StatusMessage;
+
+        await viewModel.ExportCommand.ExecuteAsync(null);
+
+        Assert.Equal(expectedStatus, viewModel.StatusMessage);
+        Assert.False(viewModel.IsExporting);
+    }
+
+    [Fact]
+    public async Task ExportUsesShareIdForAnExactLegacyZeroTitle()
+    {
+        var account = Guid.NewGuid();
+        var exporter = new RecordingExporter();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            new AccountShareCachedRecord(
+                "stable-id", "0", new Uri("https://pan.baidu.com/s/stable-id"), Now,
+                AccountShareRemoteStatus.Valid,
+                Enum.GetValues<AccountShareMetric>()
+                    .Select(metric => new AccountShareMetricHistory(metric, 1))
+                    .ToArray()),
+        ]);
+        var viewModel = Create(
+            new FakeSync(account, snapshot),
+            exportService: exporter,
+            saveDialog: new ImmediateSaveDialog("exports"));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.Single(viewModel.VisibleItems).IsSelected = true;
+
+        await viewModel.ExportCommand.ExecuteAsync(null);
+
+        Assert.Equal("stable-id", Assert.Single(Assert.Single(exporter.Requests).SelectedRows).Title);
     }
 
     [Fact]
@@ -748,7 +1035,7 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.DoesNotContain(nameof(ShareAnalyticsViewModel.CurrentResultCount), changed);
         Assert.DoesNotContain(nameof(ShareAnalyticsViewModel.VisibleItems), changed);
         Assert.Equal(1, exportCanExecuteChanged);
-        Assert.False(viewModel.ExportCommand.CanExecute(null));
+        Assert.True(viewModel.ExportCommand.CanExecute(null));
         Assert.Null(viewModel.HeaderSelectionState);
     }
 
@@ -1244,9 +1531,12 @@ public sealed class ShareAnalyticsViewModelTests
         IShareAnalyticsWorkspaceService service,
         IShareAnalyticsDelay? delay = null,
         TimeProvider? timeProvider = null,
-        IShareAnalyticsBulkScheduler? bulkScheduler = null) =>
+        IShareAnalyticsBulkScheduler? bulkScheduler = null,
+        IShareAnalyticsWorkbookExportService? exportService = null,
+        IResultSaveDialog? saveDialog = null) =>
         new(service, new AccountShareAnalyticsProjector(), new FakeLauncher(),
-            timeProvider ?? new FrozenTimeProvider(Now), delay ?? new FakeDelay(), bulkScheduler);
+            timeProvider ?? new FrozenTimeProvider(Now), delay ?? new FakeDelay(),
+            exportService ?? new RecordingExporter(), saveDialog ?? new ImmediateSaveDialog(null), bulkScheduler);
 
     private static AccountShareCachedSnapshot Snapshot(Guid account, string title, DateTimeOffset? syncedAt = null) =>
         new(account, syncedAt ?? Now, [Record(title, AccountShareRemoteStatus.Valid, 10)]);
@@ -1259,6 +1549,30 @@ public sealed class ShareAnalyticsViewModelTests
         Enum.GetValues<AccountShareMetric>().Select(metric => new AccountShareMetricHistory(
             metric, total + (long)metric,
             new Dictionary<DateOnly, long?> { [new(2026, 9, 1)] = total, [new(2026, 9, 2)] = total + 2 })).ToArray());
+
+    private static AccountShareCachedRecord ExportRecord(
+        string shareId,
+        string title,
+        AccountShareRemoteStatus status,
+        DateTimeOffset sharedAt,
+        DateOnly date,
+        long transferTotal,
+        long transferToday) => new(
+        shareId,
+        title,
+        new Uri($"https://pan.baidu.com/s/{shareId}"),
+        sharedAt,
+        status,
+        Enum.GetValues<AccountShareMetric>()
+            .Select(metric => new AccountShareMetricHistory(
+                metric,
+                transferTotal + ((long)metric * 1_000),
+                directDailyValues: new Dictionary<DateOnly, long?>
+                {
+                    [date] = transferToday + ((long)metric * 100),
+                    [date.AddDays(-1)] = transferToday - 1 + ((long)metric * 100),
+                }))
+            .ToArray());
 
     private static AccountShareCachedRecord SyntheticRecord(int index) => new(
         $"id-{index:D6}",
@@ -1390,6 +1704,75 @@ public sealed class ShareAnalyticsViewModelTests
         public bool TryOpen(Uri uri, out string safeMessage) { safeMessage = "ok"; return true; }
     }
 
+    private sealed class ImmediateSaveDialog(string? directory) : IResultSaveDialog
+    {
+        public Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(directory);
+    }
+
+    private sealed class GateSaveDialog : IResultSaveDialog
+    {
+        private readonly TaskCompletionSource<string?> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken CancellationToken { get; private set; }
+
+        public async Task<string?> PickDestinationDirectoryAsync(CancellationToken cancellationToken = default)
+        {
+            CancellationToken = cancellationToken;
+            Started.TrySetResult();
+            return await completion.Task;
+        }
+
+        public void Complete(string? directory) => completion.TrySetResult(directory);
+    }
+
+    private sealed class RecordingExporter(
+        Func<ShareAnalyticsWorkbookExportRequest, CancellationToken, Task<ShareAnalyticsWorkbookExportResult>>? handler = null)
+        : IShareAnalyticsWorkbookExportService
+    {
+        private readonly Func<ShareAnalyticsWorkbookExportRequest, CancellationToken, Task<ShareAnalyticsWorkbookExportResult>> handler =
+            handler ?? ((_, _) => Task.FromResult(
+                new ShareAnalyticsWorkbookExportResult(Path.Combine("exports", "share.xlsx"), 1, 1)));
+
+        public List<ShareAnalyticsWorkbookExportRequest> Requests { get; } = [];
+        public List<CancellationToken> CancellationTokens { get; } = [];
+
+        public Task<ShareAnalyticsWorkbookExportResult> ExportAsync(
+            ShareAnalyticsWorkbookExportRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            Requests.Add(request);
+            CancellationTokens.Add(cancellationToken);
+            return handler(request, cancellationToken);
+        }
+    }
+
+    private sealed class GateExporter : IShareAnalyticsWorkbookExportService
+    {
+        private readonly TaskCompletionSource<ShareAnalyticsWorkbookExportResult> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public ShareAnalyticsWorkbookExportRequest? Request { get; private set; }
+        public CancellationToken CancellationToken { get; private set; }
+
+        public async Task<ShareAnalyticsWorkbookExportResult> ExportAsync(
+            ShareAnalyticsWorkbookExportRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            Request = request;
+            CancellationToken = cancellationToken;
+            Started.TrySetResult();
+            return await completion.Task;
+        }
+
+        public void Complete(ShareAnalyticsWorkbookExportResult result) => completion.TrySetResult(result);
+    }
+
     private sealed class GateBulkScheduler : IShareAnalyticsBulkScheduler
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1432,6 +1815,13 @@ public sealed class ShareAnalyticsViewModelTests
         Search,
         Status,
         Sort,
+        Leave,
+        Dispose,
+    }
+
+    public enum ExportInvalidation
+    {
+        AccountSwitch,
         Leave,
         Dispose,
     }

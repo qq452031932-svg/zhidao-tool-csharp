@@ -8,12 +8,15 @@ using BaiduBatchTransfer.App.Features.Transfers;
 using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Features.Acceptance;
+using BaiduBatchTransfer.App.Features.ShareAnalytics;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Scheduling;
+using BaiduBatchTransfer.Application.ShareAnalytics;
 using BaiduBatchTransfer.BaiduAdapter.WebAutomation;
+using BaiduBatchTransfer.BaiduAdapter.Http;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -22,6 +25,7 @@ using BaiduBatchTransfer.Infrastructure.Security;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 
 namespace BaiduBatchTransfer.App.Tests;
@@ -29,6 +33,132 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class AppBootstrapTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void TransferManagedCompositionResolvesWithoutStartingAHelper()
+    {
+        var helperStarts = 0;
+        using var host = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<ManagedBrowserHelperClientFactory>();
+            services.AddSingleton(_ => new ManagedBrowserHelperClientFactory(_ =>
+            {
+                Interlocked.Increment(ref helperStarts);
+                throw new InvalidOperationException("Resolving transfer services must not start a helper.");
+            }));
+        });
+
+        Assert.Same(
+            host.Services.GetRequiredService<SqliteManagedBrowserStateStore>(),
+            host.Services.GetRequiredService<IBaiduExecutionBindingStore>());
+        Assert.IsType<BaiduExecutionContextResolver>(
+            host.Services.GetRequiredService<IBaiduExecutionContextResolver>());
+        Assert.NotNull(host.Services.GetRequiredService<ManagedBrowserHelperClientFactory>());
+        Assert.NotNull(host.Services.GetRequiredService<ManagedTransferQuarantineRegistry>());
+        Assert.NotNull(host.Services.GetRequiredService<ManagedTransferShareHandoffRegistry>());
+        Assert.NotNull(host.Services.GetRequiredService<ManagedChromiumTransferRuntimeFactory>());
+        Assert.IsType<ManagedChromiumTransferAdapter>(
+            host.Services.GetRequiredService<IManagedChromiumTransferAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<ExecutionBoundTransferAdapter>());
+        Assert.Same(
+            host.Services.GetRequiredService<SqliteTransferSchedulingStore>(),
+            host.Services.GetRequiredService<IBatchSchedulingPolicySource>());
+        Assert.Equal(0, helperStarts);
+    }
+
+    [Fact]
+    public void ShareManagedCompositionResolvesWithoutStartingAHelper()
+    {
+        var helperStarts = 0;
+        using var host = AppBootstrap.CreateHost(root, services =>
+        {
+            services.RemoveAll<ManagedBrowserHelperClientFactory>();
+            services.AddSingleton(_ => new ManagedBrowserHelperClientFactory(_ =>
+            {
+                Interlocked.Increment(ref helperStarts);
+                throw new InvalidOperationException("Resolving share services must not start a helper.");
+            }));
+        });
+
+        Assert.IsType<ManagedShareAutomationSessionFactory>(
+            host.Services.GetRequiredService<IManagedShareAutomationSessionFactory>());
+        Assert.IsType<ManagedChromiumShareAdapter>(
+            host.Services.GetRequiredService<IManagedChromiumShareAdapter>());
+        Assert.NotNull(host.Services.GetRequiredService<ExecutionBoundShareAdapter>());
+        Assert.Equal(0, helperStarts);
+    }
+
+    [Fact]
+    public void DirectBackgroundModeUsesCookieHttpTransferExecutorAndReconciler()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        var live = host.Services.GetRequiredService<IBaiduNetdiskAdapter>();
+        var executor = Assert.IsType<OperationExecutor>(
+            host.Services.GetRequiredService<ITransferOperationExecutor>());
+        var reconciler = Assert.IsType<OperationReconciliationService>(
+            host.Services.GetRequiredService<ITransferResultReconciler>());
+
+        Assert.Same(live, PrivateField<IBaiduNetdiskAdapter>(executor, "adapter"));
+        Assert.Null(PrivateField<ExecutionBoundTransferAdapter>(executor, "boundAdapter"));
+        Assert.Same(live, PrivateField<IBaiduNetdiskAdapter>(reconciler, "adapter"));
+        Assert.Null(PrivateField<ExecutionBoundTransferAdapter>(reconciler, "boundAdapter"));
+    }
+
+    [Fact]
+    public void DirectBackgroundModeUsesCookieHttpShareExecutorAndReconciler()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        var live = host.Services.GetRequiredService<IBaiduShareAdapter>();
+        var executor = Assert.IsType<ShareOperationExecutor>(
+            host.Services.GetRequiredService<IShareOperationExecutor>());
+        var reconciler = Assert.IsType<ShareOperationReconciliationService>(
+            host.Services.GetRequiredService<IShareResultReconciler>());
+
+        Assert.Same(live, PrivateField<IBaiduShareAdapter>(executor, "adapter"));
+        Assert.Null(PrivateField<ExecutionBoundShareAdapter>(executor, "boundAdapter"));
+        Assert.Same(live, PrivateField<IBaiduShareAdapter>(reconciler, "adapter"));
+        Assert.Null(PrivateField<ExecutionBoundShareAdapter>(reconciler, "boundAdapter"));
+    }
+
+#if DEBUG
+    [Fact]
+    public void AcceptanceOnlyModeUsesBoundTransferExecutorAndReconciler()
+    {
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch]);
+        var bound = host.Services.GetRequiredService<ExecutionBoundTransferAdapter>();
+        var executor = Assert.IsType<OperationExecutor>(
+            host.Services.GetRequiredService<ITransferOperationExecutor>());
+        var reconciler = Assert.IsType<OperationReconciliationService>(
+            host.Services.GetRequiredService<ITransferResultReconciler>());
+
+        Assert.Same(bound, PrivateField<ExecutionBoundTransferAdapter>(executor, "boundAdapter"));
+        Assert.Null(PrivateField<IBaiduNetdiskAdapter>(executor, "adapter"));
+        Assert.Same(bound, PrivateField<ExecutionBoundTransferAdapter>(reconciler, "boundAdapter"));
+        Assert.Null(PrivateField<IBaiduNetdiskAdapter>(reconciler, "adapter"));
+    }
+
+    [Fact]
+    public void AcceptanceOnlyModeUsesBoundShareExecutorAndReconciler()
+    {
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch]);
+        var bound = host.Services.GetRequiredService<ExecutionBoundShareAdapter>();
+        var executor = Assert.IsType<ShareOperationExecutor>(
+            host.Services.GetRequiredService<IShareOperationExecutor>());
+        var reconciler = Assert.IsType<ShareOperationReconciliationService>(
+            host.Services.GetRequiredService<IShareResultReconciler>());
+
+        Assert.Same(bound, PrivateField<ExecutionBoundShareAdapter>(executor, "boundAdapter"));
+        Assert.Null(PrivateField<IBaiduShareAdapter>(executor, "adapter"));
+        Assert.Same(bound, PrivateField<ExecutionBoundShareAdapter>(reconciler, "boundAdapter"));
+        Assert.Null(PrivateField<IBaiduShareAdapter>(reconciler, "adapter"));
+    }
+#endif
+
+    private static T? PrivateField<T>(object instance, string name) where T : class =>
+        (T?)instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(instance);
 
     [Fact]
     public void ManagedBrowserProfilePolicyAndBrowserSelectionProcessDependenciesAreSharedSingletons()
@@ -52,12 +182,12 @@ public sealed class AppBootstrapTests : IDisposable
     {
         using var host = AppBootstrap.CreateHost(root);
 
-        var transferAdapter = Assert.IsType<CoordinatedOperationBoundBaiduNetdiskAdapter>(
+        var transferAdapter = Assert.IsType<LiveBaiduNetdiskAdapter>(
             host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
-        Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(transferAdapter);
-        var shareAdapter = Assert.IsType<CoordinatedOperationBoundBaiduShareAdapter>(
+        var shareAdapter = Assert.IsType<LiveBaiduShareAdapter>(
             host.Services.GetRequiredService<IBaiduShareAdapter>());
-        Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(shareAdapter);
+        Assert.NotNull(transferAdapter);
+        Assert.NotNull(shareAdapter);
         Assert.NotNull(host.Services.GetRequiredService<WebViewBaiduShareAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<StandaloneShareCoordinator>());
         Assert.NotNull(host.Services.GetRequiredService<CreateStandaloneShareBatchService>());
@@ -68,13 +198,16 @@ public sealed class AppBootstrapTests : IDisposable
             service => service.GetType().Name == "TransferCoordinatorHostedService");
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduNetdiskAdapter>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduBatchTransfer.BaiduAdapter.Http.LiveBaiduShareAdapter>());
+        Assert.IsType<SqliteAccountCapacityStore>(host.Services.GetRequiredService<IAccountCapacityStore>());
+        Assert.NotNull(host.Services.GetRequiredService<AccountCapacityRefreshService>());
         Assert.NotNull(host.Services.GetRequiredService<BaiduAdapterConcurrencyGate>());
         var capability = host.Services.GetRequiredService<AdapterCapability>();
         Assert.False(capability.TransferValidated);
         Assert.False(capability.ShareValidated);
-        Assert.IsType<UnavailableAdapterAvailability>(host.Services.GetRequiredService<IAdapterAvailability>());
-        Assert.Equal("ManagedBrowserAccountLoginLauncher", host.Services.GetRequiredService<IAccountLoginLauncher>().GetType().Name);
-        Assert.Same(host.Services.GetRequiredService<IAccountLoginLauncher>(), host.Services.GetRequiredService<IAccountReloginLauncher>());
+        Assert.True(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
+        var cookieLogin = Assert.IsType<DirectBackgroundAccountLoginLauncher>(
+            host.Services.GetRequiredService<IAccountLoginLauncher>());
+        Assert.Same(cookieLogin, host.Services.GetRequiredService<IAccountReloginLauncher>());
         Assert.IsType<ManagedBrowserLoginWindowPresenter>(host.Services.GetRequiredService<IManagedBrowserLoginWindowPresenter>());
         Assert.Same(host.Services.GetRequiredService<ManagedBrowserLoginLauncher>(), host.Services.GetRequiredService<IManagedBrowserLoginOperations>());
         Assert.Same(host.Services.GetRequiredService<IDialogService>(), host.Services.GetRequiredService<IBrowserDirectoryPicker>());
@@ -92,7 +225,9 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.IsType<BulkWizardPrecheckWorkflow>(host.Services.GetRequiredService<IWizardPrecheckWorkflow>());
         Assert.IsType<LocalJobResultsWorkflow>(host.Services.GetRequiredService<IJobResultsWorkflow>());
         Assert.IsType<ResultSaveDialog>(host.Services.GetRequiredService<IResultSaveDialog>());
-        Assert.IsType<UnavailableJobResultCapabilityAvailability>(
+        Assert.IsType<ShareAnalyticsWorkbookExportService>(
+            host.Services.GetRequiredService<IShareAnalyticsWorkbookExportService>());
+        Assert.IsType<DirectBackgroundJobResultCapabilityAvailability>(
             host.Services.GetRequiredService<IJobResultCapabilityAvailability>());
         Assert.IsType<ExistingShareDecisionPresenter>(
             host.Services.GetRequiredService<IExistingShareDecisionPresenter>());
@@ -137,6 +272,15 @@ public sealed class AppBootstrapTests : IDisposable
             host.Services.GetRequiredService<IStandaloneShareExecutionStore>());
         Assert.IsType<ImportWorkspaceFactory>(host.Services.GetRequiredService<IImportWorkspaceFactory>());
         Assert.NotNull(host.Services.GetRequiredService<IAppShellFactory>());
+        var shellConstructorParameters = Assert.Single(typeof(AppShellFactory).GetConstructors()).GetParameters();
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(IStandaloneShareResultProjectionRepository));
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(ILocalResultExportStore));
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(IShareAnalyticsWorkbookExportService));
+        Assert.Contains(shellConstructorParameters, parameter =>
+            parameter.ParameterType == typeof(IResultSaveDialog));
         Assert.IsType<StartupRecoveryRunner>(host.Services.GetRequiredService<IAppRecoveryRunner>());
         Assert.NotNull(host.Services.GetRequiredService<ISingleInstanceGuard>());
         Assert.IsType<AcceptanceWriteLeaseCoordinator>(
@@ -188,7 +332,7 @@ public sealed class AppBootstrapTests : IDisposable
 
 #if DEBUG
     [Fact]
-    public async Task StartingAnExplicitAcceptanceHostRunsQueuedTransferWork()
+    public async Task StartingAnExplicitAcceptanceHostDoesNotRunTheGlobalTransferQueue()
     {
         var executor = new RecordingTransferExecutor();
         using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch], services =>
@@ -208,10 +352,14 @@ public sealed class AppBootstrapTests : IDisposable
             DateTimeOffset.UtcNow.AddMinutes(-1));
 
         await host.StartAsync();
-        await executor.Executed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(150);
         await host.StopAsync(TimeSpan.FromSeconds(2));
 
-        Assert.Equal(operationId, executor.OperationId);
+        Assert.Null(executor.OperationId);
+        Assert.Equal(RemoteWriteExecutionMode.AcceptanceOnly,
+            host.Services.GetRequiredService<RemoteWriteExecutionMode>());
+        Assert.Equal("Waiting", await ReadOperationStatusAsync(
+            host.Services.GetRequiredService<SqliteConnectionFactory>(), operationId));
     }
 #endif
 
@@ -223,11 +371,14 @@ public sealed class AppBootstrapTests : IDisposable
             [AcceptanceWriteLeaseOptions.Switch]);
 
         var options = host.Services.GetRequiredService<AcceptanceWriteLeaseOptions>();
+        var mode = host.Services.GetRequiredService<RemoteWriteExecutionMode>();
 
 #if DEBUG
         Assert.True(options.IsEnabled);
+        Assert.Equal(RemoteWriteExecutionMode.AcceptanceOnly, mode);
 #else
         Assert.False(options.IsEnabled);
+        Assert.Equal(RemoteWriteExecutionMode.DirectBackground, mode);
 #endif
     }
 
@@ -251,11 +402,7 @@ public sealed class AppBootstrapTests : IDisposable
         var resultCapabilities = host.Services.GetRequiredService<IJobResultCapabilityAvailability>();
         var resultActionCapability = host.Services.GetRequiredService<IJobResultActionCapability>();
 
-#if DEBUG
         Assert.True(availability.CanStartTransfers);
-#else
-        Assert.False(availability.CanStartTransfers);
-#endif
         Assert.False(resultCapabilities.CanUseTransferActions);
         Assert.False(resultCapabilities.CanUseShareActions);
         Assert.False(resultActionCapability.CanUseTransferActions);
@@ -287,13 +434,13 @@ public sealed class AppBootstrapTests : IDisposable
             root,
             [AcceptanceWriteLeaseOptions.Switch]);
 
-        Assert.True(ordinaryHost.Services.GetRequiredService<IAdapterAvailability>()
+        Assert.False(ordinaryHost.Services.GetRequiredService<IAdapterAvailability>()
             .RequiresBulkPrecheckBeforeStart);
 #if DEBUG
         Assert.False(acceptanceHost.Services.GetRequiredService<IAdapterAvailability>()
             .RequiresBulkPrecheckBeforeStart);
 #else
-        Assert.True(acceptanceHost.Services.GetRequiredService<IAdapterAvailability>()
+        Assert.False(acceptanceHost.Services.GetRequiredService<IAdapterAvailability>()
             .RequiresBulkPrecheckBeforeStart);
 #endif
     }
@@ -306,11 +453,11 @@ public sealed class AppBootstrapTests : IDisposable
     {
         using var host = AppBootstrap.CreateHost(root, [argument]);
 
-        Assert.False(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
+        Assert.True(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
     }
 
     [Fact]
-    public async Task HostBindsTransferV2WithoutChangingTheIndependentShareV1Capability()
+    public void OrdinaryHostUsesDirectWebApiAdaptersWithoutTheBrowserWriteGate()
     {
         var gate = new RecordingWriteAuthorizationGate();
         using var host = AppBootstrap.CreateHost(root, services =>
@@ -318,41 +465,13 @@ public sealed class AppBootstrapTests : IDisposable
             services.RemoveAll<IAdapterWriteAuthorizationGate>();
             services.AddSingleton<IAdapterWriteAuthorizationGate>(gate);
         });
-        var accountId = Guid.NewGuid();
-        var session = new AccountSession(
-            accountId,
-            "stable-baidu-user",
-            [new SessionCookie("BDUSS", "private", ".baidu.com", "/", null, true, true)],
-            DateTimeOffset.UtcNow);
-        var transferContext = new TransferOperationAutomationContext(
-            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
-            new ShareReference("share-id", "https://pan.baidu.com/s/share-id", "a1b2"));
-        var items = new RemoteItemIdentitySet([new("remote-1", "item")]);
-        var shareContext = new ShareOperationAutomationContext(
-            Guid.NewGuid(), Guid.NewGuid(), accountId, 1,
-            WebAutomationOwnerKind.StandaloneShare, items);
-
-        await Assert.IsAssignableFrom<IOperationBoundBaiduNetdiskAdapter>(
-                host.Services.GetRequiredService<IBaiduNetdiskAdapter>())
-            .EnsureDirectoryForOperationAsync(
-                transferContext, session, new RemotePath("/target"), CancellationToken.None);
-        await Assert.IsAssignableFrom<IOperationBoundBaiduShareAdapter>(
-                host.Services.GetRequiredService<IBaiduShareAdapter>())
-            .PreparePermanentShareForOperationAsync(
-                shareContext, session, new PermanentShareRequest(items), CancellationToken.None);
-
-        var transfer = Assert.Single(gate.Requests, request =>
-            request.Capability.AdapterKind == "BaiduTransfer");
-        var share = Assert.Single(gate.Requests, request =>
-            request.Capability.AdapterKind == "BaiduShare");
-        Assert.Equal(BaiduSelectorCatalog.TransferProtocolVersion, transfer.Capability.ProtocolVersion);
-        Assert.Equal(BaiduSelectorCatalog.TransferSelectorVersion, transfer.Capability.SelectorVersion);
-        Assert.Equal(BaiduSelectorCatalog.ProtocolVersion, share.Capability.ProtocolVersion);
-        Assert.Equal(BaiduSelectorCatalog.SelectorVersion, share.Capability.SelectorVersion);
+        Assert.IsType<LiveBaiduNetdiskAdapter>(host.Services.GetRequiredService<IBaiduNetdiskAdapter>());
+        Assert.IsType<LiveBaiduShareAdapter>(host.Services.GetRequiredService<IBaiduShareAdapter>());
+        Assert.Empty(gate.Requests);
     }
 
     [Fact]
-    public async Task OnlyExactTransferV2FormalRecordAuthorizesTheProductionBinding()
+    public async Task DisabledProductionModeIgnoresEvenAnExactFormalRecord()
     {
         using var host = AppBootstrap.CreateHost(root);
         await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
@@ -387,14 +506,11 @@ public sealed class AppBootstrapTests : IDisposable
             request.Capability.SelectorVersion, request.Capability.BuildVersion,
             acceptedAt, new string('D', 64)));
 
-        var binding = await gate.TryCreateBindingAsync(request);
-        Assert.NotNull(binding);
-        Assert.Equal(AdapterWriteAuthorizationSource.ExactFormalRecord, binding.Source);
-        Assert.Equal(request.Capability, binding.Capability);
+        Assert.Null(await gate.TryCreateBindingAsync(request));
     }
 
     [Fact]
-    public async Task StoreBackedTransferRecoveryAuthorizationSurvivesHostRestart()
+    public async Task DisabledProductionModeDoesNotAuthorizeStoreBackedRecoveryAfterRestart()
     {
         var operationId = Guid.NewGuid();
         var batchId = Guid.NewGuid();
@@ -426,17 +542,20 @@ public sealed class AppBootstrapTests : IDisposable
             Assert.True(await attempts.TryPersistTransferSourceEvidenceAsync(
                 operationId, accountId, generation, 0, source, now.AddSeconds(1)));
             var baseline = WebAutomationBaseline.Create(["existing-id"]);
+            var targetFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+                target.RemoteId, target.Path, 1, true, true, "target-generation",
+                baiduUserId, TransferTargetInventoryScope.AllItems, baseline);
             var preparation = new TransferTargetPreparationEvidence(
                 target.RemoteId, target.Path, 1, true, true, "target-generation",
-                baiduUserId, baseline, new string('b', 64));
+                baiduUserId, TransferTargetInventoryScope.AllItems, baseline, targetFingerprint);
             Assert.True(await attempts.TryPersistTransferTargetPreparationAsync(
                 operationId, accountId, generation, 1, preparation, now.AddSeconds(2)));
             var submission = new TransferSubmissionEvidence(
                 source.Items.Fingerprint, target.RemoteId, baseline.Fingerprint,
                 baiduUserId, capability, now.AddSeconds(3));
-            Assert.True(await attempts.TryPersistTransferSubmissionAsync(
+            Assert.False(await attempts.TryPersistTransferSubmissionAsync(
                 operationId, accountId, generation, 2, submission, now.AddSeconds(3)));
-            Assert.True(await attempts.TryAdvanceAsync(
+            Assert.False(await attempts.TryAdvanceAsync(
                 operationId, accountId, generation,
                 WebAutomationAttemptState.Submitting, 3,
                 WebAutomationAttemptState.ResultPending, new string('c', 64), false,
@@ -459,10 +578,7 @@ public sealed class AppBootstrapTests : IDisposable
                 operationId, batchId, accountId, generation,
                 target, baiduUserId, capability));
 
-        Assert.NotNull(binding);
-        Assert.Equal(target, binding.Target);
-        Assert.Equal(baiduUserId, binding.BaiduUserId);
-        Assert.Null(binding.MappingFingerprint);
+        Assert.Null(binding);
     }
 
 #if DEBUG
@@ -497,7 +613,7 @@ public sealed class AppBootstrapTests : IDisposable
 #endif
 
     [Fact]
-    public async Task ProductionGatePresentsExactWriteAndReachesInnerOnlyAfterExplicitConfirmation()
+    public async Task ProductionGateHonorsBuildConfigurationBeforePresentingOrReachingInner()
     {
         var presenter = new RecordingAcceptancePresenter(confirmed: true);
         using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch], services =>
@@ -529,6 +645,7 @@ public sealed class AppBootstrapTests : IDisposable
         var result = await wrapped.SubmitPermanentShareForOperationAsync(
             context, session, new PermanentShareRequest(items), CancellationToken.None);
 
+#if DEBUG
         Assert.True(prepared.IsSuccess);
         Assert.True(result.IsSuccess);
         Assert.Equal(1, presenter.PresentCount);
@@ -538,6 +655,19 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Equal(AdapterWriteAction.PrepareShare, presenter.Seen.Action);
         Assert.Equal(1, inner.PrepareCount);
         Assert.Equal(1, inner.SubmitCount);
+#else
+        Assert.False(prepared.IsSuccess);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(BaiduErrorKind.NotValidated, prepared.ErrorKind);
+        Assert.Equal(BaiduErrorKind.NotValidated, result.ErrorKind);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, prepared.SubmissionAcceptance);
+        Assert.Equal(SubmissionAcceptance.DefinitelyNotAccepted, result.SubmissionAcceptance);
+        Assert.Equal(0, presenter.PresentCount);
+        Assert.Null(presenter.Seen);
+        Assert.Equal(0, inner.PrepareCount);
+        Assert.Equal(0, inner.SubmitCount);
+#endif
+        Assert.Equal(0, presenter.EnableCount);
     }
 
     [Fact]
@@ -641,7 +771,7 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
-    public void ShellCompositionBuildsOnlyTransferAndShareWorkspaces()
+    public void ShellCompositionPreservesShareRuntimeButHidesItFromMainNavigation()
     {
         var bootstrap = File.ReadAllText(Path.Combine(
             FindRepositoryRoot(),
@@ -651,8 +781,29 @@ public sealed class AppBootstrapTests : IDisposable
 
         Assert.Contains("var transferWorkspace = new TransferWorkspaceView(transferViewModel)", bootstrap);
         Assert.Contains("var shareWorkspace = new ShareWorkspaceView(shareViewModel)", bootstrap);
-        Assert.Contains("transferWorkspace,", bootstrap);
-        Assert.Contains("shareWorkspace,", bootstrap);
+        Assert.Contains("var homeWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("var shareAnalyticsViewModel = new ShareAnalyticsViewModel(", bootstrap);
+        Assert.Contains("var shareDataWorkspace = new ShareAnalyticsView(shareAnalyticsViewModel)", bootstrap);
+        Assert.Contains("var adInsertionWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("var fileExclusionWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("var statisticsWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("var settingsWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.DoesNotContain("new DeferredWorkspaceViewModel(\"分享数据\"", bootstrap);
+        Assert.Contains("mainViewModel = new MainWindowViewModel(", bootstrap);
+        Assert.Contains(
+            "mainViewModel = new MainWindowViewModel(\n" +
+            "            homeWorkspace,\n" +
+            "            shareDataWorkspace,\n" +
+            "            transferWorkspace,\n" +
+            "            adInsertionWorkspace,\n" +
+            "            fileExclusionWorkspace,\n" +
+            "            statisticsWorkspace,\n" +
+            "            settingsWorkspace,",
+            bootstrap,
+            StringComparison.Ordinal);
+        Assert.Contains("mainViewModel?.ShowBatchTransferCommand.Execute(null)", bootstrap);
+        Assert.DoesNotContain("mainViewModel?.ShowShareCommand", bootstrap);
+        Assert.DoesNotContain("shareWorkspace,\n            loginLauncher", bootstrap, StringComparison.Ordinal);
         Assert.DoesNotContain("mainViewModel.ShowResults", bootstrap);
         Assert.DoesNotContain("ShowImportCommand", bootstrap);
         Assert.DoesNotContain("ShowCreateJobCommand", bootstrap);
@@ -690,7 +841,7 @@ public sealed class AppBootstrapTests : IDisposable
 
         Assert.Equal(1, result.Statistics.Total);
         Assert.Equal(1, result.Statistics.Ready);
-        Assert.False(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
+        Assert.True(host.Services.GetRequiredService<IAdapterAvailability>().CanStartTransfers);
     }
 
     [Fact]
@@ -752,6 +903,74 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Equal(1_000, snapshot.Count);
         Assert.Equal("00000000-0000-0000-0000-000000000001", snapshot[0].AccountId.ToString("D"));
         Assert.Equal("00000000-0000-0000-0000-000000001000", snapshot[^1].AccountId.ToString("D"));
+        Assert.Equal(1_001, visibleCount);
+    }
+
+    [Fact]
+    public async Task LegacyAccountWithActiveManagedSessionUsesManagedExecutionProfile()
+    {
+        using var host = AppBootstrap.CreateHost(root, [AcceptanceWriteLeaseOptions.Switch]);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var accountId = Guid.NewGuid();
+        const string baiduUserId = "legacy-managed-user";
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            await unit.Accounts.UpsertAsync(AccountRecord.Create(accountId, baiduUserId, "旧账号"));
+            await unit.CommitAsync();
+        }
+
+        var installation = new BrowserInstallationIdentity(
+            Guid.NewGuid(),
+            BrowserFamily.Chrome,
+            @"C:\Browser",
+            @"C:\Browser\chrome.exe",
+            "Google LLC",
+            "Google Chrome",
+            Guid.NewGuid().ToString("N"));
+        var session = new ManagedBrowserSessionReference(
+            Guid.NewGuid(),
+            installation.InstallationId,
+            accountId,
+            baiduUserId,
+            installation.BrowserFamily,
+            Guid.NewGuid().ToString("D"),
+            Guid.NewGuid().ToString("D"));
+        var binding = await host.Services.GetRequiredService<IManagedBrowserLoginStore>()
+            .BindLoginAsync(false, installation, session, null, CancellationToken.None);
+        Assert.Equal(ManagedBrowserBindingStatus.Bound, binding);
+
+        var account = Assert.Single(await host.Services.GetRequiredService<IWizardAccountProvider>()
+            .LoadEligibleAsync());
+        Assert.Equal(accountId, account.AccountId);
+        Assert.Equal(BaiduExecutionEngine.ManagedChromiumV1, account.ExecutionProfile!.Engine);
+        Assert.Equal(session.SessionId, account.ExecutionProfile.SessionId);
+    }
+
+    [Fact]
+    public async Task ManagedAccountsRemainVisibleButCannotHideLegacyAccountsOnLaterPages()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var legacyId = Guid.NewGuid();
+        await using (var unit = await host.Services.GetRequiredService<IUnitOfWorkFactory>().BeginAsync())
+        {
+            for (var index = 0; index < 1_000; index++)
+                await unit.Accounts.UpsertAsync(AccountRecord.Create(
+                    Guid.NewGuid(), $"managed-{index}", $"新浏览器账号 {index}") with
+                {
+                    LoginMethod = "ManagedChromium",
+                    SortOrder = index,
+                });
+            await unit.Accounts.UpsertAsync(AccountRecord.Create(
+                legacyId, "legacy-after-managed", "旧浏览器账号") with { SortOrder = 1_000 });
+            await unit.CommitAsync();
+        }
+
+        var snapshot = await host.Services.GetRequiredService<IWizardAccountProvider>().LoadEligibleAsync();
+        var visibleCount = await host.Services.GetRequiredService<IAccountSummaryProvider>()
+            .GetActiveAccountCountAsync();
+
+        Assert.Equal(legacyId, Assert.Single(snapshot).AccountId);
         Assert.Equal(1_001, visibleCount);
     }
 

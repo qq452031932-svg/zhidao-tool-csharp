@@ -1,8 +1,11 @@
 using BaiduBatchTransfer.Application.ShareAnalytics;
+using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Core.Domain;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using System.Collections.Immutable;
 using System.Globalization;
+using System.IO;
 
 namespace BaiduBatchTransfer.App.Features.ShareAnalytics;
 
@@ -13,12 +16,16 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private const string RefreshFailureMessage = "分享数据获取失败，请稍后重试。";
     private const string InvalidRangeMessage = "请输入有效的选取范围。";
     private const string SelectionFailureMessage = "选择操作失败，请重试。";
+    private const string ExportFailureMessage = "导出失败，请重试。";
+    private const int MaximumDisplayedFileNameLength = 96;
 
     private readonly IShareAnalyticsWorkspaceService service;
     private readonly AccountShareAnalyticsProjector projector;
     private readonly IShareLinkLauncher launcher;
     private readonly TimeProvider timeProvider;
     private readonly IShareAnalyticsDelay delay;
+    private readonly IShareAnalyticsWorkbookExportService exportService;
+    private readonly IResultSaveDialog saveDialog;
     private readonly IShareAnalyticsBulkScheduler bulkScheduler;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object refreshSync = new();
@@ -26,6 +33,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? activation;
     private CancellationTokenSource? pendingDelay;
     private CancellationTokenSource? selectionOperation;
+    private CancellationTokenSource? exportOperation;
     private RefreshFlight? currentRefresh;
     private Guid? currentRefreshAccount;
     private long currentRefreshSelection;
@@ -47,11 +55,13 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private IReadOnlyList<ShareAnalyticsRow> visibleItems = [];
     private int currentVisibleSelectedCount;
     private bool isSelectionBusy;
+    private bool isExporting;
     private long selectionGeneration;
     private long snapshotGeneration;
     private long selectionOperationGeneration;
     private long navigationGeneration;
     private long delayGeneration;
+    private long exportGeneration;
 
     public ShareAnalyticsViewModel(
         IShareAnalyticsWorkspaceService service,
@@ -59,6 +69,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         IShareLinkLauncher launcher,
         TimeProvider timeProvider,
         IShareAnalyticsDelay delay,
+        IShareAnalyticsWorkbookExportService exportService,
+        IResultSaveDialog saveDialog,
         IShareAnalyticsBulkScheduler? bulkScheduler = null)
     {
         this.service = service ?? throw new ArgumentNullException(nameof(service));
@@ -66,12 +78,17 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         this.launcher = launcher ?? throw new ArgumentNullException(nameof(launcher));
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
+        this.exportService = exportService ?? throw new ArgumentNullException(nameof(exportService));
+        this.saveDialog = saveDialog ?? throw new ArgumentNullException(nameof(saveDialog));
         this.bulkScheduler = bulkScheduler ?? new ThreadPoolShareAnalyticsBulkScheduler();
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => accountId is not null && isActive);
         SelectMetricCommand = new RelayCommand<AccountShareMetric>(SelectMetric);
         SortCommand = new RelayCommand<AccountShareSortColumn>(Sort);
         OpenCommand = new RelayCommand<ShareAnalyticsRow>(Open, row => row is not null);
-        ExportCommand = new RelayCommand(static () => { }, static () => false);
+        ExportCommand = new AsyncRelayCommand(
+            ExportAsync,
+            CanExecuteExport,
+            AsyncRelayCommandOptions.AllowConcurrentExecutions);
         SelectRangeCommand = new AsyncRelayCommand(SelectRangeAsync, CanExecuteRangeSelection);
         SelectAllCommand = new AsyncRelayCommand(
             token => RunBulkSelectionAsync(BulkSelectionKind.SelectAll, null, token),
@@ -99,7 +116,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public IRelayCommand<AccountShareMetric> SelectMetricCommand { get; }
     public IRelayCommand<AccountShareSortColumn> SortCommand { get; }
     public IRelayCommand<ShareAnalyticsRow> OpenCommand { get; }
-    public IRelayCommand ExportCommand { get; }
+    public IAsyncRelayCommand ExportCommand { get; }
     public IAsyncRelayCommand SelectRangeCommand { get; }
     public IAsyncRelayCommand SelectAllCommand { get; }
     public IAsyncRelayCommand InvertSelectionCommand { get; }
@@ -121,6 +138,15 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public string RangeStartText { get => rangeStartText; set => SetProperty(ref rangeStartText, value ?? string.Empty); }
     public string RangeEndText { get => rangeEndText; set => SetProperty(ref rangeEndText, value ?? string.Empty); }
     public bool IsSelectionBusy => isSelectionBusy;
+    public bool IsExporting
+    {
+        get => isExporting;
+        private set
+        {
+            if (!SetProperty(ref isExporting, value)) return;
+            ExportCommand.NotifyCanExecuteChanged();
+        }
+    }
     public bool IsHeaderSelectionEnabled => CanExecuteBulkSelection();
     public bool IsRefreshing
     {
@@ -191,6 +217,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     {
         if (selectedAccountId == Guid.Empty) selectedAccountId = null;
         var accountChanged = accountId != selectedAccountId;
+        if (accountChanged) InvalidateExport();
         InvalidateBulkSelection();
         Interlocked.Increment(ref snapshotGeneration);
         CancelPendingDelay();
@@ -225,6 +252,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         isActive = true;
         var navigation = Interlocked.Increment(ref navigationGeneration);
         RefreshCommand.NotifyCanExecuteChanged();
+        ExportCommand.NotifyCanExecuteChanged();
         NotifyBulkSelectionCanExecuteChanged();
         OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
         if (accountId is not { } selected) return;
@@ -265,12 +293,14 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public void Leave()
     {
         isActive = false;
+        InvalidateExport();
         InvalidateBulkSelection();
         Interlocked.Increment(ref navigationGeneration);
         CancelPendingDelay();
         activation?.Cancel();
         IsRefreshing = false;
         RefreshCommand.NotifyCanExecuteChanged();
+        ExportCommand.NotifyCanExecuteChanged();
         NotifyBulkSelectionCanExecuteChanged();
         OnPropertyChanged(nameof(IsHeaderSelectionEnabled));
     }
@@ -545,6 +575,132 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         ExportCommand.NotifyCanExecuteChanged();
     }
 
+    private bool CanExecuteExport() =>
+        isActive && accountId is not null && snapshot is not null && selectedShareIds.Count > 0 && !IsExporting;
+
+    private async Task ExportAsync(CancellationToken cancellationToken)
+    {
+        if (!CanExecuteExport() || accountId is not { } selectedAccount || snapshot is not { } currentSnapshot)
+            return;
+
+        var generation = Interlocked.Increment(ref exportGeneration);
+        var frozen = FreezeExport(selectedAccount, generation, currentSnapshot);
+        var source = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
+        var operationToken = source.Token;
+        exportOperation = source;
+        IsExporting = true;
+        try
+        {
+            var destination = await saveDialog
+                .PickDestinationDirectoryAsync(operationToken)
+                .ConfigureAwait(true);
+            if (operationToken.IsCancellationRequested || !CanApply(frozen) ||
+                string.IsNullOrWhiteSpace(destination))
+                return;
+
+            var request = new ShareAnalyticsWorkbookExportRequest(
+                destination,
+                frozen.Metric,
+                frozen.Dates,
+                frozen.Rows);
+            var result = await exportService.ExportAsync(request, operationToken).ConfigureAwait(true);
+            if (operationToken.IsCancellationRequested || !CanApply(frozen)) return;
+
+            var count = result.ExportedRows.ToString("N0", CultureInfo.InvariantCulture);
+            StatusMessage = $"已导出 {count} 条：{SafeDisplayFileName(result.FinalPath)}";
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            if (!operationToken.IsCancellationRequested && CanApply(frozen))
+                StatusMessage = ExportFailureMessage;
+        }
+        finally
+        {
+            if (generation == Volatile.Read(ref exportGeneration) && ReferenceEquals(exportOperation, source))
+            {
+                exportOperation = null;
+                source.Dispose();
+                IsExporting = false;
+            }
+        }
+    }
+
+    private FrozenExport FreezeExport(
+        Guid selectedAccount,
+        long generation,
+        AccountShareCachedSnapshot currentSnapshot)
+    {
+        var projectedAt = timeProvider.GetUtcNow();
+        var metric = SelectedMetric;
+        var currentSort = sortColumn;
+        var currentSortDescending = sortDescending;
+        var selectedIds = selectedShareIds.OrderBy(value => value, StringComparer.Ordinal).ToImmutableArray();
+        var selectedIdSet = selectedIds.ToHashSet(StringComparer.Ordinal);
+        var projected = currentSnapshot.Items
+            .Where(item => selectedIdSet.Contains(item.ShareId))
+            .Select(item => projector.Project(item, metric, projectedAt));
+        var ordered = projector.Sort(projected, currentSort, currentSortDescending);
+        var rows = ordered.Select(item => new ShareAnalyticsWorkbookExportRow(
+                string.Equals(item.Title, "0", StringComparison.Ordinal) ? item.ShareId : item.Title,
+                item.ShareUri.AbsoluteUri,
+                item.Status,
+                item.HistoricalTotal,
+                item.DailyValues))
+            .ToImmutableArray();
+        return new(
+            selectedAccount,
+            generation,
+            metric,
+            currentSort,
+            currentSortDescending,
+            projector.FiveDayWindow(projectedAt).ToImmutableArray(),
+            selectedIds,
+            rows);
+    }
+
+    private bool CanApply(FrozenExport frozen) =>
+        isActive && accountId == frozen.AccountId &&
+        frozen.Generation == Volatile.Read(ref exportGeneration);
+
+    private void InvalidateExport()
+    {
+        Interlocked.Increment(ref exportGeneration);
+        var source = exportOperation;
+        exportOperation = null;
+        if (source is not null)
+        {
+            source.Cancel();
+            source.Dispose();
+        }
+        IsExporting = false;
+    }
+
+    private static string SafeDisplayFileName(string? finalPath)
+    {
+        string fileName;
+        try
+        {
+            fileName = Path.GetFileName(finalPath ?? string.Empty);
+        }
+        catch
+        {
+            return "导出文件";
+        }
+
+        var invalid = Path.GetInvalidFileNameChars();
+        var sanitized = new string(fileName
+            .Where(character => !char.IsControl(character) && !invalid.Contains(character))
+            .ToArray())
+            .Trim();
+        if (string.IsNullOrWhiteSpace(sanitized) || sanitized is "." or "..") return "导出文件";
+        return sanitized.Length <= MaximumDisplayedFileNameLength
+            ? sanitized
+            : sanitized[..MaximumDisplayedFileNameLength];
+    }
+
     private bool CanExecuteBulkSelection() =>
         isActive && accountId is not null && snapshot is not null && VisibleItems.Count > 0 && !isSelectionBusy;
 
@@ -803,6 +959,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         isActive = false;
+        InvalidateExport();
         InvalidateBulkSelection();
         Interlocked.Increment(ref navigationGeneration);
         Interlocked.Increment(ref selectionGeneration);
@@ -858,6 +1015,16 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private sealed record BulkSelectionResult(
         HashSet<string> SelectedShareIds,
         IReadOnlyList<ShareAnalyticsRow> Rows);
+
+    private sealed record FrozenExport(
+        Guid AccountId,
+        long Generation,
+        AccountShareMetric Metric,
+        AccountShareSortColumn Sort,
+        bool SortDescending,
+        ImmutableArray<DateOnly> Dates,
+        ImmutableArray<string> SelectedIds,
+        ImmutableArray<ShareAnalyticsWorkbookExportRow> Rows);
 
     private sealed class ThreadPoolShareAnalyticsBulkScheduler : IShareAnalyticsBulkScheduler
     {
