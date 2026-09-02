@@ -195,6 +195,50 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public async Task AccountSwitchResetsProgressWhileNonCooperativeOldRefreshFinishes()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var service = new AccountSwitchBlockingSync(
+            accountA,
+            SnapshotWithoutSync(accountA, "a"),
+            Snapshot(accountB, "b", Now));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(accountA, "甲");
+        var oldEntry = viewModel.EnterAsync();
+        await service.SyncStarted.Task;
+        Assert.True(viewModel.IsRefreshing);
+
+        viewModel.SelectAccount(accountB, "乙");
+
+        Assert.False(viewModel.IsRefreshing);
+        Assert.Equal("b", Assert.Single(viewModel.VisibleItems).Title);
+        service.Release.TrySetResult();
+        await oldEntry;
+        Assert.False(viewModel.IsRefreshing);
+        Assert.Equal("b", Assert.Single(viewModel.VisibleItems).Title);
+    }
+
+    [Fact]
+    public async Task AccountSelectionClearsSnapshotTimestampAndCounts()
+    {
+        var account = Guid.NewGuid();
+        var viewModel = Create(
+            new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22))),
+            new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        Assert.NotEqual("尚未同步", viewModel.LastSuccessfulSyncText);
+        Assert.Equal(1, viewModel.TotalCount);
+
+        viewModel.SelectAccount(null, null);
+
+        Assert.Equal("尚未同步", viewModel.LastSuccessfulSyncText);
+        Assert.Equal(0, viewModel.TotalCount);
+        Assert.Empty(viewModel.VisibleItems);
+    }
+
+    [Fact]
     public async Task ReturningToSameAccountDoesNotJoinCanceledPreviousActivation()
     {
         var account = Guid.NewGuid();
@@ -270,22 +314,70 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
-    public async Task FailedFreshManualRefreshRestoresOriginalDueTimeAndPreservesCache()
+    public async Task ManualRefreshJoiningFailedAutomaticDueFlightSchedulesOneRetry()
     {
         var account = Guid.NewGuid();
-        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        var service = new BlockingSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
         {
-            SyncResults = [FailureResult]
+            SyncResult = FailureResult
         };
         var delay = new FakeDelay();
         var viewModel = Create(service, delay);
         viewModel.SelectAccount(account, "账号");
         await viewModel.EnterAsync();
+        delay.Complete(0);
+        await service.SyncStarted.Task;
+
+        var manual = viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.False(manual.IsCompleted);
+        Assert.Equal(1, service.SyncCalls);
+        service.Release.TrySetResult();
+        await manual;
+        await WaitUntilAsync(() => delay.Requests.Count == 2);
+        Assert.Equal(1, service.SyncCalls);
+        Assert.Equal(TimeSpan.FromHours(1), delay.Requests[1].Delay);
+    }
+
+    [Fact]
+    public async Task CancelingManualCommandStopsOnlyCallerWaitAndNotSharedSync()
+    {
+        var account = Guid.NewGuid();
+        var service = new BlockingSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        var manual = viewModel.RefreshCommand.ExecuteAsync(null);
+        await service.SyncStarted.Task;
+        viewModel.RefreshCommand.Cancel();
+        await manual;
+
+        Assert.False(service.SyncCancellationToken.IsCancellationRequested);
+        Assert.True(viewModel.IsRefreshing);
+        service.Release.TrySetResult();
+        await WaitUntilAsync(() => !viewModel.IsRefreshing);
+    }
+
+    [Fact]
+    public async Task FailedFreshManualRefreshRestoresOriginalDueTimeAndPreservesCache()
+    {
+        var account = Guid.NewGuid();
+        var time = new MutableTimeProvider(Now);
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        {
+            SyncResults = [FailureResult]
+        };
+        var delay = new FakeDelay();
+        var viewModel = Create(service, delay, time);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        time.Advance(TimeSpan.FromMinutes(30));
 
         await viewModel.RefreshCommand.ExecuteAsync(null);
 
         Assert.True(delay.Requests[0].Token.IsCancellationRequested);
-        Assert.Equal(TimeSpan.FromHours(1), delay.Requests[1].Delay);
+        Assert.Equal(TimeSpan.FromMinutes(30), delay.Requests[1].Delay);
         Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
         Assert.Equal(Now.ToLocalTime().AddHours(-22).ToString("yyyy-MM-dd HH:mm"), viewModel.LastSuccessfulSyncText);
         Assert.Equal("分享数据获取失败，请稍后重试。", viewModel.StatusMessage);
@@ -453,6 +545,9 @@ public sealed class ShareAnalyticsViewModelTests
         public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int SyncCalls { get; private set; }
         public bool ThrowOnRelease { get; init; }
+        public AccountShareSyncResult SyncResult { get; init; } =
+            new(AccountShareSyncDisposition.Updated, "ok");
+        public CancellationToken SyncCancellationToken { get; private set; }
         public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default) =>
             Task.FromResult(accountId == account
                 ? snapshots[Math.Min(load++, snapshots.Length - 1)]
@@ -460,9 +555,30 @@ public sealed class ShareAnalyticsViewModelTests
         public async Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
         {
             SyncCalls++;
+            SyncCancellationToken = cancellationToken;
             SyncStarted.TrySetResult();
             await Release.Task;
             if (ThrowOnRelease) throw new InvalidOperationException("sensitive detail");
+            return SyncResult;
+        }
+    }
+
+    private sealed class AccountSwitchBlockingSync(
+        Guid blockedAccount,
+        AccountShareCachedSnapshot blockedSnapshot,
+        AccountShareCachedSnapshot freshSnapshot) : IShareAnalyticsWorkspaceService
+    {
+        public TaskCompletionSource SyncStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<AccountShareCachedSnapshot> LoadCachedAsync(Guid accountId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(accountId == blockedAccount ? blockedSnapshot : freshSnapshot);
+
+        public async Task<AccountShareSyncResult> SyncAsync(Guid accountId, CancellationToken cancellationToken = default)
+        {
+            Assert.Equal(blockedAccount, accountId);
+            SyncStarted.TrySetResult();
+            await Release.Task;
             return new(AccountShareSyncDisposition.Updated, "ok");
         }
     }

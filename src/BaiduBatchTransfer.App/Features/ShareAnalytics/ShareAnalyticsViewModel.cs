@@ -20,7 +20,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private readonly object refreshSync = new();
     private CancellationTokenSource? activation;
     private CancellationTokenSource? pendingDelay;
-    private Task? currentRefresh;
+    private RefreshFlight? currentRefresh;
     private Guid? currentRefreshAccount;
     private long currentRefreshSelection;
     private long currentRefreshNavigation;
@@ -131,6 +131,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         if (selectedAccountId == Guid.Empty) selectedAccountId = null;
         CancelPendingDelay();
         activation?.Cancel();
+        IsRefreshing = false;
         Interlocked.Increment(ref selectionGeneration);
         accountId = selectedAccountId;
         CurrentAccountName = selectedAccountId is null || string.IsNullOrWhiteSpace(displayName)
@@ -138,6 +139,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             : displayName.Trim();
         snapshot = null;
         VisibleItems = [];
+        LastSuccessfulSyncText = "尚未同步";
+        OnPropertyChanged(nameof(LastSuccessfulSyncText));
         UpdateSummary();
         StatusMessage = selectedAccountId is null ? "请选择左侧账号。" : "已选择账号，等待读取分享数据。";
         RefreshCommand.NotifyCanExecuteChanged();
@@ -155,6 +158,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         CancelPendingDelay();
         activation?.Cancel();
         activation?.Dispose();
+        IsRefreshing = false;
         activation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var token = activation.Token;
         try
@@ -187,6 +191,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         Interlocked.Increment(ref navigationGeneration);
         CancelPendingDelay();
         activation?.Cancel();
+        IsRefreshing = false;
         RefreshCommand.NotifyCanExecuteChanged();
     }
 
@@ -197,7 +202,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         var navigation = Volatile.Read(ref navigationGeneration);
         var token = activation?.Token ?? lifetime.Token;
         CancelPendingDelay();
-        try { await StartOrJoinRefreshAsync(selected, selection, navigation, token, RefreshOrigin.Manual); }
+        var sharedRefresh = StartOrJoinRefreshAsync(selected, selection, navigation, token, RefreshOrigin.Manual);
+        try { await sharedRefresh.WaitAsync(cancellationToken); }
         catch (OperationCanceledException) when (token.IsCancellationRequested || cancellationToken.IsCancellationRequested) { }
     }
 
@@ -213,14 +219,19 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             if (currentRefreshAccount == selected &&
                 currentRefreshSelection == selection &&
                 currentRefreshNavigation == navigation &&
-                currentRefresh is { IsCompleted: false })
-                return currentRefresh;
+                currentRefresh is { Task.IsCompleted: false } running)
+            {
+                if (origin == RefreshOrigin.Manual) running.AddManualIntent();
+                return running.Task;
+            }
 
             currentRefreshAccount = selected;
             currentRefreshSelection = selection;
             currentRefreshNavigation = navigation;
-            currentRefresh = RefreshCoreAsync(selected, selection, navigation, cancellationToken, origin);
-            return currentRefresh;
+            var flight = new RefreshFlight(origin);
+            currentRefresh = flight;
+            flight.Task = RefreshCoreAsync(selected, selection, navigation, cancellationToken, flight);
+            return flight.Task;
         }
     }
 
@@ -229,7 +240,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         long selection,
         long navigation,
         CancellationToken cancellationToken,
-        RefreshOrigin origin)
+        RefreshFlight flight)
     {
         IsRefreshing = true;
         StatusMessage = snapshot?.LastSuccessfulSyncAtUtc is null
@@ -250,14 +261,14 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             }
 
             StatusMessage = string.IsNullOrWhiteSpace(result.SafeMessage) ? RefreshFailureMessage : result.SafeMessage;
-            ScheduleAfterFailure(selected, selection, navigation, cancellationToken, origin);
+            ScheduleAfterFailure(selected, selection, navigation, cancellationToken, flight);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch
         {
             if (!CanApply(selected, selection, navigation)) return;
             StatusMessage = RefreshFailureMessage;
-            ScheduleAfterFailure(selected, selection, navigation, cancellationToken, origin);
+            ScheduleAfterFailure(selected, selection, navigation, cancellationToken, flight);
         }
         finally
         {
@@ -278,9 +289,9 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         long selection,
         long navigation,
         CancellationToken token,
-        RefreshOrigin origin)
+        RefreshFlight flight)
     {
-        if (origin != RefreshOrigin.Manual) return;
+        if (!flight.HasManualIntent || flight.Origin == RefreshOrigin.Retry) return;
         if (snapshot?.LastSuccessfulSyncAtUtc is { } lastSuccess)
         {
             var remaining = RemainingLifetime(lastSuccess);
@@ -422,6 +433,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         isActive = false;
         Interlocked.Increment(ref navigationGeneration);
         Interlocked.Increment(ref selectionGeneration);
+        IsRefreshing = false;
         RefreshCommand.NotifyCanExecuteChanged();
         CancelPendingDelay();
         lifetime.Cancel();
@@ -436,6 +448,16 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         Manual,
         AutomaticDue,
         Retry,
+    }
+
+    private sealed class RefreshFlight(RefreshOrigin origin)
+    {
+        private int manualIntent = origin == RefreshOrigin.Manual ? 1 : 0;
+
+        public RefreshOrigin Origin { get; } = origin;
+        public Task Task { get; set; } = Task.CompletedTask;
+        public bool HasManualIntent => Volatile.Read(ref manualIntent) != 0;
+        public void AddManualIntent() => Volatile.Write(ref manualIntent, 1);
     }
 
     private static async void ObserveActivation(Task operation)
