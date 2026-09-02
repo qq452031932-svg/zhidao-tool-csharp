@@ -66,11 +66,14 @@
             </Setter>
         </Style>
 
-        <Style x:Key="ShareAnalyticsSortCellStyle" TargetType="DataGridCell">
+        <Style x:Key="ShareAnalyticsCellStyle" TargetType="DataGridCell">
             <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="#E5E7EB" />
             <Setter Property="BorderThickness" Value="0" />
         </Style>
+
+        <Style x:Key="ShareAnalyticsSortCellStyle" TargetType="DataGridCell"
+               BasedOn="{StaticResource ShareAnalyticsCellStyle}" />
     </UserControl.Resources>
 
     <Grid>
@@ -157,6 +160,9 @@
             <DataGrid ItemsSource="{Binding VisibleItems}" AutoGenerateColumns="False" IsReadOnly="True"
                       CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column"
                       ColumnHeaderStyle="{StaticResource ShareAnalyticsColumnHeaderStyle}"
+                      CellStyle="{StaticResource ShareAnalyticsCellStyle}"
+                      GridLinesVisibility="All"
+                      HorizontalGridLinesBrush="#E5E7EB" VerticalGridLinesBrush="#E5E7EB"
                       EnableRowVirtualization="True" EnableColumnVirtualization="True"
                       VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
                 <DataGrid.Columns>

@@ -190,7 +190,10 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             if (remaining <= TimeSpan.Zero)
                 await StartOrJoinRefreshAsync(selected, selection, navigation, token, RefreshOrigin.Initial);
             else
+            {
+                StatusMessage = "已显示本地缓存。";
                 ScheduleDelay(selected, selection, navigation, token, remaining, RefreshOrigin.AutomaticDue);
+            }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch

@@ -79,6 +79,22 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public void ShareAnalyticsGridUsesThinNeutralLinesInsteadOfDefaultBlackCellFrames()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+
+        Assert.Contains("GridLinesVisibility=\"All\"", view, StringComparison.Ordinal);
+        Assert.Contains("HorizontalGridLinesBrush=\"#E5E7EB\"", view, StringComparison.Ordinal);
+        Assert.Contains("VerticalGridLinesBrush=\"#E5E7EB\"", view, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ShareAnalyticsCellStyle\"", view, StringComparison.Ordinal);
+        Assert.Contains("CellStyle=\"{StaticResource ShareAnalyticsCellStyle}\"", view, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ShareAnalyticsSortCellStyle\"", view, StringComparison.Ordinal);
+        Assert.Contains("Property=\"BorderBrush\" Value=\"#E5E7EB\"", view, StringComparison.Ordinal);
+        Assert.Contains("Property=\"BorderThickness\" Value=\"0\"", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ShareAnalyticsHeaderDisplaysThePublishedLocalCacheStatus()
     {
         var root = FindRepositoryRoot();
@@ -193,6 +209,21 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Equal(TimeSpan.FromHours(1), Assert.Single(delay.Requests).Delay);
         Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
         Assert.Equal("账号甲", viewModel.CurrentAccountName);
+    }
+
+    [Fact]
+    public async Task FreshCachePublishesStableDisplayedStatusAfterApplyWithoutSync()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal(0, service.SyncCalls);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
+        Assert.Equal("已显示本地缓存。", viewModel.StatusMessage);
     }
 
     [Fact]
