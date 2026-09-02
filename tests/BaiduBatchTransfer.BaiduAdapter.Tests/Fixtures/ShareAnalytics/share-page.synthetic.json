@@ -1,0 +1,31 @@
+{
+  "errno": 0,
+  "count": 2,
+  "nextpage": 0,
+  "list": [
+    {
+      "shareId": 10001,
+      "name": "示例资源甲",
+      "typicalPath": "/示例资源甲",
+      "shortlink": "https://pan.baidu.com/s/synthetic-a",
+      "shorturl": "synthetic-a",
+      "ctime": 1788278400,
+      "status": 0,
+      "tCnt": 1200,
+      "vCnt": 3400,
+      "dCnt": 560
+    },
+    {
+      "shareId": 10002,
+      "name": "示例资源乙",
+      "typicalPath": "/示例资源乙",
+      "shortlink": "https://pan.baidu.com/s/synthetic-b",
+      "shorturl": "synthetic-b",
+      "ctime": 1788192000,
+      "status": 1,
+      "tCnt": 12,
+      "vCnt": 34,
+      "dCnt": 5
+    }
+  ]
+}
