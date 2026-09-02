@@ -6,27 +6,6 @@ using System.Security;
 
 namespace BaiduBatchTransfer.Infrastructure.Excel;
 
-public enum ReplacementWorkbookFilePublishErrorCode
-{
-    InvalidDestination,
-    InvalidFileName,
-    InvalidWorkbook,
-    DestinationExists,
-    PublishFailed,
-}
-
-public sealed class ReplacementWorkbookFilePublishException : IOException
-{
-    public ReplacementWorkbookFilePublishException(
-        ReplacementWorkbookFilePublishErrorCode code,
-        string safeMessage) : base(safeMessage)
-    {
-        Code = code;
-    }
-
-    public ReplacementWorkbookFilePublishErrorCode Code { get; }
-}
-
 public sealed class OpenXmlReplacementWorkbookFilePublisher(
     IReplacementWorkbookWriter writer) : IReplacementWorkbookFilePublisher
 {

@@ -59,6 +59,27 @@ public sealed record ReplacementWorkbookFilePublishReceipt(
         $"ReplacementWorkbookFilePublishReceipt {{ ExportedRows = {ExportedRows}, SheetCount = {SheetCount}, FinalPath = [REDACTED] }}";
 }
 
+public enum ReplacementWorkbookFilePublishErrorCode
+{
+    InvalidDestination,
+    InvalidFileName,
+    InvalidWorkbook,
+    DestinationExists,
+    PublishFailed,
+}
+
+public sealed class ReplacementWorkbookFilePublishException : IOException
+{
+    public ReplacementWorkbookFilePublishException(
+        ReplacementWorkbookFilePublishErrorCode code,
+        string safeMessage) : base(safeMessage)
+    {
+        Code = code;
+    }
+
+    public ReplacementWorkbookFilePublishErrorCode Code { get; }
+}
+
 public interface IReplacementWorkbookFilePublisher
 {
     Task<ReplacementWorkbookFilePublishReceipt> PublishAsync(

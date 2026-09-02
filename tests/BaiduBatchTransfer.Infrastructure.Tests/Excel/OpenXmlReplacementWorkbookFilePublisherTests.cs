@@ -204,7 +204,46 @@ public sealed class OpenXmlReplacementWorkbookFilePublisherTests
                 Rows(new ReplacementWorkbookRow(1, ["1a", "1b"]))));
 
         Assert.Equal(ReplacementWorkbookFilePublishErrorCode.DestinationExists, error.Code);
+        Assert.Equal("BaiduBatchTransfer.Application.Jobs", error.GetType().Namespace);
         Assert.Equal(originalBytes, await File.ReadAllBytesAsync(finalPath));
+        AssertNoTemporaryFiles(directory.Path);
+    }
+
+    [Fact]
+    public async Task ShareAnalyticsLayoutPublishesFormulaLikeLinkAndTitleAsPlainText()
+    {
+        using var directory = new TemporaryDirectory();
+        var layout = new ReplacementWorkbookLayout(
+        [
+            "序号", "指标", "历史累计", "新增", "今天", "昨天",
+            "08-31", "08-30", "08-29", "链接", "标题", "状态",
+        ]);
+        const string dangerousLink = "=HYPERLINK(\"https://evil.invalid\")";
+        const string dangerousTitle = "+SUM(1,1)";
+
+        await new OpenXmlReplacementWorkbookFilePublisher(new OpenXmlReplacementResultWriter())
+            .PublishAsync(
+                directory.Path,
+                "分享数据.xlsx",
+                layout,
+                Rows(new ReplacementWorkbookRow(
+                    1,
+                    ["1", "转存", "12", "-1", "2", "3", "", "", "", dangerousLink, dangerousTitle, "有效"])));
+
+        using var document = SpreadsheetDocument.Open(Path.Combine(directory.Path, "分享数据.xlsx"), false);
+        var workbookPart = Assert.IsType<WorkbookPart>(document.WorkbookPart);
+        var workbook = Assert.IsType<Workbook>(workbookPart.Workbook);
+        var sheet = Assert.Single(Assert.IsType<Sheets>(workbook.Sheets).Elements<Sheet>());
+        var worksheetPart = Assert.IsType<WorksheetPart>(workbookPart.GetPartById(sheet.Id!));
+        var worksheet = Assert.IsType<Worksheet>(worksheetPart.Worksheet);
+        var dataRow = Assert.Single(worksheet.Descendants<Row>().Skip(1));
+        var cells = dataRow.Elements<Cell>().ToArray();
+
+        Assert.Equal($"'{dangerousLink}", cells[9].InlineString!.Text!.Text);
+        Assert.Equal($"'{dangerousTitle}", cells[10].InlineString!.Text!.Text);
+        Assert.All(cells, cell => Assert.Null(cell.CellFormula));
+        Assert.Empty(worksheet.Descendants<Hyperlinks>());
+        Assert.Empty(worksheetPart.HyperlinkRelationships);
         AssertNoTemporaryFiles(directory.Path);
     }
 
