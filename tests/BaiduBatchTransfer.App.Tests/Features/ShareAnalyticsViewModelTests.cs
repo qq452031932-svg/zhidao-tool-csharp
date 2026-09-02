@@ -62,6 +62,33 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public void CurrentSortColumnHighlightsEverySortableCellWithoutChangingGridBehavior()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+
+        Assert.Contains("x:Key=\"ShareAnalyticsSortedCellBrush\" Color=\"#FFF9E3\"", view, StringComparison.Ordinal);
+        Assert.Contains("x:Key=\"ShareAnalyticsSortCellStyle\"", view, StringComparison.Ordinal);
+        Assert.Equal(8, view.Split("<DataGridTemplateColumn.CellStyle>", StringSplitOptions.None).Length - 1);
+        Assert.Equal(8, view.Split("Binding DataContext.SortColumn", StringSplitOptions.None).Length - 1);
+        Assert.Contains("Value=\"{x:Static analytics:AccountShareSortColumn.SharedAt}\"", view, StringComparison.Ordinal);
+        Assert.Contains("Value=\"{x:Static analytics:AccountShareSortColumn.PriorDay4}\"", view, StringComparison.Ordinal);
+        Assert.Contains("IsReadOnly=\"True\"", view, StringComparison.Ordinal);
+        Assert.Contains("EnableRowVirtualization=\"True\" EnableColumnVirtualization=\"True\"", view, StringComparison.Ordinal);
+        Assert.Contains("VirtualizingPanel.VirtualizationMode=\"Recycling\"", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ShareAnalyticsHeaderDisplaysThePublishedLocalCacheStatus()
+    {
+        var root = FindRepositoryRoot();
+        var view = File.ReadAllText(Path.Combine(root, "src", "BaiduBatchTransfer.App", "Features", "ShareAnalytics", "ShareAnalyticsView.xaml"));
+
+        Assert.Contains("Text=\"{Binding CacheStatusText}\"", view, StringComparison.Ordinal);
+        Assert.DoesNotContain("Text=\"{Binding LastSuccessfulSyncText}\"", view, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void SortCommandPublishesCurrentColumnAndDirectionForTheHeader()
     {
         var sortColumnProperty = typeof(ShareAnalyticsViewModel).GetProperty("SortColumn");
@@ -97,6 +124,57 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.Equal("↓", todayGlyphProperty.GetValue(viewModel));
         Assert.Contains("SortColumn", changed);
         Assert.Contains("SortDescending", changed);
+    }
+
+    [Fact]
+    public async Task CacheStatusReportsAppliedSnapshotAndResetsWithNotificationOnAccountSwitch()
+    {
+        var account = Guid.NewGuid();
+        var cachedAt = Now.AddHours(-22);
+        var snapshot = new AccountShareCachedSnapshot(account, cachedAt,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Invalid, 20),
+        ]);
+        var viewModel = Create(new FakeSync(account, snapshot));
+        var changed = new List<string?>();
+        viewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        Assert.Equal("尚无本地缓存", viewModel.CacheStatusText);
+        viewModel.SelectAccount(account, "账号");
+        Assert.Contains("CacheStatusText", changed);
+
+        changed.Clear();
+        await viewModel.EnterAsync();
+
+        Assert.Equal($"本地缓存｜更新于 {cachedAt.ToLocalTime():yyyy-MM-dd HH:mm}｜2 条", viewModel.CacheStatusText);
+        Assert.Contains("CacheStatusText", changed);
+
+        changed.Clear();
+        viewModel.SelectAccount(null, null);
+
+        Assert.Equal("尚无本地缓存", viewModel.CacheStatusText);
+        Assert.Contains("CacheStatusText", changed);
+    }
+
+    [Fact]
+    public async Task FailedRefreshKeepsThePublishedLocalCacheStatus()
+    {
+        var account = Guid.NewGuid();
+        var cachedAt = Now.AddHours(-22);
+        var service = new FakeSync(account, Snapshot(account, "cached", cachedAt))
+        {
+            SyncResults = [FailureResult]
+        };
+        var viewModel = Create(service, new FakeDelay());
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        var before = viewModel.CacheStatusText;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Equal(before, viewModel.CacheStatusText);
+        Assert.Equal("cached", Assert.Single(viewModel.VisibleItems).Title);
     }
 
     [Fact]

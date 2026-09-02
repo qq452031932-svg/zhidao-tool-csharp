@@ -122,6 +122,9 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     public int ValidCount { get; private set; }
     public int InvalidCount { get; private set; }
     public string LastSuccessfulSyncText { get; private set; } = "尚未同步";
+    public string CacheStatusText => snapshot?.LastSuccessfulSyncAtUtc is { } updatedAt
+        ? $"本地缓存｜更新于 {updatedAt.ToLocalTime():yyyy-MM-dd HH:mm}｜{snapshot.Items.Count:N0} 条"
+        : "尚无本地缓存";
     public string PriorDay2Header { get; private set; } = string.Empty;
     public string PriorDay3Header { get; private set; } = string.Empty;
     public string PriorDay4Header { get; private set; } = string.Empty;
@@ -151,6 +154,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         VisibleItems = [];
         LastSuccessfulSyncText = "尚未同步";
         OnPropertyChanged(nameof(LastSuccessfulSyncText));
+        OnPropertyChanged(nameof(CacheStatusText));
         UpdateSummary();
         StatusMessage = selectedAccountId is null ? "请选择左侧账号。" : "已选择账号，等待读取分享数据。";
         RefreshCommand.NotifyCanExecuteChanged();
@@ -376,6 +380,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         snapshot = value;
         LastSuccessfulSyncText = value.LastSuccessfulSyncAtUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "尚未同步";
         OnPropertyChanged(nameof(LastSuccessfulSyncText));
+        OnPropertyChanged(nameof(CacheStatusText));
         UpdateDateLabels();
         UpdateSummary();
         Rebuild();
