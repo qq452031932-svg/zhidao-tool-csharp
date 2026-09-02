@@ -29,8 +29,9 @@ public interface IShareAnalyticsDelay
 public sealed class ShareAnalyticsRow : ObservableObject
 {
     private readonly AccountShareProjectedRow projected;
-    private readonly Action<string, bool>? selectionChanged;
+    private Action<string, bool>? selectionChanged;
     private bool isSelected;
+    private bool isActive = true;
 
     public ShareAnalyticsRow(
         AccountShareProjectedRow projected,
@@ -50,9 +51,16 @@ public sealed class ShareAnalyticsRow : ObservableObject
         get => isSelected;
         set
         {
+            if (!isActive) return;
             if (!SetProperty(ref isSelected, value)) return;
             selectionChanged?.Invoke(ShareId, value);
         }
+    }
+
+    internal void Deactivate()
+    {
+        isActive = false;
+        selectionChanged = null;
     }
     public string ShareId => projected.ShareId;
     public string Title => string.Equals(projected.Title.Trim(), "0", StringComparison.Ordinal)

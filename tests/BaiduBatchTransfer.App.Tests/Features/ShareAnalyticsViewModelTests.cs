@@ -54,18 +54,12 @@ public sealed class ShareAnalyticsViewModelTests
     public void RowPublishesSequenceAndTwoWaySelectionCallback()
     {
         var projected = ProjectRow("stable-share-id", "标题").Projected;
-        var constructor = typeof(ShareAnalyticsRow).GetConstructor(
-        [
-            typeof(AccountShareProjectedRow),
-            typeof(int),
-            typeof(bool),
-            typeof(Action<string, bool>),
-        ]);
-
-        Assert.NotNull(constructor);
         var callbacks = new List<(string ShareId, bool IsSelected)>();
-        var row = Assert.IsType<ShareAnalyticsRow>(constructor.Invoke(
-            [projected, 7, false, (Action<string, bool>)((shareId, selected) => callbacks.Add((shareId, selected)))]));
+        var row = new ShareAnalyticsRow(
+            projected,
+            7,
+            false,
+            (shareId, selected) => callbacks.Add((shareId, selected)));
         var changed = new List<string?>();
         row.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
 
@@ -759,6 +753,42 @@ public sealed class ShareAnalyticsViewModelTests
     }
 
     [Fact]
+    public async Task HeaderSelectionStateTracksVisibleSelectionAcrossFilteringAndToggles()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Valid, 20),
+            Record("gamma", AccountShareRemoteStatus.Invalid, 30),
+        ]);
+        var viewModel = Create(new FakeSync(account, snapshot));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        Assert.False(viewModel.HeaderSelectionState);
+        viewModel.VisibleItems.Single(row => row.ShareId == "alpha").IsSelected = true;
+        Assert.Null(viewModel.HeaderSelectionState);
+        viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected = true;
+        Assert.Null(viewModel.HeaderSelectionState);
+
+        viewModel.StatusFilter = ShareAnalyticsStatusFilter.Valid;
+        Assert.True(viewModel.HeaderSelectionState);
+        viewModel.SearchText = "beta";
+        Assert.True(viewModel.HeaderSelectionState);
+        Assert.Single(viewModel.VisibleItems).IsSelected = false;
+        Assert.False(viewModel.HeaderSelectionState);
+
+        viewModel.SearchText = string.Empty;
+        Assert.Null(viewModel.HeaderSelectionState);
+        viewModel.StatusFilter = ShareAnalyticsStatusFilter.Invalid;
+        Assert.False(viewModel.HeaderSelectionState);
+        viewModel.SearchText = "missing";
+        Assert.Empty(viewModel.VisibleItems);
+        Assert.False(viewModel.HeaderSelectionState);
+    }
+
+    [Fact]
     public async Task SelectingDifferentAccountClearsAllSelectedShareIds()
     {
         var accountA = Guid.NewGuid();
@@ -813,6 +843,75 @@ public sealed class ShareAnalyticsViewModelTests
         Assert.True(viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected);
         Assert.False(viewModel.VisibleItems.Single(row => row.ShareId == "gamma").IsSelected);
         Assert.Null(viewModel.HeaderSelectionState);
+    }
+
+    [Fact]
+    public async Task RowFromBeforeRebuildCannotMutateCurrentSelection()
+    {
+        var account = Guid.NewGuid();
+        var snapshot = new AccountShareCachedSnapshot(account, Now,
+        [
+            Record("alpha", AccountShareRemoteStatus.Valid, 10),
+            Record("beta", AccountShareRemoteStatus.Valid, 20),
+        ]);
+        var viewModel = Create(new FakeSync(account, snapshot));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        var staleRow = viewModel.VisibleItems.Single(row => row.ShareId == "alpha");
+        viewModel.VisibleItems.Single(row => row.ShareId == "beta").IsSelected = true;
+        viewModel.SortCommand.Execute(AccountShareSortColumn.Today);
+        var currentItems = viewModel.VisibleItems;
+
+        staleRow.IsSelected = true;
+
+        Assert.Same(currentItems, viewModel.VisibleItems);
+        Assert.Equal(1, viewModel.SelectedCount);
+        Assert.Null(viewModel.HeaderSelectionState);
+        Assert.False(currentItems.Single(row => row.ShareId == "alpha").IsSelected);
+        Assert.True(currentItems.Single(row => row.ShareId == "beta").IsSelected);
+    }
+
+    [Fact]
+    public async Task RowFromPreviousAccountCannotInjectSelectionIntoCurrentAccount()
+    {
+        var accountA = Guid.NewGuid();
+        var accountB = Guid.NewGuid();
+        var viewModel = Create(new MultiAccountSync(
+            Snapshot(accountA, "alpha", Now),
+            Snapshot(accountB, "beta", Now)));
+        viewModel.SelectAccount(accountA, "甲");
+        await viewModel.EnterAsync();
+        var staleRow = Assert.Single(viewModel.VisibleItems);
+        viewModel.SelectAccount(accountB, "乙");
+        await WaitUntilAsync(() => viewModel.VisibleItems.Count == 1);
+        var currentItems = viewModel.VisibleItems;
+
+        staleRow.IsSelected = true;
+
+        Assert.Same(currentItems, viewModel.VisibleItems);
+        Assert.Equal(0, viewModel.SelectedCount);
+        Assert.False(viewModel.HeaderSelectionState);
+        Assert.Equal("beta", Assert.Single(currentItems).ShareId);
+        Assert.False(Assert.Single(currentItems).IsSelected);
+    }
+
+    [Fact]
+    public async Task RowRetainedAfterDisposeCannotMutateDisposedSelectionState()
+    {
+        var account = Guid.NewGuid();
+        var viewModel = Create(new FakeSync(account, Snapshot(account, "alpha", Now)));
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+        var staleRow = Assert.Single(viewModel.VisibleItems);
+        var currentItems = viewModel.VisibleItems;
+        viewModel.Dispose();
+
+        staleRow.IsSelected = true;
+
+        Assert.Same(currentItems, viewModel.VisibleItems);
+        Assert.Equal(0, viewModel.SelectedCount);
+        Assert.False(viewModel.HeaderSelectionState);
+        Assert.False(Assert.Single(viewModel.VisibleItems).IsSelected);
     }
 
     [Fact]

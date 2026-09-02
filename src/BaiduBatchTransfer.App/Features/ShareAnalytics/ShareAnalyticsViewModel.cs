@@ -38,6 +38,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private bool isActive;
     private string statusMessage = "请选择左侧账号。";
     private IReadOnlyList<ShareAnalyticsRow> visibleItems = [];
+    private int currentVisibleSelectedCount;
     private long selectionGeneration;
     private long navigationGeneration;
     private long delayGeneration;
@@ -130,10 +131,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     {
         get
         {
-            if (VisibleItems.Count == 0) return false;
-            var selectedVisibleCount = VisibleItems.Count(row => selectedShareIds.Contains(row.ShareId));
-            if (selectedVisibleCount == 0) return false;
-            return selectedVisibleCount == VisibleItems.Count ? true : null;
+            if (VisibleItems.Count == 0 || currentVisibleSelectedCount == 0) return false;
+            return currentVisibleSelectedCount == VisibleItems.Count ? true : null;
         }
     }
     public string LastSuccessfulSyncText { get; private set; } = "尚未同步";
@@ -167,7 +166,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
             ? "未选择账号"
             : displayName.Trim();
         snapshot = null;
-        VisibleItems = [];
+        ReplaceVisibleItems([]);
         NotifyCurrentResultsChanged();
         if (accountChanged && selectedShareIds.Count > 0)
         {
@@ -439,7 +438,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     {
         if (snapshot is null)
         {
-            VisibleItems = [];
+            ReplaceVisibleItems([]);
             NotifyCurrentResultsChanged();
             return;
         }
@@ -455,20 +454,33 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         var projectedAt = timeProvider.GetUtcNow();
         var projected = source.Select(item => projector.Project(item, SelectedMetric, projectedAt));
         var ordered = projector.Sort(projected, sortColumn, sortDescending).ToArray();
-        VisibleItems = ordered
+        ReplaceVisibleItems(ordered
             .Select((item, index) => new ShareAnalyticsRow(
                 item,
                 index + 1,
                 selectedShareIds.Contains(item.ShareId),
                 OnRowSelectionChanged))
-            .ToArray();
+            .ToArray());
         NotifyCurrentResultsChanged();
+    }
+
+    private void ReplaceVisibleItems(IReadOnlyList<ShareAnalyticsRow> replacement)
+    {
+        DeactivateVisibleItems();
+        currentVisibleSelectedCount = replacement.Count(row => row.IsSelected);
+        VisibleItems = replacement;
+    }
+
+    private void DeactivateVisibleItems()
+    {
+        foreach (var row in VisibleItems) row.Deactivate();
     }
 
     private void OnRowSelectionChanged(string shareId, bool selected)
     {
         var changed = selected ? selectedShareIds.Add(shareId) : selectedShareIds.Remove(shareId);
         if (!changed) return;
+        currentVisibleSelectedCount += selected ? 1 : -1;
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(HeaderSelectionState));
         NotifySelectionDependentCanExecuteChanged();
@@ -541,6 +553,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         Interlocked.Increment(ref selectionGeneration);
         IsRefreshing = false;
         RefreshCommand.NotifyCanExecuteChanged();
+        DeactivateVisibleItems();
         CancelPendingDelay();
         lifetime.Cancel();
         activation?.Cancel();
