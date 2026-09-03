@@ -1009,7 +1009,76 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
-    public void LoadedInitializationStartsTheSilentCheckLastAndCloseRequesterOnlyClosesTheWindow()
+    public async Task LoadedInitializationWaitsForEveryPrerequisiteBeforeStartingTheSilentCheck()
+    {
+        var activation = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var order = new List<string>();
+
+        var initialization = LoadedInitializationSequencer.RunAsync(
+            () =>
+            {
+                order.Add("run-panel");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                order.Add("share");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                order.Add("activate");
+                return activation.Task;
+            },
+            () =>
+            {
+                order.Add("handoff");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                order.Add("poll");
+                return Task.CompletedTask;
+            },
+            () => order.Add("update-check"));
+
+        Assert.Equal(["run-panel", "share", "activate"], order);
+        Assert.False(initialization.IsCompleted);
+
+        activation.SetResult();
+        await initialization;
+
+        Assert.Equal(
+            ["run-panel", "share", "activate", "handoff", "poll", "update-check"],
+            order);
+    }
+
+    [Fact]
+    public async Task LoadedInitializationDoesNotStartTheSilentCheckAfterShellCancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var updateCheckStarted = false;
+
+        var initialization = LoadedInitializationSequencer.RunAsync(
+            () => Task.CompletedTask,
+            () => Task.CompletedTask,
+            () =>
+            {
+                cancellation.Cancel();
+                return Task.CompletedTask;
+            },
+            () => Task.CompletedTask,
+            () => Task.CompletedTask,
+            () => updateCheckStarted = true,
+            cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => initialization);
+        Assert.False(updateCheckStarted);
+    }
+
+    [Fact]
+    public void CloseRequesterOnlyClosesTheMainWindow()
     {
         var bootstrap = File.ReadAllText(Path.Combine(
             FindRepositoryRoot(),
@@ -1017,18 +1086,6 @@ public sealed class AppBootstrapTests : IDisposable
             "BaiduBatchTransfer.App",
             "AppBootstrap.cs"));
 
-        var loadedStart = bootstrap.IndexOf("async Task HandleLoadedAsync()", StringComparison.Ordinal);
-        var loadedEnd = bootstrap.IndexOf("void OnLoaded", loadedStart, StringComparison.Ordinal);
-        var loaded = bootstrap[loadedStart..loadedEnd];
-
-        Assert.True(loaded.IndexOf("runPanelViewModel.InitializeAsync", StringComparison.Ordinal) <
-                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
-        Assert.True(loaded.IndexOf("shareViewModel.InitializeAsync", StringComparison.Ordinal) <
-                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
-        Assert.True(loaded.IndexOf("ActivateInitialWorkspaceAsync", StringComparison.Ordinal) <
-                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
-        Assert.True(loaded.IndexOf("handoff.RestorePendingAsync", StringComparison.Ordinal) <
-                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
         Assert.Contains("mainWindow?.Close()", bootstrap, StringComparison.Ordinal);
         Assert.DoesNotContain("Application.Current.Shutdown", bootstrap, StringComparison.Ordinal);
     }

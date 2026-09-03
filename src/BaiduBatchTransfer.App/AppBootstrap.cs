@@ -1104,16 +1104,18 @@ public sealed class AppShellFactory(
 
         async Task HandleLoadedAsync()
         {
-            await runPanelViewModel.InitializeAsync(shellLifetime.Token).ConfigureAwait(true);
-            await shareViewModel.InitializeAsync(shellLifetime.Token).ConfigureAwait(true);
-            Observe(mainViewModel.ActivateInitialWorkspaceAsync(shellLifetime.Token));
-            await handoff.RestorePendingAsync().ConfigureAwait(true);
-            await DispatchOnUiAsync(() =>
-            {
-                if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
-                if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
-            }).ConfigureAwait(true);
-            startupUpdateCheck.Start();
+            await LoadedInitializationSequencer.RunAsync(
+                () => runPanelViewModel.InitializeAsync(shellLifetime.Token),
+                () => shareViewModel.InitializeAsync(shellLifetime.Token),
+                () => mainViewModel.ActivateInitialWorkspaceAsync(shellLifetime.Token),
+                handoff.RestorePendingAsync,
+                () => DispatchOnUiAsync(() =>
+                {
+                    if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
+                    if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
+                }),
+                startupUpdateCheck.Start,
+                shellLifetime.Token).ConfigureAwait(true);
         }
 
         void OnLoaded(object? _, System.Windows.RoutedEventArgs __) => Observe(HandleLoadedAsync());
@@ -1138,6 +1140,39 @@ public sealed class AppShellFactory(
         mainWindow.Loaded += OnLoaded;
         mainWindow.Closed += OnClosed;
         return mainWindow;
+    }
+}
+
+internal static class LoadedInitializationSequencer
+{
+    public static async Task RunAsync(
+        Func<Task> initializeRunPanelAsync,
+        Func<Task> initializeShareAsync,
+        Func<Task> activateInitialWorkspaceAsync,
+        Func<Task> restorePendingAsync,
+        Func<Task> initializePollAsync,
+        Action startUpdateCheck,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(initializeRunPanelAsync);
+        ArgumentNullException.ThrowIfNull(initializeShareAsync);
+        ArgumentNullException.ThrowIfNull(activateInitialWorkspaceAsync);
+        ArgumentNullException.ThrowIfNull(restorePendingAsync);
+        ArgumentNullException.ThrowIfNull(initializePollAsync);
+        ArgumentNullException.ThrowIfNull(startUpdateCheck);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        await initializeRunPanelAsync().ConfigureAwait(true);
+        cancellationToken.ThrowIfCancellationRequested();
+        await initializeShareAsync().ConfigureAwait(true);
+        cancellationToken.ThrowIfCancellationRequested();
+        await activateInitialWorkspaceAsync().ConfigureAwait(true);
+        cancellationToken.ThrowIfCancellationRequested();
+        await restorePendingAsync().ConfigureAwait(true);
+        cancellationToken.ThrowIfCancellationRequested();
+        await initializePollAsync().ConfigureAwait(true);
+        cancellationToken.ThrowIfCancellationRequested();
+        startUpdateCheck();
     }
 }
 
