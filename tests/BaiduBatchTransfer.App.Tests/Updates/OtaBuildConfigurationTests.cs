@@ -64,6 +64,20 @@ public sealed class OtaBuildConfigurationTests
                 "PackageId=SuperPan.BaiduBatchTransfer",
                 "UpdateChannel=win-x64-stable",
             ]);
+        data.Add(
+            [
+                "VersionPrefix=1.2.3",
+                "UpdateFeedUrl=https://:443/stable/",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
+        data.Add(
+            [
+                "VersionPrefix=1.2.3",
+                "UpdateFeedUrl=https://updates.example.test:abc/stable/",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
         return data;
     }
 
