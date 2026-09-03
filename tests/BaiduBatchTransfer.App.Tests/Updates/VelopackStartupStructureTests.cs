@@ -13,13 +13,17 @@ public sealed class VelopackStartupStructureTests
             "BaiduBatchTransfer.App",
             "Program.cs"));
 
-        Assert.Contains("VelopackApp.Build()", program, StringComparison.Ordinal);
-        Assert.Contains("SetAutoApplyOnStartup(false)", program, StringComparison.Ordinal);
+        const string velopackBootstrap = "VelopackApp.Build().SetAutoApplyOnStartup(false).Run()";
+        const string appConstruction = "new App(updateRuntime)";
+        var bootstrapIndex = program.IndexOf(velopackBootstrap, StringComparison.Ordinal);
+        var appConstructionIndex = program.IndexOf(appConstruction, StringComparison.Ordinal);
+
+        Assert.True(bootstrapIndex >= 0, "The complete Velopack bootstrap chain is required.");
         Assert.Contains("VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current)", program, StringComparison.Ordinal);
-        Assert.Contains("new App(updateRuntime)", program, StringComparison.Ordinal);
+        Assert.True(appConstructionIndex >= 0, "The WPF application must own the update runtime.");
         Assert.True(
-            program.IndexOf("VelopackApp.Build()", StringComparison.Ordinal) <
-            program.IndexOf("new App(updateRuntime)", StringComparison.Ordinal));
+            bootstrapIndex + velopackBootstrap.Length <= appConstructionIndex,
+            "The complete Velopack bootstrap chain must finish before App is created.");
     }
 
     [Fact]
