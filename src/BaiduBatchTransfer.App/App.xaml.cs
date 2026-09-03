@@ -3,6 +3,7 @@ using System.IO;
 using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
+using BaiduBatchTransfer.App.Updates;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 #if DEBUG
@@ -13,10 +14,16 @@ namespace BaiduBatchTransfer.App;
 
 public partial class App : System.Windows.Application
 {
+    private readonly IApplicationUpdateRuntime updateRuntime;
     private IHost? host;
     private ApplicationShutdownCoordinator? shutdownCoordinator;
     private int shutdownRequested;
     private bool allowShutdown;
+
+    public App(IApplicationUpdateRuntime updateRuntime)
+    {
+        this.updateRuntime = updateRuntime ?? throw new ArgumentNullException(nameof(updateRuntime));
+    }
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -109,11 +116,18 @@ public partial class App : System.Windows.Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        if (host is not null)
+        try
         {
-            host.Dispose();
-            host = null;
+            if (host is not null)
+            {
+                host.Dispose();
+                host = null;
+            }
         }
-        base.OnExit(e);
+        finally
+        {
+            updateRuntime.Dispose();
+            base.OnExit(e);
+        }
     }
 }

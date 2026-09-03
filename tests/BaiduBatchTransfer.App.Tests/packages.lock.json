@@ -433,18 +433,6 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
-      "baidubatchtransfer.app": {
-        "type": "Project",
-        "dependencies": {
-          "BaiduBatchTransfer.Application": "[1.0.0, )",
-          "BaiduBatchTransfer.BaiduAdapter": "[1.0.0, )",
-          "BaiduBatchTransfer.Core": "[1.0.0, )",
-          "BaiduBatchTransfer.Infrastructure": "[1.0.0, )",
-          "CommunityToolkit.Mvvm": "[8.4.2, )",
-          "Microsoft.Extensions.Hosting": "[10.0.11, )",
-          "Microsoft.Web.WebView2": "[1.0.4129.50, )"
-        }
-      },
       "baidubatchtransfer.application": {
         "type": "Project",
         "dependencies": {
@@ -468,6 +456,19 @@
           "DocumentFormat.OpenXml": "[3.5.1, )",
           "Microsoft.Data.Sqlite": "[10.0.11, )",
           "System.Security.Cryptography.ProtectedData": "[10.0.11, )"
+        }
+      },
+      "SuperPan.BaiduBatchTransfer": {
+        "type": "Project",
+        "dependencies": {
+          "BaiduBatchTransfer.Application": "[1.0.0, )",
+          "BaiduBatchTransfer.BaiduAdapter": "[1.0.0, )",
+          "BaiduBatchTransfer.Core": "[1.0.0, )",
+          "BaiduBatchTransfer.Infrastructure": "[1.0.0, )",
+          "CommunityToolkit.Mvvm": "[8.4.2, )",
+          "Microsoft.Extensions.Hosting": "[10.0.11, )",
+          "Microsoft.Web.WebView2": "[1.0.4129.50, )",
+          "Velopack": "[1.2.0, )"
         }
       },
       "CommunityToolkit.Mvvm": {
@@ -537,6 +538,35 @@
         "requested": "[10.0.11, )",
         "resolved": "10.0.11",
         "contentHash": "PNoxCTPb+Tlux+GJyq4c89ddYdpioVSqfGx8pqOF6shCSKwUNNctXhQtRkCICjbJmGrJJsW8NY52kVYO/b8mlQ=="
+      },
+      "Velopack": {
+        "type": "CentralTransitive",
+        "requested": "[1.2.0, )",
+        "resolved": "1.2.0",
+        "contentHash": "Rz67gJL619fSBS6omaSINUxyDuwhIxkm5mmubf7uLd5Qgi6LLKaKCha+QFP6n+Bw/UjA0vutnH4JQfYzn6ANtw=="
+      }
+    },
+    "net8.0-windows7.0/win-x64": {
+      "SQLitePCLRaw.lib.e_sqlite3": {
+        "type": "Transitive",
+        "resolved": "2.1.12",
+        "contentHash": "fWi8Dbknuhgg72fWinIdjXVaqO1hHL4YBBwVLnr7e1c9TAZwJ0QE38j9syW1hwx6HaqEVTwI+O07WPdZn8Rp0w=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "QTXEoQBzz00SFWbo7nAg1Ogd4f99lwqcO9uAJ7MYSLEUR28f6As32QktrqG2Fr9cfAfd1GjLyGYspE7Ipj7P6w=="
+      },
+      "System.Text.Encodings.Web": {
+        "type": "Transitive",
+        "resolved": "10.0.11",
+        "contentHash": "R7H2/Oqr3onFff/JKDpfRjwxcQZlocF/eQ0ce8go/OTjqz+6LEp/fZK8j1YnDobtysChATEg7krVq4hQJ3IoeQ=="
+      },
+      "Microsoft.Web.WebView2": {
+        "type": "CentralTransitive",
+        "requested": "[1.0.4129.50, )",
+        "resolved": "1.0.4129.50",
+        "contentHash": "BuJC70c7SCl8wlvojLZbc/E5ONmGyG3fhAMmpftCpKerxae//TxgKOTELRK2QRD7m7jigNFQRf6cfVT3ZiIQoQ=="
       }
     }
   }
