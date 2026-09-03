@@ -33,15 +33,17 @@ public sealed class UpdateAwareShutdownOrchestrator
         if (Interlocked.CompareExchange(ref state, 1, 0) != 0)
             return false;
 
+        bool safeShutdownCompleted;
         try
         {
-            if (!await safeShutdownAsync(cancellationToken))
-            {
-                RestoreAfterSafeShutdownFailure();
-                return false;
-            }
+            safeShutdownCompleted = await safeShutdownAsync(cancellationToken);
         }
         catch
+        {
+            safeShutdownCompleted = false;
+        }
+
+        if (!safeShutdownCompleted)
         {
             RestoreAfterSafeShutdownFailure();
             return false;
@@ -76,6 +78,10 @@ public sealed class UpdateAwareShutdownOrchestrator
         try
         {
             restoreWindow();
+        }
+        catch
+        {
+            // Recovery is best-effort and must not escape a WPF async closing handler.
         }
         finally
         {

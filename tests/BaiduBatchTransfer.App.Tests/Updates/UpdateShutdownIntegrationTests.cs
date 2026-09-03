@@ -174,6 +174,40 @@ public sealed class UpdateShutdownIntegrationTests
         Assert.True(restoredOnCapturedContext);
     }
 
+    [Fact]
+    public async Task ThrowingWindowRestoreRunsOnceDoesNotEscapeAndLeavesShutdownRetryable()
+    {
+        var safeShutdownCalls = 0;
+        var restoreCalls = 0;
+        var applyCalls = 0;
+        var exitCalls = 0;
+        var orchestrator = new UpdateAwareShutdownOrchestrator(
+            _ => Task.FromResult(Interlocked.Increment(ref safeShutdownCalls) > 1),
+            () =>
+            {
+                applyCalls++;
+                return true;
+            },
+            () =>
+            {
+                restoreCalls++;
+                throw new InvalidOperationException("synthetic restore failure");
+            },
+            _ => { },
+            () => exitCalls++);
+
+        Assert.False(await orchestrator.ShutdownAsync());
+        Assert.Equal(1, restoreCalls);
+        Assert.Equal(0, applyCalls);
+        Assert.Equal(0, exitCalls);
+
+        Assert.True(await orchestrator.ShutdownAsync());
+        Assert.Equal(2, safeShutdownCalls);
+        Assert.Equal(1, restoreCalls);
+        Assert.Equal(1, applyCalls);
+        Assert.Equal(1, exitCalls);
+    }
+
     private static UpdateAwareShutdownOrchestrator CreateOrchestrator(
         List<string> events,
         Func<CancellationToken, Task<bool>> safeShutdown,
