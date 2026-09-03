@@ -21,6 +21,9 @@ public sealed class SettingsViewStructureTests
         Assert.Contains("最新版本", xaml, StringComparison.Ordinal);
         Assert.Contains("更新说明", xaml, StringComparison.Ordinal);
         Assert.Contains("ProgressBar", xaml, StringComparison.Ordinal);
+        Assert.Contains("ScrollViewer", xaml, StringComparison.Ordinal);
+        Assert.Contains("MaxHeight=", xaml, StringComparison.Ordinal);
+        Assert.Contains("VerticalScrollBarVisibility=\"Auto\"", xaml, StringComparison.Ordinal);
         Assert.Contains("CheckForUpdatesCommand", xaml, StringComparison.Ordinal);
         Assert.Contains("UpdateAndRestartCommand", xaml, StringComparison.Ordinal);
         Assert.Contains("检查更新", xaml, StringComparison.Ordinal);
@@ -29,6 +32,10 @@ public sealed class SettingsViewStructureTests
         Assert.Contains("StaticResource SecondaryButtonStyle", xaml, StringComparison.Ordinal);
         Assert.Contains("StaticResource BrandBrush", xaml, StringComparison.Ordinal);
         Assert.Contains("StaticResource MutedBrush", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.LiveSetting=\"Polite\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"更新状态\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.Name=\"更新下载进度\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("AutomationProperties.HelpText=", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("功能建设中", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("服务器地址", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("CheckBox", xaml, StringComparison.Ordinal);

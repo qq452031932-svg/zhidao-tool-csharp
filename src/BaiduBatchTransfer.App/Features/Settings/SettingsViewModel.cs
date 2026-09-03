@@ -16,7 +16,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private readonly IApplicationUpdateService updateService;
     private readonly IDialogService dialogService;
     private readonly IApplicationCloseRequester closeRequester;
-    private readonly SynchronizationContext? synchronizationContext;
+    private readonly SynchronizationContext synchronizationContext;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object lifecycleGate = new();
     private readonly object snapshotGate = new();
@@ -27,6 +27,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private string releaseNotes = "暂无更新说明。";
     private int downloadProgress;
     private bool isOperationBusy;
+    private bool preparingRestart;
+    private bool closeRequested;
     private long receivedSnapshotSequence;
     private long appliedSnapshotSequence;
     private int disposed;
@@ -35,11 +37,26 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         IApplicationUpdateService updateService,
         IDialogService dialogService,
         IApplicationCloseRequester closeRequester)
+        : this(
+            updateService,
+            dialogService,
+            closeRequester,
+            SynchronizationContext.Current ?? throw new InvalidOperationException(
+                "SettingsViewModel requires a UI SynchronizationContext."))
+    {
+    }
+
+    public SettingsViewModel(
+        IApplicationUpdateService updateService,
+        IDialogService dialogService,
+        IApplicationCloseRequester closeRequester,
+        SynchronizationContext synchronizationContext)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
         this.closeRequester = closeRequester ?? throw new ArgumentNullException(nameof(closeRequester));
-        synchronizationContext = SynchronizationContext.Current;
+        this.synchronizationContext = synchronizationContext ??
+            throw new ArgumentNullException(nameof(synchronizationContext));
 
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, CanCheckForUpdates);
         UpdateAndRestartCommand = new AsyncRelayCommand(UpdateAndRestartAsync, CanUpdateAndRestart);
@@ -190,11 +207,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                         return;
                 }
 
-                lock (lifecycleGate)
-                {
-                    if (disposed == 0 && updateService.TryPrepareRestart())
-                        closeRequester.RequestClose();
-                }
+                PrepareRestartAndRequestClose();
             }
             catch (OperationCanceledException) when (operation.IsCancellationRequested)
             {
@@ -213,13 +226,6 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             return;
 
         var sequence = NextSnapshotSequence();
-        if (synchronizationContext is null ||
-            ReferenceEquals(SynchronizationContext.Current, synchronizationContext))
-        {
-            ApplySnapshot(snapshot, sequence);
-            return;
-        }
-
         try
         {
             synchronizationContext.Post(
@@ -231,9 +237,51 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 },
                 new PostedSnapshot(this, snapshot, sequence));
         }
-        catch (InvalidOperationException)
+        catch (InvalidOperationException) when (Volatile.Read(ref disposed) != 0)
         {
             // The captured UI context can stop accepting work during shutdown.
+        }
+    }
+
+    private void PrepareRestartAndRequestClose()
+    {
+        lock (lifecycleGate)
+        {
+            if (disposed != 0 || preparingRestart || closeRequested)
+                return;
+            preparingRestart = true;
+        }
+
+        var prepared = false;
+        var shouldRequestClose = false;
+        try
+        {
+            prepared = updateService.TryPrepareRestart();
+        }
+        finally
+        {
+            lock (lifecycleGate)
+            {
+                preparingRestart = false;
+                if (disposed == 0 && prepared && !closeRequested)
+                {
+                    closeRequested = true;
+                    shouldRequestClose = true;
+                }
+            }
+        }
+
+        if (!shouldRequestClose)
+            return;
+
+        try
+        {
+            closeRequester.RequestClose();
+        }
+        finally
+        {
+            lock (lifecycleGate)
+                closeRequested = false;
         }
     }
 

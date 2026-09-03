@@ -32,6 +32,27 @@ public sealed class SettingsViewModelTests
         Assert.True(viewModel.UpdateAndRestartCommand.CanExecute(null));
     }
 
+    [Fact]
+    public void ConstructionWithoutAUiSynchronizationContextFailsFast()
+    {
+        var previous = SynchronizationContext.Current;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(null);
+
+            var exception = Assert.Throws<InvalidOperationException>(() => new SettingsViewModel(
+                new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)),
+                new FakeDialog(true),
+                new FakeCloseRequester()));
+
+            Assert.Contains("SynchronizationContext", exception.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+    }
+
     [Theory]
     [InlineData(ApplicationUpdateStatus.NotConfigured)]
     [InlineData(ApplicationUpdateStatus.Unsupported)]
@@ -175,6 +196,44 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task DisposeReenteredByPrepareCallbackPreventsCloseRequest()
+    {
+        var service = new FakeUpdateService(Snapshot(
+            ApplicationUpdateStatus.ReadyToRestart,
+            progress: 100))
+        {
+            PrepareRestartResult = true
+        };
+        var closeRequester = new FakeCloseRequester();
+        var viewModel = Create(service, new FakeDialog(true), closeRequester);
+        service.PrepareRestartCallback = viewModel.Dispose;
+
+        await viewModel.UpdateAndRestartCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, service.PrepareRestartCalls);
+        Assert.Equal(0, closeRequester.Requests);
+    }
+
+    [Fact]
+    public async Task DisposeReenteredAfterCommittedCloseIntentDoesNotCancelRequest()
+    {
+        var service = new FakeUpdateService(Snapshot(
+            ApplicationUpdateStatus.ReadyToRestart,
+            progress: 100))
+        {
+            PrepareRestartResult = true
+        };
+        SettingsViewModel? viewModel = null;
+        var closeRequester = new FakeCloseRequester(() => viewModel!.Dispose());
+        viewModel = Create(service, new FakeDialog(true), closeRequester);
+
+        await viewModel.UpdateAndRestartCommand.ExecuteAsync(null);
+
+        Assert.Equal(1, closeRequester.Requests);
+        Assert.False(viewModel.UpdateAndRestartCommand.CanExecute(null));
+    }
+
+    [Fact]
     public async Task ReadyToRestartConfirmsThenSkipsCheckAndDownload()
     {
         var service = new FakeUpdateService(Snapshot(
@@ -222,19 +281,9 @@ public sealed class SettingsViewModelTests
     [Fact]
     public async Task BackgroundNotificationsReturnToCapturedContext()
     {
-        var previous = SynchronizationContext.Current;
         var context = new QueuedSynchronizationContext();
         var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
-        SettingsViewModel? viewModel = null;
-        try
-        {
-            SynchronizationContext.SetSynchronizationContext(context);
-            viewModel = Create(service);
-        }
-        finally
-        {
-            SynchronizationContext.SetSynchronizationContext(previous);
-        }
+        var viewModel = Create(service, synchronizationContext: context);
 
         await Task.Run(() => service.Raise(Snapshot(
             ApplicationUpdateStatus.Available,
@@ -251,40 +300,87 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
-    public async Task OlderPostedSnapshotCannotOverwriteNewerUiSnapshot()
+    public async Task BackgroundDownloadProgressIsAppliedInsideTheInjectedContext()
+    {
+        var context = new QueuedSynchronizationContext();
+        var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Available));
+        using var viewModel = Create(service, synchronizationContext: context);
+        var updatesOutsideContext = 0;
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(SettingsViewModel.DownloadProgress) &&
+                !context.IsExecuting)
+            {
+                updatesOutsideContext++;
+            }
+        };
+
+        await Task.Run(() => service.Raise(Snapshot(
+            ApplicationUpdateStatus.Downloading,
+            progress: 63)));
+
+        Assert.Equal(0, viewModel.DownloadProgress);
+        context.Drain();
+
+        Assert.Equal(63, viewModel.DownloadProgress);
+        Assert.Equal(0, updatesOutsideContext);
+    }
+
+    [Fact]
+    public void NotificationsArePostedEvenWhenRaisedFromTheInjectedContext()
     {
         var previous = SynchronizationContext.Current;
         var context = new QueuedSynchronizationContext();
         var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
-        SettingsViewModel viewModel;
+        using var viewModel = Create(service, synchronizationContext: context);
         try
         {
             SynchronizationContext.SetSynchronizationContext(context);
-            viewModel = Create(service);
+            service.Raise(Snapshot(
+                ApplicationUpdateStatus.Available,
+                latestVersion: "5.0.0"));
         }
         finally
         {
             SynchronizationContext.SetSynchronizationContext(previous);
         }
+
+        Assert.Equal("—", viewModel.LatestVersion);
+        Assert.Equal(1, context.PendingCount);
+
+        context.Drain();
+
+        Assert.Equal("5.0.0", viewModel.LatestVersion);
+    }
+
+    [Fact]
+    public void ActiveUiContextPostFailuresAreNotSilentlySwallowed()
+    {
+        var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
+        using var viewModel = Create(
+            service,
+            synchronizationContext: new RejectingSynchronizationContext());
+
+        Assert.Throws<InvalidOperationException>(() => service.Raise(Snapshot(
+            ApplicationUpdateStatus.Available,
+            latestVersion: "5.1.0")));
+    }
+
+    [Fact]
+    public async Task OlderPostedSnapshotCannotOverwriteNewerUiSnapshot()
+    {
+        var context = new QueuedSynchronizationContext();
+        var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
+        var viewModel = Create(service, synchronizationContext: context);
 
         await Task.Run(() => service.Raise(Snapshot(
             ApplicationUpdateStatus.Downloading,
             latestVersion: "2.0.0",
             progress: 40)));
-        try
-        {
-            SynchronizationContext.SetSynchronizationContext(context);
-            service.Raise(Snapshot(
-                ApplicationUpdateStatus.ReadyToRestart,
-                latestVersion: "2.0.0",
-                progress: 100));
-        }
-        finally
-        {
-            SynchronizationContext.SetSynchronizationContext(previous);
-        }
-
-        Assert.Equal("重启完成更新", viewModel.UpdateActionText);
+        service.Raise(Snapshot(
+            ApplicationUpdateStatus.ReadyToRestart,
+            latestVersion: "2.0.0",
+            progress: 100));
         context.Drain();
 
         Assert.Equal("重启完成更新", viewModel.UpdateActionText);
@@ -295,19 +391,9 @@ public sealed class SettingsViewModelTests
     [Fact]
     public async Task DisposeUnsubscribesAndMakesAlreadyPostedCallbacksHarmless()
     {
-        var previous = SynchronizationContext.Current;
         var context = new QueuedSynchronizationContext();
         var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
-        SettingsViewModel viewModel;
-        try
-        {
-            SynchronizationContext.SetSynchronizationContext(context);
-            viewModel = Create(service);
-        }
-        finally
-        {
-            SynchronizationContext.SetSynchronizationContext(previous);
-        }
+        var viewModel = Create(service, synchronizationContext: context);
 
         await Task.Run(() => service.Raise(Snapshot(
             ApplicationUpdateStatus.Available,
@@ -342,11 +428,47 @@ public sealed class SettingsViewModelTests
         Assert.Equal(0, closeRequester.Requests);
     }
 
+    [Fact]
+    public async Task RealApplicationUpdateServiceDrivesTheViewModelWorkflow()
+    {
+        using var runtime = new ViewModelRuntime(Snapshot(ApplicationUpdateStatus.Available))
+        {
+            DownloadResult = Snapshot(
+                ApplicationUpdateStatus.ReadyToRestart,
+                latestVersion: "6.0.0",
+                progress: 100,
+                userMessage: "更新已下载，重启后完成安装。"),
+            PrepareRestartResult = true
+        };
+        using var service = new ApplicationUpdateService(runtime);
+        var context = new QueuedSynchronizationContext();
+        var closeRequester = new FakeCloseRequester();
+        using var viewModel = new SettingsViewModel(
+            service,
+            new FakeDialog(true),
+            closeRequester,
+            context);
+
+        await viewModel.UpdateAndRestartCommand.ExecuteAsync(null);
+        context.Drain();
+
+        Assert.Equal(1, runtime.DownloadCalls);
+        Assert.Equal(1, runtime.PrepareRestartCalls);
+        Assert.Equal(1, closeRequester.Requests);
+        Assert.Equal("6.0.0", viewModel.LatestVersion);
+        Assert.Equal("重启完成更新", viewModel.UpdateActionText);
+    }
+
     private static SettingsViewModel Create(
         FakeUpdateService service,
         IDialogService? dialog = null,
-        IApplicationCloseRequester? closeRequester = null) =>
-        new(service, dialog ?? new FakeDialog(true), closeRequester ?? new FakeCloseRequester());
+        IApplicationCloseRequester? closeRequester = null,
+        SynchronizationContext? synchronizationContext = null) =>
+        new(
+            service,
+            dialog ?? new FakeDialog(true),
+            closeRequester ?? new FakeCloseRequester(),
+            synchronizationContext ?? new ImmediateSynchronizationContext());
 
     private static ApplicationUpdateSnapshot Snapshot(
         ApplicationUpdateStatus status,
@@ -381,6 +503,7 @@ public sealed class SettingsViewModelTests
         public Func<CancellationToken, Task<ApplicationUpdateSnapshot>>? CheckHandler { get; set; }
         public Func<CancellationToken, Task<ApplicationUpdateSnapshot>>? DownloadHandler { get; set; }
         public bool PrepareRestartResult { get; init; }
+        public Action? PrepareRestartCallback { get; set; }
         public List<string>? Trace { get; init; }
         public int CheckCalls { get; private set; }
         public int DownloadCalls { get; private set; }
@@ -408,6 +531,7 @@ public sealed class SettingsViewModelTests
         {
             Trace?.Add("prepare");
             PrepareRestartCalls++;
+            PrepareRestartCallback?.Invoke();
             return PrepareRestartResult;
         }
 
@@ -480,28 +604,98 @@ public sealed class SettingsViewModelTests
             Task.FromResult<string?>(null);
     }
 
-    private sealed class FakeCloseRequester(List<string>? trace = null) : IApplicationCloseRequester
+    private sealed class FakeCloseRequester : IApplicationCloseRequester
     {
+        private readonly List<string>? trace;
+        private readonly Action? callback;
+
+        public FakeCloseRequester(List<string>? trace = null)
+        {
+            this.trace = trace;
+        }
+
+        public FakeCloseRequester(Action callback)
+        {
+            this.callback = callback;
+        }
+
         public int Requests { get; private set; }
         public void RequestClose()
         {
             trace?.Add("close");
             Requests++;
+            callback?.Invoke();
         }
+    }
+
+    private sealed class ImmediateSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state) => d(state);
+    }
+
+    private sealed class RejectingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state) =>
+            throw new InvalidOperationException("UI context is still active but rejected work.");
     }
 
     private sealed class QueuedSynchronizationContext : SynchronizationContext
     {
         private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> callbacks = [];
+        private readonly AsyncLocal<int> executionDepth = new();
 
         public int PendingCount => callbacks.Count;
+        public bool IsExecuting => executionDepth.Value > 0;
 
         public override void Post(SendOrPostCallback d, object? state) => callbacks.Enqueue((d, state));
 
         public void Drain()
         {
             while (callbacks.TryDequeue(out var callback))
-                callback.Callback(callback.State);
+            {
+                executionDepth.Value++;
+                try
+                {
+                    callback.Callback(callback.State);
+                }
+                finally
+                {
+                    executionDepth.Value--;
+                }
+            }
         }
+    }
+
+    private sealed class ViewModelRuntime(ApplicationUpdateSnapshot snapshot)
+        : IApplicationUpdateRuntime
+    {
+        public ApplicationUpdateSnapshot Snapshot { get; private set; } = snapshot;
+        public ApplicationUpdateSnapshot DownloadResult { get; init; } = snapshot;
+        public bool PrepareRestartResult { get; init; }
+        public int DownloadCalls { get; private set; }
+        public int PrepareRestartCalls { get; private set; }
+
+        public event EventHandler<ApplicationUpdateSnapshot>? SnapshotChanged;
+
+        public Task<ApplicationUpdateSnapshot> CheckAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Snapshot);
+
+        public Task<ApplicationUpdateSnapshot> DownloadAsync(CancellationToken cancellationToken)
+        {
+            DownloadCalls++;
+            Snapshot = DownloadResult;
+            SnapshotChanged?.Invoke(this, Snapshot);
+            return Task.FromResult(Snapshot);
+        }
+
+        public bool TryPrepareRestart()
+        {
+            PrepareRestartCalls++;
+            return PrepareRestartResult;
+        }
+
+        public bool LaunchPreparedUpdateAndRestart() => false;
+
+        public void Dispose() { }
     }
 }
