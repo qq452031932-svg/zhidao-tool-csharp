@@ -58,6 +58,8 @@ Windows 正式分发使用 Velopack `Setup.exe`，默认安装到当前用户目
 
 MSBuild 发布门禁禁止以下组合：生产包使用本地 feed、验收包使用正式包 ID、同时设置生产 URL 与本地目录、或普通 Release 启用运行时 feed 覆盖。验收包在产品标题和设置页中明确显示“OTA 本地验收版”，不作为用户发布物。
 
+验收包还必须强制使用独立数据根 `%LOCALAPPDATA%\BaiduBatchTransfer.OtaAcceptance`，不得读取、迁移或写入正式 `%LOCALAPPDATA%\BaiduBatchTransfer`。独立包 ID/渠道只隔离安装文件，不能替代数据目录隔离。验收构建忽略普通 Release 不允许的运行时 `--data-root` 覆盖，并由编译期标记选择固定验收根；测试可以通过显式注入临时 LocalAppData 根验证该规则。
+
 更新地址不会放到普通用户可编辑的设置项里，防止误操作把客户端切到不受信任的更新源。后续拿到服务器地址后，通过发布参数生成第一版正式安装包；以后发布新版本只上传发布目录中的更新资产。
 
 ## 客户端组件
@@ -118,7 +120,8 @@ MSBuild 发布门禁禁止以下组合：生产包使用本地 feed、验收包�
 - 检查期间禁用重复检查。
 - 没有新版时只显示“已是最新版本”。
 - 有新版时显示版本和说明，不自动下载。
-- 点击“立即更新并重启”后下载；按钮文字和进度实时变化。
+- 点击“立即更新并重启”后先确认；用户确认后才下载，按钮文字和进度实时变化。下载并登记待应用更新成功后自动请求安全关闭，不再增加第二次确认。
+- 如果安全关闭失败，或软件在下载后、应用前重新启动，设置页直接显示“重启完成更新”；再次确认后复用 `UpdatePendingRestart`，不重新检查或下载。
 - 下载或校验失败时保持当前版本可用，并允许重试。
 - 当前不是 Velopack 包或更新源为空时，按钮禁用并给出简短原因。
 
@@ -139,7 +142,7 @@ MSBuild 发布门禁禁止以下组合：生产包使用本地 feed、验收包�
 
 流程如下：
 
-1. 设置页完成下载，重新读取 `UpdateManager.UpdatePendingRestart`，向 `PendingUpdateRestartCoordinator` 登记由当前 `UpdateManager` 和 `VelopackAsset` 组成的进程内待应用句柄。
+1. 用户在下载前确认一次；设置页完成下载后重新读取 `UpdateManager.UpdatePendingRestart`，向 `PendingUpdateRestartCoordinator` 登记由当前 `UpdateManager` 和 `VelopackAsset` 组成的进程内待应用句柄。
 2. 设置页请求关闭主窗口。
 3. `App.OnMainWindowClosing` 沿用现有逻辑：冻结 UI、持久化分享数据账号偏好、关闭任务队列、确认受控浏览器退出、停止并释放 Host。
 4. 任一步失败，取消关闭并恢复 UI；不启动 Velopack updater，待应用计划保留，可再次点击重启。
@@ -156,14 +159,14 @@ MSBuild 发布门禁禁止以下组合：生产包使用本地 feed、验收包�
 - Velopack release feed 包含完整包和差分包的 SHA-256，下载时由 Velopack校验包是否与该 feed 一致。feed 和包来自同一服务器，因此该校验只检测传输损坏或 feed/包不一致，不能抵御服务器控制者同时替换二者。
 - `vpk` 与客户端库锁定同一稳定版本。
 - 发布脚本生成 SHA-256 清单，供上传前和部署后核对。
-- Release 发布脚本默认要求代码签名参数；只有专用 OTA 验收构建并显式 `-AllowUnsignedLocal` 才能生成未签名本地包。
+- 本轮发布脚本只允许专用 OTA 验收构建，并且必须显式 `-OtaAcceptanceBuild -AllowUnsignedLocal`；任何生产模式调用都在生成资产前失败。
 - 更新只从编译时固定的 HTTPS 地址获取。
 
 ### 后续外部条件
 
-正式数字签名需要代码签名证书、Azure Artifact Signing 或兼容的签名服务。发布脚本通过 Velopack `--signParams`/签名模板传入，不在仓库保存 PFX、密码、令牌或私钥。
+正式数字签名需要代码签名证书、Azure Artifact Signing 或兼容的签名服务。后续生产脚本通过 Velopack `--signParams`/签名模板传入，不在仓库保存 PFX、密码、令牌或私钥。
 
-Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体验，但本设计不假设 Velopack `1.2.0` 会自动拒绝错误发布者。真实服务器接入阶段必须先做一次黑盒验证：用另一证书或无签名的测试更新包确认客户端是否拒绝。如果框架不强制发布者一致，则在启用生产 OTA 前增加“固定发布者证书指纹的显式 Authenticode 校验”或“内置公钥验证的签名 release feed”。这可能增加客户端校验流程和发布资产格式，但不改变设置页交互和 `IApplicationUpdateService` 接口。完成这项门禁之前，生产真实性只依赖 HTTPS/TLS，不能宣称数字签名已保护完整更新链路。
+Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体验，但本设计不假设 Velopack `1.2.0` 会自动拒绝错误发布者。真实服务器接入阶段必须先做一次黑盒验证：用另一证书或无签名的测试更新包确认客户端是否拒绝。如果框架不强制发布者一致，则在启用生产 OTA 前增加“固定发布者证书指纹的显式 Authenticode 校验”或“内置公钥验证的签名 release feed”。未来脚本只有在显式选择 `PinnedPublisher` 或 `SignedFeed` 真实性模式、实际校验产物通过后才允许生成正式资产；非空 `SignParams` 本身不构成通过条件。这可能增加客户端校验流程和发布资产格式，但不改变设置页交互和 `IApplicationUpdateService` 接口。完成这项门禁之前，生产 OTA 资产生成被机器门禁禁止。
 
 服务器若被攻破，攻击者可以同时替换 release feed 和包；单独的 feed SHA-256 不能阻止恶意包注入。发布目录仍应使用最小写权限、不可变版本文件和最后覆盖 release feed 的上传顺序，但这些运维措施不能替代独立签名验证。
 
@@ -172,10 +175,12 @@ Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体�
 新增 PowerShell 发布脚本，参数包括：
 
 - `Version`（必填）；
-- `FeedUrl`（生产必填，本地验收可空）；
+- `AcceptanceFeedPath`（必填绝对本地目录）；
 - `ReleaseNotesPath`；
 - `OutputDirectory`；
-- `SignParams` 或显式 `AllowUnsignedLocal`。
+- 必须同时显式指定 `OtaAcceptanceBuild` 与 `AllowUnsignedLocal`。
+
+本轮脚本不接受生产 feed 或签名参数，也不生成待上传的正式资产。后续服务器与真实性方案到位时再扩展生产参数；届时必须把 `PinnedPublisher` 或 `SignedFeed` 的实际校验作为可执行门禁。
 
 步骤：
 
@@ -185,7 +190,7 @@ Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体�
 4. 调用锁定版本的 `vpk pack`，生成 Setup、Portable、full/delta nupkg 和 release feed。
 5. 重新读取 release feed，验证包名、版本、大小和 SHA-256。
 6. 生成上传清单和简短中文说明。
-7. 不自动连接或上传服务器；正式上传流程以后还需在远端检查版本是否已经存在。
+7. 不自动连接或上传服务器；本轮产物仅供本机验收，不能上传为正式更新。
 
 为了生成差分包，发布脚本允许把上一版 release 资产复制到工作输出目录；没有上一版时生成首个完整包。
 
@@ -228,6 +233,7 @@ Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体�
 4. 点击立即更新，确认进度、安全关闭、替换、重启和版本显示。
 5. 断开/破坏 feed、修改包字节，确认继续运行旧版本且出现安全错误。
 6. 构造一个可以被应用但无法正常启动的验收版本，记录 Velopack 实际行为并确认不会把“自动回滚”作为产品承诺；使用上一版安装包完成恢复演练。
+7. 确认全过程只使用 `BaiduBatchTransfer.OtaAcceptance` 数据根，正式数据库、账号会话、缓存和任务记录的时间戳与哈希均未变化。
 
 真实服务器地址到位后，客户端交互和更新服务抽象保持不变；需要增加 HTTPS 连通性、缓存头、Range 请求和部署后 SHA-256 核对，并完成上述发布者一致性黑盒验证。若 Velopack 不强制发布者一致，还必须实现并验收独立真实性校验，才能启用生产 OTA。
 
@@ -237,5 +243,5 @@ Authenticode 代码签名用于标识发布者并改善 Windows SmartScreen 体�
 - 未配置服务器时，普通开发和 Release 构建、启动均不受影响。
 - 本地 Velopack 安装版可完成 `1.0.0 → 1.0.1` 检查、下载、退出、替换、重启。
 - 更新操作不会绕过现有安全关闭门禁。
-- 发布脚本能可重复地产出待上传资产，并拒绝无签名生产发布；未配置独立发布者验证时，不把正式服务器 OTA 标记为“生产就绪”。
+- 发布脚本能可重复地产出本地验收资产，并在独立真实性方案尚未实现时拒绝一切生产 OTA 输出。
 - 相关聚焦测试和 Release 构建通过，已有无关脏工作树改动不被覆盖或提交。
