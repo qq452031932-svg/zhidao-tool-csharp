@@ -57,9 +57,28 @@ public sealed class ApplicationShutdownCoordinatorTests
 
         Assert.Contains("MainWindow.Closing += OnMainWindowClosing", source, StringComparison.Ordinal);
         Assert.Contains("e.Cancel = true", source, StringComparison.Ordinal);
-        Assert.Contains("await shutdownCoordinator", source, StringComparison.Ordinal);
-        Assert.Contains(".ShutdownAsync(TimeSpan.FromSeconds(15))", source, StringComparison.Ordinal);
+        Assert.Contains("await updateShutdownOrchestrator", source, StringComparison.Ordinal);
+        Assert.Contains(".ShutdownAsync(CancellationToken.None)", source, StringComparison.Ordinal);
         Assert.DoesNotContain("GetAwaiter().GetResult()", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ApplicationDelegatesCloseToUpdateAwareOrchestratorAndOwnsRuntimeUntilExit()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "App.xaml.cs"));
+
+        Assert.Contains("UpdateAwareShutdownOrchestrator", source, StringComparison.Ordinal);
+        Assert.Contains("updateRuntime.LaunchPreparedUpdateAndRestart", source, StringComparison.Ordinal);
+        Assert.Contains("await updateShutdownOrchestrator", source, StringComparison.Ordinal);
+        Assert.Contains(".ShutdownAsync(CancellationToken.None)", source, StringComparison.Ordinal);
+        Assert.Contains("updateRuntime.Dispose()", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("UnsafeApplyUpdates", source, StringComparison.Ordinal);
+
+        var safeShutdown = source.IndexOf("ShutdownSafelyAsync", StringComparison.Ordinal);
+        var launchPrepared = source.IndexOf("updateRuntime.LaunchPreparedUpdateAndRestart", StringComparison.Ordinal);
+        Assert.True(safeShutdown >= 0 && safeShutdown < launchPrepared,
+            "The complete safe-shutdown delegate must be wired before the updater launch delegate.");
     }
 
     [Fact]
