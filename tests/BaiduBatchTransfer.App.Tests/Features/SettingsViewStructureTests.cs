@@ -33,7 +33,10 @@ public sealed class SettingsViewStructureTests
         Assert.Contains("StaticResource BrandBrush", xaml, StringComparison.Ordinal);
         Assert.Contains("StaticResource MutedBrush", xaml, StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.LiveSetting=\"Polite\"", xaml, StringComparison.Ordinal);
-        Assert.Contains("AutomationProperties.Name=\"更新状态\"", xaml, StringComparison.Ordinal);
+        Assert.Contains(
+            "AutomationProperties.Name=\"{Binding StatusMessage, StringFormat=更新状态：{0}}\"",
+            xaml,
+            StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.Name=\"更新下载进度\"", xaml, StringComparison.Ordinal);
         Assert.Contains("AutomationProperties.HelpText=", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("功能建设中", xaml, StringComparison.Ordinal);
