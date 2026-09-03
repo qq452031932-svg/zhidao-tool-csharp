@@ -10,6 +10,7 @@ using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.ShareAnalytics;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Application.Imports;
@@ -33,6 +34,23 @@ namespace BaiduBatchTransfer.App.Tests;
 public sealed class AppBootstrapTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void BootstrapUsesProductVersionForMigrationAndAdapterVersionForBrowserCapabilities()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        var migratorVersion = ReadPrivateString(
+            host.Services.GetRequiredService<DatabaseMigrator>(),
+            "appVersion");
+        var adapterVersion = ReadPrivateString(
+            host.Services.GetRequiredService<WebViewBaiduNetdiskAdapter>(),
+            "applicationBuildVersion");
+
+        Assert.Equal(ApplicationBuildInfo.Current.ProductVersion, migratorVersion);
+        Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, adapterVersion);
+        Assert.NotEqual(migratorVersion, adapterVersion);
+    }
 
     [Fact]
     public void TransferManagedCompositionResolvesWithoutStartingAHelper()
@@ -477,7 +495,7 @@ public sealed class AppBootstrapTests : IDisposable
         await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
         var store = host.Services.GetRequiredService<IAdapterCapabilityStore>();
         var gate = host.Services.GetRequiredService<IAdapterWriteAuthorizationGate>();
-        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var build = ApplicationBuildInfo.Current.AdapterBuildVersion;
         var request = new AdapterWriteAuthorizationRequest(
             new AdapterCapabilityVersion(
                 "BaiduTransfer",
@@ -517,7 +535,7 @@ public sealed class AppBootstrapTests : IDisposable
         var accountId = Guid.NewGuid();
         const int generation = 2;
         const string baiduUserId = "stable-baidu-user";
-        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var build = ApplicationBuildInfo.Current.AdapterBuildVersion;
         var capability = new AdapterCapabilityVersion(
             "BaiduTransfer",
             BaiduSelectorCatalog.TransferProtocolVersion,
@@ -592,7 +610,7 @@ public sealed class AppBootstrapTests : IDisposable
             services.AddSingleton<IAcceptanceWriteLeasePresenter>(presenter);
         });
         await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
-        var build = typeof(AppBootstrap).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var build = ApplicationBuildInfo.Current.AdapterBuildVersion;
         var request = new AdapterWriteAuthorizationRequest(
             new AdapterCapabilityVersion(
                 "BaiduTransfer",
@@ -1022,6 +1040,15 @@ public sealed class AppBootstrapTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
+    private static string ReadPrivateString(object instance, string fieldName)
+    {
+        var field = instance.GetType().GetField(
+            fieldName,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return Assert.IsType<string>(field.GetValue(instance));
     }
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")

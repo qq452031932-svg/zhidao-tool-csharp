@@ -1,4 +1,3 @@
-using System.Reflection;
 using System.IO;
 using BaiduBatchTransfer.App.Features.Imports;
 using BaiduBatchTransfer.App.Features.Jobs;
@@ -12,6 +11,7 @@ using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Services;
+using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
 using BaiduBatchTransfer.Application.Imports;
 using BaiduBatchTransfer.Application.Jobs;
@@ -85,6 +85,8 @@ public static class AppBootstrap
         IReadOnlyList<string>? startupArguments = null)
     {
         startupArguments ??= Array.Empty<string>();
+        var buildInfo = ApplicationBuildInfo.Current;
+        services.AddSingleton(buildInfo);
         services.AddSingleton(paths);
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
@@ -96,7 +98,7 @@ public static class AppBootstrap
         services.AddSingleton(sp => new DatabaseMigrator(
             sp.GetRequiredService<SqliteConnectionFactory>(),
             sp.GetRequiredService<DatabaseBackupService>(),
-            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"));
+            buildInfo.ProductVersion));
         services.AddSingleton<DatabaseIntegrityService>();
         services.AddSingleton<IStartupDatabaseMaintenance, SqliteStartupDatabaseMaintenance>();
         services.AddSingleton(sp => new SqliteTransferSchedulingStore(
@@ -258,7 +260,7 @@ public static class AppBootstrap
             sp.GetRequiredService<IVisibleWebAutomationBroker>(),
             sp.GetRequiredService<IAccountProfilePathPolicy>(),
             sp.GetRequiredService<TransferAutomationFlow>(),
-            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
+            buildInfo.AdapterBuildVersion,
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
             sp.GetRequiredService<IAcceptanceOperationEvidenceSink>(),
             sp.GetRequiredService<ITransferRecoveryAuthorizationSource>()));
@@ -272,7 +274,7 @@ public static class AppBootstrap
                         "BaiduTransfer",
                         BaiduSelectorCatalog.TransferProtocolVersion,
                         BaiduSelectorCatalog.TransferSelectorVersion,
-                        Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"))
+                        buildInfo.AdapterBuildVersion))
                 : sp.GetRequiredService<LiveBaiduNetdiskAdapter>());
         services.AddSingleton(LiveBaiduNetdiskAdapter.Capability);
         services.AddSingleton<WebViewCookieSessionBridge>();
@@ -316,7 +318,7 @@ public static class AppBootstrap
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
             sp.GetRequiredService<ITransferRecoveryAuthorizationSource>(),
             sp.GetRequiredService<ManagedTransferShareHandoffRegistry>(),
-            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"));
+            buildInfo.AdapterBuildVersion));
         services.AddSingleton<ManagedChromiumTransferAdapter>(sp => new(
             sp.GetRequiredService<ManagedChromiumTransferRuntimeFactory>().BeginOperationAsync,
             sp.GetRequiredService<ManagedTransferQuarantineRegistry>()));
@@ -390,7 +392,7 @@ public static class AppBootstrap
             sp.GetRequiredService<IVisibleWebAutomationBroker>(),
             sp.GetRequiredService<IAccountProfilePathPolicy>(),
             sp.GetRequiredService<ShareAutomationFlow>(),
-            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0",
+            buildInfo.AdapterBuildVersion,
             sp.GetRequiredService<IWebAutomationAttemptStore>(),
             sp.GetRequiredService<IShareAutomationAcceptanceEvidenceStore>(),
             sp.GetRequiredService<IShareOfficialResultDestinationResolver>(),
@@ -405,7 +407,7 @@ public static class AppBootstrap
                         "BaiduShare",
                         BaiduSelectorCatalog.ProtocolVersion,
                         BaiduSelectorCatalog.SelectorVersion,
-                        Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"))
+                        buildInfo.AdapterBuildVersion))
                 : sp.GetRequiredService<LiveBaiduShareAdapter>());
         services.AddSingleton<ShareSubmissionEngine>();
         services.AddSingleton<ManagedShareAutomationSessionFactory>(sp => new(
@@ -444,7 +446,7 @@ public static class AppBootstrap
             sp.GetRequiredService<IRemoteSelectionSessionStore>(),
             sp.GetRequiredService<RemoteResourcePickerFlow>(),
             TimeProvider.System,
-            Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0"));
+            buildInfo.AdapterBuildVersion));
         services.AddSingleton<FileSystemWebViewProfileStore>();
         services.AddSingleton<IWebViewProfileStore>(sp => sp.GetRequiredService<FileSystemWebViewProfileStore>());
         services.AddSingleton<LoginProfileBootstrapper>();

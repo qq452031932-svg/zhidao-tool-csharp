@@ -6,7 +6,24 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">1.0.0</VersionPrefix>
+    <Version>$(VersionPrefix)</Version>
+    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <FileVersion>$(VersionPrefix).0</FileVersion>
+    <_VersionPrefixIsValid>$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionPrefix)', '^[0-9]+\.[0-9]+\.[0-9]+$'))</_VersionPrefixIsValid>
+    <ProductMajor Condition="'$(_VersionPrefixIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(VersionPrefix)', '^([0-9]+)\..*$', '$1'))</ProductMajor>
+    <ProductMajor Condition="'$(ProductMajor)' == ''">0</ProductMajor>
+    <AssemblyVersion>$(ProductMajor).0.0.0</AssemblyVersion>
+    <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
+    <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
+    <OtaAcceptanceBuild Condition="'$(OtaAcceptanceBuild)' == ''">false</OtaAcceptanceBuild>
     <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\artifacts\managed-browser-helper</ManagedBrowserHelperPackageDirectory>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <_UpdateFeedUrlIsValid Condition="'$(UpdateFeedUrl)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(UpdateFeedUrl)', '^https://[^/?#@\s]+(?::[0-9]+)?(?:/[^?#]*)?$'))</_UpdateFeedUrlIsValid>
+    <_AcceptanceFeedIsAbsolute Condition="'$(OtaAcceptanceFeedPath)' != ''">$([System.IO.Path]::IsPathFullyQualified('$(OtaAcceptanceFeedPath)'))</_AcceptanceFeedIsAbsolute>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,6 +37,29 @@
     <ProjectReference Include="..\BaiduBatchTransfer.Application\BaiduBatchTransfer.Application.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.Infrastructure\BaiduBatchTransfer.Infrastructure.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.BaiduAdapter\BaiduBatchTransfer.BaiduAdapter.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>UpdateFeedUrl</_Parameter1>
+      <_Parameter2>$(UpdateFeedUrl)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>UpdateChannel</_Parameter1>
+      <_Parameter2>$(UpdateChannel)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>AdapterBuildVersion</_Parameter1>
+      <_Parameter2>$(AdapterBuildVersion)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>OtaAcceptanceBuild</_Parameter1>
+      <_Parameter2>$(OtaAcceptanceBuild)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>OtaAcceptanceFeedPath</_Parameter1>
+      <_Parameter2>$(OtaAcceptanceFeedPath)</_Parameter2>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <ItemGroup>
@@ -39,6 +79,29 @@
            Text="A Release build requires a deterministic managed-browser-helper package. Run scripts/build_managed_browser_helper.ps1 and set ManagedBrowserHelperPackageDirectory if needed." />
     <Exec Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
           Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\verify_managed_browser_helper_package.ps1&quot; -ManifestSource &quot;$(MSBuildProjectDirectory)\..\..\tools\managed_browser_helper\helper-manifest.json&quot; -PackageDirectory &quot;$(ManagedBrowserHelperPackageDirectory)&quot;" />
+  </Target>
+
+  <Target Name="ValidateOtaBuildConfiguration" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(_VersionPrefixIsValid)' != 'True'"
+           Text="OTA product version must contain exactly three numeric parts." />
+    <Error Condition="'$(OtaAcceptanceBuild)' != 'true' and '$(OtaAcceptanceBuild)' != 'false'"
+           Text="OTA acceptance build flag must be true or false." />
+    <Error Condition="'$(UpdateFeedUrl)' != '' and '$(OtaAcceptanceFeedPath)' != ''"
+           Text="OTA production and acceptance feeds cannot both be configured." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'true' and '$(UpdateFeedUrl)' != ''"
+           Text="OTA acceptance builds cannot use a production feed URL." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'true' and '$(_AcceptanceFeedIsAbsolute)' != 'True'"
+           Text="OTA acceptance builds require an absolute local feed path." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'true' and '$(PackageId)' != 'SuperPan.BaiduBatchTransfer.OtaAcceptance'"
+           Text="OTA acceptance builds require the dedicated acceptance package ID." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'true' and '$(UpdateChannel)' != 'win-x64-ota-acceptance'"
+           Text="OTA acceptance builds require the dedicated acceptance channel." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(OtaAcceptanceFeedPath)' != ''"
+           Text="OTA production builds cannot use a local feed path." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateFeedUrl)' != '' and '$(_UpdateFeedUrlIsValid)' != 'True'"
+           Text="OTA production feed must be an absolute HTTPS URL without credentials, query, or fragment." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateChannel)' != 'win-x64-stable'"
+           Text="OTA production builds require the win-x64-stable channel." />
   </Target>
 
 </Project>

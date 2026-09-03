@@ -1,4 +1,5 @@
 using System.IO;
+using BaiduBatchTransfer.App.Updates;
 
 namespace BaiduBatchTransfer.App;
 
@@ -12,6 +13,34 @@ public static class StartupDataRootSelector
     {
         ArgumentNullException.ThrowIfNull(args);
         ArgumentException.ThrowIfNullOrWhiteSpace(normalRoot);
+        var fullNormalRoot = Path.GetFullPath(normalRoot);
+        if (ApplicationBuildInfo.Current.IsOtaAcceptanceBuild)
+        {
+            var localAppDataRoot = Directory.GetParent(fullNormalRoot)?.FullName
+                ?? throw new InvalidOperationException("无法确定 OTA 验收数据目录。");
+            return Path.Combine(localAppDataRoot, "BaiduBatchTransfer.OtaAcceptance");
+        }
+
+        return ResolveOrdinary(args, fullNormalRoot);
+    }
+
+    public static string ResolveFromLocalAppData(
+        IReadOnlyList<string> args,
+        string localAppDataRoot,
+        ApplicationBuildInfo buildInfo)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+        ArgumentException.ThrowIfNullOrWhiteSpace(localAppDataRoot);
+        ArgumentNullException.ThrowIfNull(buildInfo);
+        var fullLocalAppDataRoot = Path.GetFullPath(localAppDataRoot);
+        if (buildInfo.IsOtaAcceptanceBuild)
+            return Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer.OtaAcceptance");
+
+        return ResolveOrdinary(args, Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer"));
+    }
+
+    private static string ResolveOrdinary(IReadOnlyList<string> args, string normalRoot)
+    {
         var fullNormalRoot = Path.GetFullPath(normalRoot);
 
 #if DEBUG
