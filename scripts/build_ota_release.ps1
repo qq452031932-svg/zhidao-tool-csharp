@@ -16,6 +16,7 @@ $acceptancePackageId = 'SuperPan.BaiduBatchTransfer.OtaAcceptance'
 $acceptanceChannel = 'win-x64-ota-acceptance'
 $productionPackageId = 'SuperPan.BaiduBatchTransfer'
 $productionChannel = 'win-x64-stable'
+$requiredVpkVersion = '1.2.0'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts'))
 
@@ -34,6 +35,19 @@ if ($inheritedVpkVariables.Count -ne 0) {
 if ($acceptancePackageId -ceq $productionPackageId -or
     $acceptanceChannel -ceq $productionChannel) {
     throw 'The OTA acceptance package ID and channel must remain distinct from production.'
+}
+
+$rawPathInputs = [ordered]@{
+    AcceptanceFeedPath = $AcceptanceFeedPath
+    OutputDirectory = $OutputDirectory
+    PreviousReleaseDirectory = $PreviousReleaseDirectory
+    ReleaseNotesPath = $ReleaseNotesPath
+}
+foreach ($entry in $rawPathInputs.GetEnumerator()) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$entry.Value) -and
+        [string]$entry.Value -match '^\\\\') {
+        throw "$($entry.Key) must be an absolute local filesystem path, not a UNC path."
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Version) -or
@@ -73,6 +87,39 @@ function Assert-ExistingPathIsNotReparsePoint([string]$Path, [string]$Descriptio
             throw "$Description must not be a reparse point."
         }
     }
+}
+
+function Assert-LocalDrivePath([string]$Path, [string]$Description) {
+    $root = [IO.Path]::GetPathRoot($Path)
+    if ([string]::IsNullOrWhiteSpace($root) -or $root -match '^\\\\') {
+        throw "$Description must be on a local filesystem drive."
+    }
+    try { $drive = [IO.DriveInfo]::new($root) }
+    catch { throw "$Description must be on an available local filesystem drive." }
+    if ($drive.DriveType -eq [IO.DriveType]::Network) {
+        throw "$Description must not use a mapped network drive."
+    }
+}
+
+function Assert-NoReparsePointAncestors([string]$Path, [string]$Description) {
+    $root = [IO.Path]::GetPathRoot($Path).TrimEnd('\', '/')
+    $current = $Path.TrimEnd('\', '/')
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        if (Test-Path -LiteralPath $current) {
+            $attributes = [IO.File]::GetAttributes($current)
+            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Description has a reparse-point ancestor: $current"
+            }
+        }
+        if ($current.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            $parent.Equals($current, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Description did not reach its local drive root."
+        }
+        $current = $parent.TrimEnd('\', '/')
+    }
+    throw "$Description did not reach its local drive root."
 }
 
 function Get-LowerSha256([string]$Path) {
@@ -121,14 +168,15 @@ function Assert-NonReparseExistingAncestors([string]$Path, [string]$Boundary) {
     }
 }
 
-if ($AcceptanceFeedPath -match '^\\\\') {
-    throw 'AcceptanceFeedPath must be an absolute local filesystem directory, not a UNC path.'
-}
 $acceptanceFeed = Resolve-AbsolutePath $AcceptanceFeedPath 'AcceptanceFeedPath'
+Assert-LocalDrivePath $acceptanceFeed 'AcceptanceFeedPath'
+Assert-NoReparsePointAncestors $acceptanceFeed 'AcceptanceFeedPath'
 if (-not (Test-Path -LiteralPath $acceptanceFeed -PathType Container)) {
     throw 'AcceptanceFeedPath must be an existing local filesystem directory.'
 }
 $outputPath = Resolve-AbsolutePath $OutputDirectory 'OutputDirectory'
+Assert-LocalDrivePath $outputPath 'OutputDirectory'
+Assert-NoReparsePointAncestors $outputPath 'OutputDirectory'
 if (-not (Test-PathWithin $outputPath $artifactRoot)) {
     throw 'OutputDirectory must be inside the repository .artifacts directory.'
 }
@@ -160,6 +208,8 @@ $previousPath = $null
 $validatedPreviousAssets = @()
 if (-not [string]::IsNullOrWhiteSpace($PreviousReleaseDirectory)) {
     $previousPath = Resolve-AbsolutePath $PreviousReleaseDirectory 'PreviousReleaseDirectory'
+    Assert-LocalDrivePath $previousPath 'PreviousReleaseDirectory'
+    Assert-NoReparsePointAncestors $previousPath 'PreviousReleaseDirectory'
     if (-not (Test-Path -LiteralPath $previousPath -PathType Container)) {
         throw 'PreviousReleaseDirectory must be an existing directory.'
     }
@@ -262,6 +312,8 @@ if (-not [string]::IsNullOrWhiteSpace($PreviousReleaseDirectory)) {
 $releaseNotes = $null
 if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
     $releaseNotes = Resolve-AbsolutePath $ReleaseNotesPath 'ReleaseNotesPath'
+    Assert-LocalDrivePath $releaseNotes 'ReleaseNotesPath'
+    Assert-NoReparsePointAncestors $releaseNotes 'ReleaseNotesPath'
     if (-not (Test-Path -LiteralPath $releaseNotes -PathType Leaf)) {
         throw 'ReleaseNotesPath must name an existing file.'
     }
@@ -269,13 +321,19 @@ if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
 }
 
 $appProject = Join-Path $repoRoot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
+$toolManifestPath = Join-Path $repoRoot '.config\dotnet-tools.json'
 $helperVerificationScript = Join-Path $repoRoot 'scripts\verify_managed_browser_helper_package.ps1'
 $helperManifestSource = Join-Path $repoRoot 'tools\managed_browser_helper\helper-manifest.json'
 $helperSourceDirectory = Join-Path $repoRoot 'tools\managed_browser_helper'
-foreach ($requiredInput in @($appProject, $helperVerificationScript, $helperManifestSource)) {
+foreach ($requiredInput in @($appProject, $toolManifestPath, $helperVerificationScript, $helperManifestSource)) {
     if (-not (Test-Path -LiteralPath $requiredInput -PathType Leaf)) {
         throw "Required release input is missing: $requiredInput"
     }
+}
+try { $toolManifest = [IO.File]::ReadAllText($toolManifestPath) | ConvertFrom-Json }
+catch { throw 'The local dotnet tool manifest is not valid JSON.' }
+if ([string]$toolManifest.tools.vpk.version -cne $requiredVpkVersion) {
+    throw "The local vpk tool manifest must pin exactly version $requiredVpkVersion."
 }
 
 [IO.Directory]::CreateDirectory($outputPath) | Out-Null
@@ -295,29 +353,72 @@ function Invoke-RecordedCommand(
     $stdoutPath = Join-Path $logDirectory "$safeName.stdout.log"
     $stderrPath = Join-Path $logDirectory "$safeName.stderr.log"
     $startedUtc = [DateTime]::UtcNow
-    & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
-    $exitCode = $LASTEXITCODE
-    $stdout = if (Test-Path -LiteralPath $stdoutPath) {
-        [IO.File]::ReadAllText($stdoutPath)
-    } else { '' }
-    $stderr = if (Test-Path -LiteralPath $stderrPath) {
-        [IO.File]::ReadAllText($stderrPath)
-    } else { '' }
-    $record = [ordered]@{
-        name = $Name
-        executable = $FilePath
-        arguments = @($Arguments)
-        startedUtc = $startedUtc.ToString('O')
-        exitCode = $exitCode
-        stdout = $stdout
-        stderr = $stderr
+    $exitCode = $null
+    $status = 'Exception'
+    $invocationException = $null
+    $originalLocation = Get-Location
+    $originalCurrentDirectory = [Environment]::CurrentDirectory
+    $originalErrorActionPreference = $ErrorActionPreference
+    try {
+        Set-Location -LiteralPath $repoRoot
+        [Environment]::CurrentDirectory = $repoRoot
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = $null
+        & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
+        $commandSucceeded = $?
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $exitCode) {
+            if (-not $commandSucceeded) {
+                throw "Release command '$Name' could not be started."
+            }
+            $exitCode = 0
+        }
+        $status = if ($exitCode -eq 0) { 'Succeeded' } else { 'Failed' }
     }
-    [IO.File]::AppendAllText(
-        $commandLogPath,
-        (($record | ConvertTo-Json -Compress -Depth 4) + "`n"),
-        $utf8NoBom)
-    if (-not [string]::IsNullOrEmpty($stdout)) { Write-Output $stdout.TrimEnd() }
+    catch {
+        if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+            $exitCode = $LASTEXITCODE
+            $status = 'Failed'
+        }
+        else {
+            $invocationException = $_
+            $status = 'Exception'
+        }
+    }
+    finally {
+        $ErrorActionPreference = $originalErrorActionPreference
+        Set-Location -LiteralPath $originalLocation.Path
+        [Environment]::CurrentDirectory = $originalCurrentDirectory
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            [IO.File]::ReadAllText($stdoutPath)
+        } else { '' }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            [IO.File]::ReadAllText($stderrPath)
+        } else { '' }
+        if ($null -ne $invocationException) {
+            $exceptionText = [string]$invocationException
+            if ([string]::IsNullOrWhiteSpace($stderr)) { $stderr = $exceptionText }
+            else { $stderr = $stderr.TrimEnd() + "`n" + $exceptionText }
+        }
+        $record = [ordered]@{
+            name = $Name
+            executable = $FilePath
+            arguments = @($Arguments)
+            WorkingDirectory = $repoRoot
+            startedUtc = $startedUtc.ToString('O')
+            status = $status
+            exitCode = $exitCode
+            stdout = $stdout
+            stderr = $stderr
+        }
+        [IO.File]::AppendAllText(
+            $commandLogPath,
+            (($record | ConvertTo-Json -Compress -Depth 4) + "`n"),
+            $utf8NoBom)
+    }
+    if (-not [string]::IsNullOrEmpty($stdout)) { Write-Verbose $stdout.TrimEnd() }
     if (-not [string]::IsNullOrEmpty($stderr)) { Write-Warning $stderr.TrimEnd() }
+    if ($null -ne $invocationException) { throw $invocationException }
     if ($exitCode -ne 0) {
         throw "Release command '$Name' failed with exit code $exitCode. See $commandLogPath"
     }
@@ -335,6 +436,13 @@ $effectiveReleaseNotesPath = $releaseNotes
 
 $toolRestoreArguments = @('tool', 'restore')
 [void](Invoke-RecordedCommand 'dotnet-tool-restore' 'dotnet' $toolRestoreArguments)
+
+$vpkVersionArguments = @('tool', 'run', 'vpk', '--', '--version')
+$vpkVersion = Invoke-RecordedCommand 'vpk-version' 'dotnet' $vpkVersionArguments
+$reportedVpkVersion = ($vpkVersion.Stdout + "`n" + $vpkVersion.Stderr).Trim()
+if ($reportedVpkVersion -cnotmatch '^(?:vpk\s+)?1\.2\.0$') {
+    throw "The restored vpk executable must report exactly version $requiredVpkVersion."
+}
 
 $vpkHelpArguments = @('tool', 'run', 'vpk', '--', 'pack', '--help')
 $vpkHelp = Invoke-RecordedCommand 'vpk-pack-help' 'dotnet' $vpkHelpArguments
@@ -446,7 +554,7 @@ $helperGateArguments = @(
     '-PackageDirectory', $publishedHelperDirectory,
     '-HelperSourceDirectory', $helperSourceDirectory
 )
-[void](Invoke-RecordedCommand 'verify-managed-browser-helper' 'powershell.exe' $helperGateArguments)
+[void](Invoke-RecordedCommand 'verify-managed-browser-helper' 'powershell' $helperGateArguments)
 
 if ($null -ne $previousPath) {
     foreach ($previousAsset in $validatedPreviousAssets) {
@@ -586,21 +694,37 @@ $manifestLines = foreach ($assetPath in $manifestAssetPaths) {
     "$hash  $([IO.Path]::GetFileName($assetPath))"
 }
 $manifestPath = Join-Path $outputPath 'upload-manifest.sha256'
-[IO.File]::WriteAllText($manifestPath, (($manifestLines -join "`n") + "`n"), $utf8NoBom)
+try {
+    [IO.File]::WriteAllText($manifestPath, (($manifestLines -join "`n") + "`n"), $utf8NoBom)
+}
+catch {
+    throw "Unable to write upload manifest '$manifestPath': $($_.Exception.Message)"
+}
 
-$readmePath = Join-Path $outputPath '本地验收包说明.txt'
+$readmePath = Join-Path $outputPath 'LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt'
+$readmeLabels = ('{' +
+    '"heading":"\u672c\u673a OTA \u9a8c\u6536\u5305",' +
+    '"version":"\u7248\u672c",' +
+    '"package":"\u5305 ID",' +
+    '"channel":"\u6e20\u9053",' +
+    '"feed":"\u66f4\u65b0\u6e90",' +
+    '"warning":"\u6b64\u76ee\u5f55\u4ec5\u7528\u4e8e\u672a\u7b7e\u540d\u7684\u672c\u673a OTA \u9a8c\u6536\uff0c\u4e0d\u662f\u751f\u4ea7\u53d1\u5e03\u7269\u3002",' +
+    '"noUpload":"\u811a\u672c\u4e0d\u4f1a\u8fde\u63a5\u6216\u4e0a\u4f20\u5230\u4efb\u4f55\u670d\u52a1\u5668\u3002\u4e0a\u4f20\u524d\u5e94\u518d\u6b21\u6838\u5bf9 upload-manifest.sha256\u3002",' +
+    '"log":"\u547d\u4ee4\u6267\u884c\u8bb0\u5f55"' +
+    '}') | ConvertFrom-Json
 $readme = @"
-本机 OTA 验收包
+$($readmeLabels.heading)
 
-版本：$Version
-包 ID：$acceptancePackageId
-渠道：$acceptanceChannel
-更新源：$acceptanceFeed
+$($readmeLabels.version): $Version
+$($readmeLabels.package): $acceptancePackageId
+$($readmeLabels.channel): $acceptanceChannel
+$($readmeLabels.feed): $acceptanceFeed
 
-此目录仅用于未签名的本机 OTA 验收，不是生产发布物。
-脚本不会连接或上传到任何服务器。上传前应再次核对 upload-manifest.sha256。
-命令执行记录：.build\logs\commands.jsonl
+$($readmeLabels.warning)
+$($readmeLabels.noUpload)
+$($readmeLabels.log): .build\logs\commands.jsonl
 "@
-[IO.File]::WriteAllText($readmePath, $readme.Replace("`r`n", "`n"), $utf8NoBom)
+try { [IO.File]::WriteAllText($readmePath, $readme.Replace("`r`n", "`n"), $utf8NoBom) }
+catch { throw "Unable to write release description '$readmePath': $($_.Exception.Message)" }
 
 Write-Output "Local OTA acceptance release created: $outputPath"

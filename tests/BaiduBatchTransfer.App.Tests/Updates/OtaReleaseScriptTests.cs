@@ -105,6 +105,39 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Theory]
+    [InlineData("AcceptanceFeedPath")]
+    [InlineData("OutputDirectory")]
+    [InlineData("PreviousReleaseDirectory")]
+    [InlineData("ReleaseNotesPath")]
+    public async Task RejectsUncForEveryPathInputBeforeAnyFilesystemAccess(string parameterName)
+    {
+        using var fixture = ScriptFixture.Create();
+        var arguments = new List<string>
+        {
+            "-Version", "not-a-version",
+            "-AcceptanceFeedPath", fixture.FeedDirectory,
+            "-OutputDirectory", fixture.OutputDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal",
+        };
+        var index = arguments.IndexOf($"-{parameterName}");
+        if (index >= 0)
+            arguments[index + 1] = @"\\server\share\path";
+        else
+        {
+            arguments.Insert(arguments.Count - 2, $"-{parameterName}");
+            arguments.Insert(arguments.Count - 2, @"\\server\share\path");
+        }
+
+        var result = await fixture.RunAsync(arguments.ToArray());
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(parameterName, result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("local filesystem", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Theory]
     [InlineData("-ProductionFeedUrl", "https://updates.example.test/stable/")]
     [InlineData("-SignParams", "--azureTrustedSigningFile secret.json")]
     [InlineData("-AuthenticityMode", "PinnedPublisher")]
@@ -436,7 +469,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("upload-manifest.sha256", script, StringComparison.Ordinal);
         Assert.Contains("$validatedPreviousAssets", script, StringComparison.Ordinal);
         Assert.Contains("$manifestAssetPaths", script, StringComparison.Ordinal);
-        Assert.Contains("本机 OTA 验收", script, StringComparison.Ordinal);
+        Assert.Contains("LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt", script, StringComparison.Ordinal);
 
         var forbiddenCommands = new[]
         {
@@ -446,6 +479,196 @@ public sealed class OtaReleaseScriptTests
         };
         foreach (var pattern in forbiddenCommands)
             Assert.DoesNotMatch(new Regex(pattern, RegexOptions.CultureInvariant), script);
+    }
+
+    [Fact]
+    public void ScriptPinsToolVersionWorkingDirectoryLocalDrivesAndAllInputAncestors()
+    {
+        var script = ReadScript();
+
+        Assert.Contains("$requiredVpkVersion = '1.2.0'", script, StringComparison.Ordinal);
+        Assert.Contains("dotnet-tools.json", script, StringComparison.Ordinal);
+        Assert.Contains("'--version'", script, StringComparison.Ordinal);
+        Assert.Contains("WorkingDirectory = $repoRoot", script, StringComparison.Ordinal);
+        Assert.Contains("[IO.DriveType]::Network", script, StringComparison.Ordinal);
+        foreach (var marker in new[]
+                 {
+                     "Assert-NoReparsePointAncestors $acceptanceFeed 'AcceptanceFeedPath'",
+                     "Assert-NoReparsePointAncestors $outputPath 'OutputDirectory'",
+                     "Assert-NoReparsePointAncestors $previousPath 'PreviousReleaseDirectory'",
+                     "Assert-NoReparsePointAncestors $releaseNotes 'ReleaseNotesPath'",
+                 })
+            Assert.Contains(marker, script, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FakeToolchainCompletesReleaseFromOutsideRepositoryWithExactPipeline()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(tamperHash: false);
+
+        Assert.True(
+            result.ExitCode == 0,
+            result.Output + Environment.NewLine + "Fake commands:" + Environment.NewLine +
+            (File.Exists(fixture.FakeCommandLog)
+                ? await File.ReadAllTextAsync(fixture.FakeCommandLog)
+                : "<none>"));
+        var commands = await File.ReadAllLinesAsync(fixture.FakeCommandLog);
+        Assert.Equal(
+            new[]
+            {
+                "dotnet|tool restore",
+                "dotnet|tool run vpk -- --version",
+                "dotnet|tool run vpk -- pack --help",
+                "dotnet|restore",
+                "dotnet|publish",
+                "dotnet|run --project",
+                "powershell|-NoProfile -ExecutionPolicy Bypass -File",
+                "dotnet|tool run vpk pack",
+            },
+            commands.Select(ParseCommandPrefix));
+        var repositoryRoot = FindRepositoryRoot();
+        Assert.All(commands, command =>
+            Assert.Equal(repositoryRoot, command.Split('\t')[1], ignoreCase: true));
+        var combinedCommands = string.Join(Environment.NewLine, commands);
+        Assert.Contains("--locked-mode", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--self-contained" + UnitSeparator + "true", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("-p:OtaAcceptanceBuild=true", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--packId" + UnitSeparator + "SuperPan.BaiduBatchTransfer.OtaAcceptance", combinedCommands, StringComparison.Ordinal);
+        Assert.Contains("--channel" + UnitSeparator + "win-x64-ota-acceptance", combinedCommands, StringComparison.Ordinal);
+
+        var manifestPath = Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256");
+        Assert.True(File.Exists(manifestPath));
+        var manifestLines = await File.ReadAllLinesAsync(manifestPath);
+        Assert.Equal(4, manifestLines.Length);
+        foreach (var line in manifestLines)
+        {
+            var pieces = line.Split("  ", 2, StringSplitOptions.None);
+            Assert.Equal(2, pieces.Length);
+            var asset = Path.Combine(fixture.OutputDirectory, pieces[1]);
+            Assert.True(File.Exists(asset), asset);
+            Assert.Equal(LowerSha256(await File.ReadAllBytesAsync(asset)), pieces[0]);
+        }
+        Assert.True(File.Exists(Path.Combine(fixture.OutputDirectory, "LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainTamperedFeedHashFailsBeforeManifest()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(tamperHash: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("SHA-256", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
+    public async Task MissingExecutableIsRecordedAsExceptionBeforeRethrow()
+    {
+        using var fixture = ScriptFixture.Create();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            installPathOnly: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        var commandLog = Path.Combine(fixture.OutputDirectory, ".build", "logs", "commands.jsonl");
+        Assert.True(File.Exists(commandLog), result.Output);
+        var record = JsonDocument.Parse((await File.ReadAllLinesAsync(commandLog)).Single()).RootElement;
+        Assert.Equal("Exception", record.GetProperty("status").GetString());
+        Assert.Equal(JsonValueKind.Null, record.GetProperty("exitCode").ValueKind);
+    }
+
+    [Fact]
+    public async Task FailingExecutableRecordsExitCodeAndFailureStatus()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_FAIL_PREFIX"] = "tool restore",
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        var commandLog = Path.Combine(fixture.OutputDirectory, ".build", "logs", "commands.jsonl");
+        var record = JsonDocument.Parse((await File.ReadAllLinesAsync(commandLog)).Single()).RootElement;
+        Assert.True(
+            record.GetProperty("status").GetString() == "Failed",
+            record.GetRawText() + Environment.NewLine + result.Output);
+        Assert.Equal(23, record.GetProperty("exitCode").GetInt32());
+    }
+
+    [Fact]
+    public async Task RejectsFeedBelowJunctionAncestorWhenJunctionsAreAvailable()
+    {
+        using var fixture = ScriptFixture.Create();
+        var target = Path.Combine(fixture.Root, "junction-target");
+        var link = Path.Combine(fixture.Root, "junction-link");
+        Directory.CreateDirectory(Path.Combine(target, "feed"));
+        if (!TryCreateJunction(link, target)) return;
+        try
+        {
+            var outside = Path.Combine(Path.GetTempPath(), $"bbt-ota-output-{Guid.NewGuid():N}");
+            var result = await fixture.RunAsync(
+                "-Version", "1.2.3",
+                "-AcceptanceFeedPath", Path.Combine(link, "feed"),
+                "-OutputDirectory", outside,
+                "-OtaAcceptanceBuild",
+                "-AllowUnsignedLocal");
+
+            Assert.NotEqual(0, result.ExitCode);
+            Assert.Contains("reparse-point ancestor", result.Output, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            if (Directory.Exists(link)) Directory.Delete(link);
+        }
+    }
+
+    private const char UnitSeparator = (char)31;
+
+    private static string ParseCommandPrefix(string line)
+    {
+        var fields = line.Split('\t');
+        var arguments = fields[2].Split(UnitSeparator);
+        var prefixLength = fields[0] == "powershell"
+            ? Math.Min(4, arguments.Length)
+            : arguments.Length >= 2 && arguments[0] == "tool" && arguments[1] == "restore"
+                ? 2
+            : arguments.Length >= 2 && arguments[0] == "run" && arguments[1] == "--project"
+                ? 2
+            : arguments.Length >= 4 && arguments[0] == "tool" && arguments[1] == "run" && arguments[2] == "vpk"
+                ? Math.Min(arguments[3] == "--" && arguments.Length > 4 && arguments[4] == "pack" ? 6 : arguments[3] == "--" ? 5 : 4, arguments.Length)
+                : 1;
+        return fields[0] + "|" + string.Join(' ', arguments.Take(prefixLength));
+    }
+
+    private static bool TryCreateJunction(string link, string target)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        startInfo.ArgumentList.Add("/c");
+        startInfo.ArgumentList.Add("mklink");
+        startInfo.ArgumentList.Add("/J");
+        startInfo.ArgumentList.Add(link);
+        startInfo.ArgumentList.Add(target);
+        using var process = Process.Start(startInfo)!;
+        process.WaitForExit();
+        return process.ExitCode == 0 && Directory.Exists(link);
     }
 
     private static string ReadScript()
@@ -503,12 +726,18 @@ public sealed class OtaReleaseScriptTests
             FeedDirectory = Path.Combine(root, "feed");
             OutputDirectory = Path.Combine(root, "release");
             PreviousReleaseDirectory = Path.Combine(root, "previous");
+            FakeBinDirectory = Path.Combine(root, "fake-bin");
+            OutsideWorkingDirectory = Path.Combine(root, "outside-working-directory");
+            FakeCommandLog = Path.Combine(root, "fake-commands.log");
         }
 
         public string Root { get; }
         public string FeedDirectory { get; }
         public string OutputDirectory { get; }
         public string PreviousReleaseDirectory { get; }
+        public string FakeBinDirectory { get; }
+        public string OutsideWorkingDirectory { get; }
+        public string FakeCommandLog { get; }
 
         public static ScriptFixture Create()
         {
@@ -518,6 +747,8 @@ public sealed class OtaReleaseScriptTests
                 $"ota-acceptance-script-tests-{Guid.NewGuid():N}");
             var fixture = new ScriptFixture(root);
             Directory.CreateDirectory(fixture.FeedDirectory);
+            Directory.CreateDirectory(fixture.FakeBinDirectory);
+            Directory.CreateDirectory(fixture.OutsideWorkingDirectory);
             return fixture;
         }
 
@@ -537,6 +768,55 @@ public sealed class OtaReleaseScriptTests
             "-OtaAcceptanceBuild",
             "-AllowUnsignedLocal");
 
+        public async Task InstallFakeToolchainAsync()
+        {
+            var systemPowerShell = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe");
+            var implementation = Path.Combine(FakeBinDirectory, "fake-tool.ps1");
+            await File.WriteAllTextAsync(implementation, FakeToolImplementation);
+            foreach (var command in new[] { "dotnet", "powershell" })
+            {
+                var shim = $"@echo off\r\nif defined FAKE_OTA_FAIL_PREFIX exit /b 23\r\n\"{systemPowerShell}\" -NoProfile -ExecutionPolicy Bypass -File \"%~dp0fake-tool.ps1\" {command} %*\r\nexit /b %ERRORLEVEL%\r\n";
+                await File.WriteAllTextAsync(Path.Combine(FakeBinDirectory, command + ".cmd"), shim);
+            }
+        }
+
+        public Task<ScriptResult> RunFakePipelineAsync(
+            bool tamperHash,
+            bool installPathOnly = false,
+            IReadOnlyDictionary<string, string?>? additionalEnvironment = null)
+        {
+            var environment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["PATH"] = FakeBinDirectory,
+                ["FAKE_OTA_COMMAND_LOG"] = FakeCommandLog,
+                ["FAKE_OTA_TAMPER_HASH"] = tamperHash ? "1" : "0",
+            };
+            if (installPathOnly)
+            {
+                foreach (var file in Directory.EnumerateFiles(FakeBinDirectory)) File.Delete(file);
+            }
+            if (additionalEnvironment is not null)
+            {
+                foreach (var pair in additionalEnvironment) environment[pair.Key] = pair.Value;
+            }
+            return RunPowerShellAsync(
+                ScriptPath(),
+                new[]
+                {
+                    "-Version", "1.2.3",
+                    "-AcceptanceFeedPath", FeedDirectory,
+                    "-OutputDirectory", OutputDirectory,
+                    "-OtaAcceptanceBuild",
+                    "-AllowUnsignedLocal",
+                },
+                environment,
+                OutsideWorkingDirectory);
+        }
+
         public void Dispose()
         {
             if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
@@ -546,16 +826,22 @@ public sealed class OtaReleaseScriptTests
     private static async Task<ScriptResult> RunPowerShellAsync(
         string script,
         string[] arguments,
-        IReadOnlyDictionary<string, string?>? environment)
+        IReadOnlyDictionary<string, string?>? environment,
+        string? workingDirectory = null)
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = "powershell.exe",
+            FileName = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe"),
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        if (workingDirectory is not null) startInfo.WorkingDirectory = workingDirectory;
         startInfo.ArgumentList.Add("-NoProfile");
         startInfo.ArgumentList.Add("-ExecutionPolicy");
         startInfo.ArgumentList.Add("Bypass");
@@ -602,4 +888,98 @@ public sealed class OtaReleaseScriptTests
     }
 
     private sealed record ScriptResult(int ExitCode, string Output);
+
+    private const string FakeToolImplementation = """
+$ErrorActionPreference = 'Stop'
+$Tool = [string]$args[0]
+$ToolArgs = @($args | Select-Object -Skip 1)
+$normalizedArguments = New-Object Collections.Generic.List[string]
+for ($argumentIndex = 0; $argumentIndex -lt $ToolArgs.Count; $argumentIndex++) {
+    if ($ToolArgs[$argumentIndex] -ceq '-p' -and $argumentIndex + 1 -lt $ToolArgs.Count) {
+        $normalizedArguments.Add('-p:' + $ToolArgs[$argumentIndex + 1])
+        $argumentIndex++
+    }
+    else { $normalizedArguments.Add([string]$ToolArgs[$argumentIndex]) }
+}
+$ToolArgs = @($normalizedArguments)
+
+function Write-FakeLog {
+    $line = $Tool + "`t" + (Get-Location).Path + "`t" + ($ToolArgs -join [char]31) + "`n"
+    [IO.File]::AppendAllText($env:FAKE_OTA_COMMAND_LOG, $line)
+}
+
+function Get-ArgumentValue([string]$Name) {
+    for ($index = 0; $index -lt $ToolArgs.Count - 1; $index++) {
+        if ($ToolArgs[$index] -ceq $Name) { return $ToolArgs[$index + 1] }
+    }
+    throw "Missing fake argument: $Name"
+}
+
+function Get-LowerSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $hash = $algorithm.ComputeHash($stream) }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+    return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
+}
+
+Write-FakeLog
+$joined = $ToolArgs -join ' '
+if (-not [string]::IsNullOrWhiteSpace($env:FAKE_OTA_FAIL_PREFIX) -and
+    $joined.StartsWith($env:FAKE_OTA_FAIL_PREFIX, [StringComparison]::Ordinal)) {
+    exit 23
+}
+if ($Tool -ceq 'powershell') {
+    Write-Output 'fake helper gate passed'
+    exit 0
+}
+if ($joined -ceq 'tool restore') { Write-Output 'fake tool restore'; exit 0 }
+if ($joined -ceq 'tool run vpk -- --version') { Write-Output '1.2.0'; exit 0 }
+if ($joined -ceq 'tool run vpk -- pack --help') {
+    Write-Output '--packId --packVersion --packDir --mainExe --channel --runtime --outputDir --releaseNotes'
+    exit 0
+}
+if ($ToolArgs[0] -ceq 'restore') { Write-Output 'fake locked restore'; exit 0 }
+if ($ToolArgs[0] -ceq 'publish') {
+    $publishDirectory = Get-ArgumentValue '-o'
+    [IO.Directory]::CreateDirectory($publishDirectory) | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'), [byte[]](1, 2, 3))
+    [IO.Directory]::CreateDirectory((Join-Path $publishDirectory 'managed-browser-helper')) | Out-Null
+    Write-Output 'fake publish'
+    exit 0
+}
+if ($ToolArgs[0] -ceq 'run' -and $ToolArgs[1] -ceq '--project') {
+    Write-Output 'fake metadata verified'
+    exit 0
+}
+if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
+    $outputDirectory = Get-ArgumentValue '--outputDir'
+    $packageId = Get-ArgumentValue '--packId'
+    $version = Get-ArgumentValue '--packVersion'
+    $channel = Get-ArgumentValue '--channel'
+    $packageName = "$packageId-$version-full.nupkg"
+    $packagePath = Join-Path $outputDirectory $packageName
+    [IO.File]::WriteAllBytes($packagePath, [byte[]](10, 20, 30, 40))
+    [IO.File]::WriteAllBytes((Join-Path $outputDirectory "$packageId-Setup.exe"), [byte[]](50, 60))
+    [IO.File]::WriteAllBytes((Join-Path $outputDirectory "$packageId-Portable.zip"), [byte[]](70, 80))
+    $hash = if ($env:FAKE_OTA_TAMPER_HASH -ceq '1') { 'a' * 64 } else { Get-LowerSha256 $packagePath }
+    $feed = [ordered]@{
+        Assets = @([ordered]@{
+                PackageId = $packageId
+                Version = $version
+                Type = 'Full'
+                FileName = $packageName
+                SHA256 = $hash
+                Size = ([IO.FileInfo]::new($packagePath)).Length
+            })
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $outputDirectory "releases.$channel.json"),
+        ($feed | ConvertTo-Json -Depth 4))
+    Write-Output 'fake vpk pack'
+    exit 0
+}
+[Console]::Error.WriteLine("Unexpected fake command: $Tool $joined")
+exit 44
+""";
 }
