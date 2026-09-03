@@ -14,16 +14,54 @@ public sealed class VelopackStartupStructureTests
             "Program.cs"));
 
         const string velopackBootstrap = "VelopackApp.Build().SetAutoApplyOnStartup(false).Run()";
+        const string runtimeCreation = "VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current)";
         const string appConstruction = "new App(updateRuntime)";
-        var bootstrapIndex = program.IndexOf(velopackBootstrap, StringComparison.Ordinal);
-        var appConstructionIndex = program.IndexOf(appConstruction, StringComparison.Ordinal);
+        var orderedStartupMarkers = new[]
+        {
+            "[STAThread]",
+            velopackBootstrap,
+            runtimeCreation,
+            "try",
+            appConstruction,
+            "app.InitializeComponent()",
+            "app.Run()",
+            "finally",
+            "updateRuntime.Dispose()"
+        };
 
-        Assert.True(bootstrapIndex >= 0, "The complete Velopack bootstrap chain is required.");
-        Assert.Contains("VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current)", program, StringComparison.Ordinal);
-        Assert.True(appConstructionIndex >= 0, "The WPF application must own the update runtime.");
-        Assert.True(
-            bootstrapIndex + velopackBootstrap.Length <= appConstructionIndex,
-            "The complete Velopack bootstrap chain must finish before App is created.");
+        AssertMarkersAppearInOrder(program, orderedStartupMarkers);
+        var bootstrapEnd = program.IndexOf(velopackBootstrap, StringComparison.Ordinal) + velopackBootstrap.Length;
+        Assert.True(bootstrapEnd <= program.IndexOf(appConstruction, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void UpdateRuntimeDisposalIsIdempotentAndBaseExitRemainsInFinally()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var app = NormalizeLineEndings(File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "src",
+            "BaiduBatchTransfer.App",
+            "App.xaml.cs")));
+        var velopackRuntime = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "src",
+            "BaiduBatchTransfer.App",
+            "Updates",
+            "VelopackUpdateRuntime.cs"));
+        var unavailableRuntime = File.ReadAllText(Path.Combine(
+            repositoryRoot,
+            "src",
+            "BaiduBatchTransfer.App",
+            "Updates",
+            "UnavailableApplicationUpdateRuntime.cs"));
+
+        Assert.Contains("Interlocked.Exchange(ref disposed, 1) != 0", velopackRuntime, StringComparison.Ordinal);
+        Assert.Contains("Interlocked.Exchange(ref disposed, 1) != 0", unavailableRuntime, StringComparison.Ordinal);
+        Assert.Contains(
+            "finally\n        {\n            try\n            {\n                updateRuntime.Dispose();\n            }\n            finally\n            {\n                base.OnExit(e);\n            }\n        }",
+            app,
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -59,4 +97,18 @@ public sealed class VelopackStartupStructureTests
 
         throw new DirectoryNotFoundException("Repository root was not found.");
     }
+
+    private static void AssertMarkersAppearInOrder(string source, IReadOnlyList<string> markers)
+    {
+        var searchStart = 0;
+        foreach (var marker in markers)
+        {
+            var index = source.IndexOf(marker, searchStart, StringComparison.Ordinal);
+            Assert.True(index >= 0, $"Expected marker after offset {searchStart}: {marker}");
+            searchStart = index + marker.Length;
+        }
+    }
+
+    private static string NormalizeLineEndings(string value) =>
+        value.Replace("\r\n", "\n", StringComparison.Ordinal);
 }

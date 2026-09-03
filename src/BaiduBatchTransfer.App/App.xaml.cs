@@ -126,8 +126,14 @@ public partial class App : System.Windows.Application
         }
         finally
         {
-            updateRuntime.Dispose();
-            base.OnExit(e);
+            try
+            {
+                updateRuntime.Dispose();
+            }
+            finally
+            {
+                base.OnExit(e);
+            }
         }
     }
 }

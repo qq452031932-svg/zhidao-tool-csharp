@@ -2,6 +2,8 @@ namespace BaiduBatchTransfer.App.Updates;
 
 public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 {
+    private int disposed;
+
     private VelopackUpdateRuntime()
     {
     }
@@ -16,5 +18,6 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
     }
 }

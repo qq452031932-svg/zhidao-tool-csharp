@@ -10,8 +10,15 @@ internal static class Program
     {
         VelopackApp.Build().SetAutoApplyOnStartup(false).Run();
         var updateRuntime = VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current);
-        var app = new App(updateRuntime);
-        app.InitializeComponent();
-        app.Run();
+        try
+        {
+            var app = new App(updateRuntime);
+            app.InitializeComponent();
+            app.Run();
+        }
+        finally
+        {
+            updateRuntime.Dispose();
+        }
     }
 }
