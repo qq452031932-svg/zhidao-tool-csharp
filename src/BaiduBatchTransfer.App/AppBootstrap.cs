@@ -10,6 +10,7 @@ using BaiduBatchTransfer.App.Features.Accounts;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Results;
+using BaiduBatchTransfer.App.Features.Settings;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
@@ -61,19 +62,41 @@ public sealed record AppDataPaths
 public static class AppBootstrap
 {
     public static IHost CreateHost(string dataRoot, Action<IServiceCollection>? configure = null)
-        => CreateHost(dataRoot, Array.Empty<string>(), configure);
+        => CreateHost(
+            dataRoot,
+            Array.Empty<string>(),
+            new UnavailableApplicationUpdateRuntime(),
+            configure);
+
+    public static IHost CreateHost(
+        string dataRoot,
+        IApplicationUpdateRuntime updateRuntime,
+        Action<IServiceCollection>? configure = null) =>
+        CreateHost(dataRoot, Array.Empty<string>(), updateRuntime, configure);
 
     public static IHost CreateHost(
         string dataRoot,
         IReadOnlyList<string> startupArguments,
+        Action<IServiceCollection>? configure = null) =>
+        CreateHost(
+            dataRoot,
+            startupArguments,
+            new UnavailableApplicationUpdateRuntime(),
+            configure);
+
+    public static IHost CreateHost(
+        string dataRoot,
+        IReadOnlyList<string> startupArguments,
+        IApplicationUpdateRuntime updateRuntime,
         Action<IServiceCollection>? configure = null)
     {
         ArgumentNullException.ThrowIfNull(startupArguments);
+        ArgumentNullException.ThrowIfNull(updateRuntime);
         var paths = new AppDataPaths(dataRoot);
         return Host.CreateDefaultBuilder()
             .ConfigureServices(services =>
             {
-                ConfigureServices(services, paths, startupArguments);
+                ConfigureServices(services, paths, startupArguments, updateRuntime);
                 configure?.Invoke(services);
             })
             .Build();
@@ -82,11 +105,17 @@ public static class AppBootstrap
     internal static void ConfigureServices(
         IServiceCollection services,
         AppDataPaths paths,
-        IReadOnlyList<string>? startupArguments = null)
+        IReadOnlyList<string>? startupArguments,
+        IApplicationUpdateRuntime updateRuntime)
     {
         startupArguments ??= Array.Empty<string>();
+        ArgumentNullException.ThrowIfNull(updateRuntime);
         var buildInfo = ApplicationBuildInfo.Current;
         services.AddSingleton(buildInfo);
+        services.AddSingleton<IApplicationUpdateRuntime>(updateRuntime);
+        services.AddSingleton<ApplicationUpdateService>();
+        services.AddSingleton<IApplicationUpdateService>(sp =>
+            sp.GetRequiredService<ApplicationUpdateService>());
         services.AddSingleton(paths);
         services.AddSingleton(_ => new SqliteConnectionFactory(paths.DatabasePath));
         services.AddSingleton<IUnitOfWorkFactory, SqliteUnitOfWorkFactory>();
@@ -849,6 +878,8 @@ public sealed class AppShellFactory(
     IShareAnalyticsWorkbookExportService shareAnalyticsExportService,
     ManagedTransferAcceptanceRunner acceptanceRunner,
     RemoteWriteExecutionMode remoteWriteMode,
+    IApplicationUpdateService updateService,
+    ApplicationBuildInfo buildInfo,
     AppRuntimeState runtimeState) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
@@ -983,8 +1014,21 @@ public sealed class AppShellFactory(
             new DeferredWorkspaceViewModel("文件排除", "功能建设中"));
         var statisticsWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("数据统计", "功能建设中"));
-        var settingsWorkspace = new DeferredWorkspaceView(
-            new DeferredWorkspaceViewModel("设置中心", "功能建设中"));
+        MainWindow? mainWindow = null;
+        var uiDispatcher = System.Windows.Application.Current?.Dispatcher ??
+            System.Windows.Threading.Dispatcher.CurrentDispatcher;
+        var uiContext = new System.Windows.Threading.DispatcherSynchronizationContext(
+            uiDispatcher);
+        var closeRequester = new WpfApplicationCloseRequester(
+            uiDispatcher,
+            () => mainWindow?.Close());
+        var settingsViewModel = new SettingsViewModel(
+            updateService,
+            dialogService,
+            closeRequester,
+            uiContext,
+            buildInfo);
+        var settingsWorkspace = new SettingsView(settingsViewModel);
         var shareViewModel = new ShareWorkspaceViewModel(
             accounts.Select(account => new ShareAccountOption(account.AccountId, account.DisplayName)).ToArray(),
             remoteResourcePicker,
@@ -1025,8 +1069,9 @@ public sealed class AppShellFactory(
             saveShareAnalyticsAccount: shareAnalyticsPreferenceStore.SaveLastViewedAccountAsync,
             shareAnalyticsPreferenceLoadFailed: shareAnalyticsPreferenceLoadFailed,
             enterShareData: shareAnalyticsViewModel.EnterAsync,
-            leaveShareData: shareAnalyticsViewModel.Leave);
-        var mainWindow = new MainWindow(mainViewModel);
+            leaveShareData: shareAnalyticsViewModel.Leave,
+            isOtaAcceptanceBuild: buildInfo.IsOtaAcceptanceBuild);
+        mainWindow = new MainWindow(mainViewModel);
 
         static async Task ObserveAsync(Task task)
         {
@@ -1035,6 +1080,16 @@ public sealed class AppShellFactory(
         }
 
         void Observe(Task task) => _ = ObserveAsync(task);
+
+        var startupUpdateCheck = new StartupUpdateCheckCoordinator(
+            updateService,
+            version => DispatchOnUiAsync(() =>
+            {
+                if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0)
+                    return;
+                mainViewModel.ReportUpdateAvailable(version);
+            }),
+            shellLifetime.Token);
 
         var decisionPoll = new System.Windows.Threading.DispatcherTimer
         {
@@ -1058,6 +1113,7 @@ public sealed class AppShellFactory(
                 if (shellLifetime.IsCancellationRequested || Volatile.Read(ref shellClosed) != 0) return;
                 if (resultCapabilities.CanUseShareActions) decisionPoll.Start();
             }).ConfigureAwait(true);
+            startupUpdateCheck.Start();
         }
 
         void OnLoaded(object? _, System.Windows.RoutedEventArgs __) => Observe(HandleLoadedAsync());
@@ -1070,6 +1126,7 @@ public sealed class AppShellFactory(
             decisionPoll.Tick -= OnDecisionPollTick;
             mainWindow.Loaded -= OnLoaded;
             mainWindow.Closed -= OnClosed;
+            settingsViewModel.Dispose();
             transferViewModel.Dispose();
             shareAnalyticsViewModel.Dispose();
             shareViewModel.Dispose();
@@ -1081,5 +1138,76 @@ public sealed class AppShellFactory(
         mainWindow.Loaded += OnLoaded;
         mainWindow.Closed += OnClosed;
         return mainWindow;
+    }
+}
+
+internal sealed class StartupUpdateCheckCoordinator
+{
+    private readonly IApplicationUpdateService updateService;
+    private readonly Func<string, Task> reportAvailableAsync;
+    private readonly CancellationToken cancellationToken;
+    private readonly TaskCompletionSource completion = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    private int started;
+
+    public StartupUpdateCheckCoordinator(
+        IApplicationUpdateService updateService,
+        Func<string, Task> reportAvailableAsync,
+        CancellationToken cancellationToken)
+    {
+        this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
+        this.reportAvailableAsync = reportAvailableAsync ??
+            throw new ArgumentNullException(nameof(reportAvailableAsync));
+        this.cancellationToken = cancellationToken;
+    }
+
+    public Task Completion => completion.Task;
+
+    public void Start()
+    {
+        if (Interlocked.CompareExchange(ref started, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(CheckAsync);
+    }
+
+    private async Task CheckAsync()
+    {
+        try
+        {
+            var snapshot = await updateService
+                .CheckAsync(manual: false, cancellationToken)
+                .ConfigureAwait(false);
+            if (snapshot.Status == ApplicationUpdateStatus.Available &&
+                !string.IsNullOrWhiteSpace(snapshot.LatestVersion))
+            {
+                await reportAvailableAsync(snapshot.LatestVersion).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+        }
+        finally
+        {
+            completion.TrySetResult();
+        }
+    }
+}
+
+internal sealed class WpfApplicationCloseRequester(
+    System.Windows.Threading.Dispatcher dispatcher,
+    Action requestClose) : IApplicationCloseRequester
+{
+    public void RequestClose()
+    {
+        if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            return;
+        if (dispatcher.CheckAccess())
+            requestClose();
+        else
+            dispatcher.BeginInvoke(requestClose);
     }
 }

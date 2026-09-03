@@ -42,7 +42,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             dialogService,
             closeRequester,
             SynchronizationContext.Current ?? throw new InvalidOperationException(
-                "SettingsViewModel requires a UI SynchronizationContext."))
+                "SettingsViewModel requires a UI SynchronizationContext."),
+            ApplicationBuildInfo.Current)
     {
     }
 
@@ -50,13 +51,17 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         IApplicationUpdateService updateService,
         IDialogService dialogService,
         IApplicationCloseRequester closeRequester,
-        SynchronizationContext synchronizationContext)
+        SynchronizationContext synchronizationContext,
+        ApplicationBuildInfo? buildInfo = null)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
         this.closeRequester = closeRequester ?? throw new ArgumentNullException(nameof(closeRequester));
         this.synchronizationContext = synchronizationContext ??
             throw new ArgumentNullException(nameof(synchronizationContext));
+        BuildLabel = (buildInfo ?? ApplicationBuildInfo.Current).IsOtaAcceptanceBuild
+            ? "OTA 本地验收版"
+            : string.Empty;
 
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, CanCheckForUpdates);
         UpdateAndRestartCommand = new AsyncRelayCommand(UpdateAndRestartAsync, CanUpdateAndRestart);
@@ -69,6 +74,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand CheckForUpdatesCommand { get; }
 
     public IAsyncRelayCommand UpdateAndRestartCommand { get; }
+
+    public string BuildLabel { get; }
 
     public string CurrentVersion
     {

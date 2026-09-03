@@ -26,6 +26,7 @@ public sealed class SettingsViewStructureTests
         Assert.Contains("VerticalScrollBarVisibility=\"Auto\"", xaml, StringComparison.Ordinal);
         Assert.Contains("CheckForUpdatesCommand", xaml, StringComparison.Ordinal);
         Assert.Contains("UpdateAndRestartCommand", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding BuildLabel}\"", xaml, StringComparison.Ordinal);
         Assert.Contains("检查更新", xaml, StringComparison.Ordinal);
         Assert.Contains("立即更新并重启", xaml, StringComparison.Ordinal);
         Assert.Contains("StaticResource BorderedPanelStyle", xaml, StringComparison.Ordinal);

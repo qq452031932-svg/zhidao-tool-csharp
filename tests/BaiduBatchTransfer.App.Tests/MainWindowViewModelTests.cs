@@ -48,6 +48,33 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void AcceptanceBuildAddsAnExplicitProductTitleMarker()
+    {
+        var ordinary = CreateViewModel(new FakeLoginLauncher());
+        var acceptanceWorkspaces = Enumerable.Range(0, 7).Select(_ => new object()).ToArray();
+        var acceptance = new MainWindowViewModel(
+            acceptanceWorkspaces[0], acceptanceWorkspaces[1], acceptanceWorkspaces[2],
+            acceptanceWorkspaces[3], acceptanceWorkspaces[4], acceptanceWorkspaces[5],
+            acceptanceWorkspaces[6],
+            new FakeLoginLauncher(),
+            isOtaAcceptanceBuild: true);
+
+        Assert.Equal("百度批量转存", ordinary.ApplicationTitle);
+        Assert.Equal("百度批量转存 · OTA 本地验收版", acceptance.ApplicationTitle);
+    }
+
+    [Fact]
+    public void AvailableUpdateChangesShellStatusOnlyOnce()
+    {
+        var viewModel = CreateViewModel(new FakeLoginLauncher());
+
+        viewModel.ReportUpdateAvailable("2.0.0");
+        viewModel.ReportUpdateAvailable("3.0.0");
+
+        Assert.Equal("发现新版本 2.0.0，可到设置中心更新。", viewModel.StatusMessage);
+    }
+
+    [Fact]
     public void ShellDoesNotExposeLegacyNavigationCommands()
     {
         var navigationProperties = typeof(MainWindowViewModel)

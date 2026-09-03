@@ -21,6 +21,10 @@
                 <TextBlock Text="检查并安装安全发布的新版本。"
                            Margin="0,5,0,0"
                            Foreground="{StaticResource MutedBrush}" />
+                <TextBlock Text="{Binding BuildLabel}"
+                           Margin="0,5,0,0"
+                           FontWeight="SemiBold"
+                           Foreground="{StaticResource BrandBrush}" />
             </StackPanel>
 
             <Grid Grid.Row="1" Margin="0,22,0,0">

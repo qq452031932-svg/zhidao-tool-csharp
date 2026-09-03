@@ -53,6 +53,26 @@ public sealed class SettingsViewModelTests
         }
     }
 
+    [Fact]
+    public void BuildLabelIsVisibleOnlyForOtaAcceptanceBuilds()
+    {
+        var service = new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle));
+        var ordinaryBuild = ApplicationBuildInfo.CreateForTests("1.0.0", "adapter-test", null);
+        var acceptanceBuild = ApplicationBuildInfo.CreateForTests(
+            "1.0.0",
+            "adapter-test",
+            null,
+            channel: "win-x64-ota-acceptance",
+            acceptanceFeedPath: Path.GetFullPath("ota-feed"),
+            isOtaAcceptanceBuild: true);
+
+        using var ordinary = Create(service, buildInfo: ordinaryBuild);
+        using var acceptance = Create(service, buildInfo: acceptanceBuild);
+
+        Assert.Equal(string.Empty, ordinary.BuildLabel);
+        Assert.Equal("OTA 本地验收版", acceptance.BuildLabel);
+    }
+
     [Theory]
     [InlineData(ApplicationUpdateStatus.NotConfigured)]
     [InlineData(ApplicationUpdateStatus.Unsupported)]
@@ -463,12 +483,14 @@ public sealed class SettingsViewModelTests
         FakeUpdateService service,
         IDialogService? dialog = null,
         IApplicationCloseRequester? closeRequester = null,
-        SynchronizationContext? synchronizationContext = null) =>
+        SynchronizationContext? synchronizationContext = null,
+        ApplicationBuildInfo? buildInfo = null) =>
         new(
             service,
             dialog ?? new FakeDialog(true),
             closeRequester ?? new FakeCloseRequester(),
-            synchronizationContext ?? new ImmediateSynchronizationContext());
+            synchronizationContext ?? new ImmediateSynchronizationContext(),
+            buildInfo ?? ApplicationBuildInfo.Current);
 
     private static ApplicationUpdateSnapshot Snapshot(
         ApplicationUpdateStatus status,

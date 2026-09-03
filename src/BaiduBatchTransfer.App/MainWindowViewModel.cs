@@ -17,6 +17,8 @@ public sealed class MainWindowViewModel : ObservableObject
     private string statusMessage = "就绪";
     private string accountStatusMessage;
     private bool isAccountOperationBusy;
+    private readonly bool isOtaAcceptanceBuild;
+    private int updateAvailableReported;
 
     public MainWindowViewModel(
         object transferWorkspace,
@@ -24,13 +26,15 @@ public sealed class MainWindowViewModel : ObservableObject
         IAccountLoginLauncher loginLauncher,
         IAccountManagementLauncher? accountManagementLauncher = null,
         Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
-        int initialActiveAccountCount = 0)
+        int initialActiveAccountCount = 0,
+        bool isOtaAcceptanceBuild = false)
     {
         this.transferWorkspace = transferWorkspace ?? throw new ArgumentNullException(nameof(transferWorkspace));
         this.shareWorkspace = shareWorkspace ?? throw new ArgumentNullException(nameof(shareWorkspace));
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
         this.accountManagementLauncher = accountManagementLauncher;
         this.refreshAccounts = refreshAccounts;
+        this.isOtaAcceptanceBuild = isOtaAcceptanceBuild;
         accountStatusMessage = FormatAccountStatus(initialActiveAccountCount);
         currentContent = transferWorkspace;
         ShowTransferCommand = new RelayCommand(ShowTransfer);
@@ -46,7 +50,9 @@ public sealed class MainWindowViewModel : ObservableObject
             () => refreshAccounts is not null && !IsAccountOperationBusy);
     }
 
-    public string ApplicationTitle => "百度批量转存";
+    public string ApplicationTitle => isOtaAcceptanceBuild
+        ? "百度批量转存 · OTA 本地验收版"
+        : "百度批量转存";
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
     public string CurrentWorkspaceTitle { get => currentWorkspaceTitle; private set => SetProperty(ref currentWorkspaceTitle, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
@@ -185,6 +191,15 @@ public sealed class MainWindowViewModel : ObservableObject
 
     internal void ReportHandoffFailure() =>
         StatusMessage = "结果工作区操作失败，请稍后重试。";
+
+    internal void ReportUpdateAvailable(string version)
+    {
+        if (string.IsNullOrWhiteSpace(version) ||
+            Interlocked.CompareExchange(ref updateAvailableReported, 1, 0) != 0)
+            return;
+
+        StatusMessage = $"发现新版本 {version}，可到设置中心更新。";
+    }
 
     private async Task RefreshAccountsAsync(CancellationToken cancellationToken)
     {

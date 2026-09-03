@@ -36,6 +36,116 @@ public sealed class AppBootstrapTests : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void LegacyCreateHostUsesUnavailableUpdateRuntime()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        Assert.IsType<UnavailableApplicationUpdateRuntime>(
+            host.Services.GetRequiredService<IApplicationUpdateRuntime>());
+        Assert.IsType<ApplicationUpdateService>(
+            host.Services.GetRequiredService<IApplicationUpdateService>());
+    }
+
+    [Fact]
+    public void SuppliedUpdateRuntimeIsSharedButNeverOwnedByTheHost()
+    {
+        var runtime = new RecordingUpdateRuntime(UpdateSnapshot(ApplicationUpdateStatus.Idle));
+        var host = AppBootstrap.CreateHost(root, runtime);
+
+        Assert.Same(runtime, host.Services.GetRequiredService<IApplicationUpdateRuntime>());
+        Assert.Same(
+            host.Services.GetRequiredService<ApplicationUpdateService>(),
+            host.Services.GetRequiredService<IApplicationUpdateService>());
+        Assert.Equal(1, runtime.SubscriptionCount);
+
+        host.Dispose();
+
+        Assert.Equal(0, runtime.SubscriptionCount);
+        Assert.Equal(0, runtime.DisposeCalls);
+    }
+
+    [Fact]
+    public async Task StartupUpdateCheckReturnsImmediatelyRunsOnlyOnceAndReportsAvailable()
+    {
+        var result = new TaskCompletionSource<ApplicationUpdateSnapshot>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new RecordingUpdateService
+        {
+            CheckHandler = _ => result.Task
+        };
+        var reported = new List<string>();
+        var coordinator = new StartupUpdateCheckCoordinator(
+            service,
+            version =>
+            {
+                reported.Add(version);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        coordinator.Start();
+        coordinator.Start();
+
+        await service.CheckStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, service.CheckCalls);
+        Assert.False(coordinator.Completion.IsCompleted);
+        Assert.False(service.LastCheckWasManual);
+
+        result.SetResult(UpdateSnapshot(ApplicationUpdateStatus.Available, "2.0.0"));
+        await coordinator.Completion;
+
+        Assert.Equal(["2.0.0"], reported);
+    }
+
+    [Fact]
+    public async Task StartupUpdateCheckObservesFailuresWithoutEscaping()
+    {
+        var service = new RecordingUpdateService
+        {
+            CheckHandler = _ => Task.FromException<ApplicationUpdateSnapshot>(
+                new InvalidOperationException("sensitive failure"))
+        };
+        var coordinator = new StartupUpdateCheckCoordinator(
+            service,
+            _ => throw new InvalidOperationException("must not report"),
+            CancellationToken.None);
+
+        coordinator.Start();
+
+        await coordinator.Completion;
+        Assert.Equal(1, service.CheckCalls);
+    }
+
+    [Theory]
+    [InlineData(ApplicationUpdateStatus.UpToDate)]
+    [InlineData(ApplicationUpdateStatus.NetworkUnavailable)]
+    [InlineData(ApplicationUpdateStatus.NotConfigured)]
+    [InlineData(ApplicationUpdateStatus.Unsupported)]
+    public async Task StartupUpdateCheckSilentlyIgnoresNonAvailableOutcomes(
+        ApplicationUpdateStatus status)
+    {
+        var service = new RecordingUpdateService
+        {
+            CheckHandler = _ => Task.FromResult(UpdateSnapshot(status))
+        };
+        var reports = 0;
+        var coordinator = new StartupUpdateCheckCoordinator(
+            service,
+            _ =>
+            {
+                reports++;
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        coordinator.Start();
+        await coordinator.Completion;
+
+        Assert.Equal(0, reports);
+    }
+
+    [Fact]
     public void BootstrapUsesProductVersionForMigrationAndAdapterVersionForBrowserCapabilities()
     {
         using var host = AppBootstrap.CreateHost(root);
@@ -820,7 +930,10 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Contains("var adInsertionWorkspace = new DeferredWorkspaceView(", bootstrap);
         Assert.Contains("var fileExclusionWorkspace = new DeferredWorkspaceView(", bootstrap);
         Assert.Contains("var statisticsWorkspace = new DeferredWorkspaceView(", bootstrap);
-        Assert.Contains("var settingsWorkspace = new DeferredWorkspaceView(", bootstrap);
+        Assert.Contains("var settingsViewModel = new SettingsViewModel(", bootstrap);
+        Assert.Contains("var settingsWorkspace = new SettingsView(settingsViewModel);", bootstrap);
+        Assert.DoesNotContain("new DeferredWorkspaceViewModel(\"设置中心\"", bootstrap);
+        Assert.Contains("new System.Windows.Threading.DispatcherSynchronizationContext(", bootstrap);
         Assert.DoesNotContain("new DeferredWorkspaceViewModel(\"分享数据\"", bootstrap);
         Assert.Contains("mainViewModel = new MainWindowViewModel(", bootstrap);
         Assert.Contains(
@@ -858,6 +971,32 @@ public sealed class AppBootstrapTests : IDisposable
         Assert.Contains("handoff.Dispose();", bootstrap);
         Assert.Contains("decisionPoll.Tick -= OnDecisionPollTick;", bootstrap);
         Assert.Contains("transferViewModel.Dispose();", bootstrap);
+        Assert.Contains("settingsViewModel.Dispose();", bootstrap);
+    }
+
+    [Fact]
+    public void LoadedInitializationStartsTheSilentCheckLastAndCloseRequesterOnlyClosesTheWindow()
+    {
+        var bootstrap = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "AppBootstrap.cs"));
+
+        var loadedStart = bootstrap.IndexOf("async Task HandleLoadedAsync()", StringComparison.Ordinal);
+        var loadedEnd = bootstrap.IndexOf("void OnLoaded", loadedStart, StringComparison.Ordinal);
+        var loaded = bootstrap[loadedStart..loadedEnd];
+
+        Assert.True(loaded.IndexOf("runPanelViewModel.InitializeAsync", StringComparison.Ordinal) <
+                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
+        Assert.True(loaded.IndexOf("shareViewModel.InitializeAsync", StringComparison.Ordinal) <
+                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
+        Assert.True(loaded.IndexOf("ActivateInitialWorkspaceAsync", StringComparison.Ordinal) <
+                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
+        Assert.True(loaded.IndexOf("handoff.RestorePendingAsync", StringComparison.Ordinal) <
+                    loaded.IndexOf("startupUpdateCheck.Start();", StringComparison.Ordinal));
+        Assert.Contains("mainWindow?.Close()", bootstrap, StringComparison.Ordinal);
+        Assert.DoesNotContain("Application.Current.Shutdown", bootstrap, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1341,5 +1480,76 @@ public sealed class AppBootstrapTests : IDisposable
         public Task<BaiduAdapterResult<ShareCreationReceipt>> ConfirmExactShareForOperationAsync(ShareOperationAutomationContext context, AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(AccountSession session, PermanentShareRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(AccountSession session, string? cursor, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private static ApplicationUpdateSnapshot UpdateSnapshot(
+        ApplicationUpdateStatus status,
+        string? latestVersion = null) =>
+        new(status, "1.0.0", latestVersion, null, 0, status.ToString());
+
+    private sealed class RecordingUpdateRuntime(ApplicationUpdateSnapshot snapshot)
+        : IApplicationUpdateRuntime
+    {
+        private EventHandler<ApplicationUpdateSnapshot>? snapshotChanged;
+
+        public ApplicationUpdateSnapshot Snapshot { get; } = snapshot;
+        public int DisposeCalls { get; private set; }
+        public int SubscriptionCount { get; private set; }
+
+        public event EventHandler<ApplicationUpdateSnapshot>? SnapshotChanged
+        {
+            add
+            {
+                snapshotChanged += value;
+                SubscriptionCount++;
+            }
+            remove
+            {
+                snapshotChanged -= value;
+                SubscriptionCount--;
+            }
+        }
+
+        public Task<ApplicationUpdateSnapshot> CheckAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Snapshot);
+
+        public Task<ApplicationUpdateSnapshot> DownloadAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Snapshot);
+
+        public bool TryPrepareRestart() => false;
+        public bool LaunchPreparedUpdateAndRestart() => false;
+        public void Dispose() => DisposeCalls++;
+    }
+
+    private sealed class RecordingUpdateService : IApplicationUpdateService
+    {
+        public ApplicationUpdateSnapshot Snapshot { get; } =
+            UpdateSnapshot(ApplicationUpdateStatus.Idle);
+        public Func<CancellationToken, Task<ApplicationUpdateSnapshot>>? CheckHandler { get; init; }
+        public TaskCompletionSource CheckStarted { get; } = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        public int CheckCalls { get; private set; }
+        public bool LastCheckWasManual { get; private set; }
+
+        public event EventHandler<ApplicationUpdateSnapshot>? SnapshotChanged
+        {
+            add { }
+            remove { }
+        }
+
+        public Task<ApplicationUpdateSnapshot> CheckAsync(
+            bool manual,
+            CancellationToken cancellationToken)
+        {
+            CheckCalls++;
+            LastCheckWasManual = manual;
+            CheckStarted.TrySetResult();
+            return CheckHandler?.Invoke(cancellationToken) ?? Task.FromResult(Snapshot);
+        }
+
+        public Task<ApplicationUpdateSnapshot> DownloadAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public bool TryPrepareRestart() => false;
     }
 }
