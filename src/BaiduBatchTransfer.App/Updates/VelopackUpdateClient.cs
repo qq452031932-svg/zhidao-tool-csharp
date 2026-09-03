@@ -23,51 +23,114 @@ internal interface IApplicationUpdateClient : IDisposable
     void WaitExitThenApplyUpdates(VelopackClientAsset update);
 }
 
-internal sealed record VelopackClientAsset(
+internal enum VelopackUpdateSourceKind
+{
+    Https,
+    LocalDirectory
+}
+
+internal sealed record VelopackUpdateSourceConfiguration(
+    VelopackUpdateSourceKind Kind,
+    string Location,
+    string Channel);
+
+internal sealed record VelopackAssetFingerprint(
+    string PackageId,
     string Version,
+    string AssetType,
+    string FileName,
+    long Size,
+    string Sha256);
+
+internal sealed record VelopackClientAsset(
+    VelopackAssetFingerprint Fingerprint,
     string? ReleaseNotes,
-    object NativeToken);
+    object NativeToken)
+{
+    public string Version => Fingerprint.Version;
+}
+
+internal interface IVelopackUpdateManagerAdapter
+{
+    bool IsInstalled { get; }
+
+    string? CurrentVersion { get; }
+
+    VelopackClientAsset? UpdatePendingRestart { get; }
+
+    Task<VelopackClientAsset?> CheckForUpdatesAsync();
+
+    Task DownloadUpdatesAsync(
+        VelopackClientAsset update,
+        Action<int> progress,
+        CancellationToken cancellationToken);
+
+    void WaitExitThenApplyUpdates(
+        VelopackClientAsset update,
+        bool silent,
+        bool restart,
+        string[] restartArguments);
+}
 
 internal sealed class VelopackUpdateClient : IApplicationUpdateClient
 {
-    private readonly UpdateManager manager;
+    private readonly IVelopackUpdateManagerAdapter manager;
 
-    private VelopackUpdateClient(UpdateManager manager)
+    internal VelopackUpdateClient(IVelopackUpdateManagerAdapter manager)
     {
-        this.manager = manager;
+        this.manager = manager ?? throw new ArgumentNullException(nameof(manager));
     }
 
     public bool IsInstalled => manager.IsInstalled;
 
-    public string? CurrentVersion => manager.CurrentVersion?.ToString();
+    public string? CurrentVersion => manager.CurrentVersion;
 
-    public VelopackClientAsset? UpdatePendingRestart =>
-        manager.UpdatePendingRestart is { } pending ? FromAsset(pending) : null;
+    public VelopackClientAsset? UpdatePendingRestart => manager.UpdatePendingRestart;
 
-    public static IApplicationUpdateClient Create(ApplicationBuildInfo buildInfo)
+    public static IApplicationUpdateClient Create(ApplicationBuildInfo buildInfo) =>
+        Create(buildInfo, CreateManager);
+
+    internal static IApplicationUpdateClient Create(
+        ApplicationBuildInfo buildInfo,
+        Func<VelopackUpdateSourceConfiguration, IVelopackUpdateManagerAdapter> managerFactory)
     {
         ArgumentNullException.ThrowIfNull(buildInfo);
+        ArgumentNullException.ThrowIfNull(managerFactory);
 
-        IUpdateSource source = buildInfo.HttpsFeedUrl is { } httpsFeed
-            ? new SimpleWebSource(new Uri(httpsFeed, UriKind.Absolute))
-            : new SimpleFileSource(new DirectoryInfo(buildInfo.AcceptanceFeedPath!));
-        var options = new UpdateOptions { ExplicitChannel = buildInfo.Channel };
-        return new VelopackUpdateClient(new UpdateManager(source, options));
+        var configuration = buildInfo.HttpsFeedUrl is { } httpsFeed
+            ? new VelopackUpdateSourceConfiguration(
+                VelopackUpdateSourceKind.Https,
+                httpsFeed,
+                buildInfo.Channel)
+            : new VelopackUpdateSourceConfiguration(
+                VelopackUpdateSourceKind.LocalDirectory,
+                buildInfo.AcceptanceFeedPath!,
+                buildInfo.Channel);
+        return new VelopackUpdateClient(managerFactory(configuration));
     }
 
     public async Task<VelopackClientAsset?> CheckForUpdatesAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var update = await manager.CheckForUpdatesAsync()
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(false);
-            return update is null
-                ? null
-                : new VelopackClientAsset(
-                    update.TargetFullRelease.Version.ToString(),
-                    update.TargetFullRelease.NotesMarkdown,
-                    update);
+            var managerCheck = manager.CheckForUpdatesAsync();
+            try
+            {
+                return await managerCheck.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await managerCheck.ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Velopack 1.2 has no native check cancellation; observe true completion.
+                }
+
+                throw;
+            }
         }
         catch (AcquireLockFailedException exception)
         {
@@ -91,12 +154,9 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
         ArgumentNullException.ThrowIfNull(update);
         ArgumentNullException.ThrowIfNull(progress);
 
-        if (update.NativeToken is not UpdateInfo updateInfo)
-            throw new ArgumentException("The update token is invalid.", nameof(update));
-
         try
         {
-            await manager.DownloadUpdatesAsync(updateInfo, progress, cancellationToken)
+            await manager.DownloadUpdatesAsync(update, progress, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (AcquireLockFailedException exception)
@@ -116,20 +176,87 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
     public void WaitExitThenApplyUpdates(VelopackClientAsset update)
     {
         ArgumentNullException.ThrowIfNull(update);
-        if (update.NativeToken is not VelopackAsset asset)
-            throw new ArgumentException("The pending update token is invalid.", nameof(update));
-
         manager.WaitExitThenApplyUpdates(
-            asset,
+            update,
             silent: false,
             restart: true,
-            restartArgs: Array.Empty<string>());
+            restartArguments: Array.Empty<string>());
     }
 
     public void Dispose()
     {
     }
 
-    private static VelopackClientAsset FromAsset(VelopackAsset asset) =>
-        new(asset.Version.ToString(), asset.NotesMarkdown, asset);
+    private static IVelopackUpdateManagerAdapter CreateManager(
+        VelopackUpdateSourceConfiguration configuration)
+    {
+        IUpdateSource source = configuration.Kind == VelopackUpdateSourceKind.Https
+            ? new SimpleWebSource(new Uri(configuration.Location, UriKind.Absolute))
+            : new SimpleFileSource(new DirectoryInfo(configuration.Location));
+        var options = new UpdateOptions { ExplicitChannel = configuration.Channel };
+        return new VelopackUpdateManagerAdapter(new UpdateManager(source, options));
+    }
+
+    private sealed class VelopackUpdateManagerAdapter : IVelopackUpdateManagerAdapter
+    {
+        private readonly UpdateManager manager;
+
+        public VelopackUpdateManagerAdapter(UpdateManager manager)
+        {
+            this.manager = manager;
+        }
+
+        public bool IsInstalled => manager.IsInstalled;
+
+        public string? CurrentVersion => manager.CurrentVersion?.ToString();
+
+        public VelopackClientAsset? UpdatePendingRestart =>
+            manager.UpdatePendingRestart is { } pending ? FromAsset(pending) : null;
+
+        public async Task<VelopackClientAsset?> CheckForUpdatesAsync()
+        {
+            var update = await manager.CheckForUpdatesAsync().ConfigureAwait(false);
+            return update is null
+                ? null
+                : new VelopackClientAsset(
+                    Fingerprint(update.TargetFullRelease),
+                    update.TargetFullRelease.NotesMarkdown,
+                    update);
+        }
+
+        public Task DownloadUpdatesAsync(
+            VelopackClientAsset update,
+            Action<int> progress,
+            CancellationToken cancellationToken)
+        {
+            if (update.NativeToken is not UpdateInfo updateInfo)
+                throw new ArgumentException("The update token is invalid.", nameof(update));
+
+            return manager.DownloadUpdatesAsync(updateInfo, progress, cancellationToken);
+        }
+
+        public void WaitExitThenApplyUpdates(
+            VelopackClientAsset update,
+            bool silent,
+            bool restart,
+            string[] restartArguments)
+        {
+            if (update.NativeToken is not VelopackAsset asset)
+                throw new ArgumentException("The pending update token is invalid.", nameof(update));
+
+            manager.WaitExitThenApplyUpdates(asset, silent, restart, restartArguments);
+        }
+
+        private static VelopackClientAsset FromAsset(VelopackAsset asset) =>
+            new(Fingerprint(asset), asset.NotesMarkdown, asset);
+
+        private static VelopackAssetFingerprint Fingerprint(VelopackAsset asset) =>
+            new(
+                asset.PackageId ?? string.Empty,
+                asset.Version.ToString(),
+                asset.Type.ToString(),
+                asset.FileName ?? string.Empty,
+                asset.Size,
+                asset.SHA256 ?? string.Empty);
+    }
 }

@@ -6,6 +6,84 @@ namespace BaiduBatchTransfer.App.Tests.Updates;
 public sealed class VelopackUpdateRuntimeTests
 {
     [Fact]
+    public void ClientFactorySelectsHttpsSourceAndConfiguredChannel()
+    {
+        VelopackUpdateSourceConfiguration? captured = null;
+        var manager = new FakeManagerAdapter();
+
+        using var client = VelopackUpdateClient.Create(
+            BuildInfo("1.0.0"),
+            configuration =>
+            {
+                captured = configuration;
+                return manager;
+            });
+
+        Assert.NotNull(captured);
+        Assert.Equal(VelopackUpdateSourceKind.Https, captured.Kind);
+        Assert.Equal("https://updates.example.invalid/app/", captured.Location);
+        Assert.Equal("win-x64-stable", captured.Channel);
+    }
+
+    [Fact]
+    public void ClientFactorySelectsLocalDirectoryForAcceptanceFeed()
+    {
+        var feedPath = Path.GetFullPath(Path.Combine("test-data", "ota-feed"));
+        var buildInfo = ApplicationBuildInfo.CreateForTests(
+            "1.0.0",
+            "adapter-test",
+            httpsFeedUrl: null,
+            channel: "win-x64-ota-acceptance",
+            acceptanceFeedPath: feedPath,
+            isOtaAcceptanceBuild: true);
+        VelopackUpdateSourceConfiguration? captured = null;
+
+        using var client = VelopackUpdateClient.Create(
+            buildInfo,
+            configuration =>
+            {
+                captured = configuration;
+                return new FakeManagerAdapter();
+            });
+
+        Assert.NotNull(captured);
+        Assert.Equal(VelopackUpdateSourceKind.LocalDirectory, captured.Kind);
+        Assert.Equal(feedPath, captured.Location);
+        Assert.Equal("win-x64-ota-acceptance", captured.Channel);
+    }
+
+    [Fact]
+    public async Task ClientCancellationTracksNonCancellableManagerCheckToCompletion()
+    {
+        var managerResult = new TaskCompletionSource<VelopackClientAsset?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var manager = new FakeManagerAdapter { CheckHandler = () => managerResult.Task };
+        using var client = new VelopackUpdateClient(manager);
+        using var cancellation = new CancellationTokenSource();
+
+        var check = client.CheckForUpdatesAsync(cancellation.Token);
+        cancellation.Cancel();
+
+        Assert.False(check.IsCompleted);
+        managerResult.SetResult(null);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => check);
+    }
+
+    [Fact]
+    public void ClientUsesOnlyGracefulWaitExitApplyArguments()
+    {
+        var manager = new FakeManagerAdapter();
+        using var client = new VelopackUpdateClient(manager);
+        var pending = Asset("2.0.0", null);
+
+        client.WaitExitThenApplyUpdates(pending);
+
+        Assert.Same(pending, manager.AppliedAsset);
+        Assert.False(manager.ApplySilent);
+        Assert.True(manager.ApplyRestart);
+        Assert.Empty(manager.RestartArguments!);
+    }
+
+    [Fact]
     public void MissingFeedCreatesNotConfiguredRuntimeWithoutCreatingClient()
     {
         var clientsCreated = 0;
@@ -154,6 +232,29 @@ public sealed class VelopackUpdateRuntimeTests
     }
 
     [Fact]
+    public async Task SameVersionWithDifferentAssetFingerprintIsRejected()
+    {
+        VelopackClientAsset? pending = null;
+        var client = new FakeClient
+        {
+            CheckResult = Asset("2.0.0", null, sha256: "target-sha"),
+            PendingAccessor = () => pending,
+            DownloadHandler = (_, _, _) =>
+            {
+                pending = Asset("2.0.0", null, sha256: "different-sha");
+                return Task.CompletedTask;
+            }
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        await runtime.CheckAsync(CancellationToken.None);
+
+        var snapshot = await runtime.DownloadAsync(CancellationToken.None);
+
+        Assert.Equal(ApplicationUpdateStatus.VerificationFailed, snapshot.Status);
+        Assert.False(runtime.TryPrepareRestart());
+    }
+
+    [Fact]
     public void NewRuntimeRebuildsReadyStateFromCurrentPendingAsset()
     {
         var client = new FakeClient
@@ -197,6 +298,68 @@ public sealed class VelopackUpdateRuntimeTests
     }
 
     [Fact]
+    public void PreparedUpdateCanOnlyBeLaunchedOnce()
+    {
+        var client = new FakeClient
+        {
+            PendingAccessor = () => Asset("2.0.0", null)
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        Assert.True(runtime.TryPrepareRestart());
+
+        var first = runtime.LaunchPreparedUpdateAndRestart();
+        var second = runtime.LaunchPreparedUpdateAndRestart();
+
+        Assert.True(first);
+        Assert.False(second);
+        Assert.Equal(1, client.LaunchCalls);
+    }
+
+    [Fact]
+    public async Task ConcurrentLaunchesConsumePreparedUpdateAtomically()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeClient
+        {
+            PendingAccessor = () => Asset("2.0.0", null),
+            LaunchHandler = () =>
+            {
+                entered.TrySetResult();
+                release.Task.GetAwaiter().GetResult();
+            }
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        Assert.True(runtime.TryPrepareRestart());
+
+        var first = Task.Run(runtime.LaunchPreparedUpdateAndRestart);
+        await entered.Task;
+        var second = await Task.Run(runtime.LaunchPreparedUpdateAndRestart);
+        release.SetResult();
+
+        Assert.True(await first);
+        Assert.False(second);
+        Assert.Equal(1, client.LaunchCalls);
+    }
+
+    [Fact]
+    public void FailedLaunchStillConsumesPreparedUpdate()
+    {
+        var client = new FakeClient
+        {
+            PendingAccessor = () => Asset("2.0.0", null),
+            LaunchException = new InvalidOperationException("launch failed")
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        Assert.True(runtime.TryPrepareRestart());
+
+        Assert.Throws<InvalidOperationException>(() => runtime.LaunchPreparedUpdateAndRestart());
+
+        Assert.False(runtime.LaunchPreparedUpdateAndRestart());
+        Assert.Equal(1, client.LaunchCalls);
+    }
+
+    [Fact]
     public async Task ClientFailuresMapToFixedDomainStatusesWithoutLeakingDetails()
     {
         var client = new FakeClient
@@ -212,11 +375,121 @@ public sealed class VelopackUpdateRuntimeTests
         Assert.DoesNotContain("secret", snapshot.UserMessage, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task CancelledCheckRestoresStableStateWhileUnderlyingOperationRemainsTracked()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeClient
+        {
+            CheckHandler = async cancellationToken =>
+            {
+                started.TrySetResult();
+                try
+                {
+                    await release.Task.WaitAsync(cancellationToken);
+                    return null;
+                }
+                catch (OperationCanceledException)
+                {
+                    cancellationObserved.TrySetResult();
+                    await release.Task;
+                    throw;
+                }
+            }
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        using var cancellation = new CancellationTokenSource();
+
+        var check = runtime.CheckAsync(cancellation.Token);
+        await started.Task;
+        cancellation.Cancel();
+        await cancellationObserved.Task;
+
+        Assert.Equal(ApplicationUpdateStatus.Idle, runtime.Snapshot.Status);
+        Assert.False(check.IsCompleted);
+        release.SetResult();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => check);
+        Assert.Equal(ApplicationUpdateStatus.UpToDate,
+            (await runtime.CheckAsync(CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task CancelledDownloadRestoresAvailableState()
+    {
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var target = Asset("2.0.0", null);
+        var client = new FakeClient
+        {
+            CheckResult = target,
+            DownloadHandler = async (_, _, cancellationToken) =>
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    cancellationObserved.TrySetResult();
+                    throw;
+                }
+            }
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        await runtime.CheckAsync(CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+
+        var download = runtime.DownloadAsync(cancellation.Token);
+        cancellation.Cancel();
+        await cancellationObserved.Task;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => download);
+        Assert.Equal(ApplicationUpdateStatus.Available, runtime.Snapshot.Status);
+    }
+
+    [Fact]
+    public async Task CancellationWinsIfDownloadReportsAnotherFailureDuringCancellation()
+    {
+        var target = Asset("2.0.0", null);
+        var client = new FakeClient
+        {
+            CheckResult = target,
+            DownloadHandler = async (_, _, cancellationToken) =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                    .ContinueWith(_ => { }, CancellationToken.None);
+                throw new HttpRequestException("late transport failure");
+            }
+        };
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0");
+        await runtime.CheckAsync(CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+
+        var download = runtime.DownloadAsync(cancellation.Token);
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => download);
+        Assert.Equal(ApplicationUpdateStatus.Available, runtime.Snapshot.Status);
+    }
+
     private static ApplicationBuildInfo BuildInfo(string version, string? httpsFeedUrl = "https://updates.example.invalid/app/") =>
         ApplicationBuildInfo.CreateForTests(version, "adapter-test", httpsFeedUrl);
 
-    private static VelopackClientAsset Asset(string version, string? notes) =>
-        new(version, notes, new object());
+    private static VelopackClientAsset Asset(
+        string version,
+        string? notes,
+        string sha256 = "sha-256") =>
+        new(
+            new VelopackAssetFingerprint(
+                "SuperPan.BaiduBatchTransfer",
+                version,
+                "Full",
+                $"SuperPan.BaiduBatchTransfer-{version}-full.nupkg",
+                1024,
+                sha256),
+            notes,
+            new object());
 
     private sealed class FakeClient : IApplicationUpdateClient
     {
@@ -228,6 +501,8 @@ public sealed class VelopackUpdateRuntimeTests
 
         public Exception? CheckException { get; init; }
 
+        public Func<CancellationToken, Task<VelopackClientAsset?>>? CheckHandler { get; init; }
+
         public Func<VelopackClientAsset?> PendingAccessor { get; set; } = () => null;
 
         public Func<VelopackClientAsset, Action<int>, CancellationToken, Task>? DownloadHandler { get; init; }
@@ -238,11 +513,17 @@ public sealed class VelopackUpdateRuntimeTests
 
         public int LaunchCalls { get; private set; }
 
+        public Exception? LaunchException { get; init; }
+
+        public Action? LaunchHandler { get; init; }
+
         public VelopackClientAsset? UpdatePendingRestart => PendingAccessor();
 
         public Task<VelopackClientAsset?> CheckForUpdatesAsync(CancellationToken cancellationToken)
         {
             CheckCalls++;
+            if (CheckHandler is not null)
+                return CheckHandler(cancellationToken);
             return CheckException is null
                 ? Task.FromResult(CheckResult)
                 : Task.FromException<VelopackClientAsset?>(CheckException);
@@ -260,10 +541,52 @@ public sealed class VelopackUpdateRuntimeTests
         public void WaitExitThenApplyUpdates(VelopackClientAsset update)
         {
             LaunchCalls++;
+            LaunchHandler?.Invoke();
+            if (LaunchException is not null)
+                throw LaunchException;
         }
 
         public void Dispose()
         {
+        }
+    }
+
+    private sealed class FakeManagerAdapter : IVelopackUpdateManagerAdapter
+    {
+        public bool IsInstalled { get; init; } = true;
+
+        public string? CurrentVersion { get; init; } = "1.0.0";
+
+        public VelopackClientAsset? UpdatePendingRestart { get; init; }
+
+        public Func<Task<VelopackClientAsset?>>? CheckHandler { get; init; }
+
+        public VelopackClientAsset? AppliedAsset { get; private set; }
+
+        public bool ApplySilent { get; private set; }
+
+        public bool ApplyRestart { get; private set; }
+
+        public string[]? RestartArguments { get; private set; }
+
+        public Task<VelopackClientAsset?> CheckForUpdatesAsync() =>
+            CheckHandler?.Invoke() ?? Task.FromResult<VelopackClientAsset?>(null);
+
+        public Task DownloadUpdatesAsync(
+            VelopackClientAsset update,
+            Action<int> progress,
+            CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public void WaitExitThenApplyUpdates(
+            VelopackClientAsset update,
+            bool silent,
+            bool restart,
+            string[] restartArguments)
+        {
+            AppliedAsset = update;
+            ApplySilent = silent;
+            ApplyRestart = restart;
+            RestartArguments = restartArguments;
         }
     }
 }

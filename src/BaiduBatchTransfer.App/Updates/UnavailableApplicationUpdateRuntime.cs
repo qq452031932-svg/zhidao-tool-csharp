@@ -21,8 +21,8 @@ public sealed class UnavailableApplicationUpdateRuntime : IApplicationUpdateRunt
             null,
             0,
             status == ApplicationUpdateStatus.NotConfigured
-                ? "更新服务尚未配置。"
-                : "当前运行方式不支持在线更新。");
+                ? ApplicationUpdateMessages.NotConfigured
+                : ApplicationUpdateMessages.Unsupported);
     }
 
     public ApplicationUpdateSnapshot Snapshot => snapshot;
