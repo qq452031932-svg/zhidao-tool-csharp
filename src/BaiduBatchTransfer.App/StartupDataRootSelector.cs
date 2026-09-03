@@ -18,7 +18,7 @@ public static class StartupDataRootSelector
         {
             var localAppDataRoot = Directory.GetParent(fullNormalRoot)?.FullName
                 ?? throw new InvalidOperationException("无法确定 OTA 验收数据目录。");
-            return Path.Combine(localAppDataRoot, "BaiduBatchTransfer.OtaAcceptance");
+            return ResolveOtaAcceptanceRoot(localAppDataRoot);
         }
 
         return ResolveOrdinary(args, fullNormalRoot);
@@ -34,9 +34,30 @@ public static class StartupDataRootSelector
         ArgumentNullException.ThrowIfNull(buildInfo);
         var fullLocalAppDataRoot = Path.GetFullPath(localAppDataRoot);
         if (buildInfo.IsOtaAcceptanceBuild)
-            return Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer.OtaAcceptance");
+            return ResolveOtaAcceptanceRoot(fullLocalAppDataRoot);
 
         return ResolveOrdinary(args, Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer"));
+    }
+
+    private static string ResolveOtaAcceptanceRoot(string localAppDataRoot)
+    {
+        var fullLocalAppDataRoot = Path.GetFullPath(localAppDataRoot);
+        var productionRoot = Path.GetFullPath(
+            Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer"));
+        var acceptanceRoot = Path.GetFullPath(
+            Path.Combine(fullLocalAppDataRoot, "BaiduBatchTransfer.OtaAcceptance"));
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        if (string.Equals(acceptanceRoot, productionRoot, comparison))
+            throw new InvalidOperationException("OTA 验收数据目录不能与正式数据目录相同。");
+
+        var directory = Directory.CreateDirectory(acceptanceRoot);
+        directory.Refresh();
+        if (!directory.Exists || directory.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            throw new InvalidOperationException("OTA 验收数据目录不安全。");
+
+        return acceptanceRoot;
     }
 
     private static string ResolveOrdinary(IReadOnlyList<string> args, string normalRoot)

@@ -46,9 +46,24 @@ public sealed class AppBootstrapTests : IDisposable
         var adapterVersion = ReadPrivateString(
             host.Services.GetRequiredService<WebViewBaiduNetdiskAdapter>(),
             "applicationBuildVersion");
+        var shareAdapterVersion = ReadPrivateString(
+            host.Services.GetRequiredService<WebViewBaiduShareAdapter>(),
+            "applicationBuildVersion");
+        var picker = Assert.IsType<WebViewRemoteResourcePicker>(
+            host.Services.GetRequiredService<IRemoteResourcePicker>());
+        var pickerNavigation = InvokePrivate<BaiduNavigationAuthorizationRequest>(
+            picker,
+            "Navigation");
+        var runtimeCapability = ReadPrivate<AdapterCapabilityVersion>(
+            host.Services.GetRequiredService<ManagedChromiumTransferRuntimeFactory>(),
+            "capability");
 
         Assert.Equal(ApplicationBuildInfo.Current.ProductVersion, migratorVersion);
         Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, adapterVersion);
+        Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, shareAdapterVersion);
+        Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, pickerNavigation.ApplicationBuildVersion);
+        Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, pickerNavigation.Acceptance.ApplicationBuildVersion);
+        Assert.Equal(ApplicationBuildInfo.Current.AdapterBuildVersion, runtimeCapability.BuildVersion);
         Assert.NotEqual(migratorVersion, adapterVersion);
     }
 
@@ -1043,12 +1058,24 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     private static string ReadPrivateString(object instance, string fieldName)
+        => ReadPrivate<string>(instance, fieldName);
+
+    private static T ReadPrivate<T>(object instance, string fieldName)
     {
         var field = instance.GetType().GetField(
             fieldName,
             BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(field);
-        return Assert.IsType<string>(field.GetValue(instance));
+        return Assert.IsType<T>(field.GetValue(instance));
+    }
+
+    private static T InvokePrivate<T>(object instance, string methodName)
+    {
+        var method = instance.GetType().GetMethod(
+            methodName,
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        return Assert.IsType<T>(method.Invoke(instance, null));
     }
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")

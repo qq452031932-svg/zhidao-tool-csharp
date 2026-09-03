@@ -5,6 +5,76 @@ namespace BaiduBatchTransfer.App.Tests.Updates;
 
 public sealed class OtaBuildConfigurationTests
 {
+    private static readonly TimeSpan GateTimeout = TimeSpan.FromSeconds(30);
+
+    [Fact]
+    public async Task ProductionBuildRejectsAlternatePackageId()
+    {
+        var result = await RunGateAsync(
+            [
+                "VersionPrefix=1.2.3",
+                "PackageId=Contoso.Untrusted",
+                "UpdateChannel=win-x64-stable",
+            ]);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("OTA", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Version=9.9.9")]
+    [InlineData("InformationalVersion=9.9.9")]
+    [InlineData("FileVersion=9.9.9.9")]
+    [InlineData("AssemblyVersion=9.0.0.0")]
+    public async Task BuildRejectsOverridesOfDerivedVersionProperties(string overriddenProperty)
+    {
+        var result = await RunGateAsync(
+            [
+                "VersionPrefix=1.2.3",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+                overriddenProperty,
+            ]);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("OTA", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task BuildRejectsAttemptToOverrideInternalExpectedVersion()
+    {
+        var result = await RunGateAsync(
+            [
+                "VersionPrefix=1.2.3",
+                "Version=9.9.9",
+                "_ExpectedProductVersion=9.9.9",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("OTA", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("VersionPrefix=01.2.3")]
+    [InlineData("VersionPrefix=65535.2.3")]
+    [InlineData("VersionPrefix=1.65535.3")]
+    [InlineData("VersionPrefix=1.2.65535")]
+    [InlineData("VersionPrefix=999999999999999999999999.2.3")]
+    public async Task BuildRejectsNonCanonicalOrOutOfRangeVersionPrefix(string versionProperty)
+    {
+        var result = await RunGateAsync(
+            [
+                versionProperty,
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("OTA", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Theory]
     [MemberData(nameof(InvalidConfigurations))]
     public async Task InvalidOtaBuildConfigurationFailsTheDedicatedGate(params string[] properties)
@@ -94,6 +164,12 @@ public sealed class OtaBuildConfigurationTests
             ]);
         data.Add(
             [
+                "VersionPrefix=65534.65534.65534",
+                "PackageId=SuperPan.BaiduBatchTransfer",
+                "UpdateChannel=win-x64-stable",
+            ]);
+        data.Add(
+            [
                 "VersionPrefix=1.2.3",
                 "OtaAcceptanceBuild=true",
                 $"OtaAcceptanceFeedPath={acceptanceFeed}",
@@ -130,7 +206,28 @@ public sealed class OtaBuildConfigurationTests
             ?? throw new InvalidOperationException("Unable to start dotnet msbuild.");
         var standardOutput = process.StandardOutput.ReadToEndAsync();
         var standardError = process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+        using var timeout = new CancellationTokenSource(GateTimeout);
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch (InvalidOperationException)
+            {
+                // The process exited while the timeout was being handled.
+            }
+
+            await process.WaitForExitAsync();
+            throw new TimeoutException(
+                $"OTA build gate exceeded {GateTimeout}." + Environment.NewLine +
+                string.Join(Environment.NewLine, await standardOutput, await standardError));
+        }
+
         return new GateResult(
             process.ExitCode,
             string.Join(Environment.NewLine, await standardOutput, await standardError));

@@ -14,7 +14,7 @@ public sealed record ApplicationBuildInfo(
 {
     private const string ProductionChannel = "win-x64-stable";
     private static readonly Regex ThreePartVersion = new(
-        "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+        "^(?:0|[1-9][0-9]{0,4})\\.(?:0|[1-9][0-9]{0,4})\\.(?:0|[1-9][0-9]{0,4})$",
         RegexOptions.CultureInvariant);
 
     public bool IsFeedConfigured => HttpsFeedUrl is not null || AcceptanceFeedPath is not null;
@@ -133,19 +133,14 @@ public sealed record ApplicationBuildInfo(
     {
         if (string.IsNullOrWhiteSpace(value) || !ThreePartVersion.IsMatch(value))
             throw new ArgumentException(
-                "Product version must contain exactly three numeric parts.",
+                "Product version must contain exactly three canonical numeric parts.",
                 nameof(value));
-        try
-        {
-            _ = value.Split('.').Select(int.Parse).ToArray();
-        }
-        catch (OverflowException exception)
-        {
+
+        var parts = value.Split('.').Select(int.Parse).ToArray();
+        if (parts.Any(part => part > 65534))
             throw new ArgumentException(
-                "Product version contains an out-of-range numeric part.",
-                nameof(value),
-                exception);
-        }
+                "Product version components must be between 0 and 65534.",
+                nameof(value));
     }
 
     private static string? NullIfWhiteSpace(string? value) =>

@@ -44,11 +44,32 @@ public sealed class ApplicationBuildInfoTests
     }
 
     [Theory]
+    [InlineData("0.0.0", "0.0.0.0", "0.0.0.0")]
+    [InlineData("65534.65534.65534", "65534.0.0.0", "65534.65534.65534.0")]
+    public void AssemblyVersionsAcceptTheSupportedComponentBoundaries(
+        string productVersion,
+        string expectedAssemblyVersion,
+        string expectedFileVersion)
+    {
+        var versions = ApplicationBuildInfo.DeriveAssemblyVersions(productVersion);
+
+        Assert.Equal(expectedAssemblyVersion, versions.AssemblyVersion);
+        Assert.Equal(expectedFileVersion, versions.FileVersion);
+    }
+
+    [Theory]
     [InlineData("2.3")]
     [InlineData("2.3.4.5")]
     [InlineData("2.3.4-beta")]
     [InlineData("v2.3.4")]
-    public void AssemblyVersionRejectsNonThreePartProductVersion(string productVersion)
+    [InlineData("01.2.3")]
+    [InlineData("1.02.3")]
+    [InlineData("1.2.03")]
+    [InlineData("65535.2.3")]
+    [InlineData("1.65535.3")]
+    [InlineData("1.2.65535")]
+    [InlineData("999999999999999999999999.2.3")]
+    public void AssemblyVersionRejectsInvalidProductVersion(string productVersion)
     {
         Assert.Throws<ArgumentException>(() =>
             ApplicationBuildInfo.DeriveAssemblyVersions(productVersion));

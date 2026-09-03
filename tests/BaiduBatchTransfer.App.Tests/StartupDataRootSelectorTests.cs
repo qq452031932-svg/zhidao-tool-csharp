@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Infrastructure.Database;
@@ -49,6 +50,39 @@ public sealed class StartupDataRootSelectorTests : IDisposable
     }
 
     [Fact]
+    public void OtaAcceptanceBuildRejectsPreexistingJunctionToProductionRoot()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        Directory.CreateDirectory(root);
+        var productionRoot = Path.Combine(root, "BaiduBatchTransfer");
+        var acceptanceRoot = Path.Combine(root, "BaiduBatchTransfer.OtaAcceptance");
+        Directory.CreateDirectory(productionRoot);
+        var sentinel = Path.Combine(productionRoot, "production-sentinel.txt");
+        File.WriteAllText(sentinel, "untouched");
+        CreateDirectoryJunction(acceptanceRoot, productionRoot);
+        try
+        {
+            var info = ApplicationBuildInfo.CreateForTests(
+                "1.2.3",
+                "adapter-v7",
+                null,
+                channel: "win-x64-ota-acceptance",
+                acceptanceFeedPath: Path.Combine(root, "feed"),
+                isOtaAcceptanceBuild: true);
+
+            Assert.Throws<InvalidOperationException>(() =>
+                StartupDataRootSelector.ResolveFromLocalAppData([], root, info));
+            Assert.Equal("untouched", File.ReadAllText(sentinel));
+        }
+        finally
+        {
+            if (Directory.Exists(acceptanceRoot))
+                Directory.Delete(acceptanceRoot, recursive: false);
+        }
+    }
+
+    [Fact]
     public void BuildConfigurationEnforcesAcceptanceRootBoundary()
     {
         var normalRoot = Path.Combine(root, "normal");
@@ -92,5 +126,22 @@ public sealed class StartupDataRootSelectorTests : IDisposable
         var method = selector.GetMethod("Resolve", BindingFlags.Public | BindingFlags.Static);
         Assert.NotNull(method);
         return Assert.IsType<string>(method.Invoke(null, [args, normalRoot]));
+    }
+
+    private static void CreateDirectoryJunction(string junction, string target)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = Environment.GetEnvironmentVariable("COMSPEC") ?? "cmd.exe",
+            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target },
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        }) ?? throw new InvalidOperationException("The junction helper did not start.");
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(process.StandardError.ReadToEnd());
+        Assert.True(File.GetAttributes(junction).HasFlag(FileAttributes.ReparsePoint));
     }
 }

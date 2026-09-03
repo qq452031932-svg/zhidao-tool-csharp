@@ -1,4 +1,5 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk"
+         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -7,14 +8,20 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <VersionPrefix Condition="'$(VersionPrefix)' == ''">1.0.0</VersionPrefix>
-    <Version>$(VersionPrefix)</Version>
-    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
+    <_ExpectedProductVersion>$(VersionPrefix)</_ExpectedProductVersion>
+    <_ExpectedInformationalVersion>$(VersionPrefix)</_ExpectedInformationalVersion>
+    <_ExpectedFileVersion>$(VersionPrefix).0</_ExpectedFileVersion>
+    <Version>$(_ExpectedProductVersion)</Version>
+    <InformationalVersion>$(_ExpectedInformationalVersion)</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <FileVersion>$(VersionPrefix).0</FileVersion>
-    <_VersionPrefixIsValid>$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionPrefix)', '^[0-9]+\.[0-9]+\.[0-9]+$'))</_VersionPrefixIsValid>
-    <ProductMajor Condition="'$(_VersionPrefixIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(VersionPrefix)', '^([0-9]+)\..*$', '$1'))</ProductMajor>
-    <ProductMajor Condition="'$(ProductMajor)' == ''">0</ProductMajor>
-    <AssemblyVersion>$(ProductMajor).0.0.0</AssemblyVersion>
+    <FileVersion>$(_ExpectedFileVersion)</FileVersion>
+    <_VersionPrefixIsValid>$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionPrefix)', '^(?:0|[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-4])\.(?:0|[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-4])\.(?:0|[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-4])$'))</_VersionPrefixIsValid>
+    <_ExpectedProductMajor Condition="'$(_VersionPrefixIsValid)' == 'True'">$([System.Text.RegularExpressions.Regex]::Replace('$(VersionPrefix)', '^([0-9]+)\..*$', '$1'))</_ExpectedProductMajor>
+    <_ExpectedProductMajor Condition="'$(_ExpectedProductMajor)' == ''">0</_ExpectedProductMajor>
+    <_ExpectedAssemblyVersion>$(_ExpectedProductMajor).0.0.0</_ExpectedAssemblyVersion>
+    <ProductMajor>$(_ExpectedProductMajor)</ProductMajor>
+    <AssemblyVersion>$(_ExpectedAssemblyVersion)</AssemblyVersion>
+    <PackageId Condition="'$(PackageId)' == ''">SuperPan.BaiduBatchTransfer</PackageId>
     <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
     <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
     <OtaAcceptanceBuild Condition="'$(OtaAcceptanceBuild)' == ''">false</OtaAcceptanceBuild>
@@ -83,7 +90,15 @@
 
   <Target Name="ValidateOtaBuildConfiguration" BeforeTargets="PrepareForBuild">
     <Error Condition="'$(_VersionPrefixIsValid)' != 'True'"
-           Text="OTA product version must contain exactly three numeric parts." />
+           Text="OTA product version must contain three canonical numeric parts between 0 and 65534." />
+    <Error Condition="'$(Version)' != '$(_ExpectedProductVersion)'"
+           Text="OTA Version must be derived from VersionPrefix." />
+    <Error Condition="'$(InformationalVersion)' != '$(_ExpectedInformationalVersion)'"
+           Text="OTA InformationalVersion must be derived from VersionPrefix." />
+    <Error Condition="'$(FileVersion)' != '$(_ExpectedFileVersion)'"
+           Text="OTA FileVersion must be derived from VersionPrefix." />
+    <Error Condition="'$(AssemblyVersion)' != '$(_ExpectedAssemblyVersion)'"
+           Text="OTA AssemblyVersion must be derived from VersionPrefix." />
     <Error Condition="'$(OtaAcceptanceBuild)' != 'true' and '$(OtaAcceptanceBuild)' != 'false'"
            Text="OTA acceptance build flag must be true or false." />
     <Error Condition="'$(UpdateFeedUrl)' != '' and '$(OtaAcceptanceFeedPath)' != ''"
@@ -98,6 +113,8 @@
            Text="OTA acceptance builds require the dedicated acceptance channel." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(OtaAcceptanceFeedPath)' != ''"
            Text="OTA production builds cannot use a local feed path." />
+    <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(PackageId)' != 'SuperPan.BaiduBatchTransfer'"
+           Text="OTA production builds require the dedicated production package ID." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateFeedUrl)' != '' and '$(_UpdateFeedUrlIsValid)' != 'True'"
            Text="OTA production feed must be an absolute HTTPS URL without credentials, query, or fragment." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateChannel)' != 'win-x64-stable'"
