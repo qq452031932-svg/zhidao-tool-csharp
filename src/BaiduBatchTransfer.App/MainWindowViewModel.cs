@@ -17,7 +17,7 @@ public sealed class MainWindowViewModel : ObservableObject
     private string statusMessage = "就绪";
     private string accountStatusMessage;
     private bool isAccountOperationBusy;
-    private readonly bool isOtaAcceptanceBuild;
+    private bool isOtaAcceptanceBuild;
     private int updateAvailableReported;
 
     public MainWindowViewModel(
@@ -26,15 +26,13 @@ public sealed class MainWindowViewModel : ObservableObject
         IAccountLoginLauncher loginLauncher,
         IAccountManagementLauncher? accountManagementLauncher = null,
         Func<Action<int>, CancellationToken, Task>? refreshAccounts = null,
-        int initialActiveAccountCount = 0,
-        bool isOtaAcceptanceBuild = false)
+        int initialActiveAccountCount = 0)
     {
         this.transferWorkspace = transferWorkspace ?? throw new ArgumentNullException(nameof(transferWorkspace));
         this.shareWorkspace = shareWorkspace ?? throw new ArgumentNullException(nameof(shareWorkspace));
         this.loginLauncher = loginLauncher ?? throw new ArgumentNullException(nameof(loginLauncher));
         this.accountManagementLauncher = accountManagementLauncher;
         this.refreshAccounts = refreshAccounts;
-        this.isOtaAcceptanceBuild = isOtaAcceptanceBuild;
         accountStatusMessage = FormatAccountStatus(initialActiveAccountCount);
         currentContent = transferWorkspace;
         ShowTransferCommand = new RelayCommand(ShowTransfer);
@@ -50,9 +48,7 @@ public sealed class MainWindowViewModel : ObservableObject
             () => refreshAccounts is not null && !IsAccountOperationBusy);
     }
 
-    public string ApplicationTitle => isOtaAcceptanceBuild
-        ? "百度批量转存 · OTA 本地验收版"
-        : "百度批量转存";
+    public string ApplicationTitle => FormatApplicationTitle(isOtaAcceptanceBuild);
     public object CurrentContent { get => currentContent; private set => SetProperty(ref currentContent, value); }
     public string CurrentWorkspaceTitle { get => currentWorkspaceTitle; private set => SetProperty(ref currentWorkspaceTitle, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
@@ -191,6 +187,20 @@ public sealed class MainWindowViewModel : ObservableObject
 
     internal void ReportHandoffFailure() =>
         StatusMessage = "结果工作区操作失败，请稍后重试。";
+
+    internal static string FormatApplicationTitle(bool isOtaAcceptanceBuild) =>
+        isOtaAcceptanceBuild
+            ? "百度批量转存 · OTA 本地验收版"
+            : "百度批量转存";
+
+    internal void ConfigureOtaAcceptanceBuild(bool enabled)
+    {
+        if (isOtaAcceptanceBuild == enabled)
+            return;
+
+        isOtaAcceptanceBuild = enabled;
+        OnPropertyChanged(nameof(ApplicationTitle));
+    }
 
     internal void ReportUpdateAvailable(string version)
     {

@@ -1069,8 +1069,8 @@ public sealed class AppShellFactory(
             saveShareAnalyticsAccount: shareAnalyticsPreferenceStore.SaveLastViewedAccountAsync,
             shareAnalyticsPreferenceLoadFailed: shareAnalyticsPreferenceLoadFailed,
             enterShareData: shareAnalyticsViewModel.EnterAsync,
-            leaveShareData: shareAnalyticsViewModel.Leave,
-            isOtaAcceptanceBuild: buildInfo.IsOtaAcceptanceBuild);
+            leaveShareData: shareAnalyticsViewModel.Leave);
+        mainViewModel.ConfigureOtaAcceptanceBuild(buildInfo.IsOtaAcceptanceBuild);
         mainWindow = new MainWindow(mainViewModel);
 
         static async Task ObserveAsync(Task task)

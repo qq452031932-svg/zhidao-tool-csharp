@@ -975,6 +975,40 @@ public sealed class AppBootstrapTests : IDisposable
     }
 
     [Fact]
+    public void ApplicationStartupPassesTheProcessOwnedUpdateRuntimeIntoTheHost()
+    {
+        var app = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "App.xaml.cs"));
+
+        Assert.Contains(
+            "AppBootstrap.CreateHost(dataRoot, e.Args, updateRuntime)",
+            app,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AcceptanceTitleIsConfiguredAfterShellConstruction()
+    {
+        var bootstrap = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "src",
+            "BaiduBatchTransfer.App",
+            "AppBootstrap.cs"));
+
+        Assert.Contains(
+            "mainViewModel.ConfigureOtaAcceptanceBuild(buildInfo.IsOtaAcceptanceBuild);",
+            bootstrap,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "isOtaAcceptanceBuild: buildInfo.IsOtaAcceptanceBuild",
+            bootstrap,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void LoadedInitializationStartsTheSilentCheckLastAndCloseRequesterOnlyClosesTheWindow()
     {
         var bootstrap = File.ReadAllText(Path.Combine(
