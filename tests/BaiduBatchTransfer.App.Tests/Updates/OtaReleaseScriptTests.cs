@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -83,6 +84,27 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Theory]
+    [InlineData("VPK_SIGN_PARAMS")]
+    [InlineData("VPK_SIGN_TEMPLATE")]
+    [InlineData("VPK_PACK_ARGS")]
+    public async Task RejectsInheritedVpkOptionInjectionBeforeAnyOutput(string variableName)
+    {
+        using var fixture = ScriptFixture.Create();
+
+        var result = await fixture.RunWithEnvironmentAsync(
+            new Dictionary<string, string?> { [variableName] = "untrusted-option" },
+            "-Version", "not-a-version",
+            "-AcceptanceFeedPath", fixture.FeedDirectory,
+            "-OutputDirectory", fixture.OutputDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(variableName, result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Theory]
     [InlineData("-ProductionFeedUrl", "https://updates.example.test/stable/")]
     [InlineData("-SignParams", "--azureTrustedSigningFile secret.json")]
     [InlineData("-AuthenticityMode", "PinnedPublisher")]
@@ -130,6 +152,66 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Fact]
+    public async Task RejectsUncAcceptanceFeedAsNonLocalBeforeCreatingOutput()
+    {
+        using var fixture = ScriptFixture.Create();
+        var outside = Path.Combine(Path.GetTempPath(), $"bbt-ota-output-{Guid.NewGuid():N}");
+
+        var result = await fixture.RunAsync(
+            "-Version", "1.2.3",
+            "-AcceptanceFeedPath", @"\\server\share\feed",
+            "-OutputDirectory", outside,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("local", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(outside));
+    }
+
+    [Fact]
+    public async Task RejectsAcceptanceFeedThatIsAnExistingFileBeforeCreatingOutput()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.Delete(fixture.FeedDirectory);
+        await File.WriteAllTextAsync(fixture.FeedDirectory, "not-a-directory");
+        Directory.CreateDirectory(fixture.OutputDirectory);
+        await File.WriteAllTextAsync(Path.Combine(fixture.OutputDirectory, "keep.txt"), "sentinel");
+
+        var result = await fixture.RunAsync(
+            "-Version", "1.2.3",
+            "-AcceptanceFeedPath", fixture.FeedDirectory,
+            "-OutputDirectory", fixture.OutputDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("directory", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(Directory.EnumerateFileSystemEntries(fixture.OutputDirectory));
+    }
+
+    [Fact]
+    public async Task RequiresAcceptanceFeedDirectoryToExistBeforeCreatingOutput()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.Delete(fixture.FeedDirectory);
+        Directory.CreateDirectory(fixture.OutputDirectory);
+        await File.WriteAllTextAsync(Path.Combine(fixture.OutputDirectory, "keep.txt"), "sentinel");
+
+        var result = await fixture.RunAsync(
+            "-Version", "1.2.3",
+            "-AcceptanceFeedPath", fixture.FeedDirectory,
+            "-OutputDirectory", fixture.OutputDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("existing", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("directory", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(Directory.EnumerateFileSystemEntries(fixture.OutputDirectory));
+    }
+
+    [Fact]
     public async Task RejectsNonEmptyOutputWithoutChangingExistingContent()
     {
         using var fixture = ScriptFixture.Create();
@@ -155,24 +237,17 @@ public sealed class OtaReleaseScriptTests
     {
         using var fixture = ScriptFixture.Create();
         Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
-        var feed = new
-        {
-            Assets = new[]
-            {
-                new
-                {
-                    PackageId = "SuperPan.BaiduBatchTransfer.OtaAcceptance",
-                    Version = "1.2.3",
-                    Type = "Full",
-                    FileName = "SuperPan.BaiduBatchTransfer.OtaAcceptance-1.2.3-full.nupkg",
-                    SHA256 = new string('a', 64),
-                    Size = 123,
-                },
-            },
-        };
-        await File.WriteAllTextAsync(
-            Path.Combine(fixture.PreviousReleaseDirectory, "releases.win-x64-ota-acceptance.json"),
-            JsonSerializer.Serialize(feed));
+        var bytes = new byte[] { 11, 12, 13 };
+        var fileName = "SuperPan.BaiduBatchTransfer.OtaAcceptance-1.2.3-full.nupkg";
+        await File.WriteAllBytesAsync(Path.Combine(fixture.PreviousReleaseDirectory, fileName), bytes);
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-ota-acceptance.json",
+            "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+            "1.2.3",
+            fileName,
+            LowerSha256(bytes),
+            bytes.Length);
 
         var result = await fixture.RunAsync(
             "-Version", "1.2.3",
@@ -183,7 +258,132 @@ public sealed class OtaReleaseScriptTests
             "-AllowUnsignedLocal");
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("already exists", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            result.Output.Contains("already exists", StringComparison.OrdinalIgnoreCase),
+            result.Output);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Fact]
+    public async Task RejectsProductionFeedInPreviousReleaseDirectory()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-stable.json",
+            "SuperPan.BaiduBatchTransfer",
+            "1.2.3",
+            "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg",
+            new string('a', 64),
+            1);
+
+        var result = await fixture.RunWithPreviousAsync("1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("acceptance release feed", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Fact]
+    public async Task RejectsForeignPackageIdentityInAcceptanceNamedFeed()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
+        var bytes = new byte[] { 1, 2, 3 };
+        var fileName = "Foreign.Package-1.2.3-full.nupkg";
+        await File.WriteAllBytesAsync(Path.Combine(fixture.PreviousReleaseDirectory, fileName), bytes);
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-ota-acceptance.json",
+            "Foreign.Package",
+            "1.2.3",
+            fileName,
+            LowerSha256(bytes),
+            bytes.Length);
+
+        var result = await fixture.RunWithPreviousAsync("1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("package ID", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Theory]
+    [InlineData(false, false, "missing")]
+    [InlineData(true, true, "SHA-256")]
+    public async Task RejectsMissingOrMismatchedPackageReferencedByPreviousFeed(
+        bool createPackage,
+        bool useWrongHash,
+        string expectedMessage)
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
+        var bytes = new byte[] { 4, 5, 6 };
+        var fileName = "SuperPan.BaiduBatchTransfer.OtaAcceptance-1.2.3-full.nupkg";
+        if (createPackage)
+            await File.WriteAllBytesAsync(Path.Combine(fixture.PreviousReleaseDirectory, fileName), bytes);
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-ota-acceptance.json",
+            "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+            "1.2.3",
+            fileName,
+            useWrongHash ? new string('a', 64) : LowerSha256(bytes),
+            bytes.Length);
+
+        var result = await fixture.RunWithPreviousAsync("1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedMessage, result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Fact]
+    public async Task RejectsUnreferencedNupkgInPreviousReleaseDirectory()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
+        var bytes = new byte[] { 7, 8, 9 };
+        var fileName = "SuperPan.BaiduBatchTransfer.OtaAcceptance-1.2.3-full.nupkg";
+        await File.WriteAllBytesAsync(Path.Combine(fixture.PreviousReleaseDirectory, fileName), bytes);
+        await File.WriteAllBytesAsync(
+            Path.Combine(fixture.PreviousReleaseDirectory, "Foreign.Package-9.9.9-full.nupkg"),
+            new byte[] { 10 });
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-ota-acceptance.json",
+            "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+            "1.2.3",
+            fileName,
+            LowerSha256(bytes),
+            bytes.Length);
+
+        var result = await fixture.RunWithPreviousAsync("1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("unreferenced", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(fixture.OutputDirectory));
+    }
+
+    [Fact]
+    public async Task RejectsUnsafePackageFileNameInPreviousFeed()
+    {
+        using var fixture = ScriptFixture.Create();
+        Directory.CreateDirectory(fixture.PreviousReleaseDirectory);
+        await WriteFeedAsync(
+            fixture.PreviousReleaseDirectory,
+            "releases.win-x64-ota-acceptance.json",
+            "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+            "1.2.3",
+            "CON.nupkg",
+            LowerSha256(Array.Empty<byte>()),
+            0);
+
+        var result = await fixture.RunWithPreviousAsync("1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("unsafe", result.Output, StringComparison.OrdinalIgnoreCase);
         Assert.False(Directory.Exists(fixture.OutputDirectory));
     }
 
@@ -232,8 +432,10 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("OtaAcceptanceBuild", script, StringComparison.Ordinal);
         Assert.Contains("releases.$acceptanceChannel.json", script, StringComparison.Ordinal);
         Assert.Contains("ConvertFrom-Json", script, StringComparison.Ordinal);
-        Assert.Contains("Get-FileHash", script, StringComparison.Ordinal);
+        Assert.Contains("[Security.Cryptography.SHA256]::Create()", script, StringComparison.Ordinal);
         Assert.Contains("upload-manifest.sha256", script, StringComparison.Ordinal);
+        Assert.Contains("$validatedPreviousAssets", script, StringComparison.Ordinal);
+        Assert.Contains("$manifestAssetPaths", script, StringComparison.Ordinal);
         Assert.Contains("本机 OTA 验收", script, StringComparison.Ordinal);
 
         var forbiddenCommands = new[]
@@ -257,6 +459,28 @@ public sealed class OtaReleaseScriptTests
         FindRepositoryRoot(),
         "scripts",
         "build_ota_release.ps1");
+
+    private static async Task WriteFeedAsync(
+        string directory,
+        string feedName,
+        string packageId,
+        string version,
+        string fileName,
+        string sha256,
+        long size)
+    {
+        var feed = new
+        {
+            Assets = new[]
+            {
+                new { PackageId = packageId, Version = version, Type = "Full", FileName = fileName, SHA256 = sha256, Size = size },
+            },
+        };
+        await File.WriteAllTextAsync(Path.Combine(directory, feedName), JsonSerializer.Serialize(feed));
+    }
+
+    private static string LowerSha256(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
     {
@@ -292,11 +516,26 @@ public sealed class OtaReleaseScriptTests
                 FindRepositoryRoot(),
                 ".artifacts",
                 $"ota-acceptance-script-tests-{Guid.NewGuid():N}");
-            return new ScriptFixture(root);
+            var fixture = new ScriptFixture(root);
+            Directory.CreateDirectory(fixture.FeedDirectory);
+            return fixture;
         }
 
         public Task<ScriptResult> RunAsync(params string[] arguments) =>
-            RunPowerShellAsync(ScriptPath(), arguments);
+            RunPowerShellAsync(ScriptPath(), arguments, null);
+
+        public Task<ScriptResult> RunWithEnvironmentAsync(
+            IReadOnlyDictionary<string, string?> environment,
+            params string[] arguments) =>
+            RunPowerShellAsync(ScriptPath(), arguments, environment);
+
+        public Task<ScriptResult> RunWithPreviousAsync(string version) => RunAsync(
+            "-Version", version,
+            "-AcceptanceFeedPath", FeedDirectory,
+            "-OutputDirectory", OutputDirectory,
+            "-PreviousReleaseDirectory", PreviousReleaseDirectory,
+            "-OtaAcceptanceBuild",
+            "-AllowUnsignedLocal");
 
         public void Dispose()
         {
@@ -304,7 +543,10 @@ public sealed class OtaReleaseScriptTests
         }
     }
 
-    private static async Task<ScriptResult> RunPowerShellAsync(string script, string[] arguments)
+    private static async Task<ScriptResult> RunPowerShellAsync(
+        string script,
+        string[] arguments,
+        IReadOnlyDictionary<string, string?>? environment)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -320,6 +562,15 @@ public sealed class OtaReleaseScriptTests
         startInfo.ArgumentList.Add("-File");
         startInfo.ArgumentList.Add(script);
         foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
+        foreach (var inheritedName in startInfo.Environment.Keys
+                     .Where(name => name.StartsWith("VPK_", StringComparison.OrdinalIgnoreCase))
+                     .ToArray())
+            startInfo.Environment.Remove(inheritedName);
+        if (environment is not null)
+        {
+            foreach (var pair in environment)
+                startInfo.Environment[pair.Key] = pair.Value;
+        }
 
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException("Unable to start PowerShell.");

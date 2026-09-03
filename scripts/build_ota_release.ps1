@@ -23,6 +23,14 @@ $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts'))
 if (-not $OtaAcceptanceBuild -or -not $AllowUnsignedLocal) {
     throw 'Both -OtaAcceptanceBuild and -AllowUnsignedLocal are required for the unsigned local OTA acceptance pipeline.'
 }
+$inheritedVpkVariables = @(Get-ChildItem Env: | Where-Object {
+        $_.Name.StartsWith('VPK_', [StringComparison]::OrdinalIgnoreCase) -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.Value)
+    })
+if ($inheritedVpkVariables.Count -ne 0) {
+    $unsafeNames = @($inheritedVpkVariables | ForEach-Object { $_.Name } | Sort-Object) -join ', '
+    throw "Inherited VPK_* environment variables are not allowed: $unsafeNames"
+}
 if ($acceptancePackageId -ceq $productionPackageId -or
     $acceptanceChannel -ceq $productionChannel) {
     throw 'The OTA acceptance package ID and channel must remain distinct from production.'
@@ -67,6 +75,30 @@ function Assert-ExistingPathIsNotReparsePoint([string]$Path, [string]$Descriptio
     }
 }
 
+function Get-LowerSha256([string]$Path) {
+    $stream = [IO.File]::Open(
+        $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $hash = $algorithm.ComputeHash($stream) }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+    return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
+}
+
+function Test-SafeNupkgFileName([string]$FileName) {
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName.Length -gt 255 -or
+        $FileName -cne [IO.Path]::GetFileName($FileName) -or
+        [IO.Path]::GetExtension($FileName) -cne '.nupkg' -or
+        $FileName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or
+        $FileName.EndsWith(' ') -or $FileName.EndsWith('.')) {
+        return $false
+    }
+    $stem = $FileName.Split('.')[0].ToUpperInvariant()
+    return $stem -notin @(
+        'CON', 'PRN', 'AUX', 'NUL',
+        'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+        'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9')
+}
+
 function Assert-NonReparseExistingAncestors([string]$Path, [string]$Boundary) {
     if (-not $Path.Equals($Boundary, [StringComparison]::OrdinalIgnoreCase) -and
         -not (Test-PathWithin $Path $Boundary)) {
@@ -89,7 +121,13 @@ function Assert-NonReparseExistingAncestors([string]$Path, [string]$Boundary) {
     }
 }
 
+if ($AcceptanceFeedPath -match '^\\\\') {
+    throw 'AcceptanceFeedPath must be an absolute local filesystem directory, not a UNC path.'
+}
 $acceptanceFeed = Resolve-AbsolutePath $AcceptanceFeedPath 'AcceptanceFeedPath'
+if (-not (Test-Path -LiteralPath $acceptanceFeed -PathType Container)) {
+    throw 'AcceptanceFeedPath must be an existing local filesystem directory.'
+}
 $outputPath = Resolve-AbsolutePath $OutputDirectory 'OutputDirectory'
 if (-not (Test-PathWithin $outputPath $artifactRoot)) {
     throw 'OutputDirectory must be inside the repository .artifacts directory.'
@@ -119,6 +157,7 @@ if (Test-Path -LiteralPath $outputPath) {
 }
 
 $previousPath = $null
+$validatedPreviousAssets = @()
 if (-not [string]::IsNullOrWhiteSpace($PreviousReleaseDirectory)) {
     $previousPath = Resolve-AbsolutePath $PreviousReleaseDirectory 'PreviousReleaseDirectory'
     if (-not (Test-Path -LiteralPath $previousPath -PathType Container)) {
@@ -131,23 +170,93 @@ if (-not [string]::IsNullOrWhiteSpace($PreviousReleaseDirectory)) {
         throw 'PreviousReleaseDirectory and OutputDirectory must be separate directories.'
     }
 
-    $escapedVersion = [Text.RegularExpressions.Regex]::Escape($Version)
-    foreach ($feedFile in [IO.Directory]::EnumerateFiles($previousPath, 'releases.*.json',
-            [IO.SearchOption]::TopDirectoryOnly)) {
-        Assert-ExistingPathIsNotReparsePoint $feedFile 'Previous release feed'
-        $feedText = [IO.File]::ReadAllText($feedFile)
-        if ($feedText -match ('(?i)"version"\s*:\s*"' + $escapedVersion + '"')) {
-            throw "Version $Version already exists in the previous release feed."
+    $expectedPreviousFeedName = "releases.$acceptanceChannel.json"
+    $previousFeedFiles = @([IO.Directory]::EnumerateFiles(
+            $previousPath, 'releases.*.json', [IO.SearchOption]::TopDirectoryOnly))
+    if ($previousFeedFiles.Count -ne 1 -or
+        [IO.Path]::GetFileName($previousFeedFiles[0]) -cne $expectedPreviousFeedName) {
+        throw "PreviousReleaseDirectory must contain only the acceptance release feed $expectedPreviousFeedName."
+    }
+    $previousFeedPath = $previousFeedFiles[0]
+    Assert-ExistingPathIsNotReparsePoint $previousFeedPath 'Previous acceptance release feed'
+    try {
+        $previousFeed = [IO.File]::ReadAllText($previousFeedPath) | ConvertFrom-Json
+    }
+    catch {
+        throw 'Previous acceptance release feed is not valid JSON.'
+    }
+    if ($null -eq $previousFeed.PSObject.Properties['Assets']) {
+        throw 'Previous acceptance release feed has no Assets property.'
+    }
+    $previousFeedAssets = @($previousFeed.Assets)
+    if ($previousFeedAssets.Count -eq 0) {
+        throw 'Previous acceptance release feed contains no assets.'
+    }
+    $referencedPreviousPackages = New-Object `
+        'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $containsRequestedVersion = $false
+    foreach ($asset in $previousFeedAssets) {
+        foreach ($propertyName in @('PackageId', 'Version', 'FileName', 'SHA256', 'Size')) {
+            if ($null -eq $asset -or $null -eq $asset.PSObject.Properties[$propertyName]) {
+                throw "Previous acceptance release feed asset is missing $propertyName."
+            }
+        }
+        if ([string]$asset.PackageId -cne $acceptancePackageId) {
+            throw 'Previous acceptance release feed contains a foreign package ID.'
+        }
+        $fileName = [string]$asset.FileName
+        if (-not (Test-SafeNupkgFileName $fileName)) {
+            throw 'Previous acceptance release feed contains an unsafe package file name.'
+        }
+        if ($referencedPreviousPackages.ContainsKey($fileName)) {
+            throw "Previous acceptance release feed contains duplicate package file name: $fileName"
+        }
+        $declaredHash = [string]$asset.SHA256
+        if ($declaredHash -cnotmatch '^[0-9A-Fa-f]{64}$') {
+            throw "Previous acceptance release feed contains an invalid SHA-256: $fileName"
+        }
+        try { $declaredSize = [long]$asset.Size }
+        catch { throw "Previous acceptance release feed contains an invalid size: $fileName" }
+        if ($declaredSize -lt 0) {
+            throw "Previous acceptance release feed contains an invalid size: $fileName"
+        }
+        $packagePath = Join-Path $previousPath $fileName
+        if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+            throw "Previous acceptance release feed referenced package is missing: $fileName"
+        }
+        Assert-ExistingPathIsNotReparsePoint $packagePath 'Previous acceptance package'
+        $packageInfo = [IO.FileInfo]::new($packagePath)
+        if ($packageInfo.Length -ne $declaredSize) {
+            throw "Previous acceptance package size does not match its feed: $fileName"
+        }
+        $actualHash = Get-LowerSha256 $packagePath
+        if ($actualHash -cne $declaredHash.ToLowerInvariant()) {
+            throw "Previous acceptance package SHA-256 does not match its feed: $fileName"
+        }
+        $referencedPreviousPackages.Add($fileName, [pscustomobject]@{
+                FileName = $fileName
+                FullPath = $packagePath
+            })
+        if ([string]$asset.Version -ceq $Version) { $containsRequestedVersion = $true }
+    }
+    foreach ($packageFile in [IO.Directory]::EnumerateFiles(
+            $previousPath, '*.nupkg', [IO.SearchOption]::TopDirectoryOnly)) {
+        Assert-ExistingPathIsNotReparsePoint $packageFile 'Previous acceptance package'
+        $actualName = [IO.Path]::GetFileName($packageFile)
+        if (-not $referencedPreviousPackages.ContainsKey($actualName)) {
+            throw "PreviousReleaseDirectory contains an unreferenced nupkg: $actualName"
+        }
+        if ($actualName -cne [string]$referencedPreviousPackages[$actualName].FileName) {
+            throw "Previous acceptance package casing differs from its feed: $actualName"
         }
     }
-    foreach ($packageFile in [IO.Directory]::EnumerateFiles($previousPath, '*.nupkg',
-            [IO.SearchOption]::TopDirectoryOnly)) {
-        Assert-ExistingPathIsNotReparsePoint $packageFile 'Previous release package'
-        if ([IO.Path]::GetFileName($packageFile) -match
-            ('(?i)(?:^|[.-])' + $escapedVersion + '(?:[.-]|$)')) {
-            throw "Version $Version already exists in the previous release assets."
-        }
+    if ($containsRequestedVersion) {
+        throw "Version $Version already exists in the previous release feed."
     }
+    $validatedPreviousAssets = @($previousFeedPath) + @(
+        $referencedPreviousPackages.Values |
+            Sort-Object FileName |
+            ForEach-Object { $_.FullPath })
 }
 
 $releaseNotes = $null
@@ -340,12 +449,8 @@ $helperGateArguments = @(
 [void](Invoke-RecordedCommand 'verify-managed-browser-helper' 'powershell.exe' $helperGateArguments)
 
 if ($null -ne $previousPath) {
-    foreach ($previousAsset in [IO.Directory]::EnumerateFiles($previousPath, '*',
-            [IO.SearchOption]::TopDirectoryOnly)) {
+    foreach ($previousAsset in $validatedPreviousAssets) {
         $name = [IO.Path]::GetFileName($previousAsset)
-        if ($name -notmatch '^(?:releases\.[A-Za-z0-9.-]+\.json|[A-Za-z0-9._-]+\.nupkg)$') {
-            continue
-        }
         Assert-ExistingPathIsNotReparsePoint $previousAsset 'Previous release asset'
         $destination = Join-Path $outputPath $name
         if (Test-Path -LiteralPath $destination) {
@@ -369,24 +474,40 @@ $vpkArguments = @(
 [void](Invoke-RecordedCommand 'vpk-pack' 'dotnet' $vpkArguments)
 
 $releaseFeedPath = Join-Path $outputPath "releases.$acceptanceChannel.json"
-if (-not (Test-Path -LiteralPath $releaseFeedPath -PathType Leaf)) {
+$releaseFeedFiles = @([IO.Directory]::EnumerateFiles(
+        $outputPath, 'releases.*.json', [IO.SearchOption]::TopDirectoryOnly))
+if ($releaseFeedFiles.Count -ne 1 -or
+    [IO.Path]::GetFileName($releaseFeedFiles[0]) -cne [IO.Path]::GetFileName($releaseFeedPath) -or
+    -not (Test-Path -LiteralPath $releaseFeedPath -PathType Leaf)) {
     throw "Expected release feed is missing: $releaseFeedPath"
 }
-$releaseFeed = [IO.File]::ReadAllText($releaseFeedPath) | ConvertFrom-Json
+Assert-ExistingPathIsNotReparsePoint $releaseFeedPath 'Release feed'
+try { $releaseFeed = [IO.File]::ReadAllText($releaseFeedPath) | ConvertFrom-Json }
+catch { throw 'Generated release feed is not valid JSON.' }
+if ($null -eq $releaseFeed.PSObject.Properties['Assets']) {
+    throw 'Generated release feed has no Assets property.'
+}
 $assets = @($releaseFeed.Assets)
 if ($assets.Count -eq 0) { throw 'Release feed contains no assets.' }
-$targetAssets = @($assets | Where-Object {
-    [string]$_.PackageId -ceq $acceptancePackageId -and [string]$_.Version -ceq $Version
-})
-if ($targetAssets.Count -eq 0) {
-    throw 'Release feed does not contain the requested acceptance package and version.'
-}
+$referencedReleasePackages = New-Object `
+    'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+$targetAssetCount = 0
 $hasFullPackage = $false
-foreach ($asset in $targetAssets) {
+foreach ($asset in $assets) {
+    foreach ($propertyName in @('PackageId', 'Version', 'Type', 'FileName', 'SHA256', 'Size')) {
+        if ($null -eq $asset -or $null -eq $asset.PSObject.Properties[$propertyName]) {
+            throw "Release feed asset is missing $propertyName."
+        }
+    }
+    if ([string]$asset.PackageId -cne $acceptancePackageId) {
+        throw 'Release feed contains a foreign package ID.'
+    }
     $fileName = [string]$asset.FileName
-    if ([string]::IsNullOrWhiteSpace($fileName) -or
-        $fileName -cne [IO.Path]::GetFileName($fileName)) {
+    if (-not (Test-SafeNupkgFileName $fileName)) {
         throw 'Release feed contains an unsafe asset file name.'
+    }
+    if ($referencedReleasePackages.ContainsKey($fileName)) {
+        throw "Release feed contains duplicate asset file name: $fileName"
     }
     $assetPath = Join-Path $outputPath $fileName
     if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
@@ -394,35 +515,74 @@ foreach ($asset in $targetAssets) {
     }
     Assert-ExistingPathIsNotReparsePoint $assetPath 'Release asset'
     $assetInfo = [IO.FileInfo]::new($assetPath)
-    if ([long]$asset.Size -ne $assetInfo.Length) {
+    $declaredHash = [string]$asset.SHA256
+    if ($declaredHash -cnotmatch '^[0-9A-Fa-f]{64}$') {
+        throw "Release feed contains an invalid SHA-256: $fileName"
+    }
+    try { $declaredSize = [long]$asset.Size }
+    catch { throw "Release feed contains an invalid size: $fileName" }
+    if ($declaredSize -lt 0 -or $declaredSize -ne $assetInfo.Length) {
         throw "Release feed size differs from the asset: $fileName"
     }
-    $actualHash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ([string]$asset.SHA256 -cne $actualHash) {
+    $actualHash = Get-LowerSha256 $assetPath
+    if ($declaredHash.ToLowerInvariant() -cne $actualHash) {
         throw "Release feed SHA-256 differs from the asset: $fileName"
     }
-    if ([string]$asset.Type -match '(?i)full') { $hasFullPackage = $true }
+    $referencedReleasePackages.Add($fileName, [pscustomobject]@{
+            FileName = $fileName
+            FullPath = $assetPath
+        })
+    if ([string]$asset.Version -ceq $Version) {
+        $targetAssetCount++
+        if ([string]$asset.Type -match '(?i)full') { $hasFullPackage = $true }
+    }
+}
+if ($targetAssetCount -eq 0) {
+    throw 'Release feed does not contain the requested acceptance package and version.'
+}
+foreach ($packageFile in [IO.Directory]::EnumerateFiles(
+        $outputPath, '*.nupkg', [IO.SearchOption]::TopDirectoryOnly)) {
+    $actualName = [IO.Path]::GetFileName($packageFile)
+    if (-not $referencedReleasePackages.ContainsKey($actualName)) {
+        throw "Output contains an unreferenced nupkg: $actualName"
+    }
+    if ($actualName -cne [string]$referencedReleasePackages[$actualName].FileName) {
+        throw "Output package casing differs from the release feed: $actualName"
+    }
 }
 if (-not $hasFullPackage) { throw 'Release feed does not contain a full package for this version.' }
 
-$setupFiles = @([IO.Directory]::EnumerateFiles($outputPath, '*Setup*.exe',
+$setupFiles = @([IO.Directory]::EnumerateFiles($outputPath, "$acceptancePackageId*Setup*.exe",
     [IO.SearchOption]::TopDirectoryOnly))
-$portableFiles = @([IO.Directory]::EnumerateFiles($outputPath, '*Portable*.zip',
+$portableFiles = @([IO.Directory]::EnumerateFiles($outputPath, "$acceptancePackageId*Portable*.zip",
     [IO.SearchOption]::TopDirectoryOnly))
-$fullPackages = @([IO.Directory]::EnumerateFiles($outputPath, '*full*.nupkg',
-    [IO.SearchOption]::TopDirectoryOnly))
-if ($setupFiles.Count -eq 0 -or $portableFiles.Count -eq 0 -or $fullPackages.Count -eq 0) {
+if ($setupFiles.Count -eq 0 -or $portableFiles.Count -eq 0) {
     throw 'Setup, Portable ZIP, or full nupkg acceptance output is missing.'
 }
 
-$uploadAssets = @([IO.Directory]::EnumerateFiles($outputPath, '*',
-        [IO.SearchOption]::TopDirectoryOnly) | Where-Object {
-        $_ -match '\.(?:json|nupkg|exe|zip)$'
-    } | Sort-Object { [IO.Path]::GetFileName($_) })
-if ($uploadAssets.Count -eq 0) { throw 'No upload assets were generated.' }
-$manifestLines = foreach ($assetPath in $uploadAssets) {
+$manifestAssetPaths = @(
+    @($releaseFeedPath) +
+    @($referencedReleasePackages.Values | ForEach-Object { $_.FullPath }) +
+    @($setupFiles) +
+    @($portableFiles) |
+        Sort-Object { [IO.Path]::GetFileName($_) }
+)
+$manifestAssetSet = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($assetPath in $manifestAssetPaths) {
+    if (-not $manifestAssetSet.Add([IO.Path]::GetFullPath($assetPath))) {
+        throw "Duplicate upload asset path: $assetPath"
+    }
+}
+foreach ($candidate in [IO.Directory]::EnumerateFiles(
+        $outputPath, '*', [IO.SearchOption]::TopDirectoryOnly)) {
+    if ([IO.Path]::GetExtension($candidate) -notin @('.json', '.nupkg', '.exe', '.zip')) { continue }
+    if (-not $manifestAssetSet.Contains([IO.Path]::GetFullPath($candidate))) {
+        throw "Output contains a foreign asset that is excluded from the upload manifest: $candidate"
+    }
+}
+$manifestLines = foreach ($assetPath in $manifestAssetPaths) {
     Assert-ExistingPathIsNotReparsePoint $assetPath 'Upload asset'
-    $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hash = Get-LowerSha256 $assetPath
     "$hash  $([IO.Path]::GetFileName($assetPath))"
 }
 $manifestPath = Join-Path $outputPath 'upload-manifest.sha256'
