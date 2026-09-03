@@ -62,7 +62,7 @@
 - `src/BaiduBatchTransfer.App/MainWindowViewModel.cs`：验收版标题标识和启动发现新版的一次轻量提示。
 - `tests/BaiduBatchTransfer.App.Tests/AppBootstrapTests.cs`：DI、设置页和版本接线。
 - `tests/BaiduBatchTransfer.App.Tests/ApplicationShutdownCoordinatorTests.cs`：更新应用严格晚于安全关闭。
-- `tests/BaiduBatchTransfer.App.Tests/MainWindowChromeTests.cs`：显式入口和资源仍完整。
+- `tests/BaiduBatchTransfer.App.Tests/Updates/VelopackStartupStructureTests.cs`：显式入口和资源仍完整；不接管基线中预存的未跟踪 `MainWindowChromeTests.cs`。
 - `tests/BaiduBatchTransfer.App.Tests/StartupDataRootSelectorTests.cs`：正式与验收数据根隔离。
 - `docs/testing/2026-09-01.md`：追加 OTA 本地验收交接结果。
 
@@ -215,7 +215,7 @@ git commit -m "feat: define OTA build identity"
 - Modify: `src/BaiduBatchTransfer.App/App.xaml.cs`
 - Modify: `src/BaiduBatchTransfer.App/packages.lock.json`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/packages.lock.json`
-- Modify: `tests/BaiduBatchTransfer.App.Tests/MainWindowChromeTests.cs`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Updates/VelopackStartupStructureTests.cs`
 
 - [ ] **Step 1: 写显式入口结构测试**
 
@@ -232,7 +232,7 @@ Assert.Contains("<Page Include=\"App.xaml\"", project);
 
 - [ ] **Step 2: 运行测试并确认 RED**
 
-Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Debug --filter "FullyQualifiedName~MainWindowChromeTests" --logger "console;verbosity=minimal"`
+Run: `dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Debug --filter "FullyQualifiedName~VelopackStartupStructureTests" --logger "console;verbosity=minimal"`
 
 Expected: FAIL，因为 `Program.cs` 和 Velopack 引导尚不存在。
 
@@ -262,7 +262,7 @@ app.Run();
 Run:
 
 ```text
-dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Debug --filter "FullyQualifiedName~MainWindowChromeTests" --logger "console;verbosity=minimal"
+dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Debug --filter "FullyQualifiedName~VelopackStartupStructureTests" --logger "console;verbosity=minimal"
 dotnet build src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj -c Debug --no-restore
 ```
 
@@ -716,7 +716,7 @@ git commit -m "build: add guarded OTA release pipeline"
 Run:
 
 ```text
-dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Release --filter "FullyQualifiedName~ApplicationBuildInfoTests|FullyQualifiedName~OtaBuildConfigurationTests|FullyQualifiedName~StartupDataRootSelectorTests|FullyQualifiedName~ApplicationUpdateServiceTests|FullyQualifiedName~VelopackUpdateRuntimeTests|FullyQualifiedName~SettingsViewModelTests|FullyQualifiedName~SettingsViewStructureTests|FullyQualifiedName~UpdateShutdownIntegrationTests|FullyQualifiedName~OtaReleaseScriptTests|FullyQualifiedName~ApplicationShutdownCoordinatorTests|FullyQualifiedName~AppBootstrapTests|FullyQualifiedName~MainWindowChromeTests|FullyQualifiedName~MainWindowViewModelTests" --logger "console;verbosity=minimal"
+dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj -c Release --filter "FullyQualifiedName~ApplicationBuildInfoTests|FullyQualifiedName~OtaBuildConfigurationTests|FullyQualifiedName~StartupDataRootSelectorTests|FullyQualifiedName~ApplicationUpdateServiceTests|FullyQualifiedName~VelopackUpdateRuntimeTests|FullyQualifiedName~SettingsViewModelTests|FullyQualifiedName~SettingsViewStructureTests|FullyQualifiedName~UpdateShutdownIntegrationTests|FullyQualifiedName~OtaReleaseScriptTests|FullyQualifiedName~ApplicationShutdownCoordinatorTests|FullyQualifiedName~AppBootstrapTests|FullyQualifiedName~VelopackStartupStructureTests|FullyQualifiedName~MainWindowViewModelTests" --logger "console;verbosity=minimal"
 dotnet build src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj -c Release --no-restore -warnaserror
 git diff --check
 ```
