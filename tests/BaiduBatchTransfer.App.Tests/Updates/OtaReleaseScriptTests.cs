@@ -708,6 +708,22 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Fact]
+    public async Task FakeToolchainPreservesNonAsciiDefaultReleaseNotesUnderWindowsPowerShell()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(tamperHash: false);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+        using var releaseFeed = JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(fixture.OutputDirectory, "releases.win-x64-ota-acceptance.json")));
+        Assert.All(
+            releaseFeed.RootElement.GetProperty("Assets").EnumerateArray().ToArray(),
+            asset => Assert.Contains("本机 OTA 验收构建。", asset.GetProperty("NotesMarkdown").GetString(), StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task FakeToolchainRejectsAssetCatalogThatReferencesForeignOutput()
     {
         using var fixture = ScriptFixture.Create();

@@ -436,7 +436,9 @@ function Invoke-RecordedCommand(
 }
 
 if ($null -eq $releaseNotes) {
-    $effectiveReleaseNotesText = "# $Version`n`n本机 OTA 验收构建。`n"
+    $defaultReleaseNotesLabel = ('{"value":"\u672c\u673a OTA \u9a8c\u6536\u6784\u5efa\u3002"}' |
+        ConvertFrom-Json).value
+    $effectiveReleaseNotesText = "# $Version`n`n$defaultReleaseNotesLabel`n"
 }
 else {
     try { $effectiveReleaseNotesText = [IO.File]::ReadAllText($releaseNotes) }
