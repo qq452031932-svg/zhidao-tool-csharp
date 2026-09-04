@@ -131,6 +131,15 @@ function Get-LowerSha256([string]$Path) {
     return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
 }
 
+function Get-LowerSha1([string]$Path) {
+    $stream = [IO.File]::Open(
+        $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $algorithm = [Security.Cryptography.SHA1]::Create()
+    try { $hash = $algorithm.ComputeHash($stream) }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+    return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
+}
+
 function Test-SafeNupkgFileName([string]$FileName) {
     if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName.Length -gt 255 -or
         $FileName -cne [IO.Path]::GetFileName($FileName) -or
@@ -604,7 +613,7 @@ if ($assets.Count -eq 0) { throw 'Release feed contains no assets.' }
 $referencedReleasePackages = New-Object `
     'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
 $targetAssetCount = 0
-$hasFullPackage = $false
+$targetFullPackagePaths = New-Object 'Collections.Generic.List[string]'
 foreach ($asset in $assets) {
     foreach ($propertyName in @('PackageId', 'Version', 'Type', 'FileName', 'SHA256', 'Size')) {
         if ($null -eq $asset -or $null -eq $asset.PSObject.Properties[$propertyName]) {
@@ -646,7 +655,7 @@ foreach ($asset in $assets) {
         })
     if ([string]$asset.Version -ceq $Version) {
         $targetAssetCount++
-        if ([string]$asset.Type -match '(?i)full') { $hasFullPackage = $true }
+        if ([string]$asset.Type -ceq 'Full') { $targetFullPackagePaths.Add($assetPath) }
     }
 }
 if ($targetAssetCount -eq 0) {
@@ -662,18 +671,120 @@ foreach ($packageFile in [IO.Directory]::EnumerateFiles(
         throw "Output package casing differs from the release feed: $actualName"
     }
 }
-if (-not $hasFullPackage) { throw 'Release feed does not contain a full package for this version.' }
+if ($targetFullPackagePaths.Count -ne 1) {
+    throw 'Release feed must contain exactly one full package for this version.'
+}
 
 $setupFiles = @([IO.Directory]::EnumerateFiles($outputPath, "$acceptancePackageId*Setup*.exe",
     [IO.SearchOption]::TopDirectoryOnly))
 $portableFiles = @([IO.Directory]::EnumerateFiles($outputPath, "$acceptancePackageId*Portable*.zip",
     [IO.SearchOption]::TopDirectoryOnly))
-if ($setupFiles.Count -eq 0 -or $portableFiles.Count -eq 0) {
+if ($setupFiles.Count -ne 1 -or $portableFiles.Count -ne 1) {
     throw 'Setup, Portable ZIP, or full nupkg acceptance output is missing.'
+}
+
+$assetCatalogPath = Join-Path $outputPath "assets.$acceptanceChannel.json"
+$assetCatalogFiles = @([IO.Directory]::EnumerateFiles(
+        $outputPath, 'assets.*.json', [IO.SearchOption]::TopDirectoryOnly))
+if ($assetCatalogFiles.Count -ne 1 -or
+    [IO.Path]::GetFileName($assetCatalogFiles[0]) -cne [IO.Path]::GetFileName($assetCatalogPath) -or
+    -not (Test-Path -LiteralPath $assetCatalogPath -PathType Leaf)) {
+    throw "Expected asset catalog is missing: $assetCatalogPath"
+}
+Assert-ExistingPathIsNotReparsePoint $assetCatalogPath 'Asset catalog'
+try { $parsedAssetCatalog = [IO.File]::ReadAllText($assetCatalogPath) | ConvertFrom-Json }
+catch { throw 'Generated asset catalog is not valid JSON.' }
+if ($parsedAssetCatalog -isnot [array]) {
+    throw 'Generated asset catalog must be a JSON array.'
+}
+$assetCatalogEntries = @($parsedAssetCatalog)
+if ($assetCatalogEntries.Count -ne 3) {
+    throw 'Generated asset catalog must contain exactly three assets.'
+}
+$expectedCatalogFiles = New-Object `
+    'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+$expectedCatalogFiles.Add('Installer', [IO.Path]::GetFileName($setupFiles[0]))
+$expectedCatalogFiles.Add('Full', [IO.Path]::GetFileName($targetFullPackagePaths[0]))
+$expectedCatalogFiles.Add('Portable', [IO.Path]::GetFileName($portableFiles[0]))
+$catalogTypes = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+$catalogFileNames = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($catalogEntry in $assetCatalogEntries) {
+    if ($null -eq $catalogEntry) {
+        throw 'Generated asset catalog contains a null asset.'
+    }
+    $propertyNames = @($catalogEntry.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($propertyNames.Count -ne 2 -or
+        -not ($propertyNames -ccontains 'RelativeFileName') -or
+        -not ($propertyNames -ccontains 'Type')) {
+        throw 'Generated asset catalog contains missing or unknown properties.'
+    }
+    $catalogType = [string]$catalogEntry.Type
+    $relativeFileName = [string]$catalogEntry.RelativeFileName
+    if (-not $expectedCatalogFiles.ContainsKey($catalogType)) {
+        throw "Generated asset catalog contains an unknown asset type: $catalogType"
+    }
+    if (-not $catalogTypes.Add($catalogType)) {
+        throw "Generated asset catalog contains a duplicate asset type: $catalogType"
+    }
+    if ([string]::IsNullOrWhiteSpace($relativeFileName) -or
+        $relativeFileName -cne [IO.Path]::GetFileName($relativeFileName) -or
+        $relativeFileName -cne $expectedCatalogFiles[$catalogType] -or
+        -not $catalogFileNames.Add($relativeFileName)) {
+        throw "Generated asset catalog contains an unsafe or unexpected reference: $relativeFileName"
+    }
+    $catalogAssetPath = Join-Path $outputPath $relativeFileName
+    if (-not (Test-Path -LiteralPath $catalogAssetPath -PathType Leaf)) {
+        throw "Generated asset catalog references a missing asset: $relativeFileName"
+    }
+    Assert-ExistingPathIsNotReparsePoint $catalogAssetPath 'Asset catalog reference'
+    if ([IO.FileInfo]::new($catalogAssetPath).Length -le 0) {
+        throw "Generated asset catalog references an empty asset: $relativeFileName"
+    }
+}
+
+$releasesIndexPath = Join-Path $outputPath "RELEASES-$acceptanceChannel"
+$releasesIndexFiles = @([IO.Directory]::EnumerateFiles(
+        $outputPath, 'RELEASES-*', [IO.SearchOption]::TopDirectoryOnly))
+if ($releasesIndexFiles.Count -ne 1 -or
+    [IO.Path]::GetFileName($releasesIndexFiles[0]) -cne [IO.Path]::GetFileName($releasesIndexPath) -or
+    -not (Test-Path -LiteralPath $releasesIndexPath -PathType Leaf)) {
+    throw "Expected RELEASES index is missing: $releasesIndexPath"
+}
+Assert-ExistingPathIsNotReparsePoint $releasesIndexPath 'RELEASES index'
+try { $releasesLines = @([IO.File]::ReadAllLines($releasesIndexPath)) }
+catch { throw 'Generated RELEASES index cannot be read.' }
+if ($releasesLines.Count -ne $referencedReleasePackages.Count -or $releasesLines.Count -eq 0) {
+    throw 'Generated RELEASES index does not reference every release package exactly once.'
+}
+$indexedReleasePackages = New-Object `
+    'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($releaseLine in $releasesLines) {
+    if ($releaseLine -cnotmatch '^(?<sha1>[0-9A-F]{40}) (?<file>[^\s]+) (?<size>[0-9]+)$') {
+        throw 'Generated RELEASES index contains an invalid line.'
+    }
+    $indexedFileName = [string]$Matches.file
+    if (-not (Test-SafeNupkgFileName $indexedFileName) -or
+        -not $referencedReleasePackages.ContainsKey($indexedFileName) -or
+        -not $indexedReleasePackages.Add($indexedFileName) -or
+        $indexedFileName -cne [string]$referencedReleasePackages[$indexedFileName].FileName) {
+        throw "Generated RELEASES index contains an unsafe, foreign, or duplicate reference: $indexedFileName"
+    }
+    $indexedPath = [string]$referencedReleasePackages[$indexedFileName].FullPath
+    Assert-ExistingPathIsNotReparsePoint $indexedPath 'RELEASES index reference'
+    try { $indexedSize = [long]$Matches.size }
+    catch { throw "Generated RELEASES index contains an invalid size: $indexedFileName" }
+    if ($indexedSize -le 0 -or $indexedSize -ne [IO.FileInfo]::new($indexedPath).Length) {
+        throw "Generated RELEASES size differs from the asset: $indexedFileName"
+    }
+    if (([string]$Matches.sha1).ToLowerInvariant() -cne (Get-LowerSha1 $indexedPath)) {
+        throw "Generated RELEASES SHA-1 differs from the asset: $indexedFileName"
+    }
 }
 
 $manifestAssetPaths = @(
     @($releaseFeedPath) +
+    @($assetCatalogPath) +
+    @($releasesIndexPath) +
     @($referencedReleasePackages.Values | ForEach-Object { $_.FullPath }) +
     @($setupFiles) +
     @($portableFiles) |
@@ -687,7 +798,6 @@ foreach ($assetPath in $manifestAssetPaths) {
 }
 foreach ($candidate in [IO.Directory]::EnumerateFiles(
         $outputPath, '*', [IO.SearchOption]::TopDirectoryOnly)) {
-    if ([IO.Path]::GetExtension($candidate) -notin @('.json', '.nupkg', '.exe', '.zip')) { continue }
     if (-not $manifestAssetSet.Contains([IO.Path]::GetFullPath($candidate))) {
         throw "Output contains a foreign asset that is excluded from the upload manifest: $candidate"
     }

@@ -542,7 +542,13 @@ public sealed class OtaReleaseScriptTests
         var manifestPath = Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256");
         Assert.True(File.Exists(manifestPath));
         var manifestLines = await File.ReadAllLinesAsync(manifestPath);
-        Assert.Equal(4, manifestLines.Length);
+        Assert.Equal(6, manifestLines.Length);
+        Assert.Contains(
+            manifestLines,
+            line => line.EndsWith("  assets.win-x64-ota-acceptance.json", StringComparison.Ordinal));
+        Assert.Contains(
+            manifestLines,
+            line => line.EndsWith("  RELEASES-win-x64-ota-acceptance", StringComparison.Ordinal));
         foreach (var line in manifestLines)
         {
             var pieces = line.Split("  ", 2, StringSplitOptions.None);
@@ -552,6 +558,42 @@ public sealed class OtaReleaseScriptTests
             Assert.Equal(LowerSha256(await File.ReadAllBytesAsync(asset)), pieces[0]);
         }
         Assert.True(File.Exists(Path.Combine(fixture.OutputDirectory, "LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsAssetCatalogThatReferencesForeignOutput()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_ASSETS_MODE"] = "foreign-reference",
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("asset catalog", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsReleasesIndexWithTamperedSha1()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_RELEASES_MODE"] = "bad-hash",
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("RELEASES SHA-1", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
     }
 
     [Theory]
@@ -954,6 +996,14 @@ function Get-LowerSha256([string]$Path) {
     return ([BitConverter]::ToString($hash).Replace('-', '')).ToLowerInvariant()
 }
 
+function Get-UpperSha1([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA1]::Create()
+    try { $hash = $algorithm.ComputeHash($stream) }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+    return [BitConverter]::ToString($hash).Replace('-', '')
+}
+
 Write-FakeLog
 $joined = $ToolArgs -join ' '
 if (-not [string]::IsNullOrWhiteSpace($env:FAKE_OTA_FAIL_PREFIX) -and
@@ -997,16 +1047,20 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
     $channel = Get-ArgumentValue '--channel'
     $packageName = "$packageId-$version-full.nupkg"
     $packagePath = Join-Path $outputDirectory $packageName
+    $setupName = "$packageId-Setup.exe"
+    $portableName = "$packageId-Portable.zip"
     [IO.File]::WriteAllBytes($packagePath, [byte[]](10, 20, 30, 40))
-    [IO.File]::WriteAllBytes((Join-Path $outputDirectory "$packageId-Setup.exe"), [byte[]](50, 60))
-    [IO.File]::WriteAllBytes((Join-Path $outputDirectory "$packageId-Portable.zip"), [byte[]](70, 80))
+    [IO.File]::WriteAllBytes((Join-Path $outputDirectory $setupName), [byte[]](50, 60))
+    [IO.File]::WriteAllBytes((Join-Path $outputDirectory $portableName), [byte[]](70, 80))
     $hash = if ($env:FAKE_OTA_TAMPER_HASH -ceq '1') { 'a' * 64 } else { Get-LowerSha256 $packagePath }
+    $sha1 = Get-UpperSha1 $packagePath
     $feed = [ordered]@{
         Assets = @([ordered]@{
                 PackageId = $packageId
                 Version = $version
                 Type = 'Full'
                 FileName = $packageName
+                SHA1 = $sha1
                 SHA256 = $hash
                 Size = ([IO.FileInfo]::new($packagePath)).Length
             })
@@ -1014,6 +1068,22 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
     [IO.File]::WriteAllText(
         (Join-Path $outputDirectory "releases.$channel.json"),
         ($feed | ConvertTo-Json -Depth 4))
+    $catalogPortableName = if ($env:FAKE_OTA_ASSETS_MODE -ceq 'foreign-reference') {
+        'foreign.zip'
+    }
+    else { $portableName }
+    $catalog = @(
+        [ordered]@{ RelativeFileName = $setupName; Type = 'Installer' },
+        [ordered]@{ RelativeFileName = $packageName; Type = 'Full' },
+        [ordered]@{ RelativeFileName = $catalogPortableName; Type = 'Portable' }
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $outputDirectory "assets.$channel.json"),
+        ($catalog | ConvertTo-Json -Depth 3 -Compress))
+    $releasesSha1 = if ($env:FAKE_OTA_RELEASES_MODE -ceq 'bad-hash') { '0' * 40 } else { $sha1 }
+    [IO.File]::WriteAllText(
+        (Join-Path $outputDirectory "RELEASES-$channel"),
+        "$releasesSha1 $packageName $([IO.FileInfo]::new($packagePath).Length)`n")
     Write-Output 'fake vpk pack'
     exit 0
 }
