@@ -353,6 +353,7 @@ $logDirectory = Join-Path $workingDirectory 'logs'
 [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
 $commandLogPath = Join-Path $logDirectory 'commands.jsonl'
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
+$utf8Bom = New-Object Text.UTF8Encoding($true)
 
 function Invoke-RecordedCommand(
     [string]$Name,
@@ -435,13 +436,23 @@ function Invoke-RecordedCommand(
 }
 
 if ($null -eq $releaseNotes) {
-    $releaseNotes = Join-Path $workingDirectory 'release-notes.md'
-    [IO.File]::WriteAllText(
-        $releaseNotes,
-        "# $Version`n`n本机 OTA 验收构建。`n",
-        $utf8NoBom)
+    $effectiveReleaseNotesText = "# $Version`n`n本机 OTA 验收构建。`n"
 }
-$effectiveReleaseNotesPath = $releaseNotes
+else {
+    try { $effectiveReleaseNotesText = [IO.File]::ReadAllText($releaseNotes) }
+    catch { throw "Unable to read release notes '$releaseNotes': $($_.Exception.Message)" }
+}
+$expectedReleaseNotesText = $effectiveReleaseNotesText.TrimEnd()
+$effectiveReleaseNotesPath = Join-Path $workingDirectory 'release-notes.vpk.md'
+try {
+    [IO.File]::WriteAllText(
+        $effectiveReleaseNotesPath,
+        $effectiveReleaseNotesText,
+        $utf8Bom)
+}
+catch {
+    throw "Unable to create the UTF-8 BOM release-notes copy: $($_.Exception.Message)"
+}
 
 $toolRestoreArguments = @('tool', 'restore')
 [void](Invoke-RecordedCommand 'dotnet-tool-restore' 'dotnet' $toolRestoreArguments)
@@ -612,8 +623,11 @@ $assets = @($releaseFeed.Assets)
 if ($assets.Count -eq 0) { throw 'Release feed contains no assets.' }
 $referencedReleasePackages = New-Object `
     'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+$referencedFullPackages = New-Object `
+    'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+$currentReleasePackagesByType = New-Object `
+    'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
 $targetAssetCount = 0
-$targetFullPackagePaths = New-Object 'Collections.Generic.List[string]'
 foreach ($asset in $assets) {
     foreach ($propertyName in @('PackageId', 'Version', 'Type', 'FileName', 'SHA256', 'Size')) {
         if ($null -eq $asset -or $null -eq $asset.PSObject.Properties[$propertyName]) {
@@ -622,6 +636,10 @@ foreach ($asset in $assets) {
     }
     if ([string]$asset.PackageId -cne $acceptancePackageId) {
         throw 'Release feed contains a foreign package ID.'
+    }
+    $assetType = [string]$asset.Type
+    if ($assetType -cnotin @('Full', 'Delta')) {
+        throw "Release feed contains an unknown package type: $assetType"
     }
     $fileName = [string]$asset.FileName
     if (-not (Test-SafeNupkgFileName $fileName)) {
@@ -649,13 +667,24 @@ foreach ($asset in $assets) {
     if ($declaredHash.ToLowerInvariant() -cne $actualHash) {
         throw "Release feed SHA-256 differs from the asset: $fileName"
     }
-    $referencedReleasePackages.Add($fileName, [pscustomobject]@{
+    $validatedReleasePackage = [pscustomobject]@{
             FileName = $fileName
             FullPath = $assetPath
-        })
+        }
+    $referencedReleasePackages.Add($fileName, $validatedReleasePackage)
+    if ($assetType -ceq 'Full') {
+        $referencedFullPackages.Add($fileName, $validatedReleasePackage)
+    }
     if ([string]$asset.Version -ceq $Version) {
         $targetAssetCount++
-        if ([string]$asset.Type -ceq 'Full') { $targetFullPackagePaths.Add($assetPath) }
+        if ($currentReleasePackagesByType.ContainsKey($assetType)) {
+            throw "Release feed contains duplicate $assetType package for this version."
+        }
+        $currentReleasePackagesByType.Add($assetType, $assetPath)
+        if ($null -eq $asset.PSObject.Properties['NotesMarkdown'] -or
+            [string]$asset.NotesMarkdown -cne $expectedReleaseNotesText) {
+            throw "Release feed did not preserve release notes for the current $assetType package."
+        }
     }
 }
 if ($targetAssetCount -eq 0) {
@@ -671,7 +700,7 @@ foreach ($packageFile in [IO.Directory]::EnumerateFiles(
         throw "Output package casing differs from the release feed: $actualName"
     }
 }
-if ($targetFullPackagePaths.Count -ne 1) {
+if (-not $currentReleasePackagesByType.ContainsKey('Full')) {
     throw 'Release feed must contain exactly one full package for this version.'
 }
 
@@ -698,14 +727,18 @@ if ($parsedAssetCatalog -isnot [array]) {
     throw 'Generated asset catalog must be a JSON array.'
 }
 $assetCatalogEntries = @($parsedAssetCatalog)
-if ($assetCatalogEntries.Count -ne 3) {
-    throw 'Generated asset catalog must contain exactly three assets.'
-}
 $expectedCatalogFiles = New-Object `
     'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
 $expectedCatalogFiles.Add('Installer', [IO.Path]::GetFileName($setupFiles[0]))
-$expectedCatalogFiles.Add('Full', [IO.Path]::GetFileName($targetFullPackagePaths[0]))
 $expectedCatalogFiles.Add('Portable', [IO.Path]::GetFileName($portableFiles[0]))
+foreach ($currentPackage in $currentReleasePackagesByType.GetEnumerator()) {
+    $expectedCatalogFiles.Add(
+        $currentPackage.Key,
+        [IO.Path]::GetFileName($currentPackage.Value))
+}
+if ($assetCatalogEntries.Count -ne $expectedCatalogFiles.Count) {
+    throw 'Generated asset catalog does not match the current release asset count.'
+}
 $catalogTypes = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
 $catalogFileNames = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($catalogEntry in $assetCatalogEntries) {
@@ -753,8 +786,8 @@ if ($releasesIndexFiles.Count -ne 1 -or
 Assert-ExistingPathIsNotReparsePoint $releasesIndexPath 'RELEASES index'
 try { $releasesLines = @([IO.File]::ReadAllLines($releasesIndexPath)) }
 catch { throw 'Generated RELEASES index cannot be read.' }
-if ($releasesLines.Count -ne $referencedReleasePackages.Count -or $releasesLines.Count -eq 0) {
-    throw 'Generated RELEASES index does not reference every release package exactly once.'
+if ($releasesLines.Count -ne $referencedFullPackages.Count -or $releasesLines.Count -eq 0) {
+    throw 'Generated RELEASES index does not reference every full package exactly once.'
 }
 $indexedReleasePackages = New-Object `
     'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -764,12 +797,12 @@ foreach ($releaseLine in $releasesLines) {
     }
     $indexedFileName = [string]$Matches.file
     if (-not (Test-SafeNupkgFileName $indexedFileName) -or
-        -not $referencedReleasePackages.ContainsKey($indexedFileName) -or
+        -not $referencedFullPackages.ContainsKey($indexedFileName) -or
         -not $indexedReleasePackages.Add($indexedFileName) -or
-        $indexedFileName -cne [string]$referencedReleasePackages[$indexedFileName].FileName) {
+        $indexedFileName -cne [string]$referencedFullPackages[$indexedFileName].FileName) {
         throw "Generated RELEASES index contains an unsafe, foreign, or duplicate reference: $indexedFileName"
     }
-    $indexedPath = [string]$referencedReleasePackages[$indexedFileName].FullPath
+    $indexedPath = [string]$referencedFullPackages[$indexedFileName].FullPath
     Assert-ExistingPathIsNotReparsePoint $indexedPath 'RELEASES index reference'
     try { $indexedSize = [long]$Matches.size }
     catch { throw "Generated RELEASES index contains an invalid size: $indexedFileName" }

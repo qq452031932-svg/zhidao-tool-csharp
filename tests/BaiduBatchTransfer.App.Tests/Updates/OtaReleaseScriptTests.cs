@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -561,6 +562,113 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Fact]
+    public async Task FakeToolchainAcceptsCurrentDeltaCatalogAndFullOnlyMultiVersionReleasesIndex()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        await fixture.PreparePreviousReleaseAsync("1.2.2");
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_MULTI_VERSION"] = "1",
+            },
+            includePreviousRelease: true);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+        var manifestLines = await File.ReadAllLinesAsync(
+            Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256"));
+        Assert.Equal(8, manifestLines.Length);
+        Assert.Contains(manifestLines, line => line.EndsWith("-delta.nupkg", StringComparison.Ordinal));
+
+        using var catalog = JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(fixture.OutputDirectory, "assets.win-x64-ota-acceptance.json")));
+        Assert.Equal(
+            new[] { "Delta", "Full", "Installer", "Portable" },
+            catalog.RootElement.EnumerateArray()
+                .Select(asset => asset.GetProperty("Type").GetString())
+                .Order(StringComparer.Ordinal));
+        var releasesLines = await File.ReadAllLinesAsync(
+            Path.Combine(fixture.OutputDirectory, "RELEASES-win-x64-ota-acceptance"));
+        Assert.Equal(2, releasesLines.Length);
+        Assert.All(releasesLines, line => Assert.DoesNotContain("-delta.nupkg", line, StringComparison.Ordinal));
+        Assert.Contains(releasesLines, line => line.Contains("-1.2.2-full.nupkg", StringComparison.Ordinal));
+        Assert.Contains(releasesLines, line => line.Contains("-1.2.3-full.nupkg", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsHistoricalFullFromCurrentAssetCatalog()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        await fixture.PreparePreviousReleaseAsync("1.2.2");
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_MULTI_VERSION"] = "1",
+                ["FAKE_OTA_ASSETS_MODE"] = "historical-full",
+            },
+            includePreviousRelease: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("asset catalog", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsDeltaFromFullOnlyReleasesIndex()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        await fixture.PreparePreviousReleaseAsync("1.2.2");
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_MULTI_VERSION"] = "1",
+                ["FAKE_OTA_RELEASES_MODE"] = "includes-delta",
+            },
+            includePreviousRelease: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("RELEASES", result.Output, StringComparison.Ordinal);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainUsesBomNormalizedCopyAndPreservesNonAsciiReleaseNotes()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        var sourceNotesPath = Path.Combine(fixture.Root, "user-release-notes.md");
+        const string notes = "# 自定义更新说明\n\n本机 OTA 验收构建。\n";
+        var originalBytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(notes);
+        await File.WriteAllBytesAsync(sourceNotesPath, originalBytes);
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            releaseNotesPath: sourceNotesPath);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Equal(originalBytes, await File.ReadAllBytesAsync(sourceNotesPath));
+        var effectiveNotesPath = Path.Combine(
+            fixture.OutputDirectory,
+            ".build",
+            "release-notes.vpk.md");
+        var effectiveBytes = await File.ReadAllBytesAsync(effectiveNotesPath);
+        Assert.True(effectiveBytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }));
+        using var releaseFeed = JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(fixture.OutputDirectory, "releases.win-x64-ota-acceptance.json")));
+        Assert.All(
+            releaseFeed.RootElement.GetProperty("Assets").EnumerateArray().ToArray(),
+            asset => Assert.Contains("本机 OTA 验收构建。", asset.GetProperty("NotesMarkdown").GetString(), StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task FakeToolchainRejectsAssetCatalogThatReferencesForeignOutput()
     {
         using var fixture = ScriptFixture.Create();
@@ -857,10 +965,30 @@ public sealed class OtaReleaseScriptTests
             }
         }
 
+        public async Task PreparePreviousReleaseAsync(string version)
+        {
+            Directory.CreateDirectory(PreviousReleaseDirectory);
+            var packageName = $"SuperPan.BaiduBatchTransfer.OtaAcceptance-{version}-full.nupkg";
+            var packageBytes = new byte[] { 91, 92, 93, 94 };
+            await File.WriteAllBytesAsync(
+                Path.Combine(PreviousReleaseDirectory, packageName),
+                packageBytes);
+            await WriteFeedAsync(
+                PreviousReleaseDirectory,
+                "releases.win-x64-ota-acceptance.json",
+                "SuperPan.BaiduBatchTransfer.OtaAcceptance",
+                version,
+                packageName,
+                LowerSha256(packageBytes),
+                packageBytes.Length);
+        }
+
         public Task<ScriptResult> RunFakePipelineAsync(
             bool tamperHash,
             bool installPathOnly = false,
-            IReadOnlyDictionary<string, string?>? additionalEnvironment = null)
+            IReadOnlyDictionary<string, string?>? additionalEnvironment = null,
+            bool includePreviousRelease = false,
+            string? releaseNotesPath = null)
         {
             var environment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
             {
@@ -876,16 +1004,27 @@ public sealed class OtaReleaseScriptTests
             {
                 foreach (var pair in additionalEnvironment) environment[pair.Key] = pair.Value;
             }
+            var arguments = new List<string>
+            {
+                "-Version", "1.2.3",
+                "-AcceptanceFeedPath", FeedDirectory,
+                "-OutputDirectory", OutputDirectory,
+                "-OtaAcceptanceBuild",
+                "-AllowUnsignedLocal",
+            };
+            if (includePreviousRelease)
+            {
+                arguments.Add("-PreviousReleaseDirectory");
+                arguments.Add(PreviousReleaseDirectory);
+            }
+            if (releaseNotesPath is not null)
+            {
+                arguments.Add("-ReleaseNotesPath");
+                arguments.Add(releaseNotesPath);
+            }
             return RunPowerShellAsync(
                 ScriptPath(),
-                new[]
-                {
-                    "-Version", "1.2.3",
-                    "-AcceptanceFeedPath", FeedDirectory,
-                    "-OutputDirectory", OutputDirectory,
-                    "-OtaAcceptanceBuild",
-                    "-AllowUnsignedLocal",
-                },
+                arguments.ToArray(),
                 environment,
                 OutsideWorkingDirectory);
         }
@@ -1045,25 +1184,53 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
     $packageId = Get-ArgumentValue '--packId'
     $version = Get-ArgumentValue '--packVersion'
     $channel = Get-ArgumentValue '--channel'
+    $notesText = [IO.File]::ReadAllText((Get-ArgumentValue '--releaseNotes')).TrimEnd()
     $packageName = "$packageId-$version-full.nupkg"
     $packagePath = Join-Path $outputDirectory $packageName
+    $deltaName = "$packageId-$version-delta.nupkg"
+    $deltaPath = Join-Path $outputDirectory $deltaName
     $setupName = "$packageId-Setup.exe"
     $portableName = "$packageId-Portable.zip"
+    $previousAssets = @()
+    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+        $previousFeedPath = Join-Path $outputDirectory "releases.$channel.json"
+        $previousFeed = [IO.File]::ReadAllText($previousFeedPath) | ConvertFrom-Json
+        $previousAssets = @($previousFeed.Assets)
+    }
     [IO.File]::WriteAllBytes($packagePath, [byte[]](10, 20, 30, 40))
+    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+        [IO.File]::WriteAllBytes($deltaPath, [byte[]](11, 21, 31))
+    }
     [IO.File]::WriteAllBytes((Join-Path $outputDirectory $setupName), [byte[]](50, 60))
     [IO.File]::WriteAllBytes((Join-Path $outputDirectory $portableName), [byte[]](70, 80))
     $hash = if ($env:FAKE_OTA_TAMPER_HASH -ceq '1') { 'a' * 64 } else { Get-LowerSha256 $packagePath }
     $sha1 = Get-UpperSha1 $packagePath
+    $currentFull = [ordered]@{
+        PackageId = $packageId
+        Version = $version
+        Type = 'Full'
+        FileName = $packageName
+        SHA1 = $sha1
+        SHA256 = $hash
+        Size = ([IO.FileInfo]::new($packagePath)).Length
+        NotesMarkdown = $notesText
+    }
+    $feedAssets = @($currentFull)
+    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+        $feedAssets += [ordered]@{
+            PackageId = $packageId
+            Version = $version
+            Type = 'Delta'
+            FileName = $deltaName
+            SHA1 = (Get-UpperSha1 $deltaPath)
+            SHA256 = (Get-LowerSha256 $deltaPath)
+            Size = ([IO.FileInfo]::new($deltaPath)).Length
+            NotesMarkdown = $notesText
+        }
+        $feedAssets += $previousAssets
+    }
     $feed = [ordered]@{
-        Assets = @([ordered]@{
-                PackageId = $packageId
-                Version = $version
-                Type = 'Full'
-                FileName = $packageName
-                SHA1 = $sha1
-                SHA256 = $hash
-                Size = ([IO.FileInfo]::new($packagePath)).Length
-            })
+        Assets = $feedAssets
     }
     [IO.File]::WriteAllText(
         (Join-Path $outputDirectory "releases.$channel.json"),
@@ -1072,18 +1239,35 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
         'foreign.zip'
     }
     else { $portableName }
-    $catalog = @(
-        [ordered]@{ RelativeFileName = $setupName; Type = 'Installer' },
-        [ordered]@{ RelativeFileName = $packageName; Type = 'Full' },
-        [ordered]@{ RelativeFileName = $catalogPortableName; Type = 'Portable' }
-    )
+    $catalog = @()
+    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+        $catalog += [ordered]@{ RelativeFileName = $deltaName; Type = 'Delta' }
+    }
+    $catalog += [ordered]@{ RelativeFileName = $setupName; Type = 'Installer' }
+    $catalog += [ordered]@{ RelativeFileName = $packageName; Type = 'Full' }
+    $catalog += [ordered]@{ RelativeFileName = $catalogPortableName; Type = 'Portable' }
+    if ($env:FAKE_OTA_ASSETS_MODE -ceq 'historical-full') {
+        $catalog += [ordered]@{
+            RelativeFileName = [string]$previousAssets[0].FileName
+            Type = 'Full'
+        }
+    }
     [IO.File]::WriteAllText(
         (Join-Path $outputDirectory "assets.$channel.json"),
         ($catalog | ConvertTo-Json -Depth 3 -Compress))
-    $releasesSha1 = if ($env:FAKE_OTA_RELEASES_MODE -ceq 'bad-hash') { '0' * 40 } else { $sha1 }
+    $releaseLines = @()
+    foreach ($fullAsset in @($feedAssets | Where-Object { [string]$_.Type -ceq 'Full' })) {
+        $fullPath = Join-Path $outputDirectory ([string]$fullAsset.FileName)
+        $fullSha1 = if ($env:FAKE_OTA_RELEASES_MODE -ceq 'bad-hash' -and
+            [string]$fullAsset.Version -ceq $version) { '0' * 40 } else { Get-UpperSha1 $fullPath }
+        $releaseLines += "$fullSha1 $([string]$fullAsset.FileName) $([IO.FileInfo]::new($fullPath).Length)"
+    }
+    if ($env:FAKE_OTA_RELEASES_MODE -ceq 'includes-delta') {
+        $releaseLines += "$(Get-UpperSha1 $deltaPath) $deltaName $([IO.FileInfo]::new($deltaPath).Length)"
+    }
     [IO.File]::WriteAllText(
         (Join-Path $outputDirectory "RELEASES-$channel"),
-        "$releasesSha1 $packageName $([IO.FileInfo]::new($packagePath).Length)`n")
+        (($releaseLines -join "`n") + "`n"))
     Write-Output 'fake vpk pack'
     exit 0
 }
