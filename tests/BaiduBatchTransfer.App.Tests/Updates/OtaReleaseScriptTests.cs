@@ -556,8 +556,13 @@ public sealed class OtaReleaseScriptTests
         Assert.True(File.Exists(Path.Combine(fixture.OutputDirectory, "LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt")));
     }
 
-    [Fact]
-    public async Task FakeToolchainRejectsUnexpectedVpkRootHelpVersionBeforePackHelp()
+    [Theory]
+    [InlineData("Velopack CLI 1.2.1, for distributing applications.")]
+    [InlineData("Velopack CLI 1.2.0.1, for distributing applications.")]
+    [InlineData("Velopack CLI 1.2.0, for distributing applications.\nVelopack CLI 1.2.0, duplicate.")]
+    [InlineData("Velopack CLI 1.2.0, for distributing applications.\nVelopack CLI 1.2.1, conflicting.")]
+    public async Task FakeToolchainRejectsInvalidOrMultipleVpkRootHelpVersionsBeforePackHelp(
+        string rootHelp)
     {
         using var fixture = ScriptFixture.Create();
         await fixture.InstallFakeToolchainAsync();
@@ -566,7 +571,7 @@ public sealed class OtaReleaseScriptTests
             tamperHash: false,
             additionalEnvironment: new Dictionary<string, string?>
             {
-                ["FAKE_OTA_VPK_ROOT_HELP"] = "Velopack CLI 1.2.1",
+                ["FAKE_OTA_VPK_ROOT_HELP"] = rootHelp,
             });
 
         Assert.NotEqual(0, result.ExitCode);
@@ -964,7 +969,7 @@ if ($Tool -ceq 'powershell') {
 if ($joined -ceq 'tool restore') { Write-Output 'fake tool restore'; exit 0 }
 if ($joined -ceq 'tool run vpk -- --help') {
     $rootHelp = if ([string]::IsNullOrWhiteSpace($env:FAKE_OTA_VPK_ROOT_HELP)) {
-        'Velopack CLI 1.2.0'
+        'Velopack CLI 1.2.0, for distributing applications.'
     }
     else { $env:FAKE_OTA_VPK_ROOT_HELP }
     Write-Output $rootHelp

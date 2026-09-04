@@ -440,11 +440,13 @@ $toolRestoreArguments = @('tool', 'restore')
 $vpkRootHelpArguments = @('tool', 'run', 'vpk', '--', '--help')
 $vpkRootHelp = Invoke-RecordedCommand 'vpk-root-help' 'dotnet' $vpkRootHelpArguments
 $vpkRootHelpOutput = $vpkRootHelp.Stdout + "`n" + $vpkRootHelp.Stderr
-$vpkDescriptionMatches = [Text.RegularExpressions.Regex]::Matches(
+$vpkDescriptionMarkers = [Text.RegularExpressions.Regex]::Matches(
     $vpkRootHelpOutput,
-    '(?m)^[ \t]*Velopack CLI (?<version>\S+)[ \t]*\r?$')
-if ($vpkDescriptionMatches.Count -ne 1 -or
-    $vpkDescriptionMatches[0].Groups['version'].Value -cne $requiredVpkVersion) {
+    'Velopack CLI[ \t]+')
+$requiredVpkTokenMatches = [Text.RegularExpressions.Regex]::Matches(
+    $vpkRootHelpOutput,
+    ('Velopack CLI[ \t]+' + [Text.RegularExpressions.Regex]::Escape($requiredVpkVersion) + '(?=$|[\s,])'))
+if ($vpkDescriptionMarkers.Count -ne 1 -or $requiredVpkTokenMatches.Count -ne 1) {
     throw "The restored vpk executable root help must report exactly Velopack CLI $requiredVpkVersion."
 }
 
