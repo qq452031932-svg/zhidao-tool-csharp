@@ -598,6 +598,45 @@ public sealed class OtaReleaseScriptTests
     }
 
     [Fact]
+    public async Task FakeToolchainRejectsMultiVersionReleaseWithoutCurrentDelta()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+        await fixture.PreparePreviousReleaseAsync("1.2.2");
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_MULTI_VERSION"] = "1",
+                ["FAKE_OTA_SKIP_DELTA"] = "1",
+            },
+            includePreviousRelease: true);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("delta package", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsUnexpectedDeltaWithoutPreviousRelease()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_FORCE_DELTA"] = "1",
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("must not contain a delta", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
+    }
+
+    [Fact]
     public async Task FakeToolchainRejectsHistoricalFullFromCurrentAssetCatalog()
     {
         using var fixture = ScriptFixture.Create();
@@ -1191,6 +1230,9 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
     $deltaPath = Join-Path $outputDirectory $deltaName
     $setupName = "$packageId-Setup.exe"
     $portableName = "$packageId-Portable.zip"
+    $emitDelta = (($env:FAKE_OTA_MULTI_VERSION -ceq '1' -and
+            $env:FAKE_OTA_SKIP_DELTA -cne '1') -or
+        $env:FAKE_OTA_FORCE_DELTA -ceq '1')
     $previousAssets = @()
     if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
         $previousFeedPath = Join-Path $outputDirectory "releases.$channel.json"
@@ -1198,7 +1240,7 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
         $previousAssets = @($previousFeed.Assets)
     }
     [IO.File]::WriteAllBytes($packagePath, [byte[]](10, 20, 30, 40))
-    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+    if ($emitDelta) {
         [IO.File]::WriteAllBytes($deltaPath, [byte[]](11, 21, 31))
     }
     [IO.File]::WriteAllBytes((Join-Path $outputDirectory $setupName), [byte[]](50, 60))
@@ -1216,7 +1258,7 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
         NotesMarkdown = $notesText
     }
     $feedAssets = @($currentFull)
-    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+    if ($emitDelta) {
         $feedAssets += [ordered]@{
             PackageId = $packageId
             Version = $version
@@ -1227,8 +1269,8 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
             Size = ([IO.FileInfo]::new($deltaPath)).Length
             NotesMarkdown = $notesText
         }
-        $feedAssets += $previousAssets
     }
+    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') { $feedAssets += $previousAssets }
     $feed = [ordered]@{
         Assets = $feedAssets
     }
@@ -1240,7 +1282,7 @@ if ($joined.StartsWith('tool run vpk pack ', [StringComparison]::Ordinal)) {
     }
     else { $portableName }
     $catalog = @()
-    if ($env:FAKE_OTA_MULTI_VERSION -ceq '1') {
+    if ($emitDelta) {
         $catalog += [ordered]@{ RelativeFileName = $deltaName; Type = 'Delta' }
     }
     $catalog += [ordered]@{ RelativeFileName = $setupName; Type = 'Installer' }

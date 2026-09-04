@@ -703,6 +703,13 @@ foreach ($packageFile in [IO.Directory]::EnumerateFiles(
 if (-not $currentReleasePackagesByType.ContainsKey('Full')) {
     throw 'Release feed must contain exactly one full package for this version.'
 }
+$hasCurrentDelta = $currentReleasePackagesByType.ContainsKey('Delta')
+if ($null -ne $previousPath -and -not $hasCurrentDelta) {
+    throw 'A release built from previous assets must contain exactly one delta package for this version.'
+}
+if ($null -eq $previousPath -and $hasCurrentDelta) {
+    throw 'A first release without previous assets must not contain a delta package.'
+}
 
 $setupFiles = @([IO.Directory]::EnumerateFiles($outputPath, "$acceptancePackageId*Setup*.exe",
     [IO.SearchOption]::TopDirectoryOnly))
