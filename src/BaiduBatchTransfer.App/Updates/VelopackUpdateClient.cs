@@ -193,9 +193,18 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
         IUpdateSource source = configuration.Kind == VelopackUpdateSourceKind.Https
             ? new SimpleWebSource(new Uri(configuration.Location, UriKind.Absolute))
             : new SimpleFileSource(new DirectoryInfo(configuration.Location));
-        var options = new UpdateOptions { ExplicitChannel = configuration.Channel };
+        var options = CreateUpdateOptions(configuration);
         return new VelopackUpdateManagerAdapter(new UpdateManager(source, options));
     }
+
+    private static UpdateOptions CreateUpdateOptions(
+        VelopackUpdateSourceConfiguration configuration) => new()
+        {
+            ExplicitChannel = configuration.Channel,
+            // Velopack 1.2 delta reconstruction can produce a byte-different full nupkg.
+            // Download the signed/checksummed full asset so the pending fingerprint remains exact.
+            MaximumDeltasBeforeFallback = -1
+        };
 
     private sealed class VelopackUpdateManagerAdapter : IVelopackUpdateManagerAdapter
     {

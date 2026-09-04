@@ -1,10 +1,28 @@
 using System.Net.Http;
+using System.Reflection;
 using BaiduBatchTransfer.App.Updates;
+using Velopack;
 
 namespace BaiduBatchTransfer.App.Tests.Updates;
 
 public sealed class VelopackUpdateRuntimeTests
 {
+    [Fact]
+    public void ClientFactoryDisablesDeltaReconstructionForExactFingerprintVerification()
+    {
+        var configuration = new VelopackUpdateSourceConfiguration(
+            VelopackUpdateSourceKind.LocalDirectory,
+            Path.GetFullPath(Path.Combine("test-data", "ota-feed")),
+            "win-x64-ota-acceptance");
+        var factory = typeof(VelopackUpdateClient).GetMethod(
+            "CreateUpdateOptions",
+            BindingFlags.NonPublic | BindingFlags.Static);
+
+        Assert.NotNull(factory);
+        var options = Assert.IsType<UpdateOptions>(factory.Invoke(null, [configuration]));
+        Assert.Equal(-1, options.MaximumDeltasBeforeFallback);
+    }
+
     [Fact]
     public void ClientFactorySelectsHttpsSourceAndConfiguredChannel()
     {
