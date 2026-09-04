@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security.Cryptography;
 using Velopack;
 using Velopack.Exceptions;
 using Velopack.Sources;
@@ -219,8 +220,23 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
 
         public string? CurrentVersion => manager.CurrentVersion?.ToString();
 
-        public VelopackClientAsset? UpdatePendingRestart =>
-            manager.UpdatePendingRestart is { } pending ? FromAsset(pending) : null;
+        public VelopackClientAsset? UpdatePendingRestart
+        {
+            get
+            {
+                if (manager.UpdatePendingRestart is not { } pending)
+                    return null;
+
+                var fingerprint = Fingerprint(pending);
+                fingerprint = CompletePendingFingerprint(
+                    fingerprint,
+                    Velopack.Locators.VelopackLocator.Current.PackagesDir!);
+                return new VelopackClientAsset(
+                    fingerprint,
+                    pending.NotesMarkdown,
+                    pending);
+            }
+        }
 
         public async Task<VelopackClientAsset?> CheckForUpdatesAsync()
         {
@@ -256,9 +272,6 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
             manager.WaitExitThenApplyUpdates(asset, silent, restart, restartArguments);
         }
 
-        private static VelopackClientAsset FromAsset(VelopackAsset asset) =>
-            new(Fingerprint(asset), asset.NotesMarkdown, asset);
-
         private static VelopackAssetFingerprint Fingerprint(VelopackAsset asset) =>
             new(
                 asset.PackageId ?? string.Empty,
@@ -267,5 +280,47 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
                 asset.FileName ?? string.Empty,
                 asset.Size,
                 asset.SHA256 ?? string.Empty);
+    }
+
+    internal static VelopackAssetFingerprint CompletePendingFingerprint(
+        VelopackAssetFingerprint fingerprint,
+        string packagesDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(fingerprint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(packagesDirectory);
+
+        if (!string.Equals(
+                Path.GetFileName(fingerprint.FileName),
+                fingerprint.FileName,
+                StringComparison.Ordinal))
+        {
+            return fingerprint;
+        }
+
+        try
+        {
+            var root = Path.GetFullPath(packagesDirectory);
+            var packagePath = Path.GetFullPath(Path.Combine(root, fingerprint.FileName));
+            var requiredPrefix = root.EndsWith(Path.DirectorySeparatorChar)
+                ? root
+                : root + Path.DirectorySeparatorChar;
+            if (!packagePath.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase))
+                return fingerprint;
+
+            using var package = File.OpenRead(packagePath);
+            return fingerprint with
+            {
+                Size = package.Length,
+                Sha256 = Convert.ToHexString(SHA256.HashData(package))
+            };
+        }
+        catch (IOException)
+        {
+            return fingerprint;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return fingerprint;
+        }
     }
 }

@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Reflection;
+using System.Security.Cryptography;
 using BaiduBatchTransfer.App.Updates;
 using Velopack;
 
@@ -7,6 +8,49 @@ namespace BaiduBatchTransfer.App.Tests.Updates;
 
 public sealed class VelopackUpdateRuntimeTests
 {
+    [Fact]
+    public void PendingAssetAdapterDoesNotCacheVerifiedPackageFingerprint()
+    {
+        var adapter = typeof(VelopackUpdateClient).GetNestedType(
+            "VelopackUpdateManagerAdapter",
+            BindingFlags.NonPublic);
+
+        Assert.NotNull(adapter);
+        Assert.DoesNotContain(
+            adapter.GetFields(BindingFlags.NonPublic | BindingFlags.Instance),
+            field => field.FieldType == typeof(VelopackClientAsset));
+    }
+
+    [Fact]
+    public void PendingAssetFingerprintIsCompletedFromDownloadedFullPackage()
+    {
+        var directory = Directory.CreateTempSubdirectory("velopack-pending-");
+        try
+        {
+            const string fileName = "SuperPan.BaiduBatchTransfer-2.0.0-full.nupkg";
+            var content = new byte[] { 1, 2, 3, 4, 5 };
+            File.WriteAllBytes(Path.Combine(directory.FullName, fileName), content);
+            var incomplete = new VelopackAssetFingerprint(
+                "SuperPan.BaiduBatchTransfer",
+                "2.0.0",
+                "Full",
+                fileName,
+                content.Length,
+                string.Empty);
+
+            var completed = VelopackUpdateClient.CompletePendingFingerprint(
+                incomplete,
+                directory.FullName);
+
+            Assert.Equal(content.Length, completed.Size);
+            Assert.Equal(Convert.ToHexString(SHA256.HashData(content)), completed.Sha256);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
     [Fact]
     public void ClientFactoryDisablesDeltaReconstructionForExactFingerprintVerification()
     {
