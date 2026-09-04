@@ -21,10 +21,11 @@
     <_ExpectedAssemblyVersion>$(_ExpectedProductMajor).0.0.0</_ExpectedAssemblyVersion>
     <ProductMajor>$(_ExpectedProductMajor)</ProductMajor>
     <AssemblyVersion>$(_ExpectedAssemblyVersion)</AssemblyVersion>
+    <OtaAcceptanceBuild Condition="'$(OtaAcceptanceBuild)' == ''">false</OtaAcceptanceBuild>
+    <PackageId Condition="'$(PackageId)' == '' and '$(OtaAcceptanceBuild)' == 'true'">SuperPan.BaiduBatchTransfer.OtaAcceptance</PackageId>
     <PackageId Condition="'$(PackageId)' == ''">SuperPan.BaiduBatchTransfer</PackageId>
     <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
     <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
-    <OtaAcceptanceBuild Condition="'$(OtaAcceptanceBuild)' == ''">false</OtaAcceptanceBuild>
     <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\artifacts\managed-browser-helper</ManagedBrowserHelperPackageDirectory>
   </PropertyGroup>
 

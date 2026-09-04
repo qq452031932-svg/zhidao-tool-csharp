@@ -470,7 +470,6 @@ $restoreArguments = @(
     '-p:UpdateFeedUrl=',
     '-p:OtaAcceptanceBuild=true',
     "-p:OtaAcceptanceFeedPath=$acceptanceFeed",
-    "-p:PackageId=$acceptancePackageId",
     '-p:UpdateChannel=win-x64-ota-acceptance'
 )
 [void](Invoke-RecordedCommand 'dotnet-restore' 'dotnet' $restoreArguments)
@@ -488,7 +487,6 @@ $publishArguments = @(
     '-p:UpdateFeedUrl=',
     '-p:OtaAcceptanceBuild=true',
     "-p:OtaAcceptanceFeedPath=$acceptanceFeed",
-    "-p:PackageId=$acceptancePackageId",
     '-p:UpdateChannel=win-x64-ota-acceptance'
 )
 [void](Invoke-RecordedCommand 'dotnet-publish' 'dotnet' $publishArguments)

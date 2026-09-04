@@ -441,10 +441,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("'-p:UpdateFeedUrl='", script, StringComparison.Ordinal);
         Assert.Contains("'-p:OtaAcceptanceBuild=true'", script, StringComparison.Ordinal);
         Assert.Contains("'-p:UpdateChannel=win-x64-ota-acceptance'", script, StringComparison.Ordinal);
-        Assert.Equal(2, Regex.Matches(
-            script,
-            Regex.Escape("\"-p:PackageId=$acceptancePackageId\""),
-            RegexOptions.CultureInvariant).Count);
+        Assert.DoesNotContain("-p:PackageId=", script, StringComparison.Ordinal);
         Assert.Contains("verify_managed_browser_helper_package.ps1", script, StringComparison.Ordinal);
         Assert.Contains("$vpkArguments = @(", script, StringComparison.Ordinal);
         Assert.Contains("'tool', 'run', 'vpk', 'pack'", script, StringComparison.Ordinal);
@@ -538,6 +535,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("--locked-mode", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("--self-contained" + UnitSeparator + "true", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("-p:OtaAcceptanceBuild=true", combinedCommands, StringComparison.Ordinal);
+        Assert.DoesNotContain("-p:PackageId=", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("--packId" + UnitSeparator + "SuperPan.BaiduBatchTransfer.OtaAcceptance", combinedCommands, StringComparison.Ordinal);
         Assert.Contains("--channel" + UnitSeparator + "win-x64-ota-acceptance", combinedCommands, StringComparison.Ordinal);
 
