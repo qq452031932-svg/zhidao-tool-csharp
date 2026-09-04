@@ -488,7 +488,9 @@ public sealed class OtaReleaseScriptTests
 
         Assert.Contains("$requiredVpkVersion = '1.2.0'", script, StringComparison.Ordinal);
         Assert.Contains("dotnet-tools.json", script, StringComparison.Ordinal);
-        Assert.Contains("'--version'", script, StringComparison.Ordinal);
+        Assert.Contains("$vpkRootHelpArguments = @('tool', 'run', 'vpk', '--', '--help')", script, StringComparison.Ordinal);
+        Assert.Contains("Velopack CLI", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("'--version'", script, StringComparison.Ordinal);
         Assert.Contains("WorkingDirectory = $repoRoot", script, StringComparison.Ordinal);
         Assert.Contains("[IO.DriveType]::Network", script, StringComparison.Ordinal);
         foreach (var marker in new[]
@@ -520,7 +522,7 @@ public sealed class OtaReleaseScriptTests
             new[]
             {
                 "dotnet|tool restore",
-                "dotnet|tool run vpk -- --version",
+                "dotnet|tool run vpk -- --help",
                 "dotnet|tool run vpk -- pack --help",
                 "dotnet|restore",
                 "dotnet|publish",
@@ -552,6 +554,32 @@ public sealed class OtaReleaseScriptTests
             Assert.Equal(LowerSha256(await File.ReadAllBytesAsync(asset)), pieces[0]);
         }
         Assert.True(File.Exists(Path.Combine(fixture.OutputDirectory, "LOCAL-OTA-ACCEPTANCE-README.zh-CN.txt")));
+    }
+
+    [Fact]
+    public async Task FakeToolchainRejectsUnexpectedVpkRootHelpVersionBeforePackHelp()
+    {
+        using var fixture = ScriptFixture.Create();
+        await fixture.InstallFakeToolchainAsync();
+
+        var result = await fixture.RunFakePipelineAsync(
+            tamperHash: false,
+            additionalEnvironment: new Dictionary<string, string?>
+            {
+                ["FAKE_OTA_VPK_ROOT_HELP"] = "Velopack CLI 1.2.1",
+            });
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("exactly Velopack CLI 1.2.0", result.Output, StringComparison.Ordinal);
+        var commands = await File.ReadAllLinesAsync(fixture.FakeCommandLog);
+        Assert.Equal(
+            new[]
+            {
+                "dotnet|tool restore",
+                "dotnet|tool run vpk -- --help",
+            },
+            commands.Select(ParseCommandPrefix));
+        Assert.False(File.Exists(Path.Combine(fixture.OutputDirectory, "upload-manifest.sha256")));
     }
 
     [Fact]
@@ -934,7 +962,14 @@ if ($Tool -ceq 'powershell') {
     exit 0
 }
 if ($joined -ceq 'tool restore') { Write-Output 'fake tool restore'; exit 0 }
-if ($joined -ceq 'tool run vpk -- --version') { Write-Output '1.2.0'; exit 0 }
+if ($joined -ceq 'tool run vpk -- --help') {
+    $rootHelp = if ([string]::IsNullOrWhiteSpace($env:FAKE_OTA_VPK_ROOT_HELP)) {
+        'Velopack CLI 1.2.0'
+    }
+    else { $env:FAKE_OTA_VPK_ROOT_HELP }
+    Write-Output $rootHelp
+    exit 0
+}
 if ($joined -ceq 'tool run vpk -- pack --help') {
     Write-Output '--packId --packVersion --packDir --mainExe --channel --runtime --outputDir --releaseNotes'
     exit 0

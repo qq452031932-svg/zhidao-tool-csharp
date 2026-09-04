@@ -437,11 +437,15 @@ $effectiveReleaseNotesPath = $releaseNotes
 $toolRestoreArguments = @('tool', 'restore')
 [void](Invoke-RecordedCommand 'dotnet-tool-restore' 'dotnet' $toolRestoreArguments)
 
-$vpkVersionArguments = @('tool', 'run', 'vpk', '--', '--version')
-$vpkVersion = Invoke-RecordedCommand 'vpk-version' 'dotnet' $vpkVersionArguments
-$reportedVpkVersion = ($vpkVersion.Stdout + "`n" + $vpkVersion.Stderr).Trim()
-if ($reportedVpkVersion -cnotmatch '^(?:vpk\s+)?1\.2\.0$') {
-    throw "The restored vpk executable must report exactly version $requiredVpkVersion."
+$vpkRootHelpArguments = @('tool', 'run', 'vpk', '--', '--help')
+$vpkRootHelp = Invoke-RecordedCommand 'vpk-root-help' 'dotnet' $vpkRootHelpArguments
+$vpkRootHelpOutput = $vpkRootHelp.Stdout + "`n" + $vpkRootHelp.Stderr
+$vpkDescriptionMatches = [Text.RegularExpressions.Regex]::Matches(
+    $vpkRootHelpOutput,
+    '(?m)^[ \t]*Velopack CLI (?<version>\S+)[ \t]*\r?$')
+if ($vpkDescriptionMatches.Count -ne 1 -or
+    $vpkDescriptionMatches[0].Groups['version'].Value -cne $requiredVpkVersion) {
+    throw "The restored vpk executable root help must report exactly Velopack CLI $requiredVpkVersion."
 }
 
 $vpkHelpArguments = @('tool', 'run', 'vpk', '--', 'pack', '--help')
