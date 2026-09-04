@@ -74,7 +74,7 @@
                 <ProgressBar Height="8"
                              Minimum="0"
                              Maximum="100"
-                             Value="{Binding DownloadProgress}"
+                             Value="{Binding DownloadProgress, Mode=OneWay}"
                              AutomationProperties.Name="更新下载进度"
                              AutomationProperties.HelpText="显示更新下载进度，范围为 0% 到 100%。" />
                 <TextBlock Margin="0,6,0,0"

@@ -21,6 +21,10 @@ public sealed class SettingsViewStructureTests
         Assert.Contains("最新版本", xaml, StringComparison.Ordinal);
         Assert.Contains("更新说明", xaml, StringComparison.Ordinal);
         Assert.Contains("ProgressBar", xaml, StringComparison.Ordinal);
+        Assert.Contains(
+            "Value=\"{Binding DownloadProgress, Mode=OneWay}\"",
+            xaml,
+            StringComparison.Ordinal);
         Assert.Contains("ScrollViewer", xaml, StringComparison.Ordinal);
         Assert.Contains("MaxHeight=", xaml, StringComparison.Ordinal);
         Assert.Contains("VerticalScrollBarVisibility=\"Auto\"", xaml, StringComparison.Ordinal);
