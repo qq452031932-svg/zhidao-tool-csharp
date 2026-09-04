@@ -158,7 +158,7 @@ public static class AppBootstrap
         services.AddSingleton<IJobResultShareActionStore>(sp => sp.GetRequiredService<SqliteShareSchedulingStore>());
         services.AddSingleton<AllocationCounterRebuilder>();
         services.AddSingleton<ISingleInstanceGuard>(_ =>
-            new WindowsMutexSingleInstanceGuard(@"Local\BaiduBatchTransfer.Singleton.v1"));
+            new WindowsMutexSingleInstanceGuard(buildInfo.SingleInstanceMutexName));
         services.AddSingleton<StartupRecoveryService>();
 
         services.AddSingleton<ImportPageQuery>();

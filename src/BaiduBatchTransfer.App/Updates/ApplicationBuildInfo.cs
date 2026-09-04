@@ -19,6 +19,10 @@ public sealed record ApplicationBuildInfo(
 
     public bool IsFeedConfigured => HttpsFeedUrl is not null || AcceptanceFeedPath is not null;
 
+    public string SingleInstanceMutexName => IsOtaAcceptanceBuild
+        ? @"Local\BaiduBatchTransfer.OtaAcceptance.Singleton.v1"
+        : @"Local\BaiduBatchTransfer.Singleton.v1";
+
     public static ApplicationBuildInfo Current { get; } = ReadCurrent();
 
     public static bool TryCreateProduction(string feedUrl, out ApplicationBuildInfo? info)

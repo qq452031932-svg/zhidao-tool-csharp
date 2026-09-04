@@ -35,6 +35,28 @@ public sealed class ApplicationBuildInfoTests
     }
 
     [Fact]
+    public void OtaAcceptanceBuildUsesADistinctSingleInstanceMutex()
+    {
+        var production = ApplicationBuildInfo.CreateForTests(
+            "1.0.0",
+            "managed-browser-v3",
+            null);
+        var acceptance = ApplicationBuildInfo.CreateForTests(
+            "1.0.0",
+            "managed-browser-v3",
+            null,
+            channel: "win-x64-ota-acceptance",
+            acceptanceFeedPath: Path.GetFullPath("ota-acceptance-feed"),
+            isOtaAcceptanceBuild: true);
+
+        Assert.Equal(@"Local\BaiduBatchTransfer.Singleton.v1", production.SingleInstanceMutexName);
+        Assert.Equal(
+            @"Local\BaiduBatchTransfer.OtaAcceptance.Singleton.v1",
+            acceptance.SingleInstanceMutexName);
+        Assert.NotEqual(production.SingleInstanceMutexName, acceptance.SingleInstanceMutexName);
+    }
+
+    [Fact]
     public void AssemblyVersionTracksValidatedProductMajor()
     {
         var versions = ApplicationBuildInfo.DeriveAssemblyVersions("2.3.4");
