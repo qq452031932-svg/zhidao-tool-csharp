@@ -85,10 +85,16 @@ func NewLoginResult(outcome Outcome, source SourcePseudonym, code Code, at time.
 }
 
 func NewUploadStarted(operationID, candidateID string, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, candidateID); err != nil {
+		return Event{}, err
+	}
 	return newEvent(UploadStarted, OutcomeSuccess, operationID, candidateID, "", CodeAccepted, SourcePseudonym{}, at, CodeAccepted)
 }
 
 func NewUploadCompleted(outcome Outcome, operationID, candidateID string, code Code, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, candidateID); err != nil {
+		return Event{}, err
+	}
 	if (code == CodeCompleted) != (outcome == OutcomeSuccess) {
 		return Event{}, errors.New("upload audit outcome does not match result code")
 	}
@@ -96,6 +102,9 @@ func NewUploadCompleted(outcome Outcome, operationID, candidateID string, code C
 }
 
 func NewGateResult(outcome Outcome, operationID, candidateID string, code Code, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, candidateID); err != nil {
+		return Event{}, err
+	}
 	if (code == CodeAccepted) != (outcome == OutcomeSuccess) {
 		return Event{}, errors.New("gate audit outcome does not match result code")
 	}
@@ -103,22 +112,43 @@ func NewGateResult(outcome Outcome, operationID, candidateID string, code Code, 
 }
 
 func NewPublishConfirmed(operationID, candidateID, releaseID string, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, candidateID, releaseID); err != nil {
+		return Event{}, err
+	}
 	return newEvent(PublishConfirmed, OutcomeSuccess, operationID, candidateID, releaseID, CodeCompleted, SourcePseudonym{}, at, CodeCompleted)
 }
 
 func NewPublishFailed(operationID, candidateID string, code Code, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, candidateID); err != nil {
+		return Event{}, err
+	}
 	return newEvent(PublishFailed, OutcomeFailure, operationID, candidateID, "", code, SourcePseudonym{}, at, CodeHashMismatch, CodeSignatureMismatch, CodeVersionFloor, CodeInternalFailure)
 }
 
 func NewRollbackCompleted(operationID, releaseID string, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, releaseID); err != nil {
+		return Event{}, err
+	}
 	return newEvent(RollbackCompleted, OutcomeSuccess, operationID, "", releaseID, CodeCompleted, SourcePseudonym{}, at, CodeCompleted)
 }
 
 func NewCleanupResult(outcome Outcome, operationID, releaseID string, code Code, at time.Time) (Event, error) {
+	if err := requireIDs(operationID); err != nil {
+		return Event{}, err
+	}
 	if (code == CodeCompleted) != (outcome == OutcomeSuccess) {
 		return Event{}, errors.New("cleanup audit outcome does not match result code")
 	}
 	return newEvent(CleanupResult, outcome, operationID, "", releaseID, code, SourcePseudonym{}, at, CodeCompleted, CodeInternalFailure)
+}
+
+func requireIDs(values ...string) error {
+	for _, value := range values {
+		if !uuidPattern.MatchString(value) {
+			return errors.New("required audit identifier is missing or invalid")
+		}
+	}
+	return nil
 }
 
 var (

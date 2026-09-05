@@ -31,7 +31,27 @@ var (
 	ErrNotFound                = errors.New("record not found")
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db                *sql.DB
+	statePath         *statePathHandle
+	commitPublishHook func(string) error
+}
+
+type statePathHandle struct {
+	sqlitePath string
+	verify     func() error
+	close      func() error
+}
+
+func (h *statePathHandle) Verify() error { return h.verify() }
+func (h *statePathHandle) Close() error {
+	if h == nil || h.close == nil {
+		return nil
+	}
+	err := h.close()
+	h.close = nil
+	return err
+}
 
 type Administrator struct {
 	Username           string
@@ -97,34 +117,56 @@ type Release struct {
 	CommittedAt                 time.Time
 }
 
+type ReleaseAsset struct {
+	FileName  string
+	SizeBytes int64
+	SHA256    string
+}
+type PublishCommit struct {
+	Release                  Release
+	Assets                   []ReleaseAsset
+	OperationID, CandidateID string
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if err := validateDatabasePath(path); err != nil {
 		return nil, err
 	}
-	if err := prepareStatePath(path); err != nil {
+	securedPath, err := prepareStatePath(path)
+	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", databaseURI(path))
+	db, err := sql.Open("sqlite", databaseURI(securedPath.sqlitePath))
 	if err != nil {
+		_ = securedPath.Close()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	s := &Store{db: db}
+	s := &Store{db: db, statePath: securedPath}
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
+		_ = securedPath.Close()
 		return nil, fmt.Errorf("connect sqlite: %w", err)
+	}
+	if err := securedPath.Verify(); err != nil {
+		_ = db.Close()
+		_ = securedPath.Close()
+		return nil, err
 	}
 	if err := s.verifyPragmas(ctx); err != nil {
 		_ = db.Close()
+		_ = securedPath.Close()
 		return nil, err
 	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
+		_ = securedPath.Close()
 		return nil, err
 	}
-	if err := verifyStateFiles(path); err != nil {
+	if err := securedPath.Verify(); err != nil {
 		_ = db.Close()
+		_ = securedPath.Close()
 		return nil, err
 	}
 	return s, nil
@@ -184,6 +226,11 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("missing migration from schema %d", current)
 		}
 		if err := s.withTx(ctx, func(tx *sql.Tx) error {
+			if next.validate != nil {
+				if err := next.validate(tx); err != nil {
+					return err
+				}
+			}
 			if _, err := tx.ExecContext(ctx, next.sql); err != nil {
 				return err
 			}
@@ -197,7 +244,14 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	dbErr := s.db.Close()
+	pathErr := s.statePath.Close()
+	if dbErr != nil {
+		return dbErr
+	}
+	return pathErr
+}
 
 func (s *Store) withTx(ctx context.Context, work func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -315,34 +369,6 @@ func (s *Store) Admin(ctx context.Context) (Administrator, error) {
 	return admin, nil
 }
 
-func (s *Store) AdvanceHighestCommittedVersion(ctx context.Context, version string) error {
-	next, err := parseVersion(version)
-	if err != nil {
-		return err
-	}
-	return s.withTx(ctx, func(tx *sql.Tx) error {
-		var currentVersion string
-		var major, minor, patch int64
-		err := tx.QueryRowContext(ctx, `SELECT version,major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&currentVersion, &major, &minor, &patch)
-		if err == nil {
-			current := numericVersion{major, minor, patch}
-			if current.String() != currentVersion {
-				return errors.New("stored highest version tuple is inconsistent")
-			}
-			if next.compare(current) <= 0 {
-				return ErrVersionNotIncreasing
-			}
-			_, err = tx.ExecContext(ctx, `UPDATE highest_committed_version SET version=?,major=?,minor=?,patch=?,committed_at=? WHERE singleton_id=1`, version, next.major, next.minor, next.patch, timestamp(time.Now()))
-			return err
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO highest_committed_version(singleton_id,version,major,minor,patch,committed_at) VALUES(1,?,?,?,?,?)`, version, next.major, next.minor, next.patch, timestamp(time.Now()))
-		return err
-	})
-}
-
 func (s *Store) HighestCommittedVersion(ctx context.Context) (string, bool, error) {
 	var version string
 	var major, minor, patch int64
@@ -410,8 +436,20 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) error 
 }
 
 func (s *Store) TransitionOperation(ctx context.Context, id string, state OperationState, resultCode string) error {
-	if !allowedResultCode(resultCode) {
+	if !validOperationResult(state, resultCode) {
 		return errors.New("invalid operation result code")
+	}
+	var currentState, currentCode string
+	if err := s.db.QueryRowContext(ctx, `SELECT state,result_code FROM operations WHERE id=?`, id).Scan(&currentState, &currentCode); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if currentState == string(OperationSucceeded) || currentState == string(OperationFailed) {
+		if currentState == string(state) && currentCode == resultCode {
+			return nil
+		}
+		return ErrInvalidTransition
 	}
 	var finished any
 	if state == OperationSucceeded || state == OperationFailed {
@@ -421,17 +459,151 @@ func (s *Store) TransitionOperation(ctx context.Context, id string, state Operat
 	return transitionResult(result, err)
 }
 
-func (s *Store) CommitRelease(ctx context.Context, release Release) error {
-	if _, err := parseVersion(release.Version); err != nil {
+func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommit) error {
+	if len(request.Assets) == 0 {
+		return errors.New("published release requires at least one asset")
+	}
+	next, err := parseVersion(request.Release.Version)
+	if err != nil {
+		return err
+	}
+	event, err := audit.NewPublishConfirmed(request.OperationID, request.CandidateID, request.Release.ID, request.Release.CommittedAt)
+	if err != nil {
 		return err
 	}
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var candidateState, candidateVersion, operationState, operationKind, operationCode, operationRelease string
+		if err := tx.QueryRowContext(ctx, `SELECT state,COALESCE(release_version,'') FROM candidates WHERE id=?`, request.CandidateID).Scan(&candidateState, &candidateVersion); err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT state,kind,result_code,COALESCE(release_id,'') FROM operations WHERE id=? AND candidate_id=?`, request.OperationID, request.CandidateID).Scan(&operationState, &operationKind, &operationCode, &operationRelease); err != nil {
+			return err
+		}
+		if operationState == "succeeded" || operationState == "failed" {
+			if operationState == "succeeded" && operationKind == "publish" && operationCode == "completed" && operationRelease == request.Release.ID && candidateState == "published" && candidateVersion == request.Release.Version {
+				matches, err := publishedResultMatches(ctx, tx, request, next)
+				if err != nil {
+					return err
+				}
+				if matches {
+					return nil
+				}
+			}
+			return ErrInvalidTransition
+		}
+		if candidateState != "publishing" || operationState != "running" || operationKind != "publish" {
+			return ErrInvalidTransition
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE state='current'`); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?,?,?,'current',?)`, release.ID, release.Version, release.GenerationName, timestamp(release.CommittedAt))
-		return err
+		if _, err := tx.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?,?,?,'current',?)`, request.Release.ID, request.Release.Version, request.Release.GenerationName, timestamp(request.Release.CommittedAt)); err != nil {
+			return err
+		}
+		if err := s.publishBoundary("release"); err != nil {
+			return err
+		}
+		for _, asset := range request.Assets {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO release_assets(release_id,file_name,size_bytes,sha256) VALUES(?,?,?,?)`, request.Release.ID, asset.FileName, asset.SizeBytes, asset.SHA256); err != nil {
+				return err
+			}
+		}
+		if err := s.publishBoundary("assets"); err != nil {
+			return err
+		}
+		if err := advanceFloorTx(ctx, tx, next, request.Release.CommittedAt); err != nil {
+			return err
+		}
+		if err := s.publishBoundary("floor"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='published',release_version=? WHERE id=?`, request.Release.Version, request.CandidateID); err != nil {
+			return err
+		}
+		if err := s.publishBoundary("candidate"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='succeeded',result_code='completed',release_id=?,finished_at=? WHERE id=?`, request.Release.ID, timestamp(request.Release.CommittedAt), request.OperationID); err != nil {
+			return err
+		}
+		if err := s.publishBoundary("operation"); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, event); err != nil {
+			return err
+		}
+		return s.publishBoundary("audit")
 	})
+}
+
+func publishedResultMatches(ctx context.Context, tx *sql.Tx, request PublishCommit, version numericVersion) (bool, error) {
+	var storedVersion, generation string
+	var committedAt int64
+	if err := tx.QueryRowContext(ctx, `SELECT version,generation_name,committed_at FROM releases WHERE id=?`, request.Release.ID).Scan(&storedVersion, &generation, &committedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if storedVersion != request.Release.Version || generation != request.Release.GenerationName || committedAt != timestamp(request.Release.CommittedAt) {
+		return false, nil
+	}
+	var floorMajor, floorMinor, floorPatch int64
+	if err := tx.QueryRowContext(ctx, `SELECT major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&floorMajor, &floorMinor, &floorPatch); err != nil {
+		return false, err
+	}
+	if (numericVersion{floorMajor, floorMinor, floorPatch}).compare(version) < 0 {
+		return false, nil
+	}
+	var assetCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM release_assets WHERE release_id=?`, request.Release.ID).Scan(&assetCount); err != nil {
+		return false, err
+	}
+	if assetCount != len(request.Assets) {
+		return false, nil
+	}
+	for _, asset := range request.Assets {
+		var size int64
+		var digest string
+		if err := tx.QueryRowContext(ctx, `SELECT size_bytes,sha256 FROM release_assets WHERE release_id=? AND file_name=?`, request.Release.ID, asset.FileName).Scan(&size, &digest); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		if size != asset.SizeBytes || digest != asset.SHA256 {
+			return false, nil
+		}
+	}
+	var auditCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE event_type='publish_confirmed' AND outcome='success' AND operation_id=? AND candidate_id=? AND release_id=? AND code='completed'`, request.OperationID, request.CandidateID, request.Release.ID).Scan(&auditCount); err != nil {
+		return false, err
+	}
+	return auditCount == 1, nil
+}
+
+func (s *Store) publishBoundary(stage string) error {
+	if s.commitPublishHook != nil {
+		return s.commitPublishHook(stage)
+	}
+	return nil
+}
+
+func advanceFloorTx(ctx context.Context, tx *sql.Tx, next numericVersion, at time.Time) error {
+	var major, minor, patch int64
+	err := tx.QueryRowContext(ctx, `SELECT major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&major, &minor, &patch)
+	if err == nil {
+		if next.compare(numericVersion{major, minor, patch}) <= 0 {
+			return ErrVersionNotIncreasing
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE highest_committed_version SET version=?,major=?,minor=?,patch=?,committed_at=? WHERE singleton_id=1`, next.String(), next.major, next.minor, next.patch, timestamp(at))
+		return err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO highest_committed_version(singleton_id,version,major,minor,patch,committed_at) VALUES(1,?,?,?,?,?)`, next.String(), next.major, next.minor, next.patch, timestamp(at))
+	return err
 }
 
 func (s *Store) SetCurrentRelease(ctx context.Context, id string) error {
@@ -489,12 +661,16 @@ func wrapWrite(action string, err error) error {
 	}
 	return nil
 }
-func timestamp(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+func timestamp(value time.Time) int64 { return value.UTC().Unix() }
 
-func allowedResultCode(code string) bool {
-	switch code {
-	case "", "accepted", "completed", "hash_mismatch", "signature_mismatch", "version_floor", "expired", "internal_failure":
-		return true
+func validOperationResult(state OperationState, code string) bool {
+	switch state {
+	case OperationRunning:
+		return code == ""
+	case OperationSucceeded:
+		return code == "completed"
+	case OperationFailed:
+		return code == "hash_mismatch" || code == "signature_mismatch" || code == "version_floor" || code == "expired" || code == "internal_failure"
 	default:
 		return false
 	}
@@ -503,6 +679,8 @@ func allowedResultCode(code string) bool {
 type numericVersion struct{ major, minor, patch int64 }
 
 var numericVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+var uuidPatternStore = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var flatNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 func parseVersion(value string) (numericVersion, error) {
 	match := numericVersionPattern.FindStringSubmatch(value)
@@ -516,6 +694,9 @@ func parseVersion(value string) (numericVersion, error) {
 			return numericVersion{}, errors.New("version component is too large")
 		}
 		parts[index] = parsed
+		if parsed > 65534 {
+			return numericVersion{}, errors.New("version component exceeds client maximum 65534")
+		}
 	}
 	return numericVersion{parts[0], parts[1], parts[2]}, nil
 }

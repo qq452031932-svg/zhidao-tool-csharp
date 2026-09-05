@@ -66,4 +66,33 @@ func TestOpenRejectsInsecureStateParentAndLinkedDatabase(t *testing.T) {
 	if _, err := Open(context.Background(), symlink); err == nil {
 		t.Fatal("Open() accepted symlink database")
 	}
+	badSidecar := filepath.Join(root, "sidecar.db-wal")
+	if err := os.WriteFile(badSidecar, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), filepath.Join(root, "sidecar.db")); err == nil {
+		t.Fatal("Open accepted insecure preexisting WAL before SQLite use")
+	}
+}
+
+func TestPinnedStatePathRejectsDatabaseIdentityReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "state.db")
+	handle, err := prepareStatePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Verify(); err == nil {
+		t.Fatal("pinned state path accepted a replacement database inode")
+	}
 }

@@ -58,3 +58,54 @@ func TestLoadRejectsWritableParentComponent(t *testing.T) {
 		t.Fatal("Load() accepted a group-writable parent")
 	}
 }
+
+func TestLoadRejectsIntermediateSymlinkComponent(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root ownership fixture requires root")
+	}
+	root, err := os.MkdirTemp(".", ".config-link-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(realParent, "ota-admin.json")
+	if err := os.WriteFile(path, []byte(`{"database_path":"/var/lib/superpan-ota-admin/state.db"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "linked")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(filepath.Join(linkedParent, "ota-admin.json")); err == nil {
+		t.Fatal("Load followed intermediate symlink")
+	}
+}
+
+func TestLoadRejectsNonRootOwnedParentComponent(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root ownership fixture requires root")
+	}
+	root, err := os.MkdirTemp(".", ".config-owner-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	parent := filepath.Join(root, "foreign")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "ota-admin.json")
+	if err := os.WriteFile(path, []byte(`{"database_path":"/var/lib/superpan-ota-admin/state.db"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, 1, -1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a non-root-owned parent")
+	}
+}

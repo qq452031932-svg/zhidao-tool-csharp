@@ -1,30 +1,39 @@
 package store
 
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
 type migration struct {
-	version int
-	sql     string
+	version  int
+	sql      string
+	validate func(*sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: migrationV1}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, sql: migrationV2, validate: validateLegacyV1}}
 
-const schemaVersion = 1
+const schemaVersion = 2
 
-var migrationV1 = `
+var schemaV2 = `
 CREATE TABLE administrators (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     username TEXT NOT NULL UNIQUE CHECK (username = 'admin'),
     password_hash TEXT NOT NULL CHECK (password_hash GLOB '$argon2id$v=19$m=65536,t=3,p=2$*$*'),
     must_change_password INTEGER NOT NULL CHECK (must_change_password IN (0, 1)),
-    created_at TEXT NOT NULL
+    created_at INTEGER NOT NULL CHECK (` + integerCheckSQL("created_at") + `)
 );
 
 CREATE TABLE highest_committed_version (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     version TEXT NOT NULL,
-    major INTEGER NOT NULL CHECK (major >= 0),
-    minor INTEGER NOT NULL CHECK (minor >= 0),
-    patch INTEGER NOT NULL CHECK (patch >= 0),
-    committed_at TEXT NOT NULL,
+    major INTEGER NOT NULL CHECK (major BETWEEN 0 AND 65534),
+    minor INTEGER NOT NULL CHECK (minor BETWEEN 0 AND 65534),
+    patch INTEGER NOT NULL CHECK (patch BETWEEN 0 AND 65534),
+    committed_at INTEGER NOT NULL CHECK (` + integerCheckSQL("committed_at") + `),
     CHECK (version = printf('%d.%d.%d', major, minor, patch))
 );
 
@@ -43,10 +52,10 @@ BEGIN SELECT RAISE(ABORT, 'highest committed version must increase'); END;
 
 CREATE TABLE releases (
     id TEXT PRIMARY KEY CHECK (` + uuidCheckSQL("id") + `),
-    version TEXT NOT NULL UNIQUE,
+    version TEXT NOT NULL UNIQUE CHECK (` + versionCheckSQL("version") + `),
     generation_name TEXT NOT NULL UNIQUE CHECK (` + flatNameCheckSQL("generation_name") + `),
     state TEXT NOT NULL CHECK (state IN ('current', 'retained', 'removed')),
-    committed_at TEXT NOT NULL,
+    committed_at INTEGER NOT NULL CHECK (` + integerCheckSQL("committed_at") + `),
     actor TEXT NOT NULL DEFAULT 'admin' CHECK (actor = 'admin')
 );
 
@@ -67,7 +76,7 @@ BEGIN SELECT RAISE(ABORT, 'invalid release transition'); END;
 CREATE TABLE release_assets (
     release_id TEXT NOT NULL REFERENCES releases(id) ON DELETE RESTRICT,
     file_name TEXT NOT NULL CHECK (` + flatNameCheckSQL("file_name") + `),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    size_bytes INTEGER NOT NULL CHECK (` + integerCheckSQL("size_bytes") + `),
     sha256 TEXT NOT NULL CHECK (` + hexCheckSQL("sha256", 64) + `),
     PRIMARY KEY (release_id, file_name)
 );
@@ -75,10 +84,10 @@ CREATE TABLE release_assets (
 CREATE TABLE sessions (
     id_hash TEXT PRIMARY KEY CHECK (` + hexCheckSQL("id_hash", 64) + `),
     state TEXT NOT NULL CHECK (state IN ('active', 'revoked', 'expired')),
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    idle_expires_at TEXT NOT NULL,
-    absolute_expires_at TEXT NOT NULL,
+    created_at INTEGER NOT NULL CHECK (` + integerCheckSQL("created_at") + `),
+    last_seen_at INTEGER NOT NULL CHECK (` + integerCheckSQL("last_seen_at") + `),
+    idle_expires_at INTEGER NOT NULL CHECK (` + integerCheckSQL("idle_expires_at") + `),
+    absolute_expires_at INTEGER NOT NULL CHECK (` + integerCheckSQL("absolute_expires_at") + `),
     CHECK (created_at <= last_seen_at AND last_seen_at <= idle_expires_at AND idle_expires_at <= absolute_expires_at)
 );
 
@@ -97,13 +106,14 @@ CREATE TABLE candidates (
     upload_digest TEXT NOT NULL DEFAULT '' CHECK (upload_digest = '' OR ` + hexCheckSQL("upload_digest", 64) + `),
     validation_report TEXT NOT NULL DEFAULT '' CHECK (validation_report = '' OR (length(validation_report) <= 65536 AND json_valid(validation_report))),
     state TEXT NOT NULL CHECK (state IN ('uploading', 'validated', 'publishing', 'published', 'failed', 'expired')),
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL CHECK (expires_at > created_at),
-    release_version TEXT
+    created_at INTEGER NOT NULL CHECK (` + integerCheckSQL("created_at") + `),
+    expires_at INTEGER NOT NULL CHECK (` + integerCheckSQL("expires_at") + ` AND expires_at > created_at),
+    release_version TEXT REFERENCES releases(version) ON DELETE RESTRICT,
+    CHECK ((state = 'published' AND release_version IS NOT NULL) OR (state <> 'published' AND release_version IS NULL))
 );
 
 CREATE TRIGGER candidates_initial_state
-BEFORE INSERT ON candidates WHEN NEW.state <> 'uploading'
+BEFORE INSERT ON candidates WHEN NEW.state <> 'uploading' OR NEW.upload_digest <> '' OR NEW.validation_report <> '' OR NEW.release_version IS NOT NULL
 BEGIN SELECT RAISE(ABORT, 'candidate must start uploading'); END;
 
 CREATE TRIGGER candidates_immutable_bindings
@@ -114,6 +124,11 @@ WHEN NEW.session_id <> OLD.session_id OR (
        OLD.upload_digest = '' AND OLD.validation_report = '' AND
        ` + hexCheckSQL("NEW.upload_digest", 64) + ` AND NEW.validation_report <> '' AND json_valid(NEW.validation_report)
      )
+) OR (
+     NEW.release_version IS NOT OLD.release_version AND NOT (
+       OLD.state = 'publishing' AND NEW.state = 'published' AND
+       OLD.release_version IS NULL AND NEW.release_version IS NOT NULL
+     )
 )
 BEGIN SELECT RAISE(ABORT, 'candidate binding is immutable'); END;
 
@@ -123,7 +138,7 @@ WHEN NOT (
     (OLD.state = 'uploading' AND NEW.state = 'validated' AND ` + hexCheckSQL("NEW.upload_digest", 64) + ` AND NEW.validation_report <> '' AND json_valid(NEW.validation_report)) OR
     (OLD.state = 'uploading' AND NEW.state IN ('failed', 'expired')) OR
     (OLD.state = 'validated' AND NEW.state IN ('publishing', 'failed', 'expired')) OR
-    (OLD.state = 'publishing' AND NEW.state IN ('published', 'failed'))
+    (OLD.state = 'publishing' AND ((NEW.state = 'published' AND NEW.release_version IS NOT NULL) OR NEW.state = 'failed'))
 )
 BEGIN SELECT RAISE(ABORT, 'invalid candidate transition'); END;
 
@@ -133,10 +148,14 @@ CREATE TABLE operations (
     state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'failed')),
     candidate_id TEXT REFERENCES candidates(id) ON DELETE RESTRICT,
     release_id TEXT REFERENCES releases(id) ON DELETE RESTRICT,
-    result_code TEXT NOT NULL DEFAULT '' CHECK (result_code IN ('', 'accepted', 'completed', 'hash_mismatch', 'signature_mismatch', 'version_floor', 'expired', 'internal_failure')),
-    created_at TEXT NOT NULL,
-    finished_at TEXT,
-    CHECK ((state IN ('succeeded', 'failed')) = (finished_at IS NOT NULL))
+    result_code TEXT NOT NULL DEFAULT '' CHECK (result_code IN ('', 'completed', 'hash_mismatch', 'signature_mismatch', 'version_floor', 'expired', 'internal_failure')),
+    created_at INTEGER NOT NULL CHECK (` + integerCheckSQL("created_at") + `),
+    finished_at INTEGER CHECK (finished_at IS NULL OR (` + integerCheckSQL("finished_at") + `)),
+    CHECK (
+      (state IN ('pending','running') AND result_code='' AND finished_at IS NULL) OR
+      (state='succeeded' AND result_code='completed' AND finished_at IS NOT NULL) OR
+      (state='failed' AND result_code IN ('hash_mismatch','signature_mismatch','version_floor','expired','internal_failure') AND finished_at IS NOT NULL)
+    )
 );
 
 CREATE TRIGGER operations_initial_state
@@ -151,9 +170,13 @@ WHEN NOT (
 )
 BEGIN SELECT RAISE(ABORT, 'invalid operation transition'); END;
 
+CREATE TRIGGER operations_terminal_immutable
+BEFORE UPDATE ON operations WHEN OLD.state IN ('succeeded','failed')
+BEGIN SELECT RAISE(ABORT, 'terminal operation is immutable'); END;
+
 CREATE TABLE audit_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    occurred_at TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL CHECK (` + integerCheckSQL("occurred_at") + `),
     event_type TEXT NOT NULL CHECK (event_type IN ('login_result', 'upload_started', 'upload_completed', 'gate_result', 'publish_confirmed', 'publish_failed', 'rollback_completed', 'cleanup_result')),
     outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
     operation_id TEXT NOT NULL DEFAULT '' CHECK (operation_id = '' OR ` + uuidCheckSQL("operation_id") + `),
@@ -196,7 +219,19 @@ func hexCheckSQL(column string, length int) string {
 }
 
 func flatNameCheckSQL(column string) string {
-	return `length(` + column + `) BETWEEN 1 AND 128 AND ` + column + ` NOT IN ('.','..') AND ` + column + ` NOT GLOB '*[^A-Za-z0-9._-]*'`
+	return `length(` + column + `) BETWEEN 1 AND 128 AND substr(` + column + `,1,1) NOT GLOB '[^A-Za-z0-9]' AND ` + column + ` NOT IN ('.','..') AND ` + column + ` NOT GLOB '*[^A-Za-z0-9._-]*'`
+}
+
+func versionCheckSQL(column string) string {
+	tail := `substr(` + column + `,instr(` + column + `,'.')+1)`
+	major := `CAST(substr(` + column + `,1,instr(` + column + `,'.')-1) AS INTEGER)`
+	minor := `CAST(substr(` + tail + `,1,instr(` + tail + `,'.')-1) AS INTEGER)`
+	patch := `CAST(substr(` + tail + `,instr(` + tail + `,'.')+1) AS INTEGER)`
+	return column + ` NOT GLOB '*[^0-9.]*' AND ` + column + ` = printf('%d.%d.%d',` + major + `,` + minor + `,` + patch + `) AND ` + major + ` BETWEEN 0 AND 65534 AND ` + minor + ` BETWEEN 0 AND 65534 AND ` + patch + ` BETWEEN 0 AND 65534`
+}
+
+func integerCheckSQL(column string) string {
+	return `typeof(` + column + `) = 'integer' AND ` + column + ` >= 0`
 }
 
 func itoa(value int) string {
@@ -205,3 +240,166 @@ func itoa(value int) string {
 	}
 	panic("unsupported schema constant")
 }
+
+var migrationV2 = `
+DROP TRIGGER candidates_state_machine;
+DROP TRIGGER sessions_state_machine;
+DROP TRIGGER operations_state_machine;
+DROP TRIGGER highest_committed_version_no_delete;
+DROP TRIGGER highest_committed_version_monotonic;
+DROP TRIGGER audit_events_append_only_update;
+DROP TRIGGER audit_events_append_only_delete;
+ALTER TABLE administrators RENAME TO administrators_legacy;
+ALTER TABLE highest_committed_version RENAME TO highest_committed_version_legacy;
+ALTER TABLE releases RENAME TO releases_legacy;
+ALTER TABLE release_assets RENAME TO release_assets_legacy;
+ALTER TABLE candidates RENAME TO candidates_legacy;
+ALTER TABLE sessions RENAME TO sessions_legacy;
+ALTER TABLE operations RENAME TO operations_legacy;
+ALTER TABLE audit_events RENAME TO audit_events_legacy;
+` + schemaV2 + `
+INSERT INTO administrators SELECT singleton_id,username,password_hash,must_change_password,CAST(strftime('%s',created_at) AS INTEGER) FROM administrators_legacy;
+INSERT INTO highest_committed_version SELECT singleton_id,version,major,minor,patch,CAST(strftime('%s',committed_at) AS INTEGER) FROM highest_committed_version_legacy;
+INSERT INTO releases SELECT id,version,generation_name,'current',CAST(strftime('%s',committed_at) AS INTEGER),actor FROM releases_legacy;
+INSERT INTO release_assets SELECT release_id,file_name,size_bytes,sha256 FROM release_assets_legacy;
+DROP TABLE audit_events_legacy;
+DROP TABLE operations_legacy;
+DROP TABLE candidates_legacy;
+DROP TABLE sessions_legacy;
+DROP TABLE release_assets_legacy;
+DROP TABLE releases_legacy;
+DROP TABLE highest_committed_version_legacy;
+DROP TABLE administrators_legacy;
+`
+
+func validateLegacyV1(tx *sql.Tx) error {
+	for _, table := range []string{"candidates", "sessions", "operations", "audit_events"} {
+		var count int
+		if err := tx.QueryRow(`SELECT count(*) FROM ` + table).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return fmt.Errorf("legacy %s rows cannot be safely transformed", table)
+		}
+	}
+	rows, err := tx.Query(`SELECT password_hash,created_at FROM administrators`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash, at string
+		if err := rows.Scan(&hash, &at); err != nil {
+			return err
+		}
+		if _, _, err := decodePasswordHash(hash); err != nil {
+			return fmt.Errorf("unsafe legacy administrator: %w", err)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, at); err != nil {
+			return errors.New("unsafe legacy administrator timestamp")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows, err = tx.Query(`SELECT version,major,minor,patch,prerelease,committed_at FROM highest_committed_version`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version, pre, at string
+		var major, minor, patch int64
+		if err := rows.Scan(&version, &major, &minor, &patch, &pre, &at); err != nil {
+			return err
+		}
+		parsed, err := parseVersion(version)
+		if err != nil || pre != "" || parsed != (numericVersion{major, minor, patch}) {
+			return errors.New("unsafe legacy highest version")
+		}
+		if _, err = time.Parse(time.RFC3339Nano, at); err != nil {
+			return errors.New("unsafe legacy highest version timestamp")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var releaseCount int
+	if err := tx.QueryRow(`SELECT count(*) FROM releases`).Scan(&releaseCount); err != nil {
+		return err
+	}
+	if releaseCount > 1 {
+		return errors.New("multiple legacy releases cannot be safely assigned current state")
+	}
+	rows, err = tx.Query(`SELECT id,version,generation_name,state,committed_at FROM releases`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, version, name, state, at string
+		if err := rows.Scan(&id, &version, &name, &state, &at); err != nil {
+			return err
+		}
+		if !uuidPatternStore.MatchString(id) || state != "committed" || !flatNamePattern.MatchString(name) {
+			return errors.New("unsafe legacy release")
+		}
+		if _, err := parseVersion(version); err != nil {
+			return err
+		}
+		if _, err = time.Parse(time.RFC3339Nano, at); err != nil {
+			return errors.New("unsafe legacy release timestamp")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if releaseCount == 1 {
+		var releaseVersion, floorVersion string
+		if err := tx.QueryRow(`SELECT version FROM releases LIMIT 1`).Scan(&releaseVersion); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT version FROM highest_committed_version WHERE singleton_id=1`).Scan(&floorVersion); err != nil {
+			return errors.New("legacy release lacks a permanent version floor")
+		}
+		releaseParsed, _ := parseVersion(releaseVersion)
+		floorParsed, _ := parseVersion(floorVersion)
+		if floorParsed.compare(releaseParsed) < 0 {
+			return errors.New("legacy permanent floor is below committed release")
+		}
+	}
+	rows, err = tx.Query(`SELECT file_name,sha256 FROM release_assets`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, digest string
+		if err := rows.Scan(&name, &digest); err != nil {
+			return err
+		}
+		if !flatNamePattern.MatchString(name) || len(digest) != 64 || strings.ToLower(digest) != digest {
+			return errors.New("unsafe legacy asset")
+		}
+	}
+	return rows.Err()
+}
+
+const legacyV1DDL = `
+CREATE TABLE administrators (singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),username TEXT NOT NULL UNIQUE CHECK (username = 'admin'),password_hash TEXT NOT NULL CHECK (length(password_hash) > 0),must_change_password INTEGER NOT NULL CHECK (must_change_password IN (0, 1)),created_at TEXT NOT NULL);
+CREATE TABLE highest_committed_version (singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),version TEXT NOT NULL,major INTEGER NOT NULL CHECK (major >= 0),minor INTEGER NOT NULL CHECK (minor >= 0),patch INTEGER NOT NULL CHECK (patch >= 0),prerelease TEXT NOT NULL,precedence_key BLOB NOT NULL,sequence INTEGER NOT NULL CHECK (sequence > 0),committed_at TEXT NOT NULL);
+CREATE TRIGGER highest_committed_version_no_delete BEFORE DELETE ON highest_committed_version BEGIN SELECT RAISE(ABORT, 'highest committed version is permanent'); END;
+CREATE TRIGGER highest_committed_version_monotonic BEFORE UPDATE ON highest_committed_version WHEN NEW.sequence <= OLD.sequence OR NEW.precedence_key <= OLD.precedence_key BEGIN SELECT RAISE(ABORT, 'highest committed version must increase'); END;
+CREATE TABLE releases (id TEXT PRIMARY KEY,version TEXT NOT NULL UNIQUE,generation_name TEXT NOT NULL UNIQUE CHECK (generation_name NOT LIKE '/%' AND generation_name NOT LIKE '%\\%' AND generation_name NOT LIKE '%..%'),state TEXT NOT NULL CHECK (state IN ('committed', 'retained', 'removed')),committed_at TEXT NOT NULL,actor TEXT NOT NULL DEFAULT 'admin' CHECK (actor = 'admin'));
+CREATE TABLE release_assets (release_id TEXT NOT NULL REFERENCES releases(id) ON DELETE RESTRICT,file_name TEXT NOT NULL CHECK (file_name NOT LIKE '%/%' AND file_name NOT LIKE '%\\%' AND file_name NOT IN ('.', '..')),size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256)),PRIMARY KEY (release_id, file_name));
+CREATE TABLE candidates (id TEXT PRIMARY KEY,session_id TEXT NOT NULL,fingerprint TEXT NOT NULL,state TEXT NOT NULL CHECK (state IN ('uploading', 'validated', 'publishing', 'published', 'failed', 'expired')),created_at TEXT NOT NULL,expires_at TEXT NOT NULL,release_version TEXT);
+CREATE TRIGGER candidates_state_machine BEFORE UPDATE OF state ON candidates WHEN NOT ((OLD.state = 'uploading' AND NEW.state IN ('validated', 'failed', 'expired')) OR (OLD.state = 'validated' AND NEW.state IN ('publishing', 'failed', 'expired')) OR (OLD.state = 'publishing' AND NEW.state IN ('published', 'failed'))) BEGIN SELECT RAISE(ABORT, 'invalid candidate transition'); END;
+CREATE TABLE sessions (id_hash TEXT PRIMARY KEY,state TEXT NOT NULL CHECK (state IN ('active', 'revoked', 'expired')),created_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,idle_expires_at TEXT NOT NULL,absolute_expires_at TEXT NOT NULL,CHECK (idle_expires_at <= absolute_expires_at));
+CREATE TRIGGER sessions_state_machine BEFORE UPDATE OF state ON sessions WHEN NOT (OLD.state = 'active' AND NEW.state IN ('revoked', 'expired')) BEGIN SELECT RAISE(ABORT, 'invalid session transition'); END;
+CREATE TABLE operations (id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK (kind IN ('upload', 'publish', 'rollback', 'cleanup')),state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'failed')),candidate_id TEXT REFERENCES candidates(id) ON DELETE RESTRICT,release_id TEXT REFERENCES releases(id) ON DELETE RESTRICT,result_code TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,finished_at TEXT);
+CREATE TRIGGER operations_state_machine BEFORE UPDATE OF state ON operations WHEN NOT ((OLD.state = 'pending' AND NEW.state IN ('running', 'failed')) OR (OLD.state = 'running' AND NEW.state IN ('succeeded', 'failed'))) BEGIN SELECT RAISE(ABORT, 'invalid operation transition'); END;
+CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT,occurred_at TEXT NOT NULL,event_type TEXT NOT NULL,outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),operation_id TEXT NOT NULL DEFAULT '',candidate_id TEXT NOT NULL DEFAULT '',release_id TEXT NOT NULL DEFAULT '',code TEXT NOT NULL DEFAULT '',source_hash TEXT NOT NULL DEFAULT '');
+CREATE TRIGGER audit_events_append_only_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+CREATE TRIGGER audit_events_append_only_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+PRAGMA user_version=1;
+`

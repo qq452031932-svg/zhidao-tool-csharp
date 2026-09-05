@@ -105,10 +105,10 @@ func TestConfigRejectsZeroLimitsAndIdleLongerThanAbsoluteLifetime(t *testing.T) 
 func TestValidateRootOnlyMetadata(t *testing.T) {
 	t.Parallel()
 
-	if err := config.ValidateRootOnlyMetadata(0, 0o600); err != nil {
+	if err := config.ValidateRootOnlyMetadata(0, 1000, 1000, 0o600); err != nil {
 		t.Fatalf("ValidateRootOnlyMetadata(root, 0600) error = %v", err)
 	}
-	if err := config.ValidateRootOnlyMetadata(0, 0o640); err != nil {
+	if err := config.ValidateRootOnlyMetadata(0, 1000, 1000, 0o640); err != nil {
 		t.Fatalf("ValidateRootOnlyMetadata(root, 0640) error = %v; service group read must be supported", err)
 	}
 	for _, test := range []struct {
@@ -124,16 +124,19 @@ func TestValidateRootOnlyMetadata(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if err := config.ValidateRootOnlyMetadata(test.uid, test.mode); err == nil {
+			if err := config.ValidateRootOnlyMetadata(test.uid, 1000, 1000, test.mode); err == nil {
 				t.Fatal("ValidateRootOnlyMetadata() accepted insecure metadata")
 			}
 		})
+	}
+	if err := config.ValidateRootOnlyMetadata(0, 2000, 1000, 0o640); err == nil {
+		t.Fatal("ValidateRootOnlyMetadata accepted group-readable config owned by another group")
 	}
 }
 
 func TestValidateTrustedParentMetadata(t *testing.T) {
 	t.Parallel()
-	if err := config.ValidateTrustedParentMetadata(false, 0o755); err != nil {
+	if err := config.ValidateTrustedParentMetadata(0, false, 0o755); err != nil {
 		t.Fatalf("ValidateTrustedParentMetadata(0755) error = %v", err)
 	}
 	for _, test := range []struct {
@@ -147,10 +150,13 @@ func TestValidateTrustedParentMetadata(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if err := config.ValidateTrustedParentMetadata(test.symlink, test.mode); err == nil {
+			if err := config.ValidateTrustedParentMetadata(0, test.symlink, test.mode); err == nil {
 				t.Fatal("ValidateTrustedParentMetadata() accepted unsafe parent")
 			}
 		})
+	}
+	if err := config.ValidateTrustedParentMetadata(1000, false, 0o755); err == nil {
+		t.Fatal("ValidateTrustedParentMetadata accepted non-root ancestor")
 	}
 }
 

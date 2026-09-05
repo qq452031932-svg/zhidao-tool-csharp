@@ -93,6 +93,115 @@ func TestMigrationChainIsOrderedAndComplete(t *testing.T) {
 	}
 }
 
+func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
+	t.Parallel()
+	fresh := openStore(t)
+	var version int
+	if err := fresh.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("fresh schema=%d err=%v", version, err)
+	}
+	assertIntegerTimestampColumns(t, fresh.db)
+
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(legacyV1DDL); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hashPassword("Strong!Password123", nilReaderRand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = db.Exec(`INSERT INTO administrators VALUES(1,'admin',?,1,?)`, hash, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO highest_committed_version VALUES(1,'1.2.3',1,2,3,'',x'01',1,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO releases VALUES(?, '1.2.3','release-1','committed',?,'admin')`, releaseID1, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO release_assets VALUES(?,?,12,?)`, releaseID1, "asset.nupkg", digest1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	defer upgraded.Close()
+	if err = upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("upgraded schema=%d err=%v", version, err)
+	}
+	assertIntegerTimestampColumns(t, upgraded.db)
+	var state string
+	if err = upgraded.db.QueryRow(`SELECT state FROM releases WHERE id=?`, releaseID1).Scan(&state); err != nil || state != "current" {
+		t.Fatalf("release state=%q err=%v", state, err)
+	}
+	if got, ok, err := upgraded.HighestCommittedVersion(context.Background()); err != nil || !ok || got != "1.2.3" {
+		t.Fatalf("floor=%q/%v/%v", got, ok, err)
+	}
+	admin, err := upgraded.Admin(context.Background())
+	if err != nil || admin.PasswordHash != hash || !admin.MustChangePassword {
+		t.Fatalf("admin not preserved: %+v/%v", admin, err)
+	}
+	var assetCount int
+	if err := upgraded.db.QueryRow(`SELECT count(*) FROM release_assets WHERE release_id=? AND file_name='asset.nupkg'`, releaseID1).Scan(&assetCount); err != nil || assetCount != 1 {
+		t.Fatalf("asset not preserved: %d/%v", assetCount, err)
+	}
+}
+
+func assertIntegerTimestampColumns(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var declaredType string
+	if err := db.QueryRow(`SELECT type FROM pragma_table_info('administrators') WHERE name='created_at'`).Scan(&declaredType); err != nil {
+		t.Fatal(err)
+	}
+	if declaredType != "INTEGER" {
+		t.Fatalf("administrators.created_at type=%q, want INTEGER", declaredType)
+	}
+}
+
+func TestUnsafeLegacyRowsFailMigrationWithoutPartialChanges(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "unsafe-legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(legacyV1DDL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,code) VALUES('2026-01-01T00:00:00Z','unknown','success','password=secret')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Open(context.Background(), path); err == nil {
+		_ = s.Close()
+		t.Fatal("unsafe V1 migrated")
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 1 {
+		t.Fatalf("schema=%d err=%v", version, err)
+	}
+	var sourceHashColumn int
+	if err = db.QueryRow(`SELECT count(*) FROM pragma_table_info('audit_events') WHERE name='source_hash'`).Scan(&sourceHashColumn); err != nil || sourceHashColumn != 1 {
+		t.Fatalf("legacy schema partially changed")
+	}
+}
+
 func TestInitializeAdminRequiresExactArgon2idPHC(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
@@ -165,17 +274,18 @@ func TestGeneratedAdminDoesNotPrintOnAlreadyInitialized(t *testing.T) {
 
 func TestHighestCommittedVersionIsCanonicalNumericAndMonotonicAtDBBoundary(t *testing.T) {
 	t.Parallel()
-	s := openStore(t)
 	ctx := context.Background()
-	for _, version := range []string{"1.2.3", "1.10.0", "2.0.0"} {
-		if err := s.AdvanceHighestCommittedVersion(ctx, version); err != nil {
-			t.Fatalf("advance %q: %v", version, err)
-		}
+	s, request := preparedPublish(t)
+	if err := s.CommitPublishedRelease(ctx, request); err != nil {
+		t.Fatal(err)
 	}
 	for _, invalid := range []string{"2.0.0", "1.99.99", "2.0.1-beta.1", "02.0.1", "invalid"} {
-		if err := s.AdvanceHighestCommittedVersion(ctx, invalid); err == nil {
-			t.Errorf("AdvanceHighestCommittedVersion(%q) succeeded", invalid)
+		if _, err := parseVersion(invalid); err == nil && invalid != "2.0.0" && invalid != "1.99.99" {
+			t.Errorf("parseVersion(%q) succeeded", invalid)
 		}
+	}
+	if _, err := parseVersion("65535.0.0"); err == nil {
+		t.Fatal("parseVersion accepted a component outside the client range")
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE highest_committed_version SET version='1.0.0', major=1, minor=0, patch=0`); err == nil {
 		t.Fatal("raw SQL lowered the permanent version")
@@ -184,7 +294,7 @@ func TestHighestCommittedVersionIsCanonicalNumericAndMonotonicAtDBBoundary(t *te
 		t.Fatal("raw SQL stored an inconsistent version tuple")
 	}
 	got, ok, err := s.HighestCommittedVersion(ctx)
-	if err != nil || !ok || got != "2.0.0" {
+	if err != nil || !ok || got != "1.2.3" {
 		t.Fatalf("HighestCommittedVersion() = %q, %v, %v", got, ok, err)
 	}
 }
@@ -193,7 +303,8 @@ func TestHighestCommittedVersionReadRejectsPersistedTupleMismatch(t *testing.T) 
 	t.Parallel()
 	s := openStore(t)
 	ctx := context.Background()
-	if err := s.AdvanceHighestCommittedVersion(ctx, "1.2.3"); err != nil {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO highest_committed_version VALUES(1,'1.2.3',1,2,3,?)`, stamp(time.Now()))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx, `PRAGMA ignore_check_constraints=ON`); err != nil {
@@ -232,8 +343,14 @@ func TestInitialStatesAndForeignKeysAreEnforcedOnAPIsAndRawInserts(t *testing.T)
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at,upload_digest,validation_report) VALUES(?,?, 'validated', ?, ?, ?, '{"valid":true}')`, candidateID1, sessionHash1, stamp(now), stamp(now.Add(time.Hour)), digest1); err == nil {
 		t.Fatal("raw INSERT accepted a validated initial candidate")
 	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at,upload_digest,validation_report) VALUES(?,?, 'uploading', ?, ?, ?, '')`, candidateID1, sessionHash1, stamp(now), stamp(now.Add(time.Hour)), digest1); err == nil {
+		t.Fatal("raw INSERT accepted uploading candidate evidence")
+	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?, '1.0.0', 'release-1', 'retained', ?)`, releaseID1, stamp(now)); err == nil {
 		t.Fatal("raw INSERT accepted a retained initial release")
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?, '65535.0.0', 'release-1', 'current', ?)`, releaseID1, stamp(now)); err == nil {
+		t.Fatal("raw INSERT accepted a release version outside the client range")
 	}
 }
 
@@ -252,6 +369,9 @@ func TestCandidateBindsSessionDigestAndValidationReport(t *testing.T) {
 	}
 	if err := s.ValidateCandidate(ctx, candidateID1, digest1, `{"valid":true}`); err != nil {
 		t.Fatalf("ValidateCandidate() error = %v", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE candidates SET release_version='1.2.3' WHERE id=?`, candidateID1); err == nil {
+		t.Fatal("raw SQL bound a release version before publication")
 	}
 	for _, statement := range []string{
 		`UPDATE candidates SET session_id='` + sessionHash2 + `' WHERE id='` + candidateID1 + `'`,
@@ -275,11 +395,29 @@ func TestOperationTerminalStateRequiresFinishedAtAndCannotMoveBackward(t *testin
 	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationPublish, State: OperationPending, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	for _, statement := range []string{
+		`UPDATE operations SET state='running',result_code='completed' WHERE id='` + operationID1 + `'`,
+		`UPDATE operations SET state='succeeded',result_code='hash_mismatch',finished_at=1 WHERE id='` + operationID1 + `'`,
+		`UPDATE operations SET state='failed',result_code='',finished_at=1 WHERE id='` + operationID1 + `'`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err == nil {
+			t.Fatalf("raw SQL bypassed operation result invariant: %s", statement)
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET state='succeeded' WHERE id=?`, operationID1); err == nil {
 		t.Fatal("terminal operation accepted NULL finished_at")
 	}
 	if err := s.TransitionOperation(ctx, operationID1, OperationRunning, ""); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.TransitionOperation(ctx, operationID1, OperationRunning, "completed"); err == nil {
+		t.Fatal("running operation accepted completed result")
+	}
+	if err := s.TransitionOperation(ctx, operationID1, OperationSucceeded, "hash_mismatch"); err == nil {
+		t.Fatal("succeeded operation accepted failure result")
+	}
+	if err := s.TransitionOperation(ctx, operationID1, OperationFailed, ""); err == nil {
+		t.Fatal("failed operation accepted empty result")
 	}
 	if err := s.TransitionOperation(ctx, operationID1, OperationSucceeded, "completed"); err != nil {
 		t.Fatal(err)
@@ -287,6 +425,107 @@ func TestOperationTerminalStateRequiresFinishedAtAndCannotMoveBackward(t *testin
 	if err := s.TransitionOperation(ctx, operationID1, OperationRunning, ""); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("backward operation transition error = %v", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET result_code='internal_failure' WHERE id=?`, operationID1); err == nil {
+		t.Fatal("terminal operation result was mutable")
+	}
+}
+
+func TestTimestampColumnsRejectNonIntegerStorage(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	if _, err := s.db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,operation_id,candidate_id,code) VALUES('not-a-timestamp','upload_started','success',?,?, 'accepted')`, operationID1, candidateID1); err == nil {
+		t.Fatal("audit timestamp accepted non-integer storage")
+	}
+}
+
+func TestCommitPublishedReleaseIsAtomicAcrossEveryBoundary(t *testing.T) {
+	t.Parallel()
+	stages := []string{"release", "assets", "floor", "candidate", "operation", "audit"}
+	for _, failStage := range stages {
+		t.Run(failStage, func(t *testing.T) {
+			s, request := preparedPublish(t)
+			s.commitPublishHook = func(stage string) error {
+				if stage == failStage {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			if err := s.CommitPublishedRelease(context.Background(), request); err == nil {
+				t.Fatal("commit succeeded")
+			}
+			for _, table := range []string{"releases", "release_assets", "highest_committed_version", "audit_events"} {
+				var count int
+				if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("%s count=%d err=%v", table, count, err)
+				}
+			}
+			var operationState, candidateState string
+			_ = s.db.QueryRow(`SELECT state FROM operations WHERE id=?`, operationID1).Scan(&operationState)
+			_ = s.db.QueryRow(`SELECT state FROM candidates WHERE id=?`, candidateID1).Scan(&candidateState)
+			if operationState != "running" || candidateState != "publishing" {
+				t.Fatalf("states=%s/%s", operationState, candidateState)
+			}
+		})
+	}
+}
+
+func TestCommitPublishedReleaseRequiresAssetClosure(t *testing.T) {
+	t.Parallel()
+	s, request := preparedPublish(t)
+	request.Assets = nil
+	if err := s.CommitPublishedRelease(context.Background(), request); err == nil {
+		t.Fatal("publish committed without assets")
+	}
+	if _, ok, err := s.HighestCommittedVersion(context.Background()); err != nil || ok {
+		t.Fatalf("empty publish changed floor: %v/%v", ok, err)
+	}
+}
+
+func TestCommitPublishedReleaseReturnsStableIdempotentResult(t *testing.T) {
+	t.Parallel()
+	s, request := preparedPublish(t)
+	ctx := context.Background()
+	if err := s.CommitPublishedRelease(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitPublishedRelease(ctx, request); err != nil {
+		t.Fatalf("identical publish retry = %v", err)
+	}
+	for table, want := range map[string]int{"releases": 1, "release_assets": 1, "highest_committed_version": 1, "audit_events": 1} {
+		var count int
+		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&count); err != nil || count != want {
+			t.Fatalf("%s count=%d err=%v, want %d", table, count, err, want)
+		}
+	}
+	conflict := request
+	conflict.Release.GenerationName = "release-conflict"
+	if err := s.CommitPublishedRelease(ctx, conflict); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("conflicting publish retry = %v, want ErrInvalidTransition", err)
+	}
+}
+
+func preparedPublish(t *testing.T) (*Store, PublishCommit) {
+	t.Helper()
+	s := openStore(t)
+	ctx := context.Background()
+	createActiveSession(t, s, sessionHash1)
+	now := time.Now().UTC()
+	if err := s.CreateCandidate(ctx, Candidate{ID: candidateID1, SessionID: sessionHash1, State: CandidateUploading, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ValidateCandidate(ctx, candidateID1, digest1, `{"valid":true}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionCandidate(ctx, candidateID1, CandidatePublishing); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationPublish, State: OperationPending, CandidateID: candidateID1, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionOperation(ctx, operationID1, OperationRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+	return s, PublishCommit{Release: Release{ID: releaseID1, Version: "1.2.3", GenerationName: "release-1", CommittedAt: now}, OperationID: operationID1, CandidateID: candidateID1, Assets: []ReleaseAsset{{FileName: "asset.nupkg", SizeBytes: 12, SHA256: digest1}}}
 }
 
 func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T) {
@@ -294,10 +533,16 @@ func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T)
 	s := openStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if err := s.CommitRelease(ctx, Release{ID: releaseID1, Version: "1.0.0", GenerationName: "release-1", CommittedAt: now}); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?, '1.0.0','release-1','current',?,'admin')`, releaseID1, stamp(now)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CommitRelease(ctx, Release{ID: releaseID2, Version: "1.0.1", GenerationName: "release-2", CommittedAt: now.Add(time.Minute)}); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE id=?`, releaseID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?, '1.0.1','release-2','current',?,'admin')`, releaseID2, stamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO highest_committed_version VALUES(1,'1.0.1',1,0,1,?)`, stamp(now)); err != nil {
 		t.Fatal(err)
 	}
 	var currentCount int
@@ -307,12 +552,18 @@ func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T)
 	if err := s.SetCurrentRelease(ctx, releaseID1); err != nil {
 		t.Fatalf("SetCurrentRelease() error = %v", err)
 	}
+	if got, ok, err := s.HighestCommittedVersion(ctx); err != nil || !ok || got != "1.0.1" {
+		t.Fatalf("rollback changed floor: %q/%v/%v", got, ok, err)
+	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE releases SET state='removed' WHERE id=?`, releaseID1); err == nil {
 		t.Fatal("raw SQL removed the current release")
 	}
-	for index, name := range []string{"../release", "nested/release", `C:\release`, ".", "bad name"} {
+	if _, err := s.db.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE id=?`, releaseID1); err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range []string{"../release", "nested/release", `C:\release`, ".", ".hidden", "bad name"} {
 		id := fmt.Sprintf("55555555-5555-4555-8555-%012d", index)
-		if err := s.CommitRelease(ctx, Release{ID: id, Version: fmt.Sprintf("2.0.%d", index), GenerationName: name, CommittedAt: now}); err == nil {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?,?,?,'current',?,'admin')`, id, fmt.Sprintf("2.0.%d", index), name, stamp(now)); err == nil {
 			t.Errorf("CommitRelease() accepted generation name %q", name)
 		}
 	}
@@ -412,11 +663,20 @@ func createActiveSession(t *testing.T, s *Store, hash string) {
 	}
 }
 
-func stamp(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+func stamp(value time.Time) int64 { return value.UTC().Unix() }
 
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+type nilReaderRand struct{ n byte }
+
+func (r nilReaderRand) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(i + 1)
+	}
+	return len(p), nil
+}
 
 func hasPasswordClasses(password string) bool {
 	var upper, lower, digit, symbol bool

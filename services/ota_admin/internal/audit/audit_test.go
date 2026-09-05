@@ -24,6 +24,12 @@ func TestEventSpecificConstructorsRejectUnstructuredMetadata(t *testing.T) {
 	if _, err := audit.NewUploadCompleted(audit.OutcomeFailure, opID, candID, audit.Code("password=hunter2"), time.Now()); err == nil {
 		t.Fatal("constructor accepted an arbitrary code")
 	}
+	if _, err := audit.NewUploadStarted("", candID, time.Now()); err == nil {
+		t.Fatal("upload event accepted a missing required operation ID")
+	}
+	if _, err := audit.NewPublishConfirmed(opID, candID, "", time.Now()); err == nil {
+		t.Fatal("publish event accepted a missing required release ID")
+	}
 }
 
 func TestSourcePseudonymIsFullLengthKeyedHMAC(t *testing.T) {

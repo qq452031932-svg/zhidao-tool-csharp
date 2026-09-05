@@ -119,7 +119,7 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func ValidateRootOnlyMetadata(owner uint32, mode uint32) error {
+func ValidateRootOnlyMetadata(owner, group, expectedServiceGroup uint32, mode uint32) error {
 	if owner != 0 {
 		return errors.New("config must be owned by root")
 	}
@@ -129,10 +129,16 @@ func ValidateRootOnlyMetadata(owner uint32, mode uint32) error {
 	if permissions&0o027 != 0 || permissions&0o400 == 0 || permissions&0o100 != 0 {
 		return errors.New("config must be root-readable, optionally group-readable, and never executable or group/other writable")
 	}
+	if permissions&0o040 != 0 && group != expectedServiceGroup {
+		return errors.New("group-readable config must belong to the service's effective group")
+	}
 	return nil
 }
 
-func ValidateTrustedParentMetadata(symlink bool, mode uint32) error {
+func ValidateTrustedParentMetadata(owner uint32, symlink bool, mode uint32) error {
+	if owner != 0 {
+		return errors.New("config ancestors must be root-owned")
+	}
 	if symlink {
 		return errors.New("config parent cannot be a symlink")
 	}
