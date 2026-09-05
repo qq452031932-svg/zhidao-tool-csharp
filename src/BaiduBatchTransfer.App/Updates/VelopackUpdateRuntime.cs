@@ -1,3 +1,5 @@
+using System.IO;
+
 namespace BaiduBatchTransfer.App.Updates;
 
 public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
@@ -5,6 +7,7 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
     private readonly object sync = new();
     private readonly IApplicationUpdateClient client;
     private readonly SignedFeedPackageGate? packageGate;
+    private readonly Func<bool>? startSignedUpdateGuard;
     private VelopackClientAsset? availableUpdate;
     private VelopackClientAsset? preparedUpdate;
     private ApplicationUpdateSnapshot snapshot;
@@ -14,10 +17,12 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
     internal VelopackUpdateRuntime(
         IApplicationUpdateClient client,
         string fallbackCurrentVersion,
-        SignedFeedPackageGate? packageGate = null)
+        SignedFeedPackageGate? packageGate = null,
+        Func<bool>? startSignedUpdateGuard = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.packageGate = packageGate;
+        this.startSignedUpdateGuard = startSignedUpdateGuard;
         ArgumentException.ThrowIfNullOrWhiteSpace(fallbackCurrentVersion);
 
         var currentVersion = client.CurrentVersion ?? fallbackCurrentVersion;
@@ -65,15 +70,26 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         SignedFeedPackageGate? gate = null;
         if (buildInfo.HttpsFeedUrl is { } feedIdentity)
         {
+            var packagesRoot = Velopack.Locators.VelopackLocator.Current.PackagesDir;
+            if (string.IsNullOrWhiteSpace(packagesRoot))
+            {
+                client.Dispose();
+                return UnavailableApplicationUpdateRuntime.Unsupported(currentVersion);
+            }
             gate = new SignedFeedPackageGate(
                 buildInfo.SignedPendingReceiptPath,
                 new SignedFeedStateStore(
                     buildInfo.SignedFeedStatePath,
                     feedIdentity,
-                    currentVersion));
+                    currentVersion),
+                packagesRoot);
         }
 
-        return new VelopackUpdateRuntime(client, buildInfo.ProductVersion, gate);
+        return new VelopackUpdateRuntime(
+            client,
+            buildInfo.ProductVersion,
+            gate,
+            gate is null ? null : SignedUpdateGuard.Start);
     }
 
     internal static IApplicationUpdateRuntime Create(
@@ -232,6 +248,7 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
                     UserMessage = ApplicationUpdateMessages.VerificationFailed
                 });
             }
+            cancellationToken.ThrowIfCancellationRequested();
 
             return CompleteOperation(generation, stable with
             {
@@ -316,7 +333,21 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 
         using var authorization = packageGate?.TryAcquireLaunchAuthorization(prepared);
         if (packageGate is not null && authorization is null)
-            return false;
+        {
+            throw new ApplicationUpdateVerificationException(
+                new InvalidDataException("The pending signed update failed final verification."));
+        }
+
+        if (packageGate is not null)
+        {
+            if (startSignedUpdateGuard is null || !startSignedUpdateGuard())
+            {
+                throw new ApplicationUpdateVerificationException(
+                    new InvalidOperationException("The signed update guard could not be started."));
+            }
+
+            return true;
+        }
 
         client.WaitExitThenApplyUpdates(prepared);
         return true;
@@ -394,6 +425,8 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
                     restore.Generation,
                     restore.TransientStatus,
                     restore.Stable);
+                if (restore.TransientStatus == ApplicationUpdateStatus.Downloading)
+                    restore.Runtime.packageGate?.InvalidateReceipt();
             },
             new CancellationRestore(this, generation, transientStatus, stable));
 

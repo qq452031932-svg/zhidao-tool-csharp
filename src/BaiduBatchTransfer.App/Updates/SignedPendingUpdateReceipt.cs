@@ -35,6 +35,7 @@ internal sealed class WindowsCurrentUserPendingReceiptProtector : ISignedPending
 
 internal sealed record SignedPendingUpdateReceipt(
     string FeedIdentity,
+    string PackageRoot,
     string PackageId,
     string Channel,
     string Version,
@@ -74,6 +75,7 @@ internal sealed class SignedPendingUpdateReceiptStore
         {
             schemaVersion = SchemaVersion,
             feedIdentity = receipt.FeedIdentity,
+            packageRoot = receipt.PackageRoot,
             packageId = receipt.PackageId,
             channel = receipt.Channel,
             version = receipt.Version,
@@ -172,7 +174,7 @@ internal sealed class SignedPendingUpdateReceiptStore
             var root = document.RootElement;
             string[] expected =
             [
-                "schemaVersion", "feedIdentity", "packageId", "channel", "version", "type",
+                "schemaVersion", "feedIdentity", "packageRoot", "packageId", "channel", "version", "type",
                 "fileName", "size", "sha256", "manifestSha256", "authorizedAtUnixSeconds"
             ];
             var names = root.EnumerateObject().Select(property => property.Name).ToArray();
@@ -187,6 +189,7 @@ internal sealed class SignedPendingUpdateReceiptStore
 
             return new SignedPendingUpdateReceipt(
                 RequiredString(root, "feedIdentity", 2048),
+                RequiredString(root, "packageRoot", 1024),
                 RequiredString(root, "packageId", 128),
                 RequiredString(root, "channel", 128),
                 RequiredString(root, "version", 32),

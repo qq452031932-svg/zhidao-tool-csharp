@@ -264,9 +264,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
                     return null;
 
                 var fingerprint = Fingerprint(pending);
-                fingerprint = CompletePendingFingerprint(
+                fingerprint = PreparePendingFingerprint(
                     fingerprint,
-                    Velopack.Locators.VelopackLocator.Current.PackagesDir!);
+                    Velopack.Locators.VelopackLocator.Current.PackagesDir!,
+                    signedFeedSource is not null);
                 return new VelopackClientAsset(
                     fingerprint,
                     pending.NotesMarkdown,
@@ -389,4 +390,11 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
             return fingerprint;
         }
     }
+
+    internal static VelopackAssetFingerprint PreparePendingFingerprint(
+        VelopackAssetFingerprint fingerprint,
+        string packagesDirectory,
+        bool signedFeed) => signedFeed
+        ? fingerprint
+        : CompletePendingFingerprint(fingerprint, packagesDirectory);
 }

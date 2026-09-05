@@ -54,16 +54,13 @@ public sealed class UpdateAwareShutdownOrchestrator
         {
             launchPreparedUpdateAndRestart();
         }
+        catch (ApplicationUpdateVerificationException)
+        {
+            ReportUpdaterLaunchFailure();
+        }
         catch
         {
-            try
-            {
-                reportSafeError(UpdaterLaunchFailureMessage);
-            }
-            catch
-            {
-                // Reporting must not strand the process after the host has been disposed.
-            }
+            ReportUpdaterLaunchFailure();
         }
         finally
         {
@@ -71,6 +68,18 @@ public sealed class UpdateAwareShutdownOrchestrator
         }
 
         return true;
+    }
+
+    private void ReportUpdaterLaunchFailure()
+    {
+        try
+        {
+            reportSafeError(UpdaterLaunchFailureMessage);
+        }
+        catch
+        {
+            // Reporting must not strand the process after the host has been disposed.
+        }
     }
 
     private void RestoreAfterSafeShutdownFailure()

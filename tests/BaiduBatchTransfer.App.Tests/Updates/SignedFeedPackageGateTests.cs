@@ -138,6 +138,90 @@ public sealed class SignedFeedPackageGateTests : IDisposable
     }
 
     [Fact]
+    public async Task ReceiptFutureClockSkewIsBoundedToFiveMinutes()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        Assert.True(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            fixture.Pending,
+            CancellationToken.None));
+
+        fixture.Time.SetUtcNow(Now.AddMinutes(-5));
+        Assert.True(fixture.Gate.TryRevalidatePending(fixture.Pending));
+        fixture.Time.SetUtcNow(Now.AddMinutes(-5).AddSeconds(-1));
+        Assert.False(fixture.Gate.TryRevalidatePending(fixture.Pending));
+        Assert.False(File.Exists(fixture.ReceiptPath));
+    }
+
+    [Fact]
+    public async Task CancellationThatArrivesDuringReceiptProtectionDeletesCommittedReceipt()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var protector = new BlockingProtector(entered, release);
+        var fixture = CreateFixture(
+            "2.0.0",
+            Encoding.UTF8.GetBytes("signed package"),
+            protector: protector);
+        using var cancellation = new CancellationTokenSource();
+
+        var authorization = Task.Run(() => fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            fixture.Pending,
+            cancellation.Token));
+        await entered.Task;
+        cancellation.Cancel();
+        release.SetResult();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => authorization);
+        Assert.False(File.Exists(fixture.ReceiptPath));
+    }
+
+    [Fact]
+    public async Task PendingPackageMustRemainADirectChildOfPinnedVelopackPackageRoot()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        Assert.True(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            fixture.Pending,
+            CancellationToken.None));
+        var outsideRoot = Directory.CreateTempSubdirectory("signed-package-outside-");
+        try
+        {
+            var outsidePath = Path.Combine(outsideRoot.FullName, fixture.Pending.Fingerprint.FileName);
+            File.Copy(fixture.PackagePath, outsidePath);
+            var outsidePending = fixture.Pending with { LocalPackagePath = outsidePath };
+
+            Assert.False(fixture.Gate.TryRevalidatePending(outsidePending));
+            Assert.False(File.Exists(fixture.ReceiptPath));
+        }
+        finally
+        {
+            outsideRoot.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GuardRevalidatesAfterParentExitBeforeInvokingUpdater()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        Assert.True(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            fixture.Pending,
+            CancellationToken.None));
+        var updaterCalls = 0;
+
+        var launched = SignedUpdateGuard.ValidateAndLaunchAfterParentExitForTesting(
+            () => File.WriteAllText(fixture.PackagePath, "tampered while parent exits"),
+            () => fixture.Pending,
+            fixture.Gate,
+            _ => updaterCalls++);
+
+        Assert.False(launched);
+        Assert.Equal(0, updaterCalls);
+    }
+
+    [Fact]
     public async Task PendingVersionBelowPersistedReplayFloorIsRejected()
     {
         var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
@@ -192,6 +276,7 @@ public sealed class SignedFeedPackageGateTests : IDisposable
         await File.WriteAllTextAsync(fixture.PackagePath, "tampered after preparation");
 
         Assert.Null(fixture.Gate.TryAcquireLaunchAuthorization(fixture.Pending));
+        Assert.False(File.Exists(fixture.ReceiptPath));
     }
 
     [Fact]
@@ -216,7 +301,16 @@ public sealed class SignedFeedPackageGateTests : IDisposable
     {
         var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
         var client = new GateClient(fixture.Pending, fixture.Pending);
-        using var runtime = new VelopackUpdateRuntime(client, "1.0.0", fixture.Gate);
+        var guardLaunches = 0;
+        using var runtime = new VelopackUpdateRuntime(
+            client,
+            "1.0.0",
+            fixture.Gate,
+            () =>
+            {
+                guardLaunches++;
+                return true;
+            });
         await runtime.CheckAsync(CancellationToken.None);
         Assert.Equal(
             ApplicationUpdateStatus.ReadyToRestart,
@@ -225,7 +319,60 @@ public sealed class SignedFeedPackageGateTests : IDisposable
 
         await File.WriteAllTextAsync(fixture.PackagePath, "tampered after prepare");
 
-        Assert.False(runtime.LaunchPreparedUpdateAndRestart());
+        Assert.Throws<ApplicationUpdateVerificationException>(
+            () => runtime.LaunchPreparedUpdateAndRestart());
+        Assert.Equal(0, guardLaunches);
+        Assert.Equal(0, client.LaunchCalls);
+    }
+
+    [Fact]
+    public async Task SignedRuntimeStartsGuardInsteadOfCallingUpdaterDirectly()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        var client = new GateClient(fixture.Pending, fixture.Pending);
+        var guardLaunches = 0;
+        using var runtime = new VelopackUpdateRuntime(
+            client,
+            "1.0.0",
+            fixture.Gate,
+            () =>
+            {
+                guardLaunches++;
+                return true;
+            });
+        await runtime.CheckAsync(CancellationToken.None);
+        await runtime.DownloadAsync(CancellationToken.None);
+        Assert.True(runtime.TryPrepareRestart());
+
+        Assert.True(runtime.LaunchPreparedUpdateAndRestart());
+
+        Assert.Equal(1, guardLaunches);
+        Assert.Equal(0, client.LaunchCalls);
+    }
+
+    [Fact]
+    public async Task PreparedVerificationRejectionIsReportedWhileOrdinaryCloseRemainsSilent()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        var client = new GateClient(fixture.Pending, fixture.Pending);
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0", fixture.Gate, () => true);
+        await runtime.CheckAsync(CancellationToken.None);
+        await runtime.DownloadAsync(CancellationToken.None);
+        Assert.True(runtime.TryPrepareRestart());
+        File.WriteAllText(fixture.PackagePath, "tampered after user requested restart");
+        var errors = new List<string>();
+        var exits = 0;
+        var orchestrator = new UpdateAwareShutdownOrchestrator(
+            _ => Task.FromResult(true),
+            runtime.LaunchPreparedUpdateAndRestart,
+            () => { },
+            errors.Add,
+            () => exits++);
+
+        Assert.True(await orchestrator.ShutdownAsync());
+
+        Assert.Equal([UpdateAwareShutdownOrchestrator.UpdaterLaunchFailureMessage], errors);
+        Assert.Equal(1, exits);
         Assert.Equal(0, client.LaunchCalls);
     }
 
@@ -300,7 +447,8 @@ public sealed class SignedFeedPackageGateTests : IDisposable
         string version,
         byte[] packageBytes,
         long? declaredSize = null,
-        string? declaredHash = null)
+        string? declaredHash = null,
+        ISignedPendingUpdateReceiptProtector? protector = null)
     {
         Directory.CreateDirectory(root);
         var packageName = $"SuperPan.BaiduBatchTransfer-{version}-full.nupkg";
@@ -335,13 +483,14 @@ public sealed class SignedFeedPackageGateTests : IDisposable
         var stateStore = new SignedFeedStateStore(statePath, FeedIdentity, "1.0.0");
         stateStore.Accept(version, manifestHash);
         var receiptPath = Path.Combine(root, $"receipt-{Guid.NewGuid():N}.bin");
-        var protector = new AuthenticatedTestProtector();
+        protector ??= new AuthenticatedTestProtector();
         var time = new MutableTimeProvider(Now);
         var gate = SignedFeedPackageGate.CreateForTesting(
             receiptPath,
             stateStore,
             protector,
-            time);
+            time,
+            root);
         var pending = new VelopackClientAsset(fingerprint, null, new object())
         {
             LocalPackagePath = packagePath,
@@ -369,7 +518,7 @@ public sealed class SignedFeedPackageGateTests : IDisposable
     private sealed record Fixture(
         SignedFeedPackageGate Gate,
         SignedFeedStateStore StateStore,
-        AuthenticatedTestProtector Protector,
+        ISignedPendingUpdateReceiptProtector Protector,
         MutableTimeProvider Time,
         SignedFeedVerificationSnapshot Snapshot,
         VelopackClientAsset Pending,
@@ -404,6 +553,22 @@ public sealed class SignedFeedPackageGateTests : IDisposable
                 throw new CryptographicException("bad receipt");
             return payload.ToArray();
         }
+    }
+
+    private sealed class BlockingProtector(
+        TaskCompletionSource entered,
+        TaskCompletionSource release) : ISignedPendingUpdateReceiptProtector
+    {
+        private readonly AuthenticatedTestProtector inner = new();
+
+        public byte[] Protect(ReadOnlySpan<byte> plaintext)
+        {
+            entered.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+            return inner.Protect(plaintext);
+        }
+
+        public byte[] Unprotect(ReadOnlySpan<byte> protectedData) => inner.Unprotect(protectedData);
     }
 
     private sealed class GateClient(

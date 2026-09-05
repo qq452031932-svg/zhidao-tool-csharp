@@ -15,13 +15,18 @@ internal sealed class SignedFeedPackageGate
     private readonly SignedPendingUpdateReceiptStore receiptStore;
     private readonly SignedFeedStateStore stateStore;
     private readonly TimeProvider timeProvider;
+    private readonly string expectedPackageRoot;
 
-    internal SignedFeedPackageGate(string receiptPath, SignedFeedStateStore stateStore)
+    internal SignedFeedPackageGate(
+        string receiptPath,
+        SignedFeedStateStore stateStore,
+        string expectedPackageRoot)
         : this(
             receiptPath,
             stateStore,
             new WindowsCurrentUserPendingReceiptProtector(),
-            TimeProvider.System)
+            TimeProvider.System,
+            expectedPackageRoot)
     {
     }
 
@@ -29,10 +34,15 @@ internal sealed class SignedFeedPackageGate
         string receiptPath,
         SignedFeedStateStore stateStore,
         ISignedPendingUpdateReceiptProtector protector,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        string expectedPackageRoot)
     {
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        ArgumentException.ThrowIfNullOrWhiteSpace(expectedPackageRoot);
+        if (!Path.IsPathFullyQualified(expectedPackageRoot))
+            throw new ArgumentException("The Velopack package root must be absolute.", nameof(expectedPackageRoot));
+        this.expectedPackageRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(expectedPackageRoot));
         receiptStore = new SignedPendingUpdateReceiptStore(receiptPath, protector);
     }
 
@@ -40,8 +50,9 @@ internal sealed class SignedFeedPackageGate
         string receiptPath,
         SignedFeedStateStore stateStore,
         ISignedPendingUpdateReceiptProtector protector,
-        TimeProvider timeProvider) =>
-        new(receiptPath, stateStore, protector, timeProvider);
+        TimeProvider timeProvider,
+        string expectedPackageRoot) =>
+        new(receiptPath, stateStore, protector, timeProvider, expectedPackageRoot);
 
     internal async Task<bool> AuthorizeDownloadedAsync(
         SignedFeedVerificationSnapshot snapshot,
@@ -66,6 +77,7 @@ internal sealed class SignedFeedPackageGate
 
             var receipt = new SignedPendingUpdateReceipt(
                 snapshot.FeedIdentity,
+                expectedPackageRoot,
                 asset.PackageId,
                 ExpectedChannel,
                 asset.Version,
@@ -76,6 +88,7 @@ internal sealed class SignedFeedPackageGate
                 snapshot.ManifestSha256,
                 timeProvider.GetUtcNow().ToUnixTimeSeconds());
             lock (sync) receiptStore.Write(receipt);
+            cancellationToken.ThrowIfCancellationRequested();
             return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -100,10 +113,15 @@ internal sealed class SignedFeedPackageGate
             {
                 var receipt = receiptStore.Read();
                 if (!TryValidateReceipt(receipt, pending))
+                {
+                    receiptStore.Delete();
                     return false;
+                }
                 lease = OpenPackageForValidation(pending, receipt.Size);
                 var hash = LowerHash(lease);
-                return FixedTimeHashEquals(hash, receipt.Sha256);
+                var valid = FixedTimeHashEquals(hash, receipt.Sha256);
+                if (!valid) receiptStore.Delete();
+                return valid;
             }
         }
         catch (Exception exception) when (IsValidationFailure(exception))
@@ -126,7 +144,10 @@ internal sealed class SignedFeedPackageGate
             {
                 var receipt = receiptStore.Read();
                 if (!TryValidateReceipt(receipt, pending))
+                {
+                    receiptStore.Delete();
                     return null;
+                }
                 var lease = OpenPackageForValidation(pending, receipt.Size);
                 try
                 {
@@ -134,6 +155,7 @@ internal sealed class SignedFeedPackageGate
                     if (!FixedTimeHashEquals(hash, receipt.Sha256))
                     {
                         lease.Dispose();
+                        receiptStore.Delete();
                         return null;
                     }
                     lease.Position = 0;
@@ -179,6 +201,7 @@ internal sealed class SignedFeedPackageGate
     {
         var fingerprint = pending.Fingerprint;
         if (!string.Equals(receipt.FeedIdentity, stateStore.FeedIdentity, StringComparison.Ordinal) ||
+            !string.Equals(receipt.PackageRoot, expectedPackageRoot, PathComparison) ||
             !string.Equals(receipt.PackageId, ExpectedPackageId, StringComparison.Ordinal) ||
             !string.Equals(receipt.Channel, ExpectedChannel, StringComparison.Ordinal) ||
             !string.Equals(receipt.Type, ExpectedType, StringComparison.Ordinal) ||
@@ -231,7 +254,7 @@ internal sealed class SignedFeedPackageGate
             $"{ExpectedPackageId}-{receipt.Version}-full.nupkg",
             StringComparison.Ordinal);
 
-    private static async Task<string> HashPackageAsync(
+    private async Task<string> HashPackageAsync(
         VelopackClientAsset pending,
         long expectedSize,
         CancellationToken cancellationToken)
@@ -251,7 +274,7 @@ internal sealed class SignedFeedPackageGate
         return Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
     }
 
-    private static FileStream OpenPackageForValidation(VelopackClientAsset pending, long expectedSize)
+    private FileStream OpenPackageForValidation(VelopackClientAsset pending, long expectedSize)
     {
         if (string.IsNullOrWhiteSpace(pending.LocalPackagePath) ||
             !Path.IsPathFullyQualified(pending.LocalPackagePath) ||
@@ -259,8 +282,17 @@ internal sealed class SignedFeedPackageGate
         {
             throw new InvalidDataException("The pending update package path is invalid.");
         }
+        var packagePath = Path.GetFullPath(pending.LocalPackagePath);
+        var expectedPath = Path.GetFullPath(Path.Combine(expectedPackageRoot, pending.Fingerprint.FileName));
+        if (!string.Equals(packagePath, expectedPath, PathComparison) ||
+            !string.Equals(Path.GetDirectoryName(packagePath), expectedPackageRoot, PathComparison) ||
+            new DirectoryInfo(expectedPackageRoot).Attributes.HasFlag(FileAttributes.ReparsePoint) ||
+            new FileInfo(packagePath).Attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidDataException("The pending update package is outside the pinned package root.");
+        }
         var stream = new FileStream(
-            Path.GetFullPath(pending.LocalPackagePath),
+            packagePath,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
@@ -280,6 +312,12 @@ internal sealed class SignedFeedPackageGate
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
     }
+
+    internal void InvalidateReceipt() => TryInvalidateReceipt();
+
+    private static StringComparison PathComparison => OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
 
     private static string LowerHash(Stream stream)
     {

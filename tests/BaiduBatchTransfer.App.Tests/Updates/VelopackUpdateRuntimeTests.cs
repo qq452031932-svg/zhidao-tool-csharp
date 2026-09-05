@@ -52,6 +52,38 @@ public sealed class VelopackUpdateRuntimeTests
     }
 
     [Fact]
+    public void SignedPendingMetadataDoesNotReadOrHashPackageBeforeBoundedGate()
+    {
+        var directory = Directory.CreateTempSubdirectory("velopack-signed-pending-");
+        try
+        {
+            const string fileName = "SuperPan.BaiduBatchTransfer-2.0.0-full.nupkg";
+            var path = Path.Combine(directory.FullName, fileName);
+            File.WriteAllBytes(path, [1, 2, 3, 4, 5]);
+            var metadata = new VelopackAssetFingerprint(
+                "SuperPan.BaiduBatchTransfer",
+                "2.0.0",
+                "Full",
+                fileName,
+                5,
+                new string('a', 64));
+            using (var exclusive = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                var prepared = VelopackUpdateClient.PreparePendingFingerprint(
+                    metadata,
+                    directory.FullName,
+                    signedFeed: true);
+
+                Assert.Same(metadata, prepared);
+            }
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public void ClientFactoryDisablesDeltaReconstructionForExactFingerprintVerification()
     {
         var configuration = new VelopackUpdateSourceConfiguration(

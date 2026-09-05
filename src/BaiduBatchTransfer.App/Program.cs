@@ -6,9 +6,14 @@ namespace BaiduBatchTransfer.App;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         VelopackApp.Build().SetAutoApplyOnStartup(false).Run();
+        if (SignedUpdateGuard.TryRun(args, ApplicationBuildInfo.Current, out var guardExitCode))
+        {
+            Environment.ExitCode = guardExitCode;
+            return;
+        }
         var updateRuntime = VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current);
         try
         {
