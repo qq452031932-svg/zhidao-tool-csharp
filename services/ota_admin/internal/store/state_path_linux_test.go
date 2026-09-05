@@ -96,3 +96,22 @@ func TestPinnedStatePathRejectsDatabaseIdentityReplacement(t *testing.T) {
 		t.Fatal("pinned state path accepted a replacement database inode")
 	}
 }
+
+func TestPinnedStatePathRejectsMissingMainDatabase(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "state.db")
+	handle, err := prepareStatePath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Verify(); err == nil {
+		t.Fatal("pinned state path accepted a missing main database")
+	}
+}

@@ -226,13 +226,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("missing migration from schema %d", current)
 		}
 		if err := s.withTx(ctx, func(tx *sql.Tx) error {
-			if next.validate != nil {
-				if err := next.validate(tx); err != nil {
+			if next.apply != nil {
+				if err := next.apply(ctx, tx); err != nil {
 					return err
 				}
-			}
-			if _, err := tx.ExecContext(ctx, next.sql); err != nil {
-				return err
+			} else {
+				if next.validate != nil {
+					if err := next.validate(tx); err != nil {
+						return err
+					}
+				}
+				if _, err := tx.ExecContext(ctx, next.sql); err != nil {
+					return err
+				}
 			}
 			_, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, next.version))
 			return err
@@ -424,6 +430,9 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) error 
 	if operation.State != OperationPending {
 		return errors.New("operation must start pending")
 	}
+	if !validOperationAssociations(operation.Kind, operation.CandidateID, operation.ReleaseID) {
+		return errors.New("operation associations do not match its kind")
+	}
 	var candidateID, releaseID any
 	if operation.CandidateID != "" {
 		candidateID = operation.CandidateID
@@ -433,6 +442,19 @@ func (s *Store) CreateOperation(ctx context.Context, operation Operation) error 
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,release_id,created_at) VALUES(?,?,?,?,?,?)`, operation.ID, operation.Kind, operation.State, candidateID, releaseID, timestamp(operation.CreatedAt))
 	return wrapWrite("create operation", err)
+}
+
+func validOperationAssociations(kind OperationKind, candidateID, releaseID string) bool {
+	switch kind {
+	case OperationUpload, OperationPublish:
+		return candidateID != "" && releaseID == ""
+	case OperationRollback:
+		return candidateID == "" && releaseID != ""
+	case OperationCleanup:
+		return candidateID == ""
+	default:
+		return false
+	}
 }
 
 func (s *Store) TransitionOperation(ctx context.Context, id string, state OperationState, resultCode string) error {

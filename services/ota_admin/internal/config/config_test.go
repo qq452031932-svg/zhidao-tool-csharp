@@ -121,6 +121,7 @@ func TestValidateRootOnlyMetadata(t *testing.T) {
 		{"world readable", 0, 0o604},
 		{"world writable", 0, 0o602},
 		{"executable", 0, 0o700},
+		{"group executable", 0, 0o650},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

@@ -111,6 +111,9 @@ func verifyPinnedStateFiles(dirFD int, base string, existed map[string]bool, dat
 	for _, name := range []string{base, base + "-wal", base + "-shm"} {
 		fd, err := unix.Openat(dirFD, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if errors.Is(err, unix.ENOENT) {
+			if name == base {
+				return errors.New("main database disappeared after secure open")
+			}
 			continue
 		}
 		if err != nil {

@@ -126,7 +126,7 @@ func ValidateRootOnlyMetadata(owner, group, expectedServiceGroup uint32, mode ui
 	permissions := mode & 0o777
 	// 0640 is intentionally supported: deployment can give the unprivileged
 	// service's dedicated group read-only access to a root-owned configuration.
-	if permissions&0o027 != 0 || permissions&0o400 == 0 || permissions&0o100 != 0 {
+	if permissions&0o026 != 0 || permissions&0o400 == 0 || permissions&0o111 != 0 {
 		return errors.New("config must be root-readable, optionally group-readable, and never executable or group/other writable")
 	}
 	if permissions&0o040 != 0 && group != expectedServiceGroup {

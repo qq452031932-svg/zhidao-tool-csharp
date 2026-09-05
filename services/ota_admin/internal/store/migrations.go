@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -12,9 +13,10 @@ type migration struct {
 	version  int
 	sql      string
 	validate func(*sql.Tx) error
+	apply    func(context.Context, *sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, sql: migrationV2, validate: validateLegacyV1}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}}
 
 const schemaVersion = 2
 
@@ -155,6 +157,12 @@ CREATE TABLE operations (
       (state IN ('pending','running') AND result_code='' AND finished_at IS NULL) OR
       (state='succeeded' AND result_code='completed' AND finished_at IS NOT NULL) OR
       (state='failed' AND result_code IN ('hash_mismatch','signature_mismatch','version_floor','expired','internal_failure') AND finished_at IS NOT NULL)
+    ),
+    CHECK (
+      (kind='upload' AND candidate_id IS NOT NULL AND release_id IS NULL) OR
+      (kind='publish' AND candidate_id IS NOT NULL AND ((state='succeeded' AND release_id IS NOT NULL) OR (state<>'succeeded' AND release_id IS NULL))) OR
+      (kind='rollback' AND candidate_id IS NULL AND release_id IS NOT NULL) OR
+      (kind='cleanup' AND candidate_id IS NULL)
     )
 );
 
@@ -173,6 +181,16 @@ BEGIN SELECT RAISE(ABORT, 'invalid operation transition'); END;
 CREATE TRIGGER operations_terminal_immutable
 BEFORE UPDATE ON operations WHEN OLD.state IN ('succeeded','failed')
 BEGIN SELECT RAISE(ABORT, 'terminal operation is immutable'); END;
+
+CREATE TRIGGER operations_associations_immutable
+BEFORE UPDATE ON operations
+WHEN NEW.kind <> OLD.kind OR NEW.candidate_id IS NOT OLD.candidate_id OR (
+    NEW.release_id IS NOT OLD.release_id AND NOT (
+      OLD.kind='publish' AND OLD.release_id IS NULL AND NEW.release_id IS NOT NULL AND
+      OLD.state='running' AND NEW.state='succeeded'
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'operation associations are immutable'); END;
 
 CREATE TABLE audit_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +259,7 @@ func itoa(value int) string {
 	panic("unsupported schema constant")
 }
 
-var migrationV2 = `
+var migrationOriginalV2 = `
 DROP TRIGGER candidates_state_machine;
 DROP TRIGGER sessions_state_machine;
 DROP TRIGGER operations_state_machine;
@@ -271,6 +289,339 @@ DROP TABLE releases_legacy;
 DROP TABLE highest_committed_version_legacy;
 DROP TABLE administrators_legacy;
 `
+
+var migrationHardenedV2 = `
+DROP TRIGGER releases_initial_state;
+DROP TRIGGER releases_state_machine;
+DROP TRIGGER candidates_initial_state;
+DROP TRIGGER candidates_immutable_bindings;
+DROP TRIGGER candidates_state_machine;
+DROP TRIGGER sessions_initial_state;
+DROP TRIGGER sessions_state_machine;
+DROP TRIGGER operations_initial_state;
+DROP TRIGGER operations_state_machine;
+DROP TRIGGER highest_committed_version_no_delete;
+DROP TRIGGER highest_committed_version_monotonic;
+DROP TRIGGER audit_events_append_only_update;
+DROP TRIGGER audit_events_append_only_delete;
+DROP TRIGGER audit_events_no_replace;
+DROP INDEX releases_one_current;
+ALTER TABLE administrators RENAME TO administrators_legacy;
+ALTER TABLE highest_committed_version RENAME TO highest_committed_version_legacy;
+ALTER TABLE releases RENAME TO releases_legacy;
+ALTER TABLE release_assets RENAME TO release_assets_legacy;
+ALTER TABLE candidates RENAME TO candidates_legacy;
+ALTER TABLE sessions RENAME TO sessions_legacy;
+ALTER TABLE operations RENAME TO operations_legacy;
+ALTER TABLE audit_events RENAME TO audit_events_legacy;
+` + schemaV2 + `
+DROP TRIGGER releases_initial_state;
+DROP TRIGGER sessions_initial_state;
+DROP TRIGGER candidates_initial_state;
+DROP TRIGGER operations_initial_state;
+INSERT INTO administrators SELECT singleton_id,username,password_hash,must_change_password,CAST(strftime('%s',created_at) AS INTEGER) FROM administrators_legacy;
+INSERT INTO highest_committed_version SELECT singleton_id,version,major,minor,patch,CAST(strftime('%s',committed_at) AS INTEGER) FROM highest_committed_version_legacy;
+INSERT INTO releases SELECT id,version,generation_name,state,CAST(strftime('%s',committed_at) AS INTEGER),actor FROM releases_legacy;
+INSERT INTO release_assets SELECT release_id,file_name,size_bytes,sha256 FROM release_assets_legacy;
+INSERT INTO sessions SELECT id_hash,state,CAST(strftime('%s',created_at) AS INTEGER),CAST(strftime('%s',last_seen_at) AS INTEGER),CAST(strftime('%s',idle_expires_at) AS INTEGER),CAST(strftime('%s',absolute_expires_at) AS INTEGER) FROM sessions_legacy;
+INSERT INTO candidates SELECT id,session_id,upload_digest,validation_report,state,CAST(strftime('%s',created_at) AS INTEGER),CAST(strftime('%s',expires_at) AS INTEGER),release_version FROM candidates_legacy;
+INSERT INTO operations SELECT id,kind,state,candidate_id,release_id,result_code,CAST(strftime('%s',created_at) AS INTEGER),CASE WHEN finished_at IS NULL THEN NULL ELSE CAST(strftime('%s',finished_at) AS INTEGER) END FROM operations_legacy;
+INSERT INTO audit_events(sequence,occurred_at,event_type,outcome,operation_id,candidate_id,release_id,code,source_pseudonym) SELECT sequence,CAST(strftime('%s',occurred_at) AS INTEGER),event_type,outcome,operation_id,candidate_id,release_id,code,source_pseudonym FROM audit_events_legacy;
+` + initialStateTriggers + `
+DROP TABLE audit_events_legacy;
+DROP TABLE operations_legacy;
+DROP TABLE candidates_legacy;
+DROP TABLE sessions_legacy;
+DROP TABLE release_assets_legacy;
+DROP TABLE releases_legacy;
+DROP TABLE highest_committed_version_legacy;
+DROP TABLE administrators_legacy;
+`
+
+const initialStateTriggers = `
+CREATE TRIGGER releases_initial_state
+BEFORE INSERT ON releases WHEN NEW.state <> 'current'
+BEGIN SELECT RAISE(ABORT, 'release must start current'); END;
+CREATE TRIGGER sessions_initial_state
+BEFORE INSERT ON sessions WHEN NEW.state <> 'active'
+BEGIN SELECT RAISE(ABORT, 'session must start active'); END;
+CREATE TRIGGER candidates_initial_state
+BEFORE INSERT ON candidates WHEN NEW.state <> 'uploading' OR NEW.upload_digest <> '' OR NEW.validation_report <> '' OR NEW.release_version IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'candidate must start uploading'); END;
+CREATE TRIGGER operations_initial_state
+BEFORE INSERT ON operations WHEN NEW.state <> 'pending' OR NEW.finished_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'operation must start pending'); END;
+`
+
+type v1Layout int
+
+const (
+	v1LayoutOriginal v1Layout = iota + 1
+	v1LayoutHardened
+)
+
+func applyV2Migration(ctx context.Context, tx *sql.Tx) error {
+	layout, err := detectV1Layout(tx)
+	if err != nil {
+		return err
+	}
+	switch layout {
+	case v1LayoutOriginal:
+		if err := validateLegacyV1(tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, migrationOriginalV2); err != nil {
+			return fmt.Errorf("migrate original V1 data: %w", err)
+		}
+	case v1LayoutHardened:
+		if err := validateHardenedV1(tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, migrationHardenedV2); err != nil {
+			return fmt.Errorf("migrate hardened V1 data: %w", err)
+		}
+	default:
+		return errors.New("unsupported V1 schema layout")
+	}
+	return nil
+}
+
+func detectV1Layout(tx *sql.Tx) (v1Layout, error) {
+	original, err := matchesV1Layout(tx, originalV1Columns, map[string][]string{
+		"administrators":            {"check (length(password_hash) > 0)"},
+		"releases":                  {"state in ('committed', 'retained', 'removed')"},
+		"candidates":                {"fingerprint text not null"},
+		"audit_events":              {"source_hash text not null default ''"},
+		"highest_committed_version": {"prerelease text not null", "precedence_key blob not null"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	hardened, err := matchesV1Layout(tx, hardenedV1Columns, map[string][]string{
+		"administrators":            {"password_hash glob '$argon2id$v=19$m=65536,t=3,p=2$*$*'"},
+		"highest_committed_version": {"check (version = printf('%d.%d.%d', major, minor, patch))"},
+		"releases":                  {"state in ('current', 'retained', 'removed')"},
+		"candidates":                {"validation_report text not null default ''"},
+		"operations":                {"check ((state in ('succeeded', 'failed')) = (finished_at is not null))"},
+		"audit_events":              {"source_pseudonym text not null default ''"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	if original == hardened {
+		return 0, errors.New("V1 schema does not match exactly one committed layout")
+	}
+	if original {
+		return v1LayoutOriginal, nil
+	}
+	return v1LayoutHardened, nil
+}
+
+var originalV1Columns = map[string][]string{
+	"administrators":            {"singleton_id", "username", "password_hash", "must_change_password", "created_at"},
+	"highest_committed_version": {"singleton_id", "version", "major", "minor", "patch", "prerelease", "precedence_key", "sequence", "committed_at"},
+	"releases":                  {"id", "version", "generation_name", "state", "committed_at", "actor"},
+	"release_assets":            {"release_id", "file_name", "size_bytes", "sha256"},
+	"candidates":                {"id", "session_id", "fingerprint", "state", "created_at", "expires_at", "release_version"},
+	"sessions":                  {"id_hash", "state", "created_at", "last_seen_at", "idle_expires_at", "absolute_expires_at"},
+	"operations":                {"id", "kind", "state", "candidate_id", "release_id", "result_code", "created_at", "finished_at"},
+	"audit_events":              {"sequence", "occurred_at", "event_type", "outcome", "operation_id", "candidate_id", "release_id", "code", "source_hash"},
+}
+
+var hardenedV1Columns = map[string][]string{
+	"administrators":            {"singleton_id", "username", "password_hash", "must_change_password", "created_at"},
+	"highest_committed_version": {"singleton_id", "version", "major", "minor", "patch", "committed_at"},
+	"releases":                  {"id", "version", "generation_name", "state", "committed_at", "actor"},
+	"release_assets":            {"release_id", "file_name", "size_bytes", "sha256"},
+	"candidates":                {"id", "session_id", "upload_digest", "validation_report", "state", "created_at", "expires_at", "release_version"},
+	"sessions":                  {"id_hash", "state", "created_at", "last_seen_at", "idle_expires_at", "absolute_expires_at"},
+	"operations":                {"id", "kind", "state", "candidate_id", "release_id", "result_code", "created_at", "finished_at"},
+	"audit_events":              {"sequence", "occurred_at", "event_type", "outcome", "operation_id", "candidate_id", "release_id", "code", "source_pseudonym"},
+}
+
+func matchesV1Layout(tx *sql.Tx, expected map[string][]string, markers map[string][]string) (bool, error) {
+	var tableCount int
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&tableCount); err != nil {
+		return false, err
+	}
+	if tableCount != len(expected) {
+		return false, nil
+	}
+	for table, wantColumns := range expected {
+		rows, err := tx.Query(`SELECT name FROM pragma_table_info(?) ORDER BY cid`, table)
+		if err != nil {
+			return false, err
+		}
+		var gotColumns []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return false, err
+			}
+			gotColumns = append(gotColumns, name)
+		}
+		if err := rows.Close(); err != nil {
+			return false, err
+		}
+		if !equalStrings(gotColumns, wantColumns) {
+			return false, nil
+		}
+		if len(markers[table]) == 0 {
+			continue
+		}
+		var definition string
+		if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&definition); err != nil {
+			return false, err
+		}
+		definition = normalizeSQL(definition)
+		for _, marker := range markers[table] {
+			if !strings.Contains(definition, normalizeSQL(marker)) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeSQL(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(value)), " ")
+}
+
+func validateHardenedV1(tx *sql.Tx) error {
+	if err := validateLegacyAdministrators(tx); err != nil {
+		return err
+	}
+	if err := validateHardenedTimestamps(tx); err != nil {
+		return err
+	}
+	var unsafeCandidates int
+	if err := tx.QueryRow(`SELECT count(*) FROM candidates WHERE
+        (state='uploading' AND (upload_digest<>'' OR validation_report<>'' OR release_version IS NOT NULL)) OR
+        (state IN ('validated','publishing','published') AND (upload_digest='' OR validation_report='')) OR
+        (state='published' AND release_version IS NULL) OR
+        (state<>'published' AND release_version IS NOT NULL)`).Scan(&unsafeCandidates); err != nil {
+		return err
+	}
+	if unsafeCandidates != 0 {
+		return errors.New("hardened V1 contains unsafe candidate bindings")
+	}
+	return validateHardenedVersionFloor(tx)
+}
+
+func validateLegacyAdministrators(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT password_hash,created_at FROM administrators`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash, at string
+		if err := rows.Scan(&hash, &at); err != nil {
+			return err
+		}
+		if _, _, err := decodePasswordHash(hash); err != nil {
+			return fmt.Errorf("unsafe legacy administrator: %w", err)
+		}
+		if err := validateLegacyTimestamp(at); err != nil {
+			return errors.New("unsafe legacy administrator timestamp")
+		}
+	}
+	return rows.Err()
+}
+
+func validateHardenedTimestamps(tx *sql.Tx) error {
+	queries := []string{
+		`SELECT committed_at FROM highest_committed_version`,
+		`SELECT committed_at FROM releases`,
+		`SELECT created_at FROM sessions UNION ALL SELECT last_seen_at FROM sessions UNION ALL SELECT idle_expires_at FROM sessions UNION ALL SELECT absolute_expires_at FROM sessions`,
+		`SELECT created_at FROM candidates UNION ALL SELECT expires_at FROM candidates`,
+		`SELECT created_at FROM operations UNION ALL SELECT finished_at FROM operations WHERE finished_at IS NOT NULL`,
+		`SELECT occurred_at FROM audit_events`,
+	}
+	for _, query := range queries {
+		rows, err := tx.Query(query)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := validateLegacyTimestamp(value); err != nil {
+				rows.Close()
+				return errors.New("hardened V1 contains an unsafe timestamp")
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateLegacyTimestamp(value string) error {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.Unix() < 0 {
+		return errors.New("timestamp must be non-negative RFC3339")
+	}
+	return nil
+}
+
+func validateHardenedVersionFloor(tx *sql.Tx) error {
+	var floor numericVersion
+	var haveFloor bool
+	rows, err := tx.Query(`SELECT version,major,minor,patch FROM highest_committed_version`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version, &floor.major, &floor.minor, &floor.patch); err != nil {
+			rows.Close()
+			return err
+		}
+		parsed, err := parseVersion(version)
+		if err != nil || parsed != floor {
+			rows.Close()
+			return errors.New("unsafe hardened V1 highest version")
+		}
+		haveFloor = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	rows, err = tx.Query(`SELECT version FROM releases`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return err
+		}
+		parsed, err := parseVersion(version)
+		if err != nil || !haveFloor || floor.compare(parsed) < 0 {
+			return errors.New("hardened V1 release exceeds or lacks its permanent floor")
+		}
+	}
+	return rows.Err()
+}
 
 func validateLegacyV1(tx *sql.Tx) error {
 	for _, table := range []string{"candidates", "sessions", "operations", "audit_events"} {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,8 +88,9 @@ func TestMigrationChainIsOrderedAndComplete(t *testing.T) {
 		t.Fatalf("schemaVersion/migrations = %d/%+v", schemaVersion, migrations)
 	}
 	for index, migration := range migrations {
-		if migration.version != index+1 || strings.TrimSpace(migration.sql) == "" {
-			t.Fatalf("migration %d = %+v, want contiguous nonempty migration", index, migration)
+		hasSQL := strings.TrimSpace(migration.sql) != ""
+		if migration.version != index+1 || hasSQL == (migration.apply != nil) {
+			t.Fatalf("migration %d = %+v, want contiguous migration with exactly one implementation", index, migration)
 		}
 	}
 }
@@ -107,7 +109,8 @@ func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(legacyV1DDL); err != nil {
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err = db.Exec(originalV1FixtureDDL); err != nil {
 		t.Fatal(err)
 	}
 	hash, err := hashPassword("Strong!Password123", nilReaderRand{})
@@ -130,6 +133,7 @@ func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	secureMigrationFixture(t, path)
 	upgraded, err := Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("upgrade: %v", err)
@@ -156,6 +160,77 @@ func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
 	}
 }
 
+func TestHardenedCommittedV1DatabaseMigratesToV2(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hardened-v1.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err = db.Exec(hardenedV1FixtureDDL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version=1`); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hashPassword("Strong!Password123", nilReaderRand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = db.Exec(`INSERT INTO administrators VALUES(1,'admin',?,1,?)`, hash, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO highest_committed_version VALUES(1,'1.2.3',1,2,3,?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO releases VALUES(?, '1.2.3','release-1','current',?,'admin')`, releaseID1, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO release_assets VALUES(?,?,12,?)`, releaseID1, "asset.nupkg", digest1); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if _, err = db.Exec(`INSERT INTO sessions VALUES(?,'active',?,?,?,?)`, sessionHash1, now, now, expires, expires); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, candidateID1, sessionHash1, now, expires); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`UPDATE candidates SET upload_digest=?,validation_report='{"valid":true}',state='validated' WHERE id=?`, digest1, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, operationID1, candidateID1, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,operation_id,candidate_id,code) VALUES(?,'upload_started','success',?,?,'accepted')`, now, operationID1, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	upgraded, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("upgrade hardened V1: %v", err)
+	}
+	defer upgraded.Close()
+	var version int
+	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("upgraded schema=%d err=%v", version, err)
+	}
+	if got, ok, err := upgraded.HighestCommittedVersion(context.Background()); err != nil || !ok || got != "1.2.3" {
+		t.Fatalf("floor=%q/%v/%v", got, ok, err)
+	}
+	for table, want := range map[string]int{"sessions": 1, "candidates": 1, "operations": 1, "audit_events": 1} {
+		var count int
+		if err := upgraded.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&count); err != nil || count != want {
+			t.Fatalf("preserved %s count=%d err=%v", table, count, err)
+		}
+	}
+}
+
 func assertIntegerTimestampColumns(t *testing.T, db *sql.DB) {
 	t.Helper()
 	var declaredType string
@@ -174,7 +249,7 @@ func TestUnsafeLegacyRowsFailMigrationWithoutPartialChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(legacyV1DDL); err != nil {
+	if _, err = db.Exec(originalV1FixtureDDL); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,code) VALUES('2026-01-01T00:00:00Z','unknown','success','password=secret')`); err != nil {
@@ -183,9 +258,12 @@ func TestUnsafeLegacyRowsFailMigrationWithoutPartialChanges(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	secureMigrationFixture(t, path)
 	if s, err := Open(context.Background(), path); err == nil {
 		_ = s.Close()
 		t.Fatal("unsafe V1 migrated")
+	} else if !strings.Contains(err.Error(), "legacy audit_events rows cannot be safely transformed") {
+		t.Fatalf("migration failed for the wrong reason: %v", err)
 	}
 	db, err = sql.Open("sqlite", path)
 	if err != nil {
@@ -199,6 +277,58 @@ func TestUnsafeLegacyRowsFailMigrationWithoutPartialChanges(t *testing.T) {
 	var sourceHashColumn int
 	if err = db.QueryRow(`SELECT count(*) FROM pragma_table_info('audit_events') WHERE name='source_hash'`).Scan(&sourceHashColumn); err != nil || sourceHashColumn != 1 {
 		t.Fatalf("legacy schema partially changed")
+	}
+}
+
+func TestUnsafeHardenedV1FailsMigrationWithoutPartialChanges(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "unsafe-hardened-v1.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err = db.Exec(hardenedV1FixtureDDL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`PRAGMA user_version=1`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = db.Exec(`INSERT INTO operations(id,kind,state,created_at) VALUES(?,'publish','pending',?)`, operationID1, now); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	if s, err := Open(context.Background(), path); err == nil {
+		_ = s.Close()
+		t.Fatal("unsafe hardened V1 migrated")
+	} else if !strings.Contains(err.Error(), "migrate hardened V1 data") {
+		t.Fatalf("migration failed for the wrong reason: %v", err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 1 {
+		t.Fatalf("schema=%d err=%v", version, err)
+	}
+	var sourcePseudonymColumn int
+	if err = db.QueryRow(`SELECT count(*) FROM pragma_table_info('audit_events') WHERE name='source_pseudonym'`).Scan(&sourcePseudonymColumn); err != nil || sourcePseudonymColumn != 1 {
+		t.Fatal("hardened V1 schema partially changed")
+	}
+}
+
+func secureMigrationFixture(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -392,7 +522,7 @@ func TestOperationTerminalStateRequiresFinishedAtAndCannotMoveBackward(t *testin
 	s := openStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationPublish, State: OperationPending, CreatedAt: now}); err != nil {
+	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationCleanup, State: OperationPending, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	for _, statement := range []string{
@@ -427,6 +557,38 @@ func TestOperationTerminalStateRequiresFinishedAtAndCannotMoveBackward(t *testin
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET result_code='internal_failure' WHERE id=?`, operationID1); err == nil {
 		t.Fatal("terminal operation result was mutable")
+	}
+}
+
+func TestOperationAssociationsAreKindSpecificAndImmutable(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	createActiveSession(t, s, sessionHash1)
+	if err := s.CreateCandidate(ctx, Candidate{ID: candidateID1, SessionID: sessionHash1, State: CandidateUploading, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?, '1.0.0', 'release-1', 'current', ?)`, releaseID1, stamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationPublish, State: OperationPending, CreatedAt: now}); err == nil {
+		t.Fatal("publish operation accepted no candidate")
+	}
+	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationCleanup, State: OperationPending, CandidateID: candidateID1, CreatedAt: now}); err == nil {
+		t.Fatal("cleanup operation accepted a candidate")
+	}
+	if err := s.CreateOperation(ctx, Operation{ID: operationID1, Kind: OperationPublish, State: OperationPending, CandidateID: candidateID1, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`UPDATE operations SET kind='upload' WHERE id='` + operationID1 + `'`,
+		`UPDATE operations SET candidate_id=NULL WHERE id='` + operationID1 + `'`,
+		`UPDATE operations SET release_id='` + releaseID1 + `' WHERE id='` + operationID1 + `'`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err == nil {
+			t.Fatalf("raw SQL changed an operation association: %s", statement)
+		}
 	}
 }
 
@@ -579,7 +741,7 @@ func TestWithTransactionRollsBackStateAndAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?, 'publish', 'pending', ?)`, operationID1, stamp(time.Now())); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?, 'cleanup', 'pending', ?)`, operationID1, stamp(time.Now())); err != nil {
 			return err
 		}
 		if err := insertAudit(ctx, tx, event); err != nil {
