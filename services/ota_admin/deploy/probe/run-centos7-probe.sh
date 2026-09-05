@@ -22,6 +22,8 @@ readonly GO_ARCHIVE_SHA256="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63e
 readonly GO_URL="https://go.dev/dl/go1.27.1.linux-amd64.tar.gz"
 readonly GO_ROOT="$VERIFY_ROOT/go"
 readonly GO_EXE="$GO_ROOT/bin/go"
+readonly GO_CACHE="$VERIFY_ROOT/go-build-cache"
+readonly GO_MOD_CACHE="$VERIFY_ROOT/go-mod-cache"
 readonly HEALTH_URL="http://127.0.0.1:18091/admin/health"
 readonly STATIC_STRIPPED_FILE_PATTERN='^ELF 64-bit.*x86-64.*statically linked.*, stripped(,|$)'
 
@@ -53,6 +55,10 @@ if [[ -e "$GO_ROOT" || -L "$GO_ROOT" ]]; then
 fi
 if [[ -e "$SOURCE_ROOT" || -L "$SOURCE_ROOT" ]]; then
   echo "Refusing a pre-existing source extraction target." >&2
+  exit 1
+fi
+if [[ -e "$GO_CACHE" || -L "$GO_CACHE" || -e "$GO_MOD_CACHE" || -L "$GO_MOD_CACHE" ]]; then
+  echo "Refusing a pre-existing Go cache target." >&2
   exit 1
 fi
 
@@ -230,7 +236,8 @@ else
 fi
 mkdir -- "$GO_ROOT"
 tar -C "$GO_ROOT" --strip-components=1 -xzf "$GO_ARCHIVE"
-[[ "$($GO_EXE version)" == "go version go$GO_VERSION linux/amd64" ]]
+mkdir -- "$GO_CACHE" "$GO_MOD_CACHE"
+[[ "$(env GOCACHE="$GO_CACHE" GOMODCACHE="$GO_MOD_CACHE" "$GO_EXE" version)" == "go version go$GO_VERSION linux/amd64" ]]
 
 mkdir -- "$SOURCE_ROOT"
 unzip -q "$SOURCE_BUNDLE" -d "$SOURCE_ROOT"
@@ -243,7 +250,8 @@ if ! cmp -s -- "$SCRIPT_PATH" "$BUNDLED_RUNNER"; then
   echo "Executing runner differs from the verified bundled runner." >&2
   exit 1
 fi
-env CGO_ENABLED=0 GOTOOLCHAIN=local "$GO_EXE" -C "$SOURCE_ROOT" test -shuffle=on -count=10 ./...
+env CGO_ENABLED=0 GOTOOLCHAIN=local GOCACHE="$GO_CACHE" GOMODCACHE="$GO_MOD_CACHE" \
+  "$GO_EXE" -C "$SOURCE_ROOT" test -shuffle=on -count=10 ./...
 
 mkdir -p -- "$VERIFY_ROOT/oneshot"
 probe_json="$($BINARY compat-probe --work-dir="$VERIFY_ROOT/oneshot")"

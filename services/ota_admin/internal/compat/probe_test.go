@@ -191,6 +191,8 @@ func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
 		"sha256sum -c",
 		"CGO_ENABLED=0",
 		"GOTOOLCHAIN=local",
+		"GOCACHE=\"$GO_CACHE\"",
+		"GOMODCACHE=\"$GO_MOD_CACHE\"",
 		"test -shuffle=on -count=10 ./...",
 		"x86-64",
 		"statically linked",
@@ -280,8 +282,9 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
 	for _, required := range []string{
 		"a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d",
-		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "GOCACHE", "local", "-buildvcs=false",
-		"git", "diff", "--quiet", "HEAD", "ls-files", "--others",
+		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "GOCACHE", "GOMODCACHE", "local", "-buildvcs=false",
+		"git", "diff", "--quiet", "HEAD", "ls-tree", "ls-files", "--others",
+		"archive", "--format=zip", "HEAD:services/ota_admin",
 		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
 		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
 		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
@@ -291,11 +294,12 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		}
 	}
 	requireSubstringsInOrder(t, buildScript,
+		"GOTOOLCHAIN",
+		"GOCACHE",
+		"GOMODCACHE",
 		`& powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript`,
 		"ExpectedArchiveSha256",
 		"go version go1.27.1 windows/amd64",
-		"GOTOOLCHAIN",
-		"GOCACHE",
 		"mod verify",
 		"test ./...",
 		"vet ./...",
@@ -311,6 +315,9 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	}
 	if strings.Contains(buildScript[finallyOffset:], "BackupDirectory") {
 		t.Fatal("final cleanup can delete a rollback backup that was not recovered")
+	}
+	if strings.Contains(buildScript, "Copy-Item -LiteralPath $sourcePath") {
+		t.Fatal("build snapshot still copies mutable working-tree bytes")
 	}
 }
 
@@ -503,6 +510,69 @@ catch {
 	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScript, artifactRoot).CombinedOutput()
 	if runErr != nil {
 		t.Fatalf("rollback harness failed: %v; output:\n%s", runErr, output)
+	}
+}
+
+func TestGitObjectSnapshotIgnoresWorkingTreeMutation(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+	root := testLocalTempDir(t)
+	repositoryRoot := filepath.Join(root, "repository")
+	moduleRoot := filepath.Join(repositoryRoot, "services", "ota_admin")
+	if err := os.MkdirAll(filepath.Join(moduleRoot, "internal", "compat"), 0o700); err != nil {
+		t.Fatalf("create fixture module: %v", err)
+	}
+	goModPath := filepath.Join(moduleRoot, "go.mod")
+	probePath := filepath.Join(moduleRoot, "internal", "compat", "probe.go")
+	if err := os.WriteFile(goModPath, []byte("module example.test/probe\n"), 0o600); err != nil {
+		t.Fatalf("write fixture go.mod: %v", err)
+	}
+	if err := os.WriteFile(probePath, []byte("package compat\nconst source = \"committed\"\n"), 0o600); err != nil {
+		t.Fatalf("write committed fixture: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "compat@example.invalid"},
+		{"config", "user.name", "Compatibility Test"},
+		{"add", "services/ota_admin"},
+		{"commit", "-m", "fixture"},
+	} {
+		command := exec.Command("git", append([]string{"-C", repositoryRoot}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v; output:\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(probePath, []byte("package compat\nconst source = \"working-tree\"\n"), 0o600); err != nil {
+		t.Fatalf("mutate working-tree fixture: %v", err)
+	}
+
+	buildScript, err := filepath.Abs(filepath.Join("..", "..", "scripts", "build_linux_amd64.ps1"))
+	if err != nil {
+		t.Fatalf("resolve build script: %v", err)
+	}
+	harnessPath := filepath.Join(root, "snapshot-harness.ps1")
+	snapshotRoot := filepath.Join(root, "snapshot")
+	harness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $SnapshotRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+$RepositoryRoot = [System.IO.Path]::GetFullPath($FixtureRepository)
+[string[]] $paths = @('services/ota_admin/go.mod', 'services/ota_admin/internal/compat/probe.go')
+New-GitObjectSourceSnapshot -SourcePaths $paths -DestinationRoot $SnapshotRoot
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write snapshot harness: %v", err)
+	}
+	if output, err := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScript, repositoryRoot, snapshotRoot).CombinedOutput(); err != nil {
+		t.Fatalf("snapshot harness failed: %v; output:\n%s", err, output)
+	}
+	snapshotProbe, err := os.ReadFile(filepath.Join(snapshotRoot, "internal", "compat", "probe.go"))
+	if err != nil {
+		t.Fatalf("read snapshot probe: %v", err)
+	}
+	if strings.Contains(string(snapshotProbe), "working-tree") || !strings.Contains(string(snapshotProbe), "committed") {
+		t.Fatalf("snapshot did not come exclusively from HEAD: %q", snapshotProbe)
 	}
 }
 

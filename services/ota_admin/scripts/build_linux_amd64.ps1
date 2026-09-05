@@ -56,8 +56,8 @@ function Assert-PinnedGoToolchain {
 
 function Get-TrackedSourcePaths {
     $modulePrefix = 'services/ota_admin/'
-    [string[]] $trackedPaths = @(& git -C $RepositoryRoot ls-files -- services/ota_admin)
-    if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed while selecting source inputs.' }
+    [string[]] $trackedPaths = @(& git -C $RepositoryRoot ls-tree -r --name-only HEAD -- services/ota_admin)
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-tree failed while selecting committed source inputs.' }
 
     [string[]] $sourcePaths = @($trackedPaths | Where-Object {
         if (-not $_.StartsWith($modulePrefix, [System.StringComparison]::Ordinal)) { return $false }
@@ -98,24 +98,37 @@ function Assert-SourcePathsClean {
     if ($LASTEXITCODE -ne 0) { throw 'git diff failed while verifying source inputs.' }
 }
 
-function Copy-CleanSourceSnapshot {
+function New-GitObjectSourceSnapshot {
     param(
         [Parameter(Mandatory)][string[]] $SourcePaths,
         [Parameter(Mandatory)][string] $DestinationRoot
     )
 
     $modulePrefix = 'services/ota_admin/'
+    $DestinationRoot = [System.IO.Path]::GetFullPath($DestinationRoot)
+    [string[]] $moduleRelativePaths = @($SourcePaths | ForEach-Object { $_.Substring($modulePrefix.Length) })
+    $snapshotArchivePath = Join-Path (Split-Path -Parent $DestinationRoot) 'snapshot-from-head.zip'
+    if ((Test-Path -LiteralPath $DestinationRoot) -or (Test-Path -LiteralPath $snapshotArchivePath)) {
+        throw 'Git-object snapshot target unexpectedly exists.'
+    }
+
+    & git -C $RepositoryRoot archive --format=zip --output=$snapshotArchivePath 'HEAD:services/ota_admin' -- @moduleRelativePaths
+    if ($LASTEXITCODE -ne 0) { throw 'git archive failed while materializing the committed source snapshot.' }
     New-Item -ItemType Directory -Path $DestinationRoot | Out-Null
-    foreach ($repositoryRelativePath in $SourcePaths) {
-        $sourcePath = Join-Path $RepositoryRoot $repositoryRelativePath
-        $sourceItem = Get-Item -LiteralPath $sourcePath -Force
-        if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $sourceItem.PSIsContainer) {
-            throw "Source input is not a regular file: $repositoryRelativePath"
-        }
-        $moduleRelativePath = $repositoryRelativePath.Substring($modulePrefix.Length)
-        $destinationPath = Join-Path $DestinationRoot $moduleRelativePath
-        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
-        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
+    try {
+        Expand-Archive -LiteralPath $snapshotArchivePath -DestinationPath $DestinationRoot
+    }
+    finally {
+        if (Test-Path -LiteralPath $snapshotArchivePath) { Remove-Item -LiteralPath $snapshotArchivePath -Force }
+    }
+
+    [string[]] $actualPaths = @(Get-ChildItem -LiteralPath $DestinationRoot -File -Recurse | ForEach-Object {
+        $_.FullName.Substring($DestinationRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+    })
+    [System.Array]::Sort($actualPaths, [System.StringComparer]::Ordinal)
+    [System.Array]::Sort($moduleRelativePaths, [System.StringComparer]::Ordinal)
+    if ([string]::Join("`n", $actualPaths) -cne [string]::Join("`n", $moduleRelativePaths)) {
+        throw 'Git-object snapshot file set differs from the exact tracked allowlist.'
     }
 }
 
@@ -232,21 +245,22 @@ $sourcePaths = @(Get-TrackedSourcePaths)
 Assert-SourcePathsClean -SourcePaths $sourcePaths
 
 New-Item -ItemType Directory -Path $StagingDirectory | Out-Null
-Copy-CleanSourceSnapshot -SourcePaths $sourcePaths -DestinationRoot $SnapshotDirectory
-$snapshotFingerprint = Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory
-New-Item -ItemType Directory -Path $StagedPublishDirectory | Out-Null
-$stagedOutputPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64'
-$stagedOutputHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64.sha256'
-$stagedSourceBundlePath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip'
-$stagedSourceBundleHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip.sha256'
-
 try {
+    New-GitObjectSourceSnapshot -SourcePaths $sourcePaths -DestinationRoot $SnapshotDirectory
+    $snapshotFingerprint = Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory
+    New-Item -ItemType Directory -Path $StagedPublishDirectory | Out-Null
+    $stagedOutputPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64'
+    $stagedOutputHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64.sha256'
+    $stagedSourceBundlePath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip'
+    $stagedSourceBundleHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip.sha256'
+
+    $env:GOTOOLCHAIN = 'local'
+    $env:GOCACHE = Join-Path $StagingDirectory 'go-build-cache'
+    $env:GOMODCACHE = Join-Path $StagingDirectory 'go-module-cache'
     & powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript
     if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
     $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
     $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
-    $env:GOTOOLCHAIN = 'local'
-    $env:GOCACHE = Join-Path $StagingDirectory 'go-build-cache'
     $env:CGO_ENABLED = '0'
 
     Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
