@@ -114,13 +114,19 @@ function Add-AuthenticodeHashRange(
 }
 
 function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$SignerInfo) {
+    $accepted = [Collections.Generic.List[object]]::new()
     foreach ($counterSigner in $SignerInfo.CounterSignerInfos) {
         $counterSigner.CheckSignature($true)
+        $signingTimes = [Collections.Generic.List[DateTime]]::new()
         foreach ($attribute in $counterSigner.SignedAttributes) {
             if ($attribute.Oid.Value -ceq '1.2.840.113549.1.9.5' -and $attribute.Values.Count -eq 1) {
-                return ([Security.Cryptography.Pkcs.Pkcs9SigningTime]::new($attribute.Values[0].RawData)).SigningTime.ToUniversalTime()
+                $signingTimes.Add(([Security.Cryptography.Pkcs.Pkcs9SigningTime]::new($attribute.Values[0].RawData)).SigningTime.ToUniversalTime())
             }
         }
+        if ($signingTimes.Count -ne 1 -or $null -eq $counterSigner.Certificate) {
+            throw 'Authenticode countersignature timestamp is ambiguous.'
+        }
+        $accepted.Add([pscustomobject]@{ Utc=$signingTimes[0]; Certificate=$counterSigner.Certificate; Kind='legacy' })
     }
     foreach ($attribute in $SignerInfo.UnsignedAttributes) {
         if ($attribute.Oid.Value -cne '1.3.6.1.4.1.311.3.3.1') { continue }
@@ -128,6 +134,10 @@ function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$Si
             $timestampCms = [Security.Cryptography.Pkcs.SignedCms]::new()
             $timestampCms.Decode($value.RawData)
             $timestampCms.CheckSignature($true)
+            if ($timestampCms.ContentInfo.ContentType.Value -cne '1.2.840.113549.1.9.16.1.4' -or
+                $timestampCms.SignerInfos.Count -ne 1 -or $null -eq $timestampCms.SignerInfos[0].Certificate) {
+                throw 'Authenticode RFC3161 timestamp token is ambiguous or has the wrong content type.'
+            }
             $reader = [System.Formats.Asn1.AsnReader]::new(
                 $timestampCms.ContentInfo.Content,
                 [System.Formats.Asn1.AsnEncodingRules]::DER)
@@ -147,10 +157,14 @@ function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$Si
                 throw 'Authenticode timestamp is not bound to the executable signature.'
             }
             [void]$sequence.ReadInteger()
-            return $sequence.ReadGeneralizedTime().UtcDateTime
+            $timestampUtc = $sequence.ReadGeneralizedTime().UtcDateTime
+            if ($reader.HasData) { throw 'Authenticode RFC3161 timestamp token has trailing outer data.' }
+            $accepted.Add([pscustomobject]@{ Utc=$timestampUtc; Certificate=$timestampCms.SignerInfos[0].Certificate; Kind='rfc3161' })
         }
     }
-    return $null
+    if ($accepted.Count -gt 1) { throw 'Authenticode must contain exactly one accepted timestamp token.' }
+    if ($accepted.Count -eq 0) { return $null }
+    return $accepted[0]
 }
 
 function Get-VerifiedAuthenticode([string]$Path) {
@@ -245,8 +259,9 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
         throw "Executable signer certificate is missing the Code Signing EKU: $EvidencePath"
     }
     $authenticodeStatus = Get-AuthenticodeSignature -LiteralPath $Path
-    $timestampUtc = Get-AuthenticodeTimestampUtc $verified.Signer
-    if ($TimestampRequired -and ($null -eq $authenticodeStatus.TimeStamperCertificate -or $null -eq $timestampUtc)) {
+    $timestampEvidence = Get-AuthenticodeTimestampUtc $verified.Signer
+    $timestampUtc = if ($null -eq $timestampEvidence) { $null } else { [DateTime]$timestampEvidence.Utc }
+    if ($TimestampRequired -and $null -eq $timestampEvidence) {
         throw "Executable is missing the required Authenticode timestamp: $([IO.Path]::GetFileName($Path))"
     }
     $validationTime = if ($null -eq $timestampUtc) { [DateTime]::UtcNow } else { $timestampUtc }
@@ -256,7 +271,11 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     }
     if ($null -ne $timestampUtc) {
         if ($timestampUtc -gt [DateTime]::UtcNow.AddMinutes(5)) { throw "Executable timestamp is unreasonably in the future: $EvidencePath" }
-        $tsaCertificate = $authenticodeStatus.TimeStamperCertificate
+        $tsaCertificate = $timestampEvidence.Certificate
+        if ($null -ne $authenticodeStatus.TimeStamperCertificate -and
+            $authenticodeStatus.TimeStamperCertificate.Thumbprint -cne $tsaCertificate.Thumbprint) {
+            throw "Executable platform timestamp signer differs from the accepted timestamp token: $EvidencePath"
+        }
         $timestampingOid = '1.3.6.1.5.5.7.3.8'
         $hasTimestampingEku = @($tsaCertificate.Extensions | Where-Object {
                 $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
@@ -284,6 +303,7 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     })
     if ($null -ne $authenticodeStatus.TimeStamperCertificate) { $authenticodeStatus.TimeStamperCertificate.Dispose() }
     if ($null -ne $authenticodeStatus.SignerCertificate) { $authenticodeStatus.SignerCertificate.Dispose() }
+    if ($null -ne $timestampEvidence -and $null -ne $timestampEvidence.Certificate) { $timestampEvidence.Certificate.Dispose() }
     if ($null -ne $verified.Signer.Certificate) { $verified.Signer.Certificate.Dispose() }
     $authenticodeStatus = $null
     $verified = $null
@@ -296,16 +316,59 @@ function Assert-ThirdPartyAuthenticode([string]$Path, [string]$ExpectedSpki, [st
     if ($actualSpki -cne $ExpectedSpki) { throw "Third-party executable signer SPKI is not trusted: $EvidencePath" }
     $actualHash = Get-FileSha256 $Path
     if ($actualHash -cne $ExpectedHash) { throw "Third-party executable hash differs from its authenticated helper manifest: $EvidencePath" }
+    $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+    $hasCodeSigningEku = @($verified.Signer.Certificate.Extensions | Where-Object {
+            $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+            @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $codeSigningOid }).Count -eq 1
+        }).Count -eq 1
+    if (-not $hasCodeSigningEku) { throw "Third-party executable signer certificate is missing the Code Signing EKU: $EvidencePath" }
+    $authenticodeStatus = Get-AuthenticodeSignature -LiteralPath $Path
+    $timestampEvidence = Get-AuthenticodeTimestampUtc $verified.Signer
+    $timestampUtc = if ($null -eq $timestampEvidence) { $null } else { [DateTime]$timestampEvidence.Utc }
+    $validationTime = if ($null -eq $timestampUtc) { [DateTime]::UtcNow } else { $timestampUtc }
+    if ($validationTime -lt $verified.Signer.Certificate.NotBefore.ToUniversalTime() -or
+        $validationTime -gt $verified.Signer.Certificate.NotAfter.ToUniversalTime()) {
+        throw "Third-party executable signer certificate was not valid at its effective signing time: $EvidencePath"
+    }
+    if ($null -ne $timestampEvidence) {
+        if ($timestampUtc -gt [DateTime]::UtcNow.AddMinutes(5)) { throw "Third-party executable timestamp is unreasonably in the future: $EvidencePath" }
+        $tsaCertificate = $timestampEvidence.Certificate
+        if ($null -ne $authenticodeStatus.TimeStamperCertificate -and
+            $authenticodeStatus.TimeStamperCertificate.Thumbprint -cne $tsaCertificate.Thumbprint) {
+            throw "Third-party executable platform timestamp signer differs from the accepted timestamp token: $EvidencePath"
+        }
+        $timestampingOid = '1.3.6.1.5.5.7.3.8'
+        $hasTimestampingEku = @($tsaCertificate.Extensions | Where-Object {
+                $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+                @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $timestampingOid }).Count -eq 1
+            }).Count -eq 1
+        if (-not $hasTimestampingEku -or $timestampUtc -lt $tsaCertificate.NotBefore.ToUniversalTime() -or
+            $timestampUtc -gt $tsaCertificate.NotAfter.ToUniversalTime()) { throw "Third-party executable timestamp authority is invalid: $EvidencePath" }
+        $tsaChain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $tsaChain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $tsaChain.ChainPolicy.VerificationTime = $timestampUtc
+            $tsaChain.ChainPolicy.VerificationFlags = [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+            if (-not $tsaChain.Build($tsaCertificate)) { throw "Third-party executable timestamp authority chain is not trusted: $EvidencePath" }
+        }
+        finally { $tsaChain.Dispose() }
+    }
     $signatureEvidence.Add([ordered]@{
         file = $EvidencePath
         policy = 'python-psf-authenticode-and-helper-manifest'
         signerSpkiSha256 = $actualSpki
         sha256 = $actualHash
         imageDigestVerified = $true
-        timestampPresent = $false
-        timestampUtc = $null
+        platformStatus = [string]$authenticodeStatus.Status
+        timestampPresent = ($null -ne $timestampEvidence)
+        timestampUtc = if ($null -eq $timestampUtc) { $null } else { $timestampUtc.ToString('O') }
     })
+    if ($null -ne $authenticodeStatus.TimeStamperCertificate) { $authenticodeStatus.TimeStamperCertificate.Dispose() }
+    if ($null -ne $authenticodeStatus.SignerCertificate) { $authenticodeStatus.SignerCertificate.Dispose() }
+    if ($null -ne $timestampEvidence -and $null -ne $timestampEvidence.Certificate) { $timestampEvidence.Certificate.Dispose() }
     if ($null -ne $verified.Signer.Certificate) { $verified.Signer.Certificate.Dispose() }
+    $authenticodeStatus = $null
+    $timestampEvidence = $null
     $verified = $null
 }
 
@@ -609,13 +672,17 @@ try {
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
                 Assert-ThirdPartyAuthenticode $thirdPartyDestination $psfSpki "$Description::$thirdPartyName" ([string]$manifestFiles[0].sha256)
             }
+            # DLL/PYD entries are package data covered by the outer signed manifest and
+            # their enclosing archive hash. They are not classified as Authenticode
+            # executable assets; every actual .exe is handled by the signer policies above.
             foreach ($peEntry in @($inner.Entries | Where-Object {
                         $_.FullName.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase) -or
                         $_.FullName.EndsWith('.pyd', [StringComparison]::OrdinalIgnoreCase)
                     })) {
                 $signatureEvidence.Add([ordered]@{
                     file = "$Description::$($peEntry.FullName)"
-                    policy = 'authenticated-package-closure'
+                    policy = 'manifest-hash-package-data'
+                    assetClass = 'package-data-not-authenticode-executable'
                     signerSpkiSha256 = $null
                     sha256 = Get-LowerHash ([Security.Cryptography.SHA256]::Create()) $peEntry.Open()
                     imageDigestVerified = $false

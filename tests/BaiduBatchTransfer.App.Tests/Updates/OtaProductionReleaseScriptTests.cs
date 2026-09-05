@@ -124,6 +124,7 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("ls-tree", script, StringComparison.Ordinal);
         Assert.Contains("production-source-overrides.sha256", script, StringComparison.Ordinal);
         Assert.Contains("Reviewed production source override hash differs", script, StringComparison.Ordinal);
+        Assert.Contains("Staged reviewed production source override hash differs", script, StringComparison.Ordinal);
         Assert.DoesNotContain("git -C $Source ls-files", script, StringComparison.Ordinal);
         Assert.DoesNotContain("ls-files --others", script, StringComparison.Ordinal);
         Assert.Contains("$($Commit):$RelativePath", script, StringComparison.Ordinal);
@@ -153,6 +154,10 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("current/sq.version", validator, StringComparison.Ordinal);
         Assert.Contains("SignerInfo digest algorithm must be SHA-256", validator, StringComparison.Ordinal);
         Assert.Contains("signer certificate is missing the Code Signing EKU", validator, StringComparison.Ordinal);
+        Assert.Contains("Third-party executable signer certificate is missing the Code Signing EKU", validator, StringComparison.Ordinal);
+        Assert.Contains("Authenticode must contain exactly one accepted timestamp token", validator, StringComparison.Ordinal);
+        Assert.Contains("manifest-hash-package-data", validator, StringComparison.Ordinal);
+        Assert.Contains("package-data-not-authenticode-executable", validator, StringComparison.Ordinal);
         Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("Every executable carried by an inner archive", validator, StringComparison.Ordinal);
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);

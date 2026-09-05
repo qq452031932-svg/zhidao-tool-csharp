@@ -258,6 +258,11 @@ function Invoke-ProductionRelease {
         if (-not (Test-Path -LiteralPath $productionNotes -PathType Leaf)) { throw 'ReleaseNotesPath must name an existing file.' }
     }
 
+    $signingCertificate = $null
+    $signingRsa = $null
+    $productionStage = $null
+    $logDirectory = $null
+    try {
     $expectedSpki = 'f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff'
     $thumbprint = $SigningCertificateThumbprint.ToUpperInvariant()
     $certificates = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -ceq $thumbprint })
@@ -275,13 +280,13 @@ function Invoke-ProductionRelease {
         $actualSpki = ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($publicRsa.ExportSubjectPublicKeyInfo()))).ToLowerInvariant()
     }
     finally { $publicRsa.Dispose() }
-    if ($actualSpki -cne $expectedSpki) { $signingRsa.Dispose(); throw 'The signing certificate SPKI does not match the enrolled OTA publisher.' }
+    if ($actualSpki -cne $expectedSpki) { throw 'The signing certificate SPKI does not match the enrolled OTA publisher.' }
     $codeSigningOid = '1.3.6.1.5.5.7.3.3'
     $hasCodeSigning = @($signingCertificate.Extensions | Where-Object {
             $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
             @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $codeSigningOid }).Count -eq 1
         }).Count -eq 1
-    if (-not $hasCodeSigning) { $signingRsa.Dispose(); throw 'The signing certificate is not authorized for code signing.' }
+    if (-not $hasCodeSigning) { throw 'The signing certificate is not authorized for code signing.' }
 
     if (Test-Path -LiteralPath $productionOutput) { Remove-Item -LiteralPath $productionOutput -Force }
     $productionParent = [IO.Path]::GetDirectoryName($productionOutput)
@@ -402,13 +407,16 @@ function Invoke-ProductionRelease {
             $destinationPath = Join-Path $Destination $relativePath
             [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destinationPath)) | Out-Null
             [IO.File]::Copy($sourcePath, $destinationPath, $true)
+            if ((Get-LowerSha256 $destinationPath) -cne [string]$Matches.hash) {
+                Remove-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+                throw "Staged reviewed production source override hash differs: $relativePath"
+            }
         }
         if ($overridePaths.Count -eq 0) { throw 'The reviewed production source override manifest is empty.' }
     }
 
     $zipPath = $null
     $reportPath = $null
-    try {
         $sourceCommitLines = @(& git -C $repoRoot rev-parse --verify 'HEAD^{commit}')
         if ($LASTEXITCODE -ne 0 -or $sourceCommitLines.Count -ne 1 -or $sourceCommitLines[0] -cnotmatch '^[0-9a-f]{40}$') {
             throw 'Unable to resolve exactly one production source commit SHA.'
@@ -633,16 +641,17 @@ function Invoke-ProductionRelease {
         else { Write-Output "Authenticode mode: signed with required timestamp service $TimestampUrl" }
     }
     catch {
-        if (Test-Path -LiteralPath $logDirectory) {
+        if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and (Test-Path -LiteralPath $logDirectory)) {
             $failureLogDirectory = "$productionOutput.failure-logs-$([Guid]::NewGuid().ToString('N'))"
             [IO.Directory]::Move($logDirectory, $failureLogDirectory)
         }
-        if (Test-Path -LiteralPath $productionStage) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
+        if (-not [string]::IsNullOrWhiteSpace($productionStage) -and (Test-Path -LiteralPath $productionStage)) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
         throw
     }
     finally {
-        if (Test-Path -LiteralPath $productionStage) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
-        $signingRsa.Dispose()
+        if (-not [string]::IsNullOrWhiteSpace($productionStage) -and (Test-Path -LiteralPath $productionStage)) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
+        if ($null -ne $signingRsa) { $signingRsa.Dispose() }
+        if ($null -ne $signingCertificate) { $signingCertificate.Dispose() }
     }
 }
 
