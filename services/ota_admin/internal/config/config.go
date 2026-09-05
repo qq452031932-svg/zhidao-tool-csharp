@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 )
@@ -78,23 +76,9 @@ func Parse(reader io.Reader) (Config, error) {
 }
 
 func Load(path string) (Config, error) {
-	info, err := os.Lstat(path)
+	file, err := openTrustedConfig(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("stat config: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return Config{}, errors.New("config must be a regular file")
-	}
-	uid, ok := ownerUID(info.Sys())
-	if !ok {
-		return Config{}, errors.New("cannot verify root ownership of config")
-	}
-	if err := ValidateRootOnlyMetadata(uid, uint32(info.Mode().Perm())); err != nil {
 		return Config{}, err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("open config: %w", err)
 	}
 	defer file.Close()
 	return Parse(file)
@@ -103,6 +87,9 @@ func Load(path string) (Config, error) {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.DatabasePath) == "" || !isAbsolutePath(c.DatabasePath) {
 		return errors.New("database_path must be absolute")
+	}
+	if strings.HasPrefix(strings.ToLower(c.DatabasePath), "file:") || strings.ContainsAny(c.DatabasePath, "?#\x00") {
+		return errors.New("database_path must be a literal path without URI or DSN metacharacters")
 	}
 	checks := []struct {
 		name  string
@@ -137,8 +124,20 @@ func ValidateRootOnlyMetadata(owner uint32, mode uint32) error {
 		return errors.New("config must be owned by root")
 	}
 	permissions := mode & 0o777
-	if permissions&0o077 != 0 || permissions&0o400 == 0 || permissions&0o100 != 0 {
-		return errors.New("config permissions must be root-readable and inaccessible to group and others")
+	// 0640 is intentionally supported: deployment can give the unprivileged
+	// service's dedicated group read-only access to a root-owned configuration.
+	if permissions&0o027 != 0 || permissions&0o400 == 0 || permissions&0o100 != 0 {
+		return errors.New("config must be root-readable, optionally group-readable, and never executable or group/other writable")
+	}
+	return nil
+}
+
+func ValidateTrustedParentMetadata(symlink bool, mode uint32) error {
+	if symlink {
+		return errors.New("config parent cannot be a symlink")
+	}
+	if mode&0o022 != 0 {
+		return errors.New("config parent cannot be group or other writable")
 	}
 	return nil
 }
@@ -152,27 +151,6 @@ func ensureSingleJSONValue(decoder *json.Decoder) error {
 		return fmt.Errorf("decode trailing config data: %w", err)
 	}
 	return nil
-}
-
-func ownerUID(value any) (uint32, bool) {
-	reflected := reflect.ValueOf(value)
-	if !reflected.IsValid() {
-		return 0, false
-	}
-	if reflected.Kind() == reflect.Pointer {
-		if reflected.IsNil() {
-			return 0, false
-		}
-		reflected = reflected.Elem()
-	}
-	if reflected.Kind() != reflect.Struct {
-		return 0, false
-	}
-	field := reflected.FieldByName("Uid")
-	if !field.IsValid() || !field.CanUint() {
-		return 0, false
-	}
-	return uint32(field.Uint()), true
 }
 
 func isAbsolutePath(path string) bool {

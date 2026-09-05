@@ -108,15 +108,19 @@ func TestValidateRootOnlyMetadata(t *testing.T) {
 	if err := config.ValidateRootOnlyMetadata(0, 0o600); err != nil {
 		t.Fatalf("ValidateRootOnlyMetadata(root, 0600) error = %v", err)
 	}
+	if err := config.ValidateRootOnlyMetadata(0, 0o640); err != nil {
+		t.Fatalf("ValidateRootOnlyMetadata(root, 0640) error = %v; service group read must be supported", err)
+	}
 	for _, test := range []struct {
 		name string
 		uid  uint32
 		mode uint32
 	}{
 		{"non-root owner", 1000, 0o600},
-		{"group readable", 0, 0o640},
+		{"group writable", 0, 0o660},
 		{"world readable", 0, 0o604},
-		{"group writable", 0, 0o620},
+		{"world writable", 0, 0o602},
+		{"executable", 0, 0o700},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -124,6 +128,40 @@ func TestValidateRootOnlyMetadata(t *testing.T) {
 				t.Fatal("ValidateRootOnlyMetadata() accepted insecure metadata")
 			}
 		})
+	}
+}
+
+func TestValidateTrustedParentMetadata(t *testing.T) {
+	t.Parallel()
+	if err := config.ValidateTrustedParentMetadata(false, 0o755); err != nil {
+		t.Fatalf("ValidateTrustedParentMetadata(0755) error = %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		symlink bool
+		mode    uint32
+	}{
+		{"symlink", true, 0o755},
+		{"group writable", false, 0o775},
+		{"world writable", false, 0o757},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := config.ValidateTrustedParentMetadata(test.symlink, test.mode); err == nil {
+				t.Fatal("ValidateTrustedParentMetadata() accepted unsafe parent")
+			}
+		})
+	}
+}
+
+func TestConfigRejectsDatabaseDSNMetacharacters(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"/var/lib/state.db?_pragma=foreign_keys(0)", "/var/lib/state.db#fragment", "file:/var/lib/state.db"} {
+		cfg := config.Default()
+		cfg.DatabasePath = path
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() accepted database path %q", path)
+		}
 	}
 }
 
