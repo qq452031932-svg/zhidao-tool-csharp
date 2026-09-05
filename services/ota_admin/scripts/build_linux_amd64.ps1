@@ -246,6 +246,7 @@ try {
     $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
     $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
     $env:GOTOOLCHAIN = 'local'
+    $env:GOCACHE = Join-Path $StagingDirectory 'go-build-cache'
     $env:CGO_ENABLED = '0'
 
     Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity

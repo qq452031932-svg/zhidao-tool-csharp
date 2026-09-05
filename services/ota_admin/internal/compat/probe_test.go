@@ -280,7 +280,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
 	for _, required := range []string{
 		"a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d",
-		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "local", "-buildvcs=false",
+		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "GOCACHE", "local", "-buildvcs=false",
 		"git", "diff", "--quiet", "HEAD", "ls-files", "--others",
 		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
 		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
@@ -295,6 +295,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		"ExpectedArchiveSha256",
 		"go version go1.27.1 windows/amd64",
 		"GOTOOLCHAIN",
+		"GOCACHE",
 		"mod verify",
 		"test ./...",
 		"vet ./...",
