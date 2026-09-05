@@ -282,6 +282,101 @@ public sealed class OtaPublisherTrustTests
         }
     }
 
+    [Fact]
+    public async Task PublisherPolicyRequiresIssuerEqualityAndAValidSelfSignature()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "bbt-ota-self-signature-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var validCertificate = CreateRsaCertificate(3072);
+            using var issuerMismatchCertificate = CreateIssuerSignedPublisherCertificate();
+            var forgedCertificate = validCertificate.RawData.ToArray();
+            forgedCertificate[^1] ^= 0x01;
+
+            var validPath = Path.Combine(directory, "valid.cer");
+            var issuerMismatchPath = Path.Combine(directory, "issuer-mismatch.cer");
+            var forgedPath = Path.Combine(directory, "forged-signature.cer");
+            File.WriteAllBytes(validPath, validCertificate.RawData);
+            File.WriteAllBytes(issuerMismatchPath, issuerMismatchCertificate.RawData);
+            File.WriteAllBytes(forgedPath, forgedCertificate);
+
+            var command = string.Join(
+                Environment.NewLine,
+                $". '{EscapePowerShellLiteral(GetEnrollmentScriptPath())}'",
+                "function Assert-PolicyResult([string]$Path, [bool]$Expected) {",
+                "  $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([System.IO.File]::ReadAllBytes($Path))",
+                "  try { $actual = Test-PublisherCertificate -Certificate $certificate -ExpectedSpkiSha256 $null -RequirePrivateKey $false } finally { $certificate.Dispose() }",
+                "  if ($actual -ne $Expected) { throw \"Unexpected publisher policy result for ${Path}: $actual\" }",
+                "}",
+                $"Assert-PolicyResult '{EscapePowerShellLiteral(validPath)}' $true",
+                $"Assert-PolicyResult '{EscapePowerShellLiteral(issuerMismatchPath)}' $false",
+                $"Assert-PolicyResult '{EscapePowerShellLiteral(forgedPath)}' $false");
+
+            var result = await ProcessRunner.RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
+
+            Assert.True(result.ExitCode == 0, result.Output);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SelectionDecisionIsPureFailClosedAndIdempotent()
+    {
+        var command = string.Join(
+            Environment.NewLine,
+            $". '{EscapePowerShellLiteral(GetEnrollmentScriptPath())}'",
+            "$validator = { param($certificate, $expectedSpki) if (-not $certificate.Valid) { return $false }; if ($expectedSpki) { return $certificate.Spki -ceq $expectedSpki }; return $true }",
+            "$candidate = [pscustomobject]@{ Id = 'publisher'; Valid = $true; Spki = 'pin-a' }",
+            "$first = Resolve-PublisherCertificateSelection -SubjectPrivateCertificates @($candidate) -RepositorySpkiSha256 'pin-a' -CertificateValidator $validator",
+            "$second = Resolve-PublisherCertificateSelection -SubjectPrivateCertificates @($candidate) -RepositorySpkiSha256 'pin-a' -CertificateValidator $validator",
+            "if ($first.Action -ne 'reused' -or $second.Action -ne 'reused') { throw 'Existing identity was not reused.' }",
+            "if (-not [object]::ReferenceEquals($first.Certificate, $candidate) -or -not [object]::ReferenceEquals($second.Certificate, $candidate)) { throw 'Selection did not return the exact candidate.' }",
+            "$create = Resolve-PublisherCertificateSelection -SubjectPrivateCertificates @() -RepositorySpkiSha256 $null -CertificateValidator $validator",
+            "if ($create.Action -ne 'create' -or $null -ne $create.Certificate) { throw 'Empty enrollment did not request creation.' }",
+            "$mismatchFailed = $false",
+            "try { [void](Resolve-PublisherCertificateSelection -SubjectPrivateCertificates @($candidate) -RepositorySpkiSha256 'pin-b' -CertificateValidator $validator) } catch { $mismatchFailed = $_.Exception.Message -match 'disagree' }",
+            "if (-not $mismatchFailed) { throw 'Repository/store SPKI mismatch did not fail closed.' }",
+            "$multipleFailed = $false",
+            "try { [void](Resolve-PublisherCertificateSelection -SubjectPrivateCertificates @($candidate, $candidate) -RepositorySpkiSha256 'pin-a' -CertificateValidator $validator) } catch { $multipleFailed = $_.Exception.Message -match 'multiple' }",
+            "if (-not $multipleFailed) { throw 'Multiple fixed-subject identities did not fail closed.' }");
+
+        var result = await ProcessRunner.RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
+    [Fact]
+    public async Task ExistingPublisherVerificationCanRunTwiceWithoutCreatingAnotherIdentity()
+    {
+        var repositoryCertificatePath = Path.Combine(
+            FindRepositoryRoot(),
+            "eng",
+            "ota",
+            "SuperPan.OtaPublisher.cer");
+        var command = string.Join(
+            Environment.NewLine,
+            $". '{EscapePowerShellLiteral(GetEnrollmentScriptPath())}'",
+            $"$repositoryCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([System.IO.File]::ReadAllBytes('{EscapePowerShellLiteral(repositoryCertificatePath)}'))",
+            "$store = [System.Security.Cryptography.X509Certificates.X509Store]::new([System.Security.Cryptography.X509Certificates.StoreName]::My, [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)",
+            "try {",
+            "  $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)",
+            "  $candidates = @($store.Certificates | Where-Object { $_.Subject -ceq 'CN=SuperPan OTA Publisher' -and $_.HasPrivateKey })",
+            "  $pin = Get-SubjectPublicKeyInfoSha256 -Certificate $repositoryCertificate",
+            "  $first = Resolve-PublisherCertificateSelection -SubjectPrivateCertificates $candidates -RepositorySpkiSha256 $pin",
+            "  $second = Resolve-PublisherCertificateSelection -SubjectPrivateCertificates $candidates -RepositorySpkiSha256 $pin",
+            "  if ($candidates.Count -ne 1 -or $first.Action -ne 'reused' -or $second.Action -ne 'reused') { throw 'Read-only reuse verification was not stable.' }",
+            "  if ($first.Certificate.Thumbprint -cne $repositoryCertificate.Thumbprint -or $second.Certificate.Thumbprint -cne $repositoryCertificate.Thumbprint) { throw 'Read-only reuse selected the wrong identity.' }",
+            "} finally { $store.Dispose(); $repositoryCertificate.Dispose() }");
+
+        var result = await ProcessRunner.RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
     private static X509Certificate2 CreateRsaCertificate(int keySize)
     {
         using var rsa = RSA.Create(keySize);
@@ -296,6 +391,37 @@ public sealed class OtaPublisherTrustTests
         var request = new CertificateRequest(FixedSubject, ecdsa, HashAlgorithmName.SHA256);
         AddPublisherExtensions(request);
         return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+    }
+
+    private static X509Certificate2 CreateIssuerSignedPublisherCertificate()
+    {
+        using var issuerKey = RSA.Create(3072);
+        var issuerRequest = new CertificateRequest(
+            "CN=Different OTA Issuer",
+            issuerKey,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+        issuerRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(
+            certificateAuthority: true,
+            hasPathLengthConstraint: false,
+            pathLengthConstraint: 0,
+            critical: true));
+        using var issuer = issuerRequest.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-2),
+            DateTimeOffset.UtcNow.AddDays(2));
+
+        using var publisherKey = RSA.Create(3072);
+        var publisherRequest = new CertificateRequest(
+            FixedSubject,
+            publisherKey,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+        AddPublisherExtensions(publisherRequest);
+        return publisherRequest.Create(
+            issuer,
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            DateTimeOffset.UtcNow.AddDays(1),
+            RandomNumberGenerator.GetBytes(16));
     }
 
     private static void AddPublisherExtensions(CertificateRequest request)
@@ -318,6 +444,9 @@ public sealed class OtaPublisherTrustTests
 
     private static string EscapePowerShellLiteral(string value) =>
         value.Replace("'", "''", StringComparison.Ordinal);
+
+    private static string GetEnrollmentScriptPath() =>
+        Path.Combine(FindRepositoryRoot(), "scripts", "create_ota_publisher_certificate.ps1");
 
     private static string FindRepositoryRoot([CallerFilePath] string sourceFilePath = "")
     {

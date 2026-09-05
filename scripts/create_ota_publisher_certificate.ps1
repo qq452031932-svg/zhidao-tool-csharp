@@ -120,6 +120,45 @@ function Test-PrivateKeyIsNonExportable {
     }
 }
 
+function Test-CertificateIsSelfSigned {
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    if ($Certificate.Subject -cne $Certificate.Issuer) {
+        return $false
+    }
+
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.RevocationMode =
+            [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.VerificationFlags =
+            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+        $chain.ChainPolicy.TrustMode =
+            [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+        $chain.ChainPolicy.DisableCertificateDownloads = $true
+        $chain.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::Zero
+        $chain.ChainPolicy.CustomTrustStore.Clear()
+        [void]$chain.ChainPolicy.CustomTrustStore.Add($Certificate)
+
+        if (-not $chain.Build($Certificate) -or $chain.ChainElements.Count -ne 1) {
+            return $false
+        }
+
+        return [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+            $chain.ChainElements[0].Certificate.RawData,
+            $Certificate.RawData)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
 function Test-PublisherCertificate {
     param(
         [Parameter(Mandatory)]
@@ -143,6 +182,9 @@ function Test-PublisherCertificate {
         return $false
     }
     if ($RequirePrivateKey -and -not $Certificate.HasPrivateKey) {
+        return $false
+    }
+    if (-not (Test-CertificateIsSelfSigned -Certificate $Certificate)) {
         return $false
     }
 
@@ -190,6 +232,56 @@ function Test-PublisherCertificate {
     }
 
     return $true
+}
+
+function Resolve-PublisherCertificateSelection {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$SubjectPrivateCertificates,
+
+        [AllowNull()]
+        [string]$RepositorySpkiSha256,
+
+        [scriptblock]$CertificateValidator = {
+            param($certificate, $expectedSpkiSha256)
+            Test-PublisherCertificate `
+                -Certificate $certificate `
+                -ExpectedSpkiSha256 $expectedSpkiSha256 `
+                -RequirePrivateKey $true
+        }
+    )
+
+    $candidates = @($SubjectPrivateCertificates)
+    if ($candidates.Count -gt 1) {
+        throw 'Refusing enrollment because multiple fixed-subject private certificate candidates exist.'
+    }
+
+    $repositoryIdentityExists = -not [string]::IsNullOrEmpty($RepositorySpkiSha256)
+    if ($candidates.Count -eq 0) {
+        if ($repositoryIdentityExists) {
+            throw 'The repository public certificate has no matching private identity in CurrentUser\My.'
+        }
+
+        return [pscustomobject]@{
+            Action = 'create'
+            Certificate = $null
+        }
+    }
+
+    $candidate = $candidates[0]
+    if (-not (& $CertificateValidator $candidate $RepositorySpkiSha256)) {
+        if ($repositoryIdentityExists) {
+            throw 'The repository public certificate and CurrentUser\My publisher identity disagree.'
+        }
+
+        throw 'An existing fixed-subject private certificate violates the publisher policy.'
+    }
+
+    return [pscustomobject]@{
+        Action = 'reused'
+        Certificate = $candidate
+    }
 }
 
 function Write-BytesAtomically {
@@ -336,47 +428,22 @@ function Invoke-OtaPublisherCertificateEnrollment {
             $store.Certificates |
                 Where-Object { $_.Subject -ceq $PublisherSubject -and $_.HasPrivateKey })
 
-        if ($repositoryCertificate) {
-            if ($subjectPrivateCertificates.Count -eq 0) {
-                throw 'The repository public certificate has no matching private identity in CurrentUser\My.'
-            }
-            if ($subjectPrivateCertificates.Count -gt 1) {
-                throw 'Refusing enrollment because multiple fixed-subject private certificate candidates exist.'
-            }
-
-            $certificate = $subjectPrivateCertificates[0]
+        $selection = Resolve-PublisherCertificateSelection `
+            -SubjectPrivateCertificates $subjectPrivateCertificates `
+            -RepositorySpkiSha256 $repositorySpkiSha256
+        if ($selection.Action -eq 'create') {
+            $certificate = New-PublisherCertificate -Store $store
             if (-not (Test-PublisherCertificate `
                     -Certificate $certificate `
-                    -ExpectedSpkiSha256 $repositorySpkiSha256 `
+                    -ExpectedSpkiSha256 $null `
                     -RequirePrivateKey $true)) {
-                throw 'The repository public certificate and CurrentUser\My publisher identity disagree.'
+                throw 'The newly created publisher identity failed post-creation validation.'
             }
-            $action = 'reused'
+            $action = 'created'
         }
         else {
-            if ($subjectPrivateCertificates.Count -gt 1) {
-                throw 'Refusing enrollment because multiple fixed-subject private certificate candidates exist.'
-            }
-            if ($subjectPrivateCertificates.Count -eq 1) {
-                $certificate = $subjectPrivateCertificates[0]
-                if (-not (Test-PublisherCertificate `
-                        -Certificate $certificate `
-                        -ExpectedSpkiSha256 $null `
-                        -RequirePrivateKey $true)) {
-                    throw 'An existing fixed-subject private certificate violates the publisher policy.'
-                }
-                $action = 'reused'
-            }
-            else {
-                $certificate = New-PublisherCertificate -Store $store
-                if (-not (Test-PublisherCertificate `
-                        -Certificate $certificate `
-                        -ExpectedSpkiSha256 $null `
-                        -RequirePrivateKey $true)) {
-                    throw 'The newly created publisher identity failed post-creation validation.'
-                }
-                $action = 'created'
-            }
+            $certificate = $selection.Certificate
+            $action = $selection.Action
         }
 
         $spkiSha256 = Get-SubjectPublicKeyInfoSha256 -Certificate $certificate
