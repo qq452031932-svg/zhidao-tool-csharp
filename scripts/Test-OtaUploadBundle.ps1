@@ -191,6 +191,9 @@ function Get-VerifiedAuthenticode([string]$Path) {
             throw 'Executable CMS content is not SPC_INDIRECT_DATA_OBJID Authenticode content.'
         }
         if ($cms.SignerInfos.Count -ne 1 -or $null -eq $cms.SignerInfos[0].Certificate) { throw 'Executable Authenticode signer is ambiguous.' }
+        if ($cms.SignerInfos[0].DigestAlgorithm.Value -cne '2.16.840.1.101.3.4.2.1') {
+            throw 'Executable Authenticode SignerInfo digest algorithm must be SHA-256.'
+        }
 
         $asn = [System.Formats.Asn1.AsnReader]::new($cms.ContentInfo.Content, [System.Formats.Asn1.AsnEncodingRules]::BER)
         $root = $asn.ReadSequence()
@@ -232,6 +235,14 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     $actualSpki = Get-CertificateSpki $verified.Signer.Certificate
     if ($actualSpki -cne $ExpectedSpki) {
         throw "Executable signer SPKI does not match the enrolled publisher: $([IO.Path]::GetFileName($Path))"
+    }
+    $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+    $hasCodeSigningEku = @($verified.Signer.Certificate.Extensions | Where-Object {
+            $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+            @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $codeSigningOid }).Count -eq 1
+        }).Count -eq 1
+    if (-not $hasCodeSigningEku) {
+        throw "Executable signer certificate is missing the Code Signing EKU: $EvidencePath"
     }
     $authenticodeStatus = Get-AuthenticodeSignature -LiteralPath $Path
     $timestampUtc = Get-AuthenticodeTimestampUtc $verified.Signer
@@ -398,7 +409,8 @@ try {
         if ($parts.Count -eq 0) { return $null }
         $canonicalParts = [Collections.Generic.List[string]]::new()
         foreach ($part in $parts) {
-            if ($part -in @('', '.', '..') -or $part.Length -gt 255 -or $part.EndsWith(' ') -or $part.EndsWith('.') -or $part.Contains(':')) { return $null }
+            if ($part -in @('', '.', '..') -or $part.Length -gt 255 -or $part.EndsWith(' ') -or $part.EndsWith('.') -or
+                $part.Contains(':') -or $part.IndexOfAny([char[]]@('<','>','"','|','?','*')) -ge 0) { return $null }
             foreach ($character in $part.ToCharArray()) { if ([int]$character -lt 0x20 -or [int]$character -eq 0x7f) { return $null } }
             $normalized = $part.Normalize([Text.NormalizationForm]::FormC)
             $stem = $normalized.Split('.')[0].ToUpperInvariant()
@@ -448,12 +460,43 @@ try {
             if ($ExpectedPackageType -ceq 'Portable') {
                 foreach ($requiredPortablePath in @(
                     '.portable',
+                    'current/sq.version',
                     'current/BaiduBatchTransfer.App.dll',
                     'current/BaiduBatchTransfer.App.deps.json',
                     'current/BaiduBatchTransfer.App.runtimeconfig.json')) {
                     if (-not $innerNames.ContainsKey($requiredPortablePath) -or $innerNames[$requiredPortablePath] -cne $requiredPortablePath) {
                         throw "Portable archive is missing required Velopack content: $requiredPortablePath"
                     }
+                }
+                $portableMetadataEntry = $inner.GetEntry('current/sq.version')
+                if ($null -eq $portableMetadataEntry -or $portableMetadataEntry.Length -le 0 -or $portableMetadataEntry.Length -gt 1048576) {
+                    throw 'Portable archive has invalid Velopack metadata.'
+                }
+                $portableSettings = [Xml.XmlReaderSettings]::new()
+                $portableSettings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+                $portableSettings.XmlResolver = $null
+                $portableSettings.MaxCharactersInDocument = 1048576
+                $portableStream = $portableMetadataEntry.Open()
+                $portableReader = [Xml.XmlReader]::Create($portableStream, $portableSettings)
+                try {
+                    $portableXml = [Xml.XmlDocument]::new()
+                    $portableXml.XmlResolver = $null
+                    $portableXml.Load($portableReader)
+                }
+                catch { throw 'Portable archive Velopack metadata is invalid XML.' }
+                finally { $portableReader.Dispose(); $portableStream.Dispose() }
+                $portableNamespace = [Xml.XmlNamespaceManager]::new($portableXml.NameTable)
+                $portableNamespace.AddNamespace('n', $portableXml.DocumentElement.NamespaceURI)
+                $portableMetadata = $portableXml.SelectSingleNode('/n:package/n:metadata', $portableNamespace)
+                if ($null -eq $portableMetadata -or
+                    [string]$portableMetadata.SelectSingleNode('n:id', $portableNamespace).InnerText -cne $packageId -or
+                    [string]$portableMetadata.SelectSingleNode('n:version', $portableNamespace).InnerText -cne $ExpectedPackageVersion -or
+                    [string]$portableMetadata.SelectSingleNode('n:channel', $portableNamespace).InnerText -cne $channel -or
+                    [string]$portableMetadata.SelectSingleNode('n:mainExe', $portableNamespace).InnerText -cne 'BaiduBatchTransfer.App.exe' -or
+                    [string]$portableMetadata.SelectSingleNode('n:os', $portableNamespace).InnerText -cne 'win' -or
+                    [string]$portableMetadata.SelectSingleNode('n:rid', $portableNamespace).InnerText -cne 'win-x64' -or
+                    [string]$portableMetadata.SelectSingleNode('n:machineArchitecture', $portableNamespace).InnerText -cne 'x64') {
+                    throw 'Portable archive Velopack metadata identity, version, channel, executable, OS, RID, or architecture is invalid.'
                 }
             }
             else {

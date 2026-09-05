@@ -150,6 +150,9 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("1.3.6.1.4.1.311.2.1.15", validator, StringComparison.Ordinal);
         Assert.Contains("Velopack package nuspec", validator, StringComparison.Ordinal);
         Assert.Contains("Portable archive", validator, StringComparison.Ordinal);
+        Assert.Contains("current/sq.version", validator, StringComparison.Ordinal);
+        Assert.Contains("SignerInfo digest algorithm must be SHA-256", validator, StringComparison.Ordinal);
+        Assert.Contains("signer certificate is missing the Code Signing EKU", validator, StringComparison.Ordinal);
         Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("Every executable carried by an inner archive", validator, StringComparison.Ordinal);
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);
@@ -288,6 +291,33 @@ public sealed class OtaProductionReleaseScriptTests
         var bundle = Path.Combine(fixture, fixtureName);
         var certificate = Path.Combine(fixture, "publisher.cer");
         Assert.True(File.Exists(bundle), $"Missing executable rejection fixture: {bundle}");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedError, result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("invalid-portable-wrong-version-signed-upload.zip", "Portable archive Velopack metadata")]
+    [InlineData("invalid-portable-wrong-channel-signed-upload.zip", "Portable archive Velopack metadata")]
+    [InlineData("invalid-portable-windows-name-signed-upload.zip", "unsafe Windows path")]
+    [InlineData("invalid-sha1-inner-signed-upload.zip", "SignerInfo digest algorithm")]
+    public async Task SignedBundleRejectsPortableMetadataPathAndDigestAttacks(string fixtureName, string expectedError)
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, fixtureName);
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        Assert.True(File.Exists(bundle), $"Missing hardened portable fixture: {bundle}");
         using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
         var spki = Convert.ToHexString(
             SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
