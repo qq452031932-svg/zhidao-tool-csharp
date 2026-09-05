@@ -400,6 +400,80 @@ func (s *Store) CreateSession(ctx context.Context, session Session) error {
 	return wrapWrite("create session", err)
 }
 
+func (s *Store) Session(ctx context.Context, idHash string) (Session, error) {
+	var value Session
+	var createdAt, lastSeenAt, idleExpiresAt, absoluteExpiresAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT id_hash,state,created_at,last_seen_at,idle_expires_at,absolute_expires_at FROM sessions WHERE id_hash=?`, idHash).
+		Scan(&value.IDHash, &value.State, &createdAt, &lastSeenAt, &idleExpiresAt, &absoluteExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Session{}, ErrNotFound
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("read session: %w", err)
+	}
+	value.CreatedAt = time.Unix(createdAt, 0).UTC()
+	value.LastSeenAt = time.Unix(lastSeenAt, 0).UTC()
+	value.IdleExpiresAt = time.Unix(idleExpiresAt, 0).UTC()
+	value.AbsoluteExpiresAt = time.Unix(absoluteExpiresAt, 0).UTC()
+	return value, nil
+}
+
+func (s *Store) TouchSession(ctx context.Context, idHash string, lastSeenAt, idleExpiresAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET last_seen_at=max(last_seen_at,?),idle_expires_at=max(idle_expires_at,?) WHERE id_hash=? AND state='active'`, timestamp(lastSeenAt), timestamp(idleExpiresAt), idHash)
+	if err != nil {
+		return fmt.Errorf("touch session: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) RevokeAllActiveSessions(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET state='revoked' WHERE state='active'`)
+	return wrapWrite("revoke active sessions", err)
+}
+
+func (s *Store) ChangePasswordAndRotateSession(ctx context.Context, encodedHash, currentIDHash string, next Session) error {
+	if _, _, err := decodePasswordHash(encodedHash); err != nil {
+		return err
+	}
+	if next.State != SessionActive {
+		return errors.New("replacement session must start active")
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var currentState SessionState
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM sessions WHERE id_hash=?`, currentIDHash).Scan(&currentState); errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		} else if err != nil {
+			return err
+		}
+		if currentState != SessionActive {
+			return ErrNotFound
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE administrators SET password_hash=?,must_change_password=0 WHERE singleton_id=1`, encodedHash)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrNotFound
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET state='revoked' WHERE state='active'`); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO sessions(id_hash,state,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,?,?,?,?,?)`, next.IDHash, next.State, timestamp(next.CreatedAt), timestamp(next.LastSeenAt), timestamp(next.IdleExpiresAt), timestamp(next.AbsoluteExpiresAt))
+		return err
+	})
+}
+
 func (s *Store) TransitionSession(ctx context.Context, id string, state SessionState) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE sessions SET state=? WHERE id_hash=?`, state, id)
 	return transitionResult(result, err)

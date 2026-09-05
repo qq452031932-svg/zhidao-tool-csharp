@@ -402,6 +402,62 @@ func TestGeneratedAdminDoesNotPrintOnAlreadyInitialized(t *testing.T) {
 	}
 }
 
+func TestPasswordRotationRequiresTheCurrentSessionToRemainActive(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	oldHash, err := hashPassword("Strong!Password123", nilReaderRand{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InitializeAdmin(ctx, oldHash); err != nil {
+		t.Fatal(err)
+	}
+	createActiveSession(t, s, sessionHash1)
+	if err := s.TransitionSession(ctx, sessionHash1, SessionRevoked); err != nil {
+		t.Fatal(err)
+	}
+	newHash, err := hashPassword("Different!Password456", nilReaderRand{n: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	next := Session{IDHash: sessionHash2, State: SessionActive, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(time.Minute), AbsoluteExpiresAt: now.Add(time.Hour)}
+	if err := s.ChangePasswordAndRotateSession(ctx, newHash, sessionHash1, next); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ChangePasswordAndRotateSession() error=%v, want ErrNotFound", err)
+	}
+	admin, err := s.Admin(ctx)
+	if err != nil || admin.PasswordHash != oldHash || !admin.MustChangePassword {
+		t.Fatalf("administrator changed after revoked-session rotation: %+v, %v", admin, err)
+	}
+	if _, err := s.Session(ctx, sessionHash2); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("replacement session created after rejected rotation: %v", err)
+	}
+}
+
+func TestTouchSessionNeverMovesActivityOrIdleExpiryBackward(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second)
+	if err := s.CreateSession(ctx, Session{IDHash: sessionHash1, State: SessionActive, CreatedAt: base, LastSeenAt: base, IdleExpiresAt: base.Add(time.Minute), AbsoluteExpiresAt: base.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchSession(ctx, sessionHash1, base.Add(20*time.Minute), base.Add(50*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TouchSession(ctx, sessionHash1, base.Add(10*time.Minute), base.Add(40*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Session(ctx, sessionHash1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LastSeenAt.Equal(base.Add(20*time.Minute)) || !got.IdleExpiresAt.Equal(base.Add(50*time.Minute)) {
+		t.Fatalf("session touch regressed: %+v", got)
+	}
+}
+
 func TestHighestCommittedVersionIsCanonicalNumericAndMonotonicAtDBBoundary(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
