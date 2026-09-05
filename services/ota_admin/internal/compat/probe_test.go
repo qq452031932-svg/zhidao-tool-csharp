@@ -329,6 +329,10 @@ func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
 
 	moduleRoot := testModuleRoot(t)
 	repositoryRoot := filepath.Clean(filepath.Join(moduleRoot, "..", ".."))
+	expectedModuleRoot := filepath.Clean(filepath.Join(repositoryRoot, "services", "ota_admin"))
+	if !strings.EqualFold(moduleRoot, expectedModuleRoot) {
+		t.Skip("test is running from a flattened source snapshot")
+	}
 	if _, err := os.Stat(filepath.Join(repositoryRoot, ".git")); err != nil {
 		t.Skip("test is running from a source bundle without repository metadata")
 	}
