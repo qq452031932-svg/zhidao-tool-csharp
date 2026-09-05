@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -235,13 +237,15 @@ func TestRunnerOwnsCleanupAndUsesOnlyVerifiedBundledDeploymentFiles(t *testing.T
 		"SCRIPT_PATH", "BUNDLED_RUNNER", "BUNDLED_UNIT", "cmp -s --",
 		"LoadState=not-found", "OWNER_MARKER", "OWNER_TOKEN_FILE",
 		"ownership_marker_is_intact", "unit_installed=false", "unit_started=false",
-		"global_unit_is_absent",
+		"global_unit_is_absent", "GO_ROOT", "UNIT_REMOVAL_PATH", "cleanup_failed",
 	} {
 		if !strings.Contains(runner, required) {
 			t.Errorf("CentOS runner does not contain ownership/canonical-source contract %q", required)
 		}
 	}
 	requireSubstringsInOrder(t, runner,
+		`if [[ -e "$GO_ROOT" || -L "$GO_ROOT" ]]`,
+		`if [[ -e "$SOURCE_ROOT" || -L "$SOURCE_ROOT" ]]`,
 		`if [[ -e "$UNIT_TARGET" || -L "$UNIT_TARGET" ]]`,
 		`mkdir -- "$OWNER_MARKER"`,
 		"trap cleanup EXIT INT TERM",
@@ -257,10 +261,17 @@ func TestRunnerOwnsCleanupAndUsesOnlyVerifiedBundledDeploymentFiles(t *testing.T
 		`if [[ "$unit_installed" == true ]]`,
 		`cmp -s -- "$UNIT_TARGET" "$BUNDLED_UNIT"`,
 		`systemctl stop "$UNIT_NAME"`,
-		`rm -f -- "$UNIT_TARGET"`,
+		`systemctl is-active --quiet "$UNIT_NAME"`,
+		`mv -- "$UNIT_TARGET" "$UNIT_REMOVAL_PATH"`,
+		`systemctl daemon-reload`,
+		`rm -f -- "$UNIT_REMOVAL_PATH"`,
 		`ownership_marker_is_intact`,
 		`rm -rf -- "$VERIFY_ROOT"`,
 	)
+	cleanupText := runner[cleanupOffset : strings.Index(runner[cleanupOffset:], "trap cleanup EXIT INT TERM")+cleanupOffset]
+	if strings.Contains(cleanupText, "|| true") {
+		t.Fatal("owned cleanup still suppresses a failure")
+	}
 }
 
 func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.T) {
@@ -270,7 +281,9 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	for _, required := range []string{
 		"a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d",
 		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "local", "-buildvcs=false",
-		"git", "diff", "--quiet", "HEAD", "StagingDirectory", "Publish-StagedArtifacts",
+		"git", "diff", "--quiet", "HEAD", "ls-files", "--others",
+		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
+		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
 		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
 	} {
 		if !strings.Contains(buildScript, required) {
@@ -278,15 +291,218 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		}
 	}
 	requireSubstringsInOrder(t, buildScript,
+		`& powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript`,
 		"ExpectedArchiveSha256",
 		"go version go1.27.1 windows/amd64",
 		"GOTOOLCHAIN",
 		"mod verify",
 		"test ./...",
+		"vet ./...",
 		"build -buildvcs=false",
+		"Get-SnapshotFingerprint",
+		"New-DeterministicSourceBundle -SnapshotRoot $SnapshotDirectory",
 		"Write-Sha256CheckFile",
 		"Publish-StagedArtifacts",
 	)
+	finallyOffset := strings.LastIndex(buildScript, "finally {")
+	if finallyOffset < 0 {
+		t.Fatal("build script does not contain final cleanup")
+	}
+	if strings.Contains(buildScript[finallyOffset:], "BackupDirectory") {
+		t.Fatal("final cleanup can delete a rollback backup that was not recovered")
+	}
+}
+
+func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
+	repositoryRoot := filepath.Clean(filepath.Join(moduleRoot, "..", ".."))
+	if _, err := os.Stat(filepath.Join(repositoryRoot, ".git")); err != nil {
+		t.Skip("test is running from a source bundle without repository metadata")
+	}
+	fixtureName := ".untracked-build-rejection-test.go"
+	fixturePath := filepath.Join(moduleRoot, fixtureName)
+	if err := os.WriteFile(fixturePath, []byte("package rejectedfixture\n"), 0o600); err != nil {
+		t.Fatalf("create untracked fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(fixturePath); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove untracked fixture: %v", err)
+		}
+	})
+
+	buildScript := filepath.Join(moduleRoot, "scripts", "build_linux_amd64.ps1")
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", buildScript).CombinedOutput()
+	if runErr == nil {
+		t.Fatalf("build unexpectedly accepted untracked module file; output:\n%s", output)
+	}
+	outputText := string(output)
+	if !strings.Contains(outputText, "Untracked files exist under services/ota_admin") || !strings.Contains(outputText, fixtureName) {
+		t.Fatalf("build failed for the wrong reason; output:\n%s", outputText)
+	}
+}
+
+func TestRunnerCleanupFailsClosedAndPreservesOwnedResources(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil && runtime.GOOS == "windows" {
+		candidate := `C:\Program Files\Git\bin\bash.exe`
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			bash, err = candidate, nil
+		}
+	}
+	if err != nil {
+		t.Skip("bash is unavailable on this compatibility-test host")
+	}
+	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	cleanupStart := strings.Index(runner, "cleanup() {")
+	if cleanupStart < 0 {
+		t.Fatal("could not find runner cleanup function")
+	}
+	cleanupEndRelative := strings.Index(runner[cleanupStart:], "\n}\ntrap cleanup EXIT INT TERM")
+	if cleanupEndRelative < 0 {
+		t.Fatal("could not isolate runner cleanup function")
+	}
+	cleanupFunction := runner[cleanupStart : cleanupStart+cleanupEndRelative+2]
+
+	for _, scenario := range []string{"changed-owner", "stop-failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			workRoot := filepath.Join(t.TempDir(), "probe-root")
+			harnessPath := filepath.Join(t.TempDir(), "cleanup-harness.sh")
+			harness := `#!/usr/bin/env bash
+set -u
+VERIFY_ROOT="$1"
+scenario="$2"
+UNIT_NAME=probe.service
+UNIT_TARGET="$VERIFY_ROOT/unit"
+UNIT_REMOVAL_PATH="$VERIFY_ROOT/unit.removing"
+BUNDLED_UNIT="$VERIFY_ROOT/bundled-unit"
+OWNER_MARKER="$VERIFY_ROOT/owner"
+OWNER_TOKEN_FILE="$OWNER_MARKER/token"
+owner_token=expected-owner
+unit_installed=true
+unit_started=true
+cleanup_failed=false
+global_unit_is_absent() { return 0; }
+ownership_marker_is_intact() {
+  [[ -d "$OWNER_MARKER" && -f "$OWNER_TOKEN_FILE" && "$(<"$OWNER_TOKEN_FILE")" == "$owner_token" ]]
+}
+systemctl() {
+  printf '%s\n' "$*" >>"$VERIFY_ROOT/systemctl.log"
+  if [[ "$scenario" == stop-failure && "$1" == stop ]]; then return 1; fi
+  if [[ "$1" == is-active ]]; then return 0; fi
+  return 0
+}
+mkdir -p "$OWNER_MARKER"
+printf '%s\n' expected-owner >"$OWNER_TOKEN_FILE"
+printf '%s\n' canonical >"$BUNDLED_UNIT"
+cp "$BUNDLED_UNIT" "$UNIT_TARGET"
+if [[ "$scenario" == changed-owner ]]; then printf '%s\n' changed-owner >"$OWNER_TOKEN_FILE"; fi
+` + cleanupFunction + `
+cleanup
+`
+			if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+				t.Fatalf("write cleanup harness: %v", err)
+			}
+			output, runErr := exec.Command(bash, filepath.ToSlash(harnessPath), filepath.ToSlash(workRoot), scenario).CombinedOutput()
+			if runErr == nil {
+				t.Fatalf("cleanup succeeded for %s; output:\n%s", scenario, output)
+			}
+			if _, err := os.Stat(workRoot); err != nil {
+				t.Fatalf("cleanup did not preserve verification root for %s: %v; output:\n%s", scenario, err, output)
+			}
+			if _, err := os.Stat(filepath.Join(workRoot, "unit")); err != nil {
+				t.Fatalf("cleanup did not preserve unit for %s: %v; output:\n%s", scenario, err, output)
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsPreexistingExtractionTargets(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil && runtime.GOOS == "windows" {
+		candidate := `C:\Program Files\Git\bin\bash.exe`
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			bash, err = candidate, nil
+		}
+	}
+	if err != nil {
+		t.Skip("bash is unavailable on this compatibility-test host")
+	}
+	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	guardStart := strings.Index(runner, `if [[ -e "$GO_ROOT" || -L "$GO_ROOT" ]]`)
+	guardEnd := strings.Index(runner, "\nglobal_unit_is_absent()")
+	if guardStart < 0 || guardEnd < guardStart {
+		t.Fatal("could not isolate extraction-target guards")
+	}
+	guards := runner[guardStart:guardEnd]
+
+	for _, target := range []string{"go", "source"} {
+		t.Run(target, func(t *testing.T) {
+			workRoot := t.TempDir()
+			if err := os.Mkdir(filepath.Join(workRoot, target), 0o700); err != nil {
+				t.Fatalf("create preexisting target: %v", err)
+			}
+			harnessPath := filepath.Join(t.TempDir(), "extraction-guard.sh")
+			harness := "#!/usr/bin/env bash\nset -u\nGO_ROOT=\"$1/go\"\nSOURCE_ROOT=\"$1/source\"\n" + guards + "\n"
+			if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+				t.Fatalf("write extraction harness: %v", err)
+			}
+			output, runErr := exec.Command(bash, filepath.ToSlash(harnessPath), filepath.ToSlash(workRoot)).CombinedOutput()
+			if runErr == nil {
+				t.Fatalf("runner accepted preexisting %s extraction target; output:\n%s", target, output)
+			}
+			if !strings.Contains(string(output), "pre-existing") {
+				t.Fatalf("runner failed for the wrong reason; output:\n%s", output)
+			}
+		})
+	}
+}
+
+func TestArtifactRollbackFailurePreservesBackup(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
+	buildScript := filepath.Join(moduleRoot, "scripts", "build_linux_amd64.ps1")
+	harnessPath := filepath.Join(t.TempDir(), "rollback-harness.ps1")
+	artifactRoot := filepath.Join(t.TempDir(), "artifacts")
+	harness := `param([string] $BuildScript, [string] $TestArtifactRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+$ArtifactsRoot = [System.IO.Path]::GetFullPath($TestArtifactRoot)
+$published = Join-Path $ArtifactsRoot 'published'
+$staged = Join-Path $ArtifactsRoot 'staged'
+$backup = Join-Path $ArtifactsRoot 'backup'
+New-Item -ItemType Directory -Path $published, $staged -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $published 'old.txt') -Value old
+$script:moveCount = 0
+function Move-Item {
+  param([string] $LiteralPath, [string] $Destination)
+  $script:moveCount++
+  if ($script:moveCount -ge 2) { throw "injected move failure $script:moveCount" }
+  Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+}
+try {
+  Publish-StagedArtifacts -StagedPath $staged -PublishedPath $published -PreviousPath $backup
+  throw 'publication unexpectedly succeeded'
+}
+catch {
+  if ($_.Exception.Message -notlike '*backup preserved at*') { throw }
+  if (-not (Test-Path -LiteralPath (Join-Path $backup 'old.txt') -PathType Leaf)) { throw 'backup was not preserved' }
+}
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write rollback harness: %v", err)
+	}
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScript, artifactRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("rollback harness failed: %v; output:\n%s", runErr, output)
+	}
 }
 
 func requireSubstringsInOrder(t *testing.T, text string, required ...string) {

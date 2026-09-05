@@ -14,18 +14,21 @@ readonly BUNDLED_UNIT="$SOURCE_ROOT/deploy/probe/superpan-ota-admin-probe.servic
 readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly OWNER_MARKER="$VERIFY_ROOT/.runner-owner"
 readonly OWNER_TOKEN_FILE="$OWNER_MARKER/token"
+readonly UNIT_REMOVAL_PATH="$VERIFY_ROOT/.unit-removal"
 readonly GO_VERSION="1.27.1"
 readonly GO_ARCHIVE="$VERIFY_ROOT/go1.27.1.linux-amd64.tar.gz"
 readonly GO_ARCHIVE_PARTIAL="$VERIFY_ROOT/.go1.27.1.linux-amd64.tar.gz.partial"
 readonly GO_ARCHIVE_SHA256="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
 readonly GO_URL="https://go.dev/dl/go1.27.1.linux-amd64.tar.gz"
-readonly GO_EXE="$VERIFY_ROOT/go/bin/go"
+readonly GO_ROOT="$VERIFY_ROOT/go"
+readonly GO_EXE="$GO_ROOT/bin/go"
 readonly HEALTH_URL="http://127.0.0.1:18091/admin/health"
 readonly STATIC_STRIPPED_FILE_PATTERN='^ELF 64-bit.*x86-64.*statically linked.*, stripped(,|$)'
 
 unit_installed=false
 unit_started=false
 owner_token=""
+cleanup_failed=false
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "This isolated compatibility probe must run as root." >&2
@@ -42,6 +45,14 @@ fi
 if [[ ! -x "$BINARY" || ! -f "$BINARY_SHA_FILE" || ! -f "$SOURCE_BUNDLE" ||
       ! -f "$SOURCE_BUNDLE_SHA_FILE" ]]; then
   echo "An isolated probe binary, hash, or source bundle is missing." >&2
+  exit 1
+fi
+if [[ -e "$GO_ROOT" || -L "$GO_ROOT" ]]; then
+  echo "Refusing a pre-existing Go extraction target." >&2
+  exit 1
+fi
+if [[ -e "$SOURCE_ROOT" || -L "$SOURCE_ROOT" ]]; then
+  echo "Refusing a pre-existing source extraction target." >&2
   exit 1
 fi
 
@@ -82,38 +93,101 @@ fi
 cleanup() {
   local status=$?
   local remove_root=true
+  local unit_stopped=false
   trap - EXIT INT TERM
   if ! ownership_marker_is_intact; then
     echo "Ownership marker changed; refusing destructive cleanup." >&2
-    exit "$status"
-  fi
-
-  if [[ "$unit_installed" == true ]]; then
-    if [[ -f "$UNIT_TARGET" && ! -L "$UNIT_TARGET" && -f "$BUNDLED_UNIT" &&
-          ! -L "$BUNDLED_UNIT" ]] && cmp -s -- "$UNIT_TARGET" "$BUNDLED_UNIT"; then
-      if [[ "$unit_started" == true ]] || systemctl is-active --quiet "$UNIT_NAME"; then
-        systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
-        unit_started=false
-      fi
-      rm -f -- "$UNIT_TARGET"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-    elif [[ -e "$UNIT_TARGET" || -L "$UNIT_TARGET" ]]; then
-      echo "Global unit changed; preserving it and the verification root." >&2
-      remove_root=false
-    else
-      if [[ "$unit_started" == true ]] || systemctl is-active --quiet "$UNIT_NAME"; then
-        systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
-        unit_started=false
-      fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-  elif ! global_unit_is_absent; then
-    echo "An unowned global unit appeared; preserving it and the verification root." >&2
+    cleanup_failed=true
     remove_root=false
   fi
 
-  if [[ "$remove_root" == true ]] && ownership_marker_is_intact; then
-    rm -rf -- "$VERIFY_ROOT"
+  if [[ "$unit_installed" == true ]] && [[ "$cleanup_failed" == false ]]; then
+    if [[ -f "$UNIT_TARGET" && ! -L "$UNIT_TARGET" && -f "$BUNDLED_UNIT" &&
+          ! -L "$BUNDLED_UNIT" ]] && cmp -s -- "$UNIT_TARGET" "$BUNDLED_UNIT"; then
+      if [[ "$unit_started" == true ]] || systemctl is-active --quiet "$UNIT_NAME"; then
+        if systemctl stop "$UNIT_NAME"; then
+          if systemctl is-active --quiet "$UNIT_NAME"; then
+            echo "Owned probe unit remained active after cleanup stop." >&2
+            cleanup_failed=true
+            remove_root=false
+          else
+            unit_started=false
+            unit_stopped=true
+          fi
+        else
+          echo "Could not stop owned probe unit; preserving unit and verification root." >&2
+          cleanup_failed=true
+          remove_root=false
+        fi
+      else
+        unit_stopped=true
+      fi
+      if [[ "$unit_stopped" == true ]]; then
+        if [[ -e "$UNIT_REMOVAL_PATH" || -L "$UNIT_REMOVAL_PATH" ]]; then
+          echo "Unit removal holding path already exists; preserving unit and verification root." >&2
+          cleanup_failed=true
+          remove_root=false
+        elif mv -- "$UNIT_TARGET" "$UNIT_REMOVAL_PATH"; then
+          if systemctl daemon-reload; then
+            if ! rm -f -- "$UNIT_REMOVAL_PATH"; then
+              echo "Could not remove owned unit holding file; preserving verification root." >&2
+              cleanup_failed=true
+              remove_root=false
+            fi
+          else
+            echo "Could not reload systemd after removing owned unit; restoring and preserving it." >&2
+            if ! mv -- "$UNIT_REMOVAL_PATH" "$UNIT_TARGET"; then
+              echo "Could not restore owned unit; holding file preserved at $UNIT_REMOVAL_PATH." >&2
+            fi
+            cleanup_failed=true
+            remove_root=false
+          fi
+        else
+          echo "Could not move owned unit for safe removal; preserving it and the verification root." >&2
+          cleanup_failed=true
+          remove_root=false
+        fi
+      fi
+    elif [[ -e "$UNIT_TARGET" || -L "$UNIT_TARGET" ]]; then
+      echo "Global unit changed; preserving it and the verification root." >&2
+      cleanup_failed=true
+      remove_root=false
+    else
+      if [[ "$unit_started" == true ]] || systemctl is-active --quiet "$UNIT_NAME"; then
+        if ! systemctl stop "$UNIT_NAME"; then
+          echo "Could not stop owned loaded unit; preserving verification root." >&2
+          cleanup_failed=true
+          remove_root=false
+        elif systemctl is-active --quiet "$UNIT_NAME"; then
+          echo "Owned loaded unit remained active after cleanup stop." >&2
+          cleanup_failed=true
+          remove_root=false
+        else
+          unit_started=false
+        fi
+      fi
+      if [[ "$cleanup_failed" == false ]] && ! systemctl daemon-reload; then
+        echo "Could not reload systemd during owned cleanup; preserving verification root." >&2
+        cleanup_failed=true
+        remove_root=false
+      fi
+    fi
+  elif [[ "$cleanup_failed" == false ]] && ! global_unit_is_absent; then
+    echo "An unowned global unit appeared; preserving it and the verification root." >&2
+    cleanup_failed=true
+    remove_root=false
+  fi
+
+  if [[ "$remove_root" == true ]]; then
+    if ownership_marker_is_intact; then
+      rm -rf -- "$VERIFY_ROOT"
+    else
+      echo "Ownership marker changed during cleanup; preserving verification root." >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ "$cleanup_failed" == true && "$status" -eq 0 ]]; then
+    status=1
   fi
   exit "$status"
 }
@@ -154,10 +228,11 @@ else
   fi
   mv -- "$GO_ARCHIVE_PARTIAL" "$GO_ARCHIVE"
 fi
-tar -C "$VERIFY_ROOT" -xzf "$GO_ARCHIVE"
+mkdir -- "$GO_ROOT"
+tar -C "$GO_ROOT" --strip-components=1 -xzf "$GO_ARCHIVE"
 [[ "$($GO_EXE version)" == "go version go$GO_VERSION linux/amd64" ]]
 
-mkdir -p -- "$SOURCE_ROOT"
+mkdir -- "$SOURCE_ROOT"
 unzip -q "$SOURCE_BUNDLE" -d "$SOURCE_ROOT"
 if [[ ! -f "$BUNDLED_RUNNER" || -L "$BUNDLED_RUNNER" ||
       ! -f "$BUNDLED_UNIT" || -L "$BUNDLED_UNIT" ]]; then

@@ -1,20 +1,21 @@
 [CmdletBinding()]
-param()
+param([switch] $FunctionsOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $GoVersion = '1.27.1'
-$ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
-$ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
 $RepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $ModuleRoot = Join-Path $RepositoryRoot 'services\ota_admin'
+$BootstrapScript = Join-Path $ModuleRoot 'scripts\bootstrap_go_toolchain.ps1'
 $GoArchive = Join-Path $RepositoryRoot ".tools\downloads\go$GoVersion.windows-amd64.zip"
 $GoExe = Join-Path $RepositoryRoot ".tools\go-$GoVersion\go\bin\go.exe"
 $ArtifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.artifacts'))
 $OutputDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot 'ota-admin'))
 $invocationId = [guid]::NewGuid().ToString('N')
 $StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-staging-$invocationId"))
+$SnapshotDirectory = Join-Path $StagingDirectory 'snapshot'
+$StagedPublishDirectory = Join-Path $StagingDirectory 'publish'
 $BackupDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-backup-$invocationId"))
 $FixedZipTimestamp = [System.DateTimeOffset]::Parse('1980-01-01T00:00:00Z')
 
@@ -38,26 +39,25 @@ function Remove-SafeArtifactDirectory {
 }
 
 function Assert-PinnedGoToolchain {
-    if (-not (Test-Path -LiteralPath $GoArchive -PathType Leaf)) {
-        throw "Pinned Go archive is missing. Run $PSScriptRoot\bootstrap_go_toolchain.ps1 first."
-    }
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSha256,
+        [Parameter(Mandatory)][string] $ExpectedIdentity
+    )
+
+    if (-not (Test-Path -LiteralPath $GoArchive -PathType Leaf)) { throw 'Pinned Go archive is missing after bootstrap.' }
     $archiveSha256 = (Get-FileHash -LiteralPath $GoArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($archiveSha256 -ne $ExpectedArchiveSha256) {
-        throw "Pinned Go archive SHA-256 mismatch. Run $PSScriptRoot\bootstrap_go_toolchain.ps1 again."
-    }
-    if (-not (Test-Path -LiteralPath $GoExe -PathType Leaf)) {
-        throw "Pinned Go executable is missing. Run $PSScriptRoot\bootstrap_go_toolchain.ps1 first."
-    }
+    if ($archiveSha256 -cne $ExpectedSha256) { throw 'Pinned Go archive SHA-256 mismatch after bootstrap.' }
+    if (-not (Test-Path -LiteralPath $GoExe -PathType Leaf)) { throw 'Pinned Go executable is missing after bootstrap.' }
     $goIdentity = (& $GoExe version) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $goIdentity -cne $ExpectedGoIdentity) {
-        throw "Go executable identity mismatch; expected go version go1.27.1 windows/amd64."
+    if ($LASTEXITCODE -ne 0 -or $goIdentity -cne $ExpectedIdentity) {
+        throw "Go executable identity mismatch; expected $ExpectedIdentity."
     }
 }
 
 function Get-TrackedSourcePaths {
     $modulePrefix = 'services/ota_admin/'
     [string[]] $trackedPaths = @(& git -C $RepositoryRoot ls-files -- services/ota_admin)
-    if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed while selecting source bundle inputs.' }
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed while selecting source inputs.' }
 
     [string[]] $sourcePaths = @($trackedPaths | Where-Object {
         if (-not $_.StartsWith($modulePrefix, [System.StringComparison]::Ordinal)) { return $false }
@@ -82,16 +82,57 @@ function Get-TrackedSourcePaths {
     return $sourcePaths
 }
 
+function Assert-NoUntrackedModuleFiles {
+    [string[]] $untrackedPaths = @(& git -C $RepositoryRoot ls-files --others -- services/ota_admin)
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-files --others failed while checking the OTA admin module.' }
+    if ($untrackedPaths.Count -ne 0) {
+        throw "Untracked files exist under services/ota_admin; refusing to build:`n$($untrackedPaths -join "`n")"
+    }
+}
+
 function Assert-SourcePathsClean {
     param([Parameter(Mandatory)][string[]] $SourcePaths)
 
     & git -C $RepositoryRoot diff --quiet HEAD -- @SourcePaths
-    if ($LASTEXITCODE -eq 1) {
-        throw 'Selected OTA admin source inputs are dirty relative to HEAD; commit them before building artifacts.'
+    if ($LASTEXITCODE -eq 1) { throw 'Selected OTA admin source inputs are dirty relative to HEAD; commit them before building artifacts.' }
+    if ($LASTEXITCODE -ne 0) { throw 'git diff failed while verifying source inputs.' }
+}
+
+function Copy-CleanSourceSnapshot {
+    param(
+        [Parameter(Mandatory)][string[]] $SourcePaths,
+        [Parameter(Mandatory)][string] $DestinationRoot
+    )
+
+    $modulePrefix = 'services/ota_admin/'
+    New-Item -ItemType Directory -Path $DestinationRoot | Out-Null
+    foreach ($repositoryRelativePath in $SourcePaths) {
+        $sourcePath = Join-Path $RepositoryRoot $repositoryRelativePath
+        $sourceItem = Get-Item -LiteralPath $sourcePath -Force
+        if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $sourceItem.PSIsContainer) {
+            throw "Source input is not a regular file: $repositoryRelativePath"
+        }
+        $moduleRelativePath = $repositoryRelativePath.Substring($modulePrefix.Length)
+        $destinationPath = Join-Path $DestinationRoot $moduleRelativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
+        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
     }
-    if ($LASTEXITCODE -ne 0) {
-        throw 'git diff failed while verifying source bundle inputs.'
-    }
+}
+
+function Get-SnapshotFingerprint {
+    param([Parameter(Mandatory)][string] $SnapshotRoot)
+
+    [string[]] $lines = @(Get-ChildItem -LiteralPath $SnapshotRoot -File -Recurse | ForEach-Object {
+        if (($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Snapshot contains a reparse point: $($_.FullName)" }
+        $relativePath = $_.FullName.Substring($SnapshotRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+        $fileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$fileHash  $relativePath"
+    })
+    [System.Array]::Sort($lines, [System.StringComparer]::Ordinal)
+    $manifest = [System.Text.UTF8Encoding]::new($false).GetBytes(($lines -join "`n") + "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([System.BitConverter]::ToString($sha256.ComputeHash($manifest))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha256.Dispose() }
 }
 
 function Write-Sha256CheckFile {
@@ -101,52 +142,42 @@ function Write-Sha256CheckFile {
     )
 
     $hash = (Get-FileHash -LiteralPath $PayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $line = "$hash  $([System.IO.Path]::GetFileName($PayloadPath))`n"
-    [System.IO.File]::WriteAllText($CheckFilePath, $line, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($CheckFilePath, "$hash  $([System.IO.Path]::GetFileName($PayloadPath))`n", [System.Text.UTF8Encoding]::new($false))
     return $hash
 }
 
 function New-DeterministicSourceBundle {
     param(
         [Parameter(Mandatory)][string] $DestinationPath,
-        [Parameter(Mandatory)][string[]] $SourcePaths
+        [Parameter(Mandatory)][string] $SnapshotRoot
     )
 
-    $modulePrefix = 'services/ota_admin/'
     Add-Type -AssemblyName System.IO.Compression
-    $outputStream = [System.IO.File]::Open(
-        $DestinationPath,
-        [System.IO.FileMode]::CreateNew,
-        [System.IO.FileAccess]::Write,
-        [System.IO.FileShare]::None)
+    [System.IO.FileInfo[]] $sourceFiles = @(Get-ChildItem -LiteralPath $SnapshotRoot -File -Recurse)
+    [System.Array]::Sort($sourceFiles, [System.Comparison[System.IO.FileInfo]]{
+        param($left, $right)
+        $leftRelative = $left.FullName.Substring($SnapshotRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+        $rightRelative = $right.FullName.Substring($SnapshotRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+        return [System.StringComparer]::Ordinal.Compare($leftRelative, $rightRelative)
+    })
+    $outputStream = [System.IO.File]::Open($DestinationPath, [System.IO.FileMode]::CreateNew)
     try {
-        $archive = [System.IO.Compression.ZipArchive]::new(
-            $outputStream,
-            [System.IO.Compression.ZipArchiveMode]::Create,
-            $false)
+        $archive = [System.IO.Compression.ZipArchive]::new($outputStream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
         try {
-            foreach ($repositoryRelativePath in $SourcePaths) {
-                $moduleRelativePath = $repositoryRelativePath.Substring($modulePrefix.Length)
-                $entry = $archive.CreateEntry($moduleRelativePath, [System.IO.Compression.CompressionLevel]::Optimal)
+            foreach ($sourceFile in $sourceFiles) {
+                if (($sourceFile.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Snapshot contains a reparse point: $($sourceFile.FullName)" }
+                $relativePath = $sourceFile.FullName.Substring($SnapshotRoot.TrimEnd('\').Length + 1).Replace('\', '/')
+                $entry = $archive.CreateEntry($relativePath, [System.IO.Compression.CompressionLevel]::Optimal)
                 $entry.LastWriteTime = $FixedZipTimestamp
                 $entryStream = $entry.Open()
-                $sourceStream = [System.IO.File]::OpenRead((Join-Path $RepositoryRoot $repositoryRelativePath))
-                try {
-                    $sourceStream.CopyTo($entryStream)
-                }
-                finally {
-                    $sourceStream.Dispose()
-                    $entryStream.Dispose()
-                }
+                $sourceStream = [System.IO.File]::OpenRead($sourceFile.FullName)
+                try { $sourceStream.CopyTo($entryStream) }
+                finally { $sourceStream.Dispose(); $entryStream.Dispose() }
             }
         }
-        finally {
-            $archive.Dispose()
-        }
+        finally { $archive.Dispose() }
     }
-    finally {
-        $outputStream.Dispose()
-    }
+    finally { $outputStream.Dispose() }
 }
 
 function Publish-StagedArtifacts {
@@ -159,92 +190,98 @@ function Publish-StagedArtifacts {
     Assert-SafeArtifactDirectory -Path $StagedPath
     Assert-SafeArtifactDirectory -Path $PublishedPath
     Assert-SafeArtifactDirectory -Path $PreviousPath
-    if (Test-Path -LiteralPath $PreviousPath) {
-        throw 'Artifact backup path unexpectedly exists.'
-    }
+    if (Test-Path -LiteralPath $PreviousPath) { throw 'Artifact backup path unexpectedly exists.' }
 
     $movedPrevious = $false
     if (Test-Path -LiteralPath $PublishedPath) {
         $publishedItem = Get-Item -LiteralPath $PublishedPath -Force
-        if (($publishedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $publishedItem.PSIsContainer) {
-            throw 'Published artifact path is not a regular directory.'
-        }
+        if (($publishedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $publishedItem.PSIsContainer) { throw 'Published artifact path is not a regular directory.' }
         Move-Item -LiteralPath $PublishedPath -Destination $PreviousPath
         $movedPrevious = $true
     }
 
-    try {
-        Move-Item -LiteralPath $StagedPath -Destination $PublishedPath
-    }
+    try { Move-Item -LiteralPath $StagedPath -Destination $PublishedPath }
     catch {
-        if ($movedPrevious -and -not (Test-Path -LiteralPath $PublishedPath)) {
-            Move-Item -LiteralPath $PreviousPath -Destination $PublishedPath
+        $publishError = $_
+        if ($movedPrevious) {
+            if (Test-Path -LiteralPath $PublishedPath) {
+                throw "Artifact publication failed and rollback was blocked; backup preserved at $PreviousPath. Publish error: $publishError"
+            }
+            try { Move-Item -LiteralPath $PreviousPath -Destination $PublishedPath }
+            catch { throw "Artifact publication and rollback failed; backup preserved at $PreviousPath. Publish error: $publishError Rollback error: $_" }
         }
-        throw
+        throw $publishError
     }
 
     if ($movedPrevious) {
-        Remove-SafeArtifactDirectory -Path $PreviousPath
+        try { Remove-SafeArtifactDirectory -Path $PreviousPath }
+        catch { throw "New artifacts were published, but the old artifact backup could not be removed; backup preserved at $PreviousPath. Error: $_" }
     }
+}
+
+if ($FunctionsOnly) {
+    return
 }
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
 Assert-SafeArtifactDirectory -Path $OutputDirectory
 Assert-SafeArtifactDirectory -Path $StagingDirectory
 Assert-SafeArtifactDirectory -Path $BackupDirectory
+Assert-NoUntrackedModuleFiles
 $sourcePaths = @(Get-TrackedSourcePaths)
 Assert-SourcePathsClean -SourcePaths $sourcePaths
-$env:GOTOOLCHAIN = 'local'
-
-Assert-PinnedGoToolchain
-& $GoExe -C $ModuleRoot mod verify
-if ($LASTEXITCODE -ne 0) { throw 'go mod verify failed.' }
-
-Assert-PinnedGoToolchain
-& $GoExe -C $ModuleRoot test ./...
-if ($LASTEXITCODE -ne 0) { throw 'go test failed.' }
 
 New-Item -ItemType Directory -Path $StagingDirectory | Out-Null
-$stagedOutputPath = Join-Path $StagingDirectory 'superpan-ota-admin-linux-amd64'
-$stagedOutputHashPath = Join-Path $StagingDirectory 'superpan-ota-admin-linux-amd64.sha256'
-$stagedSourceBundlePath = Join-Path $StagingDirectory 'superpan-ota-admin-source.zip'
-$stagedSourceBundleHashPath = Join-Path $StagingDirectory 'superpan-ota-admin-source.zip.sha256'
+Copy-CleanSourceSnapshot -SourcePaths $sourcePaths -DestinationRoot $SnapshotDirectory
+$snapshotFingerprint = Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory
+New-Item -ItemType Directory -Path $StagedPublishDirectory | Out-Null
+$stagedOutputPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64'
+$stagedOutputHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-linux-amd64.sha256'
+$stagedSourceBundlePath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip'
+$stagedSourceBundleHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip.sha256'
 
 try {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript
+    if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
+    $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
+    $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
+    $env:GOTOOLCHAIN = 'local'
     $env:CGO_ENABLED = '0'
+
+    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    & $GoExe -C $SnapshotDirectory mod verify
+    if ($LASTEXITCODE -ne 0) { throw 'go mod verify failed.' }
+
+    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    & $GoExe -C $SnapshotDirectory test ./...
+    if ($LASTEXITCODE -ne 0) { throw 'go test failed.' }
+
+    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    & $GoExe -C $SnapshotDirectory vet ./...
+    if ($LASTEXITCODE -ne 0) { throw 'go vet failed.' }
+
     $env:GOOS = 'linux'
     $env:GOARCH = 'amd64'
-    Assert-PinnedGoToolchain
-    & $GoExe -C $ModuleRoot build -buildvcs=false -trimpath -ldflags '-s -w' -o $stagedOutputPath ./cmd/ota-admin
+    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    & $GoExe -C $SnapshotDirectory build -buildvcs=false -trimpath -ldflags '-s -w' -o $stagedOutputPath ./cmd/ota-admin
     if ($LASTEXITCODE -ne 0) { throw 'static linux/amd64 build failed.' }
-    if (-not (Test-Path -LiteralPath $stagedOutputPath -PathType Leaf)) {
-        throw "Build did not create $stagedOutputPath"
-    }
+    if (-not (Test-Path -LiteralPath $stagedOutputPath -PathType Leaf)) { throw "Build did not create $stagedOutputPath" }
 
-    Assert-SourcePathsClean -SourcePaths $sourcePaths
-    New-DeterministicSourceBundle -DestinationPath $stagedSourceBundlePath -SourcePaths $sourcePaths
+    if ((Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory) -cne $snapshotFingerprint) { throw 'The immutable source snapshot changed during verification or build.' }
+    New-DeterministicSourceBundle -SnapshotRoot $SnapshotDirectory -DestinationPath $stagedSourceBundlePath
     $hash = Write-Sha256CheckFile -PayloadPath $stagedOutputPath -CheckFilePath $stagedOutputHashPath
     $sourceHash = Write-Sha256CheckFile -PayloadPath $stagedSourceBundlePath -CheckFilePath $stagedSourceBundleHashPath
-    [string[]] $stagedNames = @(Get-ChildItem -LiteralPath $StagingDirectory -File | ForEach-Object Name)
-    [System.Array]::Sort($stagedNames, [System.StringComparer]::Ordinal)
-    [string[]] $expectedNames = @(
-        'superpan-ota-admin-linux-amd64',
-        'superpan-ota-admin-linux-amd64.sha256',
-        'superpan-ota-admin-source.zip',
-        'superpan-ota-admin-source.zip.sha256'
-    )
-    if ([string]::Join("`n", $stagedNames) -cne [string]::Join("`n", $expectedNames)) {
-        throw 'Staged artifact set is incomplete or contains unexpected files.'
-    }
 
-    Publish-StagedArtifacts -StagedPath $StagingDirectory -PublishedPath $OutputDirectory -PreviousPath $BackupDirectory
+    [string[]] $stagedNames = @(Get-ChildItem -LiteralPath $StagedPublishDirectory -File | ForEach-Object Name)
+    [System.Array]::Sort($stagedNames, [System.StringComparer]::Ordinal)
+    [string[]] $expectedNames = @('superpan-ota-admin-linux-amd64', 'superpan-ota-admin-linux-amd64.sha256', 'superpan-ota-admin-source.zip', 'superpan-ota-admin-source.zip.sha256')
+    if ([string]::Join("`n", $stagedNames) -cne [string]::Join("`n", $expectedNames)) { throw 'Staged artifact set is incomplete or contains unexpected files.' }
+
+    Publish-StagedArtifacts -StagedPath $StagedPublishDirectory -PublishedPath $OutputDirectory -PreviousPath $BackupDirectory
 }
 finally {
     if (Test-Path -LiteralPath $StagingDirectory) {
         Remove-SafeArtifactDirectory -Path $StagingDirectory
-    }
-    if (Test-Path -LiteralPath $BackupDirectory) {
-        Remove-SafeArtifactDirectory -Path $BackupDirectory
     }
 }
 
