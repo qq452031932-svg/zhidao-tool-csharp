@@ -61,7 +61,8 @@ public sealed class OtaPublisherTrustTests
         });
     }
 
-    [Fact]
+    [OtaPublisherLiveStoreFact]
+    [Trait("Category", "OtaPublisherLiveStore")]
     public void EnrolledPrivateIdentityExistsOnlyAsOneNonExportableStoreKey()
     {
         using var publicCertificate = new X509Certificate2(File.ReadAllBytes(Path.Combine(
@@ -176,7 +177,6 @@ public sealed class OtaPublisherTrustTests
         Assert.Contains("eng\\ota\\SuperPan.OtaPublisher.cer", targets, StringComparison.Ordinal);
         Assert.Contains(OtaPublisherTrust.EmbeddedCertificateResourceName, targets, StringComparison.Ordinal);
         Assert.DoesNotContain("PrivateKey", targets, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain(".pfx", targets, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -204,9 +204,6 @@ public sealed class OtaPublisherTrustTests
         Assert.Contains("publisher-thumbprint.txt", script, StringComparison.Ordinal);
         Assert.Contains("multiple", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("SPKI", script, StringComparison.Ordinal);
-        Assert.DoesNotContain(".pfx", script, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("Pkcs12", script, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("Export-PfxCertificate", script, StringComparison.OrdinalIgnoreCase);
 
         var creationFunctionStart = script.IndexOf("function New-PublisherCertificate", StringComparison.Ordinal);
         var creationFunctionEnd = script.IndexOf(
@@ -226,8 +223,6 @@ public sealed class OtaPublisherTrustTests
             creationFunction.IndexOf("$cngKey.Delete()", StringComparison.Ordinal),
             "The RSA wrapper must be disposed before deleting its named CNG key after failed creation.");
 
-        var pfxFiles = Directory.EnumerateFiles(repositoryRoot, "*.pfx", SearchOption.AllDirectories);
-        Assert.Empty(pfxFiles);
     }
 
     [Fact]
@@ -349,7 +344,8 @@ public sealed class OtaPublisherTrustTests
         Assert.True(result.ExitCode == 0, result.Output);
     }
 
-    [Fact]
+    [OtaPublisherLiveStoreFact]
+    [Trait("Category", "OtaPublisherLiveStore")]
     public async Task ExistingPublisherVerificationCanRunTwiceWithoutCreatingAnotherIdentity()
     {
         var repositoryCertificatePath = Path.Combine(

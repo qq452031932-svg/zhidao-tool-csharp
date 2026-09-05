@@ -14,4 +14,13 @@ The private key is non-exportable and remains in the publisher account's `Curren
 
 Run `pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/create_ota_publisher_certificate.ps1` from the repository root to enroll or validate/reuse the exact identity. Windows PowerShell 5.1 entry automatically delegates to `pwsh`; enrollment requires PowerShell 7 or later.
 
+The default automated test suite is hermetic and never requires or changes the live certificate store. To run the read-only publisher-store acceptance checks explicitly, use:
+
+```powershell
+$env:BAIDU_BATCH_OTA_PUBLISHER_LIVE_STORE = 'approved'
+dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter Category=OtaPublisherLiveStore --no-restore
+```
+
+Enrollment is serialized per Windows user with a named mutex before the script reads the repository certificate or opens the certificate store. A timeout or abandoned mutex stops enrollment without continuing into identity selection or output writes.
+
 The certificate uses a 15-year controlled-distribution lifetime. Renewal must happen before expiry and requires a coordinated client/server release that updates the embedded public certificate and compile-time SPKI pin before releases are signed with the replacement identity. A self-signed certificate does not establish public-CA trust or Microsoft SmartScreen reputation, so users may still see Windows download or reputation prompts.

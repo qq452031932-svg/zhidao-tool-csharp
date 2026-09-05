@@ -88,6 +88,15 @@ function Get-SubjectPublicKeyInfoSha256 {
     }
 }
 
+function Test-CngExportPolicyIsStrictlyNonExportable {
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.CngExportPolicies]$ExportPolicy
+    )
+
+    return $ExportPolicy -eq [System.Security.Cryptography.CngExportPolicies]::None
+}
+
 function Test-PrivateKeyIsNonExportable {
     param(
         [Parameter(Mandatory)]
@@ -102,11 +111,7 @@ function Test-PrivateKeyIsNonExportable {
 
     try {
         if ($privateRsa -is [System.Security.Cryptography.RSACng]) {
-            $exportPolicy = $privateRsa.Key.ExportPolicy
-            $exportableFlags =
-                [System.Security.Cryptography.CngExportPolicies]::AllowExport -bor
-                [System.Security.Cryptography.CngExportPolicies]::AllowPlaintextExport
-            return (($exportPolicy -band $exportableFlags) -eq 0)
+            return Test-CngExportPolicyIsStrictlyNonExportable $privateRsa.Key.ExportPolicy
         }
 
         if ($privateRsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
@@ -284,6 +289,180 @@ function Resolve-PublisherCertificateSelection {
     }
 }
 
+function Invoke-PublisherEnrollmentWorkflow {
+    param(
+        [AllowNull()]
+        [object]$RepositoryCertificate,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$GetSubjectPrivateCertificates,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$CreatePublisherCertificate,
+
+        [scriptblock]$ValidatePublicCertificate = {
+            param($certificate)
+            Test-PublisherCertificate `
+                -Certificate $certificate `
+                -ExpectedSpkiSha256 $null `
+                -RequirePrivateKey $false
+        },
+
+        [scriptblock]$ValidatePrivateCertificate = {
+            param($certificate, $expectedSpkiSha256)
+            Test-PublisherCertificate `
+                -Certificate $certificate `
+                -ExpectedSpkiSha256 $expectedSpkiSha256 `
+                -RequirePrivateKey $true
+        },
+
+        [scriptblock]$GetSpkiSha256 = {
+            param($certificate)
+            Get-SubjectPublicKeyInfoSha256 -Certificate $certificate
+        },
+
+        [scriptblock]$ExportPublicCertificate = {
+            param($certificate)
+            return ,([byte[]]$certificate.Export(
+                [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+        },
+
+        [scriptblock]$GetThumbprint = {
+            param($certificate)
+            return $certificate.Thumbprint.ToUpperInvariant()
+        },
+
+        [Parameter(Mandatory)]
+        [scriptblock]$WritePublicCertificate,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$WriteThumbprint
+    )
+
+    $repositorySpkiSha256 = $null
+    if ($null -ne $RepositoryCertificate) {
+        if (-not (& $ValidatePublicCertificate $RepositoryCertificate)) {
+            throw 'The repository OTA publisher certificate is malformed or violates the fixed publisher policy.'
+        }
+        $repositorySpkiSha256 = [string](& $GetSpkiSha256 $RepositoryCertificate)
+    }
+
+    $subjectPrivateCertificates = @(& $GetSubjectPrivateCertificates)
+    $selection = Resolve-PublisherCertificateSelection `
+        -SubjectPrivateCertificates $subjectPrivateCertificates `
+        -RepositorySpkiSha256 $repositorySpkiSha256 `
+        -CertificateValidator $ValidatePrivateCertificate
+    if ($selection.Action -eq 'create') {
+        $certificate = & $CreatePublisherCertificate
+        if (-not (& $ValidatePrivateCertificate $certificate $null)) {
+            throw 'The newly created publisher identity failed post-creation validation.'
+        }
+        $action = 'created'
+    }
+    else {
+        $certificate = $selection.Certificate
+        $action = $selection.Action
+    }
+
+    $spkiSha256 = [string](& $GetSpkiSha256 $certificate)
+    if ($repositorySpkiSha256 -and $spkiSha256 -cne $repositorySpkiSha256) {
+        throw 'The repository public certificate and CurrentUser\My publisher SPKI disagree.'
+    }
+
+    [byte[]]$publicDer = & $ExportPublicCertificate $certificate
+    $thumbprint = [string](& $GetThumbprint $certificate)
+    $null = & $WritePublicCertificate -Bytes $publicDer
+    $null = & $WriteThumbprint -Thumbprint $thumbprint
+
+    return [pscustomobject]@{
+        Action = $action
+        Certificate = $certificate
+        SpkiSha256 = $spkiSha256
+        PublicCertificate = $publicDer
+        Thumbprint = $thumbprint
+    }
+}
+
+function Get-PublisherEnrollmentMutexName {
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ([string]::IsNullOrWhiteSpace($currentSid)) {
+        throw 'Unable to determine the current Windows user SID for OTA publisher enrollment serialization.'
+    }
+
+    return "Local\SuperPan.OtaPublisher.Enrollment.$currentSid"
+}
+
+function Invoke-WithPublisherEnrollmentMutex {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Action,
+
+        [string]$MutexName = (Get-PublisherEnrollmentMutexName),
+
+        [TimeSpan]$Timeout = [TimeSpan]::FromSeconds(30),
+
+        [scriptblock]$MutexFactory = {
+            param($name)
+            return [System.Threading.Mutex]::new($false, $name)
+        }
+    )
+
+    $mutex = $null
+    $acquired = $false
+    try {
+        $mutex = & $MutexFactory $MutexName
+        if ($null -eq $mutex) {
+            throw 'The OTA publisher enrollment mutex factory returned no mutex.'
+        }
+
+        try {
+            $acquired = $mutex.WaitOne($Timeout)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # .NET grants ownership when WaitOne reports abandonment. Release it,
+            # but fail closed so the next run revalidates every persisted artifact.
+            $acquired = $true
+            throw [System.InvalidOperationException]::new(
+                'The OTA publisher enrollment mutex was abandoned; enrollment was stopped before state inspection.',
+                $_.Exception)
+        }
+        catch {
+            # Injectable mutex doubles surface method exceptions through a wrapper.
+            # Preserve the same abandoned-mutex ownership semantics in that case.
+            $cause = $_.Exception
+            while ($cause -and $cause -isnot [System.Threading.AbandonedMutexException]) {
+                $cause = $cause.InnerException
+            }
+            if ($cause -is [System.Threading.AbandonedMutexException]) {
+                $acquired = $true
+                throw [System.InvalidOperationException]::new(
+                    'The OTA publisher enrollment mutex was abandoned; enrollment was stopped before state inspection.',
+                    $_.Exception)
+            }
+            throw
+        }
+
+        if (-not $acquired) {
+            throw [System.TimeoutException]::new(
+                "Timed out waiting for the OTA publisher enrollment mutex '$MutexName'.")
+        }
+
+        return & $Action
+    }
+    finally {
+        if ($null -ne $mutex) {
+            try {
+                if ($acquired) {
+                    $mutex.ReleaseMutex()
+                }
+            }
+            finally {
+                $mutex.Dispose()
+            }
+        }
+    }
+}
+
 function Write-BytesAtomically {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -400,23 +579,15 @@ function New-PublisherCertificate {
     }
 }
 
-function Invoke-OtaPublisherCertificateEnrollment {
+function Invoke-OtaPublisherCertificateEnrollmentCore {
     $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $publicCertificatePath = Join-Path $repositoryRoot 'eng\ota\SuperPan.OtaPublisher.cer'
     $thumbprintPath = Join-Path $repositoryRoot '.artifacts\ota\publisher-thumbprint.txt'
 
     $repositoryCertificate = $null
-    $repositorySpkiSha256 = $null
     if ([System.IO.File]::Exists($publicCertificatePath)) {
         $repositoryCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
             [System.IO.File]::ReadAllBytes($publicCertificatePath))
-        if (-not (Test-PublisherCertificate `
-                -Certificate $repositoryCertificate `
-                -ExpectedSpkiSha256 $null `
-                -RequirePrivateKey $false)) {
-            throw "The repository OTA publisher certificate is malformed or violates the fixed publisher policy."
-        }
-        $repositorySpkiSha256 = Get-SubjectPublicKeyInfoSha256 -Certificate $repositoryCertificate
     }
 
     $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
@@ -424,52 +595,43 @@ function Invoke-OtaPublisherCertificateEnrollment {
         [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
     try {
         $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-        $subjectPrivateCertificates = @(
-            $store.Certificates |
-                Where-Object { $_.Subject -ceq $PublisherSubject -and $_.HasPrivateKey })
-
-        $selection = Resolve-PublisherCertificateSelection `
-            -SubjectPrivateCertificates $subjectPrivateCertificates `
-            -RepositorySpkiSha256 $repositorySpkiSha256
-        if ($selection.Action -eq 'create') {
-            $certificate = New-PublisherCertificate -Store $store
-            if (-not (Test-PublisherCertificate `
-                    -Certificate $certificate `
-                    -ExpectedSpkiSha256 $null `
-                    -RequirePrivateKey $true)) {
-                throw 'The newly created publisher identity failed post-creation validation.'
+        $result = Invoke-PublisherEnrollmentWorkflow `
+            -RepositoryCertificate $repositoryCertificate `
+            -GetSubjectPrivateCertificates {
+                @($store.Certificates | Where-Object {
+                    $_.Subject -ceq $PublisherSubject -and $_.HasPrivateKey
+                })
+            } `
+            -CreatePublisherCertificate { New-PublisherCertificate -Store $store } `
+            -WritePublicCertificate {
+                param([byte[]]$Bytes)
+                Write-BytesAtomically -Path $publicCertificatePath -Bytes $Bytes
+            } `
+            -WriteThumbprint {
+                param([string]$Thumbprint)
+                $thumbprintBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
+                    ($Thumbprint + [Environment]::NewLine))
+                Write-BytesAtomically -Path $thumbprintPath -Bytes $thumbprintBytes
             }
-            $action = 'created'
-        }
-        else {
-            $certificate = $selection.Certificate
-            $action = $selection.Action
-        }
 
-        $spkiSha256 = Get-SubjectPublicKeyInfoSha256 -Certificate $certificate
-        if ($repositorySpkiSha256 -and $spkiSha256 -cne $repositorySpkiSha256) {
-            throw 'The repository public certificate and CurrentUser\My publisher SPKI disagree.'
-        }
-
-        [byte[]]$publicDer = $certificate.Export(
-            [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-        Write-BytesAtomically -Path $publicCertificatePath -Bytes $publicDer
-        $thumbprintBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
-            ($certificate.Thumbprint.ToUpperInvariant() + [Environment]::NewLine))
-        Write-BytesAtomically -Path $thumbprintPath -Bytes $thumbprintBytes
-
-        Write-Output "OTA publisher identity $action."
-        Write-Output "Thumbprint: $($certificate.Thumbprint.ToUpperInvariant())"
-        Write-Output "SPKI SHA-256: $spkiSha256"
+        Write-Output "OTA publisher identity $($result.Action)."
+        Write-Output "Thumbprint: $($result.Thumbprint)"
+        Write-Output "SPKI SHA-256: $($result.SpkiSha256)"
         Write-Output "Public certificate: $publicCertificatePath"
         Write-Output "Thumbprint artifact: $thumbprintPath"
-        Write-Output "Expires (UTC): $($certificate.NotAfter.ToUniversalTime().ToString('O'))"
+        Write-Output "Expires (UTC): $($result.Certificate.NotAfter.ToUniversalTime().ToString('O'))"
     }
     finally {
         $store.Dispose()
         if ($repositoryCertificate) {
             $repositoryCertificate.Dispose()
         }
+    }
+}
+
+function Invoke-OtaPublisherCertificateEnrollment {
+    Invoke-WithPublisherEnrollmentMutex -Action {
+        Invoke-OtaPublisherCertificateEnrollmentCore
     }
 }
 
