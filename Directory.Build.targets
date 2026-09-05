@@ -1,0 +1,13 @@
+<Project>
+  <ItemGroup Condition="'$(MSBuildProjectName)' == 'BaiduBatchTransfer.App'">
+    <EmbeddedResource Include="$(MSBuildThisFileDirectory)eng\ota\SuperPan.OtaPublisher.cer"
+                      LogicalName="BaiduBatchTransfer.App.Updates.SuperPan.OtaPublisher.cer" />
+  </ItemGroup>
+
+  <Target Name="ValidateOtaPublisherTrustAnchor"
+          BeforeTargets="PrepareResources"
+          Condition="'$(MSBuildProjectName)' == 'BaiduBatchTransfer.App'">
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)eng\ota\SuperPan.OtaPublisher.cer')"
+           Text="The enrolled OTA publisher public certificate is missing. Run scripts/create_ota_publisher_certificate.ps1 with PowerShell 7." />
+  </Target>
+</Project>
