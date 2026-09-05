@@ -51,6 +51,10 @@ internal sealed record VelopackClientAsset(
     object NativeToken)
 {
     public string Version => Fingerprint.Version;
+
+    internal string? LocalPackagePath { get; init; }
+
+    internal SignedFeedVerificationSnapshot? SignedFeedSnapshot { get; init; }
 }
 
 internal interface IVelopackUpdateManagerAdapter
@@ -208,7 +212,7 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
     {
         var source = CreateUpdateSource(configuration);
         var options = CreateUpdateOptions(configuration);
-        return new VelopackUpdateManagerAdapter(new UpdateManager(source, options), source as IDisposable);
+        return new VelopackUpdateManagerAdapter(new UpdateManager(source, options), source);
     }
 
     internal static IUpdateSource CreateUpdateSource(
@@ -238,12 +242,14 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
     private sealed class VelopackUpdateManagerAdapter : IVelopackUpdateManagerAdapter, IDisposable
     {
         private readonly UpdateManager manager;
-        private readonly IDisposable? source;
+        private readonly IUpdateSource source;
+        private readonly SignedFeedUpdateSource? signedFeedSource;
 
-        public VelopackUpdateManagerAdapter(UpdateManager manager, IDisposable? source)
+        public VelopackUpdateManagerAdapter(UpdateManager manager, IUpdateSource source)
         {
             this.manager = manager;
             this.source = source;
+            signedFeedSource = source as SignedFeedUpdateSource;
         }
 
         public bool IsInstalled => manager.IsInstalled;
@@ -264,7 +270,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
                 return new VelopackClientAsset(
                     fingerprint,
                     pending.NotesMarkdown,
-                    pending);
+                    pending)
+                {
+                    LocalPackagePath = ResolvePackagePath(fingerprint)
+                };
             }
         }
 
@@ -276,7 +285,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
                 : new VelopackClientAsset(
                     Fingerprint(update.TargetFullRelease),
                     update.TargetFullRelease.NotesMarkdown,
-                    update);
+                    update)
+                {
+                    SignedFeedSnapshot = signedFeedSource?.LatestSnapshot
+                };
         }
 
         public Task DownloadUpdatesAsync(
@@ -302,7 +314,29 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
             manager.WaitExitThenApplyUpdates(asset, silent, restart, restartArguments);
         }
 
-        public void Dispose() => source?.Dispose();
+        public void Dispose()
+        {
+            if (source is IDisposable disposable)
+                disposable.Dispose();
+        }
+
+        private static string? ResolvePackagePath(VelopackAssetFingerprint fingerprint)
+        {
+            if (!string.Equals(Path.GetFileName(fingerprint.FileName), fingerprint.FileName, StringComparison.Ordinal))
+                return null;
+
+            var packagesDirectory = Velopack.Locators.VelopackLocator.Current.PackagesDir;
+            if (string.IsNullOrWhiteSpace(packagesDirectory))
+                return null;
+            var root = Path.GetFullPath(packagesDirectory);
+            var packagePath = Path.GetFullPath(Path.Combine(root, fingerprint.FileName));
+            var requiredPrefix = root.EndsWith(Path.DirectorySeparatorChar)
+                ? root
+                : root + Path.DirectorySeparatorChar;
+            return packagePath.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase)
+                ? packagePath
+                : null;
+        }
 
         private static VelopackAssetFingerprint Fingerprint(VelopackAsset asset) =>
             new(

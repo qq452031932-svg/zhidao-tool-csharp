@@ -4,6 +4,7 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 {
     private readonly object sync = new();
     private readonly IApplicationUpdateClient client;
+    private readonly SignedFeedPackageGate? packageGate;
     private VelopackClientAsset? availableUpdate;
     private VelopackClientAsset? preparedUpdate;
     private ApplicationUpdateSnapshot snapshot;
@@ -12,13 +13,17 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 
     internal VelopackUpdateRuntime(
         IApplicationUpdateClient client,
-        string fallbackCurrentVersion)
+        string fallbackCurrentVersion,
+        SignedFeedPackageGate? packageGate = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
+        this.packageGate = packageGate;
         ArgumentException.ThrowIfNullOrWhiteSpace(fallbackCurrentVersion);
 
         var currentVersion = client.CurrentVersion ?? fallbackCurrentVersion;
         var pending = ReadPendingSafely();
+        if (pending is not null && packageGate is not null && !packageGate.TryRevalidatePending(pending))
+            pending = null;
         snapshot = pending is null
             ? NewSnapshot(
                 ApplicationUpdateStatus.Idle,
@@ -43,8 +48,33 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
 
     public event EventHandler<ApplicationUpdateSnapshot>? SnapshotChanged;
 
-    public static IApplicationUpdateRuntime Create(ApplicationBuildInfo buildInfo) =>
-        Create(buildInfo, VelopackUpdateClient.Create);
+    public static IApplicationUpdateRuntime Create(ApplicationBuildInfo buildInfo)
+    {
+        ArgumentNullException.ThrowIfNull(buildInfo);
+        if (!buildInfo.IsFeedConfigured)
+            return UnavailableApplicationUpdateRuntime.NotConfigured(buildInfo.ProductVersion);
+
+        var client = VelopackUpdateClient.Create(buildInfo);
+        var currentVersion = client.CurrentVersion ?? buildInfo.ProductVersion;
+        if (!client.IsInstalled)
+        {
+            client.Dispose();
+            return UnavailableApplicationUpdateRuntime.Unsupported(currentVersion);
+        }
+
+        SignedFeedPackageGate? gate = null;
+        if (buildInfo.HttpsFeedUrl is { } feedIdentity)
+        {
+            gate = new SignedFeedPackageGate(
+                buildInfo.SignedPendingReceiptPath,
+                new SignedFeedStateStore(
+                    buildInfo.SignedFeedStatePath,
+                    feedIdentity,
+                    currentVersion));
+        }
+
+        return new VelopackUpdateRuntime(client, buildInfo.ProductVersion, gate);
+    }
 
     internal static IApplicationUpdateRuntime Create(
         ApplicationBuildInfo buildInfo,
@@ -177,7 +207,23 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
             cancellationToken.ThrowIfCancellationRequested();
 
             var pending = client.UpdatePendingRestart;
-            if (pending is null || pending.Fingerprint != update.Fingerprint)
+            if (pending is null || !FingerprintsMatch(pending.Fingerprint, update.Fingerprint))
+            {
+                return CompleteOperation(generation, stable with
+                {
+                    Status = ApplicationUpdateStatus.VerificationFailed,
+                    DownloadProgress = 0,
+                    UserMessage = ApplicationUpdateMessages.VerificationFailed
+                });
+            }
+
+            if (packageGate is not null &&
+                (update.SignedFeedSnapshot is null ||
+                 !await packageGate.AuthorizeDownloadedAsync(
+                         update.SignedFeedSnapshot,
+                         pending,
+                         cancellationToken)
+                     .ConfigureAwait(false)))
             {
                 return CompleteOperation(generation, stable with
                 {
@@ -230,10 +276,13 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         if (pending is null)
             return false;
 
+        if (packageGate is not null && !packageGate.TryRevalidatePending(pending))
+            return false;
+
         lock (sync)
         {
             if (availableUpdate is not null &&
-                availableUpdate.Fingerprint != pending.Fingerprint)
+                !FingerprintsMatch(availableUpdate.Fingerprint, pending.Fingerprint))
             {
                 return false;
             }
@@ -263,6 +312,10 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         }
 
         if (prepared is null)
+            return false;
+
+        using var authorization = packageGate?.TryAcquireLaunchAuthorization(prepared);
+        if (packageGate is not null && authorization is null)
             return false;
 
         client.WaitExitThenApplyUpdates(prepared);
@@ -405,6 +458,16 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
     }
+
+    private static bool FingerprintsMatch(
+        VelopackAssetFingerprint left,
+        VelopackAssetFingerprint right) =>
+        string.Equals(left.PackageId, right.PackageId, StringComparison.Ordinal) &&
+        string.Equals(left.Version, right.Version, StringComparison.Ordinal) &&
+        string.Equals(left.AssetType, right.AssetType, StringComparison.Ordinal) &&
+        string.Equals(left.FileName, right.FileName, StringComparison.Ordinal) &&
+        left.Size == right.Size &&
+        string.Equals(left.Sha256, right.Sha256, StringComparison.OrdinalIgnoreCase);
 
     private static ApplicationUpdateSnapshot NewSnapshot(
         ApplicationUpdateStatus status,

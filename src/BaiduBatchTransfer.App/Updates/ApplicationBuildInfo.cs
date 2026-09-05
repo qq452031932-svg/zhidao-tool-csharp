@@ -25,6 +25,12 @@ public sealed record ApplicationBuildInfo(
         "Updates",
         "signed-feed-state.json");
 
+    internal string SignedPendingReceiptPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "BaiduBatchTransfer",
+        "Updates",
+        "signed-pending-update.bin");
+
     public string SingleInstanceMutexName => IsOtaAcceptanceBuild
         ? @"Local\BaiduBatchTransfer.OtaAcceptance.Singleton.v1"
         : @"Local\BaiduBatchTransfer.Singleton.v1";
