@@ -573,6 +573,26 @@ New-GitObjectSourceSnapshot -SourcePaths $paths -DestinationRoot $SnapshotRoot
 	}
 }
 
+func TestModuleRootLocatorFindsSnapshotFixtures(t *testing.T) {
+	moduleRoot := testModuleRoot(t)
+	goMod, err := os.ReadFile(filepath.Join(moduleRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("read located go.mod: %v", err)
+	}
+	if !strings.Contains(string(goMod), "module fanfh.cn/superpan/ota-admin") {
+		t.Fatalf("located the wrong module root %q", moduleRoot)
+	}
+	for _, fixture := range []string{
+		filepath.Join("deploy", "probe", "run-centos7-probe.sh"),
+		filepath.Join("scripts", "build_linux_amd64.ps1"),
+	} {
+		info, err := os.Stat(filepath.Join(moduleRoot, fixture))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("located module root lacks fixture %q: %v", fixture, err)
+		}
+	}
+}
+
 func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
 	t.Helper()
 	offset := 0
@@ -587,7 +607,7 @@ func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
 
 func testLocalTempDir(t *testing.T) string {
 	t.Helper()
-	path, err := os.MkdirTemp(filepath.Dir(testSourceFile(t)), ".compat-test-")
+	path, err := os.MkdirTemp(filepath.Join(testModuleRoot(t), "internal", "compat"), ".compat-test-")
 	if err != nil {
 		t.Fatalf("create package-local temporary directory: %v", err)
 	}
@@ -599,18 +619,29 @@ func testLocalTempDir(t *testing.T) string {
 	return path
 }
 
-func testSourceFile(t *testing.T) string {
-	t.Helper()
-	_, testFilePath, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller could not locate probe_test.go")
-	}
-	return testFilePath
-}
-
 func testModuleRoot(t *testing.T) string {
 	t.Helper()
-	return filepath.Clean(filepath.Join(filepath.Dir(testSourceFile(t)), "..", ".."))
+	currentPath, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get test working directory: %v", err)
+	}
+	for {
+		goModPath := filepath.Join(currentPath, "go.mod")
+		if info, statErr := os.Stat(goModPath); statErr == nil && info.Mode().IsRegular() {
+			contents, readErr := os.ReadFile(goModPath)
+			if readErr != nil {
+				t.Fatalf("read candidate module file %q: %v", goModPath, readErr)
+			}
+			if strings.Contains(string(contents), "module fanfh.cn/superpan/ota-admin") {
+				return currentPath
+			}
+		}
+		parentPath := filepath.Dir(currentPath)
+		if parentPath == currentPath {
+			t.Fatalf("could not locate module fanfh.cn/superpan/ota-admin above test working directory")
+		}
+		currentPath = parentPath
+	}
 }
 
 func readRepositoryFile(t *testing.T, pathParts ...string) string {
