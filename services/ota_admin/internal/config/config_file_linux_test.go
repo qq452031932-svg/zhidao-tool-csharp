@@ -12,14 +12,7 @@ func TestLoadUsesOneRootOwnedDescriptorAndAllowsServiceGroupRead(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root ownership fixture requires root")
 	}
-	root, err := os.MkdirTemp(".", ".config-secure-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root := rootOwnedConfigTestDir(t, ".config-secure-")
 	path := filepath.Join(root, "ota-admin.json")
 	if err := os.WriteFile(path, []byte(`{"database_path":"/var/lib/superpan-ota-admin/state.db"}`), 0o640); err != nil {
 		t.Fatal(err)
@@ -41,13 +34,12 @@ func TestLoadRejectsWritableParentComponent(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root ownership fixture requires root")
 	}
-	root, err := os.MkdirTemp(".", ".config-parent-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := rootOwnedConfigTestDir(t, ".config-parent-")
 	unsafeParent := filepath.Join(root, "writable")
 	if err := os.Mkdir(unsafeParent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafeParent, 0o770); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(unsafeParent, "ota-admin.json")
@@ -63,11 +55,7 @@ func TestLoadRejectsIntermediateSymlinkComponent(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root ownership fixture requires root")
 	}
-	root, err := os.MkdirTemp(".", ".config-link-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := rootOwnedConfigTestDir(t, ".config-link-")
 	realParent := filepath.Join(root, "real")
 	if err := os.Mkdir(realParent, 0o700); err != nil {
 		t.Fatal(err)
@@ -89,11 +77,7 @@ func TestLoadRejectsNonRootOwnedParentComponent(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root ownership fixture requires root")
 	}
-	root, err := os.MkdirTemp(".", ".config-owner-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := rootOwnedConfigTestDir(t, ".config-owner-")
 	parent := filepath.Join(root, "foreign")
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatal(err)
@@ -108,4 +92,22 @@ func TestLoadRejectsNonRootOwnedParentComponent(t *testing.T) {
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load accepted a non-root-owned parent")
 	}
+}
+
+func rootOwnedConfigTestDir(t *testing.T, pattern string) string {
+	t.Helper()
+	root, err := os.MkdirTemp(".", pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		_ = os.RemoveAll(root)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(absoluteRoot) })
+	if err := os.Chmod(absoluteRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return absoluteRoot
 }
