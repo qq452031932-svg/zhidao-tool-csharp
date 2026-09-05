@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -39,7 +40,7 @@ func (reader *oneShotGateReader) Read(buffer []byte) (int, error) {
 }
 
 func TestFormalSessionPersistsOnlyTokenHashAndHonorsStoreRevocation(t *testing.T) {
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	database, err := store.Open(context.Background(), filepath.Join(privateStateTestDir(t), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +298,7 @@ func TestLockedSourceCannotChurnBootstrapOrDurableAudit(t *testing.T) {
 }
 
 func TestAdministratorReadFailureIsNotCountedAsBadCredentials(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
+	path := filepath.Join(privateStateTestDir(t), "state.db")
 	database, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
@@ -374,7 +375,7 @@ func TestSessionIssuanceBoundsRuntimeAndPrunesInactiveDatabaseRows(t *testing.T)
 
 func newObservedTestService(t *testing.T, failureLimit int) (*store.Store, *Service, *sql.DB, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "state.db")
+	path := filepath.Join(privateStateTestDir(t), "state.db")
 	database, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +408,7 @@ func auditCount(t *testing.T, observer *sql.DB) int {
 
 func newTestService(t *testing.T, failureLimit int) (*store.Store, *Service, string) {
 	t.Helper()
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	database, err := store.Open(context.Background(), filepath.Join(privateStateTestDir(t), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,6 +422,15 @@ func newTestService(t *testing.T, failureLimit int) (*store.Store, *Service, str
 		t.Fatal(err)
 	}
 	return database, newServiceForTest(t, database, failureLimit), password
+}
+
+func privateStateTestDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("make state test directory private: %v", err)
+	}
+	return root
 }
 
 func newServiceForTest(t *testing.T, database *store.Store, failureLimit int) *Service {

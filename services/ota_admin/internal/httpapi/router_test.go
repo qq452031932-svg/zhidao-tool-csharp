@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -54,7 +55,7 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	databasePath := filepath.Join(t.TempDir(), "state.db")
+	databasePath := filepath.Join(privateStateTestDir(t), "state.db")
 	database, err := store.Open(context.Background(), databasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -71,6 +72,15 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{t: t, databasePath: databasePath, store: database, clock: clock}
 	h.restart()
 	return h
+}
+
+func privateStateTestDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("make state test directory private: %v", err)
+	}
+	return root
 }
 
 func (h *harness) restart() {

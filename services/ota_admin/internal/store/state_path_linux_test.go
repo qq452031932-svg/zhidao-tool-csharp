@@ -75,6 +75,16 @@ func TestOpenRejectsInsecureStateParentAndLinkedDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsWorldReadableStateParent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), filepath.Join(root, "state.db")); err == nil {
+		t.Fatal("Open() accepted mode 0755 state parent")
+	}
+}
+
 func TestPinnedStatePathRejectsDatabaseIdentityReplacement(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {

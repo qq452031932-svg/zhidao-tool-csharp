@@ -865,12 +865,21 @@ func assertConnectionPragmas(t *testing.T, db *sql.DB) {
 
 func openStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	s, err := Open(context.Background(), filepath.Join(privateStateTestDir(t), "state.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func privateStateTestDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("make state test directory private: %v", err)
+	}
+	return root
 }
 
 func createActiveSession(t *testing.T, s *Store, hash string) {
