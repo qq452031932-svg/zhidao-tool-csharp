@@ -371,8 +371,8 @@ func TestRunnerCleanupFailsClosedAndPreservesOwnedResources(t *testing.T) {
 
 	for _, scenario := range []string{"changed-owner", "stop-failure"} {
 		t.Run(scenario, func(t *testing.T) {
-			workRoot := filepath.Join(t.TempDir(), "probe-root")
-			harnessPath := filepath.Join(t.TempDir(), "cleanup-harness.sh")
+			workRoot := filepath.Join(testLocalTempDir(t), "probe-root")
+			harnessPath := filepath.Join(testLocalTempDir(t), "cleanup-harness.sh")
 			harness := `#!/usr/bin/env bash
 set -u
 VERIFY_ROOT="$1"
@@ -443,11 +443,11 @@ func TestRunnerRejectsPreexistingExtractionTargets(t *testing.T) {
 
 	for _, target := range []string{"go", "source"} {
 		t.Run(target, func(t *testing.T) {
-			workRoot := t.TempDir()
+			workRoot := testLocalTempDir(t)
 			if err := os.Mkdir(filepath.Join(workRoot, target), 0o700); err != nil {
 				t.Fatalf("create preexisting target: %v", err)
 			}
-			harnessPath := filepath.Join(t.TempDir(), "extraction-guard.sh")
+			harnessPath := filepath.Join(testLocalTempDir(t), "extraction-guard.sh")
 			harness := "#!/usr/bin/env bash\nset -u\nGO_ROOT=\"$1/go\"\nSOURCE_ROOT=\"$1/source\"\n" + guards + "\n"
 			if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
 				t.Fatalf("write extraction harness: %v", err)
@@ -470,8 +470,8 @@ func TestArtifactRollbackFailurePreservesBackup(t *testing.T) {
 	}
 	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
 	buildScript := filepath.Join(moduleRoot, "scripts", "build_linux_amd64.ps1")
-	harnessPath := filepath.Join(t.TempDir(), "rollback-harness.ps1")
-	artifactRoot := filepath.Join(t.TempDir(), "artifacts")
+	harnessPath := filepath.Join(testLocalTempDir(t), "rollback-harness.ps1")
+	artifactRoot := filepath.Join(testLocalTempDir(t), "artifacts")
 	harness := `param([string] $BuildScript, [string] $TestArtifactRoot)
 $ErrorActionPreference = 'Stop'
 . $BuildScript -FunctionsOnly
@@ -516,6 +516,20 @@ func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
 		}
 		offset += index + len(substring)
 	}
+}
+
+func testLocalTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := os.MkdirTemp(".", ".compat-test-")
+	if err != nil {
+		t.Fatalf("create package-local temporary directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(path); err != nil {
+			t.Errorf("remove package-local temporary directory: %v", err)
+		}
+	})
+	return path
 }
 
 func readRepositoryFile(t *testing.T, pathParts ...string) string {
