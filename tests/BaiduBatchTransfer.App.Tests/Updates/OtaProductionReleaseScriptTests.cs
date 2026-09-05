@@ -70,6 +70,42 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.False(Directory.Exists(output));
     }
 
+    [Theory]
+    [InlineData("https://ota.example.test/releases/win-x64/stable/;Injected=true")]
+    [InlineData("https://ota.example.test/releases/win-x64/stable/%3bInjected=true")]
+    public async Task ProductionRejectsMsBuildFeedInjectionBeforeOutput(string feedUrl)
+    {
+        var root = FindRepositoryRoot();
+        var output = Path.Combine(root, ".artifacts", $"ota-production-feed-test-{Guid.NewGuid():N}");
+        var result = await RunPowerShellAsync(BuildScriptPath(),
+            "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
+            "-ProductionFeedUrl", feedUrl,
+            "-SigningCertificateThumbprint", new string('A', 40));
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("ProductionFeedUrl", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(output));
+    }
+
+    [Theory]
+    [InlineData("https://timestamp.example.test/path;Injected=true")]
+    [InlineData("https://timestamp.example.test/path%3bInjected=true")]
+    [InlineData("https://timestamp.example.test/path with-space")]
+    public async Task ProductionRejectsTimestampCommandInjectionBeforeOutput(string timestampUrl)
+    {
+        var root = FindRepositoryRoot();
+        var output = Path.Combine(root, ".artifacts", $"ota-production-timestamp-test-{Guid.NewGuid():N}");
+        var result = await RunPowerShellAsync(BuildScriptPath(),
+            "-Production", "-Version", "1.2.3", "-OutputDirectory", output,
+            "-ProductionFeedUrl", "https://ota.example.test/releases/win-x64/stable/",
+            "-SigningCertificateThumbprint", new string('A', 40),
+            "-TimestampUrl", timestampUrl);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("TimestampUrl", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(output));
+    }
+
     [Fact]
     public void ProductionPipelineFixesIdentitySigningAndReopenedClosureGate()
     {
@@ -82,7 +118,26 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("RSASignaturePadding]::Pkcs1", script, StringComparison.Ordinal);
         Assert.Contains("verify-production-directory", script, StringComparison.Ordinal);
         Assert.Contains("verify-reopened-production-zip", script, StringComparison.Ordinal);
+        Assert.Contains("git -C $Source ls-files", script, StringComparison.Ordinal);
+        Assert.Contains("$externalApplicationSources", script, StringComparison.Ordinal);
+        Assert.Contains("src/BaiduBatchTransfer.BaiduAdapter/Http/BaiduWebApiClient.cs", script, StringComparison.Ordinal);
+        Assert.Contains("src/BaiduBatchTransfer.Core/Services/SecureExtractionCodeGenerator.cs", script, StringComparison.Ordinal);
+        Assert.Contains("src/BaiduBatchTransfer.App/Features/Common/DeferredWorkspaceView.xaml", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("ls-files --others", script, StringComparison.Ordinal);
+        Assert.Contains("HEAD:$relativePath", script, StringComparison.Ordinal);
+        Assert.Contains("dotnet-restore-locked", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("--force-evaluate", script, StringComparison.Ordinal);
+        Assert.Contains("Private-key material is forbidden", script, StringComparison.Ordinal);
+        Assert.Contains("failure-logs", script, StringComparison.Ordinal);
+        Assert.Contains(".partial-", script, StringComparison.Ordinal);
+        Assert.Contains("Published production metadata", script, StringComparison.Ordinal);
+        Assert.Contains("Previous production upload ZIP", script, StringComparison.Ordinal);
         Assert.Contains("Get-AuthenticodeSignature", validator, StringComparison.Ordinal);
+        Assert.Contains("SignedCms", validator, StringComparison.Ordinal);
+        Assert.Contains("Authenticode image digest", validator, StringComparison.Ordinal);
+        Assert.Contains("Portable archive", validator, StringComparison.Ordinal);
+        Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
+        Assert.Contains("Every executable carried by an inner archive", validator, StringComparison.Ordinal);
         Assert.Contains("Publisher certificate SPKI pin does not match", validator, StringComparison.Ordinal);
         Assert.Contains("Upload ZIP contains a directory or nested entry", validator, StringComparison.Ordinal);
         Assert.Contains("duplicate or case-colliding file", validator, StringComparison.Ordinal);
@@ -112,6 +167,76 @@ public sealed class OtaProductionReleaseScriptTests
         var signature = rsa.SignData(bytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         Assert.Equal(384, signature.Length);
         Assert.True(rsa.VerifyData(bytes, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
+    }
+
+    [Fact]
+    public async Task CommittedGoldenBundlePassesValidatorEndToEnd()
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, "valid-upload.zip");
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        Assert.True(File.Exists(bundle), $"Missing golden bundle: {bundle}");
+        Assert.True(File.Exists(certificate), $"Missing golden certificate: {certificate}");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3");
+
+        Assert.True(result.ExitCode == 0, result.Output);
+        Assert.Contains("\"verified\": true", result.Output, StringComparison.Ordinal);
+        Assert.Contains("\"version\": \"1.2.3\"", result.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SignedManifestCannotAuthorizeBogusInnerPackage()
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, "invalid-bogus-inner-signed-upload.zip");
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("missing required publisher executable", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task UntimestampedGoldenBundleFailsWhenTimestampIsRequired()
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, "valid-upload.zip");
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3",
+            "-RequireTimestamp");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("required Authenticode timestamp", result.Output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

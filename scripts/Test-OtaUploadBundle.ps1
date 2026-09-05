@@ -19,6 +19,9 @@ $releaseFeedName = "releases.$channel.json"
 $assetCatalogName = "assets.$channel.json"
 $releasesName = "RELEASES-$channel"
 $utf8Strict = [Text.UTF8Encoding]::new($false, $true)
+$signatureEvidence = [Collections.Generic.List[object]]::new()
+
+Add-Type -AssemblyName System.Security.Cryptography.Pkcs
 
 function Get-LowerHash([Security.Cryptography.HashAlgorithm]$Algorithm, [IO.Stream]$Stream) {
     try { return ([Convert]::ToHexString($Algorithm.ComputeHash($Stream))).ToLowerInvariant() }
@@ -87,19 +90,148 @@ function Get-CertificateSpki([Security.Cryptography.X509Certificates.X509Certifi
     finally { $rsa.Dispose() }
 }
 
-function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$TimestampRequired) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($null -eq $signature.SignerCertificate -or
-        $signature.Status -in @('NotSigned', 'HashMismatch', 'NotSupported', 'Incompatible', 'FileError')) {
-        throw "Executable is not validly Authenticode signed: $([IO.Path]::GetFileName($Path)) ($($signature.Status))"
+function Add-AuthenticodeHashRange(
+    [Security.Cryptography.IncrementalHash]$Hash,
+    [IO.FileStream]$Stream,
+    [long]$Offset,
+    [long]$Count) {
+    if ($Count -lt 0 -or $Offset -lt 0 -or $Offset + $Count -gt $Stream.Length) { throw 'Authenticode image range is invalid.' }
+    $Stream.Position = $Offset
+    $buffer = [byte[]]::new(1048576)
+    while ($Count -gt 0) {
+        $read = $Stream.Read($buffer, 0, [int][Math]::Min($buffer.Length, $Count))
+        if ($read -le 0) { throw 'Authenticode image ended unexpectedly.' }
+        $Hash.AppendData($buffer, 0, $read)
+        $Count -= $read
     }
-    $actualSpki = Get-CertificateSpki $signature.SignerCertificate
+}
+
+function Get-AuthenticodeTimestampUtc([Security.Cryptography.Pkcs.SignerInfo]$SignerInfo) {
+    foreach ($counterSigner in $SignerInfo.CounterSignerInfos) {
+        $counterSigner.CheckSignature($true)
+        foreach ($attribute in $counterSigner.SignedAttributes) {
+            if ($attribute.Oid.Value -ceq '1.2.840.113549.1.9.5' -and $attribute.Values.Count -eq 1) {
+                return ([Security.Cryptography.Pkcs.Pkcs9SigningTime]::new($attribute.Values[0].RawData)).SigningTime.ToUniversalTime()
+            }
+        }
+    }
+    foreach ($attribute in $SignerInfo.UnsignedAttributes) {
+        if ($attribute.Oid.Value -cne '1.3.6.1.4.1.311.3.3.1') { continue }
+        foreach ($value in $attribute.Values) {
+            $timestampCms = [Security.Cryptography.Pkcs.SignedCms]::new()
+            $timestampCms.Decode($value.RawData)
+            $timestampCms.CheckSignature($true)
+            $reader = [System.Formats.Asn1.AsnReader]::new(
+                $timestampCms.ContentInfo.Content,
+                [System.Formats.Asn1.AsnEncodingRules]::DER)
+            $sequence = $reader.ReadSequence()
+            [void]$sequence.ReadInteger()
+            [void]$sequence.ReadObjectIdentifier()
+            $messageImprint = $sequence.ReadSequence()
+            $imprintAlgorithm = $messageImprint.ReadSequence()
+            $imprintOid = $imprintAlgorithm.ReadObjectIdentifier()
+            if ($imprintAlgorithm.HasData) { $imprintAlgorithm.ReadNull() }
+            $expectedImprint = $messageImprint.ReadOctetString()
+            if ($imprintOid -cne '2.16.840.1.101.3.4.2.1' -or $messageImprint.HasData) {
+                throw 'Authenticode timestamp uses an unsupported message imprint.'
+            }
+            $actualImprint = [Security.Cryptography.SHA256]::HashData($SignerInfo.GetSignature())
+            if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualImprint, $expectedImprint)) {
+                throw 'Authenticode timestamp is not bound to the executable signature.'
+            }
+            [void]$sequence.ReadInteger()
+            return $sequence.ReadGeneralizedTime().UtcDateTime
+        }
+    }
+    return $null
+}
+
+function Get-VerifiedAuthenticode([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $reader = [IO.BinaryReader]::new($stream, [Text.Encoding]::ASCII, $true)
+    try {
+        if ($stream.Length -lt 256 -or $reader.ReadUInt16() -ne 0x5A4D) { throw 'Executable is not a PE image.' }
+        $stream.Position = 0x3c
+        $peOffset = [long]$reader.ReadUInt32()
+        if ($peOffset -lt 0x40 -or $peOffset + 256 -gt $stream.Length) { throw 'Executable PE header is invalid.' }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw 'Executable PE signature is invalid.' }
+        $optionalOffset = $peOffset + 24
+        $stream.Position = $optionalOffset
+        $magic = $reader.ReadUInt16()
+        $dataDirectoryOffset = if ($magic -eq 0x20b) { $optionalOffset + 112 } elseif ($magic -eq 0x10b) { $optionalOffset + 96 } else { throw 'Executable optional header is invalid.' }
+        $checksumOffset = $optionalOffset + 64
+        $securityDirectoryOffset = $dataDirectoryOffset + 32
+        $stream.Position = $securityDirectoryOffset
+        $certificateOffset = [long]$reader.ReadUInt32()
+        $certificateSize = [long]$reader.ReadUInt32()
+        if ($certificateOffset -le $securityDirectoryOffset + 8 -or $certificateSize -lt 8 -or
+            $certificateOffset + $certificateSize -gt $stream.Length) { throw 'Executable has no valid Authenticode certificate table.' }
+        $stream.Position = $certificateOffset
+        $certificateLength = [long]$reader.ReadUInt32()
+        $revision = $reader.ReadUInt16()
+        $certificateType = $reader.ReadUInt16()
+        if ($certificateLength -lt 9 -or $certificateLength -gt $certificateSize -or $revision -notin @(0x0100,0x0200) -or $certificateType -ne 2) {
+            throw 'Executable Authenticode certificate entry is invalid.'
+        }
+        $pkcs7Bytes = $reader.ReadBytes([int]($certificateLength - 8))
+        if ($pkcs7Bytes.Length -ne $certificateLength - 8) { throw 'Executable Authenticode certificate entry is truncated.' }
+
+        $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
+        $cms.Decode($pkcs7Bytes)
+        $cms.CheckSignature($true)
+        if ($cms.SignerInfos.Count -ne 1 -or $null -eq $cms.SignerInfos[0].Certificate) { throw 'Executable Authenticode signer is ambiguous.' }
+
+        $asn = [System.Formats.Asn1.AsnReader]::new($cms.ContentInfo.Content, [System.Formats.Asn1.AsnEncodingRules]::BER)
+        $root = $asn.ReadSequence()
+        [void]$root.ReadEncodedValue()
+        $digestInfo = $root.ReadSequence()
+        $algorithm = $digestInfo.ReadSequence()
+        $algorithmOid = $algorithm.ReadObjectIdentifier()
+        if ($algorithm.HasData) { $algorithm.ReadNull() }
+        $expectedDigest = $digestInfo.ReadOctetString()
+        if ($algorithmOid -cne '2.16.840.1.101.3.4.2.1' -or $digestInfo.HasData -or $root.HasData -or $asn.HasData) {
+            throw 'Executable Authenticode image digest metadata is unsupported.'
+        }
+        $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+        try {
+            Add-AuthenticodeHashRange $hash $stream 0 $checksumOffset
+            Add-AuthenticodeHashRange $hash $stream ($checksumOffset + 4) ($securityDirectoryOffset - ($checksumOffset + 4))
+            Add-AuthenticodeHashRange $hash $stream ($securityDirectoryOffset + 8) ($certificateOffset - ($securityDirectoryOffset + 8))
+            if ($certificateOffset + $certificateSize -lt $stream.Length) {
+                Add-AuthenticodeHashRange $hash $stream ($certificateOffset + $certificateSize) ($stream.Length - ($certificateOffset + $certificateSize))
+            }
+            $actualDigest = $hash.GetHashAndReset()
+        }
+        finally { $hash.Dispose() }
+        if (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualDigest, $expectedDigest)) {
+            throw 'Executable Authenticode image digest does not match the signed digest.'
+        }
+        return [pscustomobject]@{ Cms=$cms; Signer=$cms.SignerInfos[0] }
+    }
+    finally { $reader.Dispose(); $stream.Dispose() }
+}
+
+function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$TimestampRequired) {
+    try { $verified = Get-VerifiedAuthenticode $Path }
+    catch { throw "Executable is not validly Authenticode signed: $([IO.Path]::GetFileName($Path)) ($($_.Exception.Message))" }
+    $actualSpki = Get-CertificateSpki $verified.Signer.Certificate
     if ($actualSpki -cne $ExpectedSpki) {
         throw "Executable signer SPKI does not match the enrolled publisher: $([IO.Path]::GetFileName($Path))"
     }
-    if ($TimestampRequired -and $null -eq $signature.TimeStamperCertificate) {
+    $authenticodeStatus = Get-AuthenticodeSignature -LiteralPath $Path
+    $timestampUtc = Get-AuthenticodeTimestampUtc $verified.Signer
+    if ($TimestampRequired -and ($null -eq $authenticodeStatus.TimeStamperCertificate -or $null -eq $timestampUtc)) {
         throw "Executable is missing the required Authenticode timestamp: $([IO.Path]::GetFileName($Path))"
     }
+    $signatureEvidence.Add([ordered]@{
+        file = [IO.Path]::GetFileName($Path)
+        signerSpkiSha256 = $actualSpki
+        imageDigestVerified = $true
+        platformStatus = [string]$authenticodeStatus.Status
+        timestampPresent = ($null -ne $timestampUtc)
+        timestampUtc = if ($null -eq $timestampUtc) { $null } else { $timestampUtc.ToString('O') }
+    })
 }
 
 $resolvedBundle = [IO.Path]::GetFullPath($BundlePath)
@@ -192,6 +324,77 @@ try {
         $input = $entry.ZipEntry.Open()
         $output = [IO.File]::Create($Destination)
         try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+    }
+
+    function Test-SafeInnerPath([string]$Name) {
+        if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 1024 -or
+            $Name.StartsWith('/') -or $Name.StartsWith('\') -or $Name.Contains('\') -or
+            $Name.Contains([char]0) -or $Name -match '^[A-Za-z]:') { return $false }
+        $parts = @($Name.Split('/'))
+        return $parts.Count -gt 0 -and @($parts | Where-Object { $_ -in @('', '.', '..') }).Count -eq 0
+    }
+
+    function Assert-InnerArchive(
+        [string]$ArchivePath,
+        [string]$Description,
+        [string[]]$RequiredPublisherExecutables,
+        [string[]]$AllowedThirdPartyExecutables = @()) {
+        $inner = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        try {
+            if ($inner.Entries.Count -eq 0 -or $inner.Entries.Count -gt 4096) { throw "$Description has an invalid entry count." }
+            $innerNames = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $innerExpanded = [long]0
+            $innerCompressed = [long]0
+            foreach ($innerEntry in $inner.Entries) {
+                if ([string]::IsNullOrEmpty($innerEntry.Name) -or -not (Test-SafeInnerPath $innerEntry.FullName)) { throw "$Description contains an unsafe path." }
+                if ($innerNames.ContainsKey($innerEntry.FullName)) { throw "$Description contains duplicate or case-colliding paths." }
+                $innerNames.Add($innerEntry.FullName, $innerEntry.FullName)
+                $unixType = (($innerEntry.ExternalAttributes -shr 16) -band 0xF000)
+                if ($unixType -eq 0xA000 -or ($innerEntry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "$Description contains a symbolic-link or reparse-point entry."
+                }
+                if ($innerEntry.Length -lt 0 -or $innerEntry.Length -gt 2GB) { throw "$Description contains an oversized entry." }
+                if ($innerEntry.Length -gt ([long]::MaxValue - $innerExpanded)) { throw "$Description expanded size overflowed." }
+                $innerExpanded += $innerEntry.Length
+                if ($innerExpanded -gt 8GB) { throw "$Description exceeds the expanded size limit." }
+                $innerCompressed += $innerEntry.CompressedLength
+                if ($innerEntry.Length -gt 0 -and ($innerEntry.CompressedLength -le 0 -or
+                    ([double]$innerEntry.Length / [double]$innerEntry.CompressedLength) -gt 100.0)) {
+                    throw "$Description contains an excessive compression ratio."
+                }
+            }
+            if ($innerCompressed -gt 0 -and ([double]$innerExpanded / [double]$innerCompressed) -gt 100.0) {
+                throw "$Description has an excessive aggregate compression ratio."
+            }
+            $executableIndex = 0
+            foreach ($requiredName in $RequiredPublisherExecutables) {
+                if (-not $innerNames.ContainsKey($requiredName) -or $innerNames[$requiredName] -cne $requiredName) {
+                    throw "$Description is missing required publisher executable: $requiredName"
+                }
+            }
+            $expectedExecutables = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($name in $RequiredPublisherExecutables) { [void]$expectedExecutables.Add($name) }
+            foreach ($name in $AllowedThirdPartyExecutables) { [void]$expectedExecutables.Add($name) }
+            $actualExecutables = @($inner.Entries | Where-Object { $_.FullName.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase) })
+            foreach ($executableEntry in $actualExecutables) {
+                if (-not $expectedExecutables.Contains($executableEntry.FullName)) {
+                    throw "$Description contains an unexpected executable: $($executableEntry.FullName)"
+                }
+            }
+            # Every executable carried by an inner archive must be explicitly
+            # classified; every publisher-owned executable is then independently
+            # checked against its Authenticode image digest and publisher SPKI.
+            foreach ($requiredName in $RequiredPublisherExecutables) {
+                $requiredEntry = $inner.GetEntry($requiredName)
+                if ($null -eq $requiredEntry -or $requiredEntry.Length -le 0) { throw "$Description has an empty required publisher executable." }
+                $destination = Join-Path $temporaryRoot ("inner-$executableIndex.exe")
+                $executableIndex++
+                $input = $requiredEntry.Open(); $output = [IO.File]::Create($destination)
+                try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent
+            }
+        }
+        finally { $inner.Dispose() }
     }
 
     $manifestBytes = Read-EntryBytes $manifestName 81788
@@ -293,6 +496,33 @@ try {
     Extract-Entry $setupName $setupPath
     Assert-Authenticode $setupPath $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent
 
+    $portableName = "$packageId-Portable.zip"
+    $portablePath = Join-Path $temporaryRoot $portableName
+    Extract-Entry $portableName $portablePath
+    Assert-InnerArchive $portablePath 'Portable archive' @(
+        "$packageId.exe",
+        'Update.exe',
+        'current/BaiduBatchTransfer.App.exe') @(
+        'current/managed-browser-helper/python.exe',
+        'current/managed-browser-helper/pythonw.exe')
+
+    $packageIndex = 0
+    foreach ($asset in $assets) {
+        $packageName = [string]$asset.FileName
+        $packagePath = Join-Path $temporaryRoot ("package-$packageIndex.nupkg")
+        $packageIndex++
+        Extract-Entry $packageName $packagePath
+        $requiredPackageExecutables = if ([string]$asset.Type -ceq 'Full') {
+            @('lib/app/BaiduBatchTransfer.App_ExecutionStub.exe', 'lib/app/BaiduBatchTransfer.App.exe', 'lib/app/Squirrel.exe')
+        }
+        else { @() }
+        $allowedPackageExecutables = if ([string]$asset.Type -ceq 'Full') {
+            @('lib/app/managed-browser-helper/python.exe', 'lib/app/managed-browser-helper/pythonw.exe')
+        }
+        else { @() }
+        Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables
+    }
+
     $report = [ordered]@{
         schemaVersion = 1
         verified = $true
@@ -302,6 +532,7 @@ try {
         manifestSha256 = Get-BytesSha256 $manifestBytes
         publisherSpkiSha256 = $certificateSpki
         authenticodeTimestampRequired = $RequireTimestamp.IsPresent
+        executableSignatures = @($signatureEvidence)
         fileCount = $entries.Count
         bundleSha256 = if (Test-Path -LiteralPath $resolvedBundle -PathType Leaf) { Get-FileSha256 $resolvedBundle } else { $null }
         files = @($actualFiles.GetEnumerator() | Sort-Object Key | ForEach-Object { [ordered]@{ name = $_.Key; size = $_.Value.size; sha256 = $_.Value.hash } })
