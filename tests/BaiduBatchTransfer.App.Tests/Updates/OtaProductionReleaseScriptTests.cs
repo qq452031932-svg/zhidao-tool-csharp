@@ -72,6 +72,7 @@ public sealed class OtaProductionReleaseScriptTests
 
     [Theory]
     [InlineData("https://ota.example.test/releases/win-x64/stable/;Injected=true")]
+    [InlineData("https://ota.example.test/releases/win-x64/stable/,Injected=true")]
     [InlineData("https://ota.example.test/releases/win-x64/stable/%3bInjected=true")]
     public async Task ProductionRejectsMsBuildFeedInjectionBeforeOutput(string feedUrl)
     {
@@ -89,6 +90,7 @@ public sealed class OtaProductionReleaseScriptTests
 
     [Theory]
     [InlineData("https://timestamp.example.test/path;Injected=true")]
+    [InlineData("https://timestamp.example.test/path,Injected=true")]
     [InlineData("https://timestamp.example.test/path%3bInjected=true")]
     [InlineData("https://timestamp.example.test/path with-space")]
     public async Task ProductionRejectsTimestampCommandInjectionBeforeOutput(string timestampUrl)
@@ -118,23 +120,35 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.Contains("RSASignaturePadding]::Pkcs1", script, StringComparison.Ordinal);
         Assert.Contains("verify-production-directory", script, StringComparison.Ordinal);
         Assert.Contains("verify-reopened-production-zip", script, StringComparison.Ordinal);
-        Assert.Contains("git -C $Source ls-files", script, StringComparison.Ordinal);
-        Assert.Contains("$externalApplicationSources", script, StringComparison.Ordinal);
-        Assert.Contains("src/BaiduBatchTransfer.BaiduAdapter/Http/BaiduWebApiClient.cs", script, StringComparison.Ordinal);
-        Assert.Contains("src/BaiduBatchTransfer.Core/Services/SecureExtractionCodeGenerator.cs", script, StringComparison.Ordinal);
-        Assert.Contains("src/BaiduBatchTransfer.App/Features/Common/DeferredWorkspaceView.xaml", script, StringComparison.Ordinal);
+        Assert.Contains("rev-parse", script, StringComparison.Ordinal);
+        Assert.Contains("ls-tree", script, StringComparison.Ordinal);
+        Assert.Contains("production-source-overrides.sha256", script, StringComparison.Ordinal);
+        Assert.Contains("Reviewed production source override hash differs", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("git -C $Source ls-files", script, StringComparison.Ordinal);
         Assert.DoesNotContain("ls-files --others", script, StringComparison.Ordinal);
-        Assert.Contains("HEAD:$relativePath", script, StringComparison.Ordinal);
+        Assert.Contains("$($Commit):$RelativePath", script, StringComparison.Ordinal);
         Assert.Contains("dotnet-restore-locked", script, StringComparison.Ordinal);
         Assert.DoesNotContain("--force-evaluate", script, StringComparison.Ordinal);
         Assert.Contains("Private-key material is forbidden", script, StringComparison.Ordinal);
         Assert.Contains("failure-logs", script, StringComparison.Ordinal);
-        Assert.Contains(".partial-", script, StringComparison.Ordinal);
+        Assert.Contains("$productionStage", script, StringComparison.Ordinal);
+        Assert.Contains("[IO.Directory]::Move($productionStage, $productionOutput)", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("Join-Path $productionOutput '.build'", script, StringComparison.Ordinal);
         Assert.Contains("Published production metadata", script, StringComparison.Ordinal);
         Assert.Contains("Previous production upload ZIP", script, StringComparison.Ordinal);
+        Assert.Contains("Previous production generation directory must contain exactly one canonical upload ZIP.", script, StringComparison.Ordinal);
+        Assert.Contains("'delta','patch'", script, StringComparison.Ordinal);
+        Assert.Contains("Delta reconstruction differs from the current Full package", script, StringComparison.Ordinal);
+        Assert.Contains("Join-Path $sourceSnapshot 'scripts\\Test-OtaUploadBundle.ps1'", script, StringComparison.Ordinal);
+        Assert.Contains("Join-Path $sourceSnapshot 'eng\\ota\\SuperPan.OtaPublisher.cer'", script, StringComparison.Ordinal);
+        Assert.Contains("Set-Location -LiteralPath $WorkingDirectory", script, StringComparison.Ordinal);
+        Assert.Contains("'--tool-manifest',$toolManifestPath", script, StringComparison.Ordinal);
         Assert.Contains("Get-AuthenticodeSignature", validator, StringComparison.Ordinal);
         Assert.Contains("SignedCms", validator, StringComparison.Ordinal);
         Assert.Contains("Authenticode image digest", validator, StringComparison.Ordinal);
+        Assert.Contains("1.3.6.1.4.1.311.2.1.4", validator, StringComparison.Ordinal);
+        Assert.Contains("1.3.6.1.4.1.311.2.1.15", validator, StringComparison.Ordinal);
+        Assert.Contains("Velopack package nuspec", validator, StringComparison.Ordinal);
         Assert.Contains("Portable archive", validator, StringComparison.Ordinal);
         Assert.Contains("lib/app/BaiduBatchTransfer.App.exe", validator, StringComparison.Ordinal);
         Assert.Contains("Every executable carried by an inner archive", validator, StringComparison.Ordinal);
@@ -192,6 +206,8 @@ public sealed class OtaProductionReleaseScriptTests
         Assert.True(result.ExitCode == 0, result.Output);
         Assert.Contains("\"verified\": true", result.Output, StringComparison.Ordinal);
         Assert.Contains("\"version\": \"1.2.3\"", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Portable archive::SuperPan.BaiduBatchTransfer.exe", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Package SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg::lib/app/BaiduBatchTransfer.App.exe", result.Output, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -213,7 +229,7 @@ public sealed class OtaProductionReleaseScriptTests
             "-ExpectedVersion", "1.2.3");
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("missing required publisher executable", result.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("missing required Velopack package content", result.Output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -237,6 +253,54 @@ public sealed class OtaProductionReleaseScriptTests
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("required Authenticode timestamp", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SignedJunkOnlyDeltaBundleIsRejected()
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, "invalid-junk-delta-signed-upload.zip");
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        Assert.True(File.Exists(bundle), $"Missing delta rejection fixture: {bundle}");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Delta package has no meaningful patch payload", result.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("invalid-wrong-inner-signer-upload.zip", "signer SPKI does not match")]
+    [InlineData("invalid-tampered-inner-image-upload.zip", "image digest does not match")]
+    public async Task SignedBundleCannotAuthorizeWrongSignerOrTamperedPe(string fixtureName, string expectedError)
+    {
+        var fixture = Path.Combine(
+            FindRepositoryRoot(), "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction");
+        var bundle = Path.Combine(fixture, fixtureName);
+        var certificate = Path.Combine(fixture, "publisher.cer");
+        Assert.True(File.Exists(bundle), $"Missing executable rejection fixture: {bundle}");
+        using var publicCertificate = new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate);
+        var spki = Convert.ToHexString(
+            SHA256.HashData(publicCertificate.PublicKey.ExportSubjectPublicKeyInfo())).ToLowerInvariant();
+
+        var result = await RunPowerShellAsync(
+            ValidatorScriptPath(),
+            "-BundlePath", bundle,
+            "-PublisherCertificatePath", certificate,
+            "-ExpectedPublisherSpkiSha256", spki,
+            "-ExpectedVersion", "1.2.3");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains(expectedError, result.Output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]

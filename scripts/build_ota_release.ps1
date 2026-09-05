@@ -189,11 +189,11 @@ function Invoke-ProductionRelease {
     }
     if (-not $Production) { throw '-Production is required for the production parameter set.' }
     function Assert-SafeProductionUriText([string]$Value, [string]$Name) {
-        if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[^\x21-\x7e]' -or $Value.IndexOfAny([char[]]'%;$@''"') -ge 0) {
+        if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[^\x21-\x7e]' -or $Value.IndexOfAny([char[]]'%,;$@''"') -ge 0) {
             throw "$Name contains whitespace, escaping, or command/property metacharacters."
         }
         $decoded = [Uri]::UnescapeDataString($Value)
-        if ($decoded -cne $Value -or $decoded.IndexOfAny([char[]]'%;$@''"') -ge 0) {
+        if ($decoded -cne $Value -or $decoded.IndexOfAny([char[]]'%,;$@''"') -ge 0) {
             throw "$Name contains encoded command/property metacharacters."
         }
     }
@@ -264,6 +264,10 @@ function Invoke-ProductionRelease {
     if ($certificates.Count -ne 1) { throw 'Exactly one enrolled signing certificate must match the requested thumbprint.' }
     $signingCertificate = $certificates[0]
     if (-not $signingCertificate.HasPrivateKey) { throw 'The enrolled signing certificate has no private key.' }
+    if ([DateTime]::UtcNow -lt $signingCertificate.NotBefore.ToUniversalTime() -or
+        [DateTime]::UtcNow -gt $signingCertificate.NotAfter.ToUniversalTime()) {
+        throw 'The enrolled signing certificate is not currently valid.'
+    }
     $signingRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($signingCertificate)
     if ($null -eq $signingRsa -or $signingRsa.KeySize -ne 3072) { throw 'The enrolled signing certificate must have an RSA-3072 private key.' }
     $publicRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($signingCertificate)
@@ -279,8 +283,12 @@ function Invoke-ProductionRelease {
         }).Count -eq 1
     if (-not $hasCodeSigning) { $signingRsa.Dispose(); throw 'The signing certificate is not authorized for code signing.' }
 
-    [IO.Directory]::CreateDirectory($productionOutput) | Out-Null
-    $buildRoot = Join-Path $productionOutput '.build'
+    if (Test-Path -LiteralPath $productionOutput) { Remove-Item -LiteralPath $productionOutput -Force }
+    $productionParent = [IO.Path]::GetDirectoryName($productionOutput)
+    $productionLeaf = [IO.Path]::GetFileName($productionOutput)
+    $productionStage = Join-Path $productionParent (".$productionLeaf.partial-$([Guid]::NewGuid().ToString('N'))")
+    [IO.Directory]::CreateDirectory($productionStage) | Out-Null
+    $buildRoot = Join-Path $productionStage (".work-$([Guid]::NewGuid().ToString('N'))")
     $publishDirectory = Join-Path $buildRoot 'publish'
     $assetDirectory = Join-Path $buildRoot 'assets'
     $logDirectory = Join-Path $buildRoot 'logs'
@@ -288,14 +296,14 @@ function Invoke-ProductionRelease {
     $commandLogPath = Join-Path $logDirectory 'commands.jsonl'
     $utf8NoBomProduction = [Text.UTF8Encoding]::new($false)
 
-    function Invoke-ProductionCommand([string]$Name, [string]$FilePath, [string[]]$Arguments) {
+    function Invoke-ProductionCommand([string]$Name, [string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory) {
         $safe = $Name -replace '[^A-Za-z0-9_.-]','_'
         $stdoutPath = Join-Path $logDirectory "$safe.stdout.log"
         $stderrPath = Join-Path $logDirectory "$safe.stderr.log"
         $started = [DateTime]::UtcNow
         $old = Get-Location
         try {
-            Set-Location -LiteralPath $repoRoot
+            Set-Location -LiteralPath $WorkingDirectory
             & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
             $code = if ($null -eq $LASTEXITCODE) { if ($?) { 0 } else { 1 } } else { $LASTEXITCODE }
         }
@@ -306,7 +314,31 @@ function Invoke-ProductionRelease {
         if ($code -ne 0) { throw "Production release command '$Name' failed with exit code $code. See $commandLogPath" }
     }
 
-    function Copy-ProductionSourceSnapshot([string]$Source, [string]$Destination) {
+    function Export-ReviewedGitBlob([string]$Source, [string]$Commit, [string]$RelativePath, [string]$DestinationPath) {
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($DestinationPath)) | Out-Null
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'git'
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.ArgumentList.Add('-C'); $startInfo.ArgumentList.Add($Source)
+        $startInfo.ArgumentList.Add('show'); $startInfo.ArgumentList.Add("$($Commit):$RelativePath")
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $output = [IO.File]::Create($DestinationPath)
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($output)
+            $process.WaitForExit()
+            $exitCode = $process.ExitCode
+            $standardError = $process.StandardError.ReadToEnd()
+        }
+        finally { $output.Dispose(); $process.Dispose() }
+        if ($exitCode -ne 0) {
+            if (Test-Path -LiteralPath $DestinationPath) { Remove-Item -LiteralPath $DestinationPath -Force }
+            throw "Unable to export reviewed production source blob $($Commit):$RelativePath ($standardError)"
+        }
+    }
+
+    function Copy-ProductionSourceSnapshot([string]$Source, [string]$Destination, [string]$Commit) {
         $sourcePathspecs = @(
             'src',
             'Directory.Build.props',
@@ -316,175 +348,82 @@ function Invoke-ProductionRelease {
             'NuGet.Config',
             '.config/dotnet-tools.json',
             'eng/ota/SuperPan.OtaPublisher.cer',
+            'eng/ota/production-source-overrides.sha256',
+            'scripts/Test-OtaUploadBundle.ps1',
             'scripts/verify_managed_browser_helper_package.ps1',
             'tools/managed_browser_helper')
-        $tracked = @(& git -C $Source ls-files -- @sourcePathspecs)
-        if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) { throw 'Unable to enumerate the tracked production source allowlist.' }
+        $tracked = @(& git -C $Source ls-tree -r --name-only $Commit -- @sourcePathspecs)
+        if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) { throw 'Unable to enumerate the commit-pinned production source allowlist.' }
         foreach ($relativePath in $tracked) {
             if ([string]::IsNullOrWhiteSpace($relativePath) -or $relativePath.Contains('..') -or [IO.Path]::IsPathRooted($relativePath)) {
-                throw 'Git returned an unsafe tracked production path.'
+                throw 'Git returned an unsafe commit-pinned production path.'
             }
             $extension = [IO.Path]::GetExtension($relativePath)
             if ($extension -in @('.pfx','.p12','.key','.pem')) { throw "Private-key material is forbidden from the production source snapshot: $relativePath" }
-            $destinationPath = Join-Path $Destination $relativePath
-            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destinationPath)) | Out-Null
-            if ($relativePath.EndsWith('/packages.lock.json', [StringComparison]::OrdinalIgnoreCase)) {
-                $startInfo = [Diagnostics.ProcessStartInfo]::new()
-                $startInfo.FileName = 'git'
-                $startInfo.UseShellExecute = $false
-                $startInfo.RedirectStandardOutput = $true
-                $startInfo.RedirectStandardError = $true
-                $startInfo.ArgumentList.Add('-C'); $startInfo.ArgumentList.Add($Source)
-                $startInfo.ArgumentList.Add('show'); $startInfo.ArgumentList.Add("HEAD:$relativePath")
-                $process = [Diagnostics.Process]::Start($startInfo)
-                $output = [IO.File]::Create($destinationPath)
-                try {
-                    $process.StandardOutput.BaseStream.CopyTo($output)
-                    $process.WaitForExit()
-                    $exitCode = $process.ExitCode
-                    $standardError = $process.StandardError.ReadToEnd()
-                }
-                finally { $output.Dispose(); $process.Dispose() }
-                if ($exitCode -ne 0) { throw "Unable to read reviewed RID lock input from HEAD: $relativePath ($standardError)" }
-            }
-            else {
-                $sourcePath = Join-Path $Source $relativePath
-                if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
-                    ([IO.File]::GetAttributes($sourcePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                    throw "Tracked production input is missing or is a reparse point: $relativePath"
-                }
-                [IO.File]::Copy($sourcePath, $destinationPath, $false)
-            }
+            Export-ReviewedGitBlob $Source $Commit $relativePath (Join-Path $Destination $relativePath)
         }
-        # The application is being assembled from an in-progress reviewed change
-        # set. Only these exact untracked source inputs are admitted; never discover
-        # arbitrary untracked files while producing a release snapshot.
-        $externalApplicationSources = @(
-            'src/BaiduBatchTransfer.App/Features/Common/DeferredWorkspaceView.xaml',
-            'src/BaiduBatchTransfer.App/Features/Common/DeferredWorkspaceView.xaml.cs',
-            'src/BaiduBatchTransfer.App/Features/Common/DeferredWorkspaceViewModel.cs',
-            'src/BaiduBatchTransfer.App/Features/Common/WorkspaceLogEntry.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/IManagedTransferRouteProof.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserDirectoryListing.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserDirectoryMutation.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserHelperClientFactory.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.DirectoryListing.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.DirectoryMutation.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.ExtractionCode.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.ShareSubmission.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.SourceListing.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.TargetBaseline.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.TransferPicker.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserProtocol.TransferSubmission.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserSourceListing.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserTargetInventory.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserTransferPicker.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserTransferSource.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedBrowserTransferSubmission.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedChromiumProcessManager.TransferExecution.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedChromiumProcessManager.TransferSource.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedChromiumShareAdapter.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedChromiumTransferAdapter.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedSessionOperationClient.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedSessionOperationProtocol.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedShareAutomationSessionFactory.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedShareSubmissionSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferDirectoryMutator.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferDirectoryPreparationSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferDirectoryReader.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferFinalSubmissionSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferPickerOpener.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferPickerSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferQuarantineRegistry.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferRuntimeRouteProof.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferSourceReader.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferSourceSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferSubmissionOperator.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferTargetBaselineSession.cs',
-            'src/BaiduBatchTransfer.App/Features/ManagedBrowser/ManagedTransferTargetInventoryReader.cs',
-            'src/BaiduBatchTransfer.App/Features/ShareAnalytics/ShareAnalyticsView.xaml.cs',
-            'src/BaiduBatchTransfer.App/Features/ShareAnalytics/SystemShareLinkLauncher.cs',
-            'src/BaiduBatchTransfer.App/Services/BaiduLoginSessionRegistrar.cs',
-            'src/BaiduBatchTransfer.App/Services/DirectBackgroundAccountLoginLauncher.cs',
-            'src/BaiduBatchTransfer.App/Styles/SuperPanTheme.xaml',
-            'src/BaiduBatchTransfer.Application/Accounts/RefreshAccountSessionService.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/BaiduExecutionContextResolver.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/ExecutionBoundShareAdapter.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/ExecutionBoundTransferAdapter.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/IManagedChromiumShareAdapter.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/IManagedChromiumTransferAdapter.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/IManagedTransferAcceptanceStore.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/ManagedTransferAcceptanceRunner.cs',
-            'src/BaiduBatchTransfer.Application/Scheduling/RemoteWriteExecutionMode.cs',
-            'src/BaiduBatchTransfer.Application/ShareAnalytics/AccountShareAnalyticsSyncService.cs',
-            'src/BaiduBatchTransfer.BaiduAdapter/Http/BaiduSameOriginHttpClient.cs',
-            'src/BaiduBatchTransfer.BaiduAdapter/Http/BaiduWebApiClient.cs',
-            'src/BaiduBatchTransfer.BaiduAdapter/Http/BaiduWebContextClient.cs',
-            'src/BaiduBatchTransfer.Core/Abstractions/IBaiduExecutionBindingStore.cs',
-            'src/BaiduBatchTransfer.Core/Services/SecureExtractionCodeGenerator.cs',
-            'src/BaiduBatchTransfer.Infrastructure/Database/Migrations/019_ManagedTransferFinalSubmission.sql',
-            'src/BaiduBatchTransfer.Infrastructure/Database/Migrations/020_AcceptanceOnlyExecutionScope.sql',
-            'src/BaiduBatchTransfer.Infrastructure/Database/Migrations/021_DirectBackgroundBatch.sql',
-            'src/BaiduBatchTransfer.Infrastructure/Database/Migrations/022_AccountShareAnalytics.sql',
-            'src/BaiduBatchTransfer.Infrastructure/Database/Repositories/SqliteAccountShareAnalyticsRepository.cs',
-            'src/BaiduBatchTransfer.Infrastructure/Database/SqliteManagedBrowserExecutionBindingStore.cs',
-            'src/BaiduBatchTransfer.Infrastructure/Database/SqliteManagedTransferAcceptanceStore.cs')
-        foreach ($relativePath in $externalApplicationSources) {
+
+        $overrideManifestPath = Join-Path $Destination 'eng\ota\production-source-overrides.sha256'
+        if (-not (Test-Path -LiteralPath $overrideManifestPath -PathType Leaf)) { throw 'The reviewed production source override manifest is missing from the source commit.' }
+        $overrideText = [IO.File]::ReadAllText($overrideManifestPath, [Text.UTF8Encoding]::new($false, $true))
+        if ($overrideText.Contains("`r") -or -not $overrideText.EndsWith("`n")) { throw 'The reviewed production source override manifest is not canonical LF UTF-8.' }
+        $overridePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $allowedHelperOverrides = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($name in @(
+            'helper-manifest.json','main.py','protocol.py','identity_query.py','transfer_source.py',
+            'transfer_source_listing.py','transfer_directory_listing.py','transfer_directory_mutation.py',
+            'transfer_picker.py','transfer_target_baseline.py','transfer_submission.py','share_submission.py',
+            'session_operations.py')) {
+            [void]$allowedHelperOverrides.Add("tools/managed_browser_helper/$name")
+        }
+        foreach ($line in @($overrideText.TrimEnd("`n").Split("`n"))) {
+            if ($line -cnotmatch '^(?<hash>[0-9a-f]{64})  (?<path>[!-~]+)$') { throw 'The reviewed production source override manifest contains a non-canonical line.' }
+            $relativePath = [string]$Matches.path
             $extension = [IO.Path]::GetExtension($relativePath)
-            if ($extension -notin @('.cs','.xaml','.sql')) {
-                throw "Unexpected application source type in the production allowlist: $relativePath"
+            $allowedApplicationOverride = $relativePath.StartsWith('src/', [StringComparison]::Ordinal) -and
+                $extension -in @('.cs','.csproj','.xaml','.sql')
+            $allowedVerificationOverride = $relativePath -ceq 'scripts/verify_managed_browser_helper_package.ps1'
+            if (-not $allowedApplicationOverride -and -not $allowedVerificationOverride -and -not $allowedHelperOverrides.Contains($relativePath)) {
+                throw "Reviewed production source override is outside the narrow allowlist: $relativePath"
+            }
+            if ($relativePath.EndsWith('/packages.lock.json', [StringComparison]::OrdinalIgnoreCase) -or
+                $relativePath.Contains('..') -or [IO.Path]::IsPathRooted($relativePath) -or
+                -not $overridePaths.Add($relativePath)) {
+                throw "Reviewed production source override path is unsafe or duplicated: $relativePath"
             }
             $sourcePath = Join-Path $Source $relativePath
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
+                ([IO.File]::GetAttributes($sourcePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reviewed production source override is missing or unsafe: $relativePath"
+            }
+            if ((Get-LowerSha256 $sourcePath) -cne [string]$Matches.hash) {
+                throw "Reviewed production source override hash differs: $relativePath"
+            }
             $destinationPath = Join-Path $Destination $relativePath
-            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
-                ([IO.File]::GetAttributes($sourcePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Required allowlisted application source is missing or unsafe: $relativePath"
-            }
-            if (-not (Test-Path -LiteralPath $destinationPath)) {
-                [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destinationPath)) | Out-Null
-                [IO.File]::Copy($sourcePath, $destinationPath, $false)
-            }
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destinationPath)) | Out-Null
+            [IO.File]::Copy($sourcePath, $destinationPath, $true)
         }
-        # The managed helper package is an explicit verified external input. Its
-        # source gate names these files exactly; copy only that fixed allowlist and
-        # let verify_managed_browser_helper_package.ps1 bind it to the manifest.
-        $externalHelperSources = @(
-            'identity_query.py',
-            'transfer_source.py',
-            'transfer_source_listing.py',
-            'transfer_directory_listing.py',
-            'transfer_directory_mutation.py',
-            'transfer_picker.py',
-            'transfer_target_baseline.py',
-            'transfer_submission.py',
-            'share_submission.py',
-            'session_operations.py')
-        foreach ($name in $externalHelperSources) {
-            $sourcePath = Join-Path $Source "tools\managed_browser_helper\$name"
-            $destinationPath = Join-Path $Destination "tools\managed_browser_helper\$name"
-            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or
-                ([IO.File]::GetAttributes($sourcePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Required allowlisted helper source is missing or unsafe: $name"
-            }
-            if (-not (Test-Path -LiteralPath $destinationPath)) {
-                [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destinationPath)) | Out-Null
-                [IO.File]::Copy($sourcePath, $destinationPath, $false)
-            }
-        }
+        if ($overridePaths.Count -eq 0) { throw 'The reviewed production source override manifest is empty.' }
     }
 
     $zipPath = $null
     $reportPath = $null
     try {
+        $sourceCommitLines = @(& git -C $repoRoot rev-parse --verify 'HEAD^{commit}')
+        if ($LASTEXITCODE -ne 0 -or $sourceCommitLines.Count -ne 1 -or $sourceCommitLines[0] -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Unable to resolve exactly one production source commit SHA.'
+        }
+        $sourceCommit = [string]$sourceCommitLines[0]
         $sourceSnapshot = Join-Path $buildRoot 'source'
-        Copy-ProductionSourceSnapshot $repoRoot $sourceSnapshot
+        Copy-ProductionSourceSnapshot $repoRoot $sourceSnapshot $sourceCommit
+        [IO.File]::WriteAllText((Join-Path $logDirectory 'source-commit.txt'), "$sourceCommit`n", $utf8NoBomProduction)
         $appProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
         $toolManifestPath = Join-Path $sourceSnapshot '.config\dotnet-tools.json'
         $helperVerificationScript = Join-Path $sourceSnapshot 'scripts\verify_managed_browser_helper_package.ps1'
         $helperManifestSource = Join-Path $sourceSnapshot 'tools\managed_browser_helper\helper-manifest.json'
         $helperSourceDirectory = Join-Path $sourceSnapshot 'tools\managed_browser_helper'
-        $bundleValidator = Join-Path $repoRoot 'scripts\Test-OtaUploadBundle.ps1'
-        $publisherCertificate = Join-Path $repoRoot 'eng\ota\SuperPan.OtaPublisher.cer'
+        $bundleValidator = Join-Path $sourceSnapshot 'scripts\Test-OtaUploadBundle.ps1'
+        $publisherCertificate = Join-Path $sourceSnapshot 'eng\ota\SuperPan.OtaPublisher.cer'
         foreach ($required in @($appProject,$toolManifestPath,$helperVerificationScript,$helperManifestSource,$bundleValidator,$publisherCertificate)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required production input is missing: $required" }
         }
@@ -492,31 +431,36 @@ function Invoke-ProductionRelease {
         if ([string]$toolManifest.tools.vpk.version -cne $requiredVpkVersion) { throw "The local vpk tool manifest must pin exactly version $requiredVpkVersion." }
 
         if ($null -ne $productionPrevious) {
-            & $bundleValidator -BundlePath $productionPrevious -PublisherCertificatePath $publisherCertificate -ExpectedPublisherSpkiSha256 $expectedSpki | Out-Null
+            $previousUploadSource = $productionPrevious
             if (Test-Path -LiteralPath $productionPrevious -PathType Container) {
-                foreach ($path in [IO.Directory]::EnumerateFiles($productionPrevious, '*', [IO.SearchOption]::TopDirectoryOnly)) {
-                    $name = [IO.Path]::GetFileName($path)
+                $previousCandidates = @([IO.Directory]::EnumerateFiles(
+                        $productionPrevious, "$productionPackageId-*-win-x64-stable-upload.zip", [IO.SearchOption]::TopDirectoryOnly) |
+                    Where-Object {
+                        [IO.Path]::GetFileName($_) -cmatch '^SuperPan\.BaiduBatchTransfer-[0-9]+\.[0-9]+\.[0-9]+-win-x64-stable-upload\.zip$'
+                    })
+                if ($previousCandidates.Count -ne 1) {
+                    throw 'Previous production generation directory must contain exactly one canonical upload ZIP.'
+                }
+                $previousUploadSource = $previousCandidates[0]
+            }
+            Assert-ExistingPathIsNotReparsePoint $previousUploadSource 'Previous production upload ZIP'
+            $validatedPrevious = Join-Path $buildRoot 'previous-upload.zip'
+            [IO.File]::Copy($previousUploadSource, $validatedPrevious, $false)
+            & $bundleValidator -BundlePath $validatedPrevious -PublisherCertificatePath $publisherCertificate -ExpectedPublisherSpkiSha256 $expectedSpki | Out-Null
+            $previousArchive = [IO.Compression.ZipFile]::OpenRead($validatedPrevious)
+            try {
+                foreach ($entry in $previousArchive.Entries) {
+                    $name = $entry.FullName
                     if ($name -ceq "releases.$productionChannel.json" -or $name.EndsWith('.nupkg', [StringComparison]::Ordinal)) {
-                        [IO.File]::Copy($path, (Join-Path $assetDirectory $name), $false)
+                        if ($name -cne [IO.Path]::GetFileName($name)) { throw 'Previous production upload ZIP contains a nested release asset.' }
+                        $destination = Join-Path $assetDirectory $name
+                        if (Test-Path -LiteralPath $destination) { throw "Previous production upload ZIP contains a duplicate release asset: $name" }
+                        $input = $entry.Open(); $output = [IO.File]::Create($destination)
+                        try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
                     }
                 }
             }
-            else {
-                $previousArchive = [IO.Compression.ZipFile]::OpenRead($productionPrevious)
-                try {
-                    foreach ($entry in $previousArchive.Entries) {
-                        $name = $entry.FullName
-                        if ($name -ceq "releases.$productionChannel.json" -or $name.EndsWith('.nupkg', [StringComparison]::Ordinal)) {
-                            if ($name -cne [IO.Path]::GetFileName($name)) { throw 'Previous production upload ZIP contains a nested release asset.' }
-                            $destination = Join-Path $assetDirectory $name
-                            if (Test-Path -LiteralPath $destination) { throw "Previous production upload ZIP contains a duplicate release asset: $name" }
-                            $input = $entry.Open(); $output = [IO.File]::Create($destination)
-                            try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-                        }
-                    }
-                }
-                finally { $previousArchive.Dispose() }
-            }
+            finally { $previousArchive.Dispose() }
         }
 
         if ($null -eq $productionNotes) { $notesText = "# $Version`n`nSuperPan production release.`n" }
@@ -524,19 +468,19 @@ function Invoke-ProductionRelease {
         $notesPath = Join-Path $buildRoot 'release-notes.vpk.md'
         [IO.File]::WriteAllText($notesPath, $notesText, [Text.UTF8Encoding]::new($true))
 
-        Invoke-ProductionCommand 'dotnet-tool-restore' 'dotnet' @('tool','restore')
-        Invoke-ProductionCommand 'vpk-root-help' 'dotnet' @('tool','run','vpk','--','--help')
-        Invoke-ProductionCommand 'vpk-pack-help' 'dotnet' @('tool','run','vpk','--','pack','--help')
+        Invoke-ProductionCommand 'dotnet-tool-restore' 'dotnet' @('tool','restore','--tool-manifest',$toolManifestPath) $sourceSnapshot
+        Invoke-ProductionCommand 'vpk-root-help' 'dotnet' @('tool','run','vpk','--','--help') $sourceSnapshot
+        Invoke-ProductionCommand 'vpk-pack-help' 'dotnet' @('tool','run','vpk','--','pack','--help') $sourceSnapshot
         $helperPackageDirectory = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts\managed-session-pipeline-20260901\helper-bundle-r2'))
         $restoreProperties = @('-r','win-x64','-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',
             "-p:VersionPrefix=$Version","-p:UpdateFeedUrl=$normalizedFeedUrl",'-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',
             "-p:UpdateChannel=$productionChannel","-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory")
-        Invoke-ProductionCommand 'dotnet-restore-locked' 'dotnet' (@('restore',$appProject,'--locked-mode') + $restoreProperties)
+        Invoke-ProductionCommand 'dotnet-restore-locked' 'dotnet' (@('restore',$appProject,'--locked-mode') + $restoreProperties) $sourceSnapshot
         Invoke-ProductionCommand 'dotnet-publish' 'dotnet' @(
             'publish',$appProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore','-o',$publishDirectory,
             "-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',"-p:UpdateFeedUrl=$normalizedFeedUrl",
             '-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',"-p:UpdateChannel=$productionChannel",
-            "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory")
+            "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory") $sourceSnapshot
         if (-not (Test-Path -LiteralPath (Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe') -PathType Leaf)) { throw 'Published production main executable is missing.' }
         $publishedAssemblyPath = Join-Path $publishDirectory 'BaiduBatchTransfer.App.dll'
         if (-not (Test-Path -LiteralPath $publishedAssemblyPath -PathType Leaf)) { throw 'Published production metadata assembly is missing.' }
@@ -554,13 +498,13 @@ function Invoke-ProductionRelease {
             throw "Published production metadata does not match the requested version, feed, channel, and build mode (version='$([string]$publishedVersionInfo.ProductVersion)', feed='$([string]$publishedMetadata.UpdateFeedUrl)', channel='$([string]$publishedMetadata.UpdateChannel)', acceptance='$([string]$publishedMetadata.OtaAcceptanceBuild)')."
         }
         Invoke-ProductionCommand 'verify-managed-browser-helper' 'pwsh' @('-NoProfile','-ExecutionPolicy','Bypass','-File',$helperVerificationScript,
-            '-ManifestSource',$helperManifestSource,'-PackageDirectory',(Join-Path $publishDirectory 'managed-browser-helper'),'-HelperSourceDirectory',$helperSourceDirectory)
+            '-ManifestSource',$helperManifestSource,'-PackageDirectory',(Join-Path $publishDirectory 'managed-browser-helper'),'-HelperSourceDirectory',$helperSourceDirectory) $sourceSnapshot
 
         $signParams = "/sha1 $thumbprint /fd SHA256"
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $signParams += " /tr $TimestampUrl /td SHA256" }
         Invoke-ProductionCommand 'vpk-pack' 'dotnet' @('tool','run','vpk','--','pack','--packId',$productionPackageId,
             '--packVersion',$Version,'--packDir',$publishDirectory,'--mainExe','BaiduBatchTransfer.App.exe','--channel',$productionChannel,
-            '--runtime','win-x64','--outputDir',$assetDirectory,'--releaseNotes',$notesPath,'--signParams',$signParams)
+            '--runtime','win-x64','--outputDir',$assetDirectory,'--releaseNotes',$notesPath,'--signParams',$signParams) $sourceSnapshot
 
         # Velopack includes the channel in generated filenames. The signed-feed contract
         # intentionally exposes stable canonical names so client and server validators do
@@ -601,6 +545,22 @@ function Invoke-ProductionRelease {
 
         $currentTypes = @($releaseAssets | Where-Object { [string]$_.Version -ceq $Version } | ForEach-Object { [string]$_.Type })
         if (@($currentTypes | Where-Object { $_ -ceq 'Full' }).Count -ne 1) { throw 'Production feed requires exactly one current Full package.' }
+        if ($currentTypes -ccontains 'Delta') {
+            $priorFullAssets = @($releaseAssets | Where-Object {
+                    [string]$_.Type -ceq 'Full' -and [version][string]$_.Version -lt [version]$Version
+                } | Sort-Object { [version][string]$_.Version })
+            if ($priorFullAssets.Count -eq 0) { throw 'Production Delta requires a preceding Full package.' }
+            $basePackagePath = Join-Path $assetDirectory ([string]$priorFullAssets[-1].FileName)
+            $deltaPackagePath = Join-Path $assetDirectory "$productionPackageId-$Version-delta.nupkg"
+            $currentFullPath = Join-Path $assetDirectory "$productionPackageId-$Version-full.nupkg"
+            $reconstructedFullPath = Join-Path $buildRoot 'delta-reconstructed-full.nupkg'
+            Invoke-ProductionCommand 'verify-delta-reconstruction' 'dotnet' @(
+                'tool','run','vpk','--','delta','patch','--base',$basePackagePath,'--patch',$deltaPackagePath,'--output',$reconstructedFullPath) $sourceSnapshot
+            if ((Get-LowerSha256 $reconstructedFullPath) -cne (Get-LowerSha256 $currentFullPath)) {
+                throw 'Delta reconstruction differs from the current Full package.'
+            }
+            Remove-Item -LiteralPath $reconstructedFullPath -Force
+        }
         $catalog = [Collections.Generic.List[object]]::new()
         $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-Setup.exe"; Type='Installer' })
         $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-$Version-full.nupkg"; Type='Full' })
@@ -631,11 +591,11 @@ function Invoke-ProductionRelease {
         $validatorArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bundleValidator,'-BundlePath',$assetDirectory,
             '-PublisherCertificatePath',$publisherCertificate,'-ExpectedVersion',$Version,'-ExpectedPublisherSpkiSha256',$expectedSpki,'-OutputReportPath',$preZipReport)
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $validatorArguments += '-RequireTimestamp' }
-        Invoke-ProductionCommand 'verify-production-directory' 'pwsh' $validatorArguments
+        Invoke-ProductionCommand 'verify-production-directory' 'pwsh' $validatorArguments $sourceSnapshot
 
         $zipName = "$productionPackageId-$Version-$productionChannel-upload.zip"
-        $finalZipPath = Join-Path $productionOutput $zipName
-        $finalReportPath = Join-Path $productionOutput "$productionPackageId-$Version-$productionChannel-verification.json"
+        $finalZipPath = Join-Path $productionStage $zipName
+        $finalReportPath = Join-Path $productionStage "$productionPackageId-$Version-$productionChannel-verification.json"
         $partialSuffix = ".partial-$([Guid]::NewGuid().ToString('N'))"
         $partialZipPath = Join-Path $buildRoot ($zipName + $partialSuffix + '.zip')
         $partialReportPath = Join-Path $buildRoot (([IO.Path]::GetFileName($finalReportPath)) + $partialSuffix + '.json')
@@ -656,30 +616,32 @@ function Invoke-ProductionRelease {
         $zipValidatorArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bundleValidator,'-BundlePath',$partialZipPath,
             '-PublisherCertificatePath',$publisherCertificate,'-ExpectedVersion',$Version,'-ExpectedPublisherSpkiSha256',$expectedSpki,'-OutputReportPath',$partialReportPath)
         if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $zipValidatorArguments += '-RequireTimestamp' }
-        Invoke-ProductionCommand 'verify-reopened-production-zip' 'pwsh' $zipValidatorArguments
+        Invoke-ProductionCommand 'verify-reopened-production-zip' 'pwsh' $zipValidatorArguments $sourceSnapshot
         [IO.File]::Move($partialReportPath, $finalReportPath)
         $reportPath = $finalReportPath
         [IO.File]::Move($partialZipPath, $finalZipPath)
         $zipPath = $finalZipPath
-        $finalLogDirectory = Join-Path $productionOutput 'build-logs'
+        $finalLogDirectory = Join-Path $productionStage 'build-logs'
         [IO.Directory]::Move($logDirectory, $finalLogDirectory)
+        if (Test-Path -LiteralPath $buildRoot) { Remove-Item -LiteralPath $buildRoot -Recurse -Force }
+        [IO.Directory]::Move($productionStage, $productionOutput)
+        $zipPath = Join-Path $productionOutput $zipName
+        $reportPath = Join-Path $productionOutput "$productionPackageId-$Version-$productionChannel-verification.json"
         Write-Output "Production OTA upload bundle created: $zipPath"
         Write-Output "Verification report: $reportPath"
         if ([string]::IsNullOrWhiteSpace($TimestampUrl)) { Write-Output 'Authenticode mode: signed and explicitly untimestamped.' }
         else { Write-Output "Authenticode mode: signed with required timestamp service $TimestampUrl" }
     }
     catch {
-        if ($null -ne $zipPath -and (Test-Path -LiteralPath $zipPath)) { Remove-Item -LiteralPath $zipPath -Force }
-        if ($null -ne $reportPath -and (Test-Path -LiteralPath $reportPath)) { Remove-Item -LiteralPath $reportPath -Force }
         if (Test-Path -LiteralPath $logDirectory) {
-            $failureLogDirectory = Join-Path $productionOutput 'failure-logs'
-            if (Test-Path -LiteralPath $failureLogDirectory) { Remove-Item -LiteralPath $failureLogDirectory -Recurse -Force }
+            $failureLogDirectory = "$productionOutput.failure-logs-$([Guid]::NewGuid().ToString('N'))"
             [IO.Directory]::Move($logDirectory, $failureLogDirectory)
         }
+        if (Test-Path -LiteralPath $productionStage) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
         throw
     }
     finally {
-        if (Test-Path -LiteralPath $buildRoot) { Remove-Item -LiteralPath $buildRoot -Recurse -Force }
+        if (Test-Path -LiteralPath $productionStage) { Remove-Item -LiteralPath $productionStage -Recurse -Force }
         $signingRsa.Dispose()
     }
 }

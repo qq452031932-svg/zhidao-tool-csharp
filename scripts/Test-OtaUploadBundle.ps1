@@ -90,6 +90,13 @@ function Get-CertificateSpki([Security.Cryptography.X509Certificates.X509Certifi
     finally { $rsa.Dispose() }
 }
 
+function Get-AnyCertificateSpki([Security.Cryptography.X509Certificates.X509Certificate2]$Certificate) {
+    $rsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
+    if ($null -eq $rsa) { throw 'Executable signer certificate must use RSA.' }
+    try { return Get-BytesSha256 $rsa.ExportSubjectPublicKeyInfo() }
+    finally { $rsa.Dispose() }
+}
+
 function Add-AuthenticodeHashRange(
     [Security.Cryptography.IncrementalHash]$Hash,
     [IO.FileStream]$Stream,
@@ -180,11 +187,18 @@ function Get-VerifiedAuthenticode([string]$Path) {
         $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
         $cms.Decode($pkcs7Bytes)
         $cms.CheckSignature($true)
+        if ($cms.ContentInfo.ContentType.Value -cne '1.3.6.1.4.1.311.2.1.4') {
+            throw 'Executable CMS content is not SPC_INDIRECT_DATA_OBJID Authenticode content.'
+        }
         if ($cms.SignerInfos.Count -ne 1 -or $null -eq $cms.SignerInfos[0].Certificate) { throw 'Executable Authenticode signer is ambiguous.' }
 
         $asn = [System.Formats.Asn1.AsnReader]::new($cms.ContentInfo.Content, [System.Formats.Asn1.AsnEncodingRules]::BER)
         $root = $asn.ReadSequence()
-        [void]$root.ReadEncodedValue()
+        $imageData = $root.ReadSequence()
+        if ($imageData.ReadObjectIdentifier() -cne '1.3.6.1.4.1.311.2.1.15') {
+            throw 'Executable Authenticode content is not bound to PE-image data.'
+        }
+        while ($imageData.HasData) { [void]$imageData.ReadEncodedValue() }
         $digestInfo = $root.ReadSequence()
         $algorithm = $digestInfo.ReadSequence()
         $algorithmOid = $algorithm.ReadObjectIdentifier()
@@ -212,7 +226,7 @@ function Get-VerifiedAuthenticode([string]$Path) {
     finally { $reader.Dispose(); $stream.Dispose() }
 }
 
-function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$TimestampRequired) {
+function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$TimestampRequired, [string]$EvidencePath) {
     try { $verified = Get-VerifiedAuthenticode $Path }
     catch { throw "Executable is not validly Authenticode signed: $([IO.Path]::GetFileName($Path)) ($($_.Exception.Message))" }
     $actualSpki = Get-CertificateSpki $verified.Signer.Certificate
@@ -224,14 +238,64 @@ function Assert-Authenticode([string]$Path, [string]$ExpectedSpki, [bool]$Timest
     if ($TimestampRequired -and ($null -eq $authenticodeStatus.TimeStamperCertificate -or $null -eq $timestampUtc)) {
         throw "Executable is missing the required Authenticode timestamp: $([IO.Path]::GetFileName($Path))"
     }
+    $validationTime = if ($null -eq $timestampUtc) { [DateTime]::UtcNow } else { $timestampUtc }
+    if ($validationTime -lt $verified.Signer.Certificate.NotBefore.ToUniversalTime() -or
+        $validationTime -gt $verified.Signer.Certificate.NotAfter.ToUniversalTime()) {
+        throw "Executable publisher certificate was not valid at its effective signing time: $EvidencePath"
+    }
+    if ($null -ne $timestampUtc) {
+        if ($timestampUtc -gt [DateTime]::UtcNow.AddMinutes(5)) { throw "Executable timestamp is unreasonably in the future: $EvidencePath" }
+        $tsaCertificate = $authenticodeStatus.TimeStamperCertificate
+        $timestampingOid = '1.3.6.1.5.5.7.3.8'
+        $hasTimestampingEku = @($tsaCertificate.Extensions | Where-Object {
+                $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+                @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $timestampingOid }).Count -eq 1
+            }).Count -eq 1
+        if (-not $hasTimestampingEku -or $timestampUtc -lt $tsaCertificate.NotBefore.ToUniversalTime() -or
+            $timestampUtc -gt $tsaCertificate.NotAfter.ToUniversalTime()) { throw "Executable timestamp authority is invalid: $EvidencePath" }
+        $tsaChain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+        try {
+            $tsaChain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $tsaChain.ChainPolicy.VerificationTime = $timestampUtc
+            $tsaChain.ChainPolicy.VerificationFlags = [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+            if (-not $tsaChain.Build($tsaCertificate)) { throw "Executable timestamp authority chain is not trusted: $EvidencePath" }
+        }
+        finally { $tsaChain.Dispose() }
+    }
     $signatureEvidence.Add([ordered]@{
-        file = [IO.Path]::GetFileName($Path)
+        file = $EvidencePath
+        policy = 'publisher-authenticode-spki'
         signerSpkiSha256 = $actualSpki
         imageDigestVerified = $true
         platformStatus = [string]$authenticodeStatus.Status
         timestampPresent = ($null -ne $timestampUtc)
         timestampUtc = if ($null -eq $timestampUtc) { $null } else { $timestampUtc.ToString('O') }
     })
+    if ($null -ne $authenticodeStatus.TimeStamperCertificate) { $authenticodeStatus.TimeStamperCertificate.Dispose() }
+    if ($null -ne $authenticodeStatus.SignerCertificate) { $authenticodeStatus.SignerCertificate.Dispose() }
+    if ($null -ne $verified.Signer.Certificate) { $verified.Signer.Certificate.Dispose() }
+    $authenticodeStatus = $null
+    $verified = $null
+}
+
+function Assert-ThirdPartyAuthenticode([string]$Path, [string]$ExpectedSpki, [string]$EvidencePath, [string]$ExpectedHash) {
+    try { $verified = Get-VerifiedAuthenticode $Path }
+    catch { throw "Third-party executable is not validly Authenticode signed: $EvidencePath ($($_.Exception.Message))" }
+    $actualSpki = Get-AnyCertificateSpki $verified.Signer.Certificate
+    if ($actualSpki -cne $ExpectedSpki) { throw "Third-party executable signer SPKI is not trusted: $EvidencePath" }
+    $actualHash = Get-FileSha256 $Path
+    if ($actualHash -cne $ExpectedHash) { throw "Third-party executable hash differs from its authenticated helper manifest: $EvidencePath" }
+    $signatureEvidence.Add([ordered]@{
+        file = $EvidencePath
+        policy = 'python-psf-authenticode-and-helper-manifest'
+        signerSpkiSha256 = $actualSpki
+        sha256 = $actualHash
+        imageDigestVerified = $true
+        timestampPresent = $false
+        timestampUtc = $null
+    })
+    if ($null -ne $verified.Signer.Certificate) { $verified.Signer.Certificate.Dispose() }
+    $verified = $null
 }
 
 $resolvedBundle = [IO.Path]::GetFullPath($BundlePath)
@@ -326,19 +390,33 @@ try {
         try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
     }
 
-    function Test-SafeInnerPath([string]$Name) {
+    function Get-WindowsCanonicalInnerPath([string]$Name) {
         if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 1024 -or
             $Name.StartsWith('/') -or $Name.StartsWith('\') -or $Name.Contains('\') -or
-            $Name.Contains([char]0) -or $Name -match '^[A-Za-z]:') { return $false }
+            $Name.Contains([char]0) -or $Name -match '^[A-Za-z]:') { return $null }
         $parts = @($Name.Split('/'))
-        return $parts.Count -gt 0 -and @($parts | Where-Object { $_ -in @('', '.', '..') }).Count -eq 0
+        if ($parts.Count -eq 0) { return $null }
+        $canonicalParts = [Collections.Generic.List[string]]::new()
+        foreach ($part in $parts) {
+            if ($part -in @('', '.', '..') -or $part.Length -gt 255 -or $part.EndsWith(' ') -or $part.EndsWith('.') -or $part.Contains(':')) { return $null }
+            foreach ($character in $part.ToCharArray()) { if ([int]$character -lt 0x20 -or [int]$character -eq 0x7f) { return $null } }
+            $normalized = $part.Normalize([Text.NormalizationForm]::FormC)
+            $stem = $normalized.Split('.')[0].ToUpperInvariant()
+            if ($stem -in @('CON','PRN','AUX','NUL','CLOCK$','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9','LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9')) { return $null }
+            $canonicalParts.Add($normalized)
+        }
+        $canonical = $canonicalParts -join '/'
+        if ($canonical.Length -gt 240) { return $null }
+        return $canonical
     }
 
     function Assert-InnerArchive(
         [string]$ArchivePath,
         [string]$Description,
         [string[]]$RequiredPublisherExecutables,
-        [string[]]$AllowedThirdPartyExecutables = @()) {
+        [string[]]$AllowedThirdPartyExecutables = @(),
+        [string]$ExpectedPackageVersion,
+        [ValidateSet('Full','Delta','Portable')][string]$ExpectedPackageType) {
         $inner = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
         try {
             if ($inner.Entries.Count -eq 0 -or $inner.Entries.Count -gt 4096) { throw "$Description has an invalid entry count." }
@@ -346,9 +424,10 @@ try {
             $innerExpanded = [long]0
             $innerCompressed = [long]0
             foreach ($innerEntry in $inner.Entries) {
-                if ([string]::IsNullOrEmpty($innerEntry.Name) -or -not (Test-SafeInnerPath $innerEntry.FullName)) { throw "$Description contains an unsafe path." }
-                if ($innerNames.ContainsKey($innerEntry.FullName)) { throw "$Description contains duplicate or case-colliding paths." }
-                $innerNames.Add($innerEntry.FullName, $innerEntry.FullName)
+                $canonicalInnerPath = Get-WindowsCanonicalInnerPath $innerEntry.FullName
+                if ([string]::IsNullOrEmpty($innerEntry.Name) -or $null -eq $canonicalInnerPath) { throw "$Description contains an unsafe Windows path." }
+                if ($innerNames.ContainsKey($canonicalInnerPath)) { throw "$Description contains duplicate, case-colliding, or Unicode-normalization-aliased paths." }
+                $innerNames.Add($canonicalInnerPath, $innerEntry.FullName)
                 $unixType = (($innerEntry.ExternalAttributes -shr 16) -band 0xF000)
                 if ($unixType -eq 0xA000 -or ($innerEntry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
                     throw "$Description contains a symbolic-link or reparse-point entry."
@@ -365,6 +444,78 @@ try {
             }
             if ($innerCompressed -gt 0 -and ([double]$innerExpanded / [double]$innerCompressed) -gt 100.0) {
                 throw "$Description has an excessive aggregate compression ratio."
+            }
+            if ($ExpectedPackageType -ceq 'Portable') {
+                foreach ($requiredPortablePath in @(
+                    '.portable',
+                    'current/BaiduBatchTransfer.App.dll',
+                    'current/BaiduBatchTransfer.App.deps.json',
+                    'current/BaiduBatchTransfer.App.runtimeconfig.json')) {
+                    if (-not $innerNames.ContainsKey($requiredPortablePath) -or $innerNames[$requiredPortablePath] -cne $requiredPortablePath) {
+                        throw "Portable archive is missing required Velopack content: $requiredPortablePath"
+                    }
+                }
+            }
+            else {
+                foreach ($requiredPackagePath in @('[Content_Types].xml','_rels/.rels',"$packageId.nuspec")) {
+                    if (-not $innerNames.ContainsKey($requiredPackagePath) -or $innerNames[$requiredPackagePath] -cne $requiredPackagePath) {
+                        throw "$Description is missing required Velopack package content: $requiredPackagePath"
+                    }
+                }
+                $nuspecEntry = $inner.GetEntry("$packageId.nuspec")
+                if ($null -eq $nuspecEntry -or $nuspecEntry.Length -le 0 -or $nuspecEntry.Length -gt 1048576) {
+                    throw "$Description has an invalid Velopack package nuspec."
+                }
+                $settings = [Xml.XmlReaderSettings]::new()
+                $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+                $settings.XmlResolver = $null
+                $settings.MaxCharactersInDocument = 1048576
+                $nuspecStream = $nuspecEntry.Open(); $xmlReader = [Xml.XmlReader]::Create($nuspecStream, $settings)
+                try { $nuspec = [Xml.XmlDocument]::new(); $nuspec.XmlResolver = $null; $nuspec.Load($xmlReader) }
+                catch { throw "$Description Velopack package nuspec is invalid XML." }
+                finally { $xmlReader.Dispose(); $nuspecStream.Dispose() }
+                $namespace = [Xml.XmlNamespaceManager]::new($nuspec.NameTable)
+                $namespace.AddNamespace('n', $nuspec.DocumentElement.NamespaceURI)
+                $metadata = $nuspec.SelectSingleNode('/n:package/n:metadata', $namespace)
+                if ($null -eq $metadata -or
+                    [string]$metadata.SelectSingleNode('n:id', $namespace).InnerText -cne $packageId -or
+                    [string]$metadata.SelectSingleNode('n:version', $namespace).InnerText -cne $ExpectedPackageVersion -or
+                    [string]$metadata.SelectSingleNode('n:channel', $namespace).InnerText -cne $channel -or
+                    [string]$metadata.SelectSingleNode('n:mainExe', $namespace).InnerText -cne 'BaiduBatchTransfer.App.exe' -or
+                    [string]$metadata.SelectSingleNode('n:os', $namespace).InnerText -cne 'win' -or
+                    [string]$metadata.SelectSingleNode('n:rid', $namespace).InnerText -cne 'win-x64') {
+                    throw "$Description Velopack package nuspec identity, version, or type metadata is invalid."
+                }
+                if ($ExpectedPackageType -ceq 'Full') {
+                    foreach ($requiredFullPath in @(
+                        'lib/app/BaiduBatchTransfer.App.dll',
+                        'lib/app/BaiduBatchTransfer.App.deps.json',
+                        'lib/app/BaiduBatchTransfer.App.runtimeconfig.json')) {
+                        if (-not $innerNames.ContainsKey($requiredFullPath) -or $innerNames[$requiredFullPath] -cne $requiredFullPath) {
+                            throw "$Description is missing required Full package content: $requiredFullPath"
+                        }
+                    }
+                }
+                else {
+                    $mainPatchBase = 'lib/app/BaiduBatchTransfer.App.exe'
+                    $hasMainPatch = $innerNames.ContainsKey("$mainPatchBase.diff") -or $innerNames.ContainsKey("$mainPatchBase.zsdiff")
+                    $patches = @($inner.Entries | Where-Object {
+                        $_.FullName.StartsWith('lib/app/', [StringComparison]::Ordinal) -and
+                        ($_.FullName.EndsWith('.diff', [StringComparison]::Ordinal) -or $_.FullName.EndsWith('.zsdiff', [StringComparison]::Ordinal))
+                    })
+                    if (-not $hasMainPatch -or -not $innerNames.ContainsKey("$mainPatchBase.shasum") -or $patches.Count -eq 0) {
+                        throw 'Delta package has no meaningful patch payload for the main executable.'
+                    }
+                    foreach ($patch in $patches) {
+                        $basePath = if ($patch.FullName.EndsWith('.zsdiff', [StringComparison]::Ordinal)) {
+                            $patch.FullName.Substring(0, $patch.FullName.Length - 7)
+                        }
+                        else { $patch.FullName.Substring(0, $patch.FullName.Length - 5) }
+                        if (-not $innerNames.ContainsKey("$basePath.shasum")) {
+                            throw "Delta package patch is missing its shasum: $($patch.FullName)"
+                        }
+                    }
+                }
             }
             $executableIndex = 0
             foreach ($requiredName in $RequiredPublisherExecutables) {
@@ -391,7 +542,43 @@ try {
                 $executableIndex++
                 $input = $requiredEntry.Open(); $output = [IO.File]::Create($destination)
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
-                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent
+                Assert-Authenticode $destination $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent "$Description::$requiredName"
+            }
+            $psfSpki = '7a1e6298a8fc5ec53e6389ad8532cb869e36233caf30c5ee0a1108d09a2b9801'
+            foreach ($thirdPartyName in $AllowedThirdPartyExecutables) {
+                if (-not $innerNames.ContainsKey($thirdPartyName)) { continue }
+                $manifestName = $thirdPartyName.Substring(0, $thirdPartyName.LastIndexOf('/') + 1) + 'helper-manifest.json'
+                if (-not $innerNames.ContainsKey($manifestName)) { throw "$Description is missing the authenticated helper manifest for $thirdPartyName" }
+                $manifestEntry = $inner.GetEntry($manifestName)
+                $manifestReader = [IO.StreamReader]::new($manifestEntry.Open(), [Text.UTF8Encoding]::new($false, $true), $true, 4096, $false)
+                try { $helperManifest = $manifestReader.ReadToEnd() | ConvertFrom-Json }
+                finally { $manifestReader.Dispose() }
+                $leaf = [IO.Path]::GetFileName($thirdPartyName)
+                $manifestFiles = @($helperManifest.files | Where-Object { [string]$_.path -ceq $leaf })
+                if ($manifestFiles.Count -ne 1 -or [string]$manifestFiles[0].sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                    throw "$Description helper manifest does not uniquely authenticate $leaf"
+                }
+                $thirdPartyEntry = $inner.GetEntry($thirdPartyName)
+                if ([long]$manifestFiles[0].length -ne $thirdPartyEntry.Length) { throw "$Description helper manifest length differs for $leaf" }
+                $thirdPartyDestination = Join-Path $temporaryRoot ("third-party-$executableIndex.exe")
+                $executableIndex++
+                $input = $thirdPartyEntry.Open(); $output = [IO.File]::Create($thirdPartyDestination)
+                try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+                Assert-ThirdPartyAuthenticode $thirdPartyDestination $psfSpki "$Description::$thirdPartyName" ([string]$manifestFiles[0].sha256)
+            }
+            foreach ($peEntry in @($inner.Entries | Where-Object {
+                        $_.FullName.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase) -or
+                        $_.FullName.EndsWith('.pyd', [StringComparison]::OrdinalIgnoreCase)
+                    })) {
+                $signatureEvidence.Add([ordered]@{
+                    file = "$Description::$($peEntry.FullName)"
+                    policy = 'authenticated-package-closure'
+                    signerSpkiSha256 = $null
+                    sha256 = Get-LowerHash ([Security.Cryptography.SHA256]::Create()) $peEntry.Open()
+                    imageDigestVerified = $false
+                    timestampPresent = $false
+                    timestampUtc = $null
+                })
             }
         }
         finally { $inner.Dispose() }
@@ -460,6 +647,21 @@ try {
     foreach ($fileName in @($actualFiles.Keys | Where-Object { $_ -clike '*.nupkg' })) { if (-not $releaseFiles.Contains($fileName)) { throw "Unreferenced package file: $fileName" } }
     $currentVersion = @($versions | Sort-Object { [version]$_ } -Descending)[0]
     if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion) -and $currentVersion -cne $ExpectedVersion) { throw 'Production release version does not match ExpectedVersion.' }
+    $deltaAssets = @($assets | Where-Object { [string]$_.Type -ceq 'Delta' })
+    if ($deltaAssets.Count -gt 0) {
+        $deltaVersions = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($deltaAsset in $deltaAssets) {
+            $deltaVersion = [string]$deltaAsset.Version
+            if (-not $deltaVersions.Add($deltaVersion) -or -not $fullFiles.Contains("$packageId-$deltaVersion-full.nupkg")) {
+                throw 'Each production Delta must uniquely match a Full package version.'
+            }
+            $priorFullVersions = @($assets | Where-Object {
+                    [string]$_.Type -ceq 'Full' -and (Compare-Version ([string]$_.Version) $deltaVersion) -lt 0
+                } | ForEach-Object { [string]$_.Version })
+            if ($priorFullVersions.Count -eq 0) { throw 'Production Delta has no lower Full base version.' }
+        }
+        if (-not $deltaVersions.Contains($currentVersion)) { throw 'Current production Full package has no matching Delta.' }
+    }
 
     try { $catalog = $utf8Strict.GetString((Read-EntryBytes $assetCatalogName 1048576)) | ConvertFrom-Json }
     catch { throw 'Production asset catalog is invalid.' }
@@ -494,7 +696,7 @@ try {
     $setupName = "$packageId-Setup.exe"
     $setupPath = Join-Path $temporaryRoot $setupName
     Extract-Entry $setupName $setupPath
-    Assert-Authenticode $setupPath $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent
+    Assert-Authenticode $setupPath $ExpectedPublisherSpkiSha256 $RequireTimestamp.IsPresent $setupName
 
     $portableName = "$packageId-Portable.zip"
     $portablePath = Join-Path $temporaryRoot $portableName
@@ -504,7 +706,7 @@ try {
         'Update.exe',
         'current/BaiduBatchTransfer.App.exe') @(
         'current/managed-browser-helper/python.exe',
-        'current/managed-browser-helper/pythonw.exe')
+        'current/managed-browser-helper/pythonw.exe') $currentVersion 'Portable'
 
     $packageIndex = 0
     foreach ($asset in $assets) {
@@ -520,7 +722,7 @@ try {
             @('lib/app/managed-browser-helper/python.exe', 'lib/app/managed-browser-helper/pythonw.exe')
         }
         else { @() }
-        Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables
+        Assert-InnerArchive $packagePath "Package $packageName" $requiredPackageExecutables $allowedPackageExecutables ([string]$asset.Version) ([string]$asset.Type)
     }
 
     $report = [ordered]@{
@@ -549,5 +751,14 @@ try {
 finally {
     if ($null -ne $archive) { $archive.Dispose() }
     $publisherCertificate.Dispose()
-    if ($null -ne $temporaryRoot -and (Test-Path -LiteralPath $temporaryRoot)) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
+    if ($null -ne $temporaryRoot -and (Test-Path -LiteralPath $temporaryRoot)) {
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            try { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop; break }
+            catch {
+                if ($attempt -eq 19) { throw }
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
 }
