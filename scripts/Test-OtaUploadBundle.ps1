@@ -644,7 +644,7 @@ try {
             foreach ($requiredName in $RequiredPublisherExecutables) {
                 $requiredEntry = $inner.GetEntry($requiredName)
                 if ($null -eq $requiredEntry -or $requiredEntry.Length -le 0) { throw "$Description has an empty required publisher executable." }
-                $destination = Join-Path $temporaryRoot ("inner-$executableIndex.exe")
+                $destination = Join-Path $temporaryRoot ("inner-$executableIndex-$([Guid]::NewGuid().ToString('N')).exe")
                 $executableIndex++
                 $input = $requiredEntry.Open(); $output = [IO.File]::Create($destination)
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
@@ -666,7 +666,7 @@ try {
                 }
                 $thirdPartyEntry = $inner.GetEntry($thirdPartyName)
                 if ([long]$manifestFiles[0].length -ne $thirdPartyEntry.Length) { throw "$Description helper manifest length differs for $leaf" }
-                $thirdPartyDestination = Join-Path $temporaryRoot ("third-party-$executableIndex.exe")
+                $thirdPartyDestination = Join-Path $temporaryRoot ("third-party-$executableIndex-$([Guid]::NewGuid().ToString('N')).exe")
                 $executableIndex++
                 $input = $thirdPartyEntry.Open(); $output = [IO.File]::Create($thirdPartyDestination)
                 try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
