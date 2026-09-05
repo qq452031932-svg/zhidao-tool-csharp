@@ -195,6 +195,10 @@ func TestReceiveClassifiesMalformedMemberDataAsInvalidArchive(t *testing.T) {
 	}
 }
 
+func TestReceiveRejectsNonemptyStoredMemberWithZeroCRC(t *testing.T) {
+	assertRejectedInvalidArchive(t, makeStoredZIPWithZeroCRC(t, "upload-manifest.sha256", []byte("manifest")))
+}
+
 func assertRejectedInvalidArchive(t *testing.T, archive []byte) {
 	t.Helper()
 	receiver := newTestReceiver(t, t.TempDir(), DefaultLimits(), func(string) (uint64, error) { return 1 << 40, nil })
@@ -261,6 +265,43 @@ func makeZIPWithExtra(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buffer.Bytes()
+}
+
+func makeStoredZIPWithZeroCRC(t *testing.T, name string, contents []byte) []byte {
+	t.Helper()
+	if len(name) > int(^uint16(0)) || len(contents) > int(^uint32(0)) {
+		t.Fatal("fixture input is too large")
+	}
+	var archive bytes.Buffer
+	local := make([]byte, localFileHeaderSize)
+	copy(local, localFileHeaderSignature)
+	binary.LittleEndian.PutUint16(local[4:6], 20)
+	binary.LittleEndian.PutUint32(local[18:22], uint32(len(contents)))
+	binary.LittleEndian.PutUint32(local[22:26], uint32(len(contents)))
+	binary.LittleEndian.PutUint16(local[26:28], uint16(len(name)))
+	archive.Write(local)
+	archive.WriteString(name)
+	archive.Write(contents)
+
+	directoryOffset := archive.Len()
+	central := make([]byte, centralDirectoryHeaderSize)
+	copy(central, centralDirectorySignature)
+	binary.LittleEndian.PutUint16(central[4:6], 20)
+	binary.LittleEndian.PutUint16(central[6:8], 20)
+	binary.LittleEndian.PutUint32(central[20:24], uint32(len(contents)))
+	binary.LittleEndian.PutUint32(central[24:28], uint32(len(contents)))
+	binary.LittleEndian.PutUint16(central[28:30], uint16(len(name)))
+	archive.Write(central)
+	archive.WriteString(name)
+
+	eocd := make([]byte, endOfCentralDirectorySize)
+	copy(eocd, endOfCentralDirectorySignature)
+	binary.LittleEndian.PutUint16(eocd[8:10], 1)
+	binary.LittleEndian.PutUint16(eocd[10:12], 1)
+	binary.LittleEndian.PutUint32(eocd[12:16], uint32(centralDirectoryHeaderSize+len(name)))
+	binary.LittleEndian.PutUint32(eocd[16:20], uint32(directoryOffset))
+	archive.Write(eocd)
+	return archive.Bytes()
 }
 
 type failingReaderAt struct{ err error }

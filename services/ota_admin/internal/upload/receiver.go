@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -288,7 +289,8 @@ func (receiver *Receiver) extract(ctx context.Context, files []*zip.File, root s
 			return nil, 0, fmt.Errorf("create ZIP entry %q: %w", archived.Name, err)
 		}
 		maximum := int64(archived.UncompressedSize64)
-		copied, copyErr := io.CopyBuffer(output, io.LimitReader(&contextReader{ctx: ctx, reader: input}, maximum+1), make([]byte, 64<<10))
+		checksum := crc32.NewIEEE()
+		copied, copyErr := io.CopyBuffer(io.MultiWriter(output, checksum), io.LimitReader(&contextReader{ctx: ctx, reader: input}, maximum+1), make([]byte, 64<<10))
 		if copyErr == nil && copied <= maximum {
 			copyErr = output.Sync()
 		}
@@ -305,6 +307,9 @@ func (receiver *Receiver) extract(ctx context.Context, files []*zip.File, root s
 		}
 		if copied != maximum {
 			return nil, 0, fmt.Errorf("%w: ZIP entry %q size mismatch", ErrInvalidArchive, archived.Name)
+		}
+		if checksum.Sum32() != archived.CRC32 {
+			return nil, 0, fmt.Errorf("%w: ZIP entry %q checksum mismatch", ErrInvalidArchive, archived.Name)
 		}
 		if copied > receiver.limits.SingleFileBytes || total > receiver.limits.ExpandedBytes-copied {
 			return nil, 0, ErrExpandedLimit
