@@ -17,11 +17,12 @@ public sealed class SignedFeedStateStoreTests
 
         Assert.Equal("2.0.0", accepted.HighestAcceptedVersion);
         Assert.Equal(FeedIdentity, accepted.FeedIdentity);
-        Assert.Single(Directory.EnumerateFiles(fixture.DirectoryPath));
-        Assert.Equal(fixture.StatePath, Directory.EnumerateFiles(fixture.DirectoryPath).Single());
+        Assert.True(File.Exists(fixture.StatePath));
+        Assert.False(File.Exists(fixture.PreviousStatePath));
         using var document = JsonDocument.Parse(File.ReadAllBytes(fixture.StatePath));
-        Assert.Equal(1, document.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(2, document.RootElement.GetProperty("schemaVersion").GetInt32());
         Assert.Equal("2.0.0", document.RootElement.GetProperty("highestAcceptedVersion").GetString());
+        Assert.Equal(64, document.RootElement.GetProperty("recordChecksumSha256").GetString()!.Length);
     }
 
     [Fact]
@@ -93,6 +94,118 @@ public sealed class SignedFeedStateStoreTests
     }
 
     [Fact]
+    public void ReadExposesTheCurrentApplicationVersionAsTheEffectiveFloor()
+    {
+        using var fixture = new StateFixture();
+        fixture.CreateStore().Accept("1.5.0", new string('a', 64));
+
+        var effective = fixture.CreateStore(currentVersion: "2.0.0").Read();
+
+        Assert.Equal("2.0.0", effective.HighestAcceptedVersion);
+        Assert.Equal(string.Empty, effective.ManifestSha256);
+    }
+
+    [Fact]
+    public void CorruptNewestSlotRecoversThePriorDurableFloor()
+    {
+        using var fixture = new StateFixture();
+        var store = fixture.CreateStore();
+        store.Accept("2.0.0", new string('a', 64));
+        store.Accept("3.0.0", new string('b', 64));
+        var newest = fixture.FindSlot("3.0.0");
+        File.WriteAllText(newest, "{torn");
+
+        var recovered = fixture.CreateStore().Read();
+
+        Assert.Equal("2.0.0", recovered.HighestAcceptedVersion);
+        Assert.Equal(new string('a', 64), recovered.ManifestSha256);
+        Assert.Throws<InvalidDataException>(() =>
+            fixture.CreateStore().Accept("1.9.9", new string('c', 64)));
+    }
+
+    [Fact]
+    public void ChecksumTamperingInNewestSlotRecoversThePriorDurableFloor()
+    {
+        using var fixture = new StateFixture();
+        var store = fixture.CreateStore();
+        store.Accept("2.0.0", new string('a', 64));
+        store.Accept("3.0.0", new string('b', 64));
+        var newest = fixture.FindSlot("3.0.0");
+        var tampered = File.ReadAllText(newest).Replace(
+            "\"highestAcceptedVersion\":\"3.0.0\"",
+            "\"highestAcceptedVersion\":\"9.0.0\"",
+            StringComparison.Ordinal);
+        File.WriteAllText(newest, tampered);
+
+        var recovered = fixture.CreateStore().Read();
+
+        Assert.Equal("2.0.0", recovered.HighestAcceptedVersion);
+        Assert.Equal(new string('a', 64), recovered.ManifestSha256);
+    }
+
+    [Fact]
+    public void ExistingJournalWithNoValidSlotFailsClosed()
+    {
+        using var fixture = new StateFixture();
+        Directory.CreateDirectory(fixture.DirectoryPath);
+        File.WriteAllText(fixture.StatePath, "{torn");
+        File.WriteAllText(fixture.PreviousStatePath, "{also-torn");
+
+        Assert.Throws<InvalidDataException>(() => fixture.CreateStore().Read());
+        Assert.Throws<InvalidDataException>(() =>
+            fixture.CreateStore().Accept("9.0.0", new string('a', 64)));
+    }
+
+    [Fact]
+    public void ValidSameVersionWithDifferentManifestAcrossSlotsFailsClosed()
+    {
+        using var fixture = new StateFixture();
+        fixture.CreateStore().Accept("2.0.0", new string('a', 64));
+        using var other = new StateFixture();
+        other.CreateStore().Accept("2.0.0", new string('b', 64));
+        File.Copy(other.StatePath, fixture.PreviousStatePath);
+
+        Assert.Throws<InvalidDataException>(() => fixture.CreateStore().Read());
+    }
+
+    [Fact]
+    public void StateLockCoordinatesWithASeparateProcess()
+    {
+        using var fixture = new StateFixture();
+        var store = fixture.CreateStore(lockTimeout: TimeSpan.FromSeconds(5));
+        Directory.CreateDirectory(fixture.DirectoryPath);
+        var readyPath = Path.Combine(fixture.DirectoryPath, "holder.ready");
+        var script =
+            $"$s=[IO.File]::Open('{EscapePowerShell(store.LockFilePath)}',[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);" +
+            $"[IO.File]::WriteAllText('{EscapePowerShell(readyPath)}','ready');" +
+            "Start-Sleep -Milliseconds 900;$s.Dispose()";
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
+        using var holder = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encoded}",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        })!;
+        try
+        {
+            Assert.True(SpinWait.SpinUntil(() => File.Exists(readyPath), TimeSpan.FromSeconds(5)));
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+            store.Accept("2.0.0", new string('a', 64));
+
+            stopwatch.Stop();
+            Assert.True(stopwatch.Elapsed >= TimeSpan.FromMilliseconds(400), stopwatch.Elapsed.ToString());
+            Assert.True(holder.WaitForExit(5000));
+            Assert.Equal(0, holder.ExitCode);
+        }
+        finally
+        {
+            if (!holder.HasExited) holder.Kill(entireProcessTree: true);
+        }
+    }
+
+    [Fact]
     public async Task ConcurrentWritersSerializeAndPreserveTheHighestVersion()
     {
         using var fixture = new StateFixture();
@@ -131,9 +244,20 @@ public sealed class SignedFeedStateStoreTests
 
         public string StatePath { get; }
 
-        public SignedFeedStateStore CreateStore(string currentVersion = "1.0.0") =>
-            new(StatePath, FeedIdentity, currentVersion);
+        public string PreviousStatePath => StatePath + ".previous";
+
+        public SignedFeedStateStore CreateStore(
+            string currentVersion = "1.0.0",
+            TimeSpan? lockTimeout = null) =>
+            new(StatePath, FeedIdentity, currentVersion, lockTimeout);
+
+        public string FindSlot(string version) => new[] { StatePath, PreviousStatePath }
+            .Single(path => File.Exists(path) && File.ReadAllText(path).Contains(
+                $"\"highestAcceptedVersion\":\"{version}\"",
+                StringComparison.Ordinal));
 
         public void Dispose() => Directory.Delete(DirectoryPath, recursive: true);
     }
+
+    private static string EscapePowerShell(string value) => value.Replace("'", "''");
 }

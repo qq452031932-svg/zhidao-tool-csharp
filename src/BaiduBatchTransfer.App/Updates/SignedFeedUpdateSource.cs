@@ -13,12 +13,15 @@ namespace BaiduBatchTransfer.App.Updates;
 internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
 {
     internal const int MaxReleaseFeedBytes = 1024 * 1024;
+    internal const long MaxPackageBytes = 2L * 1024 * 1024 * 1024;
 
     private const int SignatureBytes = 3072 / 8;
     private const string ManifestFileName = "upload-manifest.sha256";
     private const string ManifestSignatureFileName = "upload-manifest.sha256.sig";
     private const string ExpectedPackageId = "SuperPan.BaiduBatchTransfer";
     private const string ExpectedChannel = "win-x64-stable";
+    private static readonly TimeSpan DefaultMetadataOperationTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultPackageInactivityTimeout = TimeSpan.FromSeconds(30);
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly object sync = new();
@@ -29,6 +32,8 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
     private readonly SignedFeedStateStore stateStore;
     private readonly HttpClient httpClient;
     private readonly Func<byte[], byte[], SignedFeedManifest> verifyManifest;
+    private readonly TimeSpan metadataOperationTimeout;
+    private readonly TimeSpan packageInactivityTimeout;
     private SignedFeedVerificationSnapshot? latestSnapshot;
     private int disposed;
 
@@ -38,9 +43,11 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
             stateStore,
             new HttpClient(CreateProductionHttpHandler(), disposeHandler: true)
             {
-                Timeout = TimeSpan.FromSeconds(30)
+                Timeout = Timeout.InfiniteTimeSpan
             },
-            static (manifest, signature) => SignedFeedManifest.Verify(manifest, signature))
+            static (manifest, signature) => SignedFeedManifest.Verify(manifest, signature),
+            DefaultMetadataOperationTimeout,
+            DefaultPackageInactivityTimeout)
     {
     }
 
@@ -48,7 +55,9 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
         Uri normalizedBaseUri,
         SignedFeedStateStore stateStore,
         HttpClient httpClient,
-        Func<byte[], byte[], SignedFeedManifest> verifyManifest)
+        Func<byte[], byte[], SignedFeedManifest> verifyManifest,
+        TimeSpan metadataOperationTimeout,
+        TimeSpan packageInactivityTimeout)
     {
         this.baseUri = normalizedBaseUri;
         this.stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
@@ -60,6 +69,12 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
         }
         this.httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         this.verifyManifest = verifyManifest ?? throw new ArgumentNullException(nameof(verifyManifest));
+        this.metadataOperationTimeout = ValidateTimeout(
+            metadataOperationTimeout,
+            nameof(metadataOperationTimeout));
+        this.packageInactivityTimeout = ValidateTimeout(
+            packageInactivityTimeout,
+            nameof(packageInactivityTimeout));
         manifestUri = FixedSibling(ManifestFileName);
         signatureUri = FixedSibling(ManifestSignatureFileName);
         releaseFeedUri = FixedSibling(SignedFeedManifest.ReleaseFeedFileName);
@@ -70,18 +85,22 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
         Uri baseUri,
         SignedFeedStateStore stateStore,
         HttpMessageHandler handler,
-        RSA publicKey)
+        RSA publicKey,
+        TimeSpan? metadataOperationTimeout = null,
+        TimeSpan? packageInactivityTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
         ArgumentNullException.ThrowIfNull(publicKey);
         return new SignedFeedUpdateSource(
             NormalizeBaseUri(baseUri),
             stateStore,
-            new HttpClient(handler, disposeHandler: false) { Timeout = TimeSpan.FromSeconds(30) },
+            new HttpClient(handler, disposeHandler: false) { Timeout = Timeout.InfiniteTimeSpan },
             (manifest, signature) => SignedFeedManifest.VerifyWithPublicKeyForTesting(
                 manifest,
                 signature,
-                publicKey));
+                publicKey),
+            metadataOperationTimeout ?? DefaultMetadataOperationTimeout,
+            packageInactivityTimeout ?? DefaultPackageInactivityTimeout);
     }
 
     internal static HttpClientHandler CreateProductionHttpHandler() => new()
@@ -113,49 +132,60 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
             throw new InvalidDataException("The signed feed package identity or channel is invalid.");
         }
 
-        var manifestBytes = await GetBoundedBytesAsync(
-            manifestUri,
-            SignedFeedManifest.MaxManifestBytes,
-            "manifest").ConfigureAwait(false);
-        var signatureBytes = await GetBoundedBytesAsync(
-            signatureUri,
-            SignatureBytes,
-            "manifest signature").ConfigureAwait(false);
-        var manifest = verifyManifest(manifestBytes, signatureBytes);
-
-        var releaseBytes = await GetBoundedBytesAsync(
-            releaseFeedUri,
-            MaxReleaseFeedBytes,
-            "release feed").ConfigureAwait(false);
-        if (!HashMatches(releaseBytes, manifest.ReleaseFeedEntry.Sha256))
-            throw new InvalidDataException("The release feed is outside the signed manifest closure.");
-
-        VelopackAssetFeed feed;
+        using var metadataTimeout = new CancellationTokenSource(metadataOperationTimeout);
         try
         {
-            var text = StrictUtf8.GetString(releaseBytes);
-            feed = VelopackAssetFeed.FromJson(text);
-        }
-        catch (Exception exception) when (exception is not OutOfMemoryException and
-                                          not StackOverflowException and
-                                          not OperationCanceledException)
-        {
-            throw new InvalidDataException("The signed release feed is malformed.", exception);
-        }
+            var manifestBytes = await GetBoundedBytesAsync(
+                manifestUri,
+                SignedFeedManifest.MaxManifestBytes,
+                "manifest",
+                metadataTimeout.Token).ConfigureAwait(false);
+            var signatureBytes = await GetBoundedBytesAsync(
+                signatureUri,
+                SignatureBytes,
+                "manifest signature",
+                metadataTimeout.Token).ConfigureAwait(false);
+            var manifest = verifyManifest(manifestBytes, signatureBytes);
 
-        var verifiedAssets = ValidateClosure(feed, manifest);
-        var highestVersion = verifiedAssets.Values
-            .Select(asset => SignedFeedProductVersion.Parse(asset.Version, "asset version"))
-            .Max();
-        var manifestSha256 = LowerHash(manifestBytes);
-        stateStore.Accept(highestVersion.ToString(), manifestSha256);
-        var snapshot = new SignedFeedVerificationSnapshot(
-            baseUri.AbsoluteUri,
-            highestVersion.ToString(),
-            manifestSha256,
-            new ReadOnlyDictionary<string, SignedFeedVerifiedAsset>(verifiedAssets));
-        lock (sync) latestSnapshot = snapshot;
-        return feed;
+            var releaseBytes = await GetBoundedBytesAsync(
+                releaseFeedUri,
+                MaxReleaseFeedBytes,
+                "release feed",
+                metadataTimeout.Token).ConfigureAwait(false);
+            if (!HashMatches(releaseBytes, manifest.ReleaseFeedEntry.Sha256))
+                throw new InvalidDataException("The release feed is outside the signed manifest closure.");
+
+            VelopackAssetFeed feed;
+            try
+            {
+                var text = StrictUtf8.GetString(releaseBytes);
+                feed = VelopackAssetFeed.FromJson(text);
+            }
+            catch (Exception exception) when (exception is not OutOfMemoryException and
+                                              not StackOverflowException and
+                                              not OperationCanceledException)
+            {
+                throw new InvalidDataException("The signed release feed is malformed.", exception);
+            }
+
+            var verifiedAssets = ValidateClosure(feed, manifest);
+            var highestVersion = verifiedAssets.Values
+                .Select(asset => SignedFeedProductVersion.Parse(asset.Version, "asset version"))
+                .Max();
+            var manifestSha256 = LowerHash(manifestBytes);
+            stateStore.Accept(highestVersion.ToString(), manifestSha256);
+            var snapshot = new SignedFeedVerificationSnapshot(
+                baseUri.AbsoluteUri,
+                highestVersion.ToString(),
+                manifestSha256,
+                new ReadOnlyDictionary<string, SignedFeedVerifiedAsset>(verifiedAssets));
+            lock (sync) latestSnapshot = snapshot;
+            return feed;
+        }
+        catch (OperationCanceledException exception) when (metadataTimeout.IsCancellationRequested)
+        {
+            throw MetadataTimeoutException(exception);
+        }
     }
 
     public async Task DownloadReleaseEntry(
@@ -182,66 +212,78 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
             }
         }
 
-        var assetUri = FixedSibling(expected.FileName);
-        using var request = new HttpRequestMessage(HttpMethod.Get, assetUri);
-        using var response = await httpClient.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancelToken).ConfigureAwait(false);
-        ValidateResponse(response, assetUri, "update asset");
-        if (response.Content.Headers.ContentLength is { } declaredLength && declaredLength != expected.Size)
-            throw new InvalidDataException("The update asset length does not match the signed feed.");
-
-        var destination = Path.GetFullPath(localFile);
-        var parent = Path.GetDirectoryName(destination)
-            ?? throw new InvalidDataException("The update destination is invalid.");
-        Directory.CreateDirectory(parent);
-        var temporary = Path.Combine(parent, $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.tmp");
+        using var inactivity = CancellationTokenSource.CreateLinkedTokenSource(cancelToken);
         try
         {
-            await using var input = await response.Content.ReadAsStreamAsync(cancelToken).ConfigureAwait(false);
-            await using (var output = new FileStream(
-                             temporary,
-                             FileMode.CreateNew,
-                             FileAccess.Write,
-                             FileShare.None,
-                             bufferSize: 81920,
-                             FileOptions.Asynchronous | FileOptions.SequentialScan))
-            {
-                var buffer = new byte[81920];
-                long total = 0;
-                while (true)
-                {
-                    var read = await input.ReadAsync(buffer, cancelToken).ConfigureAwait(false);
-                    if (read == 0) break;
-                    total += read;
-                    if (total > expected.Size)
-                        throw new InvalidDataException("The update asset exceeds its signed size.");
-                    await output.WriteAsync(buffer.AsMemory(0, read), cancelToken).ConfigureAwait(false);
-                    progress(expected.Size == 0
-                        ? 0
-                        : (int)Math.Min(99, total * 100 / expected.Size));
-                }
+            inactivity.CancelAfter(packageInactivityTimeout);
+            var assetUri = FixedSibling(expected.FileName);
+            using var request = new HttpRequestMessage(HttpMethod.Get, assetUri);
+            using var response = await httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                inactivity.Token).ConfigureAwait(false);
+            ValidateResponse(response, assetUri, "update asset");
+            if (response.Content.Headers.ContentLength is { } declaredLength && declaredLength != expected.Size)
+                throw new InvalidDataException("The update asset length does not match the signed feed.");
 
-                if (total != expected.Size)
-                    throw new InvalidDataException("The update asset is shorter than its signed size.");
-                await output.FlushAsync(cancelToken).ConfigureAwait(false);
-                output.Flush(flushToDisk: true);
-            }
-
-            File.Move(temporary, destination, overwrite: true);
-            progress(100);
-        }
-        finally
-        {
+            var destination = Path.GetFullPath(localFile);
+            var parent = Path.GetDirectoryName(destination)
+                ?? throw new InvalidDataException("The update destination is invalid.");
+            Directory.CreateDirectory(parent);
+            var temporary = Path.Combine(parent, $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.tmp");
             try
             {
-                if (File.Exists(temporary)) File.Delete(temporary);
+                inactivity.CancelAfter(packageInactivityTimeout);
+                await using var input = await response.Content.ReadAsStreamAsync(inactivity.Token).ConfigureAwait(false);
+                inactivity.CancelAfter(Timeout.InfiniteTimeSpan);
+                await using (var output = new FileStream(
+                                 temporary,
+                                 FileMode.CreateNew,
+                                 FileAccess.Write,
+                                 FileShare.None,
+                                 bufferSize: 81920,
+                                 FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    var buffer = new byte[81920];
+                    long total = 0;
+                    while (true)
+                    {
+                        inactivity.CancelAfter(packageInactivityTimeout);
+                        var read = await input.ReadAsync(buffer, inactivity.Token).ConfigureAwait(false);
+                        inactivity.CancelAfter(Timeout.InfiniteTimeSpan);
+                        if (read == 0) break;
+                        total += read;
+                        if (total > expected.Size)
+                            throw new InvalidDataException("The update asset exceeds its signed size.");
+                        await output.WriteAsync(buffer.AsMemory(0, read), cancelToken).ConfigureAwait(false);
+                        progress((int)Math.Min(99, total * 100 / expected.Size));
+                    }
+
+                    if (total != expected.Size)
+                        throw new InvalidDataException("The update asset is shorter than its signed size.");
+                    await output.FlushAsync(cancelToken).ConfigureAwait(false);
+                    output.Flush(flushToDisk: true);
+                }
+
+                File.Move(temporary, destination, overwrite: true);
+                progress(100);
             }
-            catch
+            finally
             {
-                // An incomplete temporary never replaces the destination package.
+                try
+                {
+                    if (File.Exists(temporary)) File.Delete(temporary);
+                }
+                catch
+                {
+                    // An incomplete temporary never replaces the destination package.
+                }
             }
+        }
+        catch (OperationCanceledException exception) when (!cancelToken.IsCancellationRequested &&
+                                                           inactivity.IsCancellationRequested)
+        {
+            throw PackageTimeoutException(exception);
         }
     }
 
@@ -270,7 +312,7 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
             _ = SignedFeedProductVersion.Parse(version, "asset version");
             if (!string.Equals(packageId, ExpectedPackageId, StringComparison.Ordinal) ||
                 asset.Type is not (VelopackAssetType.Full or VelopackAssetType.Delta) ||
-                asset.Size <= 0 ||
+                asset.Size is <= 0 or > MaxPackageBytes ||
                 !IsSha256(sha256) ||
                 !manifest.TryGetEntry(fileName, out var manifestEntry) ||
                 !string.Equals(manifestEntry.Sha256, sha256, StringComparison.OrdinalIgnoreCase) ||
@@ -301,12 +343,17 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
         return verified;
     }
 
-    private async Task<byte[]> GetBoundedBytesAsync(Uri uri, int maxBytes, string resourceName)
+    private async Task<byte[]> GetBoundedBytesAsync(
+        Uri uri,
+        int maxBytes,
+        string resourceName,
+        CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         using var response = await httpClient.SendAsync(
             request,
-            HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken).ConfigureAwait(false);
         ValidateResponse(response, uri, resourceName);
         if (response.Content.Headers.ContentLength is { } declaredLength &&
             (declaredLength < 0 || declaredLength > maxBytes))
@@ -314,14 +361,16 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
             throw new InvalidDataException($"The signed {resourceName} exceeds its size limit.");
         }
 
-        await using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         using var buffer = new MemoryStream(Math.Min(maxBytes, 81920));
         var chunk = new byte[81920];
         while (true)
         {
             var remaining = maxBytes - checked((int)buffer.Length);
             var requested = Math.Min(chunk.Length, remaining + 1);
-            var read = await stream.ReadAsync(chunk.AsMemory(0, requested)).ConfigureAwait(false);
+            var read = await stream.ReadAsync(
+                chunk.AsMemory(0, requested),
+                cancellationToken).ConfigureAwait(false);
             if (read == 0) break;
             if (buffer.Length + read > maxBytes)
                 throw new InvalidDataException($"The signed {resourceName} exceeds its size limit.");
@@ -379,6 +428,23 @@ internal sealed class SignedFeedUpdateSource : IUpdateSource, IDisposable
 
     private static string LowerHash(byte[] bytes) =>
         Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    private static TimeSpan ValidateTimeout(TimeSpan value, string parameterName)
+    {
+        if (value <= TimeSpan.Zero || value > TimeSpan.FromMinutes(5))
+            throw new ArgumentOutOfRangeException(parameterName);
+        return value;
+    }
+
+    private static HttpRequestException MetadataTimeoutException(Exception exception) =>
+        new(
+            "The signed update metadata request timed out.",
+            new TimeoutException("The signed update metadata operation timed out.", exception));
+
+    private static HttpRequestException PackageTimeoutException(Exception exception) =>
+        new(
+            "The update package transfer became inactive.",
+            new TimeoutException("The update package response timed out due to inactivity.", exception));
 
     private Uri FixedSibling(string fileName)
     {

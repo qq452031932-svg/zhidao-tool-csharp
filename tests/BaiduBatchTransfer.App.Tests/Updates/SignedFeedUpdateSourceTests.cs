@@ -157,6 +157,7 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
     [InlineData("Version")]
     [InlineData("FileName")]
     [InlineData("Size")]
+    [InlineData("TooLarge")]
     [InlineData("SHA256")]
     public async Task RejectsFeedAssetsOutsideTheSignedClosure(string property)
     {
@@ -198,6 +199,61 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => source.GetReleaseFeed(
             NullVelopackLogger.Instance, PackageId, Channel, null, null!));
         Assert.True(handler.OversizedStreamWasDisposed);
+    }
+
+    [Fact]
+    public async Task MetadataTimeoutCoversABodyThatStallsAfterHeaders()
+    {
+        var bundle = Bundle("2.0.0");
+        var source = SignedFeedUpdateSource.CreateForTesting(
+            new Uri(BaseUrl),
+            Store(),
+            Handler(bundle, blockedResponse: "manifest"),
+            signingKey,
+            metadataOperationTimeout: TimeSpan.FromMilliseconds(150));
+
+        var exception = await Assert.ThrowsAsync<HttpRequestException>(() => source.GetReleaseFeed(
+            NullVelopackLogger.Instance, PackageId, Channel, null, null!));
+
+        Assert.IsType<TimeoutException>(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task PackageDownloadHasAnInactivityTimeoutWithoutMaskingCallerCancellation()
+    {
+        var bundle = Bundle("2.0.0");
+        var timeoutSource = SignedFeedUpdateSource.CreateForTesting(
+            new Uri(BaseUrl),
+            Store(),
+            Handler(bundle, blockedResponse: "package", includePackage: true),
+            signingKey,
+            packageInactivityTimeout: TimeSpan.FromMilliseconds(150));
+        var timeoutFeed = await timeoutSource.GetReleaseFeed(
+            NullVelopackLogger.Instance, PackageId, Channel, null, null!);
+
+        var timeout = await Assert.ThrowsAsync<HttpRequestException>(() => timeoutSource.DownloadReleaseEntry(
+            NullVelopackLogger.Instance,
+            timeoutFeed.Assets.Single(),
+            Path.Combine(directory, "timeout.nupkg"),
+            _ => { },
+            CancellationToken.None));
+        Assert.IsType<TimeoutException>(timeout.InnerException);
+
+        var cancellationSource = SignedFeedUpdateSource.CreateForTesting(
+            new Uri(BaseUrl),
+            Store(),
+            Handler(bundle, blockedResponse: "package", includePackage: true),
+            signingKey,
+            packageInactivityTimeout: TimeSpan.FromSeconds(5));
+        var cancellationFeed = await cancellationSource.GetReleaseFeed(
+            NullVelopackLogger.Instance, PackageId, Channel, null, null!);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancellationSource.DownloadReleaseEntry(
+            NullVelopackLogger.Instance,
+            cancellationFeed.Assets.Single(),
+            Path.Combine(directory, "cancelled.nupkg"),
+            _ => { },
+            cancellation.Token));
     }
 
     [Fact]
@@ -261,7 +317,12 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
                 : packageFileName,
             ["SHA1"] = new string('A', 40),
             ["SHA256"] = mutateProperty == "SHA256" ? new string('B', 64) : packageHash.ToUpperInvariant(),
-            ["Size"] = mutateProperty == "Size" ? 0 : packageBytes.Length,
+            ["Size"] = mutateProperty switch
+            {
+                "Size" => 0,
+                "TooLarge" => SignedFeedUpdateSource.MaxPackageBytes + 1,
+                _ => packageBytes.Length
+            },
             ["NotesMarkdown"] = "notes"
         };
         var release = JsonSerializer.SerializeToUtf8Bytes(new { Assets = new[] { properties } });
@@ -297,7 +358,8 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
         string? responseToMove = null,
         string? oversizedResponse = null,
         int oversizedLength = 0,
-        bool includePackage = false) => new(request =>
+        bool includePackage = false,
+        string? blockedResponse = null) => new(request =>
         {
             var name = request.RequestUri!.Segments.Last();
             var responseKey = name switch
@@ -310,6 +372,13 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
             };
             if (responseKey == "unknown")
                 return new HttpResponseMessage(HttpStatusCode.NotFound);
+            if (responseKey == blockedResponse)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(new BlockingStream())
+                };
+            }
             if (responseKey == oversizedResponse)
             {
                 var stream = new TrackingOversizedStream(oversizedLength);
@@ -398,6 +467,27 @@ public sealed class SignedFeedUpdateSourceTests : IDisposable
             LastDisposed = true;
             base.Dispose(disposing);
         }
+    }
+
+    private sealed class BlockingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private sealed record SignedBytes(byte[] Manifest, byte[] Signature);

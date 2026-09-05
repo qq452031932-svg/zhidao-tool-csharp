@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
@@ -7,19 +8,22 @@ namespace BaiduBatchTransfer.App.Updates;
 
 internal sealed class SignedFeedStateStore
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
     private const int MaxStateBytes = 4096;
-    private static readonly UTF8Encoding Utf8WithoutBom = new(false, true);
+    private static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan LockRetryInterval = TimeSpan.FromMilliseconds(20);
 
     private readonly string statePath;
+    private readonly string previousStatePath;
     private readonly string feedIdentity;
     private readonly SignedFeedProductVersion currentApplicationVersion;
-    private readonly string mutexName;
+    private readonly TimeSpan lockTimeout;
 
     internal SignedFeedStateStore(
         string statePath,
         string feedIdentity,
-        string currentApplicationVersion)
+        string currentApplicationVersion,
+        TimeSpan? lockTimeout = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(statePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(feedIdentity);
@@ -27,6 +31,7 @@ internal sealed class SignedFeedStateStore
             throw new ArgumentException("The signed feed state path must be absolute.", nameof(statePath));
         if (!Uri.TryCreate(feedIdentity, UriKind.Absolute, out var feedUri) ||
             feedUri.Scheme != Uri.UriSchemeHttps ||
+            string.IsNullOrEmpty(feedUri.Host) ||
             !string.IsNullOrEmpty(feedUri.UserInfo) ||
             !string.IsNullOrEmpty(feedUri.Query) ||
             !string.IsNullOrEmpty(feedUri.Fragment))
@@ -35,46 +40,53 @@ internal sealed class SignedFeedStateStore
         }
 
         this.statePath = Path.GetFullPath(statePath);
+        previousStatePath = this.statePath + ".previous";
+        LockFilePath = this.statePath + ".lock";
         this.feedIdentity = feedUri.AbsoluteUri;
+        if (this.feedIdentity.Length > 2048)
+            throw new ArgumentException("The signed feed identity is too long.", nameof(feedIdentity));
         this.currentApplicationVersion = SignedFeedProductVersion.Parse(
             currentApplicationVersion,
             "current application version");
-        var mutexMaterial = Encoding.UTF8.GetBytes(this.statePath.ToUpperInvariant());
-        mutexName = @"Local\BaiduBatchTransfer.SignedFeed.State." +
-                    Convert.ToHexString(SHA256.HashData(mutexMaterial));
-    }
-
-    internal SignedFeedAcceptedState Read()
-    {
-        using var lease = EnterExclusive();
-        var existing = LoadExisting();
-        if (existing is not null &&
-            !string.Equals(existing.FeedIdentity, feedIdentity, StringComparison.Ordinal))
-        {
-            throw new InvalidDataException("The signed feed state belongs to a different feed identity.");
-        }
-
-        return existing ?? new SignedFeedAcceptedState(
-            feedIdentity,
-            currentApplicationVersion.ToString(),
-            string.Empty);
+        this.lockTimeout = lockTimeout ?? DefaultLockTimeout;
+        if (this.lockTimeout <= TimeSpan.Zero || this.lockTimeout > TimeSpan.FromMinutes(5))
+            throw new ArgumentOutOfRangeException(nameof(lockTimeout));
     }
 
     internal string FeedIdentity => feedIdentity;
 
+    internal string LockFilePath { get; }
+
+    internal SignedFeedAcceptedState Read()
+    {
+        using var lease = EnterExclusive();
+        var journal = LoadJournal();
+        if (journal.Selected is null)
+        {
+            return new SignedFeedAcceptedState(
+                feedIdentity,
+                currentApplicationVersion.ToString(),
+                string.Empty);
+        }
+
+        var persisted = SignedFeedProductVersion.Parse(
+            journal.Selected.State!.HighestAcceptedVersion,
+            "state version");
+        return persisted.CompareTo(currentApplicationVersion) >= 0
+            ? journal.Selected.State
+            : new SignedFeedAcceptedState(
+                feedIdentity,
+                currentApplicationVersion.ToString(),
+                string.Empty);
+    }
+
     internal SignedFeedAcceptedState Accept(string version, string manifestSha256)
     {
         var candidate = SignedFeedProductVersion.Parse(version, "version");
-        ValidateSha256(manifestSha256);
+        ValidateSha256(manifestSha256, "manifest SHA-256");
         using var lease = EnterExclusive();
-
-        var existing = LoadExisting();
-        if (existing is not null &&
-            !string.Equals(existing.FeedIdentity, feedIdentity, StringComparison.Ordinal))
-        {
-            throw new InvalidDataException("The signed feed state belongs to a different feed identity.");
-        }
-
+        var journal = LoadJournal();
+        var existing = journal.Selected?.State;
         var persisted = existing is null
             ? currentApplicationVersion
             : SignedFeedProductVersion.Parse(existing.HighestAcceptedVersion, "state version");
@@ -99,41 +111,76 @@ internal sealed class SignedFeedStateStore
             feedIdentity,
             candidate.ToString(),
             manifestSha256);
-        PersistAtomically(accepted);
+        var target = SelectWriteTarget(journal);
+        WriteDurableSlot(target, accepted);
+        var verified = ReadSlot(target);
+        if (!verified.IsValid || verified.State != accepted)
+            throw new IOException("The signed feed replay floor could not be verified after persistence.");
         return accepted;
     }
 
-    private SignedFeedAcceptedState? LoadExisting()
+    private JournalSnapshot LoadJournal()
     {
-        if (!File.Exists(statePath))
-            return null;
+        var slots = new[] { ReadSlot(statePath), ReadSlot(previousStatePath) };
+        var existingSlots = slots.Where(slot => slot.Exists).ToArray();
+        var validSlots = existingSlots.Where(slot => slot.IsValid).ToArray();
+        if (existingSlots.Length > 0 && validSlots.Length == 0)
+            throw new InvalidDataException("The signed feed state journal contains no valid record.");
 
-        byte[] bytes;
-        try
+        foreach (var slot in validSlots)
         {
-            using var stream = new FileStream(
-                statePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                bufferSize: 4096,
-                FileOptions.SequentialScan);
-            if (stream.Length is <= 0 or > MaxStateBytes)
-                throw new InvalidDataException("The signed feed state has an invalid size.");
-            bytes = new byte[checked((int)stream.Length)];
-            stream.ReadExactly(bytes);
-        }
-        catch (InvalidDataException)
-        {
-            throw;
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            throw new InvalidDataException("The signed feed state cannot be read safely.", exception);
+            if (!string.Equals(slot.State!.FeedIdentity, feedIdentity, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "The signed feed state belongs to a different feed identity.");
+            }
         }
 
+        foreach (var group in validSlots.GroupBy(
+                     slot => slot.State!.HighestAcceptedVersion,
+                     StringComparer.Ordinal))
+        {
+            if (group.Select(slot => slot.State!.ManifestSha256)
+                .Distinct(StringComparer.Ordinal)
+                .Skip(1)
+                .Any())
+            {
+                throw new InvalidDataException(
+                    "The signed feed journal contains conflicting records for one version.");
+            }
+        }
+
+        var selected = validSlots
+            .OrderByDescending(slot => SignedFeedProductVersion.Parse(
+                slot.State!.HighestAcceptedVersion,
+                "state version"))
+            .ThenBy(slot => slot.Path, StringComparer.Ordinal)
+            .FirstOrDefault();
+        return new JournalSnapshot(slots, selected);
+    }
+
+    private SlotSnapshot ReadSlot(string path)
+    {
+        if (!File.Exists(path))
+            return new SlotSnapshot(path, Exists: false, State: null);
+
         try
         {
+            byte[] bytes;
+            using (var stream = new FileStream(
+                       path,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.Read,
+                       bufferSize: 4096,
+                       FileOptions.SequentialScan))
+            {
+                if (stream.Length is <= 0 or > MaxStateBytes)
+                    throw new InvalidDataException("The signed feed state has an invalid size.");
+                bytes = new byte[checked((int)stream.Length)];
+                stream.ReadExactly(bytes);
+            }
+
             var reader = new Utf8JsonReader(bytes, new JsonReaderOptions
             {
                 AllowTrailingCommas = false,
@@ -143,19 +190,19 @@ internal sealed class SignedFeedStateStore
             using var document = JsonDocument.ParseValue(ref reader);
             if (reader.BytesConsumed != bytes.Length || document.RootElement.ValueKind != JsonValueKind.Object)
                 throw new InvalidDataException("The signed feed state is malformed.");
-
-            var names = document.RootElement.EnumerateObject().Select(property => property.Name).ToArray();
-            if (names.Length != 4 ||
-                names.Distinct(StringComparer.Ordinal).Count() != 4 ||
+            var root = document.RootElement;
+            var names = root.EnumerateObject().Select(property => property.Name).ToArray();
+            if (names.Length != 5 ||
+                names.Distinct(StringComparer.Ordinal).Count() != 5 ||
                 !names.Contains("schemaVersion", StringComparer.Ordinal) ||
                 !names.Contains("feedIdentity", StringComparer.Ordinal) ||
                 !names.Contains("highestAcceptedVersion", StringComparer.Ordinal) ||
-                !names.Contains("manifestSha256", StringComparer.Ordinal))
+                !names.Contains("manifestSha256", StringComparer.Ordinal) ||
+                !names.Contains("recordChecksumSha256", StringComparer.Ordinal))
             {
                 throw new InvalidDataException("The signed feed state schema is invalid.");
             }
 
-            var root = document.RootElement;
             if (root.GetProperty("schemaVersion").ValueKind != JsonValueKind.Number ||
                 root.GetProperty("schemaVersion").GetInt32() != SchemaVersion)
             {
@@ -165,111 +212,144 @@ internal sealed class SignedFeedStateStore
             var identity = root.GetProperty("feedIdentity").GetString();
             var version = root.GetProperty("highestAcceptedVersion").GetString();
             var manifestSha256 = root.GetProperty("manifestSha256").GetString();
-            if (identity is null || version is null || manifestSha256 is null)
+            var checksum = root.GetProperty("recordChecksumSha256").GetString();
+            if (identity is null || version is null || manifestSha256 is null || checksum is null)
                 throw new InvalidDataException("The signed feed state is incomplete.");
             _ = SignedFeedProductVersion.Parse(version, "state version");
-            ValidateSha256(manifestSha256);
-            return new SignedFeedAcceptedState(identity, version, manifestSha256);
+            ValidateSha256(manifestSha256, "manifest SHA-256");
+            ValidateSha256(checksum, "record checksum");
+            var expectedChecksum = ComputeRecordChecksum(identity, version, manifestSha256);
+            if (!FixedTimeHexEquals(checksum, expectedChecksum))
+                throw new InvalidDataException("The signed feed state checksum is invalid.");
+            return new SlotSnapshot(
+                path,
+                Exists: true,
+                new SignedFeedAcceptedState(identity, version, manifestSha256));
         }
-        catch (InvalidDataException)
+        catch (Exception exception) when (exception is InvalidDataException or
+                                          JsonException or
+                                          InvalidOperationException or
+                                          FormatException or
+                                          DecoderFallbackException)
         {
-            throw;
+            return new SlotSnapshot(path, Exists: true, State: null);
         }
-        catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new InvalidDataException("The signed feed state is malformed.", exception);
+            throw new InvalidDataException("The signed feed state cannot be read safely.", exception);
         }
     }
 
-    private void PersistAtomically(SignedFeedAcceptedState accepted)
+    private string SelectWriteTarget(JournalSnapshot journal)
+    {
+        var reusable = journal.Slots.FirstOrDefault(slot => !slot.IsValid);
+        if (reusable is not null)
+            return reusable.Path;
+        return journal.Slots
+            .OrderBy(slot => SignedFeedProductVersion.Parse(
+                slot.State!.HighestAcceptedVersion,
+                "state version"))
+            .ThenBy(slot => slot.Path, StringComparer.Ordinal)
+            .First()
+            .Path;
+    }
+
+    private void WriteDurableSlot(string path, SignedFeedAcceptedState state)
+    {
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            schemaVersion = SchemaVersion,
+            feedIdentity = state.FeedIdentity,
+            highestAcceptedVersion = state.HighestAcceptedVersion,
+            manifestSha256 = state.ManifestSha256,
+            recordChecksumSha256 = ComputeRecordChecksum(
+                state.FeedIdentity,
+                state.HighestAcceptedVersion,
+                state.ManifestSha256)
+        });
+        if (payload.Length > MaxStateBytes)
+            throw new InvalidDataException("The signed feed state exceeds its size limit.");
+        using var stream = new FileStream(
+            path,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 4096,
+            FileOptions.WriteThrough);
+        stream.Write(payload);
+        stream.Flush(flushToDisk: true);
+    }
+
+    private FileStream EnterExclusive()
     {
         var parent = Path.GetDirectoryName(statePath)
             ?? throw new InvalidOperationException("The signed feed state directory is unavailable.");
         Directory.CreateDirectory(parent);
-        var temporaryPath = Path.Combine(
-            parent,
-            $".{Path.GetFileName(statePath)}.{Guid.NewGuid():N}.tmp");
-        var payload = JsonSerializer.SerializeToUtf8Bytes(new
+        var stopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                return new FileStream(
+                    LockFilePath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.WriteThrough);
+            }
+            catch (IOException) when (stopwatch.Elapsed < lockTimeout)
+            {
+                Thread.Sleep(LockRetryInterval);
+            }
+        }
+    }
+
+    private static string ComputeRecordChecksum(
+        string identity,
+        string version,
+        string manifestSha256)
+    {
+        var canonical = JsonSerializer.SerializeToUtf8Bytes(new
         {
             schemaVersion = SchemaVersion,
-            feedIdentity = accepted.FeedIdentity,
-            highestAcceptedVersion = accepted.HighestAcceptedVersion,
-            manifestSha256 = accepted.ManifestSha256
+            feedIdentity = identity,
+            highestAcceptedVersion = version,
+            manifestSha256
         });
-        try
-        {
-            using (var stream = new FileStream(
-                       temporaryPath,
-                       FileMode.CreateNew,
-                       FileAccess.Write,
-                       FileShare.None,
-                       bufferSize: 4096,
-                       FileOptions.WriteThrough))
-            {
-                stream.Write(payload);
-                stream.Flush(flushToDisk: true);
-            }
+        return Convert.ToHexString(SHA256.HashData(canonical)).ToLowerInvariant();
+    }
 
-            File.Move(temporaryPath, statePath, overwrite: true);
-        }
+    private static bool FixedTimeHexEquals(string left, string right)
+    {
+        var leftBytes = Convert.FromHexString(left);
+        var rightBytes = Convert.FromHexString(right);
+        try { return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes); }
         finally
         {
-            try
-            {
-                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
-            }
-            catch
-            {
-                // A stale same-directory temporary file never becomes accepted state.
-            }
+            CryptographicOperations.ZeroMemory(leftBytes);
+            CryptographicOperations.ZeroMemory(rightBytes);
         }
     }
 
-    private IDisposable EnterExclusive()
-    {
-        var mutex = new Mutex(initiallyOwned: false, mutexName);
-        try
-        {
-            try
-            {
-                if (!mutex.WaitOne(TimeSpan.FromSeconds(30)))
-                    throw new IOException("Timed out while locking the signed feed state.");
-            }
-            catch (AbandonedMutexException)
-            {
-                // Ownership was transferred; the on-disk state is revalidated below.
-            }
-
-            return new MutexLease(mutex);
-        }
-        catch
-        {
-            mutex.Dispose();
-            throw;
-        }
-    }
-
-    private static void ValidateSha256(string value)
+    private static void ValidateSha256(string value, string fieldName)
     {
         if (value.Length != 64 || value.Any(character =>
                 character is not (>= '0' and <= '9') and not (>= 'a' and <= 'f')))
         {
-            throw new InvalidDataException("The signed feed manifest SHA-256 is invalid.");
+            throw new InvalidDataException($"The signed feed {fieldName} is invalid.");
         }
     }
 
-    private sealed class MutexLease : IDisposable
+    private sealed record SlotSnapshot(
+        string Path,
+        bool Exists,
+        SignedFeedAcceptedState? State)
     {
-        private Mutex? mutex;
-
-        internal MutexLease(Mutex mutex) => this.mutex = mutex;
-
-        public void Dispose()
-        {
-            var owned = Interlocked.Exchange(ref mutex, null);
-            if (owned is null) return;
-            try { owned.ReleaseMutex(); }
-            finally { owned.Dispose(); }
-        }
+        internal bool IsValid => State is not null;
     }
+
+    private sealed record JournalSnapshot(
+        IReadOnlyList<SlotSnapshot> Slots,
+        SlotSnapshot? Selected);
 }
