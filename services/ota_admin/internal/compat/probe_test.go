@@ -284,7 +284,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		"a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d",
 		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "GOCACHE", "GOMODCACHE", "local", "-buildvcs=false",
 		"git", "diff", "--quiet", "HEAD", "ls-tree", "ls-files", "--others",
-		"archive", "--format=zip", "HEAD:services/ota_admin",
+		"archive", "--format=zip", "HEAD:services/ota_admin", "core.autocrlf=false", "core.eol=lf",
 		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
 		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
 		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
@@ -570,6 +570,9 @@ New-GitObjectSourceSnapshot -SourcePaths $paths -DestinationRoot $SnapshotRoot
 	}
 	if strings.Contains(string(snapshotProbe), "working-tree") || !strings.Contains(string(snapshotProbe), "committed") {
 		t.Fatalf("snapshot did not come exclusively from HEAD: %q", snapshotProbe)
+	}
+	if strings.Contains(string(snapshotProbe), "\r") {
+		t.Fatalf("Git-object snapshot applied working-tree CRLF conversion: %q", snapshotProbe)
 	}
 }
 

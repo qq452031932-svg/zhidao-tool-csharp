@@ -112,7 +112,7 @@ function New-GitObjectSourceSnapshot {
         throw 'Git-object snapshot target unexpectedly exists.'
     }
 
-    & git -C $RepositoryRoot archive --format=zip --output=$snapshotArchivePath 'HEAD:services/ota_admin' -- @moduleRelativePaths
+    & git -C $RepositoryRoot -c core.autocrlf=false -c core.eol=lf archive --format=zip --output=$snapshotArchivePath 'HEAD:services/ota_admin' -- @moduleRelativePaths
     if ($LASTEXITCODE -ne 0) { throw 'git archive failed while materializing the committed source snapshot.' }
     New-Item -ItemType Directory -Path $DestinationRoot | Out-Null
     try {
