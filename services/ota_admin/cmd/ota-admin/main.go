@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/compat"
+	"fanfh.cn/superpan/ota-admin/internal/config"
+	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
 func main() {
@@ -19,17 +22,28 @@ func main() {
 }
 
 func run(arguments []string, stdout, stderr io.Writer) int {
-	if len(arguments) == 0 || arguments[0] != "compat-probe" {
-		fmt.Fprintln(stderr, "usage: ota-admin compat-probe [--serve] [--listen 127.0.0.1:PORT] [--work-dir PATH]")
+	if len(arguments) == 0 {
+		writeUsage(stderr)
 		return 2
 	}
+	switch arguments[0] {
+	case "compat-probe":
+		return runCompatProbe(arguments[1:], stdout, stderr)
+	case "init-admin":
+		return runInitAdmin(arguments[1:], stdout, stderr)
+	default:
+		writeUsage(stderr)
+		return 2
+	}
+}
 
+func runCompatProbe(arguments []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("compat-probe", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	serve := flags.Bool("serve", false, "keep the loopback health endpoint running")
 	listenAddress := flags.String("listen", "127.0.0.1:18091", "loopback health listen address")
 	workDir := flags.String("work-dir", "", "probe working directory")
-	if err := flags.Parse(arguments[1:]); err != nil {
+	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
 
@@ -82,4 +96,37 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func runInitAdmin(arguments []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("init-admin", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "", "root-owned service configuration file")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if *configPath == "" || flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "usage: ota-admin init-admin --config PATH")
+		return 2
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "init-admin: invalid configuration: %v\n", err)
+		return 1
+	}
+	database, err := store.Open(context.Background(), cfg.DatabasePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "init-admin: open state store: %v\n", err)
+		return 1
+	}
+	defer database.Close()
+	if err := database.InitializeAdminWithGeneratedPassword(context.Background(), stdout, rand.Reader); err != nil {
+		fmt.Fprintf(stderr, "init-admin: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func writeUsage(writer io.Writer) {
+	fmt.Fprintln(writer, "usage: ota-admin <compat-probe|init-admin> [options]")
 }
