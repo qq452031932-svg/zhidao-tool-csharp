@@ -1,12 +1,15 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
+	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
 const (
@@ -15,15 +18,29 @@ const (
 )
 
 type Options struct {
-	Sessions     *session.Service
-	PublicOrigin string
-	MaxJSONBytes int64
+	Sessions        *session.Service
+	PublicOrigin    string
+	MaxJSONBytes    int64
+	Uploads         UploadReceiver
+	UploadEnvelopes EnvelopeAcceptor
+}
+
+type UploadReceiver interface {
+	Receive(context.Context, io.Reader, int64) (*upload.Envelope, error)
+}
+
+// EnvelopeAcceptor is the Task 9 integration seam. A nil error transfers
+// ownership of the envelope and its cleanup obligation to the acceptor.
+type EnvelopeAcceptor interface {
+	AcceptEnvelope(context.Context, string, *upload.Envelope) error
 }
 
 type Router struct {
-	sessions     *session.Service
-	publicOrigin string
-	maxJSONBytes int64
+	sessions        *session.Service
+	publicOrigin    string
+	maxJSONBytes    int64
+	uploads         UploadReceiver
+	uploadEnvelopes EnvelopeAcceptor
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -36,7 +53,10 @@ func NewRouter(options Options) (http.Handler, error) {
 	if options.MaxJSONBytes <= 0 {
 		return nil, errors.New("maximum JSON body size must be positive")
 	}
-	router := &Router{sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes}
+	router := &Router{
+		sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes,
+		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes,
+	}
 	return withAdminSecurityHeaders(router), nil
 }
 
@@ -108,6 +128,12 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 		router.changePassword(response, request, principal)
 	case principal.MustChangePassword:
 		writeError(response, http.StatusForbidden, "password_change_required")
+	case request.URL.Path == "/admin/api/uploads":
+		if request.Method != http.MethodPost {
+			writeMethodNotAllowed(response, http.MethodPost)
+			return
+		}
+		router.receiveUpload(response, request, principal)
 	default:
 		writeError(response, http.StatusNotFound, "not_found")
 	}
