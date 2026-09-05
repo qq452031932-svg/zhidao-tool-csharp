@@ -21,6 +21,6 @@ $env:BAIDU_BATCH_OTA_PUBLISHER_LIVE_STORE = 'approved'
 dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter Category=OtaPublisherLiveStore --no-restore
 ```
 
-Enrollment is serialized per Windows user with a named mutex before the script reads the repository certificate or opens the certificate store. A timeout or abandoned mutex stops enrollment without continuing into identity selection or output writes.
+Enrollment is serialized across Windows sessions for the current user with a `Global\SuperPan.OtaPublisher.Enrollment.<current-user-SID>` named mutex before the script reads the repository certificate or opens the certificate store. The mutex owner and sole access rule are restricted to that user SID; inability to create or validate this ACL, a timeout, or an abandoned mutex stops enrollment without continuing into identity selection or output writes.
 
 The certificate uses a 15-year controlled-distribution lifetime. Renewal must happen before expiry and requires a coordinated client/server release that updates the embedded public certificate and compile-time SPKI pin before releases are signed with the replacement identity. A self-signed certificate does not establish public-CA trust or Microsoft SmartScreen reputation, so users may still see Windows download or reputation prompts.

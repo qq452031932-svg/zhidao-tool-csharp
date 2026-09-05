@@ -384,12 +384,162 @@ function Invoke-PublisherEnrollmentWorkflow {
 }
 
 function Get-PublisherEnrollmentMutexName {
-    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    if ([string]::IsNullOrWhiteSpace($currentSid)) {
+    param(
+        [System.Security.Principal.SecurityIdentifier]$CurrentSid =
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    )
+
+    if ($null -eq $CurrentSid -or [string]::IsNullOrWhiteSpace($CurrentSid.Value)) {
         throw 'Unable to determine the current Windows user SID for OTA publisher enrollment serialization.'
     }
 
-    return "Local\SuperPan.OtaPublisher.Enrollment.$currentSid"
+    return "Global\SuperPan.OtaPublisher.Enrollment.$($CurrentSid.Value)"
+}
+
+function Test-PublisherEnrollmentMutexSecurityDescriptor {
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.AccessControl.MutexSecurity]$Security,
+
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$CurrentSid
+    )
+
+    if (-not $Security.AreAccessRulesProtected) {
+        return $false
+    }
+
+    $owner = $Security.GetOwner([System.Security.Principal.SecurityIdentifier])
+    if ($null -eq $owner -or $owner.Value -cne $CurrentSid.Value) {
+        return $false
+    }
+
+    $rules = @($Security.GetAccessRules(
+        $true,
+        $true,
+        [System.Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1) {
+        return $false
+    }
+
+    $rule = $rules[0]
+    return (
+        -not $rule.IsInherited -and
+        $rule.IdentityReference.Value -ceq $CurrentSid.Value -and
+        $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $rule.MutexRights -eq [System.Security.AccessControl.MutexRights]::FullControl)
+}
+
+function New-PublisherEnrollmentMutexSecurity {
+    param(
+        [System.Security.Principal.SecurityIdentifier]$CurrentSid =
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    )
+
+    try {
+        if ($null -eq $CurrentSid) {
+            throw 'The current Windows user SID is unavailable.'
+        }
+
+        $security = [System.Security.AccessControl.MutexSecurity]::new()
+        $security.SetOwner($CurrentSid)
+        $security.SetAccessRuleProtection($true, $false)
+        $rule = [System.Security.AccessControl.MutexAccessRule]::new(
+            $CurrentSid,
+            [System.Security.AccessControl.MutexRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule) | Out-Null
+        if (-not (Test-PublisherEnrollmentMutexSecurityDescriptor `
+                -Security $security `
+                -CurrentSid $CurrentSid)) {
+            throw 'The constructed mutex security descriptor failed validation.'
+        }
+        return $security
+    }
+    catch {
+        throw [System.InvalidOperationException]::new(
+            'Unable to construct the restricted OTA publisher enrollment mutex security descriptor.',
+            $_.Exception)
+    }
+}
+
+function Assert-PublisherEnrollmentMutexSecurity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$MutexName,
+
+        [System.Security.Principal.SecurityIdentifier]$CurrentSid =
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    )
+
+    try {
+        $sections =
+            [System.Security.AccessControl.AccessControlSections]::Access -bor
+            [System.Security.AccessControl.AccessControlSections]::Owner
+        $security = [System.Security.AccessControl.MutexSecurity]::new($MutexName, $sections)
+        if (-not (Test-PublisherEnrollmentMutexSecurityDescriptor `
+                -Security $security `
+                -CurrentSid $CurrentSid)) {
+            throw 'The mutex security descriptor grants unexpected access or ownership.'
+        }
+    }
+    catch {
+        throw [System.InvalidOperationException]::new(
+            "Unable to validate restricted access for OTA publisher enrollment mutex '$MutexName'.",
+            $_.Exception)
+    }
+}
+
+function New-PublisherEnrollmentMutex {
+    param(
+        [Parameter(Mandatory)]
+        [string]$MutexName,
+
+        [System.Security.Principal.SecurityIdentifier]$CurrentSid =
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+
+        [scriptblock]$SecurityFactory = {
+            param($currentSid)
+            return New-PublisherEnrollmentMutexSecurity -CurrentSid $currentSid
+        },
+
+        [scriptblock]$MutexFactory = {
+            param($name, $security)
+            $createdNew = $false
+            return [System.Threading.MutexAcl]::Create(
+                $false,
+                $name,
+                [ref]$createdNew,
+                $security)
+        },
+
+        [scriptblock]$SecurityValidator = {
+            param($name, $currentSid)
+            Assert-PublisherEnrollmentMutexSecurity -MutexName $name -CurrentSid $currentSid
+        }
+    )
+
+    $mutex = $null
+    try {
+        $security = & $SecurityFactory $CurrentSid
+        if ($null -eq $security) {
+            throw 'The mutex security factory returned no security descriptor.'
+        }
+        $mutex = & $MutexFactory $MutexName $security
+        if ($null -eq $mutex) {
+            throw 'The restricted mutex factory returned no mutex.'
+        }
+        $null = & $SecurityValidator $MutexName $CurrentSid
+        return $mutex
+    }
+    catch {
+        if ($null -ne $mutex) {
+            $mutex.Dispose()
+        }
+        throw [System.InvalidOperationException]::new(
+            "Unable to create or open the restricted OTA publisher enrollment mutex '$MutexName'.",
+            $_.Exception)
+    }
 }
 
 function Invoke-WithPublisherEnrollmentMutex {
@@ -403,7 +553,7 @@ function Invoke-WithPublisherEnrollmentMutex {
 
         [scriptblock]$MutexFactory = {
             param($name)
-            return [System.Threading.Mutex]::new($false, $name)
+            return New-PublisherEnrollmentMutex -MutexName $name
         }
     )
 

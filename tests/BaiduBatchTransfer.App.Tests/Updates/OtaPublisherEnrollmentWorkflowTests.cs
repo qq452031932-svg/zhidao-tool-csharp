@@ -6,6 +6,56 @@ namespace BaiduBatchTransfer.App.Tests.Updates;
 public sealed class OtaPublisherEnrollmentWorkflowTests
 {
     [Fact]
+    public async Task PublisherMutexUsesGlobalNamespaceAndCurrentUserOnlySecurity()
+    {
+        var command = string.Join(
+            Environment.NewLine,
+            DotSourceEnrollmentScript(),
+            "$testSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')",
+            "$expectedName = 'Global\\SuperPan.OtaPublisher.Enrollment.' + $testSid.Value",
+            "$actualName = Get-PublisherEnrollmentMutexName -CurrentSid $testSid",
+            "if ($actualName -cne $expectedName) { throw \"Mutex name is not cross-session and per-user: $actualName\" }",
+            "$security = New-PublisherEnrollmentMutexSecurity -CurrentSid $testSid",
+            "if (-not $security.AreAccessRulesProtected) { throw 'Mutex DACL permits inherited access.' }",
+            "$owner = $security.GetOwner([System.Security.Principal.SecurityIdentifier])",
+            "if ($owner.Value -cne $testSid.Value) { throw 'Mutex owner is not the current user SID.' }",
+            "$rules = @($security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))",
+            "if ($rules.Count -ne 1) { throw \"Expected one explicit access rule, got $($rules.Count).\" }",
+            "$rule = $rules[0]",
+            "if ($rule.IdentityReference.Value -cne $testSid.Value -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $rule.MutexRights -ne [System.Security.AccessControl.MutexRights]::FullControl) { throw 'Mutex access is not restricted to the current user SID.' }",
+            "$realSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+            "$disposableName = 'Global\\SuperPan.OtaPublisher.Enrollment.Test.' + $realSid.Value + '.' + [Guid]::NewGuid().ToString('N')",
+            "$mutex = New-PublisherEnrollmentMutex -MutexName $disposableName -CurrentSid $realSid",
+            "try { Assert-PublisherEnrollmentMutexSecurity -MutexName $disposableName -CurrentSid $realSid } finally { $mutex.Dispose() }");
+
+        var result = await RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
+    [Fact]
+    public async Task PublisherMutexFailsClosedWhenAclConstructionOrValidationIsUnavailable()
+    {
+        var command = string.Join(
+            Environment.NewLine,
+            DotSourceEnrollmentScript(),
+            "$sid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-1-2-3-1001')",
+            "$state = [pscustomobject]@{ MutexCreates = 0; Disposals = 0; Validations = 0 }",
+            "$securityFailure = $false",
+            "try { [void](New-PublisherEnrollmentMutex -MutexName 'Global\\acl-construction-failure' -CurrentSid $sid -SecurityFactory { param($currentSid) throw 'injected ACL construction unavailable' } -MutexFactory { param($name, $security) $state.MutexCreates++; throw 'must not create mutex' }) } catch { $securityFailure = $_.Exception.ToString() -match 'ACL construction unavailable' }",
+            "if (-not $securityFailure -or $state.MutexCreates -ne 0) { throw 'ACL construction failure did not stop mutex creation.' }",
+            "$fakeMutex = [pscustomobject]@{ }",
+            "$fakeMutex | Add-Member ScriptMethod Dispose { $state.Disposals++ }",
+            "$validationFailure = $false",
+            "try { [void](New-PublisherEnrollmentMutex -MutexName 'Global\\acl-validation-failure' -CurrentSid $sid -SecurityFactory { param($currentSid) return [pscustomobject]@{} } -MutexFactory { param($name, $security) $state.MutexCreates++; return $fakeMutex } -SecurityValidator { param($name, $currentSid) $state.Validations++; throw 'injected ACL validation unavailable' }) } catch { $validationFailure = $_.Exception.ToString() -match 'ACL validation unavailable' }",
+            "if (-not $validationFailure -or $state.MutexCreates -ne 1 -or $state.Validations -ne 1 -or $state.Disposals -ne 1) { throw 'ACL validation failure was not fail-closed and disposed.' }");
+
+        var result = await RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
+
+        Assert.True(result.ExitCode == 0, result.Output);
+    }
+
+    [Fact]
     public async Task CngExportPolicyRequiresExactlyNone()
     {
         var command = string.Join(
@@ -108,14 +158,14 @@ public sealed class OtaPublisherEnrollmentWorkflowTests
             "$shared = New-FakeMutex $false",
             "$factory = { param($name) return $shared }",
             "$mutexState = [pscustomobject]@{ NestedTimedOut = $false; Actions = 0 }",
-            "Invoke-WithPublisherEnrollmentMutex -MutexName 'Local\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory $factory -Action {",
+            "Invoke-WithPublisherEnrollmentMutex -MutexName 'Global\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory $factory -Action {",
             "  $mutexState.Actions++",
-            "  try { Invoke-WithPublisherEnrollmentMutex -MutexName 'Local\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory $factory -Action { throw 'must not enter' } } catch [System.TimeoutException] { $mutexState.NestedTimedOut = $_.Exception.Message -match 'timed out' }",
+            "  try { Invoke-WithPublisherEnrollmentMutex -MutexName 'Global\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory $factory -Action { throw 'must not enter' } } catch [System.TimeoutException] { $mutexState.NestedTimedOut = $_.Exception.Message -match 'timed out' }",
             "}",
             "if (-not $mutexState.NestedTimedOut -or $mutexState.Actions -ne 1 -or $shared.Releases -ne 1 -or $shared.Disposals -ne 2 -or $shared.Held) { throw 'Mutex contention was not serialized.' }",
             "$abandoned = New-FakeMutex $true",
             "$abandonedFailed = $false",
-            "try { Invoke-WithPublisherEnrollmentMutex -MutexName 'Local\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory { param($name) return $abandoned } -Action { throw 'must not enter' } } catch { $abandonedFailed = $_.Exception.Message -match 'abandoned' }",
+            "try { Invoke-WithPublisherEnrollmentMutex -MutexName 'Global\\test-current-user' -Timeout ([TimeSpan]::Zero) -MutexFactory { param($name) return $abandoned } -Action { throw 'must not enter' } } catch { $abandonedFailed = $_.Exception.Message -match 'abandoned' }",
             "if (-not $abandonedFailed -or $abandoned.Releases -ne 1 -or $abandoned.Disposals -ne 1) { throw 'Abandoned mutex was not failed and released clearly.' }");
 
         var result = await RunAsync("pwsh.exe", ["-NoProfile", "-Command", command]);
