@@ -24,7 +24,7 @@
 
 - HTTP 的 `/.well-known/acme-challenge/` 先由 OTA 独立 webroot 提供，其余请求跳转 HTTPS。
 - HTTPS 支持 `GET`、`HEAD`，目录浏览关闭。
-- `releases.*.json`、`RELEASES-*` 和清单文件响应 `Cache-Control: no-cache, must-revalidate`。
+- `releases.*.json`、`assets.*.json`、`RELEASES-*` 和清单文件响应 `Cache-Control: no-cache, must-revalidate`。
 - 只有文件名包含精确版本或内容哈希的 `.nupkg`、Setup、Portable 资产使用长期 immutable 缓存；固定名称的 Setup/Portable 别名使用 `no-cache, must-revalidate`。
 - 未匹配文件返回 404，不回落到现有站点。
 
@@ -34,7 +34,7 @@
 
 服务器部署先完成静态站点、TLS、目录和健康检查。没有经过生产发布门禁的资产不会写入稳定渠道，避免客户端拉取到验收包或半成品。
 
-生产发布门禁采用 fail-closed，并按 vpk 的真实格式分别校验：release JSON 的 PackageId、版本、类型、文件名、size、SHA-256 必须与实际资产精确一致；asset catalog 只允许预期 Type，并以 RelativeFileName 反向关联已验证资产；RELEASES 按 SHA-1、文件名、size 校验且只包含全部 Full。渠道由独立目录以及唯一允许的 `releases.win-x64-stable.json`、`assets.win-x64-stable.json`、`RELEASES-win-x64-stable` 文件名共同锁定。`upload-manifest.sha256` 必须精确覆盖允许的全部顶层资产，包括 Setup、Portable、Full、Delta 和三类元数据；缺失、额外、Acceptance、其他 channel、外部引用或未引用项均拒绝发布。
+生产发布门禁采用 fail-closed，并按 vpk 的真实格式分别校验：release JSON 的 PackageId、版本、类型、文件名、size、SHA-256 必须与实际资产精确一致；asset catalog 只允许预期 Type，并以 RelativeFileName 反向关联已验证资产；RELEASES 按 SHA-1、文件名、size 校验且只包含全部 Full。渠道由独立目录以及唯一允许的 `releases.win-x64-stable.json`、`assets.win-x64-stable.json`、`RELEASES-win-x64-stable` 文件名共同锁定。`upload-manifest.sha256` 必须精确覆盖除自身以外的全部可发布顶层资产，包括 Setup、Portable、Full、Delta 和三类元数据；发布目录额外只允许 manifest 自身，`release-readme.json` 等未声明文件一律拒绝。缺失、额外、Acceptance、其他 channel、外部引用或未引用项均拒绝发布。
 
 不可变资产先上传到站点外的 staging 目录，全部校验后移动到发布目录；其他元数据先就位，release JSON 最后通过同文件系统原子替换发布，作为这一代发布的唯一提交点，并保留上一版元数据与资产快照。
 
