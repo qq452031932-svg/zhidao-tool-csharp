@@ -18,6 +18,43 @@ import (
 	"time"
 )
 
+func TestNewReceiverRejectsRelativeStagingRootEvenWhenItExists(t *testing.T) {
+	if _, err := NewReceiver(ReceiverOptions{
+		StagingRoot: ".",
+		Limits:      DefaultLimits(),
+		AvailableBytes: func(string) (uint64, error) {
+			return 1 << 40, nil
+		},
+	}); err == nil {
+		t.Fatal("existing relative staging root was accepted")
+	}
+}
+
+func TestLinuxPrivateStagingRootMetadataPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		owner      uint32
+		currentUID uint32
+		mode       os.FileMode
+		wantError  bool
+	}{
+		{"private owned root", 1000, 1000, 0o700, false},
+		{"foreign owner", 0, 1000, 0o700, true},
+		{"group readable", 1000, 1000, 0o750, true},
+		{"group writable", 1000, 1000, 0o770, true},
+		{"other accessible", 1000, 1000, 0o701, true},
+		{"owner cannot traverse", 1000, 1000, 0o600, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validatePrivateStagingRootMetadata(test.owner, test.currentUID, test.mode)
+			if (err != nil) != test.wantError {
+				t.Fatalf("owner=%d current=%d mode=%#o error=%v", test.owner, test.currentUID, test.mode, err)
+			}
+		})
+	}
+}
+
 func TestReceiveStreamsValidZIPIntoPrivateRandomPaths(t *testing.T) {
 	staging := t.TempDir()
 	archive := makeZIP(t, map[string]string{

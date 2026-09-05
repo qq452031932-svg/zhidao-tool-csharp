@@ -56,19 +56,42 @@ func NewReceiver(options ReceiverOptions) (*Receiver, error) {
 	if options.AvailableBytes == nil {
 		options.AvailableBytes = filesystemAvailableBytes
 	}
-	absRoot, err := filepath.Abs(options.StagingRoot)
-	if err != nil || options.StagingRoot == "" {
+	if options.StagingRoot == "" || !filepath.IsAbs(options.StagingRoot) {
 		return nil, errors.New("staging root must be an existing absolute directory")
+	}
+	absRoot := filepath.Clean(options.StagingRoot)
+	providedInfo, err := os.Lstat(absRoot)
+	if err != nil || !providedInfo.IsDir() {
+		return nil, errors.New("staging root must be an existing directory")
+	}
+	if providedInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("staging root cannot be a symbolic link")
 	}
 	resolvedRoot, err := filepath.EvalSymlinks(absRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve staging root: %w", err)
 	}
-	info, err := os.Stat(resolvedRoot)
+	info, err := os.Lstat(resolvedRoot)
 	if err != nil || !info.IsDir() {
 		return nil, errors.New("staging root must be an existing directory")
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("resolved staging root cannot be a symbolic link")
+	}
+	if err := validateStagingRoot(info); err != nil {
+		return nil, fmt.Errorf("insecure staging root: %w", err)
+	}
 	return &Receiver{stagingRoot: filepath.Clean(resolvedRoot), limits: options.Limits, availableBytes: options.AvailableBytes}, nil
+}
+
+func validatePrivateStagingRootMetadata(owner, currentUID uint32, mode os.FileMode) error {
+	if owner != currentUID {
+		return errors.New("staging root must be owned by the service user")
+	}
+	if mode.Perm() != 0o700 {
+		return errors.New("staging root permissions must be 0700")
+	}
+	return nil
 }
 
 func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLength int64) (*Envelope, error) {
