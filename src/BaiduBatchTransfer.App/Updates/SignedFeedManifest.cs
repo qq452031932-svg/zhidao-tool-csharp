@@ -21,6 +21,13 @@ internal sealed class SignedFeedManifest
     private const string ManifestSignatureFileName = "upload-manifest.sha256.sig";
     private const int ExpectedRsaKeySize = 3072;
     private const int Sha256HexLength = 64;
+    private const int SeparatorLength = 2;
+    private const int MaxFileNameBytes = 255;
+    private const int MaxCanonicalLineBytes =
+        Sha256HexLength + SeparatorLength + MaxFileNameBytes + 1;
+
+    internal const int MaxEntries = 254;
+    internal const int MaxManifestBytes = MaxCanonicalLineBytes * MaxEntries;
 
     private static readonly UTF8Encoding StrictUtf8 = new(
         encoderShouldEmitUTF8Identifier: false,
@@ -45,14 +52,26 @@ internal sealed class SignedFeedManifest
         ReadOnlySpan<byte> manifestBytes,
         ReadOnlySpan<byte> signatureBytes)
     {
+        var entryCount = ValidateResourceBounds(manifestBytes);
         using var publicKey = OtaPublisherTrust.CreateVerifiedPublicKey();
-        return Verify(manifestBytes, signatureBytes, publicKey);
+        return VerifyBounded(manifestBytes, signatureBytes, publicKey, entryCount);
     }
 
-    internal static SignedFeedManifest Verify(
+    // Hermetic/cross-language seam only; production callers must use the pinned overload above.
+    internal static SignedFeedManifest VerifyWithPublicKeyForTesting(
         ReadOnlySpan<byte> manifestBytes,
         ReadOnlySpan<byte> signatureBytes,
         RSA publicKey)
+    {
+        var entryCount = ValidateResourceBounds(manifestBytes);
+        return VerifyBounded(manifestBytes, signatureBytes, publicKey, entryCount);
+    }
+
+    private static SignedFeedManifest VerifyBounded(
+        ReadOnlySpan<byte> manifestBytes,
+        ReadOnlySpan<byte> signatureBytes,
+        RSA publicKey,
+        int entryCount)
     {
         ArgumentNullException.ThrowIfNull(publicKey);
         if (publicKey.KeySize != ExpectedRsaKeySize)
@@ -81,7 +100,7 @@ internal sealed class SignedFeedManifest
         if (!signatureIsValid)
             throw new InvalidDataException("The OTA manifest signature is invalid.");
 
-        return ParseCanonicalBytes(manifestBytes);
+        return ParseCanonicalBytes(manifestBytes, entryCount);
     }
 
     internal bool TryGetEntry(
@@ -93,10 +112,45 @@ internal sealed class SignedFeedManifest
                entriesByFileName.TryGetValue(fileName!, out entry);
     }
 
-    private static SignedFeedManifest ParseCanonicalBytes(ReadOnlySpan<byte> manifestBytes)
+    private static int ValidateResourceBounds(ReadOnlySpan<byte> manifestBytes)
     {
-        if (manifestBytes.IsEmpty ||
-            manifestBytes.StartsWith(Encoding.UTF8.Preamble) ||
+        if (manifestBytes.IsEmpty)
+            throw new InvalidDataException("The OTA manifest must not be empty.");
+        if (manifestBytes.Length > MaxManifestBytes)
+            throw new InvalidDataException("The OTA manifest size exceeds the allowed limit.");
+
+        var entryCount = 0;
+        foreach (var value in manifestBytes)
+        {
+            if (value != (byte)'\n')
+                continue;
+
+            entryCount++;
+            if (entryCount > MaxEntries)
+            {
+                throw new InvalidDataException(
+                    "The OTA manifest contains too many entries.");
+            }
+        }
+
+        if (manifestBytes[^1] != (byte)'\n')
+        {
+            entryCount++;
+            if (entryCount > MaxEntries)
+            {
+                throw new InvalidDataException(
+                    "The OTA manifest contains too many entries.");
+            }
+        }
+
+        return entryCount;
+    }
+
+    private static SignedFeedManifest ParseCanonicalBytes(
+        ReadOnlySpan<byte> manifestBytes,
+        int entryCount)
+    {
+        if (manifestBytes.StartsWith(Encoding.UTF8.Preamble) ||
             manifestBytes[^1] != (byte)'\n' ||
             (manifestBytes.Length > 1 && manifestBytes[^2] == (byte)'\n') ||
             manifestBytes.Contains((byte)'\r'))
@@ -114,15 +168,21 @@ internal sealed class SignedFeedManifest
             throw new InvalidDataException("The OTA manifest encoding is not valid UTF-8.");
         }
 
-        var lines = manifestText[..^1].Split('\n', StringSplitOptions.None);
-        if (lines.Length == 0 || lines.Any(string.IsNullOrEmpty))
-            throw new InvalidDataException("The OTA manifest contains a blank line.");
-
-        var entries = lines.Select(ParseLine).ToArray();
+        var entries = new SignedFeedManifestEntry[entryCount];
         var exactFileNames = new HashSet<string>(StringComparer.Ordinal);
         var caseInsensitiveFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in entries)
+        var entryIndex = 0;
+        var lineStart = 0;
+        var text = manifestText.AsSpan();
+        for (var index = 0; index < text.Length; index++)
         {
+            if (text[index] != '\n')
+                continue;
+            if (index == lineStart)
+                throw new InvalidDataException("The OTA manifest contains a blank line.");
+
+            var entry = ParseLine(text[lineStart..index]);
+            entries[entryIndex++] = entry;
             if (!exactFileNames.Add(entry.FileName))
                 throw new InvalidDataException("The OTA manifest contains a duplicate filename.");
             if (!caseInsensitiveFileNames.Add(entry.FileName))
@@ -130,7 +190,12 @@ internal sealed class SignedFeedManifest
                 throw new InvalidDataException(
                     "The OTA manifest contains a case-insensitive filename collision.");
             }
+
+            lineStart = index + 1;
         }
+
+        if (entryIndex != entryCount || lineStart != text.Length)
+            throw new InvalidDataException("The OTA manifest entry count is invalid.");
 
         string? previousFileName = null;
         foreach (var entry in entries)
@@ -155,30 +220,30 @@ internal sealed class SignedFeedManifest
             new ReadOnlyCollection<SignedFeedManifestEntry>(entries));
     }
 
-    private static SignedFeedManifestEntry ParseLine(string line)
+    private static SignedFeedManifestEntry ParseLine(ReadOnlySpan<char> line)
     {
         if (line.Length <= Sha256HexLength + 2 ||
             line[Sha256HexLength] != ' ' ||
             line[Sha256HexLength + 1] != ' ' ||
             line[Sha256HexLength + 2] == ' ' ||
-            !line.AsSpan(0, Sha256HexLength).ContainsOnlyLowerHex())
+            !line[..Sha256HexLength].ContainsOnlyLowerHex())
         {
             throw new InvalidDataException("The OTA manifest contains a malformed line.");
         }
 
-        var fileName = line[(Sha256HexLength + 2)..];
+        var fileName = line[(Sha256HexLength + SeparatorLength)..];
         if (fileName.Length == 0 || fileName[0] == ' ' || fileName[^1] == ' ')
             throw new InvalidDataException("The OTA manifest contains a malformed line.");
 
         return new SignedFeedManifestEntry(
-            line[..Sha256HexLength],
-            fileName);
+            line[..Sha256HexLength].ToString(),
+            fileName.ToString());
     }
 
     private static bool IsAllowedProductionFileName([NotNullWhen(true)] string? fileName)
     {
         if (string.IsNullOrEmpty(fileName) ||
-            fileName.Length > 255 ||
+            fileName.Length > MaxFileNameBytes ||
             fileName is "." or ".." or ManifestFileName or ManifestSignatureFileName ||
             fileName[0] is '/' or '\\' ||
             fileName[^1] is ' ' or '.' ||
