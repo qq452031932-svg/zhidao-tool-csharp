@@ -8,7 +8,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
-func (router *Router) receiveUpload(response http.ResponseWriter, request *http.Request, principal session.Principal) {
+func (router *Router) receiveUpload(response http.ResponseWriter, request *http.Request, principal session.Principal, sessionToken, csrfToken string) {
 	if router.uploads == nil || router.uploadEnvelopes == nil {
 		writeError(response, http.StatusServiceUnavailable, "upload_unavailable")
 		return
@@ -33,7 +33,19 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		writeError(response, http.StatusInternalServerError, "operation_failed")
 		return
 	}
-	if err := router.uploadEnvelopes.AcceptEnvelope(request.Context(), principal.IDHash, envelope); err != nil {
+	currentPrincipal, err := router.sessions.Authenticate(request.Context(), sessionToken, csrfToken, true)
+	if err != nil || currentPrincipal.IDHash != principal.IDHash || currentPrincipal.MustChangePassword {
+		if cleanupErr := envelope.Cleanup(); cleanupErr != nil {
+			writeError(response, http.StatusInternalServerError, "operation_failed")
+			return
+		}
+		if err == nil {
+			err = session.ErrUnauthorized
+		}
+		writeUploadError(response, err)
+		return
+	}
+	if err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, envelope); err != nil {
 		if cleanupErr := envelope.Cleanup(); cleanupErr != nil {
 			writeError(response, http.StatusInternalServerError, "operation_failed")
 			return
@@ -52,6 +64,10 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 
 func writeUploadError(response http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, session.ErrUnauthorized):
+		writeError(response, http.StatusUnauthorized, "authentication_failed")
+	case errors.Is(err, session.ErrForbidden):
+		writeError(response, http.StatusForbidden, "request_rejected")
 	case errors.Is(err, upload.ErrCompressedLimit):
 		writeError(response, http.StatusRequestEntityTooLarge, "upload_too_large")
 	case errors.Is(err, upload.ErrInsufficientDisk):

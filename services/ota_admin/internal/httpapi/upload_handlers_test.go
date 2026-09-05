@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/httpapi"
+	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
@@ -22,6 +24,12 @@ type fakeUploadReceiver struct {
 	body          []byte
 }
 
+type blockingUploadReceiver struct {
+	result  *upload.Envelope
+	started chan struct{}
+	release chan struct{}
+}
+
 type fakeEnvelopeAcceptor struct {
 	calls     int
 	sessionID string
@@ -29,7 +37,7 @@ type fakeEnvelopeAcceptor struct {
 	err       error
 }
 
-func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelope(_ context.Context, sessionID string, envelope *upload.Envelope) error {
+func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID string, envelope *upload.Envelope) error {
 	acceptor.calls++
 	acceptor.sessionID = sessionID
 	acceptor.envelope = envelope
@@ -44,6 +52,16 @@ func (receiver *fakeUploadReceiver) Receive(ctx context.Context, body io.Reader,
 	}
 	receiver.body, _ = io.ReadAll(body)
 	return receiver.result, receiver.err
+}
+
+func (receiver *blockingUploadReceiver) Receive(ctx context.Context, _ io.Reader, _ int64) (*upload.Envelope, error) {
+	close(receiver.started)
+	select {
+	case <-receiver.release:
+		return receiver.result, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func TestUploadEndpointRequiresAuthenticationSameOriginCSRFAndPasswordChange(t *testing.T) {
@@ -112,6 +130,63 @@ func TestUploadEndpointStreamsRawZIPAndReturnsOnlyUnverifiedEnvelopeMetadata(t *
 	}
 }
 
+func TestUploadEndpointRevalidatesSessionAfterBlockedReceive(t *testing.T) {
+	tests := []struct {
+		name       string
+		invalidate func(*testing.T, *harness, *http.Cookie, string)
+	}{
+		{"logout", func(t *testing.T, h *harness, cookie *http.Cookie, csrf string) {
+			response := h.request(http.MethodPost, "/admin/api/session/logout", `{}`, csrf, cookie)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("logout status=%d body=%s", response.Code, response.Body.String())
+			}
+		}},
+		{"password rotation", func(t *testing.T, h *harness, cookie *http.Cookie, csrf string) {
+			response := h.request(http.MethodPost, "/admin/api/session/password", `{"current_password":"`+newPassword+`","new_password":"third password with enough entropy"}`, csrf, cookie)
+			if response.Code != http.StatusOK {
+				t.Fatalf("password rotation status=%d body=%s", response.Code, response.Body.String())
+			}
+		}},
+		{"expiry", func(_ *testing.T, h *harness, _ *http.Cookie, _ string) {
+			h.clock.Advance(31 * time.Minute)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			cookie, csrf, _, _ := login(t, h, oldPassword)
+			cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+			receiver := &blockingUploadReceiver{result: testEnvelope(), started: make(chan struct{}), release: make(chan struct{})}
+			acceptor := &fakeEnvelopeAcceptor{}
+			installUploadReceiver(t, h, receiver, acceptor)
+
+			responses := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				responses <- uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+			}()
+			select {
+			case <-receiver.started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upload did not reach blocked receiver")
+			}
+			test.invalidate(t, h, cookie, csrf)
+			close(receiver.release)
+
+			select {
+			case response := <-responses:
+				if response.Code != http.StatusUnauthorized || decodeBody(t, response)["code"] != "authentication_failed" {
+					t.Fatalf("upload status=%d body=%s", response.Code, response.Body.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("upload did not finish after receiver release")
+			}
+			if acceptor.calls != 0 {
+				t.Fatalf("acceptor called for stale session: %d", acceptor.calls)
+			}
+		})
+	}
+}
+
 func TestUploadEndpointRequiresOneExactZIPContentType(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{result: testEnvelope()}
@@ -162,6 +237,23 @@ func TestUploadEndpointNormalizesEnvelopeFailures(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestUploadEndpointNormalizesSessionRevocationAtTransactionalAcceptance(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{result: testEnvelope()}
+	acceptor := &fakeEnvelopeAcceptor{err: session.ErrUnauthorized}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusUnauthorized || decodeBody(t, response)["code"] != "authentication_failed" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if acceptor.calls != 1 {
+		t.Fatalf("acceptor calls=%d", acceptor.calls)
 	}
 }
 

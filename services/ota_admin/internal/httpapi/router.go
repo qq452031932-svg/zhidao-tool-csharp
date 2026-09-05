@@ -29,10 +29,12 @@ type UploadReceiver interface {
 	Receive(context.Context, io.Reader, int64) (*upload.Envelope, error)
 }
 
-// EnvelopeAcceptor is the Task 9 integration seam. A nil error transfers
-// ownership of the envelope and its cleanup obligation to the acceptor.
+// EnvelopeAcceptor is the Task 9 integration seam. Implementations must verify
+// that sessionID is active and unexpired in the same transaction that adopts
+// the envelope, returning session.ErrUnauthorized when that condition fails.
+// A nil error transfers ownership and the cleanup obligation.
 type EnvelopeAcceptor interface {
-	AcceptEnvelope(context.Context, string, *upload.Envelope) error
+	AcceptEnvelopeForActiveSession(context.Context, string, *upload.Envelope) error
 }
 
 type Router struct {
@@ -133,7 +135,7 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 			writeMethodNotAllowed(response, http.MethodPost)
 			return
 		}
-		router.receiveUpload(response, request, principal)
+		router.receiveUpload(response, request, principal, cookie.Value, csrfToken)
 	default:
 		writeError(response, http.StatusNotFound, "not_found")
 	}

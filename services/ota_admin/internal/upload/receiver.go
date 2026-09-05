@@ -117,7 +117,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 	archiveReservation, extractionReservation := receiver.reservations(contentLength)
 	available, err := receiver.availableBytes(receiver.stagingRoot)
 	if err != nil {
-		return nil, fmt.Errorf("check disk space before upload: %w", err)
+		return nil, fmt.Errorf("check disk space before upload: %w", classifyStorageError(err))
 	}
 	if archiveReservation > ^uint64(0)-extractionReservation || available < archiveReservation+extractionReservation {
 		return nil, ErrInsufficientDisk
@@ -125,7 +125,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 
 	candidate, err := os.CreateTemp(receiver.stagingRoot, ".upload-*.zip")
 	if err != nil {
-		return nil, fmt.Errorf("create upload candidate: %w", err)
+		return nil, fmt.Errorf("create upload candidate: %w", classifyStorageError(err))
 	}
 	archivePath := candidate.Name()
 	cleanupFailure := func(extractionRoot string) error {
@@ -144,7 +144,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 		return nil, errors.Join(primary, cleanupFailure(extractionRoot))
 	}
 	if err := candidate.Chmod(0o600); err != nil {
-		return fail(fmt.Errorf("secure upload candidate: %w", err), "")
+		return fail(fmt.Errorf("secure upload candidate: %w", classifyStorageError(err)), "")
 	}
 
 	hash := sha256.New()
@@ -158,7 +158,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 		copyErr = ctx.Err()
 	}
 	if copyErr != nil {
-		return fail(fmt.Errorf("receive upload: %w", copyErr), "")
+		return fail(fmt.Errorf("receive upload: %w", classifyStorageError(copyErr)), "")
 	}
 	if written > receiver.limits.CompressedBytes {
 		return fail(ErrCompressedLimit, "")
@@ -200,7 +200,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 	}
 	available, err = receiver.availableBytes(receiver.stagingRoot)
 	if err != nil {
-		return fail(fmt.Errorf("check disk space: %w", err), "")
+		return fail(fmt.Errorf("check disk space: %w", classifyStorageError(err)), "")
 	}
 	if available < declaredExpanded {
 		return fail(ErrInsufficientDisk, "")
@@ -211,10 +211,10 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 
 	extractionRoot, err := os.MkdirTemp(receiver.stagingRoot, ".extract-")
 	if err != nil {
-		return fail(fmt.Errorf("create extraction root: %w", err), "")
+		return fail(fmt.Errorf("create extraction root: %w", classifyStorageError(err)), "")
 	}
 	if err := os.Chmod(extractionRoot, 0o700); err != nil {
-		return fail(fmt.Errorf("secure extraction root: %w", err), extractionRoot)
+		return fail(fmt.Errorf("secure extraction root: %w", classifyStorageError(err)), extractionRoot)
 	}
 	entries, expanded, extractErr := receiver.extract(ctx, archive.File, extractionRoot)
 	if extractErr != nil {
@@ -224,7 +224,7 @@ func (receiver *Receiver) Receive(ctx context.Context, body io.Reader, contentLe
 		return fail(err, extractionRoot)
 	}
 	if err := candidate.Close(); err != nil {
-		return fail(fmt.Errorf("close upload: %w", err), extractionRoot)
+		return fail(fmt.Errorf("close upload: %w", classifyStorageError(err)), extractionRoot)
 	}
 	candidate = nil
 	if err := ctx.Err(); err != nil {
@@ -269,7 +269,8 @@ func (writer *diskGuardWriter) Write(data []byte) (int, error) {
 	if uint64(len(data)) > ^uint64(0)-writer.safetyFloor || available < writer.safetyFloor+uint64(len(data)) {
 		return 0, ErrInsufficientDisk
 	}
-	return writer.writer.Write(data)
+	written, err := writer.writer.Write(data)
+	return written, classifyStorageError(err)
 }
 
 func (receiver *Receiver) extract(ctx context.Context, files []*zip.File, root string) ([]Entry, int64, error) {
@@ -286,7 +287,7 @@ func (receiver *Receiver) extract(ctx context.Context, files []*zip.File, root s
 		output, path, err := createOutputFile(root, archived.Name)
 		if err != nil {
 			_ = input.Close()
-			return nil, 0, fmt.Errorf("create ZIP entry %q: %w", archived.Name, err)
+			return nil, 0, fmt.Errorf("create ZIP entry %q: %w", archived.Name, classifyStorageError(err))
 		}
 		maximum := int64(archived.UncompressedSize64)
 		checksum := crc32.NewIEEE()
@@ -300,7 +301,7 @@ func (receiver *Receiver) extract(ctx context.Context, files []*zip.File, root s
 			return nil, 0, fmt.Errorf("extract ZIP entry %q: %w", archived.Name, classifyArchiveDataError(copyErr))
 		}
 		if outputCloseErr != nil {
-			return nil, 0, fmt.Errorf("close extracted file %q: %w", archived.Name, outputCloseErr)
+			return nil, 0, fmt.Errorf("close extracted file %q: %w", archived.Name, classifyStorageError(outputCloseErr))
 		}
 		if inputCloseErr != nil {
 			return nil, 0, fmt.Errorf("close ZIP entry %q: %w", archived.Name, classifyArchiveDataError(inputCloseErr))
@@ -334,6 +335,9 @@ func classifyArchiveParserError(err error) error {
 func classifyArchiveDataError(err error) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
+	}
+	if isInsufficientDiskError(err) {
+		return classifyStorageError(err)
 	}
 	var pathError *os.PathError
 	if errors.As(err, &pathError) {
