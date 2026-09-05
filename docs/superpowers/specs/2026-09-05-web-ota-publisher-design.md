@@ -47,7 +47,7 @@
 - 管理员用户名固定，密码使用 Argon2id 和每用户随机 salt 保存，不保存明文或可逆密文。
 - 首次部署生成高强度随机临时密码，仅显示一次；首次成功登录必须更换密码后才能上传或发布。
 - 会话 Cookie 必须设置 `Secure`、`HttpOnly`、`SameSite=Strict` 和 `Path=/admin/`；会话有固定最长寿命和空闲过期时间。登录、登出、改密、上传、确认和回滚 API 全部位于 `/admin/api/`，不允许依赖 Path 之外的 Cookie 或接口。
-- 唯一匿名业务接口是 `/admin/api/session/login`；它只接受账号、密码和登录所需 CSRF/同源证明。其他 `/admin/api/` 接口全部要求有效会话。
+- 匿名接口只有 `GET /admin/api/session/bootstrap` 和 `POST /admin/api/session/login`。bootstrap 创建短时、一次性的服务端 pre-auth 记录，设置 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/admin/` 的随机 pre-auth Cookie，并在 JSON 中返回与该记录绑定的 CSRF token；login 必须同时提交该 Cookie、CSRF header、账号密码和有效同源 `Origin`/`Referer`。登录尝试无论成功失败都消费该 pre-auth 记录，成功后换发正式会话 Cookie。其他 `/admin/api/` 接口全部要求有效正式会话。
 - 所有改变状态的请求必须校验 CSRF token、同源 `Origin`/`Referer` 和当前会话。
 - 登录失败按来源与账号共同限速，连续失败触发短时锁定；日志只记录时间、结果和脱敏来源，不记录密码或 Cookie。
 - 修改密码会撤销除当前改密响应外的全部既有会话；服务重启后旧会话不得自动恢复为有效。
@@ -65,7 +65,7 @@
 
 签名格式固定为 RSA-3072、RSASSA-PKCS1-v1_5 和 SHA-256；`.sig` 是原始二进制签名。manifest 固定为无 BOM UTF-8、LF 换行、末尾一个 LF，条目按 UTF-8 文件名的 ordinal 字节顺序排列，每行格式为小写 64 位 SHA-256、两个 ASCII 空格和文件名。固定身份是证书 SubjectPublicKeyInfo 的 SHA-256，而不是可变的证书文件指纹；服务器和客户端都内置同一 SPKI 指纹及公钥。
 
-服务器不执行签名，只验证：manifest 数字签名来自固定公钥、SPKI SHA-256 与配置一致、manifest 精确覆盖 ZIP 中除 `upload-manifest.sha256` 和 `upload-manifest.sha256.sig` 外的全部允许资产、每个资产的哈希与清单一致。没有签名、签名不匹配、使用另一公钥或只有 Authenticode 而没有签名 manifest 的 ZIP 一律拒绝。
+服务器不执行签名，只验证：manifest 数字签名来自固定公钥、SPKI SHA-256 与配置一致、manifest 精确覆盖 ZIP 中除 `upload-manifest.sha256` 和 `upload-manifest.sha256.sig` 外的全部允许资产、每个资产的哈希与清单一致。没有签名、签名不匹配、使用另一公钥或只有 Authenticode 而没有签名 manifest 的 ZIP 一律拒绝。公开的 `upload-manifest.sha256.sig` 与 manifest、release JSON 一样必须使用 `Cache-Control: no-cache, must-revalidate`，禁止 immutable 缓存。
 
 真实性不能只停留在发布服务器。正式客户端必须使用 `SignedFeed` 模式：在检查更新前下载 manifest 和 `.sig`，使用内置公钥与 SPKI pin 验证签名，再验证 release JSON 的哈希；Velopack 返回的包名、版本、大小与哈希必须属于这个已签名闭包，下载完成后再次按已签名 manifest 计算文件哈希，匹配后才允许进入 updater。客户端保存已接受的最高发布版本并拒绝签名正确但低于当前应用版本或已接受最高版本的重放 feed。另一公钥、无签名、被篡改 feed/包和旧 feed 重放必须在应用 updater 启动前失败。
 
@@ -97,7 +97,7 @@ ZIP 顶层只允许当前生产包 ID `SuperPan.BaiduBatchTransfer`、渠道 `wi
 
 后台使用数据库事务与进程级排他锁保证同一时间只有一个上传确认、发布或回滚操作。公开路径调整为：`/www/wwwroot/ota.fanfh.cn/releases/win-x64/generations/<release-id>/` 保存每一代完整快照，`/www/wwwroot/ota.fanfh.cn/releases/win-x64/stable` 是指向当前代的相对符号链接。Nginx 仍通过原 URL 提供文件。
 
-候选代先在同一文件系统的隐藏临时目录中完成。版本化资产、固定 Setup/Portable、asset catalog、RELEASES、manifest 和签名依次写入并 `fsync`，release JSON 在该尚未公开的代目录中最后写入；随后重新执行完整闭包校验。只有整代验证完成后，后台才创建新的临时相对符号链接，`fsync` 父目录，并用同一父目录内的原子重命名一次性替换 `stable` 链接。`stable` 链接切换是公开发布的唯一提交点；所指代目录中的已签名 release JSON 是恢复权威。这样固定 Setup/Portable、元数据和版本资产会作为同一代一起切换，不存在别名与 feed 跨版本组合。
+候选代先在与 `generations` 同一文件系统的隐藏临时目录中完成。版本化资产、固定 Setup/Portable、asset catalog、RELEASES、manifest 和签名依次写入，release JSON 在该尚未公开的候选目录中最后写入；随后重新执行完整闭包校验。持久化顺序固定为：逐个 `fsync` 所有文件 → `fsync` 候选目录 → 原子重命名候选目录为不可修改的最终 `generations/<release-id>` → `fsync` `generations` 目录 → 创建新的临时相对 `stable` 符号链接 → 用同一 `win-x64` 父目录内的原子重命名替换 `stable` → `fsync` `win-x64` 父目录。最后一次父目录 `fsync` 成功后才允许向管理员报告发布成功。`stable` 链接切换是公开发布的唯一提交点；所指代目录中的已签名 release JSON 是恢复权威。这样固定 Setup/Portable、元数据和版本资产会作为同一代一起切换，不存在别名与 feed 跨版本组合。
 
 发布前保存当前 `stable` 链接目标和完整已验证代记录。若链接切换前失败，删除未公开临时代并保留当前版本；若链接切换后数据库事务未完成，服务启动恢复流程读取 `stable` 链接目标，验证该代的签名 release JSON 和完整磁盘哈希，再幂等补齐最终发布记录，不能猜测性地再次切换。链接缺失、越出 generations 根、目标不完整或签名失败时进入只读保护状态。
 
@@ -109,7 +109,7 @@ ZIP 顶层只允许当前生产包 ID `SuperPan.BaiduBatchTransfer`、渠道 `wi
 - 只有新版本成功提交并完成审计后，才清理第 4 个及更旧快照。
 - 清理资产前必须证明它不再被当前 feed 或保留的三个快照引用；无法证明时保留文件并记录清理失败，不影响发布结果。
 - 回滚需要重新输入当前管理员密码并二次确认目标版本。
-- 回滚只创建临时相对符号链接并原子替换 `stable`，指回目标 generation；不重新签名、不修改任何 generation 内容。切换后的 `stable` 及其签名 release JSON同样是恢复权威。
+- 回滚只创建临时相对符号链接并原子替换 `stable`，指回目标 generation；替换后必须 `fsync` `win-x64` 父目录，成功后才能报告完成。回滚不重新签名、不修改任何 generation 内容；切换后的 `stable` 及其签名 release JSON 同样是恢复权威。
 - 回滚不会让已经升级的客户端自动降级。发现坏版本后，回滚用于阻止尚未升级的客户端继续获得坏版本；已升级客户端必须通过发布版本号更高的修复版恢复。
 
 ## 数据与审计
@@ -145,7 +145,7 @@ ZIP 顶层只允许当前生产包 ID `SuperPan.BaiduBatchTransfer`、渠道 `wi
 - 最近 3 版保留、generation 越界链接拒绝、清理失败、固定别名与 feed 同代切换及回滚。
 - 已升级客户端不会被错误描述为自动降级。
 
-服务器验收必须使用隔离测试目录先完成真实上传、确认、失败注入和回滚，再接入稳定目录。最终验证 `/admin/` 登录与发布流程、OTA 静态下载和缓存头、HTTPS 证书、自动续期，以及 `f.fanfh.cn` 配置哈希、证书和页面响应均未变化。
+服务器验收必须使用隔离测试目录先完成真实上传、确认、失败注入和回滚，再接入稳定目录。还必须覆盖现有空 `stable` 目录安全迁移为相对符号链接、迁移失败回滚，以及 manifest 签名文件的 no-cache 响应。最终验证 `/admin/` 登录与发布流程、OTA 静态下载和缓存头、HTTPS 证书、自动续期，以及 `f.fanfh.cn` 配置哈希、证书和页面响应均未变化。
 
 ## 非目标与后续事项
 
