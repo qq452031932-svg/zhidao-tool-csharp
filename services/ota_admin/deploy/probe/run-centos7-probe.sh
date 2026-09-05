@@ -17,6 +17,7 @@ readonly GO_ARCHIVE_SHA256="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63e
 readonly GO_URL="https://go.dev/dl/go1.27.1.linux-amd64.tar.gz"
 readonly GO_EXE="$VERIFY_ROOT/go/bin/go"
 readonly HEALTH_URL="http://127.0.0.1:18091/admin/health"
+readonly STATIC_STRIPPED_FILE_PATTERN='^ELF 64-bit.*x86-64.*statically linked.*, stripped(,|$)'
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "This isolated compatibility probe must run as root." >&2
@@ -49,7 +50,11 @@ trap cleanup EXIT INT TERM
 
 file_output="$(file -b "$BINARY")"
 printf '%s\n' "$file_output"
-grep -Eq 'ELF 64-bit.*x86-64.*statically linked.*stripped' <<<"$file_output"
+if grep -Fq 'not stripped' <<<"$file_output"; then
+  echo "Probe binary is not stripped." >&2
+  exit 1
+fi
+grep -Eq "$STATIC_STRIPPED_FILE_PATTERN" <<<"$file_output"
 
 verify_go_archive() {
   local archive_path="$1"

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -185,6 +186,33 @@ func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
 		if !strings.Contains(runner, required) {
 			t.Errorf("CentOS runner does not contain %q", required)
 		}
+	}
+}
+
+func TestStaticBinaryFilePatternRejectsNotStripped(t *testing.T) {
+	t.Parallel()
+
+	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	declaration := regexp.MustCompile(`(?m)^readonly STATIC_STRIPPED_FILE_PATTERN='([^']+)'$`)
+	match := declaration.FindStringSubmatch(runner)
+	if len(match) != 2 {
+		t.Fatal("CentOS runner does not declare STATIC_STRIPPED_FILE_PATTERN")
+	}
+	pattern, err := regexp.Compile(match[1])
+	if err != nil {
+		t.Fatalf("STATIC_STRIPPED_FILE_PATTERN is invalid: %v", err)
+	}
+
+	valid := "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped"
+	if !pattern.MatchString(valid) {
+		t.Fatalf("static stripped pattern rejected representative output %q", valid)
+	}
+	notStripped := "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, not stripped"
+	if pattern.MatchString(notStripped) {
+		t.Fatalf("static stripped pattern accepted representative output %q", notStripped)
+	}
+	if !strings.Contains(runner, "grep -Fq 'not stripped'") {
+		t.Fatal("CentOS runner does not explicitly reject the 'not stripped' token")
 	}
 }
 
