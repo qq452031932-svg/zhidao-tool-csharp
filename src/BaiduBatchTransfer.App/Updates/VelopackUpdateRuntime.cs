@@ -386,6 +386,7 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         {
             if (disposed != 0 || operationGeneration != generation)
                 return snapshot;
+            operationGeneration++;
             snapshot = completed;
         }
 
@@ -393,7 +394,7 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         return completed;
     }
 
-    private void RestoreStable(
+    private bool RestoreStable(
         long generation,
         ApplicationUpdateStatus transientStatus,
         ApplicationUpdateSnapshot stable)
@@ -404,13 +405,15 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
                 operationGeneration != generation ||
                 snapshot.Status != transientStatus)
             {
-                return;
+                return false;
             }
 
+            operationGeneration++;
             snapshot = stable;
         }
 
         RaiseSnapshotChanged(stable);
+        return true;
     }
 
     private CancellationTokenRegistration RegisterCancellation(
@@ -421,11 +424,11 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
             static state =>
             {
                 var restore = (CancellationRestore)state!;
-                restore.Runtime.RestoreStable(
+                var restored = restore.Runtime.RestoreStable(
                     restore.Generation,
                     restore.TransientStatus,
                     restore.Stable);
-                if (restore.TransientStatus == ApplicationUpdateStatus.Downloading)
+                if (restored && restore.TransientStatus == ApplicationUpdateStatus.Downloading)
                     restore.Runtime.packageGate?.InvalidateReceipt();
             },
             new CancellationRestore(this, generation, transientStatus, stable));
@@ -500,7 +503,9 @@ public sealed class VelopackUpdateRuntime : IApplicationUpdateRuntime
         string.Equals(left.AssetType, right.AssetType, StringComparison.Ordinal) &&
         string.Equals(left.FileName, right.FileName, StringComparison.Ordinal) &&
         left.Size == right.Size &&
-        string.Equals(left.Sha256, right.Sha256, StringComparison.OrdinalIgnoreCase);
+        (string.IsNullOrEmpty(left.Sha256) ||
+         string.IsNullOrEmpty(right.Sha256) ||
+         string.Equals(left.Sha256, right.Sha256, StringComparison.OrdinalIgnoreCase));
 
     private static ApplicationUpdateSnapshot NewSnapshot(
         ApplicationUpdateStatus status,

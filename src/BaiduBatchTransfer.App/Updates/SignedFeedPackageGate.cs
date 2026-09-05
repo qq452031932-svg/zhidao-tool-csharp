@@ -1,5 +1,8 @@
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace BaiduBatchTransfer.App.Updates;
 
@@ -135,7 +138,7 @@ internal sealed class SignedFeedPackageGate
         }
     }
 
-    internal IDisposable? TryAcquireLaunchAuthorization(VelopackClientAsset pending)
+    internal SignedPackageLaunchAuthorization? TryAcquireLaunchAuthorization(VelopackClientAsset pending)
     {
         ArgumentNullException.ThrowIfNull(pending);
         try
@@ -159,7 +162,9 @@ internal sealed class SignedFeedPackageGate
                         return null;
                     }
                     lease.Position = 0;
-                    return lease;
+                    return new SignedPackageLaunchAuthorization(
+                        Path.GetFullPath(pending.LocalPackagePath!),
+                        lease);
                 }
                 catch
                 {
@@ -234,7 +239,7 @@ internal sealed class SignedFeedPackageGate
         asset.Size == fingerprint.Size &&
         asset.Size is > 0 and <= SignedFeedUpdateSource.MaxPackageBytes &&
         IsSha256(asset.Sha256) &&
-        FixedTimeHashEquals(asset.Sha256, fingerprint.Sha256) &&
+        LocalHashMatchesSignedHash(asset.Sha256, fingerprint.Sha256) &&
         string.Equals(
             asset.FileName,
             $"{ExpectedPackageId}-{asset.Version}-full.nupkg",
@@ -248,7 +253,7 @@ internal sealed class SignedFeedPackageGate
         receipt.Size == fingerprint.Size &&
         receipt.Size is > 0 and <= SignedFeedUpdateSource.MaxPackageBytes &&
         IsSha256(receipt.Sha256) &&
-        FixedTimeHashEquals(receipt.Sha256, fingerprint.Sha256) &&
+        LocalHashMatchesSignedHash(receipt.Sha256, fingerprint.Sha256) &&
         string.Equals(
             receipt.FileName,
             $"{ExpectedPackageId}-{receipt.Version}-full.nupkg",
@@ -286,11 +291,11 @@ internal sealed class SignedFeedPackageGate
         var expectedPath = Path.GetFullPath(Path.Combine(expectedPackageRoot, pending.Fingerprint.FileName));
         if (!string.Equals(packagePath, expectedPath, PathComparison) ||
             !string.Equals(Path.GetDirectoryName(packagePath), expectedPackageRoot, PathComparison) ||
-            new DirectoryInfo(expectedPackageRoot).Attributes.HasFlag(FileAttributes.ReparsePoint) ||
             new FileInfo(packagePath).Attributes.HasFlag(FileAttributes.ReparsePoint))
         {
             throw new InvalidDataException("The pending update package is outside the pinned package root.");
         }
+        ValidateRootAncestors();
         var stream = new FileStream(
             packagePath,
             FileMode.Open,
@@ -298,12 +303,47 @@ internal sealed class SignedFeedPackageGate
             FileShare.Read,
             128 * 1024,
             FileOptions.SequentialScan | FileOptions.Asynchronous);
+        ValidateOpenedHandlePath(stream.SafeFileHandle, packagePath);
         if (stream.Length != expectedSize)
         {
             stream.Dispose();
             throw new InvalidDataException("The pending update package length is invalid.");
         }
         return stream;
+    }
+
+    private static void ValidateOpenedHandlePath(SafeFileHandle handle, string expectedPath)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var buffer = new StringBuilder(32_768);
+        var length = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
+        if (length == 0 || length >= buffer.Capacity)
+            throw new InvalidDataException("The pending update package handle could not be resolved.");
+        var resolved = NormalizeWindowsFinalPath(buffer.ToString());
+        if (!string.Equals(Path.GetFullPath(expectedPath), resolved, PathComparison))
+            throw new InvalidDataException("The pending update package handle resolves outside its trusted path.");
+    }
+
+    private static string NormalizeWindowsFinalPath(string path)
+    {
+        const string uncPrefix = @"\\?\UNC\";
+        const string devicePrefix = @"\\?\";
+        if (path.StartsWith(uncPrefix, StringComparison.OrdinalIgnoreCase))
+            return @"\\" + path[uncPrefix.Length..];
+        return path.StartsWith(devicePrefix, StringComparison.OrdinalIgnoreCase)
+            ? path[devicePrefix.Length..]
+            : path;
+    }
+
+    private void ValidateRootAncestors()
+    {
+        var current = new DirectoryInfo(expectedPackageRoot);
+        while (current is not null)
+        {
+            if (current.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                throw new InvalidDataException("The pinned package root contains a reparse point.");
+            current = current.Parent;
+        }
     }
 
     private void TryInvalidateReceipt()
@@ -342,7 +382,32 @@ internal sealed class SignedFeedPackageGate
         }
     }
 
+    private static bool LocalHashMatchesSignedHash(string signedHash, string localHash) =>
+        string.IsNullOrEmpty(localHash) || FixedTimeHashEquals(signedHash, localHash);
+
     private static bool IsValidationFailure(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or CryptographicException or
             InvalidDataException or ArgumentException or NotSupportedException;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        [Out] StringBuilder filePath,
+        uint filePathLength,
+        uint flags);
+}
+
+internal sealed class SignedPackageLaunchAuthorization : IDisposable
+{
+    private FileStream? lease;
+
+    internal SignedPackageLaunchAuthorization(string packagePath, FileStream lease)
+    {
+        PackagePath = packagePath;
+        this.lease = lease;
+    }
+
+    internal string PackagePath { get; }
+
+    public void Dispose() => Interlocked.Exchange(ref lease, null)?.Dispose();
 }

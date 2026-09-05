@@ -48,7 +48,7 @@ internal sealed record SignedPendingUpdateReceipt(
 
 internal sealed class SignedPendingUpdateReceiptStore
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
     private const int MaxProtectedBytes = 16 * 1024;
     private const int MaxPlaintextBytes = 8 * 1024;
     private const uint MoveFileReplaceExisting = 0x1;

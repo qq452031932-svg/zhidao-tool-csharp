@@ -31,6 +31,12 @@ public sealed record ApplicationBuildInfo(
         "Updates",
         "signed-pending-update.bin");
 
+    internal string SignedGuardFailureMarkerPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "BaiduBatchTransfer",
+        "Updates",
+        "signed-update-guard-failed.bin");
+
     public string SingleInstanceMutexName => IsOtaAcceptanceBuild
         ? @"Local\BaiduBatchTransfer.OtaAcceptance.Singleton.v1"
         : @"Local\BaiduBatchTransfer.Singleton.v1";

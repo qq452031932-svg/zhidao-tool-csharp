@@ -14,6 +14,14 @@ internal static class Program
             Environment.ExitCode = guardExitCode;
             return;
         }
+        if (SignedUpdateGuardFailureMarker.TryConsume(ApplicationBuildInfo.Current.SignedGuardFailureMarkerPath))
+        {
+            System.Windows.MessageBox.Show(
+                UpdateAwareShutdownOrchestrator.UpdaterLaunchFailureMessage,
+                "软件更新",
+                System.Windows.MessageBoxButton.OK,
+                System.Windows.MessageBoxImage.Warning);
+        }
         var updateRuntime = VelopackUpdateRuntime.Create(ApplicationBuildInfo.Current);
         try
         {

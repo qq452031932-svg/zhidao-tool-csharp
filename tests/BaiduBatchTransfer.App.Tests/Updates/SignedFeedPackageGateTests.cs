@@ -1,6 +1,10 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.IO.Compression;
+using System.Diagnostics;
+using System.IO.Pipes;
 using BaiduBatchTransfer.App.Updates;
+using Velopack;
 
 namespace BaiduBatchTransfer.App.Tests.Updates;
 
@@ -21,6 +25,106 @@ public sealed class SignedFeedPackageGateTests : IDisposable
             CancellationToken.None));
         Assert.True(File.Exists(fixture.ReceiptPath));
         Assert.True(fixture.Gate.TryRevalidatePending(fixture.Pending));
+    }
+
+    [Fact]
+    public async Task RealVelopackPendingAssetWithEmptyChecksumPassesSignedByteGate()
+    {
+        Directory.CreateDirectory(root);
+        const string version = "2.0.0";
+        var packageName = $"SuperPan.BaiduBatchTransfer-{version}-full.nupkg";
+        var packagePath = Path.Combine(root, packageName);
+        CreateMinimalNupkg(packagePath, version);
+        var nativePending = VelopackAsset.FromNupkgNoChecksum(packagePath);
+        Assert.True(string.IsNullOrEmpty(nativePending.SHA256));
+        var fixture = CreateFixture(version, File.ReadAllBytes(packagePath));
+        var emptyChecksumPending = fixture.Pending with
+        {
+            Fingerprint = fixture.Pending.Fingerprint with { Sha256 = string.Empty },
+            NativeToken = nativePending
+        };
+
+        Assert.True(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            emptyChecksumPending,
+            CancellationToken.None));
+        Assert.True(fixture.Gate.TryRevalidatePending(emptyChecksumPending));
+    }
+
+    [Fact]
+    public async Task RealVelopackEmptyChecksumPendingPassesDownloadStartupAndRestartFlow()
+    {
+        Directory.CreateDirectory(root);
+        const string version = "2.0.0";
+        var packagePath = Path.Combine(root, $"SuperPan.BaiduBatchTransfer-{version}-full.nupkg");
+        CreateMinimalNupkg(packagePath, version);
+        var nativePending = VelopackAsset.FromNupkgNoChecksum(packagePath);
+        var fixture = CreateFixture(version, File.ReadAllBytes(packagePath));
+        var pending = fixture.Pending with
+        {
+            Fingerprint = fixture.Pending.Fingerprint with { Sha256 = nativePending.SHA256 },
+            NativeToken = nativePending
+        };
+        var client = new GateClient(fixture.Pending, pending);
+        var guardStarts = 0;
+
+        using (var runtime = new VelopackUpdateRuntime(client, "1.0.0", fixture.Gate, () =>
+               {
+                   guardStarts++;
+                   return true;
+               }))
+        {
+            await runtime.CheckAsync(CancellationToken.None);
+            Assert.Equal(ApplicationUpdateStatus.ReadyToRestart,
+                (await runtime.DownloadAsync(CancellationToken.None)).Status);
+        }
+
+        using var restarted = new VelopackUpdateRuntime(client, "1.0.0", fixture.Gate, () =>
+        {
+            guardStarts++;
+            return true;
+        });
+        Assert.Equal(ApplicationUpdateStatus.ReadyToRestart, restarted.Snapshot.Status);
+        Assert.True(restarted.TryPrepareRestart());
+        Assert.True(restarted.LaunchPreparedUpdateAndRestart());
+        Assert.Equal(1, guardStarts);
+        Assert.Equal(0, client.LaunchCalls);
+    }
+
+    [Fact]
+    public async Task CancellationRaisedByReadyNotificationCannotDeleteCommittedReceipt()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        var client = new GateClient(fixture.Pending, fixture.Pending);
+        using var runtime = new VelopackUpdateRuntime(client, "1.0.0", fixture.Gate);
+        await runtime.CheckAsync(CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+        runtime.SnapshotChanged += (_, snapshot) =>
+        {
+            if (snapshot.Status == ApplicationUpdateStatus.ReadyToRestart)
+                cancellation.Cancel();
+        };
+
+        var result = await runtime.DownloadAsync(cancellation.Token);
+
+        Assert.Equal(ApplicationUpdateStatus.ReadyToRestart, result.Status);
+        Assert.True(File.Exists(fixture.ReceiptPath));
+        Assert.True(runtime.TryPrepareRestart());
+    }
+
+    [Fact]
+    public async Task NonemptyMismatchingLocalPendingChecksumIsRejected()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        var wrongLocalMetadata = fixture.Pending with
+        {
+            Fingerprint = fixture.Pending.Fingerprint with { Sha256 = new string('f', 64) }
+        };
+
+        Assert.False(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            wrongLocalMetadata,
+            CancellationToken.None));
     }
 
     [Fact]
@@ -215,10 +319,167 @@ public sealed class SignedFeedPackageGateTests : IDisposable
             () => File.WriteAllText(fixture.PackagePath, "tampered while parent exits"),
             () => fixture.Pending,
             fixture.Gate,
-            _ => updaterCalls++);
+            _ =>
+            {
+                updaterCalls++;
+                return true;
+            });
 
         Assert.False(launched);
         Assert.Equal(0, updaterCalls);
+    }
+
+    [Fact]
+    public void GuardRejectsMissingOrSpoofedParentIdentity()
+    {
+        Assert.False(SignedUpdateGuard.TryOpenVerifiedParentForTesting(
+            int.MaxValue,
+            DateTime.UtcNow.Ticks,
+            out _));
+
+        using var current = Process.GetCurrentProcess();
+        Assert.False(SignedUpdateGuard.TryOpenVerifiedParentForTesting(
+            current.Id,
+            current.StartTime.ToUniversalTime().Ticks + 1,
+            out _));
+        Assert.True(SignedUpdateGuard.TryOpenVerifiedParentForTesting(
+            current.Id,
+            current.StartTime.ToUniversalTime().Ticks,
+            out var verified));
+        verified!.Dispose();
+    }
+
+    [Fact]
+    public async Task GuardReadinessHandshakeRejectsTimeoutAndWrongNonce()
+    {
+        var nonce = RandomNumberGenerator.GetBytes(32);
+        await using (var timedOut = SignedUpdateGuard.CreateHandshakeServerForTesting())
+        {
+            Assert.False(await SignedUpdateGuard.WaitForGuardReadyForTesting(
+                timedOut.Server,
+                nonce,
+                TimeSpan.FromMilliseconds(50)));
+        }
+
+        await using var wrong = SignedUpdateGuard.CreateHandshakeServerForTesting();
+        var client = Task.Run(async () =>
+        {
+            await using var pipe = new NamedPipeClientStream(
+                ".",
+                wrong.Name,
+                PipeDirection.Out,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            await pipe.ConnectAsync(1_000);
+            await pipe.WriteAsync(new byte[32]);
+        });
+        Assert.False(await SignedUpdateGuard.WaitForGuardReadyForTesting(
+            wrong.Server,
+            nonce,
+            TimeSpan.FromSeconds(1)));
+        await client;
+    }
+
+    [Fact]
+    public async Task GuardReadinessHandshakeAcceptsExactNonceFromCurrentUserPipe()
+    {
+        var nonce = RandomNumberGenerator.GetBytes(32);
+        await using var handshake = SignedUpdateGuard.CreateHandshakeServerForTesting();
+        var client = Task.Run(async () =>
+        {
+            await using var pipe = new NamedPipeClientStream(
+                ".",
+                handshake.Name,
+                PipeDirection.Out,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            await pipe.ConnectAsync(1_000);
+            await pipe.WriteAsync(nonce);
+        });
+
+        Assert.True(await SignedUpdateGuard.WaitForGuardReadyForTesting(
+            handshake.Server,
+            nonce,
+            TimeSpan.FromSeconds(1)));
+        await client;
+    }
+
+    [Fact]
+    public async Task GuardHoldsVerifiedPackageLeaseUntilNativeUpdaterCompletes()
+    {
+        var fixture = CreateFixture("2.0.0", Encoding.UTF8.GetBytes("signed package"));
+        Assert.True(await fixture.Gate.AuthorizeDownloadedAsync(
+            fixture.Snapshot,
+            fixture.Pending,
+            CancellationToken.None));
+        string? receivedPath = null;
+
+        var launched = SignedUpdateGuard.ValidateAndLaunchAfterParentExitForTesting(
+            static () => { },
+            () => fixture.Pending,
+            fixture.Gate,
+            packagePath =>
+            {
+                receivedPath = packagePath;
+                Assert.Throws<IOException>(() => File.WriteAllText(packagePath, "replacement"));
+                return true;
+            });
+
+        Assert.True(launched);
+        Assert.Equal(fixture.PackagePath, receivedPath);
+        File.WriteAllText(fixture.PackagePath, "replacement after updater exit");
+    }
+
+    [Fact]
+    public void NativeUpdaterReceivesExactVerifiedPackageWithoutGuardWaitPid()
+    {
+        var appRoot = Path.Combine(root, "app");
+        var packageRoot = Path.Combine(appRoot, "packages");
+        Directory.CreateDirectory(packageRoot);
+        var updater = Path.Combine(appRoot, "Update.exe");
+        var package = Path.Combine(packageRoot, "SuperPan.BaiduBatchTransfer-2.0.0-full.nupkg");
+        File.WriteAllBytes(updater, [1]);
+        File.WriteAllBytes(package, [2]);
+
+        var info = SignedUpdateGuard.CreateNativeUpdaterStartInfoForTesting(
+            updater, package, appRoot, packageRoot);
+
+        Assert.Equal(updater, info.FileName);
+        Assert.Equal(
+            ["apply", "--package", package, "--rootDir", appRoot, "--packageDir", packageRoot],
+            info.ArgumentList);
+        Assert.DoesNotContain("--waitPid", info.ArgumentList);
+    }
+
+    [Fact]
+    public void TimedOutNativeUpdaterIsTerminatedBeforeVerifiedLeaseCanBeReleased()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var info = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        info.ArgumentList.Add("-NoProfile");
+        info.ArgumentList.Add("-Command");
+        info.ArgumentList.Add("Start-Sleep -Seconds 30");
+        using var process = Process.Start(info)!;
+
+        Assert.False(SignedUpdateGuard.WaitForUpdaterExitForTesting(
+            process,
+            TimeSpan.FromMilliseconds(50)));
+        Assert.True(process.HasExited);
+    }
+
+    [Fact]
+    public void GuardFailureMarkerIsAuthenticatedAndConsumedOnce()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var marker = Path.Combine(root, "guard-failed.bin");
+
+        SignedUpdateGuardFailureMarker.TryWrite(marker);
+
+        Assert.True(SignedUpdateGuardFailureMarker.TryConsume(marker));
+        Assert.False(SignedUpdateGuardFailureMarker.TryConsume(marker));
     }
 
     [Fact]
@@ -505,6 +766,24 @@ public sealed class SignedFeedPackageGateTests : IDisposable
             pending,
             packagePath,
             receiptPath);
+    }
+
+    private static void CreateMinimalNupkg(string path, string version)
+    {
+        using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
+        var entry = archive.CreateEntry("SuperPan.BaiduBatchTransfer.nuspec");
+        using var writer = new StreamWriter(entry.Open(), new UTF8Encoding(false));
+        writer.Write($"""
+            <?xml version="1.0" encoding="utf-8"?>
+            <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+              <metadata>
+                <id>SuperPan.BaiduBatchTransfer</id>
+                <version>{version}</version>
+                <authors>SuperPan</authors>
+                <description>OTA compatibility fixture</description>
+              </metadata>
+            </package>
+            """);
     }
 
     public void Dispose()
