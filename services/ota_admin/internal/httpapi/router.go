@@ -41,6 +41,11 @@ func NewRouter(options Options) (http.Handler, error) {
 }
 
 func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodPost {
+		response.Header().Set("Allow", "GET, POST")
+		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
 	switch {
 	case request.URL.Path == "/admin/api/session/bootstrap" && request.Method == http.MethodGet:
 		router.bootstrap(response, request)
@@ -54,7 +59,7 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 }
 
 func (router *Router) authenticated(response http.ResponseWriter, request *http.Request) {
-	mutating := request.Method == http.MethodPost || request.Method == http.MethodPut || request.Method == http.MethodPatch || request.Method == http.MethodDelete
+	mutating := request.Method == http.MethodPost
 	if mutating && !security.SameOriginRequest(request, router.publicOrigin) {
 		writeError(response, http.StatusForbidden, "request_rejected")
 		return
@@ -71,24 +76,44 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 	}
 	principal, err := router.sessions.Authenticate(request.Context(), cookie.Value, csrfToken, mutating)
 	if err != nil {
-		if errors.Is(err, session.ErrForbidden) {
+		switch {
+		case errors.Is(err, session.ErrForbidden):
 			writeError(response, http.StatusForbidden, "request_rejected")
-		} else {
+		case errors.Is(err, session.ErrUnauthorized):
 			writeError(response, http.StatusUnauthorized, "authentication_failed")
+		default:
+			writeError(response, http.StatusInternalServerError, "operation_failed")
 		}
 		return
 	}
 
 	switch {
-	case request.URL.Path == "/admin/api/session/current" && request.Method == http.MethodGet:
+	case request.URL.Path == "/admin/api/session/current":
+		if request.Method != http.MethodGet {
+			writeMethodNotAllowed(response, http.MethodGet)
+			return
+		}
 		writeJSON(response, http.StatusOK, map[string]any{"authenticated": true, "must_change_password": principal.MustChangePassword})
-	case request.URL.Path == "/admin/api/session/logout" && request.Method == http.MethodPost:
+	case request.URL.Path == "/admin/api/session/logout":
+		if request.Method != http.MethodPost {
+			writeMethodNotAllowed(response, http.MethodPost)
+			return
+		}
 		router.logout(response, request, principal)
-	case request.URL.Path == "/admin/api/session/password" && request.Method == http.MethodPost:
+	case request.URL.Path == "/admin/api/session/password":
+		if request.Method != http.MethodPost {
+			writeMethodNotAllowed(response, http.MethodPost)
+			return
+		}
 		router.changePassword(response, request, principal)
 	case principal.MustChangePassword:
 		writeError(response, http.StatusForbidden, "password_change_required")
 	default:
 		writeError(response, http.StatusNotFound, "not_found")
 	}
+}
+
+func writeMethodNotAllowed(response http.ResponseWriter, allowed string) {
+	response.Header().Set("Allow", allowed)
+	writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
 }

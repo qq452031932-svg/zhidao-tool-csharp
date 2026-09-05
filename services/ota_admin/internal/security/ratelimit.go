@@ -29,10 +29,18 @@ func NewRateLimiter(limit int, window, lockFor time.Duration) *RateLimiter {
 }
 
 func (limiter *RateLimiter) Locked(account, source string, now time.Time) (bool, time.Duration) {
+	return limiter.locked(rateKeys(account, source), now)
+}
+
+func (limiter *RateLimiter) LockedKey(key string, now time.Time) (bool, time.Duration) {
+	return limiter.locked([]string{"key:" + key}, now)
+}
+
+func (limiter *RateLimiter) locked(keys []string, now time.Time) (bool, time.Duration) {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
 	remaining := time.Duration(0)
-	for _, key := range rateKeys(account, source) {
+	for _, key := range keys {
 		entry := limiter.entries[key]
 		if entry == nil {
 			continue
@@ -49,20 +57,31 @@ func (limiter *RateLimiter) Locked(account, source string, now time.Time) (bool,
 	return remaining > 0, remaining
 }
 
-func (limiter *RateLimiter) RecordFailure(account, source string, now time.Time) {
+func (limiter *RateLimiter) RecordFailure(account, source string, now time.Time) bool {
+	return limiter.recordFailure(rateKeys(account, source), now)
+}
+
+func (limiter *RateLimiter) RecordFailureKey(key string, now time.Time) bool {
+	return limiter.recordFailure([]string{"key:" + key}, now)
+}
+
+func (limiter *RateLimiter) recordFailure(keys []string, now time.Time) bool {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	for _, key := range rateKeys(account, source) {
+	recorded := false
+	for _, key := range keys {
 		entry := limiter.entry(key, now)
 		if entry == nil {
 			continue
 		}
+		recorded = true
 		limiter.prune(entry, now)
 		entry.failures = append(entry.failures, now)
 		if len(entry.failures) >= limiter.limit {
 			entry.lockedUntil = now.Add(limiter.lockFor)
 		}
 	}
+	return recorded
 }
 
 func (limiter *RateLimiter) RecordSuccess(account, source string) {

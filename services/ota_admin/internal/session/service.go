@@ -25,6 +25,7 @@ var (
 const (
 	maximumPreauthorizations          = 4096
 	maximumPreauthorizationsPerSource = 8
+	maximumActiveSessions             = 32
 )
 
 type Options struct {
@@ -40,15 +41,17 @@ type Options struct {
 }
 
 type Service struct {
-	store          *store.Store
-	now            func() time.Time
-	random         io.Reader
-	sourceHMACKey  []byte
-	preauthTTL     time.Duration
-	idleTimeout    time.Duration
-	absoluteExpiry time.Duration
-	limiter        *security.RateLimiter
-	loginMu        sync.Mutex
+	store            *store.Store
+	now              func() time.Time
+	random           io.Reader
+	sourceHMACKey    []byte
+	preauthTTL       time.Duration
+	idleTimeout      time.Duration
+	absoluteExpiry   time.Duration
+	limiter          *security.RateLimiter
+	invalidLimiter   *security.RateLimiter
+	bootstrapLimiter *security.RateLimiter
+	loginMu          sync.Mutex
 
 	mu              sync.Mutex
 	preauth         map[string]*preauthorization
@@ -65,7 +68,8 @@ type preauthorization struct {
 }
 
 type runtimeSession struct {
-	csrfHash string
+	csrfHash  string
+	createdAt time.Time
 }
 
 type LoginGrant struct{ state *loginGrantState }
@@ -108,19 +112,24 @@ func NewService(database *store.Store, options Options) (*Service, error) {
 	if err := database.RevokeAllActiveSessions(context.Background()); err != nil {
 		return nil, err
 	}
+	if err := database.ExpireAndPruneSessions(context.Background(), options.Now().UTC()); err != nil {
+		return nil, err
+	}
 	return &Service{
-		store:           database,
-		now:             options.Now,
-		random:          options.Random,
-		sourceHMACKey:   append([]byte(nil), options.SourceHMACKey...),
-		preauthTTL:      options.PreauthTTL,
-		idleTimeout:     options.IdleTimeout,
-		absoluteExpiry:  options.AbsoluteExpiry,
-		limiter:         security.NewRateLimiter(options.FailureLimit, options.FailureWindow, options.FailureLock),
-		preauth:         make(map[string]*preauthorization),
-		preauthOrder:    list.New(),
-		preauthBySource: make(map[string]int),
-		sessions:        make(map[string]runtimeSession),
+		store:            database,
+		now:              options.Now,
+		random:           options.Random,
+		sourceHMACKey:    append([]byte(nil), options.SourceHMACKey...),
+		preauthTTL:       options.PreauthTTL,
+		idleTimeout:      options.IdleTimeout,
+		absoluteExpiry:   options.AbsoluteExpiry,
+		limiter:          security.NewRateLimiter(options.FailureLimit, options.FailureWindow, options.FailureLock),
+		invalidLimiter:   security.NewRateLimiter(options.FailureLimit, options.FailureWindow, options.FailureLock),
+		bootstrapLimiter: security.NewRateLimiter(maximumPreauthorizationsPerSource, options.PreauthTTL, options.PreauthTTL),
+		preauth:          make(map[string]*preauthorization),
+		preauthOrder:     list.New(),
+		preauthBySource:  make(map[string]int),
+		sessions:         make(map[string]runtimeSession),
 	}, nil
 }
 
@@ -129,13 +138,24 @@ func (service *Service) Bootstrap(sourceAddress string) (token, csrfToken string
 	if err != nil {
 		return "", "", time.Time{}, 0, err
 	}
+	service.loginMu.Lock()
+	defer service.loginMu.Unlock()
 	now := service.now().UTC()
 	expiresAt = now.Add(service.preauthTTL)
 	sourceKey := source.String()
+	if locked, _ := service.limiter.Locked(store.AdministratorUsername, sourceKey, now); locked {
+		return "", "", time.Time{}, 0, ErrBootstrapLimited
+	}
+	if locked, _ := service.bootstrapLimiter.LockedKey(sourceKey, now); locked {
+		return "", "", time.Time{}, 0, ErrBootstrapLimited
+	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	service.deleteExpiredPreauthLocked(now)
 	if len(service.preauth) >= maximumPreauthorizations || service.preauthBySource[sourceKey] >= maximumPreauthorizationsPerSource {
+		return "", "", time.Time{}, 0, ErrBootstrapLimited
+	}
+	if !service.bootstrapLimiter.RecordFailureKey(sourceKey, now) {
 		return "", "", time.Time{}, 0, ErrBootstrapLimited
 	}
 	token, err = security.NewRandomToken(service.random)
@@ -174,32 +194,34 @@ func (service *Service) ConsumePreauthorization(token, csrfToken string) LoginGr
 }
 
 func (service *Service) Login(ctx context.Context, grant LoginGrant, username, password, sourceAddress string) (LoginResult, time.Duration, error) {
-	now := service.now().UTC()
 	source, err := audit.PseudonymizeSource(service.sourceHMACKey, sourceAddress)
 	if err != nil {
 		return LoginResult{}, 0, err
 	}
-	if !grant.claim() {
-		if err := service.recordLogin(ctx, audit.OutcomeFailure, source, audit.CodeLoginRejected, now); err != nil {
-			return LoginResult{}, 0, err
-		}
-		return LoginResult{}, 0, ErrUnauthorized
-	}
 	service.loginMu.Lock()
 	defer service.loginMu.Unlock()
+	now := service.now().UTC()
+	if !grant.claim() {
+		return service.rejectInvalidGrant(ctx, source, now)
+	}
 	if locked, remaining := service.limiter.Locked(store.AdministratorUsername, source.String(), now); locked {
-		if err := service.recordLogin(ctx, audit.OutcomeFailure, source, audit.CodeLoginLocked, now); err != nil {
-			return LoginResult{}, 0, err
-		}
 		return LoginResult{}, remaining, ErrLocked
 	}
 	administrator, adminErr := service.store.Admin(ctx)
+	if adminErr != nil {
+		return LoginResult{}, 0, adminErr
+	}
 	validUsername := constantUsernameMatch(username, administrator.Username)
 	validPassword := security.VerifyPassword(password, administrator.PasswordHash)
-	validCredentials := adminErr == nil && validUsername && validPassword
+	validCredentials := validUsername && validPassword
 	if !validCredentials {
 		service.limiter.RecordFailure(store.AdministratorUsername, source.String(), now)
-		if err := service.recordLogin(ctx, audit.OutcomeFailure, source, audit.CodeLoginRejected, now); err != nil {
+		locked, _ := service.limiter.Locked(store.AdministratorUsername, source.String(), now)
+		code := audit.CodeLoginRejected
+		if locked {
+			code = audit.CodeLoginLocked
+		}
+		if err := service.recordLogin(ctx, audit.OutcomeFailure, source, code, now); err != nil {
 			return LoginResult{}, 0, err
 		}
 		return LoginResult{}, 0, ErrUnauthorized
@@ -211,12 +233,33 @@ func (service *Service) Login(ctx context.Context, grant LoginGrant, username, p
 	}
 	if err := service.recordLogin(ctx, audit.OutcomeSuccess, source, audit.CodeLoginAccepted, now); err != nil {
 		_ = service.store.TransitionSession(ctx, security.HashToken(result.Token), store.SessionRevoked)
-		service.mu.Lock()
-		delete(service.sessions, security.HashToken(result.Token))
-		service.mu.Unlock()
+		service.forgetSession(security.HashToken(result.Token))
+		_ = service.store.ExpireAndPruneSessions(ctx, now)
 		return LoginResult{}, 0, err
 	}
 	return result, 0, nil
+}
+
+func (service *Service) rejectInvalidGrant(ctx context.Context, source audit.SourcePseudonym, now time.Time) (LoginResult, time.Duration, error) {
+	sourceKey := source.String()
+	if locked, remaining := service.invalidLimiter.LockedKey(sourceKey, now); locked {
+		return LoginResult{}, remaining, ErrLocked
+	}
+	if !service.invalidLimiter.RecordFailureKey(sourceKey, now) {
+		return LoginResult{}, service.preauthTTL, ErrLocked
+	}
+	locked, remaining := service.invalidLimiter.LockedKey(sourceKey, now)
+	code := audit.CodeLoginRejected
+	if locked {
+		code = audit.CodeLoginLocked
+	}
+	if err := service.recordLogin(ctx, audit.OutcomeFailure, source, code, now); err != nil {
+		return LoginResult{}, 0, err
+	}
+	if locked {
+		return LoginResult{}, remaining, ErrLocked
+	}
+	return LoginResult{}, 0, ErrUnauthorized
 }
 
 func (grant LoginGrant) claim() bool {
@@ -247,14 +290,23 @@ func (service *Service) Authenticate(ctx context.Context, token, csrfToken strin
 		return Principal{}, ErrForbidden
 	}
 	persisted, err := service.store.Session(ctx, idHash)
-	if err != nil || persisted.State != store.SessionActive {
+	if errors.Is(err, store.ErrNotFound) {
 		service.forgetSession(idHash)
+		return Principal{}, ErrUnauthorized
+	}
+	if err != nil {
+		return Principal{}, err
+	}
+	if persisted.State != store.SessionActive {
+		service.forgetSession(idHash)
+		_ = service.store.ExpireAndPruneSessions(ctx, service.now().UTC())
 		return Principal{}, ErrUnauthorized
 	}
 	now := service.now().UTC()
 	if !now.Before(persisted.IdleExpiresAt) || !now.Before(persisted.AbsoluteExpiresAt) {
 		_ = service.store.TransitionSession(ctx, idHash, store.SessionExpired)
 		service.forgetSession(idHash)
+		_ = service.store.ExpireAndPruneSessions(ctx, now)
 		return Principal{}, ErrUnauthorized
 	}
 	idleExpiresAt := now.Add(service.idleTimeout)
@@ -263,7 +315,10 @@ func (service *Service) Authenticate(ctx context.Context, token, csrfToken strin
 	}
 	if err := service.store.TouchSession(ctx, idHash, now, idleExpiresAt); err != nil {
 		service.forgetSession(idHash)
-		return Principal{}, ErrUnauthorized
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrInvalidTransition) {
+			return Principal{}, ErrUnauthorized
+		}
+		return Principal{}, err
 	}
 	administrator, err := service.store.Admin(ctx)
 	if err != nil {
@@ -275,6 +330,7 @@ func (service *Service) Authenticate(ctx context.Context, token, csrfToken strin
 func (service *Service) Logout(ctx context.Context, principal Principal) error {
 	err := service.store.TransitionSession(ctx, principal.IDHash, store.SessionRevoked)
 	service.forgetSession(principal.IDHash)
+	_ = service.store.ExpireAndPruneSessions(ctx, service.now().UTC())
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrInvalidTransition) {
 		return ErrUnauthorized
 	}
@@ -282,6 +338,8 @@ func (service *Service) Logout(ctx context.Context, principal Principal) error {
 }
 
 func (service *Service) ChangePassword(ctx context.Context, principal Principal, currentPassword, newPassword string) (LoginResult, error) {
+	service.loginMu.Lock()
+	defer service.loginMu.Unlock()
 	administrator, err := service.store.Admin(ctx)
 	if err != nil {
 		return LoginResult{}, err
@@ -302,12 +360,19 @@ func (service *Service) ChangePassword(ctx context.Context, principal Principal,
 		return LoginResult{}, err
 	}
 	service.mu.Lock()
-	service.sessions = map[string]runtimeSession{persisted.IDHash: {csrfHash: security.HashToken(csrfToken)}}
+	service.sessions = map[string]runtimeSession{persisted.IDHash: {csrfHash: security.HashToken(csrfToken), createdAt: persisted.CreatedAt}}
 	service.mu.Unlock()
+	_ = service.store.ExpireAndPruneSessions(ctx, now)
 	return LoginResult{Token: token, CSRFToken: csrfToken, ExpiresAt: persisted.AbsoluteExpiresAt, CookieMaxAge: service.absoluteExpiry, MustChangePassword: false}, nil
 }
 
 func (service *Service) issueSession(ctx context.Context, mustChange bool, now time.Time) (LoginResult, error) {
+	if err := service.cleanupSessions(ctx, now); err != nil {
+		return LoginResult{}, err
+	}
+	if err := service.makeSessionCapacity(ctx, now); err != nil {
+		return LoginResult{}, err
+	}
 	token, csrfToken, persisted, err := service.newSessionValues(now)
 	if err != nil {
 		return LoginResult{}, err
@@ -316,9 +381,65 @@ func (service *Service) issueSession(ctx context.Context, mustChange bool, now t
 		return LoginResult{}, err
 	}
 	service.mu.Lock()
-	service.sessions[persisted.IDHash] = runtimeSession{csrfHash: security.HashToken(csrfToken)}
+	service.sessions[persisted.IDHash] = runtimeSession{csrfHash: security.HashToken(csrfToken), createdAt: persisted.CreatedAt}
 	service.mu.Unlock()
 	return LoginResult{Token: token, CSRFToken: csrfToken, ExpiresAt: persisted.AbsoluteExpiresAt, CookieMaxAge: service.absoluteExpiry, MustChangePassword: mustChange}, nil
+}
+
+func (service *Service) cleanupSessions(ctx context.Context, now time.Time) error {
+	service.mu.Lock()
+	identifiers := make([]string, 0, len(service.sessions))
+	for idHash := range service.sessions {
+		identifiers = append(identifiers, idHash)
+	}
+	service.mu.Unlock()
+	for _, idHash := range identifiers {
+		persisted, err := service.store.Session(ctx, idHash)
+		if errors.Is(err, store.ErrNotFound) {
+			service.forgetSession(idHash)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if persisted.State != store.SessionActive {
+			service.forgetSession(idHash)
+			continue
+		}
+		if !now.Before(persisted.IdleExpiresAt) || !now.Before(persisted.AbsoluteExpiresAt) {
+			if err := service.store.TransitionSession(ctx, idHash, store.SessionExpired); err != nil && !errors.Is(err, store.ErrInvalidTransition) && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			service.forgetSession(idHash)
+		}
+	}
+	return service.store.ExpireAndPruneSessions(ctx, now)
+}
+
+func (service *Service) makeSessionCapacity(ctx context.Context, now time.Time) error {
+	for {
+		service.mu.Lock()
+		if len(service.sessions) < maximumActiveSessions {
+			service.mu.Unlock()
+			return nil
+		}
+		var oldestID string
+		var oldestAt time.Time
+		for idHash, runtime := range service.sessions {
+			if oldestID == "" || runtime.createdAt.Before(oldestAt) || (runtime.createdAt.Equal(oldestAt) && idHash < oldestID) {
+				oldestID = idHash
+				oldestAt = runtime.createdAt
+			}
+		}
+		service.mu.Unlock()
+		if err := service.store.TransitionSession(ctx, oldestID, store.SessionRevoked); err != nil && !errors.Is(err, store.ErrInvalidTransition) && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		service.forgetSession(oldestID)
+		if err := service.store.ExpireAndPruneSessions(ctx, now); err != nil {
+			return err
+		}
+	}
 }
 
 func (service *Service) newSessionValues(now time.Time) (string, string, store.Session, error) {

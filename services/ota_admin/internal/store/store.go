@@ -438,6 +438,16 @@ func (s *Store) RevokeAllActiveSessions(ctx context.Context) error {
 	return wrapWrite("revoke active sessions", err)
 }
 
+func (s *Store) ExpireAndPruneSessions(ctx context.Context, now time.Time) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET state='expired' WHERE state='active' AND (idle_expires_at<=? OR absolute_expires_at<=?)`, timestamp(now), timestamp(now)); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE state IN ('revoked','expired') AND NOT EXISTS (SELECT 1 FROM candidates WHERE candidates.session_id=sessions.id_hash)`)
+		return err
+	})
+}
+
 func (s *Store) ChangePasswordAndRotateSession(ctx context.Context, encodedHash, currentIDHash string, next Session) error {
 	if _, _, err := decodePasswordHash(encodedHash); err != nil {
 		return err

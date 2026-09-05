@@ -393,7 +393,7 @@ func TestFiveFailuresLockAccountOrSourceForFifteenMinutes(t *testing.T) {
 			t.Fatalf("failure %d status=%d body=%s", attempt, response.Code, response.Body.String())
 		}
 	}
-	_, _, _, locked := login(t, h, oldPassword)
+	locked := h.request(http.MethodGet, "/admin/api/session/bootstrap", "", "")
 	if locked.Code != http.StatusTooManyRequests || locked.Header().Get("Retry-After") == "" {
 		t.Fatalf("locked status=%d headers=%v body=%s", locked.Code, locked.Header(), locked.Body.String())
 	}
@@ -498,5 +498,54 @@ func TestEveryAdminResponseIsNoCacheAndHardened(t *testing.T) {
 		if !strings.Contains(response.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
 			t.Fatalf("%s CSP=%q", path, response.Header().Get("Content-Security-Policy"))
 		}
+	}
+}
+
+func TestRouterRejectsUnsupportedMethodsFromAnExplicitMethodSet(t *testing.T) {
+	h := newHarness(t)
+	for _, method := range []string{http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions, http.MethodTrace, http.MethodConnect} {
+		request := httptest.NewRequest(method, "http://backend/admin/api/session/current", nil)
+		response := httptest.NewRecorder()
+		h.handler.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("method %s status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestSessionEndpointsRejectAValidGlobalMethodWhenRouteDoesNotAllowIt(t *testing.T) {
+	h := newHarness(t)
+	cookie, csrf, _, response := login(t, h, oldPassword)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/admin/api/session/current", `{}`},
+		{http.MethodGet, "/admin/api/session/logout", ""},
+		{http.MethodGet, "/admin/api/session/password", ""},
+	} {
+		response := h.request(test.method, test.path, test.body, csrf, cookie)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s %s status=%d body=%s", test.method, test.path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestSessionStoreFailureIsNormalizedAsInternalNotInvalidCredentials(t *testing.T) {
+	h := newHarness(t)
+	cookie, _, _, response := login(t, h, oldPassword)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response = h.request(http.MethodGet, "/admin/api/session/current", "", "", cookie)
+	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" {
+		t.Fatalf("store failure status=%d body=%s", response.Code, response.Body.String())
 	}
 }
