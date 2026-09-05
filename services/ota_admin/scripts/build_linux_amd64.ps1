@@ -38,7 +38,10 @@ function New-DeterministicSourceBundle {
         $moduleRelativePath = $_.Substring($modulePrefix.Length)
         return $moduleRelativePath -eq 'go.mod' -or
             $moduleRelativePath -eq 'go.sum' -or
-            $moduleRelativePath.EndsWith('.go', [System.StringComparison]::Ordinal)
+            $moduleRelativePath.EndsWith('.go', [System.StringComparison]::Ordinal) -or
+            $moduleRelativePath.EndsWith('.ps1', [System.StringComparison]::Ordinal) -or
+            $moduleRelativePath.EndsWith('.sh', [System.StringComparison]::Ordinal) -or
+            $moduleRelativePath.EndsWith('.service', [System.StringComparison]::Ordinal)
     })
     [System.Array]::Sort($sourcePaths, [System.StringComparer]::Ordinal)
     if ($sourcePaths.Count -eq 0 -or

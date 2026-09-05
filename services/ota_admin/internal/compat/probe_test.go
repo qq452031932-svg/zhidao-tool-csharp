@@ -156,6 +156,7 @@ func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
 		"git", "ls-files", "superpan-ota-admin-source.zip",
 		"superpan-ota-admin-source.zip.sha256", "superpan-ota-admin-linux-amd64.sha256",
 		"1980-01-01", "StringComparer]::Ordinal",
+		"EndsWith('.ps1'", "EndsWith('.sh'", "EndsWith('.service'",
 	} {
 		if !strings.Contains(buildScript, required) {
 			t.Errorf("build script does not contain %q", required)
