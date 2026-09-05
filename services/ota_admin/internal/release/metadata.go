@@ -78,6 +78,48 @@ type catalogAsset struct {
 	Type             *string `json:"Type"`
 }
 
+func (document *releaseDocument) UnmarshalJSON(data []byte) error {
+	if err := requireExactObjectKeys(data, "Assets"); err != nil {
+		return err
+	}
+	type alias releaseDocument
+	return json.Unmarshal(data, (*alias)(document))
+}
+
+func (asset *releaseAsset) UnmarshalJSON(data []byte) error {
+	if err := requireExactObjectKeys(data,
+		"PackageId", "Version", "Type", "FileName", "SHA1", "SHA256", "Size", "NotesMarkdown", "NotesHTML"); err != nil {
+		return err
+	}
+	type alias releaseAsset
+	return json.Unmarshal(data, (*alias)(asset))
+}
+
+func (asset *catalogAsset) UnmarshalJSON(data []byte) error {
+	if err := requireExactObjectKeys(data, "RelativeFileName", "Type"); err != nil {
+		return err
+	}
+	type alias catalogAsset
+	return json.Unmarshal(data, (*alias)(asset))
+}
+
+func requireExactObjectKeys(data []byte, allowed ...string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		return errors.New("JSON value is not an object")
+	}
+	accepted := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		accepted[key] = struct{}{}
+	}
+	for key := range object {
+		if _, ok := accepted[key]; !ok {
+			return fmt.Errorf("JSON property %q does not use its exact schema spelling", key)
+		}
+	}
+	return nil
+}
+
 func decodeStrictJSON(data []byte, destination any) error {
 	if len(data) == 0 || len(data) > maxMetadataBytes || bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
 		return errors.New("JSON size or encoding is invalid")
@@ -138,8 +180,10 @@ func rejectDuplicateJSONKeys(data []byte) error {
 			if !ok {
 				return errors.New("JSON object key is invalid")
 			}
-			if _, duplicate := stack[len(stack)-1].seen[key]; duplicate {
-				return fmt.Errorf("duplicate JSON property %q", key)
+			for prior := range stack[len(stack)-1].seen {
+				if strings.EqualFold(prior, key) {
+					return fmt.Errorf("duplicate JSON property %q", key)
+				}
 			}
 			stack[len(stack)-1].seen[key] = struct{}{}
 			stack[len(stack)-1].expectingKey = false

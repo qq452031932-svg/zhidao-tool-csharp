@@ -3,20 +3,57 @@ package release
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"fanfh.cn/superpan/ota-admin/internal/publisher"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
-func TestPowerShellProductionGoldenBundle(t *testing.T) {
+func TestCommittedPowerShellProductionGoldenBundle(t *testing.T) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test source path")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", "..", ".."))
+	fixtureRoot := filepath.Join(repositoryRoot, "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction")
+	bundlePath := filepath.Join(fixtureRoot, "valid-upload.zip")
+	certificateBytes, err := os.ReadFile(filepath.Join(fixtureRoot, "publisher.cer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(certificateBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+	trust, err := publisher.NewTrust(certificate.RawSubjectPublicKeyInfo, hex.EncodeToString(digest[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validatePowerShellGolden(t, bundlePath, trust, "1.2.3")
+}
+
+func TestOptionalLargeProductionCandidate(t *testing.T) {
 	bundlePath := os.Getenv("SUPERPAN_OTA_GOLDEN_ZIP")
 	if bundlePath == "" {
 		t.Skip("SUPERPAN_OTA_GOLDEN_ZIP is not set")
 	}
+	trust, err := publisher.ProductionTrust()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validatePowerShellGolden(t, bundlePath, trust, "")
+}
+
+func validatePowerShellGolden(t *testing.T, bundlePath string, trust *publisher.Trust, expectedVersion string) {
+	t.Helper()
 	archive, err := zip.OpenReader(bundlePath)
 	if err != nil {
 		t.Fatal(err)
@@ -46,15 +83,14 @@ func TestPowerShellProductionGoldenBundle(t *testing.T) {
 		}
 		envelope.Entries = append(envelope.Entries, upload.Entry{Name: archived.Name, Path: path, Size: int64(archived.UncompressedSize64)})
 	}
-	trust, err := publisher.ProductionTrust()
-	if err != nil {
-		t.Fatal(err)
-	}
 	report, err := NewValidator(trust).Validate(context.Background(), envelope, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !report.Verified || report.PackageID != packageID || report.Channel != channel {
 		t.Fatalf("report = %#v", report)
+	}
+	if expectedVersion != "" && report.Version != expectedVersion {
+		t.Fatalf("version = %q, want %q", report.Version, expectedVersion)
 	}
 }

@@ -49,9 +49,18 @@ type Report struct {
 type verifiedFile struct {
 	name   string
 	path   string
+	file   *os.File
+	info   os.FileInfo
 	size   int64
 	sha256 string
 	sha1   string
+}
+
+type loadedEnvelope struct {
+	rootPath string
+	root     *os.File
+	rootInfo os.FileInfo
+	files    map[string]*verifiedFile
 }
 
 func NewValidator(trust *publisher.Trust) *Validator { return &Validator{trust: trust} }
@@ -60,20 +69,22 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 	if validator == nil || validator.trust == nil || envelope == nil || envelope.Verified {
 		return Report{}, fmt.Errorf("%w: validator input", ErrManifest)
 	}
-	files, err := loadEnvelope(ctx, envelope)
+	loaded, err := loadEnvelope(ctx, envelope)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: %v", ErrManifest, err)
 	}
+	defer loaded.close()
+	files := loaded.files
 	for _, required := range []string{manifestName, signatureName, releaseFeedName, assetCatalogName, releasesIndexName, setupName, portableName} {
 		if _, ok := files[required]; !ok {
 			return Report{}, fmt.Errorf("%w: missing %s", ErrManifest, required)
 		}
 	}
-	manifest, err := readLimited(files[manifestName].path, 81_788)
+	manifest, err := readLimited(files[manifestName], 81_788)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: manifest read", ErrManifest)
 	}
-	signature, err := readLimited(files[signatureName].path, 384)
+	signature, err := readLimited(files[signatureName], 384)
 	if err != nil || len(signature) != 384 {
 		return Report{}, ErrSignature
 	}
@@ -93,16 +104,15 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 		if !ok || item.Name == manifestName || item.Name == signatureName {
 			return Report{}, fmt.Errorf("%w: closure member", ErrManifest)
 		}
-		digest, err := hashFile(ctx, file.path, sha256.New())
-		if err != nil || digest != item.SHA256 {
+		sha256Value, sha1Value, err := hashFile(ctx, file)
+		if err != nil || sha256Value != item.SHA256 {
 			return Report{}, fmt.Errorf("%w: hash %s", ErrManifest, item.Name)
 		}
-		file.sha256 = digest
-		files[item.Name] = file
-		reportFiles = append(reportFiles, ReportFile{Name: item.Name, Size: file.size, SHA256: digest})
+		file.sha256, file.sha1 = sha256Value, sha1Value
+		reportFiles = append(reportFiles, ReportFile{Name: item.Name, Size: file.size, SHA256: sha256Value})
 	}
 
-	feedBytes, err := readLimited(files[releaseFeedName].path, maxMetadataBytes)
+	feedBytes, err := readLimited(files[releaseFeedName], maxMetadataBytes)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: feed read", ErrMetadata)
 	}
@@ -110,7 +120,7 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 	if err := decodeStrictJSON(feedBytes, &feed); err != nil || len(feed.Assets) == 0 || len(feed.Assets) > 254 {
 		return Report{}, fmt.Errorf("%w: feed JSON", ErrMetadata)
 	}
-	currentVersion, fullAssets, releaseFiles, err := validateReleaseAssets(ctx, feed.Assets, files)
+	currentVersion, fullAssets, releaseFiles, err := validateReleaseAssets(feed.Assets, files)
 	if err != nil {
 		return Report{}, err
 	}
@@ -121,15 +131,21 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 			}
 		}
 	}
-	if highestCommittedVersion != "" {
-		floor, floorErr := parseVersion(highestCommittedVersion)
-		current, currentErr := parseVersion(currentVersion)
-		if floorErr != nil || currentErr != nil || current.compare(floor) <= 0 {
-			return Report{}, ErrVersionFloor
+	// Linux authenticates package bytes through the signed manifest/SPKI root.
+	// This gate validates bounded Velopack structure and exact production identity;
+	// the Windows publisher remains responsible for full Authenticode verification.
+	if err := validateSetupStructure(files[setupName]); err != nil {
+		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
+	}
+	if err := validatePortableStructure(files[portableName], currentVersion); err != nil {
+		return Report{}, fmt.Errorf("%w: %v", ErrMetadata, err)
+	}
+	for _, asset := range feed.Assets {
+		if err := validatePackageStructure(files[*asset.FileName], *asset.Version, *asset.Type); err != nil {
+			return Report{}, fmt.Errorf("%w: %s: %v", ErrMetadata, *asset.FileName, err)
 		}
 	}
-
-	catalogBytes, err := readLimited(files[assetCatalogName].path, maxMetadataBytes)
+	catalogBytes, err := readLimited(files[assetCatalogName], maxMetadataBytes)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: catalog read", ErrCatalog)
 	}
@@ -141,7 +157,7 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 		return Report{}, err
 	}
 
-	indexBytes, err := readLimited(files[releasesIndexName].path, maxMetadataBytes)
+	indexBytes, err := readLimited(files[releasesIndexName], maxMetadataBytes)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: index read", ErrReleasesIndex)
 	}
@@ -153,10 +169,19 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 	for i, expected := range fullAssets {
 		actual := index[i]
 		file := files[expected.name]
-		sha1Value, hashErr := hashFile(ctx, file.path, sha1.New())
-		if hashErr != nil || actual.Name != expected.name || actual.Size != file.size || actual.SHA1 != strings.ToUpper(sha1Value) {
+		if actual.Name != expected.name || actual.Size != file.size || actual.SHA1 != strings.ToUpper(file.sha1) {
 			return Report{}, fmt.Errorf("%w: %s", ErrReleasesIndex, expected.name)
 		}
+	}
+	if highestCommittedVersion != "" {
+		floor, floorErr := parseVersion(highestCommittedVersion)
+		current, currentErr := parseVersion(currentVersion)
+		if floorErr != nil || currentErr != nil || current.compare(floor) <= 0 {
+			return Report{}, ErrVersionFloor
+		}
+	}
+	if err := loaded.verifyStable(); err != nil {
+		return Report{}, fmt.Errorf("%w: envelope changed after validation", ErrManifest)
 	}
 	manifestDigest := sha256.Sum256(manifest)
 	return Report{
@@ -166,7 +191,7 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 	}, nil
 }
 
-func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (map[string]verifiedFile, error) {
+func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (*loadedEnvelope, error) {
 	root, err := filepath.Abs(envelope.ExtractionRoot)
 	if err != nil || !filepath.IsAbs(root) {
 		return nil, errors.New("extraction root is invalid")
@@ -176,7 +201,22 @@ func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (map[string]ve
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("extraction root changed")
 	}
-	files := make(map[string]verifiedFile, len(envelope.Entries))
+	rootFile, err := openDirectoryNoFollow(root)
+	if err != nil {
+		return nil, errors.New("extraction root cannot be securely opened")
+	}
+	openedRootInfo, err := rootFile.Stat()
+	if err != nil || !openedRootInfo.IsDir() || !os.SameFile(rootInfo, openedRootInfo) {
+		rootFile.Close()
+		return nil, errors.New("extraction root identity changed")
+	}
+	loaded := &loadedEnvelope{rootPath: root, root: rootFile, rootInfo: openedRootInfo, files: make(map[string]*verifiedFile, len(envelope.Entries))}
+	failed := true
+	defer func() {
+		if failed {
+			loaded.close()
+		}
+	}()
 	folded := make(map[string]struct{}, len(envelope.Entries))
 	for _, entry := range envelope.Entries {
 		if err := ctx.Err(); err != nil {
@@ -189,14 +229,54 @@ func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (map[string]ve
 		if _, duplicate := folded[key]; duplicate {
 			return nil, errors.New("duplicate entry")
 		}
-		info, err := os.Lstat(entry.Path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != entry.Size {
+		pathInfo, err := os.Lstat(entry.Path)
+		if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() != entry.Size {
 			return nil, errors.New("entry metadata changed")
 		}
+		file, err := openChildNoFollow(rootFile, entry.Path, entry.Name)
+		if err != nil {
+			return nil, errors.New("entry cannot be securely opened")
+		}
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size || !os.SameFile(pathInfo, info) {
+			file.Close()
+			return nil, errors.New("entry descriptor identity changed")
+		}
 		folded[key] = struct{}{}
-		files[entry.Name] = verifiedFile{name: entry.Name, path: entry.Path, size: info.Size()}
+		loaded.files[entry.Name] = &verifiedFile{name: entry.Name, path: entry.Path, file: file, info: info, size: info.Size()}
 	}
-	return files, nil
+	failed = false
+	return loaded, nil
+}
+
+func (loaded *loadedEnvelope) close() {
+	if loaded == nil {
+		return
+	}
+	for _, file := range loaded.files {
+		_ = file.file.Close()
+	}
+	if loaded.root != nil {
+		_ = loaded.root.Close()
+	}
+}
+
+func (loaded *loadedEnvelope) verifyStable() error {
+	rootDescriptor, err := loaded.root.Stat()
+	rootPath, pathErr := os.Lstat(loaded.rootPath)
+	if err != nil || pathErr != nil || !os.SameFile(loaded.rootInfo, rootDescriptor) || !os.SameFile(rootDescriptor, rootPath) || rootPath.Mode()&os.ModeSymlink != 0 {
+		return errors.New("extraction root identity changed")
+	}
+	for _, file := range loaded.files {
+		descriptor, descriptorErr := file.file.Stat()
+		pathInfo, pathErr := os.Lstat(file.path)
+		if descriptorErr != nil || pathErr != nil || !descriptor.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 ||
+			!os.SameFile(file.info, descriptor) || !os.SameFile(descriptor, pathInfo) || descriptor.Size() != file.size ||
+			descriptor.ModTime() != file.info.ModTime() {
+			return fmt.Errorf("entry identity changed: %s", file.name)
+		}
+	}
+	return nil
 }
 
 func allowedName(name string) bool {
@@ -217,7 +297,7 @@ type fullAsset struct {
 	parsed version
 }
 
-func validateReleaseAssets(ctx context.Context, assets []releaseAsset, files map[string]verifiedFile) (string, []fullAsset, map[string]releaseAsset, error) {
+func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile) (string, []fullAsset, map[string]releaseAsset, error) {
 	current := version{}
 	currentText := ""
 	releaseFiles := make(map[string]releaseAsset, len(assets))
@@ -246,8 +326,7 @@ func validateReleaseAssets(ctx context.Context, assets []releaseAsset, files map
 		if _, duplicate := identities[identity]; duplicate {
 			return "", nil, nil, ErrMetadata
 		}
-		sha1Value, err := hashFile(ctx, file.path, sha1.New())
-		if err != nil || !strings.EqualFold(*asset.SHA256, file.sha256) || *asset.SHA1 != strings.ToUpper(sha1Value) {
+		if !strings.EqualFold(*asset.SHA256, file.sha256) || *asset.SHA1 != strings.ToUpper(file.sha1) {
 			return "", nil, nil, ErrMetadata
 		}
 		releaseFiles[*asset.FileName] = asset
@@ -260,26 +339,49 @@ func validateReleaseAssets(ctx context.Context, assets []releaseAsset, files map
 			fulls = append(fulls, fullAsset{name: *asset.FileName, parsed: parsed})
 		}
 	}
-	fullVersions := make(map[string]struct{}, len(fulls))
+	fullVersions := make(map[string]version, len(fulls))
 	for _, full := range fulls {
 		if _, duplicate := fullVersions[full.name]; duplicate {
 			return "", nil, nil, ErrMetadata
 		}
-		fullVersions[full.name] = struct{}{}
+		fullVersions[full.name] = full.parsed
 	}
 	currentFull := packageID + "-" + currentText + "-full.nupkg"
 	if _, ok := releaseFiles[currentFull]; !ok {
 		return "", nil, nil, ErrMetadata
 	}
+	hasDelta := false
+	hasCurrentDelta := false
 	for name, asset := range releaseFiles {
-		if *asset.Type == "Delta" && *asset.Version != currentText {
-			return "", nil, nil, fmt.Errorf("%w: historical delta %s", ErrMetadata, name)
+		if *asset.Type != "Delta" {
+			continue
 		}
+		hasDelta = true
+		deltaVersion, _ := parseVersion(*asset.Version)
+		if _, ok := fullVersions[packageID+"-"+*asset.Version+"-full.nupkg"]; !ok {
+			return "", nil, nil, fmt.Errorf("%w: delta has no same-version Full %s", ErrMetadata, name)
+		}
+		hasLowerFull := false
+		for _, fullVersion := range fullVersions {
+			if fullVersion.compare(deltaVersion) < 0 {
+				hasLowerFull = true
+				break
+			}
+		}
+		if !hasLowerFull {
+			return "", nil, nil, fmt.Errorf("%w: delta has no lower Full base %s", ErrMetadata, name)
+		}
+		if *asset.Version == currentText {
+			hasCurrentDelta = true
+		}
+	}
+	if hasDelta && !hasCurrentDelta {
+		return "", nil, nil, fmt.Errorf("%w: current Full has no Delta", ErrMetadata)
 	}
 	return currentText, fulls, releaseFiles, nil
 }
 
-func validateCatalog(catalog []catalogAsset, currentVersion string, releaseFiles map[string]releaseAsset, files map[string]verifiedFile) error {
+func validateCatalog(catalog []catalogAsset, currentVersion string, releaseFiles map[string]releaseAsset, files map[string]*verifiedFile) error {
 	expected := map[string]string{
 		"Installer": setupName,
 		"Full":      packageID + "-" + currentVersion + "-full.nupkg",
@@ -308,45 +410,39 @@ func validateCatalog(catalog []catalogAsset, currentVersion string, releaseFiles
 	return nil
 }
 
-func readLimited(path string, limit int64) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
+func readLimited(file *verifiedFile, limit int64) ([]byte, error) {
+	if _, err := file.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	data, err := io.ReadAll(io.LimitReader(file.file, limit+1))
 	if err != nil || int64(len(data)) > limit {
 		return nil, errors.New("file exceeds limit")
 	}
 	return data, nil
 }
 
-type hashWriter interface {
-	io.Writer
-	Sum([]byte) []byte
-}
-
-func hashFile(ctx context.Context, path string, hash hashWriter) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
+func hashFile(ctx context.Context, file *verifiedFile) (string, string, error) {
+	if _, err := file.file.Seek(0, io.SeekStart); err != nil {
+		return "", "", err
 	}
-	defer file.Close()
+	sha256Hash := sha256.New()
+	sha1Hash := sha1.New()
+	writer := io.MultiWriter(sha256Hash, sha1Hash)
 	buffer := make([]byte, 64<<10)
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", "", err
 		}
-		count, readErr := file.Read(buffer)
+		count, readErr := file.file.Read(buffer)
 		if count > 0 {
-			_, _ = hash.Write(buffer[:count])
+			_, _ = writer.Write(buffer[:count])
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return "", readErr
+			return "", "", readErr
 		}
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(sha256Hash.Sum(nil)), hex.EncodeToString(sha1Hash.Sum(nil)), nil
 }
