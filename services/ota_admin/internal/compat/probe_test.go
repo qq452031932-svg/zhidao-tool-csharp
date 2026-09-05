@@ -327,7 +327,7 @@ func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
 		t.Skip("PowerShell is unavailable on this compatibility-test host")
 	}
 
-	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
+	moduleRoot := testModuleRoot(t)
 	repositoryRoot := filepath.Clean(filepath.Join(moduleRoot, "..", ".."))
 	if _, err := os.Stat(filepath.Join(repositoryRoot, ".git")); err != nil {
 		t.Skip("test is running from a source bundle without repository metadata")
@@ -475,7 +475,7 @@ func TestArtifactRollbackFailurePreservesBackup(t *testing.T) {
 	if err != nil {
 		t.Skip("PowerShell is unavailable on this compatibility-test host")
 	}
-	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
+	moduleRoot := testModuleRoot(t)
 	buildScript := filepath.Join(moduleRoot, "scripts", "build_linux_amd64.ps1")
 	harnessPath := filepath.Join(testLocalTempDir(t), "rollback-harness.ps1")
 	artifactRoot := filepath.Join(testLocalTempDir(t), "artifacts")
@@ -548,10 +548,7 @@ func TestGitObjectSnapshotIgnoresWorkingTreeMutation(t *testing.T) {
 		t.Fatalf("mutate working-tree fixture: %v", err)
 	}
 
-	buildScript, err := filepath.Abs(filepath.Join("..", "..", "scripts", "build_linux_amd64.ps1"))
-	if err != nil {
-		t.Fatalf("resolve build script: %v", err)
-	}
+	buildScript := filepath.Join(testModuleRoot(t), "scripts", "build_linux_amd64.ps1")
 	harnessPath := filepath.Join(root, "snapshot-harness.ps1")
 	snapshotRoot := filepath.Join(root, "snapshot")
 	harness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $SnapshotRoot)
@@ -590,7 +587,7 @@ func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
 
 func testLocalTempDir(t *testing.T) string {
 	t.Helper()
-	path, err := os.MkdirTemp(".", ".compat-test-")
+	path, err := os.MkdirTemp(filepath.Dir(testSourceFile(t)), ".compat-test-")
 	if err != nil {
 		t.Fatalf("create package-local temporary directory: %v", err)
 	}
@@ -602,9 +599,24 @@ func testLocalTempDir(t *testing.T) string {
 	return path
 }
 
+func testSourceFile(t *testing.T) string {
+	t.Helper()
+	_, testFilePath, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller could not locate probe_test.go")
+	}
+	return testFilePath
+}
+
+func testModuleRoot(t *testing.T) string {
+	t.Helper()
+	return filepath.Clean(filepath.Join(filepath.Dir(testSourceFile(t)), "..", ".."))
+}
+
 func readRepositoryFile(t *testing.T, pathParts ...string) string {
 	t.Helper()
-	path := filepath.Join(append([]string{"..", ".."}, pathParts...)...)
+	moduleRoot := testModuleRoot(t)
+	path := filepath.Join(append([]string{moduleRoot}, pathParts...)...)
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
