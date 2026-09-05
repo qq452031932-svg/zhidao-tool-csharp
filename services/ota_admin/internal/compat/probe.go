@@ -157,13 +157,39 @@ func healthHandler(report Report) http.Handler {
 	return mux
 }
 
-func exerciseSQLite(databasePath string) error {
+func exerciseSQLite(databasePath string) (resultErr error) {
+	if err := cleanupSQLiteProbe(databasePath); err != nil {
+		return err
+	}
+	defer func() {
+		if err := cleanupSQLiteProbe(databasePath); resultErr == nil && err != nil {
+			resultErr = err
+		}
+	}()
+
+	if err := writeSQLiteProbe(databasePath); err != nil {
+		return err
+	}
+	value, err := readSQLiteProbe(databasePath)
+	if err != nil {
+		return err
+	}
+	if value != "round-trip" {
+		return errors.New("sqlite value mismatch")
+	}
+	return nil
+}
+
+func cleanupSQLiteProbe(databasePath string) error {
 	for _, path := range []string{databasePath, databasePath + "-shm", databasePath + "-wal"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
+	return nil
+}
 
+func writeSQLiteProbe(databasePath string) error {
 	database, err := sql.Open("sqlite", databasePath)
 	if err != nil {
 		return err
@@ -181,14 +207,34 @@ func exerciseSQLite(databasePath string) error {
 	if _, err := transaction.Exec(`INSERT INTO compat_probe (value) VALUES (?)`, "round-trip"); err != nil {
 		return err
 	}
-	var value string
-	if err := transaction.QueryRow(`SELECT value FROM compat_probe WHERE id = 1`).Scan(&value); err != nil {
+	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	if value != "round-trip" {
-		return errors.New("sqlite value mismatch")
+	return database.Close()
+}
+
+func readSQLiteProbe(databasePath string) (string, error) {
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		return "", err
 	}
-	return transaction.Commit()
+	defer database.Close()
+	transaction, err := database.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer transaction.Rollback()
+	var value string
+	if err := transaction.QueryRow(`SELECT value FROM compat_probe WHERE id = 1`).Scan(&value); err != nil {
+		return "", err
+	}
+	if err := transaction.Commit(); err != nil {
+		return "", err
+	}
+	if err := database.Close(); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func hashArgon2id(password, salt []byte) []byte {

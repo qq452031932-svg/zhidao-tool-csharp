@@ -26,15 +26,26 @@ func TestSQLiteCreateWriteReadTransaction(t *testing.T) {
 	}
 }
 
-func TestSQLiteProbeCanRunAgainAfterServiceRestart(t *testing.T) {
+func TestSQLiteCommitClosesThenReopensAndReadsSameDatabase(t *testing.T) {
 	t.Parallel()
 
 	databasePath := filepath.Join(t.TempDir(), "probe.db")
-	if err := exerciseSQLite(databasePath); err != nil {
-		t.Fatalf("first exerciseSQLite() error = %v", err)
+	if err := writeSQLiteProbe(databasePath); err != nil {
+		t.Fatalf("writeSQLiteProbe() error = %v", err)
 	}
-	if err := exerciseSQLite(databasePath); err != nil {
-		t.Fatalf("second exerciseSQLite() error = %v", err)
+	renamedPath := databasePath + ".closed"
+	if err := os.Rename(databasePath, renamedPath); err != nil {
+		t.Fatalf("rename committed database after close: %v", err)
+	}
+	if err := os.Rename(renamedPath, databasePath); err != nil {
+		t.Fatalf("restore committed database for reopen: %v", err)
+	}
+	value, err := readSQLiteProbe(databasePath)
+	if err != nil {
+		t.Fatalf("readSQLiteProbe() error = %v", err)
+	}
+	if value != "round-trip" {
+		t.Fatalf("reopened value = %q, want round-trip", value)
 	}
 }
 
@@ -213,6 +224,80 @@ func TestStaticBinaryFilePatternRejectsNotStripped(t *testing.T) {
 	}
 	if !strings.Contains(runner, "grep -Fq 'not stripped'") {
 		t.Fatal("CentOS runner does not explicitly reject the 'not stripped' token")
+	}
+}
+
+func TestRunnerOwnsCleanupAndUsesOnlyVerifiedBundledDeploymentFiles(t *testing.T) {
+	t.Parallel()
+
+	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	for _, required := range []string{
+		"SCRIPT_PATH", "BUNDLED_RUNNER", "BUNDLED_UNIT", "cmp -s --",
+		"LoadState=not-found", "OWNER_MARKER", "OWNER_TOKEN_FILE",
+		"ownership_marker_is_intact", "unit_installed=false", "unit_started=false",
+		"global_unit_is_absent",
+	} {
+		if !strings.Contains(runner, required) {
+			t.Errorf("CentOS runner does not contain ownership/canonical-source contract %q", required)
+		}
+	}
+	requireSubstringsInOrder(t, runner,
+		`if [[ -e "$UNIT_TARGET" || -L "$UNIT_TARGET" ]]`,
+		`mkdir -- "$OWNER_MARKER"`,
+		"trap cleanup EXIT INT TERM",
+		`cmp -s -- "$SCRIPT_PATH" "$BUNDLED_RUNNER"`,
+		`$BUNDLED_UNIT`,
+		`unit_installed=true`,
+	)
+	cleanupOffset := strings.Index(runner, "cleanup() {")
+	if cleanupOffset < 0 {
+		t.Fatal("CentOS runner does not define cleanup")
+	}
+	requireSubstringsInOrder(t, runner[cleanupOffset:],
+		`if [[ "$unit_installed" == true ]]`,
+		`cmp -s -- "$UNIT_TARGET" "$BUNDLED_UNIT"`,
+		`systemctl stop "$UNIT_NAME"`,
+		`rm -f -- "$UNIT_TARGET"`,
+		`ownership_marker_is_intact`,
+		`rm -rf -- "$VERIFY_ROOT"`,
+	)
+}
+
+func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.T) {
+	t.Parallel()
+
+	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	for _, required := range []string{
+		"a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d",
+		"go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "local", "-buildvcs=false",
+		"git", "diff", "--quiet", "HEAD", "StagingDirectory", "Publish-StagedArtifacts",
+		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("build script does not contain pinned/reproducible contract %q", required)
+		}
+	}
+	requireSubstringsInOrder(t, buildScript,
+		"ExpectedArchiveSha256",
+		"go version go1.27.1 windows/amd64",
+		"GOTOOLCHAIN",
+		"mod verify",
+		"test ./...",
+		"build -buildvcs=false",
+		"Write-Sha256CheckFile",
+		"Publish-StagedArtifacts",
+	)
+}
+
+func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
+	t.Helper()
+	offset := 0
+	for _, substring := range required {
+		index := strings.Index(text[offset:], substring)
+		if index < 0 {
+			t.Fatalf("text does not contain %q after byte offset %d", substring, offset)
+		}
+		offset += index + len(substring)
 	}
 }
 
