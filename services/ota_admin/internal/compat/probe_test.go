@@ -166,6 +166,11 @@ func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
 	for _, required := range []string{
 		"go1.27.1.linux-amd64.tar.gz",
 		"63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445",
+		"GO_ARCHIVE_PARTIAL",
+		"if [[ -e \"$GO_ARCHIVE\" || -L \"$GO_ARCHIVE\" ]]",
+		"if [[ ! -f \"$GO_ARCHIVE\" || -L \"$GO_ARCHIVE\" ]]",
+		"--output \"$GO_ARCHIVE_PARTIAL\"",
+		"mv -- \"$GO_ARCHIVE_PARTIAL\" \"$GO_ARCHIVE\"",
 		"superpan-ota-admin-source.zip.sha256",
 		"superpan-ota-admin-linux-amd64.sha256",
 		"sha256sum -c",

@@ -12,6 +12,7 @@ readonly SOURCE_BUNDLE_SHA_FILE="$VERIFY_ROOT/superpan-ota-admin-source.zip.sha2
 readonly SOURCE_ROOT="$VERIFY_ROOT/source"
 readonly GO_VERSION="1.27.1"
 readonly GO_ARCHIVE="$VERIFY_ROOT/go1.27.1.linux-amd64.tar.gz"
+readonly GO_ARCHIVE_PARTIAL="$VERIFY_ROOT/.go1.27.1.linux-amd64.tar.gz.partial"
 readonly GO_ARCHIVE_SHA256="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
 readonly GO_URL="https://go.dev/dl/go1.27.1.linux-amd64.tar.gz"
 readonly GO_EXE="$VERIFY_ROOT/go/bin/go"
@@ -50,9 +51,30 @@ file_output="$(file -b "$BINARY")"
 printf '%s\n' "$file_output"
 grep -Eq 'ELF 64-bit.*x86-64.*statically linked.*stripped' <<<"$file_output"
 
-curl --fail --location --silent --show-error "$GO_URL" --output "$GO_ARCHIVE"
-printf '%s  %s\n' "$GO_ARCHIVE_SHA256" "$(basename "$GO_ARCHIVE")" |
-  (cd "$VERIFY_ROOT" && sha256sum -c -)
+verify_go_archive() {
+  local archive_path="$1"
+  printf '%s  %s\n' "$GO_ARCHIVE_SHA256" "$(basename "$archive_path")" |
+    (cd "$VERIFY_ROOT" && sha256sum -c -)
+}
+
+if [[ -e "$GO_ARCHIVE" || -L "$GO_ARCHIVE" ]]; then
+  if [[ ! -f "$GO_ARCHIVE" || -L "$GO_ARCHIVE" ]]; then
+    echo "The preseeded Go archive is not a regular, non-symlink file." >&2
+    exit 1
+  fi
+  if ! verify_go_archive "$GO_ARCHIVE"; then
+    echo "The preseeded Go archive failed SHA-256 verification; refusing to overwrite it." >&2
+    exit 1
+  fi
+else
+  rm -f -- "$GO_ARCHIVE_PARTIAL"
+  curl --fail --location --silent --show-error "$GO_URL" --output "$GO_ARCHIVE_PARTIAL"
+  if ! verify_go_archive "$GO_ARCHIVE_PARTIAL"; then
+    echo "The downloaded Go archive failed SHA-256 verification." >&2
+    exit 1
+  fi
+  mv -- "$GO_ARCHIVE_PARTIAL" "$GO_ARCHIVE"
+fi
 tar -C "$VERIFY_ROOT" -xzf "$GO_ARCHIVE"
 [[ "$($GO_EXE version)" == "go version go$GO_VERSION linux/amd64" ]]
 
