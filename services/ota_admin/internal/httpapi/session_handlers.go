@@ -37,7 +37,7 @@ func (router *Router) bootstrap(response http.ResponseWriter, request *http.Requ
 	token, csrfToken, expiresAt, maxAge, err := router.sessions.Bootstrap(security.TrustedSourceAddress(request))
 	if err != nil {
 		if errors.Is(err, session.ErrBootstrapLimited) {
-			response.Header().Set("Retry-After", "300")
+			response.Header().Set("Retry-After", retryAfterSeconds(maxAge))
 			writeError(response, http.StatusTooManyRequests, "request_unavailable")
 			return
 		}
@@ -74,8 +74,7 @@ func (router *Router) login(response http.ResponseWriter, request *http.Request)
 	result, retryAfter, err := router.sessions.Login(request.Context(), grant, input.Username, input.Password, security.TrustedSourceAddress(request))
 	if err != nil {
 		if errors.Is(err, session.ErrLocked) {
-			seconds := int64(retryAfter/time.Second) + 1
-			response.Header().Set("Retry-After", json.Number(stringInt(seconds)).String())
+			response.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
 			writeError(response, http.StatusTooManyRequests, "authentication_failed")
 		} else if errors.Is(err, session.ErrUnauthorized) {
 			writeError(response, http.StatusUnauthorized, "authentication_failed")
@@ -98,7 +97,11 @@ func (router *Router) logout(response http.ResponseWriter, request *http.Request
 		return
 	}
 	if err := router.sessions.Logout(request.Context(), principal); err != nil {
-		writeError(response, http.StatusUnauthorized, "authentication_failed")
+		if errors.Is(err, session.ErrUnauthorized) {
+			writeError(response, http.StatusUnauthorized, "authentication_failed")
+		} else {
+			writeError(response, http.StatusInternalServerError, "operation_failed")
+		}
 		return
 	}
 	clearAdminCookie(response, sessionCookieName)
@@ -291,4 +294,12 @@ func stringInt(value int64) string {
 		value /= 10
 	}
 	return string(buffer[index:])
+}
+
+func retryAfterSeconds(duration time.Duration) string {
+	seconds := int64(duration / time.Second)
+	if duration%time.Second != 0 {
+		seconds++
+	}
+	return json.Number(stringInt(seconds)).String()
 }

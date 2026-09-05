@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -43,16 +44,18 @@ func (clock *testClock) Advance(delta time.Duration) {
 }
 
 type harness struct {
-	t        *testing.T
-	store    *store.Store
-	clock    *testClock
-	sessions *session.Service
-	handler  http.Handler
+	t            *testing.T
+	databasePath string
+	store        *store.Store
+	clock        *testClock
+	sessions     *session.Service
+	handler      http.Handler
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	databasePath := filepath.Join(t.TempDir(), "state.db")
+	database, err := store.Open(context.Background(), databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +68,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	clock := &testClock{now: time.Unix(2_000_000_000, 0).UTC()}
-	h := &harness{t: t, store: database, clock: clock}
+	h := &harness{t: t, databasePath: databasePath, store: database, clock: clock}
 	h.restart()
 	return h
 }
@@ -385,6 +388,30 @@ func TestLogoutRevocationExpiryAndRestartInvalidation(t *testing.T) {
 	}
 }
 
+func TestLogoutStoreFailureIsNormalizedAsInternal(t *testing.T) {
+	h := newHarness(t)
+	cookie, csrf, _, response := login(t, h, oldPassword)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Body.String())
+	}
+	observer, err := sql.Open("sqlite", h.databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = observer.Close() })
+	if _, err := observer.Exec(`CREATE TRIGGER fail_session_revoke
+		BEFORE UPDATE OF state ON sessions
+		WHEN NEW.state='revoked'
+		BEGIN SELECT RAISE(FAIL, 'forced storage failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	response = h.request(http.MethodPost, "/admin/api/session/logout", `{}`, csrf, cookie)
+	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" {
+		t.Fatalf("logout store failure status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestFiveFailuresLockAccountOrSourceForFifteenMinutes(t *testing.T) {
 	h := newHarness(t)
 	for attempt := 1; attempt <= 5; attempt++ {
@@ -402,6 +429,38 @@ func TestFiveFailuresLockAccountOrSourceForFifteenMinutes(t *testing.T) {
 	if recovered.Code != http.StatusOK {
 		t.Fatalf("post-lock login status=%d body=%s", recovered.Code, recovered.Body.String())
 	}
+}
+
+func TestBootstrapRetryAfterReflectsTheActiveLimiter(t *testing.T) {
+	t.Run("source bootstrap throttle", func(t *testing.T) {
+		h := newHarness(t)
+		for attempt := 1; attempt <= 8; attempt++ {
+			response := h.request(http.MethodGet, "/admin/api/session/bootstrap", "", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("bootstrap %d status=%d body=%s", attempt, response.Code, response.Body.String())
+			}
+		}
+		h.clock.Advance(45 * time.Second)
+		response := h.request(http.MethodGet, "/admin/api/session/bootstrap", "", "")
+		if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "255" {
+			t.Fatalf("source throttle status=%d retry-after=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+		}
+	})
+
+	t.Run("credential lock", func(t *testing.T) {
+		h := newHarness(t)
+		for attempt := 1; attempt <= 5; attempt++ {
+			_, _, _, response := login(t, h, "incorrect password")
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("failure %d status=%d body=%s", attempt, response.Code, response.Body.String())
+			}
+		}
+		h.clock.Advance(45 * time.Second)
+		response := h.request(http.MethodGet, "/admin/api/session/bootstrap", "", "")
+		if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "855" {
+			t.Fatalf("credential lock status=%d retry-after=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+		}
+	})
 }
 
 func TestStrictJSONContentTypeBodyLimitAndExactSchemas(t *testing.T) {

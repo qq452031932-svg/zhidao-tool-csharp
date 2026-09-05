@@ -143,11 +143,11 @@ func (service *Service) Bootstrap(sourceAddress string) (token, csrfToken string
 	now := service.now().UTC()
 	expiresAt = now.Add(service.preauthTTL)
 	sourceKey := source.String()
-	if locked, _ := service.limiter.Locked(store.AdministratorUsername, sourceKey, now); locked {
-		return "", "", time.Time{}, 0, ErrBootstrapLimited
+	if locked, remaining := service.limiter.Locked(store.AdministratorUsername, sourceKey, now); locked {
+		return "", "", time.Time{}, remaining, ErrBootstrapLimited
 	}
-	if locked, _ := service.bootstrapLimiter.LockedKey(sourceKey, now); locked {
-		return "", "", time.Time{}, 0, ErrBootstrapLimited
+	if locked, remaining := service.bootstrapLimiter.LockedKey(sourceKey, now); locked {
+		return "", "", time.Time{}, remaining, ErrBootstrapLimited
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
