@@ -33,7 +33,9 @@ internal enum VelopackUpdateSourceKind
 internal sealed record VelopackUpdateSourceConfiguration(
     VelopackUpdateSourceKind Kind,
     string Location,
-    string Channel);
+    string Channel,
+    string CurrentVersion = "0.0.0",
+    string? SignedFeedStatePath = null);
 
 internal sealed record VelopackAssetFingerprint(
     string PackageId,
@@ -102,11 +104,14 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
             ? new VelopackUpdateSourceConfiguration(
                 VelopackUpdateSourceKind.Https,
                 httpsFeed,
-                buildInfo.Channel)
+                buildInfo.Channel,
+                buildInfo.ProductVersion,
+                buildInfo.SignedFeedStatePath)
             : new VelopackUpdateSourceConfiguration(
                 VelopackUpdateSourceKind.LocalDirectory,
                 buildInfo.AcceptanceFeedPath!,
-                buildInfo.Channel);
+                buildInfo.Channel,
+                buildInfo.ProductVersion);
         return new VelopackUpdateClient(managerFactory(configuration));
     }
 
@@ -141,6 +146,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
         {
             throw new ApplicationUpdateVerificationException(exception);
         }
+        catch (InvalidDataException exception)
+        {
+            throw new ApplicationUpdateVerificationException(exception);
+        }
         catch (NotInstalledException exception)
         {
             throw new ApplicationUpdateUnsupportedException(exception);
@@ -168,6 +177,10 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
         {
             throw new ApplicationUpdateVerificationException(exception);
         }
+        catch (InvalidDataException exception)
+        {
+            throw new ApplicationUpdateVerificationException(exception);
+        }
         catch (NotInstalledException exception)
         {
             throw new ApplicationUpdateUnsupportedException(exception);
@@ -186,16 +199,31 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
 
     public void Dispose()
     {
+        if (manager is IDisposable disposable)
+            disposable.Dispose();
     }
 
     private static IVelopackUpdateManagerAdapter CreateManager(
         VelopackUpdateSourceConfiguration configuration)
     {
-        IUpdateSource source = configuration.Kind == VelopackUpdateSourceKind.Https
-            ? new SimpleWebSource(new Uri(configuration.Location, UriKind.Absolute))
-            : new SimpleFileSource(new DirectoryInfo(configuration.Location));
+        var source = CreateUpdateSource(configuration);
         var options = CreateUpdateOptions(configuration);
-        return new VelopackUpdateManagerAdapter(new UpdateManager(source, options));
+        return new VelopackUpdateManagerAdapter(new UpdateManager(source, options), source as IDisposable);
+    }
+
+    internal static IUpdateSource CreateUpdateSource(
+        VelopackUpdateSourceConfiguration configuration)
+    {
+        if (configuration.Kind == VelopackUpdateSourceKind.LocalDirectory)
+            return new SimpleFileSource(new DirectoryInfo(configuration.Location));
+        if (string.IsNullOrWhiteSpace(configuration.SignedFeedStatePath))
+            throw new InvalidOperationException("The signed feed replay state path is not configured.");
+        var feedUri = new Uri(configuration.Location, UriKind.Absolute);
+        var store = new SignedFeedStateStore(
+            configuration.SignedFeedStatePath,
+            feedUri.AbsoluteUri,
+            configuration.CurrentVersion);
+        return new SignedFeedUpdateSource(feedUri, store);
     }
 
     private static UpdateOptions CreateUpdateOptions(
@@ -207,13 +235,15 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
             MaximumDeltasBeforeFallback = -1
         };
 
-    private sealed class VelopackUpdateManagerAdapter : IVelopackUpdateManagerAdapter
+    private sealed class VelopackUpdateManagerAdapter : IVelopackUpdateManagerAdapter, IDisposable
     {
         private readonly UpdateManager manager;
+        private readonly IDisposable? source;
 
-        public VelopackUpdateManagerAdapter(UpdateManager manager)
+        public VelopackUpdateManagerAdapter(UpdateManager manager, IDisposable? source)
         {
             this.manager = manager;
+            this.source = source;
         }
 
         public bool IsInstalled => manager.IsInstalled;
@@ -271,6 +301,8 @@ internal sealed class VelopackUpdateClient : IApplicationUpdateClient
 
             manager.WaitExitThenApplyUpdates(asset, silent, restart, restartArguments);
         }
+
+        public void Dispose() => source?.Dispose();
 
         private static VelopackAssetFingerprint Fingerprint(VelopackAsset asset) =>
             new(

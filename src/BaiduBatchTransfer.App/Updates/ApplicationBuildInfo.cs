@@ -19,6 +19,12 @@ public sealed record ApplicationBuildInfo(
 
     public bool IsFeedConfigured => HttpsFeedUrl is not null || AcceptanceFeedPath is not null;
 
+    internal string SignedFeedStatePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "BaiduBatchTransfer",
+        "Updates",
+        "signed-feed-state.json");
+
     public string SingleInstanceMutexName => IsOtaAcceptanceBuild
         ? @"Local\BaiduBatchTransfer.OtaAcceptance.Singleton.v1"
         : @"Local\BaiduBatchTransfer.Singleton.v1";
@@ -61,6 +67,13 @@ public sealed record ApplicationBuildInfo(
                 "Production update feed must be an immutable absolute HTTPS URL.",
                 nameof(httpsFeedUrl));
         }
+        if (normalizedHttpsFeed is not null &&
+            !string.Equals(channel, ProductionChannel, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Production HTTPS updates require the fixed stable channel.",
+                nameof(channel));
+        }
 
         string? normalizedAcceptanceFeed = null;
         if (acceptanceFeedPath is not null)
@@ -74,6 +87,11 @@ public sealed record ApplicationBuildInfo(
             }
 
             normalizedAcceptanceFeed = Path.GetFullPath(acceptanceFeedPath);
+        }
+        if (normalizedHttpsFeed is not null && normalizedAcceptanceFeed is not null)
+        {
+            throw new ArgumentException(
+                "Production and acceptance update feeds cannot both be configured.");
         }
 
         return new ApplicationBuildInfo(
@@ -129,7 +147,13 @@ public sealed record ApplicationBuildInfo(
             return false;
         }
 
-        normalized = uri.AbsoluteUri;
+        var builder = new UriBuilder(uri)
+        {
+            Path = uri.AbsolutePath.TrimEnd('/') + "/",
+            Query = string.Empty,
+            Fragment = string.Empty
+        };
+        normalized = builder.Uri.AbsoluteUri;
         return true;
     }
 
