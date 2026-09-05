@@ -1,12 +1,16 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Acceptance')]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
-    [Parameter(Mandatory = $true)][string]$AcceptanceFeedPath,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Acceptance')][string]$AcceptanceFeedPath,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
     [string]$PreviousReleaseDirectory,
     [string]$ReleaseNotesPath,
-    [switch]$OtaAcceptanceBuild,
-    [switch]$AllowUnsignedLocal
+    [Parameter(ParameterSetName = 'Acceptance')][switch]$OtaAcceptanceBuild,
+    [Parameter(ParameterSetName = 'Acceptance')][switch]$AllowUnsignedLocal,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][switch]$Production,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$ProductionFeedUrl,
+    [Parameter(Mandatory = $true, ParameterSetName = 'Production')][string]$SigningCertificateThumbprint,
+    [Parameter(ParameterSetName = 'Production')][string]$TimestampUrl
 )
 
 Set-StrictMode -Version Latest
@@ -20,8 +24,10 @@ $requiredVpkVersion = '1.2.0'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifactRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts'))
 
-# This is the first release gate. There is deliberately no production or signing bypass.
-if (-not $OtaAcceptanceBuild -or -not $AllowUnsignedLocal) {
+# Acceptance remains an explicitly unsigned, local-only gate. Production is a separate
+# parameter set and has no unsigned bypass.
+if ($PSCmdlet.ParameterSetName -eq 'Acceptance' -and
+    (-not $OtaAcceptanceBuild -or -not $AllowUnsignedLocal)) {
     throw 'Both -OtaAcceptanceBuild and -AllowUnsignedLocal are required for the unsigned local OTA acceptance pipeline.'
 }
 $inheritedVpkVariables = @(Get-ChildItem Env: | Where-Object {
@@ -175,6 +181,299 @@ function Assert-NonReparseExistingAncestors([string]$Path, [string]$Boundary) {
         }
         $current = $parent
     }
+}
+
+function Invoke-ProductionRelease {
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw 'Production OTA builds require PowerShell 7 (pwsh) for pinned-key cryptography.'
+    }
+    if (-not $Production) { throw '-Production is required for the production parameter set.' }
+    $parsedFeedUri = $null
+    if ($ProductionFeedUrl -match '\s' -or -not [Uri]::TryCreate($ProductionFeedUrl, [UriKind]::Absolute, [ref]$parsedFeedUri)) {
+        throw 'ProductionFeedUrl must be an absolute HTTPS URL.'
+    }
+    $feedUri = $parsedFeedUri
+    if ($feedUri.Scheme -cne 'https' -or -not [string]::IsNullOrEmpty($feedUri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($feedUri.Query) -or -not [string]::IsNullOrEmpty($feedUri.Fragment)) {
+        throw 'ProductionFeedUrl must be an absolute HTTPS URL without credentials, query, or fragment.'
+    }
+    $normalizedFeedUrl = $feedUri.AbsoluteUri.TrimEnd('/') + '/'
+    if ($SigningCertificateThumbprint -cnotmatch '^[0-9A-Fa-f]{40}$') {
+        throw 'SigningCertificateThumbprint must be exactly 40 hexadecimal characters.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+        $timestampUri = $null
+        if (-not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$timestampUri) -or
+            $timestampUri.Scheme -cne 'https' -or -not [string]::IsNullOrEmpty($timestampUri.UserInfo) -or
+            -not [string]::IsNullOrEmpty($timestampUri.Query) -or -not [string]::IsNullOrEmpty($timestampUri.Fragment)) {
+            throw 'TimestampUrl must be an absolute HTTPS URL without credentials, query, or fragment.'
+        }
+    }
+
+    $productionOutput = Resolve-AbsolutePath $OutputDirectory 'OutputDirectory'
+    Assert-LocalDrivePath $productionOutput 'OutputDirectory'
+    Assert-NoReparsePointAncestors $productionOutput 'OutputDirectory'
+    if (-not (Test-PathWithin $productionOutput $artifactRoot)) {
+        throw 'Production OutputDirectory must be inside the repository .artifacts directory.'
+    }
+    Assert-NonReparseExistingAncestors $productionOutput $artifactRoot
+    $relativeProductionOutput = $productionOutput.Substring($artifactRoot.TrimEnd('\','/').Length + 1).Replace('/', '\')
+    if (-not $relativeProductionOutput.Split('\')[0].StartsWith('ota-production-', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Production OutputDirectory must use a dedicated .artifacts/ota-production-* directory.'
+    }
+    if (Test-Path -LiteralPath $productionOutput) {
+        if (-not (Test-Path -LiteralPath $productionOutput -PathType Container) -or
+            @([IO.Directory]::EnumerateFileSystemEntries($productionOutput)).Count -ne 0) {
+            throw 'Production OutputDirectory must be an empty directory.'
+        }
+    }
+
+    $productionPrevious = $null
+    if (-not [string]::IsNullOrWhiteSpace($PreviousReleaseDirectory)) {
+        $productionPrevious = Resolve-AbsolutePath $PreviousReleaseDirectory 'PreviousReleaseDirectory'
+        Assert-LocalDrivePath $productionPrevious 'PreviousReleaseDirectory'
+        Assert-NoReparsePointAncestors $productionPrevious 'PreviousReleaseDirectory'
+        if (-not (Test-Path -LiteralPath $productionPrevious -PathType Container)) {
+            throw 'PreviousReleaseDirectory must be an existing signed production generation directory.'
+        }
+    }
+    $productionNotes = $null
+    if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesPath)) {
+        $productionNotes = Resolve-AbsolutePath $ReleaseNotesPath 'ReleaseNotesPath'
+        Assert-LocalDrivePath $productionNotes 'ReleaseNotesPath'
+        Assert-NoReparsePointAncestors $productionNotes 'ReleaseNotesPath'
+        if (-not (Test-Path -LiteralPath $productionNotes -PathType Leaf)) { throw 'ReleaseNotesPath must name an existing file.' }
+    }
+
+    $expectedSpki = 'f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff'
+    $thumbprint = $SigningCertificateThumbprint.ToUpperInvariant()
+    $certificates = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -ceq $thumbprint })
+    if ($certificates.Count -ne 1) { throw 'Exactly one enrolled signing certificate must match the requested thumbprint.' }
+    $signingCertificate = $certificates[0]
+    if (-not $signingCertificate.HasPrivateKey) { throw 'The enrolled signing certificate has no private key.' }
+    $signingRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($signingCertificate)
+    if ($null -eq $signingRsa -or $signingRsa.KeySize -ne 3072) { throw 'The enrolled signing certificate must have an RSA-3072 private key.' }
+    $publicRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($signingCertificate)
+    try {
+        $actualSpki = ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($publicRsa.ExportSubjectPublicKeyInfo()))).ToLowerInvariant()
+    }
+    finally { $publicRsa.Dispose() }
+    if ($actualSpki -cne $expectedSpki) { $signingRsa.Dispose(); throw 'The signing certificate SPKI does not match the enrolled OTA publisher.' }
+    $codeSigningOid = '1.3.6.1.5.5.7.3.3'
+    $hasCodeSigning = @($signingCertificate.Extensions | Where-Object {
+            $_ -is [Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] -and
+            @($_.EnhancedKeyUsages | Where-Object { $_.Value -ceq $codeSigningOid }).Count -eq 1
+        }).Count -eq 1
+    if (-not $hasCodeSigning) { $signingRsa.Dispose(); throw 'The signing certificate is not authorized for code signing.' }
+
+    [IO.Directory]::CreateDirectory($productionOutput) | Out-Null
+    $buildRoot = Join-Path $productionOutput '.build'
+    $publishDirectory = Join-Path $buildRoot 'publish'
+    $assetDirectory = Join-Path $buildRoot 'assets'
+    $logDirectory = Join-Path $buildRoot 'logs'
+    foreach ($directory in @($publishDirectory,$assetDirectory,$logDirectory)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+    $commandLogPath = Join-Path $logDirectory 'commands.jsonl'
+    $utf8NoBomProduction = [Text.UTF8Encoding]::new($false)
+
+    function Invoke-ProductionCommand([string]$Name, [string]$FilePath, [string[]]$Arguments) {
+        $safe = $Name -replace '[^A-Za-z0-9_.-]','_'
+        $stdoutPath = Join-Path $logDirectory "$safe.stdout.log"
+        $stderrPath = Join-Path $logDirectory "$safe.stderr.log"
+        $started = [DateTime]::UtcNow
+        $old = Get-Location
+        try {
+            Set-Location -LiteralPath $repoRoot
+            & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
+            $code = if ($null -eq $LASTEXITCODE) { if ($?) { 0 } else { 1 } } else { $LASTEXITCODE }
+        }
+        catch { $code = 1; [IO.File]::AppendAllText($stderrPath, [string]$_) }
+        finally { Set-Location -LiteralPath $old.Path }
+        $record = [ordered]@{ name=$Name; executable=$FilePath; arguments=@($Arguments); startedUtc=$started.ToString('O'); exitCode=$code }
+        [IO.File]::AppendAllText($commandLogPath, (($record | ConvertTo-Json -Compress -Depth 4) + "`n"), $utf8NoBomProduction)
+        if ($code -ne 0) { throw "Production release command '$Name' failed with exit code $code. See $commandLogPath" }
+    }
+
+    function Copy-ProductionSourceSnapshot([string]$Source, [string]$Destination) {
+        $excludedDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($name in @('.git','.artifacts','.tools','.worktrees','.vs','.pytest_cache','bin','obj')) { [void]$excludedDirectories.Add($name) }
+        function Copy-SnapshotDirectory([string]$CurrentSource, [string]$CurrentDestination) {
+            $sourceInfo = [IO.DirectoryInfo]::new($CurrentSource)
+            if (($sourceInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Production source snapshot encountered a reparse point: $CurrentSource" }
+            [IO.Directory]::CreateDirectory($CurrentDestination) | Out-Null
+            foreach ($file in $sourceInfo.EnumerateFiles()) {
+                if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Production source snapshot encountered a reparse-point file: $($file.FullName)" }
+                [IO.File]::Copy($file.FullName, (Join-Path $CurrentDestination $file.Name), $false)
+            }
+            foreach ($directory in $sourceInfo.EnumerateDirectories()) {
+                if ($excludedDirectories.Contains($directory.Name)) { continue }
+                Copy-SnapshotDirectory $directory.FullName (Join-Path $CurrentDestination $directory.Name)
+            }
+        }
+        Copy-SnapshotDirectory $Source $Destination
+    }
+
+    try {
+        $sourceSnapshot = Join-Path $buildRoot 'source'
+        Copy-ProductionSourceSnapshot $repoRoot $sourceSnapshot
+        $appProject = Join-Path $sourceSnapshot 'src\BaiduBatchTransfer.App\BaiduBatchTransfer.App.csproj'
+        $toolManifestPath = Join-Path $repoRoot '.config\dotnet-tools.json'
+        $helperVerificationScript = Join-Path $repoRoot 'scripts\verify_managed_browser_helper_package.ps1'
+        $helperManifestSource = Join-Path $repoRoot 'tools\managed_browser_helper\helper-manifest.json'
+        $helperSourceDirectory = Join-Path $repoRoot 'tools\managed_browser_helper'
+        $bundleValidator = Join-Path $repoRoot 'scripts\Test-OtaUploadBundle.ps1'
+        $publisherCertificate = Join-Path $repoRoot 'eng\ota\SuperPan.OtaPublisher.cer'
+        foreach ($required in @($appProject,$toolManifestPath,$helperVerificationScript,$helperManifestSource,$bundleValidator,$publisherCertificate)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required production input is missing: $required" }
+        }
+        $toolManifest = [IO.File]::ReadAllText($toolManifestPath) | ConvertFrom-Json
+        if ([string]$toolManifest.tools.vpk.version -cne $requiredVpkVersion) { throw "The local vpk tool manifest must pin exactly version $requiredVpkVersion." }
+
+        if ($null -ne $productionPrevious) {
+            & $bundleValidator -BundlePath $productionPrevious -PublisherCertificatePath $publisherCertificate -ExpectedPublisherSpkiSha256 $expectedSpki | Out-Null
+            foreach ($path in [IO.Directory]::EnumerateFiles($productionPrevious, '*', [IO.SearchOption]::TopDirectoryOnly)) {
+                $name = [IO.Path]::GetFileName($path)
+                if ($name -ceq "releases.$productionChannel.json" -or $name.EndsWith('.nupkg', [StringComparison]::Ordinal)) {
+                    [IO.File]::Copy($path, (Join-Path $assetDirectory $name), $false)
+                }
+            }
+        }
+
+        if ($null -eq $productionNotes) { $notesText = "# $Version`n`nSuperPan production release.`n" }
+        else { $notesText = [IO.File]::ReadAllText($productionNotes) }
+        $notesPath = Join-Path $buildRoot 'release-notes.vpk.md'
+        [IO.File]::WriteAllText($notesPath, $notesText, [Text.UTF8Encoding]::new($true))
+
+        Invoke-ProductionCommand 'dotnet-tool-restore' 'dotnet' @('tool','restore')
+        Invoke-ProductionCommand 'vpk-root-help' 'dotnet' @('tool','run','vpk','--','--help')
+        Invoke-ProductionCommand 'vpk-pack-help' 'dotnet' @('tool','run','vpk','--','pack','--help')
+        $helperPackageDirectory = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts\managed-session-pipeline-20260901\helper-bundle-r2'))
+        $restoreProperties = @('-r','win-x64','-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',
+            "-p:VersionPrefix=$Version","-p:UpdateFeedUrl=$normalizedFeedUrl",'-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',
+            "-p:UpdateChannel=$productionChannel","-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory")
+        Invoke-ProductionCommand 'dotnet-restore-snapshot-lock' 'dotnet' (@('restore',$appProject,'--force-evaluate') + $restoreProperties)
+        Invoke-ProductionCommand 'dotnet-restore-locked' 'dotnet' (@('restore',$appProject,'--locked-mode') + $restoreProperties)
+        Invoke-ProductionCommand 'dotnet-publish' 'dotnet' @(
+            'publish',$appProject,'-c','Release','-r','win-x64','--self-contained','true','--no-restore','-o',$publishDirectory,
+            "-p:VersionPrefix=$Version",'-p:RuntimeIdentifier=win-x64','-p:SelfContained=true',"-p:UpdateFeedUrl=$normalizedFeedUrl",
+            '-p:OtaAcceptanceBuild=false','-p:OtaAcceptanceFeedPath=',"-p:UpdateChannel=$productionChannel",
+            "-p:ManagedBrowserHelperPackageDirectory=$helperPackageDirectory")
+        if (-not (Test-Path -LiteralPath (Join-Path $publishDirectory 'BaiduBatchTransfer.App.exe') -PathType Leaf)) { throw 'Published production main executable is missing.' }
+        Invoke-ProductionCommand 'verify-managed-browser-helper' 'pwsh' @('-NoProfile','-ExecutionPolicy','Bypass','-File',$helperVerificationScript,
+            '-ManifestSource',$helperManifestSource,'-PackageDirectory',(Join-Path $publishDirectory 'managed-browser-helper'),'-HelperSourceDirectory',$helperSourceDirectory)
+
+        $signParams = "/sha1 $thumbprint /fd SHA256"
+        if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $signParams += " /tr $TimestampUrl /td SHA256" }
+        Invoke-ProductionCommand 'vpk-pack' 'dotnet' @('tool','run','vpk','--','pack','--packId',$productionPackageId,
+            '--packVersion',$Version,'--packDir',$publishDirectory,'--mainExe','BaiduBatchTransfer.App.exe','--channel',$productionChannel,
+            '--runtime','win-x64','--outputDir',$assetDirectory,'--releaseNotes',$notesPath,'--signParams',$signParams)
+
+        # Velopack includes the channel in generated filenames. The signed-feed contract
+        # intentionally exposes stable canonical names so client and server validators do
+        # not have to accept aliases. Normalize once, then regenerate every reference.
+        $releaseFeedPath = Join-Path $assetDirectory "releases.$productionChannel.json"
+        $assetCatalogPath = Join-Path $assetDirectory "assets.$productionChannel.json"
+        $releasesIndexPath = Join-Path $assetDirectory "RELEASES-$productionChannel"
+        $releaseFeed = [IO.File]::ReadAllText($releaseFeedPath) | ConvertFrom-Json
+        $releaseAssets = @($releaseFeed.Assets)
+        if ($releaseAssets.Count -eq 0) { throw 'Velopack production feed contains no assets.' }
+        foreach ($asset in $releaseAssets) {
+            $assetVersion = [string]$asset.Version
+            $assetType = [string]$asset.Type
+            if ($assetType -cnotin @('Full','Delta')) { throw "Velopack produced an unknown package type: $assetType" }
+            $canonicalName = "$productionPackageId-$assetVersion-$($assetType.ToLowerInvariant()).nupkg"
+            $sourceName = [string]$asset.FileName
+            $sourcePath = Join-Path $assetDirectory $sourceName
+            $canonicalPath = Join-Path $assetDirectory $canonicalName
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw "Velopack feed references a missing package: $sourceName" }
+            if ($sourceName -cne $canonicalName) {
+                if (Test-Path -LiteralPath $canonicalPath) { throw "Canonical package already exists: $canonicalName" }
+                [IO.File]::Move($sourcePath, $canonicalPath)
+            }
+            $asset.FileName = $canonicalName
+            $asset.Size = [IO.FileInfo]::new($canonicalPath).Length
+            $asset.SHA256 = (Get-LowerSha256 $canonicalPath).ToUpperInvariant()
+            $asset.SHA1 = (Get-LowerSha1 $canonicalPath).ToUpperInvariant()
+        }
+        $setupGenerated = Join-Path $assetDirectory "$productionPackageId-$productionChannel-Setup.exe"
+        $portableGenerated = Join-Path $assetDirectory "$productionPackageId-$productionChannel-Portable.zip"
+        $setupCanonical = Join-Path $assetDirectory "$productionPackageId-Setup.exe"
+        $portableCanonical = Join-Path $assetDirectory "$productionPackageId-Portable.zip"
+        foreach ($rename in @(@($setupGenerated,$setupCanonical),@($portableGenerated,$portableCanonical))) {
+            if (-not (Test-Path -LiteralPath $rename[0] -PathType Leaf) -or (Test-Path -LiteralPath $rename[1])) { throw 'Velopack fixed production alias normalization failed.' }
+            [IO.File]::Move($rename[0], $rename[1])
+        }
+        [IO.File]::WriteAllText($releaseFeedPath, ($releaseFeed | ConvertTo-Json -Depth 8 -Compress), $utf8NoBomProduction)
+
+        $currentTypes = @($releaseAssets | Where-Object { [string]$_.Version -ceq $Version } | ForEach-Object { [string]$_.Type })
+        if (@($currentTypes | Where-Object { $_ -ceq 'Full' }).Count -ne 1) { throw 'Production feed requires exactly one current Full package.' }
+        $catalog = [Collections.Generic.List[object]]::new()
+        $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-Setup.exe"; Type='Installer' })
+        $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-$Version-full.nupkg"; Type='Full' })
+        if ($currentTypes -ccontains 'Delta') { $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-$Version-delta.nupkg"; Type='Delta' }) }
+        $catalog.Add([ordered]@{ RelativeFileName="$productionPackageId-Portable.zip"; Type='Portable' })
+        [IO.File]::WriteAllText($assetCatalogPath, ($catalog | ConvertTo-Json -Depth 4 -Compress), $utf8NoBomProduction)
+
+        $fullAssets = @($releaseAssets | Where-Object { [string]$_.Type -ceq 'Full' } | Sort-Object { [version][string]$_.Version })
+        $releaseLines = foreach ($asset in $fullAssets) {
+            $path = Join-Path $assetDirectory ([string]$asset.FileName)
+            "$((Get-LowerSha1 $path).ToUpperInvariant()) $([string]$asset.FileName) $([IO.FileInfo]::new($path).Length)"
+        }
+        [IO.File]::WriteAllText($releasesIndexPath, (($releaseLines -join "`n") + "`n"), $utf8NoBomProduction)
+
+        $assetNames = @([IO.Directory]::EnumerateFiles($assetDirectory, '*', [IO.SearchOption]::TopDirectoryOnly) | ForEach-Object { [IO.Path]::GetFileName($_) })
+        foreach ($name in $assetNames) {
+            if ($name -cin @('upload-manifest.sha256','upload-manifest.sha256.sig') -or $name.Contains('/') -or $name.Contains('\')) { throw "Unexpected production asset: $name" }
+        }
+        [Array]::Sort($assetNames, [StringComparer]::Ordinal)
+        $manifestLines = foreach ($name in $assetNames) { "$(Get-LowerSha256 (Join-Path $assetDirectory $name))  $name" }
+        $manifestPath = Join-Path $assetDirectory 'upload-manifest.sha256'
+        [IO.File]::WriteAllText($manifestPath, (($manifestLines -join "`n") + "`n"), $utf8NoBomProduction)
+        $manifestBytes = [IO.File]::ReadAllBytes($manifestPath)
+        $manifestSignature = $signingRsa.SignData($manifestBytes, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        [IO.File]::WriteAllBytes((Join-Path $assetDirectory 'upload-manifest.sha256.sig'), $manifestSignature)
+
+        $preZipReport = Join-Path $logDirectory 'pre-zip-verification.json'
+        $validatorArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bundleValidator,'-BundlePath',$assetDirectory,
+            '-PublisherCertificatePath',$publisherCertificate,'-ExpectedVersion',$Version,'-ExpectedPublisherSpkiSha256',$expectedSpki,'-OutputReportPath',$preZipReport)
+        if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $validatorArguments += '-RequireTimestamp' }
+        Invoke-ProductionCommand 'verify-production-directory' 'pwsh' $validatorArguments
+
+        $zipName = "$productionPackageId-$Version-$productionChannel-upload.zip"
+        $zipPath = Join-Path $productionOutput $zipName
+        $zipStream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $zip = [IO.Compression.ZipArchive]::new($zipStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $zipNames = @([IO.Directory]::EnumerateFiles($assetDirectory, '*', [IO.SearchOption]::TopDirectoryOnly) | ForEach-Object { [IO.Path]::GetFileName($_) })
+            [Array]::Sort($zipNames, [StringComparer]::Ordinal)
+            foreach ($name in $zipNames) {
+                $entry = $zip.CreateEntry($name, [IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [DateTimeOffset]::new(2026,1,1,0,0,0,[TimeSpan]::Zero)
+                $source = [IO.File]::OpenRead((Join-Path $assetDirectory $name)); $destination = $entry.Open()
+                try { $source.CopyTo($destination) } finally { $destination.Dispose(); $source.Dispose() }
+            }
+        }
+        finally { $zip.Dispose(); $zipStream.Dispose() }
+
+        $reportPath = Join-Path $productionOutput "$productionPackageId-$Version-$productionChannel-verification.json"
+        $zipValidatorArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$bundleValidator,'-BundlePath',$zipPath,
+            '-PublisherCertificatePath',$publisherCertificate,'-ExpectedVersion',$Version,'-ExpectedPublisherSpkiSha256',$expectedSpki,'-OutputReportPath',$reportPath)
+        if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) { $zipValidatorArguments += '-RequireTimestamp' }
+        Invoke-ProductionCommand 'verify-reopened-production-zip' 'pwsh' $zipValidatorArguments
+        Remove-Item -LiteralPath $buildRoot -Recurse -Force
+        Write-Output "Production OTA upload bundle created: $zipPath"
+        Write-Output "Verification report: $reportPath"
+        if ([string]::IsNullOrWhiteSpace($TimestampUrl)) { Write-Output 'Authenticode mode: signed and explicitly untimestamped.' }
+        else { Write-Output "Authenticode mode: signed with required timestamp service $TimestampUrl" }
+    }
+    catch {
+        throw
+    }
+    finally { $signingRsa.Dispose() }
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Production') {
+    Invoke-ProductionRelease
+    return
 }
 
 $acceptanceFeed = Resolve-AbsolutePath $AcceptanceFeedPath 'AcceptanceFeedPath'

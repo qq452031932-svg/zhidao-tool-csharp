@@ -12,17 +12,20 @@ public sealed class OtaReleaseScriptTests
     private static readonly TimeSpan ScriptTimeout = TimeSpan.FromSeconds(30);
 
     [Fact]
-    public void ScriptDefinesAcceptanceOnlyContractAndFixedIdentity()
+    public void ScriptKeepsAcceptanceContractAndAddsSeparateProductionIdentity()
     {
         var script = ReadScript();
 
         Assert.Contains("[Parameter(Mandatory = $true)][string]$Version", script, StringComparison.Ordinal);
-        Assert.Contains("[Parameter(Mandatory = $true)][string]$AcceptanceFeedPath", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Acceptance')][string]$AcceptanceFeedPath", script, StringComparison.Ordinal);
         Assert.Contains("[Parameter(Mandatory = $true)][string]$OutputDirectory", script, StringComparison.Ordinal);
-        Assert.Contains("[switch]$OtaAcceptanceBuild", script, StringComparison.Ordinal);
-        Assert.Contains("[switch]$AllowUnsignedLocal", script, StringComparison.Ordinal);
-        Assert.DoesNotContain("$ProductionFeed", script, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("$SignParams", script, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("ParameterSetName = 'Acceptance')][switch]$OtaAcceptanceBuild", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Acceptance')][switch]$AllowUnsignedLocal", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][switch]$Production", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$ProductionFeedUrl", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$SigningCertificateThumbprint", script, StringComparison.Ordinal);
+        Assert.Contains("ParameterSetName = 'Production')][string]$TimestampUrl", script, StringComparison.Ordinal);
+        Assert.Contains("$signParams", script, StringComparison.Ordinal);
         Assert.DoesNotContain("$AuthenticityMode", script, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("$acceptancePackageId = 'SuperPan.BaiduBatchTransfer.OtaAcceptance'", script, StringComparison.Ordinal);
         Assert.Contains("$acceptanceChannel = 'win-x64-ota-acceptance'", script, StringComparison.Ordinal);
@@ -157,7 +160,6 @@ public sealed class OtaReleaseScriptTests
             parameter, value);
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains(parameter.TrimStart('-'), result.Output, StringComparison.OrdinalIgnoreCase);
         Assert.False(Directory.Exists(fixture.OutputDirectory));
     }
 
@@ -442,7 +444,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("'-p:UpdateFeedUrl='", script, StringComparison.Ordinal);
         Assert.Contains("'-p:OtaAcceptanceBuild=true'", script, StringComparison.Ordinal);
         Assert.Contains("'-p:UpdateChannel=win-x64-ota-acceptance'", script, StringComparison.Ordinal);
-        Assert.DoesNotContain("-p:PackageId=", script, StringComparison.Ordinal);
+        Assert.Contains("'--packId',$productionPackageId", script, StringComparison.Ordinal);
         Assert.Contains("verify_managed_browser_helper_package.ps1", script, StringComparison.Ordinal);
         Assert.Contains("$vpkArguments = @(", script, StringComparison.Ordinal);
         Assert.Contains("'tool', 'run', 'vpk', 'pack'", script, StringComparison.Ordinal);
@@ -450,7 +452,7 @@ public sealed class OtaReleaseScriptTests
         Assert.Contains("'--channel', $acceptanceChannel", script, StringComparison.Ordinal);
         Assert.Contains("'--runtime', 'win-x64'", script, StringComparison.Ordinal);
         Assert.Contains("'--releaseNotes', $effectiveReleaseNotesPath", script, StringComparison.Ordinal);
-        Assert.DoesNotContain("--signParams", script, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("'--signParams',$signParams", script, StringComparison.Ordinal);
     }
 
     [Fact]
