@@ -160,8 +160,8 @@ func TestPreauthorizationStorageHasAHardCapacityAndReleasesConsumedSlots(t *test
 			firstSource = source
 		}
 	}
-	if _, _, _, _, err := service.Bootstrap("198.51.100.1"); !errors.Is(err, ErrBootstrapLimited) {
-		t.Fatalf("capacity overflow error=%v", err)
+	if _, _, _, retryAfter, err := service.Bootstrap("198.51.100.1"); !errors.Is(err, ErrBootstrapLimited) || retryAfter != 5*time.Minute {
+		t.Fatalf("capacity overflow error=%v retry-after=%v", err, retryAfter)
 	}
 	service.ConsumePreauthorization(firstToken, firstCSRF)
 	if _, _, _, _, err := service.Bootstrap(firstSource); err != nil {
@@ -169,6 +169,19 @@ func TestPreauthorizationStorageHasAHardCapacityAndReleasesConsumedSlots(t *test
 	}
 	if len(service.preauth) != maximumPreauthorizations || service.preauthOrder.Len() != maximumPreauthorizations {
 		t.Fatalf("preauthorization bounds map=%d queue=%d", len(service.preauth), service.preauthOrder.Len())
+	}
+}
+
+func TestBootstrapLimiterCapacityReturnsConservativeRetryDelay(t *testing.T) {
+	_, service, _ := newTestService(t, 5)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	for index := range maximumPreauthorizations {
+		if !service.bootstrapLimiter.RecordFailureKey("filler-"+string(rune(index)), now) {
+			t.Fatalf("limiter filled early at %d", index)
+		}
+	}
+	if _, _, _, retryAfter, err := service.Bootstrap("198.51.100.2"); !errors.Is(err, ErrBootstrapLimited) || retryAfter != 5*time.Minute {
+		t.Fatalf("limiter capacity error=%v retry-after=%v", err, retryAfter)
 	}
 }
 

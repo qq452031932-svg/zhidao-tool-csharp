@@ -153,10 +153,10 @@ func (service *Service) Bootstrap(sourceAddress string) (token, csrfToken string
 	defer service.mu.Unlock()
 	service.deleteExpiredPreauthLocked(now)
 	if len(service.preauth) >= maximumPreauthorizations || service.preauthBySource[sourceKey] >= maximumPreauthorizationsPerSource {
-		return "", "", time.Time{}, 0, ErrBootstrapLimited
+		return "", "", time.Time{}, service.preauthTTL, ErrBootstrapLimited
 	}
 	if !service.bootstrapLimiter.RecordFailureKey(sourceKey, now) {
-		return "", "", time.Time{}, 0, ErrBootstrapLimited
+		return "", "", time.Time{}, service.preauthTTL, ErrBootstrapLimited
 	}
 	token, err = security.NewRandomToken(service.random)
 	if err != nil {
