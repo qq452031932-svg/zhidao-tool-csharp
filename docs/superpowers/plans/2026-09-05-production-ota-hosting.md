@@ -37,10 +37,13 @@
 **Files:**
 - Create: `/www/server/panel/vhost/nginx/ota.fanfh.cn.conf`
 
-- [ ] Write an HTTP-only candidate vhost with ACME exception, OTA root and no default-site fallback.
+- [ ] Generate an OTA-only temporary self-signed certificate and create `/www/server/panel/vhost/nginx/ota.fanfh.cn.fallback.conf.disabled`, a dedicated HTTP/HTTPS `server_name ota.fanfh.cn` 503 vhost that never references the existing site.
+- [ ] Activate the fallback first, run `nginx -t`, reload, and verify local SNI for both ports cannot return `f.fanfh.cn` content.
+- [ ] Write an HTTP/HTTPS candidate vhost with ACME exception, OTA root and no default-site fallback; HTTPS initially uses the temporary OTA certificate.
 - [ ] Atomically place it in the included vhost directory while retaining whether the previous state was absent or present.
 - [ ] Run `/www/server/nginx/sbin/nginx -t`; on failure restore the exact previous/absent state, test again and do not reload.
 - [ ] Reload Nginx only after a successful config test.
+- [ ] Treat post-reload OTA routing and existing-site isolation checks as part of the commit gate. If either fails, atomically restore the previous active vhost (or activate the dedicated fallback), run `nginx -t`, reload and verify the rollback before continuing.
 - [ ] Verify `http://ota.fanfh.cn/` serves the isolated health page while `f.fanfh.cn` remains unchanged.
 
 ### Task 4: Issue TLS and apply production cache policy
@@ -51,19 +54,21 @@
 - Modify: `/www/server/panel/vhost/nginx/ota.fanfh.cn.conf`
 
 - [ ] Use the existing ACME client when available; otherwise install the minimum supported client. Allow only `certonly`/webroot mode for the OTA webroot; prohibit Nginx installer/edit/reload modes.
-- [ ] Issue a certificate only for `ota.fanfh.cn` using the isolated webroot and copy/link only its resulting certificate into the OTA certificate directory.
+- [ ] Issue a certificate only for `ota.fanfh.cn` using the isolated webroot. Nginx must reference the ACME client's stable live certificate paths directly; do not copy certificate material into a second lifecycle.
 - [ ] Restrict private-key permissions.
 - [ ] Add HTTPS, HSTS, GET/HEAD-only static serving, explicit metadata no-cache rules, versioned-asset immutable rules, fixed Setup/Portable no-cache rules, and an OTA-only 503 isolation fallback.
-- [ ] Atomically replace the HTTP candidate with HTTPS while retaining the previous HTTP vhost. On failure restore the HTTP vhost, remove the bad candidate, run `nginx -t` again and reload only the restored valid state.
+- [ ] Atomically replace the temporary-certificate candidate with the ACME-certificate vhost while retaining the previous active vhost. On syntax or post-reload routing/SNI/certificate/existing-site validation failure, restore the previous active vhost or dedicated fallback, run `nginx -t`, reload and verify rollback.
 - [ ] Validate config before reload and verify certificate hostname, SNI and expiry.
-- [ ] Install a renewal deploy hook scoped to the OTA certificate that runs `nginx -t` before reload and fails closed; run the supported renewal dry-run/test and re-verify hostname, SNI and expiry.
+- [ ] Install a renewal deploy hook scoped to the OTA certificate that runs `nginx -t` before reload and fails closed; run a renewal dry-run mode that actually executes the deploy hook, then re-verify hostname, SNI and expiry.
 
 ### Task 5: Verify isolation and record deployment
 
 **Files:**
 - Modify: `docs/testing/2026-09-01.md`
 
-- [ ] Verify with explicit local SNI/`--resolve` requests: OTA HTTP redirect; HTTPS health 200; unknown path 404; directory listing denied; POST rejected; release JSON, asset JSON, RELEASES and manifest no-cache; versioned asset immutable; fixed Setup/Portable no-cache.
+- [ ] Create a random, non-client `.ota-probe/<nonce>/` fixture outside `releases/win-x64/stable` whose filenames exercise release JSON, asset JSON, RELEASES, manifest, versioned asset and fixed Setup/Portable cache locations without exposing a consumable feed.
+- [ ] Verify with explicit local SNI/`--resolve` requests: OTA HTTP redirect; HTTPS health 200; unknown path 404; directory listing denied; POST rejected; probe metadata no-cache; probe versioned asset immutable; probe fixed Setup/Portable no-cache.
+- [ ] Remove the probe fixture and verify its path returns 404 before final acceptance.
 - [ ] Re-run the complete `f.fanfh.cn` baseline checks with local SNI/`--resolve` and compare its configuration hash, certificate and selected response evidence.
 - [ ] Confirm the stable directory contains no acceptance package, partial production release or feed metadata. Phase 1 completion does not authorize uploading stable assets.
 - [ ] Record server paths, certificate expiry, checks and the separate required signed production-publication/release-gate task.
