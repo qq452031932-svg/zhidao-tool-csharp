@@ -136,6 +136,54 @@ func TestReceiveRejectsAdvertisedOverflowBeforeReadingOrWriting(t *testing.T) {
 	assertStagingEmpty(t, staging)
 }
 
+func TestReceivePreflightsDiskBeforeReadingOrCreatingCandidate(t *testing.T) {
+	staging := t.TempDir()
+	reader := &countingReader{}
+	receiver := newTestReceiver(t, staging, Limits{CompressedBytes: 8, ExpandedBytes: 16, SingleFileBytes: 16, Entries: 8, CompressionRatio: 2}, func(string) (uint64, error) { return 0, nil })
+	if _, err := receiver.Receive(context.Background(), reader, 8); !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("disk error=%v", err)
+	}
+	if reader.reads != 0 {
+		t.Fatalf("body read %d times before disk rejection", reader.reads)
+	}
+	assertStagingEmpty(t, staging)
+}
+
+func TestReceiveUnknownLengthReservesWorstCaseBeforeReading(t *testing.T) {
+	staging := t.TempDir()
+	reader := &countingReader{}
+	limits := Limits{CompressedBytes: 8, ExpandedBytes: 16, SingleFileBytes: 16, Entries: 8, CompressionRatio: 2}
+	receiver := newTestReceiver(t, staging, limits, func(string) (uint64, error) { return 23, nil })
+	if _, err := receiver.Receive(context.Background(), reader, -1); !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("disk error=%v", err)
+	}
+	if reader.reads != 0 {
+		t.Fatalf("unknown-length body read %d times before disk rejection", reader.reads)
+	}
+	assertStagingEmpty(t, staging)
+}
+
+func TestReceivePreservesExtractionFloorWhileStreaming(t *testing.T) {
+	staging := t.TempDir()
+	archive := makeZIP(t, map[string]string{"upload-manifest.sha256": "manifest"})
+	limits := Limits{CompressedBytes: 1 << 20, ExpandedBytes: 1 << 20, SingleFileBytes: 1 << 20, Entries: 8, CompressionRatio: 100}
+	probes := 0
+	receiver := newTestReceiver(t, staging, limits, func(string) (uint64, error) {
+		probes++
+		if probes == 1 {
+			return uint64(len(archive)) + uint64(limits.ExpandedBytes), nil
+		}
+		return 0, nil
+	})
+	if _, err := receiver.Receive(context.Background(), bytes.NewReader(archive), int64(len(archive))); !errors.Is(err, ErrInsufficientDisk) {
+		t.Fatalf("streaming disk error=%v", err)
+	}
+	if probes < 2 {
+		t.Fatalf("disk probes=%d want at least 2", probes)
+	}
+	assertStagingEmpty(t, staging)
+}
+
 func TestReceiveRejectsCentralDirectoryEntryBombBeforeZIPParser(t *testing.T) {
 	staging := t.TempDir()
 	archive := makeZIP(t, map[string]string{"upload-manifest.sha256": "manifest"})
@@ -143,8 +191,8 @@ func TestReceiveRejectsCentralDirectoryEntryBombBeforeZIPParser(t *testing.T) {
 	if eocd < 0 {
 		t.Fatal("test ZIP has no EOCD")
 	}
-	binary.LittleEndian.PutUint16(archive[eocd+8:eocd+10], 0xffff)
-	binary.LittleEndian.PutUint16(archive[eocd+10:eocd+12], 0xffff)
+	binary.LittleEndian.PutUint16(archive[eocd+8:eocd+10], 257)
+	binary.LittleEndian.PutUint16(archive[eocd+10:eocd+12], 257)
 	receiver := newTestReceiver(t, staging, DefaultLimits(), func(string) (uint64, error) { return 1 << 40, nil })
 	if _, err := receiver.Receive(context.Background(), bytes.NewReader(archive), int64(len(archive))); !errors.Is(err, ErrEntryLimit) {
 		t.Fatalf("entry bomb error=%v", err)
@@ -291,29 +339,24 @@ func TestConcurrentReceivesSerializeDiskPreflightThroughExtraction(t *testing.T)
 	staging := t.TempDir()
 	archive := makeZIP(t, map[string]string{"upload-manifest.sha256": "123456789"})
 	limits := Limits{CompressedBytes: 1 << 20, ExpandedBytes: 9, SingleFileBytes: 9, Entries: 1, CompressionRatio: 100}
+	totalCapacity := uint64(len(archive)) + 9
 	available := func(root string) (uint64, error) {
 		var used uint64
-		roots, err := filepath.Glob(filepath.Join(root, ".extract-*"))
+		err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr == nil && info.Mode().IsRegular() {
+				used += uint64(info.Size())
+			}
+			return walkErr
+		})
 		if err != nil {
 			return 0, err
 		}
-		for _, extractionRoot := range roots {
-			err = filepath.Walk(extractionRoot, func(path string, info os.FileInfo, walkErr error) error {
-				if walkErr == nil && info.Mode().IsRegular() {
-					used += uint64(info.Size())
-				}
-				return walkErr
-			})
-			if err != nil {
-				return 0, err
-			}
-		}
 		// Make concurrent unsynchronized probes reliably overlap.
 		time.Sleep(25 * time.Millisecond)
-		if used >= 9 {
+		if used >= totalCapacity {
 			return 0, nil
 		}
-		return 9 - used, nil
+		return totalCapacity - used, nil
 	}
 	receiver := newTestReceiver(t, staging, limits, available)
 	start := make(chan struct{})

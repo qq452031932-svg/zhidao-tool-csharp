@@ -20,7 +20,7 @@ func TestEnvelopeMetadataAcceptsEveryInclusiveBoundary(t *testing.T) {
 		entries[index].CompressedSize = 2
 		entries[index].UncompressedSize = 200
 	}
-	if err := validateHeaders(entries, 200, limits); err != nil {
+	if err := validateHeaders(entries, 200, compressedTotal(entries), limits); err != nil {
 		t.Fatalf("inclusive boundary rejected: %v", err)
 	}
 }
@@ -49,7 +49,7 @@ func TestEnvelopeMetadataRejectsEveryResourceLimitWithoutLargeAllocations(t *tes
 			if activeLimits == (Limits{}) {
 				activeLimits = limits
 			}
-			if err := validateHeaders(test.entries, test.archive, activeLimits); !errors.Is(err, test.want) {
+			if err := validateHeaders(test.entries, test.archive, compressedTotal(test.entries), activeLimits); !errors.Is(err, test.want) {
 				t.Fatalf("error=%v want=%v", err, test.want)
 			}
 		})
@@ -75,7 +75,7 @@ func TestEnvelopeRejectsUnsafeUnknownAndCollidingNames(t *testing.T) {
 		{{Name: "upload-manifest.sha256", Regular: true}, {Name: "upload-manifest.sha256", Regular: true}},
 		{{Name: "upload-manifest.sha256", Regular: true}, {Name: "UPLOAD-MANIFEST.SHA256", Regular: true}},
 	} {
-		if err := validateHeaders(entries, 1, DefaultLimits()); !errors.Is(err, ErrDuplicateName) {
+		if err := validateHeaders(entries, 1, compressedTotal(entries), DefaultLimits()); !errors.Is(err, ErrDuplicateName) {
 			t.Fatalf("collision error=%v", err)
 		}
 	}
@@ -88,8 +88,16 @@ func TestEnvelopeRejectsDirectoriesSymlinksAndNonRegularModes(t *testing.T) {
 		{Name: "upload-manifest.sha256", Regular: false},
 		{Name: "upload-manifest.sha256", Regular: true, Encrypted: true},
 	} {
-		if err := validateHeaders([]entryHeader{entry}, 1, DefaultLimits()); !errors.Is(err, ErrUnsafeEntry) {
+		if err := validateHeaders([]entryHeader{entry}, 1, entry.CompressedSize, DefaultLimits()); !errors.Is(err, ErrUnsafeEntry) {
 			t.Fatalf("entry=%#v error=%v", entry, err)
 		}
 	}
+}
+
+func compressedTotal(entries []entryHeader) uint64 {
+	var total uint64
+	for _, entry := range entries {
+		total += entry.CompressedSize
+	}
+	return total
 }

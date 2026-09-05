@@ -18,6 +18,8 @@ var (
 	ErrDuplicateName    = errors.New("duplicate archive entry name")
 	ErrUnsafeEntry      = errors.New("unsafe archive entry type")
 	ErrInvalidArchive   = errors.New("invalid ZIP archive")
+	ErrAmbiguousEOCD    = errors.New("ambiguous ZIP end records")
+	ErrUnsupportedZIP64 = errors.New("ZIP64 archives are not accepted")
 	ErrInsufficientDisk = errors.New("insufficient disk space")
 )
 

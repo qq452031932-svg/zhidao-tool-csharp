@@ -50,7 +50,7 @@ func headerFor(file *zip.File) entryHeader {
 	}
 }
 
-func validateHeaders(entries []entryHeader, archiveBytes int64, limits Limits) error {
+func validateHeaders(entries []entryHeader, archiveBytes int64, actualCompressed uint64, limits Limits) error {
 	if err := limits.Validate(); err != nil {
 		return err
 	}
@@ -98,7 +98,10 @@ func validateHeaders(entries []entryHeader, archiveBytes int64, limits Limits) e
 			return ErrExpandedLimit
 		}
 	}
-	if exceedsRatio(totalExpanded, totalCompressed, uint64(limits.CompressionRatio)) {
+	if actualCompressed != totalCompressed {
+		return fmt.Errorf("%w: compressed byte accounting mismatch", ErrInvalidArchive)
+	}
+	if exceedsRatio(totalExpanded, actualCompressed, uint64(limits.CompressionRatio)) {
 		return ErrCompressionRatio
 	}
 	return nil
