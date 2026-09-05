@@ -19,8 +19,10 @@ public sealed class SignedFeedStateStoreTests
         Assert.Equal(FeedIdentity, accepted.FeedIdentity);
         Assert.True(File.Exists(fixture.StatePath));
         Assert.False(File.Exists(fixture.PreviousStatePath));
+        Assert.True(File.Exists(fixture.CommitPointerPath));
         using var document = JsonDocument.Parse(File.ReadAllBytes(fixture.StatePath));
-        Assert.Equal(2, document.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(3, document.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(1, document.RootElement.GetProperty("generation").GetInt64());
         Assert.Equal("2.0.0", document.RootElement.GetProperty("highestAcceptedVersion").GetString());
         Assert.Equal(64, document.RootElement.GetProperty("recordChecksumSha256").GetString()!.Length);
     }
@@ -106,50 +108,47 @@ public sealed class SignedFeedStateStoreTests
     }
 
     [Fact]
-    public void CorruptNewestSlotRecoversThePriorDurableFloor()
+    public void TornInactiveSlotBeforePointerSwitchKeepsTheCommittedFloor()
     {
         using var fixture = new StateFixture();
         var store = fixture.CreateStore();
         store.Accept("2.0.0", new string('a', 64));
-        store.Accept("3.0.0", new string('b', 64));
-        var newest = fixture.FindSlot("3.0.0");
-        File.WriteAllText(newest, "{torn");
+        File.WriteAllText(fixture.PreviousStatePath, "{torn-inactive-candidate");
 
         var recovered = fixture.CreateStore().Read();
 
         Assert.Equal("2.0.0", recovered.HighestAcceptedVersion);
         Assert.Equal(new string('a', 64), recovered.ManifestSha256);
-        Assert.Throws<InvalidDataException>(() =>
-            fixture.CreateStore().Accept("1.9.9", new string('c', 64)));
     }
 
     [Fact]
-    public void ChecksumTamperingInNewestSlotRecoversThePriorDurableFloor()
+    public void CorruptionOfThePointerDesignatedCommittedSlotFailsClosed()
     {
         using var fixture = new StateFixture();
         var store = fixture.CreateStore();
         store.Accept("2.0.0", new string('a', 64));
         store.Accept("3.0.0", new string('b', 64));
-        var newest = fixture.FindSlot("3.0.0");
-        var tampered = File.ReadAllText(newest).Replace(
+        var committed = fixture.CommittedSlotPath();
+        var tampered = File.ReadAllText(committed).Replace(
             "\"highestAcceptedVersion\":\"3.0.0\"",
             "\"highestAcceptedVersion\":\"9.0.0\"",
             StringComparison.Ordinal);
-        File.WriteAllText(newest, tampered);
+        File.WriteAllText(committed, tampered);
 
-        var recovered = fixture.CreateStore().Read();
-
-        Assert.Equal("2.0.0", recovered.HighestAcceptedVersion);
-        Assert.Equal(new string('a', 64), recovered.ManifestSha256);
+        Assert.Throws<InvalidDataException>(() => fixture.CreateStore().Read());
     }
 
-    [Fact]
-    public void ExistingJournalWithNoValidSlotFailsClosed()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void MissingOrCorruptCommitPointerWithJournalArtifactsFailsClosed(bool deletePointer)
     {
         using var fixture = new StateFixture();
-        Directory.CreateDirectory(fixture.DirectoryPath);
-        File.WriteAllText(fixture.StatePath, "{torn");
-        File.WriteAllText(fixture.PreviousStatePath, "{also-torn");
+        fixture.CreateStore().Accept("2.0.0", new string('a', 64));
+        if (deletePointer)
+            File.Delete(fixture.CommitPointerPath);
+        else
+            File.WriteAllText(fixture.CommitPointerPath, "{torn-pointer");
 
         Assert.Throws<InvalidDataException>(() => fixture.CreateStore().Read());
         Assert.Throws<InvalidDataException>(() =>
@@ -157,13 +156,36 @@ public sealed class SignedFeedStateStoreTests
     }
 
     [Fact]
-    public void ValidSameVersionWithDifferentManifestAcrossSlotsFailsClosed()
+    public void CompletedCommitReopensAtTheNewHighFloor()
+    {
+        using var fixture = new StateFixture();
+        var store = fixture.CreateStore();
+        store.Accept("2.0.0", new string('a', 64));
+        store.Accept("3.0.0", new string('b', 64));
+
+        var reopened = fixture.CreateStore().Read();
+
+        Assert.Equal("3.0.0", reopened.HighestAcceptedVersion);
+        Assert.Equal(new string('b', 64), reopened.ManifestSha256);
+        Assert.Throws<InvalidDataException>(() =>
+            fixture.CreateStore().Accept("2.9.9", new string('c', 64)));
+    }
+
+    [Theory]
+    [InlineData("pointer")]
+    [InlineData("slot")]
+    public void UnreadableDesignatedArtifactFailsClosed(string artifact)
     {
         using var fixture = new StateFixture();
         fixture.CreateStore().Accept("2.0.0", new string('a', 64));
-        using var other = new StateFixture();
-        other.CreateStore().Accept("2.0.0", new string('b', 64));
-        File.Copy(other.StatePath, fixture.PreviousStatePath);
+        var path = artifact == "pointer"
+            ? fixture.CommitPointerPath
+            : fixture.CommittedSlotPath();
+        using var exclusive = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None);
 
         Assert.Throws<InvalidDataException>(() => fixture.CreateStore().Read());
     }
@@ -246,15 +268,20 @@ public sealed class SignedFeedStateStoreTests
 
         public string PreviousStatePath => StatePath + ".previous";
 
+        public string CommitPointerPath => StatePath + ".commit";
+
         public SignedFeedStateStore CreateStore(
             string currentVersion = "1.0.0",
             TimeSpan? lockTimeout = null) =>
             new(StatePath, FeedIdentity, currentVersion, lockTimeout);
 
-        public string FindSlot(string version) => new[] { StatePath, PreviousStatePath }
-            .Single(path => File.Exists(path) && File.ReadAllText(path).Contains(
-                $"\"highestAcceptedVersion\":\"{version}\"",
-                StringComparison.Ordinal));
+        public string CommittedSlotPath()
+        {
+            using var document = JsonDocument.Parse(File.ReadAllBytes(CommitPointerPath));
+            return document.RootElement.GetProperty("slot").GetInt32() == 0
+                ? StatePath
+                : PreviousStatePath;
+        }
 
         public void Dispose() => Directory.Delete(DirectoryPath, recursive: true);
     }
