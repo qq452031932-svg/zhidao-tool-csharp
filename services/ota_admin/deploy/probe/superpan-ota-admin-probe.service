@@ -1,0 +1,15 @@
+[Unit]
+Description=SuperPan OTA admin CentOS 7 compatibility probe
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/superpan-ota-admin-verify
+ExecStart=/root/superpan-ota-admin-verify/superpan-ota-admin-linux-amd64 compat-probe --serve --listen=127.0.0.1:18091 --work-dir=/root/superpan-ota-admin-verify/state
+Restart=no
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
