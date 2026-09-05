@@ -55,6 +55,18 @@ func TestLinuxPrivateStagingRootMetadataPolicy(t *testing.T) {
 	}
 }
 
+func TestNewTestReceiverMakesFixtureStagingRootPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX staging modes")
+	}
+	staging := t.TempDir()
+	if err := os.Chmod(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	newTestReceiver(t, staging, DefaultLimits(), func(string) (uint64, error) { return 1 << 40, nil })
+	assertMode(t, staging, 0o700)
+}
+
 func TestReceiveStreamsValidZIPIntoPrivateRandomPaths(t *testing.T) {
 	staging := t.TempDir()
 	archive := makeZIP(t, map[string]string{
@@ -459,6 +471,9 @@ func makeSpecialZIP(t *testing.T, kind string) []byte {
 
 func newTestReceiver(t *testing.T, staging string, limits Limits, disk func(string) (uint64, error)) *Receiver {
 	t.Helper()
+	if err := os.Chmod(staging, 0o700); err != nil {
+		t.Fatalf("secure test staging root: %v", err)
+	}
 	receiver, err := NewReceiver(ReceiverOptions{StagingRoot: staging, Limits: limits, AvailableBytes: disk})
 	if err != nil {
 		t.Fatal(err)
