@@ -10,8 +10,10 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -144,6 +146,50 @@ func TestHealthServerRejectsNonLoopbackListenAddress(t *testing.T) {
 	if _, _, err := StartHealthServer(Report{OK: true}, "0.0.0.0:0"); err == nil {
 		t.Fatal("startHealthServer() accepted a non-loopback address")
 	}
+}
+
+func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
+	t.Parallel()
+
+	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	for _, required := range []string{
+		"git", "ls-files", "superpan-ota-admin-source.zip",
+		"superpan-ota-admin-source.zip.sha256", "superpan-ota-admin-linux-amd64.sha256",
+		"1980-01-01", "StringComparer]::Ordinal",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("build script does not contain %q", required)
+		}
+	}
+
+	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	for _, required := range []string{
+		"go1.27.1.linux-amd64.tar.gz",
+		"63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445",
+		"superpan-ota-admin-source.zip.sha256",
+		"superpan-ota-admin-linux-amd64.sha256",
+		"sha256sum -c",
+		"CGO_ENABLED=0",
+		"GOTOOLCHAIN=local",
+		"test -shuffle=on -count=10 ./...",
+		"x86-64",
+		"statically linked",
+		"stripped",
+	} {
+		if !strings.Contains(runner, required) {
+			t.Errorf("CentOS runner does not contain %q", required)
+		}
+	}
+}
+
+func readRepositoryFile(t *testing.T, pathParts ...string) string {
+	t.Helper()
+	path := filepath.Join(append([]string{"..", ".."}, pathParts...)...)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+	}
+	return string(contents)
 }
 
 func countCall(calls []string, want string) int {
