@@ -35,6 +35,7 @@ type blockingUploadReceiver struct {
 type fakeEnvelopeAcceptor struct {
 	calls       int
 	lookupCalls int
+	failCalls   int
 	sessionID   string
 	operationID string
 	envelope    *upload.Envelope
@@ -57,7 +58,10 @@ func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.
 }
 
 func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string) (candidate.Summary, error) {
-	return candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "failed", ResultCode: code}, nil
+	acceptor.failCalls++
+	failed := candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "failed", ResultCode: code}
+	acceptor.existing = &failed
+	return failed, nil
 }
 
 func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope) (candidate.Summary, error) {
@@ -191,6 +195,37 @@ func TestUploadEndpointReturnsSafeChineseValidationErrorWithOperationID(t *testi
 	body := decodeBody(t, response)
 	if response.Code != http.StatusUnprocessableEntity || body["code"] != "signature_mismatch" || body["message"] != "签名校验失败" || body["operation_id"] != testOperationID {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if acceptor.failCalls != 1 {
+		t.Fatalf("failed reservation terminalizations=%d", acceptor.failCalls)
+	}
+	replayed := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
+	if replayed.Code != http.StatusUnprocessableEntity || decodeBody(t, replayed)["code"] != "signature_mismatch" || receiver.calls != 1 {
+		t.Fatalf("replay status=%d receiver=%d body=%s", replayed.Code, receiver.calls, replayed.Body.String())
+	}
+}
+
+func TestUploadEndpointTerminalizesEveryPostReservationFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		receiver *fakeUploadReceiver
+		acceptor *fakeEnvelopeAcceptor
+	}{
+		{name: "receiver", receiver: &fakeUploadReceiver{err: upload.ErrInvalidArchive}, acceptor: &fakeEnvelopeAcceptor{}},
+		{name: "nil envelope", receiver: &fakeUploadReceiver{}, acceptor: &fakeEnvelopeAcceptor{}},
+		{name: "acceptance", receiver: &fakeUploadReceiver{result: testEnvelope()}, acceptor: &fakeEnvelopeAcceptor{err: release.ErrMetadata}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			installUploadReceiver(t, h, test.receiver, test.acceptor)
+			cookie, csrf, _, _ := login(t, h, oldPassword)
+			cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+			_ = uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+			if test.acceptor.failCalls != 1 {
+				t.Fatalf("failed reservation terminalizations=%d", test.acceptor.failCalls)
+			}
+		})
 	}
 }
 
@@ -328,6 +363,10 @@ func TestUploadEndpointNormalizesEnvelopeFailures(t *testing.T) {
 			response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
 			if response.Code != test.want || decodeBody(t, response)["code"] != test.code || strings.Contains(response.Body.String(), "secret") {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			replayed := uploadRequest(h, []byte("retry must not be consumed"), "application/zip", csrf, cookie)
+			if replayed.Code != test.want || decodeBody(t, replayed)["code"] != test.code || receiver.calls != 1 {
+				t.Fatalf("replay status=%d receiver=%d body=%s", replayed.Code, receiver.calls, replayed.Body.String())
 			}
 		})
 	}

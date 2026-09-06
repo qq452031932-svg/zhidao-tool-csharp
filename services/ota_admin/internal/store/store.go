@@ -571,7 +571,8 @@ func (s *Store) ReserveCandidateForActiveSession(ctx context.Context, request Ca
 }
 
 func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationID, resultCode string, at time.Time) (CandidateRecord, error) {
-	if resultCode != "hash_mismatch" && resultCode != "signature_mismatch" && resultCode != "version_floor" && resultCode != "internal_failure" && resultCode != "expired" {
+	operationCode, publicCode, gateCode, valid := candidateFailureCodes(resultCode)
+	if !valid {
 		return CandidateRecord{}, errors.New("candidate failure code is invalid")
 	}
 	s.candidateMu.Lock()
@@ -591,17 +592,29 @@ func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationI
 			return nil
 		}
 		uploadCode := audit.CodeInternalFailure
-		if resultCode == "hash_mismatch" {
+		if operationCode == "hash_mismatch" {
 			uploadCode = audit.CodeHashMismatch
 		}
-		if resultCode == "expired" {
+		if operationCode == "expired" {
 			uploadCode = audit.CodeExpired
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='failed' WHERE id=? AND state='uploading'`, record.ID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND state='pending'`, resultCode, timestamp(at), operationID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_upload_failures(operation_id,candidate_id,public_code) VALUES(?,?,?)`, operationID, record.ID, publicCode); err != nil {
 			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND state='pending'`, operationCode, timestamp(at), operationID); err != nil {
+			return err
+		}
+		if operationCode != "expired" {
+			gateEvent, err := audit.NewGateResult(audit.OutcomeFailure, operationID, record.ID, gateCode, at)
+			if err != nil {
+				return err
+			}
+			if err := insertAudit(ctx, tx, gateEvent); err != nil {
+				return err
+			}
 		}
 		event, err := audit.NewUploadCompleted(audit.OutcomeFailure, operationID, record.ID, uploadCode, at)
 		if err != nil {
@@ -610,10 +623,31 @@ func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationI
 		if err := insertAudit(ctx, tx, event); err != nil {
 			return err
 		}
-		record.State, record.OperationState, record.ResultCode = CandidateFailed, OperationFailed, resultCode
+		record.State, record.OperationState, record.ResultCode = CandidateFailed, OperationFailed, publicCode
 		return nil
 	})
 	return record, err
+}
+
+func candidateFailureCodes(code string) (operationCode, publicCode string, gateCode audit.Code, ok bool) {
+	switch code {
+	case "signature_mismatch":
+		return code, code, audit.CodeSignatureMismatch, true
+	case "version_floor":
+		return code, code, audit.CodeVersionFloor, true
+	case "hash_mismatch":
+		return code, "release_validation_failed", audit.CodeHashMismatch, true
+	case "release_validation_failed":
+		return "internal_failure", code, audit.CodeInternalFailure, true
+	case "invalid_zip_envelope", "upload_too_large", "insufficient_storage", "operation_failed":
+		return "internal_failure", code, audit.CodeInternalFailure, true
+	case "expired", "candidate_expired":
+		return "expired", "candidate_expired", audit.CodeExpired, true
+	case "internal_failure":
+		return code, "operation_failed", audit.CodeInternalFailure, true
+	default:
+		return "", "", "", false
+	}
 }
 
 func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request CandidateAcceptance) (CandidateRecord, bool, error) {
@@ -917,6 +951,9 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 					return err
 				}
 				if changed == 1 {
+					if _, err := tx.ExecContext(ctx, `UPDATE candidate_cleanup_attempts SET outcome='failure',finished_at=? WHERE operation_id=? AND candidate_id=? AND outcome=''`, timestamp(now), item.oldOperation.String, item.id); err != nil {
+						return err
+					}
 					event, err := audit.NewCleanupResult(audit.OutcomeFailure, item.oldOperation.String, "", audit.CodeInternalFailure, now)
 					if err != nil {
 						return err
@@ -939,6 +976,9 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 				continue
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, opID, timestamp(now)); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_cleanup_attempts(operation_id,candidate_id,attempt_number,started_at) VALUES(?,?,?,?)`, opID, item.id, item.attempts+1, timestamp(now)); err != nil {
 				return err
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=?`, opID); err != nil {
@@ -989,6 +1029,21 @@ func (s *Store) finishCandidateCleanup(ctx context.Context, claim CleanupClaim, 
 		if err := insertAudit(ctx, tx, event); err != nil {
 			return err
 		}
+		outcome := "failure"
+		if success {
+			outcome = "success"
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE candidate_cleanup_attempts SET outcome=?,finished_at=? WHERE operation_id=? AND candidate_id=? AND outcome=''`, outcome, timestamp(at), claim.OperationID, claim.CandidateID)
+		if err != nil {
+			return err
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
 		if success {
 			result, err = tx.ExecContext(ctx, `UPDATE candidate_cleanups SET state='completed',claim_token='',claim_expires_at=NULL,last_error_code='',updated_at=?,completed_at=? WHERE candidate_id=? AND operation_id=? AND claim_token=? AND state='pending'`, timestamp(at), timestamp(at), claim.CandidateID, claim.OperationID, claim.ClaimToken)
 		} else {
@@ -1031,7 +1086,7 @@ func (s *Store) RecordCleanupResult(ctx context.Context, operationID string, suc
 	})
 }
 
-const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,CASE WHEN c.validation_report='' THEN '' ELSE COALESCE(json_extract(c.validation_report,'$.version'),'') END,o.id,o.state,o.result_code FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload'`
+const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,CASE WHEN c.validation_report='' THEN '' ELSE COALESCE(json_extract(c.validation_report,'$.version'),'') END,o.id,o.state,COALESCE(f.public_code,o.result_code) FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload' LEFT JOIN candidate_upload_failures f ON f.operation_id=o.id`
 
 type rowScanner interface{ Scan(...any) error }
 

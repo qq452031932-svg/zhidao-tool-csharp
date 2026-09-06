@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -238,8 +239,38 @@ func TestFailedReservationIsTerminalAndReplayable(t *testing.T) {
 		t.Fatalf("failed=%+v err=%v", failed, err)
 	}
 	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(2 * time.Second), ExpiresAt: now.Add(24 * time.Hour)})
-	if err != nil || created || replayed.ID != candidateID1 || replayed.ResultCode != "internal_failure" {
+	if err != nil || created || replayed.ID != candidateID1 || replayed.ResultCode != "operation_failed" {
 		t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
+	}
+}
+
+func TestFailedValidationRecordsSeparateTruthfulGateAndUploadTerminalAudits(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	for index, code := range []string{"signature_mismatch", "version_floor", "hash_mismatch", "internal_failure"} {
+		candidateID := fmt.Sprintf("%08d-1111-4111-8111-%012d", index+1, index+1)
+		operationID := fmt.Sprintf("%08d-2222-4222-8222-%012d", index+1, index+1)
+		if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID, SessionID: sessionHash1, OperationID: operationID, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID, code, now.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var gateCode, uploadCode string
+		if err := s.db.QueryRow(`SELECT code FROM audit_events WHERE event_type='gate_result' AND operation_id=?`, operationID).Scan(&gateCode); err != nil || gateCode != code {
+			t.Fatalf("code=%s gate=%s err=%v", code, gateCode, err)
+		}
+		if err := s.db.QueryRow(`SELECT code FROM audit_events WHERE event_type='upload_completed' AND operation_id=?`, operationID).Scan(&uploadCode); err != nil {
+			t.Fatal(err)
+		}
+		wantUpload := "internal_failure"
+		if code == "hash_mismatch" {
+			wantUpload = code
+		}
+		if uploadCode != wantUpload {
+			t.Fatalf("code=%s upload=%s want=%s", code, uploadCode, wantUpload)
+		}
 	}
 }
 

@@ -16,9 +16,9 @@ type migration struct {
 	apply    func(context.Context, *sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}, {version: 4, sql: schemaV4}}
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 var schemaV3 = `
 CREATE TABLE candidate_cleanups (
@@ -35,6 +35,25 @@ CREATE TABLE candidate_cleanups (
     CHECK ((state='pending' AND completed_at IS NULL) OR (state='completed' AND completed_at IS NOT NULL AND claim_token='' AND claim_expires_at IS NULL AND last_error_code=''))
 );
 CREATE INDEX candidate_cleanups_pending ON candidate_cleanups(state,claim_expires_at,candidate_id);
+`
+
+var schemaV4 = `
+CREATE TABLE candidate_upload_failures (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id) ON DELETE RESTRICT,
+    public_code TEXT NOT NULL CHECK (public_code IN ('signature_mismatch','version_floor','release_validation_failed','invalid_zip_envelope','upload_too_large','insufficient_storage','operation_failed','candidate_expired'))
+);
+CREATE TABLE candidate_cleanup_attempts (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE RESTRICT,
+    attempt_number INTEGER NOT NULL CHECK (` + integerCheckSQL("attempt_number") + ` AND attempt_number > 0),
+    started_at INTEGER NOT NULL CHECK (` + integerCheckSQL("started_at") + `),
+    finished_at INTEGER CHECK (finished_at IS NULL OR (` + integerCheckSQL("finished_at") + `)),
+    outcome TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','success','failure')),
+    CHECK ((outcome='' AND finished_at IS NULL) OR (outcome<>'' AND finished_at IS NOT NULL)),
+    UNIQUE(candidate_id,attempt_number)
+);
+CREATE INDEX candidate_cleanup_attempts_candidate ON candidate_cleanup_attempts(candidate_id,attempt_number);
 `
 
 var schemaV2 = `

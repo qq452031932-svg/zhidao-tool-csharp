@@ -45,9 +45,13 @@ func deleteCandidatePaths(root, id string) error {
 		}
 		directory := os.NewFile(uintptr(directoryFD), extraction.name)
 		entries, err := directory.ReadDir(257)
-		if err != nil && !errors.Is(err, io.EOF) || len(entries) > 256 {
+		if err != nil && !errors.Is(err, io.EOF) {
 			directory.Close()
 			return err
+		}
+		if len(entries) > 256 {
+			directory.Close()
+			return errors.New("candidate extraction contains too many members")
 		}
 		for _, entry := range entries {
 			child, err := preflightAt(directoryFD, entry.Name(), false)

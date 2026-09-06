@@ -134,6 +134,7 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	}
 	floor, _, err := service.store.HighestCommittedVersion(ctx)
 	if err != nil {
+		service.failBestEffort(sessionID, operationID, "internal_failure")
 		return Summary{}, err
 	}
 	report, err := service.validator.Validate(ctx, envelope, floor)
@@ -143,11 +144,13 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	}
 	reportJSON, err := json.Marshal(report)
 	if err != nil {
+		service.failBestEffort(sessionID, operationID, "internal_failure")
 		return Summary{}, errors.New("encode candidate validation report")
 	}
 	candidateID := existing.ID
 	paths := service.paths(candidateID)
 	if err := service.adoptEnvelope(envelope, paths); err != nil {
+		service.failBestEffort(sessionID, operationID, "internal_failure")
 		return Summary{}, err
 	}
 	cleanupAfterAdoption := func(cause error) (Summary, error) {
@@ -213,6 +216,8 @@ func validationFailureCode(err error) string {
 		return "version_floor"
 	case errors.Is(err, ErrDigestMismatch):
 		return "hash_mismatch"
+	case errors.Is(err, release.ErrManifest), errors.Is(err, release.ErrMetadata), errors.Is(err, release.ErrCatalog), errors.Is(err, release.ErrReleasesIndex):
+		return "release_validation_failed"
 	default:
 		return "internal_failure"
 	}

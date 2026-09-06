@@ -24,7 +24,7 @@ func TestV3MigrationAddsConstrainedCandidateCleanupLedger(t *testing.T) {
 	}
 }
 
-func TestV2ToV3MigrationIsIncrementalAndIdempotent(t *testing.T) {
+func TestV2ToCurrentMigrationIsIncrementalAndIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")
 	db, err := sql.Open("sqlite", path)
@@ -44,11 +44,49 @@ func TestV2ToV3MigrationIsIncrementalAndIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 		var version, count int
-		if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
+		if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
 			t.Fatalf("version=%d err=%v", version, err)
 		}
 		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_cleanups'`).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table count=%d err=%v", count, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestV3ToV4MigrationPreservesCleanupLedgerAndIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(schemaV2 + schemaV3 + `PRAGMA user_version=3;`); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	for range 2 {
+		s, err := Open(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var version, ledgers, attempts, failures int
+		if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+			t.Fatalf("version=%d err=%v", version, err)
+		}
+		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_cleanups'`).Scan(&ledgers); err != nil || ledgers != 1 {
+			t.Fatalf("cleanup ledgers=%d err=%v", ledgers, err)
+		}
+		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_cleanup_attempts'`).Scan(&attempts); err != nil || attempts != 1 {
+			t.Fatalf("attempt tables=%d err=%v", attempts, err)
+		}
+		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_upload_failures'`).Scan(&failures); err != nil || failures != 1 {
+			t.Fatalf("upload failure tables=%d err=%v", failures, err)
 		}
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
@@ -135,5 +173,15 @@ func TestExpiredCleanupLeaseIsFailedAndAuditedBeforeRetryClaim(t *testing.T) {
 	var audits int
 	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='cleanup_result' AND operation_id=? AND outcome='failure'`, releaseID1).Scan(&audits); err != nil || audits != 1 {
 		t.Fatalf("audits=%d err=%v", audits, err)
+	}
+	var firstCandidate, secondCandidate string
+	if err := s.db.QueryRow(`SELECT candidate_id FROM candidate_cleanup_attempts WHERE operation_id=?`, releaseID1).Scan(&firstCandidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT candidate_id FROM candidate_cleanup_attempts WHERE operation_id=?`, candidateID1).Scan(&secondCandidate); err != nil {
+		t.Fatal(err)
+	}
+	if firstCandidate != candidateID1 || secondCandidate != candidateID1 {
+		t.Fatalf("cleanup attempt association lost: first=%s second=%s", firstCandidate, secondCandidate)
 	}
 }

@@ -87,6 +87,10 @@ func adoptCandidatePaths(root, sourceArchive, sourceExtraction, destinationArchi
 			return errors.New("candidate extraction member changed")
 		}
 	}
+	if err := unix.Fsync(directoryFD); err != nil {
+		directory.Close()
+		return err
+	}
 	if err := directory.Close(); err != nil {
 		return err
 	}

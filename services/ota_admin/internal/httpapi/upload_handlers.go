@@ -33,14 +33,22 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		return
 	}
 	if !created {
-		writeCandidateSummary(response, http.StatusAccepted, reserved)
+		writeReservedCandidateResult(response, reserved)
 		return
 	}
+	terminal := false
+	failureCode := "operation_failed"
+	defer func() {
+		if terminal {
+			return
+		}
+		finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, principal.IDHash, operationID, failureCode)
+	}()
 	envelope, err := router.uploads.Receive(request.Context(), request.Body, request.ContentLength)
 	if err != nil {
-		finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, _ = router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, principal.IDHash, operationID, "internal_failure")
-		cancel()
+		failureCode = uploadPublicFailureCode(err)
 		writeUploadError(response, err)
 		return
 	}
@@ -68,6 +76,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	}
 	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope)
 	if err != nil {
+		failureCode = candidatePublicFailureCode(err)
 		if cleanupErr := envelope.Cleanup(); cleanupErr != nil {
 			writeError(response, http.StatusInternalServerError, "operation_failed")
 			return
@@ -75,7 +84,63 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		writeUploadOperationError(response, err, operationID)
 		return
 	}
+	terminal = true
 	writeCandidateSummary(response, http.StatusAccepted, summary)
+}
+
+func writeReservedCandidateResult(response http.ResponseWriter, summary candidate.Summary) {
+	if summary.State != "failed" {
+		writeCandidateSummary(response, http.StatusAccepted, summary)
+		return
+	}
+	switch summary.ResultCode {
+	case "signature_mismatch":
+		writeCandidateError(response, http.StatusUnprocessableEntity, "signature_mismatch", "签名校验失败", summary.OperationID)
+	case "version_floor":
+		writeCandidateError(response, http.StatusUnprocessableEntity, "version_floor", "版本号不是递增", summary.OperationID)
+	case "hash_mismatch":
+		writeCandidateError(response, http.StatusUnprocessableEntity, "release_validation_failed", "发布包校验失败", summary.OperationID)
+	case "release_validation_failed":
+		writeCandidateError(response, http.StatusUnprocessableEntity, "release_validation_failed", "发布包校验失败", summary.OperationID)
+	case "invalid_zip_envelope":
+		writeCandidateError(response, http.StatusUnprocessableEntity, "invalid_zip_envelope", "发布包格式无效", summary.OperationID)
+	case "upload_too_large":
+		writeCandidateError(response, http.StatusRequestEntityTooLarge, "upload_too_large", "发布包过大", summary.OperationID)
+	case "insufficient_storage":
+		writeCandidateError(response, http.StatusInsufficientStorage, "insufficient_storage", "服务器空间不足", summary.OperationID)
+	case "expired", "candidate_expired":
+		writeCandidateError(response, http.StatusGone, "candidate_expired", "候选版本已过期", summary.OperationID)
+	default:
+		writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败", summary.OperationID)
+	}
+}
+
+func candidatePublicFailureCode(err error) string {
+	switch {
+	case errors.Is(err, release.ErrSignature):
+		return "signature_mismatch"
+	case errors.Is(err, release.ErrVersionFloor):
+		return "version_floor"
+	case errors.Is(err, release.ErrManifest), errors.Is(err, release.ErrMetadata), errors.Is(err, release.ErrCatalog), errors.Is(err, release.ErrReleasesIndex), errors.Is(err, candidate.ErrDigestMismatch):
+		return "release_validation_failed"
+	case errors.Is(err, candidate.ErrExpired):
+		return "candidate_expired"
+	default:
+		return "operation_failed"
+	}
+}
+
+func uploadPublicFailureCode(err error) string {
+	switch {
+	case errors.Is(err, upload.ErrCompressedLimit):
+		return "upload_too_large"
+	case errors.Is(err, upload.ErrInsufficientDisk):
+		return "insufficient_storage"
+	case errors.Is(err, upload.ErrExpandedLimit), errors.Is(err, upload.ErrSingleFileLimit), errors.Is(err, upload.ErrEntryLimit), errors.Is(err, upload.ErrCompressionRatio), errors.Is(err, upload.ErrUnsafeName), errors.Is(err, upload.ErrUnknownName), errors.Is(err, upload.ErrDuplicateName), errors.Is(err, upload.ErrUnsafeEntry), errors.Is(err, upload.ErrInvalidArchive):
+		return "invalid_zip_envelope"
+	default:
+		return "operation_failed"
+	}
 }
 
 func writeUploadOperationError(response http.ResponseWriter, err error, operationID string) {

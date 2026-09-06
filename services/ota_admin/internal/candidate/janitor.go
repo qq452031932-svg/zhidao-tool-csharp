@@ -61,13 +61,12 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 	if janitor == nil {
 		return errors.New("janitor is nil")
 	}
-	now := janitor.now().UTC()
-	if err := cleanupStaleUploadArtifacts(janitor.stagingRoot, now.Add(-24*time.Hour)); err != nil {
+	if err := cleanupStaleUploadArtifacts(janitor.stagingRoot, janitor.now().UTC().Add(-24*time.Hour)); err != nil {
 		return err
 	}
 	const pageSize = 64
 	for {
-		ids, err := janitor.store.QueueExpiredCandidateCleanups(ctx, now, pageSize)
+		ids, err := janitor.store.QueueExpiredCandidateCleanups(ctx, janitor.now().UTC(), pageSize)
 		if err != nil {
 			return err
 		}
@@ -88,7 +87,7 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 				return errors.Join(errors.Join(failures...), err)
 			}
 		}
-		claims, err := janitor.store.ClaimCandidateCleanups(ctx, now, 5*time.Minute, pageSize, claimToken, operationIDs)
+		claims, err := janitor.store.ClaimCandidateCleanups(ctx, janitor.now().UTC(), 5*time.Minute, pageSize, claimToken, operationIDs)
 		if err != nil {
 			return errors.Join(errors.Join(failures...), err)
 		}

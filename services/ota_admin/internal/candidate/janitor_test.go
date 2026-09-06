@@ -1,8 +1,10 @@
 package candidate
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -172,5 +174,74 @@ func TestJanitorRemovesOnlyStaleBoundedRawUploadArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatalf("fresh upload removed: %v", err)
+	}
+}
+
+func TestJanitorRawArtifactScanCannotStarveBehindMoreThanOnePage(t *testing.T) {
+	_, database, staging, base := newCandidateHarness(t)
+	for index := range 300 {
+		name := filepath.Join(staging, fmt.Sprintf("000-junk-%03d", index))
+		if err := os.WriteFile(name, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stale := filepath.Join(staging, ".upload-stale")
+	if err := os.WriteFile(stale, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := base.Add(-25 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return base }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := janitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale artifact starved behind first page: %v", err)
+	}
+}
+
+func TestJanitorUsesFreshTimeWhenClaimingExpiredCleanupLease(t *testing.T) {
+	service, database, staging, base := newCandidateHarness(t)
+	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry := base.Add(24 * time.Hour)
+	if _, err := database.QueueExpiredCandidateCleanups(context.Background(), expiry, 1); err != nil {
+		t.Fatal(err)
+	}
+	oldToken := "33333333-3333-4333-8333-333333333333"
+	oldOperation := "44444444-4444-4444-8444-444444444444"
+	claims, err := database.ClaimCandidateCleanups(context.Background(), expiry, time.Minute, 1, oldToken, []string{oldOperation})
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("old claim=%+v err=%v", claims, err)
+	}
+	times := []time.Time{expiry, expiry, expiry.Add(2 * time.Minute)}
+	index := 0
+	janitor, err := NewJanitor(JanitorOptions{
+		Store: database, StagingRoot: staging,
+		Now: func() time.Time {
+			if index >= len(times) {
+				return times[len(times)-1]
+			}
+			value := times[index]
+			index++
+			return value
+		},
+		Random: bytes.NewReader(bytes.Repeat([]byte{0x91}, 4096)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := janitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(service.paths(summary.CandidateID).archive); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("freshly expired cleanup lease was not reclaimed: %v", err)
 	}
 }
