@@ -133,7 +133,7 @@ async function initialize() {
       showView("login-view");
     }
   } finally {
-    if (epoch === state.dashboardEpoch) setLoading(false);
+    setLoading(false);
   }
 }
 
@@ -379,7 +379,7 @@ async function loadDashboard() {
   } catch (error) {
     if (error.status !== 401) showPageError(messageFor(error, "读取发布状态失败。"));
   } finally {
-    setLoading(false);
+    if (epoch === state.dashboardEpoch) setLoading(false);
   }
 }
 

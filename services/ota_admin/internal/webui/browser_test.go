@@ -243,6 +243,9 @@ func tail(value string, limit int) string {
 const browserBootstrapScript = `
 window.__xhrSends = 0;
 window.__mode = new URL(location.href).searchParams.get("mode");
+window.__runtimeErrors = [];
+window.addEventListener("error", event => window.__runtimeErrors.push(event.message || "window.error"));
+window.addEventListener("unhandledrejection", event => window.__runtimeErrors.push(String(event.reason || "unhandledrejection")));
 class TestUploadTarget {
   constructor() { this.listeners = {}; }
   addEventListener(name, listener) { this.listeners[name] = listener; }
@@ -299,6 +302,7 @@ try {
     await waitFor(() => !document.getElementById("console-view").hidden, "改密后控制台");
     assert(document.getElementById("current-password").value === "" && document.getElementById("new-password").value === "", "改密后密码字段未清空");
   }
+  await waitFor(() => document.getElementById("loading-state").hidden, "初始化加载结束");
   await waitFor(() => document.querySelectorAll("#validation-list li.passed").length === 7, "逐项校验证据");
   const incomplete = window.__candidate("21.0.1");
   incomplete.report.gates.storage.passed = false;
@@ -379,6 +383,7 @@ try {
     assert(protocol.publish_keys.length === 2 && protocol.publish_keys[0] === protocol.publish_keys[1], "重复发布未沿用幂等键");
     assert(protocol.rollback_keys.length === 2 && protocol.rollback_keys[0] === protocol.rollback_keys[1], "重复回滚未沿用幂等键");
   }
+  assert(window.__runtimeErrors.length === 0, "页面存在未处理异常：" + window.__runtimeErrors.join(","));
   result.textContent = "PASS " + window.__mode;
 } catch (error) {
   result.textContent = "FAIL " + window.__mode + ": " + error.message;
