@@ -31,6 +31,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runCompatProbe(arguments[1:], stdout, stderr)
 	case "init-admin":
 		return runInitAdmin(arguments[1:], stdout, stderr)
+	case "serve":
+		return runServe(arguments[1:], stdout, stderr)
 	default:
 		writeUsage(stderr)
 		return 2
@@ -128,5 +130,5 @@ func runInitAdmin(arguments []string, stdout, stderr io.Writer) int {
 }
 
 func writeUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: ota-admin <compat-probe|init-admin> [options]")
+	fmt.Fprintln(writer, "usage: ota-admin <compat-probe|init-admin|serve> [options]")
 }

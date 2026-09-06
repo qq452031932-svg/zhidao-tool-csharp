@@ -1,12 +1,26 @@
 package config_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/config"
 )
+
+func productionConfig() config.Config {
+	cfg := config.Default()
+	cfg.DatabasePath = "/var/lib/superpan-ota-admin/state.db"
+	cfg.ListenAddress = "127.0.0.1:18091"
+	cfg.PublicOrigin = "https://ota.fanfh.cn"
+	cfg.StagingRoot = "/var/lib/superpan-ota-admin/staging"
+	cfg.ReleaseRoot = "/www/wwwroot/ota.fanfh.cn/releases/win-x64"
+	cfg.PublisherCertificatePath = "/etc/superpan-ota-admin/publisher.cer"
+	cfg.PublisherSPKISHA256 = "f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff"
+	cfg.SourceHMACKeyPath = "/etc/superpan-ota-admin/source-hmac.key"
+	return cfg
+}
 
 func TestCompiledHardMaxima(t *testing.T) {
 	t.Parallel()
@@ -177,5 +191,89 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 
 	if _, err := config.Parse(strings.NewReader(`{"database_path":"/state.db","disable_limits":true}`)); err == nil {
 		t.Fatal("Parse() accepted an unknown field")
+	}
+}
+
+func TestParseRejectsDuplicateCaseFoldedAndOversizedConfiguration(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"database_path":"/one.db","database_path":"/two.db"}`,
+		`{"database_path":"/one.db","DATABASE_PATH":"/two.db"}`,
+		`{"database_path":"/one.db","limits":{"zip_bytes":1,"ZIP_BYTES":2}}`,
+	} {
+		if _, err := config.Parse(strings.NewReader(body)); err == nil {
+			t.Fatalf("Parse() accepted ambiguous JSON %s", body)
+		}
+	}
+	oversized := `{"database_path":"/` + strings.Repeat("a", 70<<10) + `.db"}`
+	if _, err := config.Parse(strings.NewReader(oversized)); err == nil {
+		t.Fatal("Parse() accepted an oversized service configuration")
+	}
+	if _, err := config.Parse(strings.NewReader("{\"database_path\":\"/state-\xff.db\"}")); err == nil {
+		t.Fatal("Parse() accepted invalid UTF-8")
+	}
+}
+
+func TestValidateServeAcceptsCompleteLoopbackProductionConfig(t *testing.T) {
+	t.Parallel()
+	if err := productionConfig().ValidateServe(); err != nil {
+		t.Fatalf("ValidateServe() error = %v", err)
+	}
+}
+
+func TestValidateServeRejectsIncompleteOrNonLoopbackConfiguration(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		edit func(*config.Config)
+	}{
+		{"missing listen", func(c *config.Config) { c.ListenAddress = "" }},
+		{"wildcard IPv4", func(c *config.Config) { c.ListenAddress = "0.0.0.0:18091" }},
+		{"wildcard IPv6", func(c *config.Config) { c.ListenAddress = "[::]:18091" }},
+		{"hostname ambiguity", func(c *config.Config) { c.ListenAddress = "localhost:18091" }},
+		{"no port", func(c *config.Config) { c.ListenAddress = "127.0.0.1" }},
+		{"http origin", func(c *config.Config) { c.PublicOrigin = "http://ota.fanfh.cn" }},
+		{"wrong origin", func(c *config.Config) { c.PublicOrigin = "https://f.fanfh.cn" }},
+		{"origin path", func(c *config.Config) { c.PublicOrigin = "https://ota.fanfh.cn/admin/" }},
+		{"bad pin", func(c *config.Config) { c.PublisherSPKISHA256 = strings.Repeat("A", 64) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := productionConfig()
+			test.edit(&cfg)
+			if err := cfg.ValidateServe(); err == nil {
+				t.Fatal("ValidateServe() accepted unsafe production configuration")
+			}
+		})
+	}
+}
+
+func TestValidateServeRejectsRelativeAndOverlappingSensitivePaths(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		edit func(*config.Config)
+	}{
+		{"relative staging", func(c *config.Config) { c.StagingRoot = "staging" }},
+		{"relative release", func(c *config.Config) { c.ReleaseRoot = "releases" }},
+		{"relative certificate", func(c *config.Config) { c.PublisherCertificatePath = "publisher.cer" }},
+		{"relative hmac", func(c *config.Config) { c.SourceHMACKeyPath = "source-hmac.key" }},
+		{"database in release tree", func(c *config.Config) { c.DatabasePath = filepath.Join(c.ReleaseRoot, "state.db") }},
+		{"staging in release tree", func(c *config.Config) { c.StagingRoot = filepath.Join(c.ReleaseRoot, "staging") }},
+		{"release in staging tree", func(c *config.Config) { c.ReleaseRoot = filepath.Join(c.StagingRoot, "releases") }},
+		{"certificate in release tree", func(c *config.Config) { c.PublisherCertificatePath = filepath.Join(c.ReleaseRoot, "publisher.cer") }},
+		{"hmac in release tree", func(c *config.Config) { c.SourceHMACKeyPath = filepath.Join(c.ReleaseRoot, "source-hmac.key") }},
+		{"same cert and key", func(c *config.Config) { c.SourceHMACKeyPath = c.PublisherCertificatePath }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := productionConfig()
+			test.edit(&cfg)
+			if err := cfg.ValidateServe(); err == nil {
+				t.Fatal("ValidateServe() accepted unsafe path layout")
+			}
+		})
 	}
 }

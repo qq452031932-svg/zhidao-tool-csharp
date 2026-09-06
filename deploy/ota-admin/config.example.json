@@ -1,0 +1,23 @@
+{
+  "database_path": "/var/lib/superpan-ota-admin/state.db",
+  "listen_address": "127.0.0.1:18091",
+  "public_origin": "https://ota.fanfh.cn",
+  "staging_root": "/var/lib/superpan-ota-admin/staging",
+  "release_root": "/www/wwwroot/ota.fanfh.cn/releases/win-x64",
+  "publisher_certificate_path": "/etc/superpan-ota-admin/publisher.cer",
+  "publisher_spki_sha256": "f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff",
+  "source_hmac_key_path": "/etc/superpan-ota-admin/source-hmac.key",
+  "limits": {
+    "zip_bytes": 2147483648,
+    "expanded_bytes": 8589934592,
+    "single_file_bytes": 2147483648,
+    "archive_entries": 256,
+    "compression_ratio": 100,
+    "candidate_lifetime_ns": 86400000000000,
+    "session_idle_ns": 1800000000000,
+    "session_lifetime_ns": 28800000000000,
+    "login_failures": 5,
+    "failure_window_ns": 900000000000,
+    "failure_lock_ns": 900000000000
+  }
+}
