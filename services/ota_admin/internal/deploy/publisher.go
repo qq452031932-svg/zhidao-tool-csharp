@@ -40,6 +40,14 @@ type PublishResult struct {
 	State       string `json:"state"`
 }
 
+type RollbackResult struct {
+	OperationID         string `json:"operation_id"`
+	ReleaseID           string `json:"release_id"`
+	Version             string `json:"version"`
+	State               string `json:"state"`
+	ClientAutoDowngrade bool   `json:"client_auto_downgrade"`
+}
+
 var processLocks sync.Map
 
 var (
@@ -130,6 +138,73 @@ func (publisher *Publisher) replayPublishLocked(ctx context.Context, operation s
 		return PublishResult{}, errors.Join(err, store.ErrInvalidTransition)
 	}
 	return PublishResult{OperationID: operation.OperationID, CandidateID: operation.CandidateID, ReleaseID: published.ID, Version: published.Version, State: "succeeded"}, nil
+}
+
+func (publisher *Publisher) RollbackForActiveSession(ctx context.Context, sessionID, releaseID, operationID string) (RollbackResult, error) {
+	publisher.lock.Lock()
+	defer publisher.lock.Unlock()
+	if err := publisher.ReadOnlyError(); err != nil {
+		return RollbackResult{}, err
+	}
+	operation, created, err := publisher.store.BeginRollbackForActiveSession(ctx, sessionID, releaseID, operationID, publisher.now().UTC())
+	if err != nil {
+		return RollbackResult{}, err
+	}
+	if !created {
+		return publisher.replayRollbackLocked(ctx, sessionID, operation)
+	}
+	target, found, err := publisher.store.ReleaseByID(ctx, releaseID)
+	if err != nil || !found {
+		return RollbackResult{}, errors.Join(err, store.ErrNotFound)
+	}
+	assets, err := publisher.store.ReleaseAssets(ctx, releaseID)
+	if err != nil {
+		return RollbackResult{}, err
+	}
+	generation, switched, err := publisher.disk.RollbackGenerationAuthorized(ctx, operationID, target.GenerationName, target.Version, assets, publisher.validator, func(authContext context.Context) error {
+		return publisher.store.RequireActiveSession(authContext, sessionID, publisher.now().UTC())
+	})
+	if err != nil {
+		if switched || errors.Is(err, ErrCrashSimulation) || errors.Is(err, ErrCleanupIncomplete) {
+			publisher.protect(err)
+			return RollbackResult{}, err
+		}
+		if failureErr := publisher.store.FailRollback(context.Background(), operationID, releaseID, publisher.now().UTC()); failureErr != nil {
+			combined := errors.Join(err, failureErr)
+			publisher.protect(combined)
+			return RollbackResult{}, combined
+		}
+		return RollbackResult{}, err
+	}
+	if err := publisher.store.CommitRollback(ctx, operationID, releaseID, publisher.now().UTC()); err != nil {
+		publisher.protect(err)
+		return RollbackResult{}, err
+	}
+	return RollbackResult{OperationID: operationID, ReleaseID: releaseID, Version: generation.Report.Version, State: "succeeded", ClientAutoDowngrade: false}, nil
+}
+
+func (publisher *Publisher) replayRollbackLocked(ctx context.Context, sessionID string, operation store.ReleaseOperation) (RollbackResult, error) {
+	if operation.State == store.OperationRunning {
+		if err := publisher.recoverLocked(ctx); err != nil {
+			return RollbackResult{}, err
+		}
+		refreshed, _, err := publisher.store.BeginRollbackForActiveSession(ctx, sessionID, operation.ReleaseID, operation.OperationID, publisher.now().UTC())
+		if err != nil {
+			return RollbackResult{}, err
+		}
+		operation = refreshed
+	}
+	if operation.State == store.OperationFailed {
+		return RollbackResult{}, store.ErrInvalidTransition
+	}
+	if operation.State != store.OperationSucceeded || operation.ResultCode != "completed" {
+		return RollbackResult{}, store.ErrInvalidTransition
+	}
+	target, found, err := publisher.store.ReleaseByID(ctx, operation.ReleaseID)
+	if err != nil || !found {
+		return RollbackResult{}, errors.Join(err, store.ErrInvalidTransition)
+	}
+	return RollbackResult{OperationID: operation.OperationID, ReleaseID: target.ID, Version: target.Version, State: "succeeded", ClientAutoDowngrade: false}, nil
 }
 
 func normalizedPublishFailureCode(err error) string {

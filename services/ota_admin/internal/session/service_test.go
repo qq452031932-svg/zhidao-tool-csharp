@@ -233,6 +233,43 @@ func TestPasswordRotationSerializesAgainstOldPasswordLogin(t *testing.T) {
 	}
 }
 
+func TestConfirmPasswordRequiresCurrentHashAndStillActiveSession(t *testing.T) {
+	database, service, password := newTestService(t, 5)
+	preauth, csrf, _, _, err := service.Bootstrap("203.0.113.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, _, err := service.Login(context.Background(), service.ConsumePreauthorization(preauth, csrf), "admin", password, "203.0.113.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := service.Authenticate(context.Background(), login.Token, login.CSRFToken, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const replacement = "a replacement administrator password"
+	rotated, err := service.ChangePassword(context.Background(), principal, password, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err = service.Authenticate(context.Background(), rotated.Token, rotated.CSRFToken, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ConfirmPassword(context.Background(), principal, "wrong"); !errors.Is(err, ErrPassword) {
+		t.Fatalf("wrong password err=%v", err)
+	}
+	if err := service.ConfirmPassword(context.Background(), principal, replacement); err != nil {
+		t.Fatalf("correct password err=%v", err)
+	}
+	if err := database.TransitionSession(context.Background(), principal.IDHash, store.SessionRevoked); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ConfirmPassword(context.Background(), principal, replacement); !errors.Is(err, store.ErrSessionInactive) {
+		t.Fatalf("revoked session err=%v", err)
+	}
+}
+
 func TestInvalidPreauthorizationIsSourceLimitedAndAuditCoalesced(t *testing.T) {
 	database, service, observer, password := newObservedTestService(t, 5)
 	preauth, csrf, _, _, err := service.Bootstrap("203.0.113.20")

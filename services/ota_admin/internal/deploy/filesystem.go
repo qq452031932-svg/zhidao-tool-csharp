@@ -28,16 +28,18 @@ var ErrCleanupIncomplete = errors.New("pre-commit cleanup could not be proven")
 type Boundary string
 
 const (
-	BoundaryFileSynced        Boundary = "file_synced"
-	BoundaryCandidateSynced   Boundary = "candidate_dir_synced"
-	BoundaryGenerationNamed   Boundary = "generation_renamed"
-	BoundaryGenerationsSynced Boundary = "generations_dir_synced"
-	BoundaryStableTemp        Boundary = "stable_temp_created"
-	BoundaryStableReplaced    Boundary = "stable_replaced"
-	BoundaryParentSynced      Boundary = "win_x64_parent_synced"
-	BoundaryMigrationRenamed  Boundary = "migration_stable_renamed"
-	BoundaryMigrationSynced   Boundary = "migration_parent_synced"
-	BoundaryMigrationRemoved  Boundary = "migration_backup_removed"
+	BoundaryFileSynced           Boundary = "file_synced"
+	BoundaryCandidateSynced      Boundary = "candidate_dir_synced"
+	BoundaryGenerationNamed      Boundary = "generation_renamed"
+	BoundaryGenerationsSynced    Boundary = "generations_dir_synced"
+	BoundaryStableTemp           Boundary = "stable_temp_created"
+	BoundaryStableReplaced       Boundary = "stable_replaced"
+	BoundaryParentSynced         Boundary = "win_x64_parent_synced"
+	BoundaryRollbackStable       Boundary = "rollback_stable_replaced"
+	BoundaryRollbackParentSynced Boundary = "rollback_win_x64_parent_synced"
+	BoundaryMigrationRenamed     Boundary = "migration_stable_renamed"
+	BoundaryMigrationSynced      Boundary = "migration_parent_synced"
+	BoundaryMigrationRemoved     Boundary = "migration_backup_removed"
 )
 
 type FaultHook func(Boundary) error

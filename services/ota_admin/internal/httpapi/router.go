@@ -12,6 +12,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
+	"fanfh.cn/superpan/ota-admin/internal/store"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
@@ -21,16 +22,22 @@ const (
 )
 
 type Options struct {
-	Sessions        *session.Service
-	PublicOrigin    string
-	MaxJSONBytes    int64
-	Uploads         UploadReceiver
-	UploadEnvelopes EnvelopeAcceptor
-	Publisher       CandidatePublisher
+	Sessions          *session.Service
+	PublicOrigin      string
+	MaxJSONBytes      int64
+	Uploads           UploadReceiver
+	UploadEnvelopes   EnvelopeAcceptor
+	Publisher         CandidatePublisher
+	ReleaseOperations ReleaseOperations
 }
 
 type CandidatePublisher interface {
 	PublishForActiveSession(context.Context, string, string, string) (deploy.PublishResult, error)
+}
+
+type ReleaseOperations interface {
+	ReleaseHistory(context.Context) ([]store.ReleaseHistoryItem, error)
+	RollbackForActiveSession(context.Context, session.Principal, string, string, string) (deploy.RollbackResult, error)
 }
 
 type UploadReceiver interface {
@@ -55,12 +62,13 @@ type EnvelopeAcceptor interface {
 var canonicalOperationID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 type Router struct {
-	sessions        *session.Service
-	publicOrigin    string
-	maxJSONBytes    int64
-	uploads         UploadReceiver
-	uploadEnvelopes EnvelopeAcceptor
-	publisher       CandidatePublisher
+	sessions          *session.Service
+	publicOrigin      string
+	maxJSONBytes      int64
+	uploads           UploadReceiver
+	uploadEnvelopes   EnvelopeAcceptor
+	publisher         CandidatePublisher
+	releaseOperations ReleaseOperations
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -73,9 +81,13 @@ func NewRouter(options Options) (http.Handler, error) {
 	if options.MaxJSONBytes <= 0 {
 		return nil, errors.New("maximum JSON body size must be positive")
 	}
+	publisher := options.Publisher
+	if publisher == nil && options.ReleaseOperations != nil {
+		publisher, _ = options.ReleaseOperations.(CandidatePublisher)
+	}
 	router := &Router{
 		sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes,
-		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes, publisher: options.Publisher,
+		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes, publisher: publisher, releaseOperations: options.ReleaseOperations,
 	}
 	return withAdminSecurityHeaders(router), nil
 }
@@ -160,6 +172,18 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 			return
 		}
 		router.currentCandidate(response, request, principal)
+	case request.URL.Path == "/admin/api/releases":
+		if request.Method != http.MethodGet {
+			writeMethodNotAllowed(response, http.MethodGet)
+			return
+		}
+		router.releaseHistory(response, request)
+	case strings.HasPrefix(request.URL.Path, "/admin/api/releases/") && strings.HasSuffix(request.URL.Path, "/rollback"):
+		if request.Method != http.MethodPost {
+			writeMethodNotAllowed(response, http.MethodPost)
+			return
+		}
+		router.rollbackRelease(response, request, principal)
 	case strings.HasPrefix(request.URL.Path, "/admin/api/candidates/") && strings.HasSuffix(request.URL.Path, "/publish"):
 		if request.Method != http.MethodPost {
 			writeMethodNotAllowed(response, http.MethodPost)

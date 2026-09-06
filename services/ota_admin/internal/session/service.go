@@ -366,6 +366,22 @@ func (service *Service) ChangePassword(ctx context.Context, principal Principal,
 	return LoginResult{Token: token, CSRFToken: csrfToken, ExpiresAt: persisted.AbsoluteExpiresAt, CookieMaxAge: service.absoluteExpiry, MustChangePassword: false}, nil
 }
 
+func (service *Service) ConfirmPassword(ctx context.Context, principal Principal, password string) error {
+	service.loginMu.Lock()
+	defer service.loginMu.Unlock()
+	if password == "" || len(password) > security.MaximumPasswordBytes || principal.IDHash == "" || principal.MustChangePassword {
+		return ErrPassword
+	}
+	administrator, err := service.store.Admin(ctx)
+	if err != nil {
+		return err
+	}
+	if !security.VerifyPassword(password, administrator.PasswordHash) {
+		return ErrPassword
+	}
+	return service.store.RequireActiveSession(ctx, principal.IDHash, service.now().UTC())
+}
+
 func (service *Service) issueSession(ctx context.Context, mustChange bool, now time.Time) (LoginResult, error) {
 	if err := service.cleanupSessions(ctx, now); err != nil {
 		return LoginResult{}, err

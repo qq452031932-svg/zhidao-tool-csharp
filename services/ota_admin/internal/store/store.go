@@ -146,14 +146,16 @@ type Operation struct {
 }
 
 type Release struct {
-	ID, Version, GenerationName string
-	CommittedAt                 time.Time
+	ID             string    `json:"id"`
+	Version        string    `json:"version"`
+	GenerationName string    `json:"generation_name"`
+	CommittedAt    time.Time `json:"committed_at"`
 }
 
 type ReleaseAsset struct {
-	FileName  string
-	SizeBytes int64
-	SHA256    string
+	FileName  string `json:"file_name"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
 }
 type PublishCommit struct {
 	Release                  Release
@@ -162,6 +164,18 @@ type PublishCommit struct {
 }
 
 type PublishOperation struct {
+	OperationID, CandidateID, ReleaseID, ResultCode string
+	State                                           OperationState
+}
+
+type ReleaseHistoryItem struct {
+	Release
+	State  string         `json:"state"`
+	Actor  string         `json:"actor"`
+	Assets []ReleaseAsset `json:"assets"`
+}
+
+type ReleaseOperation struct {
 	OperationID, CandidateID, ReleaseID, ResultCode string
 	State                                           OperationState
 }
@@ -1422,6 +1436,13 @@ func (s *Store) BeginPublishForActiveSession(ctx context.Context, sessionID, can
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		var busy int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE kind IN ('publish','rollback') AND state='running'`).Scan(&busy); err != nil {
+			return err
+		}
+		if busy != 0 {
+			return ErrInvalidTransition
+		}
 		var state CandidateState
 		var owner string
 		var expires int64
@@ -1539,6 +1560,390 @@ func (s *Store) FailPublish(ctx context.Context, operationID, candidateID, code 
 		}
 		return insertAudit(ctx, tx, event)
 	})
+}
+
+func (s *Store) BeginRollbackForActiveSession(ctx context.Context, sessionID, releaseID, operationID string, now time.Time) (ReleaseOperation, bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var operation ReleaseOperation
+	created := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		var kind string
+		err := tx.QueryRowContext(ctx, `SELECT id,COALESCE(candidate_id,''),COALESCE(release_id,''),state,result_code,kind FROM operations WHERE id=?`, operationID).Scan(&operation.OperationID, &operation.CandidateID, &operation.ReleaseID, &operation.State, &operation.ResultCode, &kind)
+		if err == nil {
+			if kind != string(OperationRollback) || operation.ReleaseID != releaseID {
+				return ErrInvalidTransition
+			}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var releaseState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM releases WHERE id=?`, releaseID).Scan(&releaseState); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if releaseState != "retained" {
+			return ErrInvalidTransition
+		}
+		var busy int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE kind IN ('publish','rollback') AND state='running'`).Scan(&busy); err != nil {
+			return err
+		}
+		if busy != 0 {
+			return ErrInvalidTransition
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,release_id,created_at) VALUES(?,'rollback','pending',?,?)`, operationID, releaseID, timestamp(now)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=? AND kind='rollback' AND release_id=? AND state='pending'`, operationID, releaseID); err != nil {
+			return err
+		}
+		operation = ReleaseOperation{OperationID: operationID, ReleaseID: releaseID, State: OperationRunning}
+		created = true
+		return nil
+	})
+	return operation, created, err
+}
+
+func (s *Store) CommitRollback(ctx context.Context, operationID, releaseID string, at time.Time) error {
+	event, err := audit.NewRollbackCompleted(operationID, releaseID, at)
+	if err != nil {
+		return err
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var state, kind, target, resultCode string
+		if err := tx.QueryRowContext(ctx, `SELECT state,kind,COALESCE(release_id,''),result_code FROM operations WHERE id=?`, operationID).Scan(&state, &kind, &target, &resultCode); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if kind != string(OperationRollback) || target != releaseID {
+			return ErrInvalidTransition
+		}
+		if state == string(OperationSucceeded) {
+			if resultCode != string(audit.CodeCompleted) {
+				return ErrInvalidTransition
+			}
+			var releaseCount, auditCount int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM releases WHERE id=?`, releaseID).Scan(&releaseCount); err != nil {
+				return err
+			}
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE event_type='rollback_completed' AND operation_id=? AND release_id=? AND outcome='success' AND code='completed'`, operationID, releaseID).Scan(&auditCount); err != nil {
+				return err
+			}
+			if releaseCount != 1 || auditCount != 1 {
+				return ErrInvalidTransition
+			}
+			return nil
+		}
+		if state != string(OperationRunning) {
+			return ErrInvalidTransition
+		}
+		var releaseState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM releases WHERE id=?`, releaseID).Scan(&releaseState); err != nil {
+			return err
+		}
+		if releaseState != "retained" {
+			return ErrInvalidTransition
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE state='current'`); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE releases SET state='current' WHERE id=? AND state='retained'`, releaseID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return errors.Join(err, ErrInvalidTransition)
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE operations SET state='succeeded',result_code='completed',finished_at=? WHERE id=? AND state='running' AND kind='rollback' AND release_id=?`, timestamp(at), operationID, releaseID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return errors.Join(err, ErrInvalidTransition)
+		}
+		return insertAudit(ctx, tx, event)
+	})
+}
+
+func (s *Store) FailRollback(ctx context.Context, operationID, releaseID string, at time.Time) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var state, kind, target, code string
+		if err := tx.QueryRowContext(ctx, `SELECT state,kind,COALESCE(release_id,''),result_code FROM operations WHERE id=?`, operationID).Scan(&state, &kind, &target, &code); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if kind != string(OperationRollback) || target != releaseID {
+			return ErrInvalidTransition
+		}
+		if state == string(OperationFailed) && code == string(audit.CodeInternalFailure) {
+			return nil
+		}
+		if state != string(OperationRunning) {
+			return ErrInvalidTransition
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=? AND kind='rollback' AND release_id=? AND state='running'`, timestamp(at), operationID, releaseID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return errors.Join(err, ErrInvalidTransition)
+		}
+		return nil
+	})
+}
+
+func (s *Store) ReleaseHistory(ctx context.Context, limit int) ([]ReleaseHistoryItem, error) {
+	if limit <= 0 || limit > 100 {
+		return nil, errors.New("release history limit invalid")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE state IN ('current','retained') ORDER BY CASE state WHEN 'current' THEN 0 ELSE 1 END, committed_at DESC,id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ReleaseHistoryItem, 0, limit)
+	for rows.Next() {
+		var item ReleaseHistoryItem
+		var committed int64
+		if err := rows.Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		item.CommittedAt = time.Unix(committed, 0).UTC()
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range items {
+		assets, err := s.ReleaseAssets(ctx, items[index].ID)
+		if err != nil {
+			return nil, err
+		}
+		items[index].Assets = assets
+	}
+	return items, nil
+}
+
+func (s *Store) ReleaseByID(ctx context.Context, id string) (ReleaseHistoryItem, bool, error) {
+	var item ReleaseHistoryItem
+	var committed int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE id=?`, id).Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReleaseHistoryItem{}, false, nil
+	}
+	if err != nil {
+		return ReleaseHistoryItem{}, false, err
+	}
+	item.CommittedAt = time.Unix(committed, 0).UTC()
+	item.Assets, err = s.ReleaseAssets(ctx, id)
+	if err != nil {
+		return ReleaseHistoryItem{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Store) ReleaseAssets(ctx context.Context, id string) ([]ReleaseAsset, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT file_name,size_bytes,sha256 FROM release_assets WHERE release_id=? ORDER BY file_name`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var assets []ReleaseAsset
+	for rows.Next() {
+		var asset ReleaseAsset
+		if err := rows.Scan(&asset.FileName, &asset.SizeBytes, &asset.SHA256); err != nil {
+			return nil, err
+		}
+		assets = append(assets, asset)
+	}
+	return assets, rows.Err()
+}
+
+func (s *Store) BeginRetentionCleanup(ctx context.Context, operationID string, now time.Time) (ReleaseHistoryItem, bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var target ReleaseHistoryItem
+	created := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var existingState, existingKind, existingRelease string
+		err := tx.QueryRowContext(ctx, `SELECT state,kind,COALESCE(release_id,'') FROM operations WHERE id=?`, operationID).Scan(&existingState, &existingKind, &existingRelease)
+		if err == nil {
+			if existingKind != string(OperationCleanup) || existingRelease == "" {
+				return ErrInvalidTransition
+			}
+			var committed int64
+			if err := tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE id=?`, existingRelease).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor); err != nil {
+				return err
+			}
+			target.CommittedAt = time.Unix(committed, 0).UTC()
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var committed int64
+		err = tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases
+			WHERE state='retained' AND id NOT IN (
+				SELECT id FROM releases WHERE state='retained' ORDER BY committed_at DESC,id DESC LIMIT 2
+			)
+			ORDER BY committed_at ASC,id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = tx.QueryRowContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor FROM releases r
+				WHERE r.state='removed' AND NOT EXISTS (
+					SELECT 1 FROM operations o WHERE o.kind='cleanup' AND o.release_id=r.id AND o.state='succeeded'
+				) AND NOT EXISTS (
+					SELECT 1 FROM operations o WHERE o.kind='cleanup' AND o.release_id=r.id AND o.state IN ('pending','running')
+				) ORDER BY r.committed_at ASC,r.id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target.CommittedAt = time.Unix(committed, 0).UTC()
+		if target.State == "retained" {
+			result, err := tx.ExecContext(ctx, `UPDATE releases SET state='removed' WHERE id=? AND state='retained'`, target.ID)
+			if err != nil {
+				return err
+			}
+			if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+				return errors.Join(err, ErrInvalidTransition)
+			}
+			target.State = "removed"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,release_id,created_at) VALUES(?,'cleanup','pending',?,?)`, operationID, target.ID, timestamp(now)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=? AND kind='cleanup' AND release_id=? AND state='pending'`, operationID, target.ID); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	return target, created, err
+}
+
+func (s *Store) InFlightRetentionCleanup(ctx context.Context) (ReleaseHistoryItem, string, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor,o.id
+		FROM operations o JOIN releases r ON r.id=o.release_id
+		WHERE o.kind='cleanup' AND o.state='running' AND r.state='removed'
+		ORDER BY o.created_at,o.id LIMIT 2`)
+	if err != nil {
+		return ReleaseHistoryItem{}, "", false, err
+	}
+	defer rows.Close()
+	type record struct {
+		item        ReleaseHistoryItem
+		operationID string
+	}
+	var records []record
+	for rows.Next() {
+		var value record
+		var committed int64
+		if err := rows.Scan(&value.item.ID, &value.item.Version, &value.item.GenerationName, &value.item.State, &committed, &value.item.Actor, &value.operationID); err != nil {
+			return ReleaseHistoryItem{}, "", false, err
+		}
+		value.item.CommittedAt = time.Unix(committed, 0).UTC()
+		records = append(records, value)
+	}
+	if err := rows.Err(); err != nil {
+		return ReleaseHistoryItem{}, "", false, err
+	}
+	if len(records) > 1 {
+		return ReleaseHistoryItem{}, "", false, errors.New("multiple retention cleanups are in flight")
+	}
+	if len(records) == 0 {
+		return ReleaseHistoryItem{}, "", false, nil
+	}
+	return records[0].item, records[0].operationID, true, nil
+}
+
+func (s *Store) FinishRetentionCleanup(ctx context.Context, operationID, releaseID string, succeeded bool, at time.Time) error {
+	outcome, code, state := audit.OutcomeFailure, audit.CodeInternalFailure, OperationFailed
+	if succeeded {
+		outcome, code, state = audit.OutcomeSuccess, audit.CodeCompleted, OperationSucceeded
+	}
+	event, err := audit.NewCleanupResult(outcome, operationID, releaseID, code, at)
+	if err != nil {
+		return err
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var currentState, currentCode, kind, target string
+		if err := tx.QueryRowContext(ctx, `SELECT state,result_code,kind,COALESCE(release_id,'') FROM operations WHERE id=?`, operationID).Scan(&currentState, &currentCode, &kind, &target); err != nil {
+			return err
+		}
+		if kind != string(OperationCleanup) || target != releaseID {
+			return ErrInvalidTransition
+		}
+		if currentState == string(state) && currentCode == string(code) {
+			var count int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE event_type='cleanup_result' AND operation_id=? AND release_id=? AND outcome=? AND code=?`, operationID, releaseID, outcome, code).Scan(&count); err != nil {
+				return err
+			}
+			if count == 1 {
+				return nil
+			}
+			return ErrInvalidTransition
+		}
+		if currentState != string(OperationRunning) {
+			return ErrInvalidTransition
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE operations SET state=?,result_code=?,finished_at=? WHERE id=? AND kind='cleanup' AND release_id=? AND state='running'`, state, code, timestamp(at), operationID, releaseID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return errors.Join(err, ErrInvalidTransition)
+		}
+		return insertAudit(ctx, tx, event)
+	})
+}
+
+func (s *Store) InFlightReleaseOperation(ctx context.Context) (ReleaseOperation, OperationKind, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,COALESCE(candidate_id,''),COALESCE(release_id,''),state,result_code,kind FROM operations WHERE kind IN ('publish','rollback') AND state='running' ORDER BY id LIMIT 2`)
+	if err != nil {
+		return ReleaseOperation{}, "", false, err
+	}
+	defer rows.Close()
+	type record struct {
+		op   ReleaseOperation
+		kind OperationKind
+	}
+	var found []record
+	for rows.Next() {
+		var item record
+		if err := rows.Scan(&item.op.OperationID, &item.op.CandidateID, &item.op.ReleaseID, &item.op.State, &item.op.ResultCode, &item.kind); err != nil {
+			return ReleaseOperation{}, "", false, err
+		}
+		found = append(found, item)
+	}
+	if err := rows.Err(); err != nil {
+		return ReleaseOperation{}, "", false, err
+	}
+	if len(found) > 1 {
+		return ReleaseOperation{}, "", false, errors.New("multiple release operations are in flight")
+	}
+	if len(found) == 0 {
+		return ReleaseOperation{}, "", false, nil
+	}
+	return found[0].op, found[0].kind, true, nil
 }
 
 func (s *Store) InFlightPublish(ctx context.Context) (PublishOperation, bool, error) {
