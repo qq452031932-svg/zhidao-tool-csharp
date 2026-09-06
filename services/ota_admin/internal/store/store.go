@@ -150,6 +150,7 @@ type Release struct {
 	Version        string    `json:"version"`
 	GenerationName string    `json:"generation_name"`
 	CommittedAt    time.Time `json:"committed_at"`
+	Notes          string    `json:"notes"`
 }
 
 type ReleaseAsset struct {
@@ -1675,7 +1676,21 @@ func (s *Store) CommitRollback(ctx context.Context, operationID, releaseID strin
 	})
 }
 
-func (s *Store) FailRollback(ctx context.Context, operationID, releaseID string, at time.Time) error {
+func (s *Store) FailRollback(ctx context.Context, operationID, releaseID, failureCode string, at time.Time) error {
+	if failureCode != "hash_mismatch" && failureCode != "signature_mismatch" && failureCode != "internal_failure" {
+		return errors.New("rollback failure code invalid")
+	}
+	eventCode := audit.CodeInternalFailure
+	if failureCode == "hash_mismatch" {
+		eventCode = audit.CodeHashMismatch
+	}
+	if failureCode == "signature_mismatch" {
+		eventCode = audit.CodeSignatureMismatch
+	}
+	event, err := audit.NewRollbackFailed(operationID, releaseID, eventCode, at)
+	if err != nil {
+		return err
+	}
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var state, kind, target, code string
 		if err := tx.QueryRowContext(ctx, `SELECT state,kind,COALESCE(release_id,''),result_code FROM operations WHERE id=?`, operationID).Scan(&state, &kind, &target, &code); err != nil {
@@ -1687,20 +1702,27 @@ func (s *Store) FailRollback(ctx context.Context, operationID, releaseID string,
 		if kind != string(OperationRollback) || target != releaseID {
 			return ErrInvalidTransition
 		}
-		if state == string(OperationFailed) && code == string(audit.CodeInternalFailure) {
-			return nil
+		if state == string(OperationFailed) && code == failureCode {
+			var auditCount int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE event_type='rollback_failed' AND operation_id=? AND release_id=? AND outcome='failure' AND code=?`, operationID, releaseID, failureCode).Scan(&auditCount); err != nil {
+				return err
+			}
+			if auditCount == 1 {
+				return nil
+			}
+			return ErrInvalidTransition
 		}
 		if state != string(OperationRunning) {
 			return ErrInvalidTransition
 		}
-		result, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=? AND kind='rollback' AND release_id=? AND state='running'`, timestamp(at), operationID, releaseID)
+		result, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND kind='rollback' AND release_id=? AND state='running'`, failureCode, timestamp(at), operationID, releaseID)
 		if err != nil {
 			return err
 		}
 		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
 			return errors.Join(err, ErrInvalidTransition)
 		}
-		return nil
+		return insertAudit(ctx, tx, event)
 	})
 }
 
@@ -1708,7 +1730,7 @@ func (s *Store) ReleaseHistory(ctx context.Context, limit int) ([]ReleaseHistory
 	if limit <= 0 || limit > 100 {
 		return nil, errors.New("release history limit invalid")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE state IN ('current','retained') ORDER BY CASE state WHEN 'current' THEN 0 ELSE 1 END, committed_at DESC,id DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor,notes FROM releases WHERE state IN ('current','retained') ORDER BY CASE state WHEN 'current' THEN 0 ELSE 1 END, committed_at DESC,id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1716,7 +1738,7 @@ func (s *Store) ReleaseHistory(ctx context.Context, limit int) ([]ReleaseHistory
 	for rows.Next() {
 		var item ReleaseHistoryItem
 		var committed int64
-		if err := rows.Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor); err != nil {
+		if err := rows.Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor, &item.Notes); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -1743,7 +1765,7 @@ func (s *Store) ReleaseHistory(ctx context.Context, limit int) ([]ReleaseHistory
 func (s *Store) ReleaseByID(ctx context.Context, id string) (ReleaseHistoryItem, bool, error) {
 	var item ReleaseHistoryItem
 	var committed int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE id=?`, id).Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor,notes FROM releases WHERE id=?`, id).Scan(&item.ID, &item.Version, &item.GenerationName, &item.State, &committed, &item.Actor, &item.Notes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReleaseHistoryItem{}, false, nil
 	}
@@ -1788,7 +1810,7 @@ func (s *Store) BeginRetentionCleanup(ctx context.Context, operationID string, n
 				return ErrInvalidTransition
 			}
 			var committed int64
-			if err := tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases WHERE id=?`, existingRelease).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor,notes FROM releases WHERE id=?`, existingRelease).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor, &target.Notes); err != nil {
 				return err
 			}
 			target.CommittedAt = time.Unix(committed, 0).UTC()
@@ -1798,18 +1820,22 @@ func (s *Store) BeginRetentionCleanup(ctx context.Context, operationID string, n
 			return err
 		}
 		var committed int64
-		err = tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor FROM releases
+		err = tx.QueryRowContext(ctx, `SELECT id,version,generation_name,state,committed_at,actor,notes FROM releases
 			WHERE state='retained' AND id NOT IN (
 				SELECT id FROM releases WHERE state='retained' ORDER BY committed_at DESC,id DESC LIMIT 2
+			) AND id NOT IN (
+				SELECT release_id FROM operations WHERE kind='rollback' AND state='running' AND release_id IS NOT NULL
 			)
-			ORDER BY committed_at ASC,id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor)
+			ORDER BY committed_at ASC,id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor, &target.Notes)
 		if errors.Is(err, sql.ErrNoRows) {
-			err = tx.QueryRowContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor FROM releases r
+			err = tx.QueryRowContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor,r.notes FROM releases r
 				WHERE r.state='removed' AND NOT EXISTS (
 					SELECT 1 FROM operations o WHERE o.kind='cleanup' AND o.release_id=r.id AND o.state='succeeded'
 				) AND NOT EXISTS (
 					SELECT 1 FROM operations o WHERE o.kind='cleanup' AND o.release_id=r.id AND o.state IN ('pending','running')
-				) ORDER BY r.committed_at ASC,r.id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor)
+				) AND r.id NOT IN (
+					SELECT release_id FROM operations WHERE kind='rollback' AND state='running' AND release_id IS NOT NULL
+				) ORDER BY r.committed_at ASC,r.id ASC LIMIT 1`).Scan(&target.ID, &target.Version, &target.GenerationName, &target.State, &committed, &target.Actor, &target.Notes)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -1841,7 +1867,7 @@ func (s *Store) BeginRetentionCleanup(ctx context.Context, operationID string, n
 }
 
 func (s *Store) InFlightRetentionCleanup(ctx context.Context) (ReleaseHistoryItem, string, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor,o.id
+	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.version,r.generation_name,r.state,r.committed_at,r.actor,r.notes,o.id
 		FROM operations o JOIN releases r ON r.id=o.release_id
 		WHERE o.kind='cleanup' AND o.state='running' AND r.state='removed'
 		ORDER BY o.created_at,o.id LIMIT 2`)
@@ -1857,7 +1883,7 @@ func (s *Store) InFlightRetentionCleanup(ctx context.Context) (ReleaseHistoryIte
 	for rows.Next() {
 		var value record
 		var committed int64
-		if err := rows.Scan(&value.item.ID, &value.item.Version, &value.item.GenerationName, &value.item.State, &committed, &value.item.Actor, &value.operationID); err != nil {
+		if err := rows.Scan(&value.item.ID, &value.item.Version, &value.item.GenerationName, &value.item.State, &committed, &value.item.Actor, &value.item.Notes, &value.operationID); err != nil {
 			return ReleaseHistoryItem{}, "", false, err
 		}
 		value.item.CommittedAt = time.Unix(committed, 0).UTC()
@@ -2043,7 +2069,7 @@ func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommi
 		if _, err := tx.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE state='current'`); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?,?,?,'current',?)`, request.Release.ID, request.Release.Version, request.Release.GenerationName, timestamp(request.Release.CommittedAt)); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at,notes) VALUES(?,?,?,'current',?,?)`, request.Release.ID, request.Release.Version, request.Release.GenerationName, timestamp(request.Release.CommittedAt), request.Release.Notes); err != nil {
 			return err
 		}
 		if err := s.publishBoundary("release"); err != nil {

@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"strings"
 
+	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
+	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/store"
@@ -66,6 +68,10 @@ func (router *Router) rollbackRelease(response http.ResponseWriter, request *htt
 			writeCandidateError(response, http.StatusUnauthorized, "authentication_failed", "登录已失效", operationID)
 		case errors.Is(err, store.ErrNotFound):
 			writeCandidateError(response, http.StatusNotFound, "release_not_found", "未找到可回滚版本", operationID)
+		case errors.Is(err, release.ErrSignature):
+			writeCandidateError(response, http.StatusUnprocessableEntity, "signature_mismatch", "签名校验失败", operationID)
+		case errors.Is(err, release.ErrManifest), errors.Is(err, release.ErrMetadata), errors.Is(err, release.ErrCatalog), errors.Is(err, release.ErrReleasesIndex), errors.Is(err, candidate.ErrDigestMismatch):
+			writeCandidateError(response, http.StatusUnprocessableEntity, "release_validation_failed", "发布包校验失败", operationID)
 		case errors.Is(err, store.ErrInvalidTransition):
 			writeCandidateError(response, http.StatusConflict, "operation_conflict", "已有发布或回滚正在进行", operationID)
 		default:

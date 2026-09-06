@@ -63,7 +63,7 @@ func (publisher *Publisher) recoverLocked(ctx context.Context) error {
 		if inflight.OperationID != releaseID {
 			return publisher.recoveryFailure(errors.New("stable generation has no matching publish transaction"))
 		}
-		commit := store.PublishCommit{Release: store.Release{ID: releaseID, Version: generation.Report.Version, GenerationName: generation.Name, CommittedAt: publisher.now().UTC()}, OperationID: inflight.OperationID, CandidateID: inflight.CandidateID, Assets: generation.Assets}
+		commit := store.PublishCommit{Release: store.Release{ID: releaseID, Version: generation.Report.Version, GenerationName: generation.Name, CommittedAt: publisher.now().UTC(), Notes: generation.Report.NotesMarkdown}, OperationID: inflight.OperationID, CandidateID: inflight.CandidateID, Assets: generation.Assets}
 		if err := publisher.store.CommitPublishedRelease(ctx, commit); err != nil {
 			return publisher.recoveryFailure(err)
 		}
@@ -101,7 +101,7 @@ func (publisher *Publisher) abortInflight(ctx context.Context, operation store.R
 		if err := publisher.disk.abortRollback(operation.OperationID, target.GenerationName); err != nil {
 			return err
 		}
-		return publisher.store.FailRollback(ctx, operation.OperationID, operation.ReleaseID, publisher.now().UTC())
+		return publisher.store.FailRollback(ctx, operation.OperationID, operation.ReleaseID, "internal_failure", publisher.now().UTC())
 	default:
 		return errors.New("unknown in-flight release operation")
 	}

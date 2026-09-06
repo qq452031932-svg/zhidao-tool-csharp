@@ -49,7 +49,7 @@ type fakeRetainer struct {
 	err   error
 }
 
-func (retainer *fakeRetainer) Run(context.Context) error { retainer.calls++; return retainer.err }
+func (retainer *fakeRetainer) Trigger() { retainer.calls++ }
 
 type fakeHistory struct {
 	items []store.ReleaseHistoryItem
@@ -74,7 +74,7 @@ func TestRollbackRequiresCurrentPasswordBeforeCallingPublisher(t *testing.T) {
 	}
 }
 
-func TestSuccessfulPublishReturnsBeforeBestEffortRetentionFailure(t *testing.T) {
+func TestSuccessfulPublishOnlyEnqueuesBackgroundRetention(t *testing.T) {
 	want := deploy.PublishResult{OperationID: testOperationID, CandidateID: testCandidateID, ReleaseID: testOperationID, Version: "1.0.4", State: "succeeded"}
 	publisher := &fakePublisher{publishResult: want}
 	retention := &fakeRetainer{err: errors.New("cleanup failed")}

@@ -273,6 +273,17 @@ func (fixture *bundleFixture) releaseAsset(version, kind, name string) string {
 		packageID, version, kind, name, strings.ToUpper(sha1Hex(data)), strings.ToUpper(sha256Hex(data)), len(data))
 }
 
+func TestValidationReportIncludesSignedCurrentReleaseNotes(t *testing.T) {
+	fixture := newBundleFixture(t, "1.2.3", false)
+	report, err := fixture.validator.Validate(context.Background(), fixture.envelope, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.NotesMarkdown != "notes" {
+		t.Fatalf("NotesMarkdown=%q, want signed current release notes", report.NotesMarkdown)
+	}
+}
+
 func (fixture *bundleFixture) reseal() {
 	fixture.t.Helper()
 	delete(fixture.files, manifestName)

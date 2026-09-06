@@ -40,6 +40,7 @@ type Report struct {
 	PackageID           string       `json:"packageId"`
 	Channel             string       `json:"channel"`
 	Version             string       `json:"version"`
+	NotesMarkdown       string       `json:"notesMarkdown"`
 	ManifestSHA256      string       `json:"manifestSha256"`
 	PublisherSPKISHA256 string       `json:"publisherSpkiSha256"`
 	FileCount           int          `json:"fileCount"`
@@ -136,7 +137,7 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 	if err := decodeStrictJSON(feedBytes, &feed); err != nil || len(feed.Assets) == 0 || len(feed.Assets) > 254 {
 		return Report{}, fmt.Errorf("%w: feed JSON", ErrMetadata)
 	}
-	currentVersion, fullAssets, releaseFiles, err := validateReleaseAssets(feed.Assets, files)
+	currentVersion, notesMarkdown, fullAssets, releaseFiles, err := validateReleaseAssets(feed.Assets, files)
 	if err != nil {
 		return Report{}, err
 	}
@@ -201,7 +202,7 @@ func (validator *Validator) validate(ctx context.Context, envelope *upload.Envel
 	}
 	manifestDigest := sha256.Sum256(manifest)
 	return Report{
-		SchemaVersion: 1, Verified: true, PackageID: packageID, Channel: channel, Version: currentVersion,
+		SchemaVersion: 1, Verified: true, PackageID: packageID, Channel: channel, Version: currentVersion, NotesMarkdown: notesMarkdown,
 		ManifestSHA256: hex.EncodeToString(manifestDigest[:]), PublisherSPKISHA256: validator.trust.SPKISHA256(),
 		FileCount: len(files), Files: reportFiles,
 	}, nil
@@ -335,7 +336,7 @@ type fullAsset struct {
 	parsed version
 }
 
-func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile) (string, []fullAsset, map[string]releaseAsset, error) {
+func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile) (string, string, []fullAsset, map[string]releaseAsset, error) {
 	current := version{}
 	currentText := ""
 	releaseFiles := make(map[string]releaseAsset, len(assets))
@@ -345,27 +346,27 @@ func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile
 	for _, asset := range assets {
 		if asset.PackageID == nil || asset.Version == nil || asset.Type == nil || asset.FileName == nil || asset.SHA1 == nil || asset.SHA256 == nil || asset.Size == nil ||
 			*asset.PackageID != packageID || (*asset.Type != "Full" && *asset.Type != "Delta") || *asset.Size < 0 {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		parsed, err := parseVersion(*asset.Version)
 		if err != nil {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		expectedName := fmt.Sprintf("%s-%s-%s.nupkg", packageID, *asset.Version, strings.ToLower(*asset.Type))
 		file, ok := files[*asset.FileName]
 		if !ok || *asset.FileName != expectedName || *asset.Size != file.size || !exactHex(*asset.SHA256, 64, true) || !exactHex(*asset.SHA1, 40, true) {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		folded := strings.ToLower(*asset.FileName)
 		identity := *asset.Version + ":" + *asset.Type
 		if _, duplicate := foldedFiles[folded]; duplicate {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		if _, duplicate := identities[identity]; duplicate {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		if !strings.EqualFold(*asset.SHA256, file.sha256) || *asset.SHA1 != strings.ToUpper(file.sha1) {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		releaseFiles[*asset.FileName] = asset
 		foldedFiles[folded] = struct{}{}
@@ -380,13 +381,20 @@ func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile
 	fullVersions := make(map[string]version, len(fulls))
 	for _, full := range fulls {
 		if _, duplicate := fullVersions[full.name]; duplicate {
-			return "", nil, nil, ErrMetadata
+			return "", "", nil, nil, ErrMetadata
 		}
 		fullVersions[full.name] = full.parsed
 	}
 	currentFull := packageID + "-" + currentText + "-full.nupkg"
-	if _, ok := releaseFiles[currentFull]; !ok {
-		return "", nil, nil, ErrMetadata
+	currentAsset, ok := releaseFiles[currentFull]
+	if !ok || currentAsset.NotesMarkdown == nil || len(*currentAsset.NotesMarkdown) > maxMetadataBytes {
+		return "", "", nil, nil, ErrMetadata
+	}
+	notesMarkdown := *currentAsset.NotesMarkdown
+	for _, asset := range releaseFiles {
+		if *asset.Version == currentText && (asset.NotesMarkdown == nil || *asset.NotesMarkdown != notesMarkdown) {
+			return "", "", nil, nil, fmt.Errorf("%w: current release notes disagree", ErrMetadata)
+		}
 	}
 	hasDelta := false
 	hasCurrentDelta := false
@@ -397,7 +405,7 @@ func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile
 		hasDelta = true
 		deltaVersion, _ := parseVersion(*asset.Version)
 		if _, ok := fullVersions[packageID+"-"+*asset.Version+"-full.nupkg"]; !ok {
-			return "", nil, nil, fmt.Errorf("%w: delta has no same-version Full %s", ErrMetadata, name)
+			return "", "", nil, nil, fmt.Errorf("%w: delta has no same-version Full %s", ErrMetadata, name)
 		}
 		hasLowerFull := false
 		for _, fullVersion := range fullVersions {
@@ -407,16 +415,16 @@ func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile
 			}
 		}
 		if !hasLowerFull {
-			return "", nil, nil, fmt.Errorf("%w: delta has no lower Full base %s", ErrMetadata, name)
+			return "", "", nil, nil, fmt.Errorf("%w: delta has no lower Full base %s", ErrMetadata, name)
 		}
 		if *asset.Version == currentText {
 			hasCurrentDelta = true
 		}
 	}
 	if hasDelta && !hasCurrentDelta {
-		return "", nil, nil, fmt.Errorf("%w: current Full has no Delta", ErrMetadata)
+		return "", "", nil, nil, fmt.Errorf("%w: current Full has no Delta", ErrMetadata)
 	}
-	return currentText, fulls, releaseFiles, nil
+	return currentText, notesMarkdown, fulls, releaseFiles, nil
 }
 
 func validateCatalog(catalog []catalogAsset, currentVersion string, releaseFiles map[string]releaseAsset, files map[string]*verifiedFile) error {

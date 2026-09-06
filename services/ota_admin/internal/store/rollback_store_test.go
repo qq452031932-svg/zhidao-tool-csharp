@@ -110,6 +110,61 @@ func TestRunningRetentionCleanupIsRecoverableAfterRestart(t *testing.T) {
 	}
 }
 
+func TestFailedRollbackPersistsTypedReplayAndAudit(t *testing.T) {
+	s := openStore(t)
+	now := time.Now().UTC()
+	createActiveSession(t, s, sessionHash1)
+	seedReleaseHistory(t, s, now)
+	if _, created, err := s.BeginRollbackForActiveSession(context.Background(), sessionHash1, releaseID3, rollbackOperationID, now); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if err := s.FailRollback(context.Background(), rollbackOperationID, releaseID3, "signature_mismatch", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	replay, created, err := s.BeginRollbackForActiveSession(context.Background(), sessionHash1, releaseID3, rollbackOperationID, now.Add(2*time.Second))
+	if err != nil || created || replay.State != OperationFailed || replay.ResultCode != "signature_mismatch" {
+		t.Fatalf("replay=%+v created=%v err=%v", replay, created, err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='rollback_failed' AND operation_id=? AND release_id=? AND outcome='failure' AND code='signature_mismatch'`, rollbackOperationID, releaseID3).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("audit count=%d err=%v", count, err)
+	}
+}
+
+func TestRetentionExcludesRunningRollbackTarget(t *testing.T) {
+	s := openStore(t)
+	now := time.Now().UTC()
+	createActiveSession(t, s, sessionHash1)
+	seedReleaseHistory(t, s, now)
+	if _, created, err := s.BeginRollbackForActiveSession(context.Background(), sessionHash1, releaseID1, rollbackOperationID, now); err != nil || !created {
+		t.Fatalf("begin rollback created=%v err=%v", created, err)
+	}
+	target, created, err := s.BeginRetentionCleanup(context.Background(), cleanupOperationID, now.Add(time.Second))
+	if err != nil || created || target.ID != "" {
+		t.Fatalf("retention target=%+v created=%v err=%v", target, created, err)
+	}
+	var state string
+	if err := s.db.QueryRow(`SELECT state FROM releases WHERE id=?`, releaseID1).Scan(&state); err != nil || state != "retained" {
+		t.Fatalf("rollback target state=%q err=%v", state, err)
+	}
+}
+
+func TestReleaseHistoryReturnsPersistedSignedNotes(t *testing.T) {
+	s := openStore(t)
+	now := time.Now().UTC()
+	seedReleaseHistory(t, s, now)
+	if _, err := s.db.Exec(`UPDATE releases SET notes='修复批量转存。' WHERE id=?`, releaseID4); err != nil {
+		t.Fatal(err)
+	}
+	history, err := s.ReleaseHistory(context.Background(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) == 0 || history[0].Notes != "修复批量转存。" {
+		t.Fatalf("history=%+v", history)
+	}
+}
+
 func seedReleaseHistory(t *testing.T, s *Store, now time.Time) {
 	t.Helper()
 	items := []struct {

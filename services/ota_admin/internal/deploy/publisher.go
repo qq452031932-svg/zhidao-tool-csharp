@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -50,9 +51,15 @@ type RollbackResult struct {
 
 var processLocks sync.Map
 
+func processMutationLock(root string) *sync.Mutex {
+	value, _ := processLocks.LoadOrStore(root, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
 var (
 	ErrReadOnly         = errors.New("publisher is in read-only protection")
 	ErrRecoveryRequired = errors.New("publisher startup recovery is required")
+	ErrRollbackFailed   = errors.New("rollback operation failed")
 )
 
 func NewPublisher(options PublisherOptions) (*Publisher, error) {
@@ -62,8 +69,7 @@ func NewPublisher(options PublisherOptions) (*Publisher, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	lockValue, _ := processLocks.LoadOrStore(options.Disk.root, &sync.Mutex{})
-	return &Publisher{disk: options.Disk, store: options.Store, candidates: options.Candidates, validator: options.Validator, now: options.Now, lock: lockValue.(*sync.Mutex), readOnly: errors.Join(ErrReadOnly, ErrRecoveryRequired)}, nil
+	return &Publisher{disk: options.Disk, store: options.Store, candidates: options.Candidates, validator: options.Validator, now: options.Now, lock: processMutationLock(options.Disk.root), readOnly: errors.Join(ErrReadOnly, ErrRecoveryRequired)}, nil
 }
 
 func (publisher *Publisher) PublishForActiveSession(ctx context.Context, sessionID, candidateID, operationID string) (PublishResult, error) {
@@ -112,7 +118,7 @@ func (publisher *Publisher) PublishForActiveSession(ctx context.Context, session
 		return PublishResult{}, err
 	}
 	committedAt := publisher.now().UTC()
-	commit := store.PublishCommit{Release: store.Release{ID: releaseID, Version: generation.Report.Version, GenerationName: generation.Name, CommittedAt: committedAt}, OperationID: operationID, CandidateID: candidateID, Assets: generation.Assets}
+	commit := store.PublishCommit{Release: store.Release{ID: releaseID, Version: generation.Report.Version, GenerationName: generation.Name, CommittedAt: committedAt, Notes: generation.Report.NotesMarkdown}, OperationID: operationID, CandidateID: candidateID, Assets: generation.Assets}
 	if err := publisher.store.CommitPublishedRelease(ctx, commit); err != nil {
 		publisher.protect(err)
 		return PublishResult{}, err
@@ -155,13 +161,13 @@ func (publisher *Publisher) RollbackForActiveSession(ctx context.Context, sessio
 	}
 	target, found, err := publisher.store.ReleaseByID(ctx, releaseID)
 	if err != nil || !found {
-		return RollbackResult{}, errors.Join(err, store.ErrNotFound)
+		cause := errors.Join(err, store.ErrNotFound)
+		return RollbackResult{}, publisher.failRollback(operationID, releaseID, cause)
 	}
-	assets, err := publisher.store.ReleaseAssets(ctx, releaseID)
-	if err != nil {
-		return RollbackResult{}, err
+	if len(target.Assets) == 0 {
+		return RollbackResult{}, publisher.failRollback(operationID, releaseID, errors.New("rollback release has no committed assets"))
 	}
-	generation, switched, err := publisher.disk.RollbackGenerationAuthorized(ctx, operationID, target.GenerationName, target.Version, assets, publisher.validator, func(authContext context.Context) error {
+	generation, switched, err := publisher.disk.RollbackGenerationAuthorized(ctx, operationID, target.GenerationName, target.Version, target.Assets, publisher.validator, func(authContext context.Context) error {
 		return publisher.store.RequireActiveSession(authContext, sessionID, publisher.now().UTC())
 	})
 	if err != nil {
@@ -169,12 +175,7 @@ func (publisher *Publisher) RollbackForActiveSession(ctx context.Context, sessio
 			publisher.protect(err)
 			return RollbackResult{}, err
 		}
-		if failureErr := publisher.store.FailRollback(context.Background(), operationID, releaseID, publisher.now().UTC()); failureErr != nil {
-			combined := errors.Join(err, failureErr)
-			publisher.protect(combined)
-			return RollbackResult{}, combined
-		}
-		return RollbackResult{}, err
+		return RollbackResult{}, publisher.failRollback(operationID, releaseID, err)
 	}
 	if err := publisher.store.CommitRollback(ctx, operationID, releaseID, publisher.now().UTC()); err != nil {
 		publisher.protect(err)
@@ -195,7 +196,7 @@ func (publisher *Publisher) replayRollbackLocked(ctx context.Context, sessionID 
 		operation = refreshed
 	}
 	if operation.State == store.OperationFailed {
-		return RollbackResult{}, store.ErrInvalidTransition
+		return RollbackResult{}, persistedRollbackFailure(operation.ResultCode)
 	}
 	if operation.State != store.OperationSucceeded || operation.ResultCode != "completed" {
 		return RollbackResult{}, store.ErrInvalidTransition
@@ -205,6 +206,20 @@ func (publisher *Publisher) replayRollbackLocked(ctx context.Context, sessionID 
 		return RollbackResult{}, errors.Join(err, store.ErrInvalidTransition)
 	}
 	return RollbackResult{OperationID: operation.OperationID, ReleaseID: target.ID, Version: target.Version, State: "succeeded", ClientAutoDowngrade: false}, nil
+}
+
+func (publisher *Publisher) failRollback(operationID, releaseID string, cause error) error {
+	failureCode := normalizedRollbackFailureCode(cause)
+	terminalContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if failureErr := publisher.store.FailRollback(terminalContext, operationID, releaseID, failureCode, publisher.now().UTC()); failureErr != nil {
+		combined := errors.Join(cause, failureErr)
+		publisher.protect(combined)
+		return combined
+	}
+	// Preserve only the durable public classification in the error chain so the
+	// first response and every idempotent replay map to the same status/code.
+	return fmt.Errorf("%w: %v", persistedRollbackFailure(failureCode), cause)
 }
 
 func normalizedPublishFailureCode(err error) string {
@@ -234,6 +249,25 @@ func persistedPublishFailure(code string) error {
 		return candidate.ErrDigestMismatch
 	default:
 		return store.ErrInvalidTransition
+	}
+}
+
+func normalizedRollbackFailureCode(err error) string {
+	code := normalizedPublishFailureCode(err)
+	if code == "version_floor" {
+		return "internal_failure"
+	}
+	return code
+}
+
+func persistedRollbackFailure(code string) error {
+	switch code {
+	case "signature_mismatch":
+		return release.ErrSignature
+	case "hash_mismatch":
+		return candidate.ErrDigestMismatch
+	default:
+		return ErrRollbackFailed
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,6 +151,56 @@ func TestV4ToV5MigrationAddsConstrainedUploadLeaseLedgerIdempotently(t *testing.
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestV5ToV6MigrationAddsReleaseNotesAndRollbackFailureAuditIdempotently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(schemaV2 + schemaV3 + schemaV4 + schemaV5 + `PRAGMA user_version=5;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,code,source_pseudonym) VALUES(?,'login_result','success','login_accepted',?)`, timestamp(time.Now().UTC()), "hmac-sha256:"+strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	for range 2 {
+		s, err := Open(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var version, notesColumns int
+		if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+			t.Fatalf("version=%d err=%v", version, err)
+		}
+		if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('releases') WHERE name='notes' AND type='TEXT'`).Scan(&notesColumns); err != nil || notesColumns != 1 {
+			t.Fatalf("notes columns=%d err=%v", notesColumns, err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,operation_id,release_id,code) VALUES(?,'rollback_failed','failure',?,?,'internal_failure')`, timestamp(time.Now().UTC()), rollbackOperationID, releaseID3); err != nil {
+			t.Fatalf("rollback failure audit rejected: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		break
+	}
+	s, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var rollbackCount, loginCount int
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='rollback_failed'`).Scan(&rollbackCount); err != nil || rollbackCount != 1 {
+		t.Fatalf("rollback audit count=%d err=%v", rollbackCount, err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='login_result'`).Scan(&loginCount); err != nil || loginCount != 1 {
+		t.Fatalf("preserved login audit count=%d err=%v", loginCount, err)
 	}
 }
 

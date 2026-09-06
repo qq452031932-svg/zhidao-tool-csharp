@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/httpapi"
+	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 )
@@ -41,7 +43,7 @@ func (operations *fakeReleaseOperations) RollbackForActiveSession(_ context.Cont
 
 func TestHistoryEndpointReturnsThreeRetainedReleasesAndNoDowngradePromise(t *testing.T) {
 	h := newHarness(t)
-	operations := &fakeReleaseOperations{history: []store.ReleaseHistoryItem{{Release: store.Release{ID: testReleaseID, Version: "1.0.3", GenerationName: "release-" + testReleaseID, CommittedAt: time.Unix(2_000_000_000, 0)}, State: "current", Assets: []store.ReleaseAsset{{FileName: "SuperPan-1.0.3-full.nupkg", SizeBytes: 123, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}
+	operations := &fakeReleaseOperations{history: []store.ReleaseHistoryItem{{Release: store.Release{ID: testReleaseID, Version: "1.0.3", GenerationName: "release-" + testReleaseID, CommittedAt: time.Unix(2_000_000_000, 0), Notes: "修复批量转存。"}, State: "current", Assets: []store.ReleaseAsset{{FileName: "SuperPan-1.0.3-full.nupkg", SizeBytes: 123, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}
 	installReleaseOperations(t, h, operations)
 	cookie, csrf, _, _ := login(t, h, oldPassword)
 	cookie, _ = changeTestPassword(t, h, cookie, csrf)
@@ -59,7 +61,7 @@ func TestHistoryEndpointReturnsThreeRetainedReleasesAndNoDowngradePromise(t *tes
 		t.Fatalf("releases=%#v", body["releases"])
 	}
 	item, ok := releases[0].(map[string]any)
-	if !ok || item["id"] != testReleaseID || item["version"] != "1.0.3" || item["state"] != "current" {
+	if !ok || item["id"] != testReleaseID || item["version"] != "1.0.3" || item["state"] != "current" || item["notes"] != "修复批量转存。" {
 		t.Fatalf("release item=%#v", releases[0])
 	}
 	assets, ok := item["assets"].([]any)
@@ -105,6 +107,9 @@ func TestRollbackEndpointMapsPasswordConflictAndReadOnlyFailuresToStableChineseE
 		{name: "password", err: session.ErrPassword, want: http.StatusBadRequest, code: "password_rejected"},
 		{name: "busy", err: store.ErrInvalidTransition, want: http.StatusConflict, code: "operation_conflict"},
 		{name: "read only", err: deploy.ErrReadOnly, want: http.StatusServiceUnavailable, code: "publish_unavailable"},
+		{name: "signature", err: release.ErrSignature, want: http.StatusUnprocessableEntity, code: "signature_mismatch"},
+		{name: "hash", err: candidate.ErrDigestMismatch, want: http.StatusUnprocessableEntity, code: "release_validation_failed"},
+		{name: "terminal internal", err: deploy.ErrRollbackFailed, want: http.StatusInternalServerError, code: "operation_failed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHarness(t)

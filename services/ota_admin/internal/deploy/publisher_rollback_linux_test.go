@@ -122,6 +122,46 @@ func TestPublisherRollbackIsIdempotentPreservesFloorAndRecoversAfterStableSwitch
 	}
 }
 
+func TestPublisherRollbackFailureIsAuditedAndReplaysTheSameTypedError(t *testing.T) {
+	root := publicationRoot(t)
+	disk, err := NewDisk(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportOne := rollbackReport("1.0.1")
+	reportTwo := rollbackReport("1.0.2")
+	generationOne, _, err := disk.PublishGeneration(context.Background(), rollbackSourceEnvelope(t, "1.0.1"), rollbackReleaseOne, reportOne, fixedValidator{report: reportOne})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generationTwo, _, err := disk.PublishGeneration(context.Background(), rollbackSourceEnvelope(t, "1.0.2"), rollbackReleaseTwo, reportTwo, fixedValidator{report: reportTwo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := rollbackStateStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	if err := database.CreateSession(context.Background(), store.Session{IDHash: deploySessionID, State: store.SessionActive, CreatedAt: now.Add(-time.Minute), LastSeenAt: now, IdleExpiresAt: now.Add(time.Hour), AbsoluteExpiresAt: now.Add(2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	commitRollbackRelease(t, database, deploySessionID, rollbackCandidate1, rollbackReleaseOne, generationOne, now)
+	commitRollbackRelease(t, database, deploySessionID, rollbackCandidate2, rollbackReleaseTwo, generationTwo, now.Add(time.Minute))
+	valid := contentVersionValidator{reports: map[string]release.Report{"1.0.1": reportOne, "1.0.2": reportTwo}}
+	publisher, err := NewPublisher(PublisherOptions{Disk: disk, Store: database, Candidates: &fixedPreparer{}, Validator: valid, Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	publisher.validator = fixedValidator{err: release.ErrSignature}
+	for attempt := range 2 {
+		_, rollbackErr := publisher.RollbackForActiveSession(context.Background(), deploySessionID, rollbackReleaseOne, rollbackOperation)
+		if !errors.Is(rollbackErr, release.ErrSignature) {
+			t.Fatalf("attempt %d err=%v", attempt, rollbackErr)
+		}
+	}
+}
+
 func rollbackReport(version string) release.Report {
 	return release.Report{SchemaVersion: 1, Verified: true, PackageID: "SuperPan.BaiduBatchTransfer", Channel: "win-x64-stable", Version: version, FileCount: 1, Files: []release.ReportFile{{Name: "asset.nupkg", Size: int64(len(version)), SHA256: strings.Repeat(version[len(version)-1:], 64)}}}
 }

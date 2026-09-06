@@ -16,9 +16,59 @@ type migration struct {
 	apply    func(context.Context, *sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}, {version: 4, sql: schemaV4}, {version: 5, sql: schemaV5}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}, {version: 4, sql: schemaV4}, {version: 5, sql: schemaV5}, {version: 6, apply: applyV6Migration}}
 
-const schemaVersion = 5
+const schemaVersion = 6
+
+func applyV6Migration(ctx context.Context, tx *sql.Tx) error {
+	statements := []string{
+		`ALTER TABLE releases ADD COLUMN notes TEXT NOT NULL DEFAULT '' CHECK (length(notes) <= 65536)`,
+		`DROP TRIGGER audit_events_append_only_update`,
+		`DROP TRIGGER audit_events_append_only_delete`,
+		`DROP TRIGGER audit_events_no_replace`,
+		`ALTER TABLE audit_events RENAME TO audit_events_v5`,
+		auditEventsV6DDL,
+		`INSERT INTO audit_events(sequence,occurred_at,event_type,outcome,operation_id,candidate_id,release_id,code,source_pseudonym)
+		 SELECT sequence,occurred_at,event_type,outcome,operation_id,candidate_id,release_id,code,source_pseudonym FROM audit_events_v5 ORDER BY sequence`,
+		`DROP TABLE audit_events_v5`,
+		auditEventsAppendOnlyV6DDL,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var auditEventsV6DDL = `CREATE TABLE audit_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at INTEGER NOT NULL CHECK (` + integerCheckSQL("occurred_at") + `),
+    event_type TEXT NOT NULL CHECK (event_type IN ('login_result', 'upload_started', 'upload_completed', 'gate_result', 'publish_confirmed', 'publish_failed', 'rollback_completed', 'rollback_failed', 'cleanup_result')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+    operation_id TEXT NOT NULL DEFAULT '' CHECK (operation_id = '' OR ` + uuidCheckSQL("operation_id") + `),
+    candidate_id TEXT NOT NULL DEFAULT '' CHECK (candidate_id = '' OR ` + uuidCheckSQL("candidate_id") + `),
+    release_id TEXT NOT NULL DEFAULT '' CHECK (release_id = '' OR ` + uuidCheckSQL("release_id") + `),
+    code TEXT NOT NULL CHECK (code IN ('accepted', 'completed', 'login_accepted', 'login_rejected', 'login_locked', 'hash_mismatch', 'signature_mismatch', 'version_floor', 'expired', 'internal_failure')),
+    source_pseudonym TEXT NOT NULL DEFAULT '' CHECK (source_pseudonym = '' OR (length(source_pseudonym) = 76 AND substr(source_pseudonym, 1, 12) = 'hmac-sha256:' AND substr(source_pseudonym, 13) NOT GLOB '*[^0-9a-f]*')),
+    CHECK (
+      (event_type = 'login_result' AND operation_id = '' AND candidate_id = '' AND release_id = '' AND source_pseudonym <> '' AND ((outcome='success' AND code='login_accepted') OR (outcome='failure' AND code IN ('login_rejected','login_locked')))) OR
+      (event_type = 'upload_started' AND outcome = 'success' AND operation_id <> '' AND candidate_id <> '' AND release_id = '' AND source_pseudonym = '' AND code = 'accepted') OR
+      (event_type = 'upload_completed' AND operation_id <> '' AND candidate_id <> '' AND release_id = '' AND source_pseudonym = '' AND ((outcome='success' AND code='completed') OR (outcome='failure' AND code IN ('hash_mismatch','expired','internal_failure')))) OR
+      (event_type = 'gate_result' AND operation_id <> '' AND candidate_id <> '' AND release_id = '' AND source_pseudonym = '' AND ((outcome='success' AND code='accepted') OR (outcome='failure' AND code IN ('hash_mismatch','signature_mismatch','version_floor','internal_failure')))) OR
+      (event_type = 'publish_confirmed' AND outcome = 'success' AND operation_id <> '' AND candidate_id <> '' AND release_id <> '' AND source_pseudonym = '' AND code = 'completed') OR
+      (event_type = 'publish_failed' AND outcome = 'failure' AND operation_id <> '' AND candidate_id <> '' AND release_id = '' AND source_pseudonym = '' AND code IN ('hash_mismatch','signature_mismatch','version_floor','internal_failure')) OR
+      (event_type = 'rollback_completed' AND outcome = 'success' AND operation_id <> '' AND candidate_id = '' AND release_id <> '' AND source_pseudonym = '' AND code = 'completed') OR
+      (event_type = 'rollback_failed' AND outcome = 'failure' AND operation_id <> '' AND candidate_id = '' AND release_id <> '' AND source_pseudonym = '' AND code IN ('hash_mismatch','signature_mismatch','internal_failure')) OR
+      (event_type = 'cleanup_result' AND operation_id <> '' AND candidate_id = '' AND source_pseudonym = '' AND ((outcome='success' AND code='completed') OR (outcome='failure' AND code='internal_failure')))
+    )
+)`
+
+const auditEventsAppendOnlyV6DDL = `
+CREATE TRIGGER audit_events_append_only_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+CREATE TRIGGER audit_events_append_only_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+CREATE TRIGGER audit_events_no_replace BEFORE INSERT ON audit_events WHEN NEW.sequence >= 0 AND EXISTS(SELECT 1 FROM audit_events WHERE sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'audit events cannot be replaced'); END;
+`
 
 var schemaV5 = `
 UPDATE candidate_cleanup_attempts

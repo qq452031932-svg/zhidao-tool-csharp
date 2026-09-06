@@ -751,13 +751,13 @@ func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T)
 	s := openStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?, '1.0.0','release-1','current',?,'admin')`, releaseID1, stamp(now)); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at,actor) VALUES(?, '1.0.0','release-1','current',?,'admin')`, releaseID1, stamp(now)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE releases SET state='retained' WHERE id=?`, releaseID1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?, '1.0.1','release-2','current',?,'admin')`, releaseID2, stamp(now)); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at,actor) VALUES(?, '1.0.1','release-2','current',?,'admin')`, releaseID2, stamp(now)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO highest_committed_version VALUES(1,'1.0.1',1,0,1,?)`, stamp(now)); err != nil {
@@ -781,7 +781,7 @@ func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T)
 	}
 	for index, name := range []string{"../release", "nested/release", `C:\release`, ".", ".hidden", "bad name"} {
 		id := fmt.Sprintf("55555555-5555-4555-8555-%012d", index)
-		if _, err := s.db.ExecContext(ctx, `INSERT INTO releases VALUES(?,?,?,'current',?,'admin')`, id, fmt.Sprintf("2.0.%d", index), name, stamp(now)); err == nil {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO releases(id,version,generation_name,state,committed_at,actor) VALUES(?,?,?,'current',?,'admin')`, id, fmt.Sprintf("2.0.%d", index), name, stamp(now)); err == nil {
 			t.Errorf("CommitRelease() accepted generation name %q", name)
 		}
 	}

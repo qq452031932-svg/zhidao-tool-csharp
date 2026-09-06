@@ -21,6 +21,7 @@ const (
 	PublishConfirmed  EventType = "publish_confirmed"
 	PublishFailed     EventType = "publish_failed"
 	RollbackCompleted EventType = "rollback_completed"
+	RollbackFailed    EventType = "rollback_failed"
 	CleanupResult     EventType = "cleanup_result"
 
 	OutcomeSuccess Outcome = "success"
@@ -130,6 +131,14 @@ func NewRollbackCompleted(operationID, releaseID string, at time.Time) (Event, e
 		return Event{}, err
 	}
 	return newEvent(RollbackCompleted, OutcomeSuccess, operationID, "", releaseID, CodeCompleted, SourcePseudonym{}, at, CodeCompleted)
+}
+
+func NewRollbackFailed(operationID, releaseID string, code Code, at time.Time) (Event, error) {
+	if err := requireIDs(operationID, releaseID); err != nil {
+		return Event{}, err
+	}
+	return newEvent(RollbackFailed, OutcomeFailure, operationID, "", releaseID, code, SourcePseudonym{}, at,
+		CodeHashMismatch, CodeSignatureMismatch, CodeInternalFailure)
 }
 
 func NewCleanupResult(outcome Outcome, operationID, releaseID string, code Code, at time.Time) (Event, error) {

@@ -461,6 +461,19 @@ func TestPublishersForOneRootShareTheProcessLockAndReplayOneCommit(t *testing.T)
 	}
 }
 
+func TestFailedRollbackReplayReturnsItsPersistedTypedOutcome(t *testing.T) {
+	publisher, _, _, _, _ := newPublisherHarness(t, nil)
+	_, err := publisher.replayRollbackLocked(context.Background(), deploySessionID, store.ReleaseOperation{
+		OperationID: deployPublishID,
+		ReleaseID:   testReleaseID,
+		State:       store.OperationFailed,
+		ResultCode:  "signature_mismatch",
+	})
+	if !errors.Is(err, release.ErrSignature) {
+		t.Fatalf("replay error=%v", err)
+	}
+}
+
 func newPublisherHarness(t *testing.T, hook FaultHook) (*Publisher, *store.Store, *fixedPreparer, string, time.Time) {
 	t.Helper()
 	publisher, database, preparer, root, now := newUnrecoveredPublisherHarness(t, hook)

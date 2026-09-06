@@ -141,3 +141,10 @@ func (disk *Disk) RemoveRetainedGeneration(name string) error {
 	}
 	return disk.bound.verify()
 }
+
+func (disk *Disk) mutationLockKey() string {
+	if disk == nil {
+		return ""
+	}
+	return disk.root
+}

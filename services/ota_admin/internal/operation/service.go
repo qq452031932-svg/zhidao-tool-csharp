@@ -23,7 +23,7 @@ type HistoryStore interface {
 }
 
 type Retainer interface {
-	Run(context.Context) error
+	Trigger()
 }
 
 type Options struct {
@@ -52,10 +52,9 @@ func (service *Service) PublishForActiveSession(ctx context.Context, sessionID, 
 	if err != nil {
 		return deploy.PublishResult{}, err
 	}
-	// Retention has its own operation and audit record. Once publication is
-	// durable, a cleanup failure must not turn the successful publish response
-	// into a failure or attempt to roll the release back.
-	_ = service.retention.Run(context.WithoutCancel(ctx))
+	// Trigger is a non-blocking enqueue. Retention has its own durable operation
+	// and audit record, and runs on its startup/periodic background worker.
+	service.retention.Trigger()
 	return result, nil
 }
 
