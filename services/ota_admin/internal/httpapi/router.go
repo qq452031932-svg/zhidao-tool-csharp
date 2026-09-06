@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 
+	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
@@ -32,10 +34,16 @@ type UploadReceiver interface {
 // EnvelopeAcceptor is the Task 9 integration seam. Implementations must verify
 // that sessionID is active and unexpired in the same transaction that adopts
 // the envelope, returning session.ErrUnauthorized when that condition fails.
-// A nil error transfers ownership and the cleanup obligation.
+// A successful result transfers ownership and the cleanup obligation and is
+// returned idempotently for the same active session and operation ID.
 type EnvelopeAcceptor interface {
-	AcceptEnvelopeForActiveSession(context.Context, string, *upload.Envelope) error
+	CandidateForOperationForActiveSession(context.Context, string, string) (candidate.Summary, bool, error)
+	AcceptEnvelopeForActiveSession(context.Context, string, string, *upload.Envelope) (candidate.Summary, error)
+	CurrentForActiveSession(context.Context, string) (candidate.Summary, error)
+	StatusForActiveSession(context.Context, string, string) (candidate.Summary, error)
 }
+
+var canonicalOperationID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 type Router struct {
 	sessions        *session.Service
@@ -136,6 +144,18 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 			return
 		}
 		router.receiveUpload(response, request, principal, cookie.Value, csrfToken)
+	case request.URL.Path == "/admin/api/candidates/current":
+		if request.Method != http.MethodGet {
+			writeMethodNotAllowed(response, http.MethodGet)
+			return
+		}
+		router.currentCandidate(response, request, principal)
+	case strings.HasPrefix(request.URL.Path, "/admin/api/candidates/"):
+		if request.Method != http.MethodGet {
+			writeMethodNotAllowed(response, http.MethodGet)
+			return
+		}
+		router.candidateStatus(response, request, principal)
 	default:
 		writeError(response, http.StatusNotFound, "not_found")
 	}

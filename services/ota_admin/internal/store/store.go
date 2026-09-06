@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/audit"
@@ -29,12 +31,15 @@ var (
 	ErrInvalidTransition       = errors.New("invalid state transition")
 	ErrVersionNotIncreasing    = errors.New("version does not exceed historical maximum")
 	ErrNotFound                = errors.New("record not found")
+	ErrSessionInactive         = errors.New("session is inactive or expired")
+	ErrCandidateExpired        = errors.New("candidate expired")
 )
 
 type Store struct {
 	db                *sql.DB
 	statePath         *statePathHandle
 	commitPublishHook func(string) error
+	candidateMu       sync.Mutex
 }
 
 type statePathHandle struct {
@@ -74,6 +79,18 @@ type Candidate struct {
 	ID, SessionID        string
 	State                CandidateState
 	CreatedAt, ExpiresAt time.Time
+}
+
+type CandidateRecord struct {
+	Candidate
+	UploadDigest, ValidationReport, Version, OperationID string
+}
+
+type CandidateAcceptance struct {
+	CandidateID, SessionID, OperationID string
+	UploadDigest, ValidationReport      string
+	Version                             string
+	CreatedAt, ExpiresAt                time.Time
 }
 
 type SessionState string
@@ -495,6 +512,265 @@ func (s *Store) CreateCandidate(ctx context.Context, candidate Candidate) error 
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,?,?,?)`, candidate.ID, candidate.SessionID, candidate.State, timestamp(candidate.CreatedAt), timestamp(candidate.ExpiresAt))
 	return wrapWrite("create candidate", err)
+}
+
+func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request CandidateAcceptance) (CandidateRecord, bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	if request.CreatedAt.IsZero() || !request.ExpiresAt.After(request.CreatedAt) || request.ExpiresAt.Sub(request.CreatedAt) > 24*time.Hour {
+		return CandidateRecord{}, false, errors.New("candidate lifetime is invalid")
+	}
+	if !exactLowerHex(request.UploadDigest, 64) {
+		return CandidateRecord{}, false, errors.New("candidate digest is invalid")
+	}
+	parsed, err := parseVersion(request.Version)
+	if err != nil {
+		return CandidateRecord{}, false, err
+	}
+	var reportVersion struct {
+		Verified bool   `json:"verified"`
+		Version  string `json:"version"`
+	}
+	if len(request.ValidationReport) == 0 || len(request.ValidationReport) > 65536 || json.Unmarshal([]byte(request.ValidationReport), &reportVersion) != nil || !reportVersion.Verified || reportVersion.Version != request.Version {
+		return CandidateRecord{}, false, errors.New("candidate validation report is invalid")
+	}
+	uploadStarted, err := audit.NewUploadStarted(request.OperationID, request.CandidateID, request.CreatedAt)
+	if err != nil {
+		return CandidateRecord{}, false, err
+	}
+	uploadCompleted, err := audit.NewUploadCompleted(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeCompleted, request.CreatedAt)
+	if err != nil {
+		return CandidateRecord{}, false, err
+	}
+	gateAccepted, err := audit.NewGateResult(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeAccepted, request.CreatedAt)
+	if err != nil {
+		return CandidateRecord{}, false, err
+	}
+	var accepted CandidateRecord
+	created := false
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		existing, found, err := candidateByOperationTx(ctx, tx, request.OperationID)
+		if err != nil {
+			return err
+		}
+		if found {
+			if existing.SessionID != request.SessionID {
+				return ErrSessionInactive
+			}
+			accepted = existing
+			return nil
+		}
+		if err := requireActiveSessionTx(ctx, tx, request.SessionID, request.CreatedAt); err != nil {
+			return err
+		}
+		var major, minor, patch int64
+		floorErr := tx.QueryRowContext(ctx, `SELECT major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&major, &minor, &patch)
+		if floorErr == nil && parsed.compare(numericVersion{major, minor, patch}) <= 0 {
+			return ErrVersionNotIncreasing
+		}
+		if floorErr != nil && !errors.Is(floorErr, sql.ErrNoRows) {
+			return floorErr
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, request.CandidateID, request.SessionID, timestamp(request.CreatedAt), timestamp(request.ExpiresAt)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, request.OperationID, request.CandidateID, timestamp(request.CreatedAt)); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, uploadStarted); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=?`, request.OperationID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET upload_digest=?,validation_report=?,state='validated' WHERE id=?`, request.UploadDigest, request.ValidationReport, request.CandidateID); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, gateAccepted); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='succeeded',result_code='completed',finished_at=? WHERE id=?`, timestamp(request.CreatedAt), request.OperationID); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, uploadCompleted); err != nil {
+			return err
+		}
+		accepted = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateValidated, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, UploadDigest: request.UploadDigest, ValidationReport: request.ValidationReport, Version: request.Version, OperationID: request.OperationID}
+		created = true
+		return nil
+	})
+	return accepted, created, err
+}
+
+func (s *Store) CandidateByOperationForActiveSession(ctx context.Context, sessionID, operationID string, now time.Time) (CandidateRecord, bool, error) {
+	var record CandidateRecord
+	var found bool
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		var err error
+		record, found, err = candidateByOperationTx(ctx, tx, operationID)
+		if err != nil {
+			return err
+		}
+		if found && record.SessionID != sessionID {
+			return ErrSessionInactive
+		}
+		return nil
+	})
+	return record, found, err
+}
+
+func (s *Store) CurrentCandidateForActiveSession(ctx context.Context, sessionID string, now time.Time) (CandidateRecord, error) {
+	var record CandidateRecord
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		row := tx.QueryRowContext(ctx, candidateRecordSQL+` WHERE c.session_id=? ORDER BY c.created_at DESC,c.id DESC LIMIT 1`, sessionID)
+		var err error
+		record, err = scanCandidateRecord(row)
+		return err
+	})
+	return record, err
+}
+
+func (s *Store) CandidateForActiveSession(ctx context.Context, sessionID, candidateID string, now time.Time) (CandidateRecord, error) {
+	var record CandidateRecord
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		var err error
+		record, err = scanCandidateRecord(tx.QueryRowContext(ctx, candidateRecordSQL+` WHERE c.id=? AND c.session_id=?`, candidateID, sessionID))
+		if errors.Is(err, ErrNotFound) {
+			return ErrSessionInactive
+		}
+		return err
+	})
+	return record, err
+}
+
+func (s *Store) CandidateForConfirmForActiveSession(ctx context.Context, sessionID, candidateID string, now time.Time) (CandidateRecord, error) {
+	var record CandidateRecord
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		row := tx.QueryRowContext(ctx, candidateRecordSQL+` WHERE c.id=? AND c.session_id=?`, candidateID, sessionID)
+		var err error
+		record, err = scanCandidateRecord(row)
+		if errors.Is(err, ErrNotFound) {
+			return ErrSessionInactive
+		}
+		if err != nil {
+			return err
+		}
+		if record.State != CandidateValidated {
+			return ErrInvalidTransition
+		}
+		if !now.Before(record.ExpiresAt) {
+			return ErrCandidateExpired
+		}
+		return nil
+	})
+	return record, err
+}
+
+func (s *Store) ExpireCandidates(ctx context.Context, now time.Time) ([]string, error) {
+	var ids []string
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='expired' WHERE state IN ('uploading','validated') AND expires_at<=?`, timestamp(now)); err != nil {
+			return err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM candidates WHERE state='expired' ORDER BY id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	return ids, err
+}
+
+func (s *Store) RecordCleanupResult(ctx context.Context, operationID string, success bool, at time.Time) error {
+	outcome, code, terminal := audit.OutcomeFailure, audit.CodeInternalFailure, OperationFailed
+	if success {
+		outcome, code, terminal = audit.OutcomeSuccess, audit.CodeCompleted, OperationSucceeded
+	}
+	event, err := audit.NewCleanupResult(outcome, operationID, "", code, at)
+	if err != nil {
+		return err
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, operationID, timestamp(at)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=?`, operationID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state=?,result_code=?,finished_at=? WHERE id=?`, terminal, code, timestamp(at), operationID); err != nil {
+			return err
+		}
+		return insertAudit(ctx, tx, event)
+	})
+}
+
+const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,COALESCE(json_extract(c.validation_report,'$.version'),''),o.id FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload'`
+
+type rowScanner interface{ Scan(...any) error }
+
+func scanCandidateRecord(row rowScanner) (CandidateRecord, error) {
+	var record CandidateRecord
+	var createdAt, expiresAt int64
+	err := row.Scan(&record.ID, &record.SessionID, &record.State, &createdAt, &expiresAt, &record.UploadDigest, &record.ValidationReport, &record.Version, &record.OperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CandidateRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	record.CreatedAt = time.Unix(createdAt, 0).UTC()
+	record.ExpiresAt = time.Unix(expiresAt, 0).UTC()
+	return record, nil
+}
+
+func candidateByOperationTx(ctx context.Context, tx *sql.Tx, operationID string) (CandidateRecord, bool, error) {
+	record, err := scanCandidateRecord(tx.QueryRowContext(ctx, candidateRecordSQL+` WHERE o.id=?`, operationID))
+	if errors.Is(err, ErrNotFound) {
+		return CandidateRecord{}, false, nil
+	}
+	return record, err == nil, err
+}
+
+func requireActiveSessionTx(ctx context.Context, tx *sql.Tx, sessionID string, now time.Time) error {
+	var state SessionState
+	var idleExpiresAt, absoluteExpiresAt int64
+	err := tx.QueryRowContext(ctx, `SELECT state,idle_expires_at,absolute_expires_at FROM sessions WHERE id_hash=?`, sessionID).Scan(&state, &idleExpiresAt, &absoluteExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && (state != SessionActive || timestamp(now) >= idleExpiresAt || timestamp(now) >= absoluteExpiresAt) {
+		return ErrSessionInactive
+	}
+	return err
+}
+
+func exactLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) ValidateCandidate(ctx context.Context, id, digest, report string) error {

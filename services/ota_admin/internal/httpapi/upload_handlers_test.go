@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/httpapi"
+	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
@@ -31,17 +33,47 @@ type blockingUploadReceiver struct {
 }
 
 type fakeEnvelopeAcceptor struct {
-	calls     int
-	sessionID string
-	envelope  *upload.Envelope
-	err       error
+	calls       int
+	lookupCalls int
+	sessionID   string
+	operationID string
+	envelope    *upload.Envelope
+	result      candidate.Summary
+	existing    *candidate.Summary
+	err         error
 }
 
-func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID string, envelope *upload.Envelope) error {
+func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope) (candidate.Summary, error) {
 	acceptor.calls++
 	acceptor.sessionID = sessionID
+	acceptor.operationID = operationID
 	acceptor.envelope = envelope
-	return acceptor.err
+	if acceptor.result.CandidateID == "" {
+		acceptor.result = testCandidateSummary(operationID)
+	}
+	return acceptor.result, acceptor.err
+}
+
+func (acceptor *fakeEnvelopeAcceptor) CandidateForOperationForActiveSession(_ context.Context, _ string, operationID string) (candidate.Summary, bool, error) {
+	acceptor.lookupCalls++
+	if acceptor.err != nil && acceptor.existing != nil {
+		return candidate.Summary{}, false, acceptor.err
+	}
+	if acceptor.existing == nil {
+		return candidate.Summary{}, false, nil
+	}
+	return *acceptor.existing, true, nil
+}
+
+func (acceptor *fakeEnvelopeAcceptor) CurrentForActiveSession(context.Context, string) (candidate.Summary, error) {
+	if acceptor.result.CandidateID == "" {
+		return candidate.Summary{}, acceptor.err
+	}
+	return acceptor.result, acceptor.err
+}
+
+func (acceptor *fakeEnvelopeAcceptor) StatusForActiveSession(context.Context, string, string) (candidate.Summary, error) {
+	return acceptor.CurrentForActiveSession(context.Background(), "")
 }
 
 func (receiver *fakeUploadReceiver) Receive(ctx context.Context, body io.Reader, contentLength int64) (*upload.Envelope, error) {
@@ -101,7 +133,7 @@ func TestUploadEndpointRequiresAuthenticationSameOriginCSRFAndPasswordChange(t *
 	}
 }
 
-func TestUploadEndpointStreamsRawZIPAndReturnsOnlyUnverifiedEnvelopeMetadata(t *testing.T) {
+func TestUploadEndpointStreamsRawZIPAndReturnsValidatedCandidateSummary(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{result: testEnvelope()}
 	acceptor := &fakeEnvelopeAcceptor{}
@@ -117,16 +149,60 @@ func TestUploadEndpointStreamsRawZIPAndReturnsOnlyUnverifiedEnvelopeMetadata(t *
 	if receiver.calls != 1 || receiver.contentLength != int64(len(payload)) || !bytes.Equal(receiver.body, payload) {
 		t.Fatalf("receiver calls=%d length=%d body=%q", receiver.calls, receiver.contentLength, receiver.body)
 	}
-	if acceptor.calls != 1 || acceptor.sessionID == "" || acceptor.envelope != receiver.result {
-		t.Fatalf("ownership handoff calls=%d session=%q envelope=%p", acceptor.calls, acceptor.sessionID, acceptor.envelope)
+	if acceptor.calls != 1 || acceptor.sessionID == "" || acceptor.operationID != testOperationID || acceptor.envelope != receiver.result {
+		t.Fatalf("ownership handoff calls=%d session=%q operation=%q envelope=%p", acceptor.calls, acceptor.sessionID, acceptor.operationID, acceptor.envelope)
 	}
 	body := response.Body.String()
-	if strings.Contains(body, `C:\\secret`) || strings.Contains(body, "/srv/secret") || strings.Contains(body, "verified") {
+	if strings.Contains(body, `C:\\secret`) || strings.Contains(body, "/srv/secret") {
 		t.Fatalf("response leaked paths or verification claim: %s", body)
 	}
 	decoded := decodeBody(t, response)
-	if decoded["state"] != "envelope_accepted" || decoded["sha256"] != strings.Repeat("a", 64) || decoded["entry_count"] != float64(1) {
+	if decoded["state"] != "validated" || decoded["candidate_id"] != testCandidateID || decoded["operation_id"] != testOperationID {
 		t.Fatalf("response metadata=%v", decoded)
+	}
+}
+
+func TestUploadEndpointReturnsSafeChineseValidationErrorWithOperationID(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{result: testEnvelope()}
+	acceptor := &fakeEnvelopeAcceptor{err: release.ErrSignature}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	body := decodeBody(t, response)
+	if response.Code != http.StatusUnprocessableEntity || body["code"] != "signature_mismatch" || body["message"] != "签名校验失败" || body["operation_id"] != testOperationID {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestUploadEndpointRequiresCanonicalIdempotencyKeyAndReturnsExistingWithoutReceiving(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{result: testEnvelope()}
+	existing := testCandidateSummary(testOperationID)
+	acceptor := &fakeEnvelopeAcceptor{existing: &existing}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	request := newUploadRequest([]byte("zip"), csrf, cookie)
+	request.Header.Del("Idempotency-Key")
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || receiver.calls != 0 {
+		t.Fatalf("missing key status=%d receiver=%d body=%s", response.Code, receiver.calls, response.Body.String())
+	}
+	request = newUploadRequest([]byte("zip"), csrf, cookie)
+	request.Header.Set("Idempotency-Key", strings.ToUpper(testOperationID))
+	response = httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || receiver.calls != 0 {
+		t.Fatalf("noncanonical key status=%d receiver=%d body=%s", response.Code, receiver.calls, response.Body.String())
+	}
+	response = uploadRequest(h, []byte("retry bytes are not consumed"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusAccepted || receiver.calls != 0 || acceptor.calls != 0 || decodeBody(t, response)["candidate_id"] != testCandidateID {
+		t.Fatalf("retry status=%d receiver=%d accept=%d body=%s", response.Code, receiver.calls, acceptor.calls, response.Body.String())
 	}
 }
 
@@ -303,6 +379,7 @@ func newUploadRequest(body []byte, csrf string, cookie *http.Cookie) *http.Reque
 	request.Header.Set("Content-Type", "application/zip")
 	request.Header.Set("Origin", publicOrigin)
 	request.Header.Set("Referer", publicOrigin+"/admin/")
+	request.Header.Set("Idempotency-Key", testOperationID)
 	if csrf != "" {
 		request.Header.Set("X-CSRF-Token", csrf)
 	}
@@ -310,6 +387,29 @@ func newUploadRequest(body []byte, csrf string, cookie *http.Cookie) *http.Reque
 		request.AddCookie(cookie)
 	}
 	return request
+}
+
+const (
+	testOperationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	testCandidateID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+)
+
+func testCandidateSummary(operationID string) candidate.Summary {
+	return candidate.Summary{
+		CandidateID: testCandidateID,
+		OperationID: operationID,
+		State:       "validated",
+		CreatedAt:   time.Unix(2_000_000_000, 0).UTC(),
+		ExpiresAt:   time.Unix(2_000_000_000, 0).UTC().Add(24 * time.Hour),
+		Report: release.Report{
+			SchemaVersion: 1,
+			Verified:      true,
+			PackageID:     "SuperPan",
+			Channel:       "stable",
+			Version:       "21.0.0",
+			FileCount:     7,
+		},
+	}
 }
 
 func uploadRequest(h *harness, body []byte, contentType, csrf string, cookie *http.Cookie) *httptest.ResponseRecorder {
