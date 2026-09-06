@@ -47,6 +47,7 @@
 - 后台只监听 `127.0.0.1:18091`；未发现 `0.0.0.0:18091` 或 `[::]:18091` 监听。
 - `/www/server/nginx/sbin/nginx -t` 通过；reload 前后的真实 master PID 均为 `9117`，进程名为 `nginx`。
 - `https://ota.fanfh.cn/admin/` 返回 `200`，同时具有 `Cache-Control: no-store, max-age=0`、CSP 和 `X-Frame-Options: DENY`。
+- 已在用户可见的 Codex 应用内浏览器打开真实 `https://ota.fanfh.cn/admin/` 页面并读取无障碍树：页面标题为“SuperPan OTA 发布后台”，连接状态为“已连接”，登录表单包含管理员账号、密码和登录按钮；不是截图或本地 mock。
 - OTA vhost 仅增加一次 `/etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf` include；部署后 SHA-256 为 `23046876bdd83b91eb64156c6b8a1ec7eaa321bcb42f14db3dcedbab58971786`。
 - OTA `/health`、TLS 叶证书、`f.fanfh.cn` vhost 和 fullchain 哈希与部署前完全一致。
 - 旧空 `stable` 目录已按迁移逻辑移除，当前发布树只有空的 `generations` 目录；尚无 `stable` 相对链接、release JSON、RELEASES、Setup、Portable 或任何正式版本。
@@ -75,6 +76,4 @@
 6. 停止后台服务，证明 Nginx 静态 stable 仍可下载；随后启动服务，验证恢复、旧会话失效和 read-only 状态清除。
 7. 在发布存在后执行完整 `deploy/ota-admin/verify.sh`，复核 stable 下载哈希、元数据 no-cache、版本资产 immutable、端口隔离、停服恢复 trap 和本机/公网 TLS。
 8. 重新取得部署后的 Windows 可信 `f.fanfh.cn` 正文哈希，并执行既有证书续期 dry-run，补齐三项不可变基线与续期健康的最终证据。
-9. 在用户可见浏览器中打开真实页面完成视觉验收。此前一次自动页面读取卡住并被终止；该问题没有影响安装器、服务或服务器状态，不能算视觉验收完成。
-
 完成以上步骤前，最终门禁仍是关闭状态；不得把生产 OTA 标记为完整上线。
