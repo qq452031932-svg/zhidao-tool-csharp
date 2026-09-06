@@ -743,7 +743,7 @@ func preparedPublish(t *testing.T) (*Store, PublishCommit) {
 	if err := s.TransitionOperation(ctx, operationID1, OperationRunning, ""); err != nil {
 		t.Fatal(err)
 	}
-	return s, PublishCommit{Release: Release{ID: releaseID1, Version: "1.2.3", GenerationName: "release-1", CommittedAt: now}, OperationID: operationID1, CandidateID: candidateID1, Assets: []ReleaseAsset{{FileName: "asset.nupkg", SizeBytes: 12, SHA256: digest1}}}
+	return s, PublishCommit{Release: Release{ID: operationID1, Version: "1.2.3", GenerationName: "release-" + operationID1, CommittedAt: now}, OperationID: operationID1, CandidateID: candidateID1, Assets: []ReleaseAsset{{FileName: "asset.nupkg", SizeBytes: 12, SHA256: digest1}}}
 }
 
 func TestReleaseCurrentUniquenessTransitionsAndFlatGenerationNames(t *testing.T) {

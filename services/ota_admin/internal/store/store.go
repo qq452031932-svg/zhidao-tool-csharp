@@ -161,6 +161,11 @@ type PublishCommit struct {
 	OperationID, CandidateID string
 }
 
+type PublishOperation struct {
+	OperationID, CandidateID, ReleaseID, ResultCode string
+	State                                           OperationState
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if err := validateDatabasePath(path); err != nil {
 		return nil, err
@@ -1388,9 +1393,210 @@ func (s *Store) TransitionOperation(ctx context.Context, id string, state Operat
 	return transitionResult(result, err)
 }
 
+func (s *Store) BeginPublishForActiveSession(ctx context.Context, sessionID, candidateID, operationID string, now time.Time) (PublishOperation, bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var operation PublishOperation
+	created := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		var kind, operationOwner string
+		err := tx.QueryRowContext(ctx, `SELECT o.id,o.candidate_id,o.state,o.result_code,COALESCE(o.release_id,''),o.kind,c.session_id FROM operations o JOIN candidates c ON c.id=o.candidate_id WHERE o.id=?`, operationID).Scan(&operation.OperationID, &operation.CandidateID, &operation.State, &operation.ResultCode, &operation.ReleaseID, &kind, &operationOwner)
+		if err == nil {
+			if operationOwner != sessionID {
+				return ErrSessionInactive
+			}
+			if kind != "publish" || operation.CandidateID != candidateID {
+				return ErrInvalidTransition
+			}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var state CandidateState
+		var owner string
+		var expires int64
+		if err := tx.QueryRowContext(ctx, `SELECT state,session_id,expires_at FROM candidates WHERE id=?`, candidateID).Scan(&state, &owner, &expires); err != nil {
+			return err
+		}
+		if owner != sessionID {
+			return ErrSessionInactive
+		}
+		if state != CandidateValidated {
+			return ErrInvalidTransition
+		}
+		if timestamp(now) >= expires {
+			return ErrCandidateExpired
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'publish','pending',?,?)`, operationID, candidateID, timestamp(now)); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE candidates SET state='publishing' WHERE id=? AND state='validated'`, candidateID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=? AND state='pending'`, operationID)
+		if err != nil {
+			return err
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		operation = PublishOperation{OperationID: operationID, CandidateID: candidateID, State: OperationRunning}
+		created = true
+		return nil
+	})
+	return operation, created, err
+}
+
+func (s *Store) PublishOperationForActiveSession(ctx context.Context, sessionID, operationID string, now time.Time) (PublishOperation, bool, error) {
+	var operation PublishOperation
+	found := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		var owner, kind string
+		err := tx.QueryRowContext(ctx, `SELECT o.id,o.candidate_id,o.state,o.result_code,COALESCE(o.release_id,''),o.kind,c.session_id FROM operations o JOIN candidates c ON c.id=o.candidate_id WHERE o.id=?`, operationID).Scan(&operation.OperationID, &operation.CandidateID, &operation.State, &operation.ResultCode, &operation.ReleaseID, &kind, &owner)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if owner != sessionID {
+			return ErrSessionInactive
+		}
+		if kind != "publish" {
+			return ErrInvalidTransition
+		}
+		found = true
+		return nil
+	})
+	return operation, found, err
+}
+
+func (s *Store) FailPublish(ctx context.Context, operationID, candidateID, code string, at time.Time) error {
+	if code != "hash_mismatch" && code != "signature_mismatch" && code != "version_floor" && code != "internal_failure" {
+		return errors.New("publish failure code invalid")
+	}
+	eventCode := audit.CodeInternalFailure
+	if code == "hash_mismatch" {
+		eventCode = audit.CodeHashMismatch
+	}
+	if code == "signature_mismatch" {
+		eventCode = audit.CodeSignatureMismatch
+	}
+	if code == "version_floor" {
+		eventCode = audit.CodeVersionFloor
+	}
+	event, err := audit.NewPublishFailed(operationID, candidateID, eventCode, at)
+	if err != nil {
+		return err
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE candidates SET state='failed' WHERE id=? AND state='publishing'`, candidateID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND candidate_id=? AND kind='publish' AND state='running'`, code, timestamp(at), operationID, candidateID)
+		if err != nil {
+			return err
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		return insertAudit(ctx, tx, event)
+	})
+}
+
+func (s *Store) InFlightPublish(ctx context.Context) (PublishOperation, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,candidate_id,state,result_code,COALESCE(release_id,'') FROM operations WHERE kind='publish' AND state='running' ORDER BY id LIMIT 2`)
+	if err != nil {
+		return PublishOperation{}, false, err
+	}
+	defer rows.Close()
+	var found []PublishOperation
+	for rows.Next() {
+		var item PublishOperation
+		if err := rows.Scan(&item.OperationID, &item.CandidateID, &item.State, &item.ResultCode, &item.ReleaseID); err != nil {
+			return PublishOperation{}, false, err
+		}
+		found = append(found, item)
+	}
+	if err := rows.Err(); err != nil {
+		return PublishOperation{}, false, err
+	}
+	if len(found) > 1 {
+		return PublishOperation{}, false, errors.New("multiple publish operations are in flight")
+	}
+	if len(found) == 0 {
+		return PublishOperation{}, false, nil
+	}
+	return found[0], true, nil
+}
+
+func (s *Store) CurrentRelease(ctx context.Context) (Release, []ReleaseAsset, bool, error) {
+	var value Release
+	var committed int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at FROM releases WHERE state='current'`).Scan(&value.ID, &value.Version, &value.GenerationName, &committed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, nil, false, nil
+	}
+	if err != nil {
+		return Release{}, nil, false, err
+	}
+	value.CommittedAt = time.Unix(committed, 0).UTC()
+	rows, err := s.db.QueryContext(ctx, `SELECT file_name,size_bytes,sha256 FROM release_assets WHERE release_id=? ORDER BY file_name`, value.ID)
+	if err != nil {
+		return Release{}, nil, false, err
+	}
+	defer rows.Close()
+	var assets []ReleaseAsset
+	for rows.Next() {
+		var asset ReleaseAsset
+		if err := rows.Scan(&asset.FileName, &asset.SizeBytes, &asset.SHA256); err != nil {
+			return Release{}, nil, false, err
+		}
+		assets = append(assets, asset)
+	}
+	if err := rows.Err(); err != nil {
+		return Release{}, nil, false, err
+	}
+	return value, assets, true, nil
+}
+
 func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommit) error {
 	if len(request.Assets) == 0 {
 		return errors.New("published release requires at least one asset")
+	}
+	if request.Release.ID != request.OperationID || request.Release.GenerationName != "release-"+request.Release.ID {
+		return ErrInvalidTransition
 	}
 	next, err := parseVersion(request.Release.Version)
 	if err != nil {

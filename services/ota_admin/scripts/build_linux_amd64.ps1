@@ -54,6 +54,23 @@ function Assert-PinnedGoToolchain {
     }
 }
 
+function Assert-AcceptanceHarnessExcluded {
+    param(
+        [Parameter(Mandatory)][string] $GoExecutable,
+        [Parameter(Mandatory)][string] $SnapshotRoot
+    )
+
+    $acceptanceMain = Join-Path $SnapshotRoot 'cmd\ota-admin-acceptance\main_linux.go'
+    if (-not (Test-Path -LiteralPath $acceptanceMain -PathType Leaf)) { throw 'Acceptance harness source is missing from the audited snapshot.' }
+    $firstLine = Get-Content -LiteralPath $acceptanceMain -Encoding UTF8 -TotalCount 1
+    if ($firstLine -cne '//go:build linux && ota_admin_acceptance') { throw 'Acceptance harness is not protected by its opt-in build tag.' }
+    [string[]] $defaultPackages = @(& $GoExecutable -C $SnapshotRoot list -f '{{.ImportPath}}' ./...)
+    if ($LASTEXITCODE -ne 0) { throw 'go list failed while proving acceptance harness isolation.' }
+    if ($defaultPackages -ccontains 'fanfh.cn/superpan/ota-admin/cmd/ota-admin-acceptance') {
+        throw 'Acceptance-only harness entered the production build graph.'
+    }
+}
+
 function Get-TrackedSourcePaths {
     $modulePrefix = 'services/ota_admin/'
     [string[]] $trackedPaths = @(& git -C $RepositoryRoot ls-tree -r --name-only HEAD -- services/ota_admin)
@@ -278,6 +295,7 @@ try {
     $env:GOOS = 'linux'
     $env:GOARCH = 'amd64'
     Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    Assert-AcceptanceHarnessExcluded -GoExecutable $GoExe -SnapshotRoot $SnapshotDirectory
     & $GoExe -C $SnapshotDirectory build -buildvcs=false -trimpath -ldflags '-s -w' -o $stagedOutputPath ./cmd/ota-admin
     if ($LASTEXITCODE -ne 0) { throw 'static linux/amd64 build failed.' }
     if (-not (Test-Path -LiteralPath $stagedOutputPath -PathType Leaf)) { throw "Build did not create $stagedOutputPath" }

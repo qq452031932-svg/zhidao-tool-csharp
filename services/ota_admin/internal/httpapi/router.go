@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
+	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
@@ -25,6 +26,11 @@ type Options struct {
 	MaxJSONBytes    int64
 	Uploads         UploadReceiver
 	UploadEnvelopes EnvelopeAcceptor
+	Publisher       CandidatePublisher
+}
+
+type CandidatePublisher interface {
+	PublishForActiveSession(context.Context, string, string, string) (deploy.PublishResult, error)
 }
 
 type UploadReceiver interface {
@@ -54,6 +60,7 @@ type Router struct {
 	maxJSONBytes    int64
 	uploads         UploadReceiver
 	uploadEnvelopes EnvelopeAcceptor
+	publisher       CandidatePublisher
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -68,7 +75,7 @@ func NewRouter(options Options) (http.Handler, error) {
 	}
 	router := &Router{
 		sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes,
-		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes,
+		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes, publisher: options.Publisher,
 	}
 	return withAdminSecurityHeaders(router), nil
 }
@@ -153,6 +160,12 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 			return
 		}
 		router.currentCandidate(response, request, principal)
+	case strings.HasPrefix(request.URL.Path, "/admin/api/candidates/") && strings.HasSuffix(request.URL.Path, "/publish"):
+		if request.Method != http.MethodPost {
+			writeMethodNotAllowed(response, http.MethodPost)
+			return
+		}
+		router.publishCandidate(response, request, principal)
 	case strings.HasPrefix(request.URL.Path, "/admin/api/candidates/"):
 		if request.Method != http.MethodGet {
 			writeMethodNotAllowed(response, http.MethodGet)
