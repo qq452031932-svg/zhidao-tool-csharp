@@ -310,6 +310,7 @@ function renderGateEvidence(candidate) {
     item.classList.toggle("failed", Boolean(failed));
     item.firstElementChild.textContent = passed ? "✓" : failed ? "×" : "○";
     const description = item.querySelector("small");
+    if (description && !item.dataset.defaultEvidence) item.dataset.defaultEvidence = description.textContent;
     if (description && gate && gate.evidence) description.textContent = gate.evidence;
   }
 }
