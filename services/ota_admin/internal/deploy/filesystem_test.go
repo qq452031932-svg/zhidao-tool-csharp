@@ -314,7 +314,7 @@ func TestMigrateEmptyStableRejectsCrossFilesystemAndRollsBackEveryFault(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		disk.sameDevice = func(os.FileInfo, os.FileInfo) bool { return false }
+		disk.deviceOK = func(rootEntry) bool { return false }
 		if err := disk.MigrateEmptyStable(); err == nil {
 			t.Fatal("cross-filesystem stable directory migrated")
 		}

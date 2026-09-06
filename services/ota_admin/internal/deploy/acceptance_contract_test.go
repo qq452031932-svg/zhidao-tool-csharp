@@ -1,6 +1,8 @@
 package deploy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,21 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 	if !hasNewline || strings.TrimSuffix(firstLine, "\r") != "//go:build linux && ota_admin_acceptance" {
 		t.Fatal("acceptance harness is not protected by its Linux-only opt-in build tag")
 	}
+	for _, required := range []string{
+		"//go:embed testdata/valid-upload.zip",
+		"//go:embed testdata/publisher.cer",
+		"x509.ParseCertificate",
+		"release.NewValidator",
+		"upload.NewReceiver",
+		"candidate.NewService",
+		"RevalidateForConfirm",
+		"/proc/self/cgroup",
+		"/proc/1/comm",
+	} {
+		if !strings.Contains(string(mainSource), required) {
+			t.Fatalf("acceptance harness missing real-chain/systemd contract %q", required)
+		}
+	}
 	acceptanceScript := readTask10Script(t, filepath.Join(moduleRoot, "scripts", "build_linux_acceptance.ps1"))
 	for _, required := range []string{"-tags 'ota_admin_acceptance'", "./cmd/ota-admin-acceptance", "superpan-ota-admin-acceptance-linux-amd64"} {
 		if !strings.Contains(acceptanceScript, required) {
@@ -30,6 +47,40 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 			t.Fatalf("production build script missing isolation proof %q", required)
 		}
 	}
+}
+
+func TestAcceptanceHarnessFixturesExactlyMatchTrackedPowerShellGolden(t *testing.T) {
+	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
+	repositoryRoot := filepath.Clean(filepath.Join(moduleRoot, "..", ".."))
+	acceptanceFixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
+	productionFixtureRoot := filepath.Join(repositoryRoot, "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction")
+	for _, name := range []string{"valid-upload.zip", "publisher.cer"} {
+		want := fixtureSHA256(t, filepath.Join(productionFixtureRoot, name))
+		got := fixtureSHA256(t, filepath.Join(acceptanceFixtureRoot, name))
+		if got != want {
+			t.Fatalf("acceptance fixture %s hash = %s, want tracked golden %s", name, got, want)
+		}
+	}
+	entries, err := os.ReadDir(acceptanceFixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		lower := strings.ToLower(entry.Name())
+		if strings.Contains(lower, "private") || strings.HasSuffix(lower, ".pfx") || strings.HasSuffix(lower, ".p12") || strings.HasSuffix(lower, ".key") || strings.HasSuffix(lower, ".pem") {
+			t.Fatalf("acceptance fixture directory contains prohibited key material: %s", entry.Name())
+		}
+	}
+}
+
+func fixtureSHA256(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:])
 }
 
 func readTask10Script(t *testing.T, path string) string {

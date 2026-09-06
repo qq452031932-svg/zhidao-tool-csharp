@@ -3,8 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,22 +16,30 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
+	"fanfh.cn/superpan/ota-admin/internal/publisher"
 	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 	"golang.org/x/sys/unix"
 )
 
+// These are exact copies of the tracked PowerShell production golden. The
+// certificate is public; private signing material is never embedded here.
+//
+//go:embed testdata/valid-upload.zip
+var goldenUpload []byte
+
+//go:embed testdata/publisher.cer
+var goldenCertificate []byte
+
 const (
 	acceptanceSessionID   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	acceptanceCandidateID = "55555555-5555-4555-8555-555555555555"
 	acceptanceUploadID    = "66666666-6666-4666-8666-666666666666"
 	acceptancePublishID   = "77777777-7777-4777-8777-777777777777"
 	productionRoot        = "/www/wwwroot/ota.fanfh.cn"
@@ -58,41 +69,6 @@ type evidence struct {
 	Error          string `json:"error,omitempty"`
 }
 
-type fixtureValidator struct{ report release.Report }
-
-func (validator fixtureValidator) Validate(_ context.Context, envelope *upload.Envelope, _ string) (release.Report, error) {
-	if envelope == nil || len(envelope.Entries) != len(validator.report.Files) {
-		return release.Report{}, errors.New("fixture generation closure mismatch")
-	}
-	expected := make(map[string]release.ReportFile, len(validator.report.Files))
-	for _, file := range validator.report.Files {
-		expected[file.Name] = file
-	}
-	seen := make(map[string]bool, len(envelope.Entries))
-	for _, entry := range envelope.Entries {
-		want, ok := expected[entry.Name]
-		if !ok || seen[entry.Name] {
-			return release.Report{}, errors.New("fixture generation member mismatch")
-		}
-		seen[entry.Name] = true
-		content, err := os.ReadFile(entry.Path)
-		if err != nil {
-			return release.Report{}, err
-		}
-		digest := sha256.Sum256(content)
-		if int64(len(content)) != want.Size || hex.EncodeToString(digest[:]) != want.SHA256 {
-			return release.Report{}, errors.New("fixture generation hash mismatch")
-		}
-	}
-	return validator.report, nil
-}
-
-type fixturePreparer struct{ prepared candidate.Prepared }
-
-func (preparer fixturePreparer) RevalidateForConfirm(context.Context, string, string) (candidate.Prepared, error) {
-	return preparer.prepared, nil
-}
-
 func main() {
 	rootFlag := flag.String("root", "", "caller-created empty isolated publication root")
 	failureFlag := flag.String("failure-point", "", "enumerated durability boundary")
@@ -105,6 +81,9 @@ func main() {
 	if !ok {
 		emitAndExit(result, errors.New("failure point is not enumerated"))
 	}
+	if err := refuseServiceManager(); err != nil {
+		emitAndExit(result, err)
+	}
 	root, err := validateIsolatedRoot(*rootFlag)
 	if err != nil {
 		emitAndExit(result, err)
@@ -114,7 +93,7 @@ func main() {
 	emitAndExit(result, err)
 }
 
-func exercise(root string, failure deploy.Boundary, result evidence) (evidence, error) {
+func exercise(root isolatedRoot, failure deploy.Boundary, result evidence) (evidence, error) {
 	stateRoot, err := os.MkdirTemp("", "superpan-ota-acceptance-state-")
 	if err != nil {
 		return result, err
@@ -123,32 +102,66 @@ func exercise(root string, failure deploy.Boundary, result evidence) (evidence, 
 	if err := os.Chmod(stateRoot, 0o700); err != nil {
 		return result, err
 	}
-	sourceRoot, err := os.MkdirTemp("", "superpan-ota-acceptance-source-")
+	stagingRoot := filepath.Join(stateRoot, "staging")
+	if err := os.Mkdir(stagingRoot, 0o700); err != nil {
+		return result, err
+	}
+	certificate, err := x509.ParseCertificate(goldenCertificate)
 	if err != nil {
 		return result, err
 	}
-	defer os.RemoveAll(sourceRoot)
-	if err := os.Chmod(sourceRoot, 0o700); err != nil {
-		return result, err
-	}
-	envelope, report, err := newFixture(sourceRoot)
+	spkiDigest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)
+	trust, err := publisher.NewTrust(certificate.RawSubjectPublicKeyInfo, hex.EncodeToString(spkiDigest[:]))
 	if err != nil {
 		return result, err
 	}
-	validator := fixtureValidator{report: report}
+	validator := release.NewValidator(trust)
+	receiver, err := upload.NewReceiver(upload.ReceiverOptions{StagingRoot: stagingRoot, Limits: upload.DefaultLimits()})
+	if err != nil {
+		return result, err
+	}
+	envelope, err := receiver.Receive(context.Background(), bytes.NewReader(goldenUpload), int64(len(goldenUpload)))
+	if err != nil {
+		return result, err
+	}
+	defer envelope.Cleanup()
 	databasePath := filepath.Join(stateRoot, "state.db")
 	database, err := store.Open(context.Background(), databasePath)
 	if err != nil {
 		return result, err
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := seedCandidate(database, report, now); err != nil {
+	if err := seedSession(database, now); err != nil {
 		database.Close()
 		return result, err
 	}
+	candidates, err := candidate.NewService(candidate.Options{Store: database, Validator: validator, StagingRoot: stagingRoot, Lifetime: 24 * time.Hour, Now: func() time.Time { return now }})
+	if err != nil {
+		database.Close()
+		return result, err
+	}
+	reserved, acquired, err := candidates.ReserveEnvelopeForActiveSession(context.Background(), acceptanceSessionID, acceptanceUploadID)
+	if err != nil || !acquired {
+		database.Close()
+		return result, errors.Join(errors.New("candidate reservation failed"), err)
+	}
+	accepted, err := candidates.AcceptEnvelopeForActiveSession(context.Background(), acceptanceSessionID, acceptanceUploadID, envelope, reserved.LeaseOwner)
+	if err != nil {
+		database.Close()
+		return result, err
+	}
+	if !accepted.Report.Verified || accepted.Report.Version != "1.2.3" {
+		database.Close()
+		return result, errors.New("production golden did not produce its expected verified report")
+	}
+	prepared, err := candidates.RevalidateForConfirm(context.Background(), acceptanceSessionID, accepted.CandidateID)
+	if err != nil || prepared.Report.Version != accepted.Report.Version {
+		database.Close()
+		return result, errors.Join(errors.New("real candidate confirmation revalidation failed"), err)
+	}
 	var faultMu sync.Mutex
 	faultObserved := false
-	disk, err := deploy.NewDisk(root, func(actual deploy.Boundary) error {
+	disk, err := deploy.NewDisk(root.path, func(actual deploy.Boundary) error {
 		faultMu.Lock()
 		defer faultMu.Unlock()
 		if actual == failure && !faultObserved {
@@ -161,17 +174,20 @@ func exercise(root string, failure deploy.Boundary, result evidence) (evidence, 
 		database.Close()
 		return result, err
 	}
-	preparer := fixturePreparer{prepared: candidate.Prepared{Summary: candidate.Summary{CandidateID: acceptanceCandidateID}, Report: report, Envelope: envelope}}
-	publisher, err := deploy.NewPublisher(deploy.PublisherOptions{Disk: disk, Store: database, Candidates: preparer, Validator: validator, Now: func() time.Time { return now }})
+	if err := verifyIsolatedRoot(root); err != nil {
+		database.Close()
+		return result, err
+	}
+	otaPublisher, err := deploy.NewPublisher(deploy.PublisherOptions{Disk: disk, Store: database, Candidates: candidates, Validator: validator, Now: func() time.Time { return now }})
 	if err != nil {
 		database.Close()
 		return result, err
 	}
-	if err := publisher.Recover(context.Background()); err != nil {
+	if err := otaPublisher.Recover(context.Background()); err != nil {
 		database.Close()
 		return result, err
 	}
-	if _, publishErr := publisher.PublishForActiveSession(context.Background(), acceptanceSessionID, acceptanceCandidateID, acceptancePublishID); publishErr == nil {
+	if _, publishErr := otaPublisher.PublishForActiveSession(context.Background(), acceptanceSessionID, accepted.CandidateID, acceptancePublishID); publishErr == nil {
 		database.Close()
 		return result, errors.New("faulted publish unexpectedly succeeded")
 	}
@@ -190,11 +206,15 @@ func exercise(root string, failure deploy.Boundary, result evidence) (evidence, 
 		return result, err
 	}
 	defer database.Close()
-	restartedDisk, err := deploy.NewDisk(root, nil)
+	restartedDisk, err := deploy.NewDisk(root.path, nil)
 	if err != nil {
 		return result, err
 	}
-	restarted, err := deploy.NewPublisher(deploy.PublisherOptions{Disk: restartedDisk, Store: database, Candidates: preparer, Validator: validator, Now: func() time.Time { return now.Add(time.Minute) }})
+	restartedCandidates, err := candidate.NewService(candidate.Options{Store: database, Validator: validator, StagingRoot: stagingRoot, Lifetime: 24 * time.Hour, Now: func() time.Time { return now.Add(time.Minute) }})
+	if err != nil {
+		return result, err
+	}
+	restarted, err := deploy.NewPublisher(deploy.PublisherOptions{Disk: restartedDisk, Store: database, Candidates: restartedCandidates, Validator: validator, Now: func() time.Time { return now.Add(time.Minute) }})
 	if err != nil {
 		return result, err
 	}
@@ -215,7 +235,7 @@ func exercise(root string, failure deploy.Boundary, result evidence) (evidence, 
 	result.OperationState = string(operation.State)
 	stable, stableErr := restartedDisk.StableTarget()
 	if result.CommitExpected {
-		if stableErr != nil || stable != "release-"+acceptancePublishID || !haveCurrent || current.ID != acceptancePublishID || current.Version != report.Version || operation.State != store.OperationSucceeded {
+		if stableErr != nil || stable != "release-"+acceptancePublishID || !haveCurrent || current.ID != acceptancePublishID || current.Version != accepted.Report.Version || operation.State != store.OperationSucceeded {
 			return result, errors.New("post-commit recovery did not converge")
 		}
 		result.StableTarget = stable
@@ -229,109 +249,93 @@ func exercise(root string, failure deploy.Boundary, result evidence) (evidence, 
 	return result, nil
 }
 
-func seedCandidate(database *store.Store, report release.Report, now time.Time) error {
+func seedSession(database *store.Store, now time.Time) error {
 	ctx := context.Background()
-	if err := database.CreateSession(ctx, store.Session{IDHash: acceptanceSessionID, State: store.SessionActive, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(30 * time.Minute), AbsoluteExpiresAt: now.Add(2 * time.Hour)}); err != nil {
-		return err
-	}
-	if _, acquired, err := database.ReserveCandidateForActiveSession(ctx, store.CandidateReservation{
-		CandidateID: acceptanceCandidateID, SessionID: acceptanceSessionID, OperationID: acceptanceUploadID, LeaseOwner: acceptanceCandidateID,
-		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute),
-	}); err != nil || !acquired {
-		return errors.Join(errors.New("candidate reservation failed"), err)
-	}
-	reportJSON, err := json.Marshal(report)
-	if err != nil {
-		return err
-	}
-	_, created, err := database.AcceptCandidateForActiveSession(ctx, store.CandidateAcceptance{
-		CandidateID: acceptanceCandidateID, SessionID: acceptanceSessionID, OperationID: acceptanceUploadID, LeaseOwner: acceptanceCandidateID,
-		UploadDigest: strings.Repeat("c", 64), ValidationReport: string(reportJSON), Version: report.Version,
-		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
-	})
-	if err != nil || !created {
-		return errors.Join(errors.New("candidate acceptance failed"), err)
+	return database.CreateSession(ctx, store.Session{IDHash: acceptanceSessionID, State: store.SessionActive, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(30 * time.Minute), AbsoluteExpiresAt: now.Add(2 * time.Hour)})
+}
+
+type isolatedRoot struct {
+	path   string
+	device uint64
+	inode  uint64
+}
+
+func refuseServiceManager() error {
+	environment := os.Getenv("INVOCATION_ID") != "" || os.Getenv("SYSTEMD_EXEC_PID") != "" || os.Getenv("NOTIFY_SOCKET") != ""
+	parentPID := os.Getppid()
+	parentComm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", parentPID))
+	initComm, _ := os.ReadFile("/proc/1/comm")
+	cgroup, _ := os.ReadFile("/proc/self/cgroup")
+	if systemdExecution(environment, parentPID, string(parentComm), string(initComm), string(cgroup)) {
+		return errors.New("acceptance harness refuses systemd service execution")
 	}
 	return nil
 }
 
-func newFixture(root string) (*upload.Envelope, release.Report, error) {
-	contents := map[string][]byte{
-		"SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg": []byte("acceptance full package\n"),
-		"releases.win-x64-stable.json":                 []byte("acceptance signed release metadata\n"),
+func systemdExecution(environment bool, parentPID int, parentComm, initComm, cgroup string) bool {
+	if environment || parentPID == 1 || strings.EqualFold(strings.TrimSpace(parentComm), "systemd") {
+		return true
 	}
-	names := make([]string, 0, len(contents))
-	for name := range contents {
-		names = append(names, name)
+	if !strings.EqualFold(strings.TrimSpace(initComm), "systemd") {
+		return false
 	}
-	sort.Strings(names)
-	report := release.Report{SchemaVersion: 1, Verified: true, PackageID: "SuperPan.BaiduBatchTransfer", Channel: "win-x64-stable", Version: "1.2.3", FileCount: len(names)}
-	envelope := &upload.Envelope{ExtractionRoot: root}
-	for _, name := range names {
-		path := filepath.Join(root, name)
-		content := contents[name]
-		if err := os.WriteFile(path, content, 0o600); err != nil {
-			return nil, release.Report{}, err
-		}
-		digest := sha256.Sum256(content)
-		file := release.ReportFile{Name: name, Size: int64(len(content)), SHA256: hex.EncodeToString(digest[:])}
-		report.Files = append(report.Files, file)
-		envelope.Entries = append(envelope.Entries, upload.Entry{Name: name, Path: path, Size: file.Size})
-		envelope.ExpandedBytes += file.Size
-	}
-	return envelope, report, nil
+	cgroup = strings.ToLower(cgroup)
+	return strings.Contains(cgroup, "/system.slice/") || strings.Contains(cgroup, ".service")
 }
 
-func validateIsolatedRoot(input string) (string, error) {
+func validateIsolatedRoot(input string) (isolatedRoot, error) {
 	if input == "" || !filepath.IsAbs(input) {
-		return "", errors.New("an absolute isolated root is required")
-	}
-	if os.Getenv("INVOCATION_ID") != "" || os.Getenv("SYSTEMD_EXEC_PID") != "" || os.Getenv("NOTIFY_SOCKET") != "" {
-		return "", errors.New("acceptance harness refuses systemd service execution")
+		return isolatedRoot{}, errors.New("an absolute isolated root is required")
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return "", err
+		return isolatedRoot{}, err
 	}
 	resolvedExecutable, err := filepath.EvalSymlinks(executable)
 	if err != nil {
-		return "", err
+		return isolatedRoot{}, err
 	}
 	if pathWithin(resolvedExecutable, productionServiceRoot) {
-		return "", errors.New("acceptance harness refuses the production service directory")
+		return isolatedRoot{}, errors.New("acceptance harness refuses the production service directory")
 	}
 	clean := filepath.Clean(input)
+	if pathWithin(clean, productionRoot) || pathWithin(productionRoot, clean) {
+		return isolatedRoot{}, errors.New("acceptance harness refuses the production publication tree")
+	}
 	resolved, err := filepath.EvalSymlinks(clean)
 	if err != nil || filepath.Clean(resolved) != clean {
-		return "", errors.New("isolated root cannot use symbolic-link aliases")
+		return isolatedRoot{}, errors.New("isolated root cannot use symbolic-link aliases")
 	}
-	if pathWithin(clean, productionRoot) || pathWithin(productionRoot, clean) {
-		return "", errors.New("acceptance harness refuses the production publication tree")
-	}
-	info, err := os.Lstat(clean)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
-		return "", errors.New("isolated root must be a caller-created private directory")
-	}
-	stat, ok := info.Sys().(*unix.Stat_t)
-	if !ok || int(stat.Uid) != os.Geteuid() {
-		return "", errors.New("isolated root must be owned by the caller")
-	}
-	handle, err := os.Open(clean)
+	fd, err := unix.Open(clean, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return "", err
+		return isolatedRoot{}, errors.New("isolated root must be a caller-created private directory")
+	}
+	handle := os.NewFile(uintptr(fd), clean)
+	defer handle.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o777 != 0o700 || int(stat.Uid) != os.Geteuid() {
+		return isolatedRoot{}, errors.New("isolated root must be owned by the caller and mode 0700")
 	}
 	entries, readErr := handle.ReadDir(1)
-	closeErr := handle.Close()
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return "", readErr
-	}
-	if closeErr != nil {
-		return "", closeErr
+		return isolatedRoot{}, readErr
 	}
 	if len(entries) != 0 {
-		return "", errors.New("isolated root must be empty")
+		return isolatedRoot{}, errors.New("isolated root must be empty")
 	}
-	return clean, nil
+	root := isolatedRoot{path: clean, device: uint64(stat.Dev), inode: stat.Ino}
+	if err := verifyIsolatedRoot(root); err != nil {
+		return isolatedRoot{}, err
+	}
+	return root, nil
+}
+
+func verifyIsolatedRoot(root isolatedRoot) error {
+	var stat unix.Stat_t
+	if err := unix.Lstat(root.path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || uint64(stat.Dev) != root.device || stat.Ino != root.inode {
+		return errors.New("isolated root identity changed")
+	}
+	return nil
 }
 
 func pathWithin(path, root string) bool {

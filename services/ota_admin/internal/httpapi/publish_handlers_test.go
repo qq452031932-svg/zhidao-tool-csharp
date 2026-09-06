@@ -92,6 +92,7 @@ func TestPublishEndpointReturnsSafeStableErrorsWithOperationID(t *testing.T) {
 		{name: "expired", err: store.ErrCandidateExpired, want: http.StatusGone, code: "candidate_expired"},
 		{name: "signature", err: release.ErrSignature, want: http.StatusUnprocessableEntity, code: "signature_mismatch"},
 		{name: "release closure", err: release.ErrManifest, want: http.StatusUnprocessableEntity, code: "release_validation_failed"},
+		{name: "session revoked at commit", err: store.ErrSessionInactive, want: http.StatusUnauthorized, code: "authentication_failed"},
 		{name: "recovery required", err: errors.Join(deploy.ErrReadOnly, deploy.ErrRecoveryRequired), want: http.StatusServiceUnavailable, code: "publish_unavailable"},
 	}
 	for _, test := range tests {

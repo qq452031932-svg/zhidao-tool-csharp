@@ -59,6 +59,30 @@ func TestPublisherRefusesWritesUntilStartupRecoveryCompletes(t *testing.T) {
 	}
 }
 
+func TestPublishRechecksSessionImmediatelyBeforeStableSwitch(t *testing.T) {
+	var database *store.Store
+	publisher, opened, _, root, now := newPublisherHarness(t, func(actual Boundary) error {
+		if actual == BoundaryGenerationsSynced {
+			if err := database.TransitionSession(context.Background(), deploySessionID, store.SessionRevoked); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	database = opened
+	_, err := publisher.PublishForActiveSession(context.Background(), deploySessionID, deployCandidateID, deployPublishID)
+	if !errors.Is(err, store.ErrInvalidTransition) {
+		t.Fatalf("publish error=%v, want persisted failed result", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "stable")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable became public after session revocation: %v", err)
+	}
+	op, found, lookupErr := database.PublishOperationForActiveSession(context.Background(), deploySessionID, deployPublishID, now)
+	if !errors.Is(lookupErr, store.ErrSessionInactive) || found || op.OperationID != "" {
+		t.Fatalf("revoked replay lookup=(%+v,%v,%v)", op, found, lookupErr)
+	}
+}
+
 func (preparer *fixedPreparer) RevalidateForConfirm(context.Context, string, string) (candidate.Prepared, error) {
 	preparer.mu.Lock()
 	defer preparer.mu.Unlock()
@@ -86,6 +110,20 @@ func TestPublishReplayReturnsCommittedResultWithoutRevalidatingConsumedCandidate
 	if err := database.CommitPublishedRelease(context.Background(), store.PublishCommit{Release: store.Release{ID: deployPublishID, Version: report.Version, GenerationName: "release-" + deployPublishID, CommittedAt: now}, OperationID: deployPublishID, CandidateID: deployCandidateID, Assets: assets}); err != nil {
 		t.Fatal(err)
 	}
+	secondCandidate := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	secondPublish := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	if err := database.CreateCandidate(context.Background(), store.Candidate{ID: secondCandidate, SessionID: deploySessionID, State: store.CandidateUploading, CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ValidateCandidate(context.Background(), secondCandidate, strings.Repeat("d", 64), `{"valid":true}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := database.BeginPublishForActiveSession(context.Background(), deploySessionID, secondCandidate, secondPublish, now); err != nil || !created {
+		t.Fatalf("second publish begin created=%v err=%v", created, err)
+	}
+	if err := database.CommitPublishedRelease(context.Background(), store.PublishCommit{Release: store.Release{ID: secondPublish, Version: "1.2.4", GenerationName: "release-" + secondPublish, CommittedAt: now.Add(time.Minute)}, OperationID: secondPublish, CandidateID: secondCandidate, Assets: assets}); err != nil {
+		t.Fatal(err)
+	}
 	first := PublishResult{OperationID: deployPublishID, CandidateID: deployCandidateID, ReleaseID: deployPublishID, Version: report.Version, State: "succeeded"}
 	second, err := publisher.PublishForActiveSession(context.Background(), deploySessionID, deployCandidateID, deployPublishID)
 	if err != nil {
@@ -98,8 +136,65 @@ func TestPublishReplayReturnsCommittedResultWithoutRevalidatingConsumedCandidate
 		t.Fatalf("candidate revalidation calls=%d", preparer.callCount())
 	}
 	current, _, found, err := database.CurrentRelease(context.Background())
-	if err != nil || !found || current.ID != deployPublishID || !current.CommittedAt.Equal(now) {
+	if err != nil || !found || current.ID != secondPublish {
 		t.Fatalf("current=%+v found=%v err=%v", current, found, err)
+	}
+}
+
+func TestPreCommitValidationFailurePersistsOneStableReplayAndAuditCode(t *testing.T) {
+	for _, test := range []struct {
+		name, code string
+		validation error
+		persisted  error
+	}{
+		{name: "signature", code: "signature_mismatch", validation: release.ErrSignature, persisted: release.ErrSignature},
+		{name: "manifest closure", code: "hash_mismatch", validation: release.ErrManifest, persisted: candidate.ErrDigestMismatch},
+		{name: "version floor", code: "version_floor", validation: release.ErrVersionFloor, persisted: release.ErrVersionFloor},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publisher, database, _, _, now := newPublisherHarness(t, nil)
+			publisher.validator = fixedValidator{err: test.validation}
+			for attempt := range 2 {
+				if _, err := publisher.PublishForActiveSession(context.Background(), deploySessionID, deployCandidateID, deployPublishID); !errors.Is(err, test.persisted) {
+					t.Fatalf("attempt %d err=%v", attempt+1, err)
+				}
+			}
+			op, found, err := database.PublishOperationForActiveSession(context.Background(), deploySessionID, deployPublishID, now)
+			if err != nil || !found || op.State != store.OperationFailed || op.ResultCode != test.code {
+				t.Fatalf("operation=%+v found=%v err=%v", op, found, err)
+			}
+		})
+	}
+}
+
+func TestPreCommitCleanupFailureStaysRunningAndRecoversBeforeWritesResume(t *testing.T) {
+	publisher, database, preparer, root, now := newPublisherHarness(t, nil)
+	publisher.validator = fixedValidator{err: release.ErrSignature}
+	publisher.disk.remove = func(string, string) error { return errors.New("injected cleanup refusal") }
+	if _, err := publisher.PublishForActiveSession(context.Background(), deploySessionID, deployCandidateID, deployPublishID); !errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("publish err=%v", err)
+	}
+	if publisher.ReadOnlyError() == nil {
+		t.Fatal("cleanup uncertainty did not enter read-only protection")
+	}
+	op, found, err := database.PublishOperationForActiveSession(context.Background(), deploySessionID, deployPublishID, now)
+	if err != nil || !found || op.State != store.OperationRunning {
+		t.Fatalf("operation=%+v found=%v err=%v", op, found, err)
+	}
+	disk, err := NewDisk(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPublisher(PublisherOptions{Disk: disk, Store: database, Candidates: preparer, Validator: fixedValidator{report: preparer.prepared.Report}, Now: func() time.Time { return now.Add(time.Minute) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	op, found, err = database.PublishOperationForActiveSession(context.Background(), deploySessionID, deployPublishID, now.Add(time.Minute))
+	if err != nil || !found || op.State != store.OperationFailed {
+		t.Fatalf("recovered operation=%+v found=%v err=%v", op, found, err)
 	}
 }
 

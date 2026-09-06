@@ -76,6 +76,27 @@ func TestCommitPublishedReleaseRequiresTheRecoveryIdentityConvention(t *testing.
 	}
 }
 
+func TestCommitPublishedReleaseAtomicallyQueuesPublishedCandidateCleanup(t *testing.T) {
+	s, request := preparedPublish(t)
+	if err := s.CommitPublishedRelease(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM candidate_cleanups WHERE candidate_id=?`, request.CandidateID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CommitPublishedRelease(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var count int
+	if err := s.db.QueryRow(`SELECT state FROM candidate_cleanups WHERE candidate_id=?`, request.CandidateID).Scan(&state); err != nil || state != "pending" {
+		t.Fatalf("cleanup state=%q err=%v", state, err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM candidate_cleanups WHERE candidate_id=?`, request.CandidateID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("cleanup count=%d err=%v", count, err)
+	}
+}
+
 func TestFailPublishRollsBackCandidateOperationAndAuditTogether(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()

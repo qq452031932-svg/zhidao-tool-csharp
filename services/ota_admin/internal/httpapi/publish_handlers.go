@@ -44,7 +44,7 @@ func (router *Router) publishCandidate(response http.ResponseWriter, request *ht
 		switch {
 		case errors.Is(err, deploy.ErrReadOnly):
 			writeCandidateError(response, http.StatusServiceUnavailable, "publish_unavailable", "发布服务正在恢复，请稍后重试", operationID)
-		case errors.Is(err, session.ErrUnauthorized):
+		case errors.Is(err, session.ErrUnauthorized), errors.Is(err, store.ErrSessionInactive):
 			writeCandidateError(response, http.StatusUnauthorized, "authentication_failed", "登录已失效", operationID)
 		case errors.Is(err, candidate.ErrExpired), errors.Is(err, store.ErrCandidateExpired):
 			writeCandidateError(response, http.StatusGone, "candidate_expired", "候选版本已过期", operationID)

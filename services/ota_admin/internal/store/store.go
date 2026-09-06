@@ -1313,6 +1313,12 @@ func requireActiveSessionTx(ctx context.Context, tx *sql.Tx, sessionID string, n
 	return err
 }
 
+func (s *Store) RequireActiveSession(ctx context.Context, sessionID string, now time.Time) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		return requireActiveSessionTx(ctx, tx, sessionID, now)
+	})
+}
+
 func exactLowerHex(value string, length int) bool {
 	if len(value) != length {
 		return false
@@ -1621,7 +1627,7 @@ func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommi
 					return err
 				}
 				if matches {
-					return nil
+					return queuePublishedCandidateCleanup(ctx, tx, request.CandidateID, request.Release.CommittedAt)
 				}
 			}
 			return ErrInvalidTransition
@@ -1655,6 +1661,9 @@ func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommi
 		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='published',release_version=? WHERE id=?`, request.Release.Version, request.CandidateID); err != nil {
 			return err
 		}
+		if err := queuePublishedCandidateCleanup(ctx, tx, request.CandidateID, request.Release.CommittedAt); err != nil {
+			return err
+		}
 		if err := s.publishBoundary("candidate"); err != nil {
 			return err
 		}
@@ -1669,6 +1678,25 @@ func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommi
 		}
 		return s.publishBoundary("audit")
 	})
+}
+
+func queuePublishedCandidateCleanup(ctx context.Context, tx *sql.Tx, candidateID string, at time.Time) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO candidate_cleanups(candidate_id,state,updated_at) VALUES(?,'pending',?) ON CONFLICT(candidate_id) DO NOTHING`, candidateID, timestamp(at))
+	return err
+}
+
+func (s *Store) PublishedRelease(ctx context.Context, id string) (Release, bool, error) {
+	var value Release
+	var committed int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at FROM releases WHERE id=?`, id).Scan(&value.ID, &value.Version, &value.GenerationName, &committed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, false, nil
+	}
+	if err != nil {
+		return Release{}, false, err
+	}
+	value.CommittedAt = time.Unix(committed, 0).UTC()
+	return value, true, nil
 }
 
 func publishedResultMatches(ctx context.Context, tx *sql.Tx, request PublishCommit, version numericVersion) (bool, error) {

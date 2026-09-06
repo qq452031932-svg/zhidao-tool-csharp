@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
+	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
@@ -80,26 +81,25 @@ func (publisher *Publisher) PublishForActiveSession(ctx context.Context, session
 		return PublishResult{}, err
 	}
 	if !created {
-		if op.State == store.OperationSucceeded {
-			return PublishResult{OperationID: operationID, CandidateID: candidateID, ReleaseID: op.ReleaseID, Version: prepared.Report.Version, State: "succeeded"}, nil
-		}
-		if op.State == store.OperationFailed {
-			return PublishResult{}, store.ErrInvalidTransition
-		}
+		return publisher.replayPublishLocked(ctx, op)
 	}
 	releaseID := operationID
-	generation, switched, err := publisher.disk.PublishGeneration(ctx, prepared.Envelope, releaseID, prepared.Report, publisher.validator)
+	generation, switched, err := publisher.disk.PublishGenerationAuthorized(ctx, prepared.Envelope, releaseID, prepared.Report, publisher.validator, func(authContext context.Context) error {
+		return publisher.store.RequireActiveSession(authContext, sessionID, publisher.now().UTC())
+	})
 	if err != nil {
 		if switched {
 			publisher.protect(err)
-		} else if errors.Is(err, ErrCrashSimulation) {
+		} else if errors.Is(err, ErrCrashSimulation) || errors.Is(err, ErrCleanupIncomplete) {
 			publisher.protect(err)
 		} else {
-			if failureErr := publisher.store.FailPublish(context.Background(), operationID, candidateID, "internal_failure", publisher.now().UTC()); failureErr != nil {
+			failureCode := normalizedPublishFailureCode(err)
+			if failureErr := publisher.store.FailPublish(context.Background(), operationID, candidateID, failureCode, publisher.now().UTC()); failureErr != nil {
 				combined := errors.Join(err, failureErr)
 				publisher.protect(combined)
 				return PublishResult{}, combined
 			}
+			return PublishResult{}, errors.Join(persistedPublishFailure(failureCode), err)
 		}
 		return PublishResult{}, err
 	}
@@ -119,17 +119,47 @@ func (publisher *Publisher) replayPublishLocked(ctx context.Context, operation s
 		}
 	}
 	if operation.State == store.OperationFailed {
-		return PublishResult{}, store.ErrInvalidTransition
+		return PublishResult{}, persistedPublishFailure(operation.ResultCode)
 	}
-	current, _, found, err := publisher.store.CurrentRelease(ctx)
 	expectedReleaseID := operation.ReleaseID
-	if operation.State == store.OperationRunning {
+	if expectedReleaseID == "" {
 		expectedReleaseID = operation.OperationID
 	}
-	if err != nil || !found || current.ID != expectedReleaseID {
+	published, found, err := publisher.store.PublishedRelease(ctx, expectedReleaseID)
+	if err != nil || !found {
 		return PublishResult{}, errors.Join(err, store.ErrInvalidTransition)
 	}
-	return PublishResult{OperationID: operation.OperationID, CandidateID: operation.CandidateID, ReleaseID: current.ID, Version: current.Version, State: "succeeded"}, nil
+	return PublishResult{OperationID: operation.OperationID, CandidateID: operation.CandidateID, ReleaseID: published.ID, Version: published.Version, State: "succeeded"}, nil
+}
+
+func normalizedPublishFailureCode(err error) string {
+	switch {
+	case errors.Is(err, release.ErrSignature):
+		return "signature_mismatch"
+	case errors.Is(err, release.ErrVersionFloor):
+		return "version_floor"
+	case errors.Is(err, candidate.ErrDigestMismatch):
+		return "hash_mismatch"
+	case errors.Is(err, release.ErrManifest), errors.Is(err, release.ErrMetadata), errors.Is(err, release.ErrCatalog), errors.Is(err, release.ErrReleasesIndex):
+		// The v2 operations/audit schema intentionally exposes the structural
+		// release gate through its hash/closure mismatch bucket.
+		return "hash_mismatch"
+	default:
+		return "internal_failure"
+	}
+}
+
+func persistedPublishFailure(code string) error {
+	switch code {
+	case "signature_mismatch":
+		return release.ErrSignature
+	case "version_floor":
+		return release.ErrVersionFloor
+	case "hash_mismatch":
+		return candidate.ErrDigestMismatch
+	default:
+		return store.ErrInvalidTransition
+	}
 }
 
 func (publisher *Publisher) ReadOnlyError() error {
