@@ -119,7 +119,8 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("backup_target \"$ACTIVE_VHOST\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_persistent_target \"$HMAC_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_persistent_target \"$INITIAL_PASSWORD_FILE\"", install, StringComparison.Ordinal);
-        Assert.Contains("backup_persistent_target \"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
+        Assert.DoesNotContain("backup_persistent_target \"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
+        Assert.Contains("transient-targets.txt", install, StringComparison.Ordinal);
         Assert.DoesNotContain("backup_target \"$HMAC_TARGET\"", install, StringComparison.Ordinal);
         Assert.DoesNotContain("backup_target \"$INITIAL_PASSWORD_FILE\"", install, StringComparison.Ordinal);
         Assert.Contains("persistent-new-targets.txt", install, StringComparison.Ordinal);

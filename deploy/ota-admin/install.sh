@@ -196,7 +196,14 @@ backup_target "$CERTIFICATE_TARGET" "publisher.cer"
 backup_target "$ACTIVE_VHOST" "ota.fanfh.cn.conf"
 backup_persistent_target "$HMAC_TARGET" "source-hmac.key"
 backup_persistent_target "$INITIAL_PASSWORD_FILE" "superpan-ota-admin.initial-password"
-backup_persistent_target "$PASSWORD_TEMP" "superpan-ota-admin.initial-password.new"
+# The .new path is transaction recovery media, not rollback state. Restoring an
+# older temporary password while retaining a newer DB administrator would lock
+# out the operator, so only record its pre-install presence for the audit trail.
+if [ -e "$PASSWORD_TEMP" ] || [ -L "$PASSWORD_TEMP" ]; then
+    printf 'present %s\n' "$PASSWORD_TEMP" >"${BACKUP_DIR}/transient-targets.txt"
+else
+    printf 'absent %s\n' "$PASSWORD_TEMP" >"${BACKUP_DIR}/transient-targets.txt"
+fi
 sha256sum -- "$ACTIVE_VHOST" >"${BACKUP_DIR}/ota.fanfh.cn.conf.sha256"
 stat -c '%u %g %a %n' "$RELEASE_ROOT" >"${BACKUP_DIR}/release-directory-metadata.txt"
 if [ "$GENERATIONS_EXISTED" = true ]; then

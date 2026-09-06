@@ -63,7 +63,7 @@ export EXPECTED_CERT_SHA256 EXPECTED_HEALTH_SHA256 STABLE_PROBE_URL EXPECTED_STA
 
 安装器在任何持久化修改前校验二进制、证书及 SPKI；重复执行会保留已有 HMAC 密钥和数据库。配置为 `root:superpan-ota-admin`、`0640`，状态目录为服务用户独占的 `0700`。32 字节 source HMAC 密钥只写入 root 管理的配置目录，不输出。管理员初始化以数据库中的管理员记录为准，而不是以数据库文件是否存在为准；幂等重试可修复“数据库已创建但管理员尚未写入”的中断状态。一次性密码只写入 root-only 的 `/root/superpan-ota-admin.initial-password`，不会经过 systemd 或 journald；安全的中断临时文件会恢复或清空后重试。
 
-每次执行只逐个备份管理后台的二进制、service/mount unit、include、配置、公开证书、HMAC、一次性密码文件及其中断临时文件，以及本次手工加入 include 后的 OTA vhost 和只读哈希；两个 unit 原先的 enabled 与 active 状态分别写入 `unit-enabled-state.txt` 和 `unit-active-state.txt`。数据库不会回滚，因此首次安装新建的 HMAC 和一次性密码也不会作为 absent 目标删除；它们记录在 `persistent-new-targets.txt`，与保留的数据库同生命周期。备份固定存放在校验为 `root:root`、`0700` 的 `/var/backups/superpan-ota-admin`，不接受任意备份根参数。成功与备份后发生的任何失败都会显示精确备份目录和回滚提示。安装器不会改写 vhost 的任何内容。发布代、stable 链接和静态站点不进入安装备份。`releases/win-x64` 与 `generations` 由专用服务用户拥有并保持 `0755`：只有 owner 可发布，Nginx 仍可只读下载，且满足服务启动时对 group/other 不可写的校验。
+每次执行只逐个备份管理后台的二进制、service/mount unit、include、配置、公开证书、HMAC、一次性密码文件，以及本次手工加入 include 后的 OTA vhost 和只读哈希；两个 unit 原先的 enabled 与 active 状态分别写入 `unit-enabled-state.txt` 和 `unit-active-state.txt`。数据库不会回滚，因此首次安装新建的 HMAC 和一次性密码也不会作为 absent 目标删除；它们记录在 `persistent-new-targets.txt`，与保留的数据库同生命周期。`.new` 密码临时文件只在 `transient-targets.txt` 记录是否存在，不备份也不恢复，避免旧临时密码与保留的新管理员哈希错配。备份固定存放在校验为 `root:root`、`0700` 的 `/var/backups/superpan-ota-admin`，不接受任意备份根参数。成功与备份后发生的任何失败都会显示精确备份目录和回滚提示。安装器不会改写 vhost 的任何内容。发布代、stable 链接和静态站点不进入安装备份。`releases/win-x64` 与 `generations` 由专用服务用户拥有并保持 `0755`：只有 owner 可发布，Nginx 仍可只读下载，且满足服务启动时对 group/other 不可写的校验。
 
 安装器重启服务后先等待 `systemctl is-active` 和 loopback `/admin/` 同时就绪，最多 30 秒；只有就绪且 `nginx -t` 已通过才 reload Nginx。服务未就绪时现有 Nginx 配置不会被 reload。
 
