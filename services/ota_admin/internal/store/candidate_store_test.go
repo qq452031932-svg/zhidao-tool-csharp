@@ -11,16 +11,30 @@ import (
 
 const candidateID2 = "55555555-5555-4555-8555-555555555555"
 
+func reserveCandidateAcceptance(t *testing.T, s *Store, request CandidateAcceptance) CandidateAcceptance {
+	t.Helper()
+	request.LeaseOwner = request.CandidateID
+	_, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: request.CandidateID, SessionID: request.SessionID, OperationID: request.OperationID, LeaseOwner: request.LeaseOwner,
+		CreatedAt: request.CreatedAt, ExpiresAt: request.ExpiresAt, LeaseExpiresAt: request.CreatedAt.Add(5 * time.Minute),
+	})
+	if err != nil || !created {
+		t.Fatalf("reserve candidate created=%v err=%v", created, err)
+	}
+	return request
+}
+
 func TestAcceptCandidateForActiveSessionBindsEvidenceAndUploadOperationAtomically(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(time.Hour))
 
-	record, created, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+	request := reserveCandidateAcceptance(t, s, CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"schemaVersion":1,"verified":true,"version":"1.2.3"}`,
 		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
 	})
+	record, created, err := s.AcceptCandidateForActiveSession(context.Background(), request)
 	if err != nil || !created {
 		t.Fatalf("accept created=%v err=%v", created, err)
 	}
@@ -71,7 +85,7 @@ func TestAcceptCandidateForActiveSessionRejectsRevokedAndExpiredSessionsWithoutP
 			_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 				CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 				UploadDigest: digest1, ValidationReport: `{"schemaVersion":1,"verified":true,"version":"1.2.3"}`,
-				Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
+				Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now, LeaseOwner: candidateID1,
 			})
 			if !errors.Is(err, ErrSessionInactive) {
 				t.Fatalf("err=%v, want %v", err, ErrSessionInactive)
@@ -93,11 +107,11 @@ func TestAcceptCandidateUsesFreshCommitTimeForNewAndReservedOperations(t *testin
 			now := time.Unix(2_000_000_000, 0).UTC()
 			createCandidateSession(t, s, sessionHash1, now, now.Add(time.Minute))
 			if reserved {
-				if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+				if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(time.Minute)})
+			_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(time.Minute)})
 			if !errors.Is(err, ErrSessionInactive) {
 				t.Fatalf("err=%v", err)
 			}
@@ -116,7 +130,7 @@ func TestAcceptCandidateRejectsUnverifiedValidationReport(t *testing.T) {
 	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"verified":false,"version":"1.2.3"}`,
-		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
+		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now, LeaseOwner: candidateID1,
 	})
 	if err == nil {
 		t.Fatal("unverified report accepted")
@@ -128,10 +142,8 @@ func TestAcceptCandidateOperationIDIsConcurrentAndSessionBoundIdempotent(t *test
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
 	createCandidateSession(t, s, sessionHash2, now, now.Add(time.Hour))
-	requests := []CandidateAcceptance{
-		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now},
-		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now},
-	}
+	request := reserveCandidateAcceptance(t, s, CandidateAcceptance{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now})
+	requests := []CandidateAcceptance{request, request}
 	var wait sync.WaitGroup
 	results := make(chan CandidateRecord, len(requests))
 	errorsSeen := make(chan error, len(requests))
@@ -172,8 +184,8 @@ func TestReserveCandidateAtomicallyClaimsIdempotencyKeyBeforeUpload(t *testing.T
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
 	requests := []CandidateReservation{
-		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
-		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
+		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)},
+		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID2, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)},
 	}
 	var wait sync.WaitGroup
 	created := make(chan bool, 2)
@@ -237,6 +249,16 @@ func TestUploadOwnerLeaseRenewsAndAnExpiredReplayTerminalizesWithoutReceivingAga
 	})
 	if err != nil || !acquired || first.LeaseOwner != releaseID1 {
 		t.Fatalf("first=%+v acquired=%v err=%v", first, acquired, err)
+	}
+	if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "operation_failed", now.Add(time.Minute), ""); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("empty owner fail err=%v", err)
+	}
+	if _, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3",
+		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(time.Minute),
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("empty owner accept err=%v", err)
 	}
 	active, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
 		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
@@ -314,12 +336,16 @@ func TestPendingUploadWithoutLeaseIsRecoveredAsTerminalFailureOnReplay(t *testin
 	if _, err := s.db.Exec(`DELETE FROM candidate_upload_leases WHERE operation_id=?`, operationID1); err != nil {
 		t.Fatal(err)
 	}
-	replayed, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+	_, acquired, err = s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
 		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
 		CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(6 * time.Minute),
 	})
-	if err != nil || acquired || replayed.State != CandidateFailed || replayed.OperationState != OperationFailed || replayed.ResultCode != "operation_failed" {
-		t.Fatalf("replayed=%+v acquired=%v err=%v", replayed, acquired, err)
+	if !errors.Is(err, ErrUploadLeaseRecoveryRequired) || acquired {
+		t.Fatalf("reserve acquired=%v err=%v", acquired, err)
+	}
+	replayed, err := s.RecoverUnleasedCandidateForActiveSession(context.Background(), sessionHash1, operationID1, now.Add(time.Minute))
+	if err != nil || replayed.State != CandidateFailed || replayed.OperationState != OperationFailed || replayed.ResultCode != "operation_failed" {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
 	}
 }
 
@@ -327,14 +353,14 @@ func TestFailedReservationIsTerminalAndReplayable(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
-	if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+	if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "internal_failure", now.Add(time.Second))
+	failed, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "internal_failure", now.Add(time.Second), candidateID1)
 	if err != nil || failed.State != CandidateFailed || failed.OperationState != OperationFailed {
 		t.Fatalf("failed=%+v err=%v", failed, err)
 	}
-	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(2 * time.Second), ExpiresAt: now.Add(24 * time.Hour)})
+	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID2, CreatedAt: now.Add(2 * time.Second), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)})
 	if err != nil || created || replayed.ID != candidateID1 || replayed.ResultCode != "operation_failed" {
 		t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
 	}
@@ -347,10 +373,10 @@ func TestFailedValidationRecordsSeparateTruthfulGateAndUploadTerminalAudits(t *t
 	for index, code := range []string{"signature_mismatch", "version_floor", "hash_mismatch", "internal_failure"} {
 		candidateID := fmt.Sprintf("%08d-1111-4111-8111-%012d", index+1, index+1)
 		operationID := fmt.Sprintf("%08d-2222-4222-8222-%012d", index+1, index+1)
-		if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID, SessionID: sessionHash1, OperationID: operationID, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+		if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID, SessionID: sessionHash1, OperationID: operationID, LeaseOwner: candidateID, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute)}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID, code, now.Add(time.Second)); err != nil {
+		if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID, code, now.Add(time.Second), candidateID); err != nil {
 			t.Fatal(err)
 		}
 		var gateCode, uploadCode string
@@ -374,10 +400,11 @@ func TestUploadReplayRemainsValidatedAfterLaterPublishFailure(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
-	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+	request := reserveCandidateAcceptance(t, s, CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(time.Hour), CommittedAt: now,
 	})
+	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +423,7 @@ func TestUploadReplayRemainsValidatedAfterLaterPublishFailure(t *testing.T) {
 	if _, err := s.db.Exec(`UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=?`, timestamp(now.Add(time.Second)), releaseID1); err != nil {
 		t.Fatal(err)
 	}
-	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Hour)})
+	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: candidateID2, CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Hour), LeaseExpiresAt: now.Add(6 * time.Minute)})
 	if err != nil || created || replayed.State != CandidateValidated || replayed.OperationState != OperationSucceeded || replayed.ResultCode != "completed" {
 		t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
 	}
@@ -407,10 +434,11 @@ func TestCandidateConfirmReadAndExpiryAreSessionBoundTransactions(t *testing.T) 
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
 	createCandidateSession(t, s, sessionHash2, now, now.Add(time.Hour))
-	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+	request := reserveCandidateAcceptance(t, s, CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(30 * time.Minute), CommittedAt: now,
 	})
+	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,10 +459,11 @@ func TestCandidateStatusReadIsSessionBoundButAllowsExpiredState(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
 	createCandidateSession(t, s, sessionHash2, now, now.Add(2*time.Hour))
-	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+	request := reserveCandidateAcceptance(t, s, CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(time.Minute), CommittedAt: now,
 	})
+	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}

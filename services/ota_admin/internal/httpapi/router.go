@@ -39,9 +39,9 @@ type UploadReceiver interface {
 type EnvelopeAcceptor interface {
 	ReserveEnvelopeForActiveSession(context.Context, string, string) (candidate.Summary, bool, error)
 	RenewEnvelopeLeaseForActiveSession(context.Context, string, string, string) error
-	FailEnvelopeForActiveSession(context.Context, string, string, string, ...string) (candidate.Summary, error)
+	FailEnvelopeForActiveSession(context.Context, string, string, string, string) (candidate.Summary, error)
 	CandidateForOperationForActiveSession(context.Context, string, string) (candidate.Summary, bool, error)
-	AcceptEnvelopeForActiveSession(context.Context, string, string, *upload.Envelope, ...string) (candidate.Summary, error)
+	AcceptEnvelopeForActiveSession(context.Context, string, string, *upload.Envelope, string) (candidate.Summary, error)
 	CurrentForActiveSession(context.Context, string) (candidate.Summary, error)
 	StatusForActiveSession(context.Context, string, string) (candidate.Summary, error)
 }

@@ -9,6 +9,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/release"
 	"fanfh.cn/superpan/ota-admin/internal/session"
+	"fanfh.cn/superpan/ota-admin/internal/store"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
@@ -41,8 +42,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	defer stopLease()
 	envelope, err := router.uploads.Receive(receiveContext, request.Body, request.ContentLength)
 	if err != nil {
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, uploadPublicFailureCode(err)) {
-			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, uploadPublicFailureCode(err)) {
 			return
 		}
 		writeUploadError(response, err)
@@ -52,8 +52,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		if envelope != nil {
 			_ = envelope.Cleanup()
 		}
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
 			return
 		}
 		writeError(response, http.StatusInternalServerError, "operation_failed")
@@ -61,8 +60,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	}
 	if err := router.uploadEnvelopes.RenewEnvelopeLeaseForActiveSession(request.Context(), principal.IDHash, operationID, leaseOwner); err != nil {
 		_ = envelope.Cleanup()
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
 			return
 		}
 		writeUploadOperationError(response, err, operationID)
@@ -74,8 +72,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		if err == nil {
 			err = session.ErrUnauthorized
 		}
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
 			return
 		}
 		writeUploadError(response, err)
@@ -84,8 +81,7 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope, leaseOwner)
 	if err != nil {
 		_ = envelope.Cleanup()
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, candidatePublicFailureCode(err)) {
-			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, candidatePublicFailureCode(err)) {
 			return
 		}
 		writeUploadOperationError(response, err, operationID)
@@ -94,11 +90,23 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	writeReservedCandidateResult(response, summary)
 }
 
-func (router *Router) terminalizeUploadFailure(sessionID, operationID, leaseOwner, code string) bool {
+func (router *Router) ensureUploadFailureRecorded(response http.ResponseWriter, sessionID, operationID, leaseOwner, code string) bool {
 	finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code, leaseOwner)
-	return err == nil
+	summary, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code, leaseOwner)
+	if err == nil {
+		return true
+	}
+	summary, found, lookupErr := router.uploadEnvelopes.CandidateForOperationForActiveSession(finishContext, sessionID, operationID)
+	if lookupErr != nil || !found {
+		writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+		return false
+	}
+	if summary.State == string(store.CandidateUploading) {
+		writeReservedCandidateResult(response, summary)
+		return false
+	}
+	return true
 }
 
 func (router *Router) maintainUploadLease(parent context.Context, sessionID, operationID, leaseOwner string) (context.Context, func()) {
@@ -136,6 +144,7 @@ func (router *Router) maintainUploadLease(parent context.Context, sessionID, ope
 func writeReservedCandidateResult(response http.ResponseWriter, summary candidate.Summary) {
 	if summary.State != "failed" {
 		if summary.State == "uploading" {
+			response.Header().Set("Retry-After", "5")
 			writeCandidateError(response, http.StatusConflict, "upload_in_progress", "上传处理中，请稍后重试", summary.OperationID)
 			return
 		}

@@ -71,7 +71,7 @@ func (acceptor *fakeEnvelopeAcceptor) RenewEnvelopeLeaseForActiveSession(context
 	return nil
 }
 
-func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string, _ ...string) (candidate.Summary, error) {
+func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code, _ string) (candidate.Summary, error) {
 	acceptor.failCalls++
 	if acceptor.failErr != nil {
 		return candidate.Summary{}, acceptor.failErr
@@ -81,7 +81,7 @@ func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Con
 	return failed, nil
 }
 
-func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope, _ ...string) (candidate.Summary, error) {
+func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope, _ string) (candidate.Summary, error) {
 	acceptor.calls++
 	acceptor.sessionID = sessionID
 	acceptor.operationID = operationID
@@ -274,7 +274,7 @@ func TestUploadEndpointTerminalizesEveryPostReservationFailure(t *testing.T) {
 	}
 }
 
-func TestUploadEndpointDoesNotReportOriginalFailureBeforeTerminalizationCommits(t *testing.T) {
+func TestUploadEndpointReportsPersistedPendingStateWhenTerminalizationDoesNotCommit(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
 	acceptor := &fakeEnvelopeAcceptor{failErr: errors.New("injected persistence failure")}
@@ -282,12 +282,12 @@ func TestUploadEndpointDoesNotReportOriginalFailureBeforeTerminalizationCommits(
 	cookie, csrf, _, _ := login(t, h, oldPassword)
 	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
 	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
-	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" || acceptor.failCalls != 1 {
+	if response.Code != http.StatusConflict || decodeBody(t, response)["code"] != "upload_in_progress" || response.Header().Get("Retry-After") == "" || acceptor.failCalls != 1 {
 		t.Fatalf("status=%d failCalls=%d body=%s", response.Code, acceptor.failCalls, response.Body.String())
 	}
 }
 
-func TestUploadEndpointReplaysARecoverableTerminalResultAfterFailurePersistenceWasLost(t *testing.T) {
+func TestUploadEndpointReturnsTheSamePendingResultOnImmediateReplayWhenFailurePersistenceWasLost(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
 	acceptor := &fakeEnvelopeAcceptor{failErr: errors.New("injected persistence failure")}
@@ -296,13 +296,17 @@ func TestUploadEndpointReplaysARecoverableTerminalResultAfterFailurePersistenceW
 	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
 
 	first := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
-	if first.Code != http.StatusInternalServerError || receiver.calls != 1 {
+	firstBody := decodeBody(t, first)
+	if first.Code != http.StatusConflict || firstBody["code"] != "upload_in_progress" || first.Header().Get("Retry-After") == "" || receiver.calls != 1 {
 		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
 	}
-	acceptor.takeoverExpired = true
 	replayed := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
-	if replayed.Code != http.StatusInternalServerError || decodeBody(t, replayed)["code"] != "operation_failed" || receiver.calls != 1 {
+	replayBody := decodeBody(t, replayed)
+	if replayed.Code != http.StatusConflict || replayBody["code"] != "upload_in_progress" || replayed.Header().Get("Retry-After") == "" || receiver.calls != 1 {
 		t.Fatalf("replay status=%d receiver=%d body=%s", replayed.Code, receiver.calls, replayed.Body.String())
+	}
+	if firstBody["code"] != replayBody["code"] || firstBody["operation_id"] != replayBody["operation_id"] {
+		t.Fatalf("first=%v replay=%v", firstBody, replayBody)
 	}
 }
 

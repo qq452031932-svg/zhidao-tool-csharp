@@ -31,7 +31,7 @@ func TestAcceptEnvelopeValidatesAdoptsAndPersistsForActiveSession(t *testing.T) 
 	envelope := receiveGolden(t, staging)
 	originalArchive, originalExtraction := envelope.ArchivePath, envelope.ExtractionRoot
 
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope)
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,10 +61,28 @@ func TestAcceptEnvelopeValidatesAdoptsAndPersistsForActiveSession(t *testing.T) 
 	}
 }
 
+func TestAcceptEnvelopeRequiresTheExactUploadLeaseOwner(t *testing.T) {
+	service, _, staging, _ := newCandidateHarness(t)
+	envelope := receiveGolden(t, staging)
+	reserved, acquired, err := service.ReserveEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID)
+	if err != nil || !acquired || reserved.LeaseOwner == "" {
+		t.Fatalf("reserved=%+v acquired=%v err=%v", reserved, acquired, err)
+	}
+	if _, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope, ""); err == nil {
+		t.Fatal("empty lease owner accepted")
+	}
+	if _, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope, "33333333-3333-4333-8333-333333333333"); err == nil {
+		t.Fatal("wrong lease owner accepted")
+	}
+	if _, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope, reserved.LeaseOwner); err != nil {
+		t.Fatalf("exact lease owner rejected: %v", err)
+	}
+}
+
 func TestCandidateOperationLookupIsIdempotentAndSessionBound(t *testing.T) {
 	service, database, staging, now := newCandidateHarness(t)
 	envelope := receiveGolden(t, staging)
-	accepted, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope)
+	accepted, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +92,7 @@ func TestCandidateOperationLookupIsIdempotentAndSessionBound(t *testing.T) {
 	}
 	retryEnvelope := receiveGolden(t, staging)
 	retryArchive, retryExtraction := retryEnvelope.ArchivePath, retryEnvelope.ExtractionRoot
-	retried, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, retryEnvelope)
+	retried, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, retryEnvelope)
 	if err != nil || retried.CandidateID != accepted.CandidateID {
 		t.Fatalf("retried=%+v err=%v", retried, err)
 	}
@@ -94,7 +112,7 @@ func TestCandidateOperationLookupIsIdempotentAndSessionBound(t *testing.T) {
 
 func TestTerminalUploadReplayIgnoresCallerCleanupFailure(t *testing.T) {
 	service, _, staging, _ := newCandidateHarness(t)
-	accepted, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	accepted, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +126,7 @@ func TestTerminalUploadReplayIgnoresCallerCleanupFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(retry.ArchivePath, "cannot-remove"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, retry)
+	replayed, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, retry)
 	if err != nil || replayed.CandidateID != accepted.CandidateID || replayed.State != string(store.CandidateValidated) {
 		t.Fatalf("replayed=%+v err=%v", replayed, err)
 	}
@@ -127,7 +145,7 @@ func TestAcceptEnvelopeRechecksSessionTransactionallyAndDoesNotAdoptOnKnownRevoc
 	if err := database.TransitionSession(context.Background(), testSessionID, store.SessionRevoked); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope); !errors.Is(err, session.ErrUnauthorized) {
+	if _, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, envelope); !errors.Is(err, session.ErrUnauthorized) {
 		t.Fatalf("err=%v", err)
 	}
 	if _, err := os.Stat(envelope.ArchivePath); err != nil {
@@ -138,7 +156,7 @@ func TestAcceptEnvelopeRechecksSessionTransactionallyAndDoesNotAdoptOnKnownRevoc
 func TestRevalidateForConfirmRehashesArchiveAndFullExtractedClosure(t *testing.T) {
 	t.Run("accepted", func(t *testing.T) {
 		service, _, staging, _ := newCandidateHarness(t)
-		summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+		summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -149,7 +167,7 @@ func TestRevalidateForConfirmRehashesArchiveAndFullExtractedClosure(t *testing.T
 	})
 	t.Run("archive replaced", func(t *testing.T) {
 		service, _, staging, _ := newCandidateHarness(t)
-		summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+		summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +180,7 @@ func TestRevalidateForConfirmRehashesArchiveAndFullExtractedClosure(t *testing.T
 	})
 	t.Run("extracted file changed", func(t *testing.T) {
 		service, _, staging, _ := newCandidateHarness(t)
-		summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+		summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 		if err != nil {
 			t.Fatal(err)
 		}

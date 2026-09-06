@@ -111,28 +111,28 @@ func secureStagingRoot(path string) (string, error) {
 	return root, nil
 }
 
-func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string, envelope *upload.Envelope, leaseOwners ...string) (Summary, error) {
+func (service *Service) AcceptNewEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string, envelope *upload.Envelope) (Summary, error) {
+	reserved, acquired, err := service.ReserveEnvelopeForActiveSession(ctx, sessionID, operationID)
+	if err != nil {
+		return Summary{}, err
+	}
+	if !acquired {
+		_ = envelope.Cleanup()
+		if reserved.State != string(store.CandidateUploading) {
+			return reserved, nil
+		}
+		return Summary{}, ErrUploadInProgress
+	}
+	return service.AcceptEnvelopeForActiveSession(ctx, sessionID, operationID, envelope, reserved.LeaseOwner)
+}
+
+func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string, envelope *upload.Envelope, leaseOwner string) (Summary, error) {
 	if service == nil || envelope == nil || envelope.Verified || !canonicalUUID.MatchString(operationID) {
 		return Summary{}, errors.New("candidate request is invalid")
 	}
-	if len(leaseOwners) > 1 || len(leaseOwners) == 1 && !canonicalUUID.MatchString(leaseOwners[0]) {
+	if !canonicalUUID.MatchString(leaseOwner) {
 		return Summary{}, errors.New("candidate upload lease owner is invalid")
 	}
-	if len(leaseOwners) == 0 {
-		reserved, acquired, err := service.ReserveEnvelopeForActiveSession(ctx, sessionID, operationID)
-		if err != nil {
-			return Summary{}, err
-		}
-		if !acquired {
-			_ = envelope.Cleanup()
-			if reserved.State != string(store.CandidateUploading) {
-				return reserved, nil
-			}
-			return Summary{}, ErrUploadInProgress
-		}
-		return service.AcceptEnvelopeForActiveSession(ctx, sessionID, operationID, envelope, reserved.LeaseOwner)
-	}
-	leaseOwner := leaseOwners[0]
 	now := service.now().UTC()
 	existing, found, err := service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, now)
 	if err != nil {
@@ -216,8 +216,8 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	return summaryFromRecord(accepted)
 }
 
-func (service *Service) FailEnvelopeForActiveSession(ctx context.Context, sessionID, operationID, code string, leaseOwners ...string) (Summary, error) {
-	record, err := service.store.FailReservedCandidate(ctx, sessionID, operationID, code, service.now().UTC(), leaseOwners...)
+func (service *Service) FailEnvelopeForActiveSession(ctx context.Context, sessionID, operationID, code, leaseOwner string) (Summary, error) {
+	record, err := service.store.FailReservedCandidate(ctx, sessionID, operationID, code, service.now().UTC(), leaseOwner)
 	if err != nil {
 		return Summary{}, mapStoreError(err)
 	}
@@ -272,6 +272,10 @@ func (service *Service) ReserveEnvelopeForActiveSession(ctx context.Context, ses
 		return Summary{}, false, err
 	}
 	record, created, err := service.store.ReserveCandidateForActiveSession(ctx, store.CandidateReservation{CandidateID: candidateID, SessionID: sessionID, OperationID: operationID, LeaseOwner: leaseOwner, CreatedAt: now, ExpiresAt: now.Add(service.lifetime), LeaseExpiresAt: now.Add(uploadLeaseDuration)})
+	if errors.Is(err, store.ErrUploadLeaseRecoveryRequired) {
+		record, err = service.store.RecoverUnleasedCandidateForActiveSession(ctx, sessionID, operationID, now)
+		created = false
+	}
 	if err != nil {
 		return Summary{}, false, mapStoreError(err)
 	}

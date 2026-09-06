@@ -21,6 +21,9 @@ var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply:
 const schemaVersion = 5
 
 var schemaV5 = `
+UPDATE candidate_cleanup_attempts
+SET started_at=(SELECT o.created_at FROM operations o WHERE o.id=candidate_cleanup_attempts.operation_id)
+WHERE started_at<>(SELECT o.created_at FROM operations o WHERE o.id=candidate_cleanup_attempts.operation_id);
 CREATE TABLE candidate_upload_leases (
     operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
     candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id) ON DELETE RESTRICT,

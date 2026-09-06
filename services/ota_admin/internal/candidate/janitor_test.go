@@ -16,7 +16,7 @@ import (
 
 func TestJanitorExpiresAndDeletesOnlyDerivedCandidatePaths(t *testing.T) {
 	service, database, staging, now := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestJanitorExpiresAndDeletesOnlyDerivedCandidatePaths(t *testing.T) {
 
 func TestJanitorAuditsFailureAndRetriesCleanup(t *testing.T) {
 	service, database, staging, now := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestJanitorAuditsFailureAndRetriesCleanup(t *testing.T) {
 
 func TestJanitorCompletesLedgerWhenPathsAlreadyDeletedAfterAuditFailure(t *testing.T) {
 	service, database, staging, base := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestJanitorCompletesLedgerWhenPathsAlreadyDeletedAfterAuditFailure(t *testi
 
 func TestJanitorRefusesUnexpectedExtractionMembersAndStartDoesNotBlock(t *testing.T) {
 	service, database, staging, now := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestJanitorRawArtifactScanCannotStarveBehindMoreThanOnePage(t *testing.T) {
 
 func TestJanitorUsesFreshTimeWhenClaimingExpiredCleanupLease(t *testing.T) {
 	service, database, staging, base := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestJanitorUsesFreshTimeWhenClaimingExpiredCleanupLease(t *testing.T) {
 
 func TestJanitorRequeuesCompletedCleanupWhenLateAdoptionRestoresCandidatePaths(t *testing.T) {
 	service, database, staging, base := newCandidateHarness(t)
-	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	summary, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestJanitorRequeuesCompletedCleanupWhenLateAdoptionRestoresCandidatePaths(t
 
 func TestJanitorContinuesPastOneCleanupFailureAndBacksOffItsRetry(t *testing.T) {
 	service, database, staging, base := newCandidateHarness(t)
-	first, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	first, err := service.AcceptNewEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
 	if err != nil {
 		t.Fatal(err)
 	}

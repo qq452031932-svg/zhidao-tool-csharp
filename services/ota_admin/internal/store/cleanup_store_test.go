@@ -10,6 +10,33 @@ import (
 	"time"
 )
 
+// deployedSchemaV4Snapshot is the exact v4 migration shipped before v5. Its
+// backfill used candidate_cleanups.updated_at for started_at; v5 must repair it.
+const deployedSchemaV4Snapshot = `
+CREATE TABLE candidate_upload_failures (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id) ON DELETE RESTRICT,
+    public_code TEXT NOT NULL CHECK (public_code IN ('signature_mismatch','version_floor','release_validation_failed','invalid_zip_envelope','upload_too_large','insufficient_storage','operation_failed','candidate_expired'))
+);
+CREATE TABLE candidate_cleanup_attempts (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE RESTRICT,
+    attempt_number INTEGER NOT NULL CHECK (typeof(attempt_number) = 'integer' AND attempt_number >= 0 AND attempt_number > 0),
+    started_at INTEGER NOT NULL CHECK (typeof(started_at) = 'integer' AND started_at >= 0),
+    finished_at INTEGER CHECK (finished_at IS NULL OR (typeof(finished_at) = 'integer' AND finished_at >= 0)),
+    outcome TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','success','failure')),
+    CHECK ((outcome='' AND finished_at IS NULL) OR (outcome<>'' AND finished_at IS NOT NULL)),
+    UNIQUE(candidate_id,attempt_number)
+);
+CREATE INDEX candidate_cleanup_attempts_candidate ON candidate_cleanup_attempts(candidate_id,attempt_number);
+INSERT INTO candidate_cleanup_attempts(operation_id,candidate_id,attempt_number,started_at,finished_at,outcome)
+SELECT x.operation_id,x.candidate_id,x.attempt_count,x.updated_at,
+       CASE WHEN o.state IN ('succeeded','failed') THEN o.finished_at ELSE NULL END,
+       CASE WHEN o.state='succeeded' THEN 'success' WHEN o.state='failed' THEN 'failure' ELSE '' END
+FROM candidate_cleanups x JOIN operations o ON o.id=x.operation_id
+WHERE x.operation_id IS NOT NULL AND x.attempt_count>0;
+`
+
 func TestV3MigrationAddsConstrainedCandidateCleanupLedger(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
@@ -123,6 +150,54 @@ func TestV4ToV5MigrationAddsConstrainedUploadLeaseLedgerIdempotently(t *testing.
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestV5RepairsDeployedV4CleanupAttemptStartTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(2_000_000_000, 0).UTC()
+	if _, err = db.Exec(schemaV2 + schemaV3); err != nil {
+		t.Fatal(err)
+	}
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO sessions(id_hash,state,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?,'active',?,?,?,?)`, []any{sessionHash1, timestamp(now), timestamp(now), timestamp(now.Add(time.Hour)), timestamp(now.Add(2 * time.Hour))}},
+		{`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, []any{candidateID1, sessionHash1, timestamp(now), timestamp(now.Add(time.Hour))}},
+		{`UPDATE candidates SET state='failed' WHERE id=?`, []any{candidateID1}},
+		{`INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, []any{operationID1, timestamp(now)}},
+		{`UPDATE operations SET state='running' WHERE id=?`, []any{operationID1}},
+		{`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,claim_token,claim_expires_at,updated_at) VALUES(?,?,'pending',1,?,?,?)`, []any{candidateID1, operationID1, candidateID2, timestamp(now.Add(time.Minute)), timestamp(now.Add(30 * time.Second))}},
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(deployedSchemaV4Snapshot + `PRAGMA user_version=4;`); err != nil {
+		t.Fatal(err)
+	}
+	var wrongStarted int64
+	if err := db.QueryRow(`SELECT started_at FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1).Scan(&wrongStarted); err != nil || wrongStarted != timestamp(now.Add(30*time.Second)) {
+		t.Fatalf("old v4 started_at=%d err=%v", wrongStarted, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	s, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var repaired int64
+	if err := s.db.QueryRow(`SELECT started_at FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1).Scan(&repaired); err != nil || repaired != timestamp(now) {
+		t.Fatalf("repaired started_at=%d err=%v", repaired, err)
 	}
 }
 
