@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -121,7 +122,7 @@ func requireExactObjectKeys(data []byte, allowed ...string) error {
 }
 
 func decodeStrictJSON(data []byte, destination any) error {
-	if len(data) == 0 || len(data) > maxMetadataBytes || bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
+	if len(data) == 0 || len(data) > maxMetadataBytes || !utf8.Valid(data) || bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
 		return errors.New("JSON size or encoding is invalid")
 	}
 	if err := rejectDuplicateJSONKeys(data); err != nil {

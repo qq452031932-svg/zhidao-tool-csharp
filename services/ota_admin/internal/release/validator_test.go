@@ -14,6 +14,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -153,6 +155,9 @@ func makeNupkg(t *testing.T, version, kind, packageChannel string) []byte {
 		entries["lib/app/BaiduBatchTransfer.App.dll"] = []byte("managed assembly")
 		entries["lib/app/BaiduBatchTransfer.App.deps.json"] = []byte(`{}`)
 		entries["lib/app/BaiduBatchTransfer.App.runtimeconfig.json"] = []byte(`{}`)
+		entries["lib/app/BaiduBatchTransfer.App_ExecutionStub.exe"] = makeSetupImage()
+		entries["lib/app/BaiduBatchTransfer.App.exe"] = makeSetupImage()
+		entries["lib/app/Squirrel.exe"] = makeSetupImage()
 	} else {
 		entries["lib/app/BaiduBatchTransfer.App.exe.diff"] = []byte("real patch bytes")
 		entries["lib/app/BaiduBatchTransfer.App.exe.shasum"] = []byte(strings.Repeat("0", 64))
@@ -168,6 +173,9 @@ func makePortable(t *testing.T, version, packageChannel string) []byte {
 		"current/BaiduBatchTransfer.App.dll":                []byte("managed assembly"),
 		"current/BaiduBatchTransfer.App.deps.json":          []byte(`{}`),
 		"current/BaiduBatchTransfer.App.runtimeconfig.json": []byte(`{}`),
+		packageID + ".exe":                                  makeSetupImage(),
+		"Update.exe":                                        makeSetupImage(),
+		"current/BaiduBatchTransfer.App.exe":                makeSetupImage(),
 	})
 }
 
@@ -186,6 +194,57 @@ func zipBytes(t *testing.T, entries map[string][]byte) []byte {
 	sort.Strings(names)
 	for _, name := range names {
 		entry, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(entries[name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func readZipBytes(t *testing.T, data []byte) map[string][]byte {
+	t.Helper()
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make(map[string][]byte, len(reader.File))
+	for _, archived := range reader.File {
+		stream, err := archived.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, readErr := io.ReadAll(stream)
+		closeErr := stream.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read %s: read=%v close=%v", archived.Name, readErr, closeErr)
+		}
+		entries[archived.Name] = content
+	}
+	return entries
+}
+
+func zipBytesWithReparseEntry(t *testing.T, entries map[string][]byte, reparseName string) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	archive := zip.NewWriter(&output)
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
+		if name == reparseName {
+			header.CreatorVersion = 0
+			header.ExternalAttrs = 0x400
+		}
+		entry, err := archive.CreateHeader(header)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -418,6 +477,174 @@ func TestValidatorRejectsArbitraryOrMismatchedPackageStructures(t *testing.T) {
 				t.Fatalf("error = %v, want %v", err, ErrMetadata)
 			}
 		})
+	}
+}
+
+func TestValidatorRequiresPublisherExecutablesAndRejectsUnexpectedExecutables(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*bundleFixture)
+	}{
+		{"Full missing publisher executable", func(f *bundleFixture) {
+			name := "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg"
+			entries := readZipBytes(t, f.files[name])
+			delete(entries, "lib/app/Squirrel.exe")
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Full has unexpected executable", func(f *bundleFixture) {
+			name := "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg"
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/evil.exe"] = makeSetupImage()
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Portable missing publisher executable", func(f *bundleFixture) {
+			entries := readZipBytes(t, f.files[portableName])
+			delete(entries, "Update.exe")
+			f.files[portableName] = zipBytes(t, entries)
+			f.reseal()
+		}},
+		{"Portable has unexpected executable", func(f *bundleFixture) {
+			entries := readZipBytes(t, f.files[portableName])
+			entries["current/evil.exe"] = makeSetupImage()
+			f.files[portableName] = zipBytes(t, entries)
+			f.reseal()
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", false)
+			test.edit(fixture)
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
+	}
+}
+
+func TestValidatorRequiresPortableX64MachineArchitecture(t *testing.T) {
+	fixture := newBundleFixture(t, "1.2.3", false)
+	entries := readZipBytes(t, fixture.files[portableName])
+	entries["current/sq.version"] = []byte(strings.Replace(packageMetadata("1.2.3", channel), "<machineArchitecture>x64</machineArchitecture>", "", 1))
+	fixture.files[portableName] = zipBytes(t, entries)
+	fixture.reseal()
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("error = %v, want %v", err, ErrMetadata)
+	}
+}
+
+func TestValidatorRejectsInvalidUTF8InAllowedJSONValue(t *testing.T) {
+	fixture := newBundleFixture(t, "1.2.3", false)
+	fixture.files[releaseFeedName] = bytes.Replace(
+		fixture.files[releaseFeedName], []byte(`"NotesMarkdown":"notes"`),
+		[]byte{'"', 'N', 'o', 't', 'e', 's', 'M', 'a', 'r', 'k', 'd', 'o', 'w', 'n', '"', ':', '"', 0xff, '"'}, 1)
+	fixture.reseal()
+	if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+		t.Fatalf("error = %v, want %v", err, ErrMetadata)
+	}
+}
+
+func TestValidatorRejectsNFCPathCollisionAndWindowsReparseAttribute(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*bundleFixture)
+	}{
+		{"NFC collision", func(f *bundleFixture) {
+			name := "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg"
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/caf\u00e9.dll"] = []byte("one")
+			entries["lib/app/cafe\u0301.dll"] = []byte("two")
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Windows case collision", func(f *bundleFixture) {
+			name := "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg"
+			entries := readZipBytes(t, f.files[name])
+			entries["lib/app/Helper.dll"] = []byte("one")
+			entries["lib/app/helper.dll"] = []byte("two")
+			f.replaceReleaseAsset(name, zipBytes(t, entries))
+		}},
+		{"Windows reparse attribute", func(f *bundleFixture) {
+			name := "SuperPan.BaiduBatchTransfer-1.2.3-full.nupkg"
+			entries := readZipBytes(t, f.files[name])
+			reparseName := "lib/app/reparse.bin"
+			entries[reparseName] = []byte("target")
+			f.replaceReleaseAsset(name, zipBytesWithReparseEntry(t, entries, reparseName))
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", false)
+			test.edit(fixture)
+			if _, err := fixture.validator.Validate(context.Background(), fixture.envelope, ""); !errorsIs(err, ErrMetadata) {
+				t.Fatalf("error = %v, want %v", err, ErrMetadata)
+			}
+		})
+	}
+}
+
+func TestCanonicalInnerWindowsPathUsesNFCAndUTF16Lengths(t *testing.T) {
+	longUnicodeComponent := strings.Repeat("界", 200)
+	canonical, ok := canonicalInnerWindowsPath("root/" + longUnicodeComponent)
+	if !ok || canonical == "" {
+		t.Fatal("valid 200 UTF-16-unit component was rejected by byte length")
+	}
+	precomposed, ok := canonicalInnerWindowsPath("caf\u00e9.txt")
+	if !ok {
+		t.Fatal("precomposed name rejected")
+	}
+	decomposed, ok := canonicalInnerWindowsPath("cafe\u0301.txt")
+	if !ok || decomposed != precomposed {
+		t.Fatalf("NFC canonicalization = %q, want %q", decomposed, precomposed)
+	}
+	if _, ok := canonicalInnerWindowsPath(strings.Repeat("界", 256)); ok {
+		t.Fatal("component above 255 UTF-16 units was accepted")
+	}
+}
+
+func TestInnerZipPreflightRejectsEntryCountAndZIP64SizeBeforeReader(t *testing.T) {
+	tooMany := make([]byte, 22)
+	binary.LittleEndian.PutUint32(tooMany, 0x06054b50)
+	binary.LittleEndian.PutUint16(tooMany[8:], maxInnerEntries+1)
+	binary.LittleEndian.PutUint16(tooMany[10:], maxInnerEntries+1)
+	if _, err := preflightInnerArchive(bytes.NewReader(tooMany), int64(len(tooMany))); err == nil {
+		t.Fatal("preflight accepted entry count above cap")
+	}
+
+	zip64 := make([]byte, 98)
+	binary.LittleEndian.PutUint32(zip64[0:], 0x06064b50)
+	binary.LittleEndian.PutUint64(zip64[4:], 44)
+	binary.LittleEndian.PutUint64(zip64[24:], 1)
+	binary.LittleEndian.PutUint64(zip64[32:], 1)
+	binary.LittleEndian.PutUint64(zip64[40:], math.MaxUint64)
+	binary.LittleEndian.PutUint64(zip64[48:], 0)
+	binary.LittleEndian.PutUint32(zip64[56:], 0x07064b50)
+	binary.LittleEndian.PutUint64(zip64[64:], 0)
+	binary.LittleEndian.PutUint32(zip64[72:], 1)
+	binary.LittleEndian.PutUint32(zip64[76:], 0x06054b50)
+	binary.LittleEndian.PutUint16(zip64[84:], math.MaxUint16)
+	binary.LittleEndian.PutUint16(zip64[86:], math.MaxUint16)
+	binary.LittleEndian.PutUint32(zip64[88:], math.MaxUint32)
+	binary.LittleEndian.PutUint32(zip64[92:], math.MaxUint32)
+	if _, err := preflightInnerArchive(bytes.NewReader(zip64), int64(len(zip64))); err == nil {
+		t.Fatal("preflight accepted overflowing ZIP64 central directory size")
+	}
+
+	central := make([]byte, 67+22)
+	binary.LittleEndian.PutUint32(central[0:], 0x02014b50)
+	binary.LittleEndian.PutUint32(central[20:], math.MaxUint32)
+	binary.LittleEndian.PutUint32(central[24:], math.MaxUint32)
+	binary.LittleEndian.PutUint16(central[28:], 1)
+	binary.LittleEndian.PutUint16(central[30:], 20)
+	central[46] = 'a'
+	binary.LittleEndian.PutUint16(central[47:], 0x0001)
+	binary.LittleEndian.PutUint16(central[49:], 16)
+	binary.LittleEndian.PutUint64(central[51:], math.MaxUint64)
+	binary.LittleEndian.PutUint64(central[59:], math.MaxUint64)
+	binary.LittleEndian.PutUint32(central[67:], 0x06054b50)
+	binary.LittleEndian.PutUint16(central[75:], 1)
+	binary.LittleEndian.PutUint16(central[77:], 1)
+	binary.LittleEndian.PutUint32(central[79:], 67)
+	if _, err := preflightInnerArchive(bytes.NewReader(central), int64(len(central))); err == nil {
+		t.Fatal("preflight accepted overflowing ZIP64 entry sizes")
 	}
 }
 
