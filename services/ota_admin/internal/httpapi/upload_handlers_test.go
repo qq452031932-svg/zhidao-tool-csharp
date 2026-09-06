@@ -43,6 +43,11 @@ type fakeEnvelopeAcceptor struct {
 	existing        *candidate.Summary
 	err             error
 	failErr         error
+	failResult      *candidate.Summary
+	failUntilExpiry bool
+	lookupResult    *candidate.Summary
+	lookupErr       error
+	lookupSawLive   bool
 	takeoverExpired bool
 }
 
@@ -71,10 +76,19 @@ func (acceptor *fakeEnvelopeAcceptor) RenewEnvelopeLeaseForActiveSession(context
 	return nil
 }
 
-func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code, _ string) (candidate.Summary, error) {
+func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(ctx context.Context, _, operationID, code, _ string) (candidate.Summary, error) {
 	acceptor.failCalls++
+	if acceptor.failUntilExpiry {
+		<-ctx.Done()
+		return candidate.Summary{}, ctx.Err()
+	}
 	if acceptor.failErr != nil {
 		return candidate.Summary{}, acceptor.failErr
+	}
+	if acceptor.failResult != nil {
+		failed := *acceptor.failResult
+		acceptor.existing = &failed
+		return failed, nil
 	}
 	failed := candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "failed", ResultCode: code}
 	acceptor.existing = &failed
@@ -96,10 +110,19 @@ func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.C
 	return acceptor.result, acceptor.err
 }
 
-func (acceptor *fakeEnvelopeAcceptor) CandidateForOperationForActiveSession(_ context.Context, _ string, operationID string) (candidate.Summary, bool, error) {
+func (acceptor *fakeEnvelopeAcceptor) CandidateForOperationForActiveSession(ctx context.Context, _ string, operationID string) (candidate.Summary, bool, error) {
 	acceptor.lookupCalls++
+	if ctx.Err() == nil {
+		acceptor.lookupSawLive = true
+	}
+	if acceptor.lookupErr != nil {
+		return candidate.Summary{}, false, acceptor.lookupErr
+	}
 	if acceptor.err != nil && acceptor.existing != nil {
 		return candidate.Summary{}, false, acceptor.err
+	}
+	if acceptor.lookupResult != nil {
+		return *acceptor.lookupResult, true, nil
 	}
 	if acceptor.existing == nil {
 		return candidate.Summary{}, false, nil
@@ -287,6 +310,84 @@ func TestUploadEndpointReportsPersistedPendingStateWhenTerminalizationDoesNotCom
 	}
 }
 
+func TestUploadEndpointUsesIndependentLookupContextAfterFinalizationDeadline(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
+	acceptor := &fakeEnvelopeAcceptor{failUntilExpiry: true}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusConflict || decodeBody(t, response)["code"] != "upload_in_progress" || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !acceptor.lookupSawLive {
+		t.Fatal("terminal-state lookup reused the exhausted finalization context")
+	}
+}
+
+func TestUploadEndpointConservativelyReportsPendingWhenFailureStateCannotBeRead(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
+	acceptor := &fakeEnvelopeAcceptor{
+		failErr:   errors.New("injected finalization failure"),
+		lookupErr: errors.New("injected lookup failure"),
+	}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusConflict || decodeBody(t, response)["code"] != "upload_in_progress" || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestUploadEndpointUsesPersistedFailureSummaryInsteadOfTheLocalError(t *testing.T) {
+	tests := []struct {
+		name     string
+		acceptor *fakeEnvelopeAcceptor
+	}{
+		{
+			name: "fail returns an existing terminal result",
+			acceptor: &fakeEnvelopeAcceptor{failResult: &candidate.Summary{
+				CandidateID: testCandidateID, OperationID: testOperationID, State: "failed", ResultCode: "candidate_expired",
+			}},
+		},
+		{
+			name: "fallback lookup finds a terminal result",
+			acceptor: &fakeEnvelopeAcceptor{
+				failErr: errors.New("lost finalization acknowledgement"),
+				lookupResult: &candidate.Summary{
+					CandidateID: testCandidateID, OperationID: testOperationID, State: "failed", ResultCode: "signature_mismatch",
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
+			installUploadReceiver(t, h, receiver, test.acceptor)
+			cookie, csrf, _, _ := login(t, h, oldPassword)
+			cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+			response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+			body := decodeBody(t, response)
+			if test.name == "fail returns an existing terminal result" {
+				if response.Code != http.StatusGone || body["code"] != "candidate_expired" {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				return
+			}
+			if response.Code != http.StatusUnprocessableEntity || body["code"] != "signature_mismatch" {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestUploadEndpointReturnsTheSamePendingResultOnImmediateReplayWhenFailurePersistenceWasLost(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
@@ -397,7 +498,7 @@ func TestUploadEndpointRevalidatesSessionAfterBlockedReceive(t *testing.T) {
 
 			select {
 			case response := <-responses:
-				if response.Code != http.StatusUnauthorized || decodeBody(t, response)["code"] != "authentication_failed" {
+				if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" {
 					t.Fatalf("upload status=%d body=%s", response.Code, response.Body.String())
 				}
 			case <-time.After(5 * time.Second):
@@ -470,7 +571,7 @@ func TestUploadEndpointNormalizesEnvelopeFailures(t *testing.T) {
 	}
 }
 
-func TestUploadEndpointNormalizesSessionRevocationAtTransactionalAcceptance(t *testing.T) {
+func TestUploadEndpointUsesPersistedFailureAtTransactionalSessionRevocation(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{result: testEnvelope()}
 	acceptor := &fakeEnvelopeAcceptor{err: session.ErrUnauthorized}
@@ -479,7 +580,7 @@ func TestUploadEndpointNormalizesSessionRevocationAtTransactionalAcceptance(t *t
 	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
 
 	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
-	if response.Code != http.StatusUnauthorized || decodeBody(t, response)["code"] != "authentication_failed" {
+	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	if acceptor.calls != 1 {

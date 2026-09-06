@@ -13,6 +13,8 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 )
 
+const uploadFailureLookupTimeout = 2 * time.Second
+
 func (router *Router) receiveUpload(response http.ResponseWriter, request *http.Request, principal session.Principal, sessionToken, csrfToken string) {
 	if router.uploads == nil || router.uploadEnvelopes == nil {
 		writeError(response, http.StatusServiceUnavailable, "upload_unavailable")
@@ -42,28 +44,19 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 	defer stopLease()
 	envelope, err := router.uploads.Receive(receiveContext, request.Body, request.ContentLength)
 	if err != nil {
-		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, uploadPublicFailureCode(err)) {
-			return
-		}
-		writeUploadError(response, err)
+		router.writeUploadFailureResult(response, principal.IDHash, operationID, leaseOwner, uploadPublicFailureCode(err))
 		return
 	}
 	if envelope == nil || envelope.Verified {
 		if envelope != nil {
 			_ = envelope.Cleanup()
 		}
-		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			return
-		}
-		writeError(response, http.StatusInternalServerError, "operation_failed")
+		router.writeUploadFailureResult(response, principal.IDHash, operationID, leaseOwner, "operation_failed")
 		return
 	}
 	if err := router.uploadEnvelopes.RenewEnvelopeLeaseForActiveSession(request.Context(), principal.IDHash, operationID, leaseOwner); err != nil {
 		_ = envelope.Cleanup()
-		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			return
-		}
-		writeUploadOperationError(response, err, operationID)
+		router.writeUploadFailureResult(response, principal.IDHash, operationID, leaseOwner, "operation_failed")
 		return
 	}
 	currentPrincipal, err := router.sessions.Authenticate(request.Context(), sessionToken, csrfToken, true)
@@ -72,41 +65,34 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		if err == nil {
 			err = session.ErrUnauthorized
 		}
-		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, "operation_failed") {
-			return
-		}
-		writeUploadError(response, err)
+		router.writeUploadFailureResult(response, principal.IDHash, operationID, leaseOwner, "operation_failed")
 		return
 	}
 	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope, leaseOwner)
 	if err != nil {
 		_ = envelope.Cleanup()
-		if !router.ensureUploadFailureRecorded(response, principal.IDHash, operationID, leaseOwner, candidatePublicFailureCode(err)) {
-			return
-		}
-		writeUploadOperationError(response, err, operationID)
+		router.writeUploadFailureResult(response, principal.IDHash, operationID, leaseOwner, candidatePublicFailureCode(err))
 		return
 	}
 	writeReservedCandidateResult(response, summary)
 }
 
-func (router *Router) ensureUploadFailureRecorded(response http.ResponseWriter, sessionID, operationID, leaseOwner, code string) bool {
+func (router *Router) writeUploadFailureResult(response http.ResponseWriter, sessionID, operationID, leaseOwner, code string) {
 	finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	summary, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code, leaseOwner)
+	cancel()
 	if err == nil {
-		return true
-	}
-	summary, found, lookupErr := router.uploadEnvelopes.CandidateForOperationForActiveSession(finishContext, sessionID, operationID)
-	if lookupErr != nil || !found {
-		writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
-		return false
-	}
-	if summary.State == string(store.CandidateUploading) {
 		writeReservedCandidateResult(response, summary)
-		return false
+		return
 	}
-	return true
+	lookupContext, lookupCancel := context.WithTimeout(context.Background(), uploadFailureLookupTimeout)
+	defer lookupCancel()
+	summary, found, lookupErr := router.uploadEnvelopes.CandidateForOperationForActiveSession(lookupContext, sessionID, operationID)
+	if lookupErr != nil || !found {
+		writeReservedCandidateResult(response, candidate.Summary{OperationID: operationID, State: string(store.CandidateUploading)})
+		return
+	}
+	writeReservedCandidateResult(response, summary)
 }
 
 func (router *Router) maintainUploadLease(parent context.Context, sessionID, operationID, leaseOwner string) (context.Context, func()) {
