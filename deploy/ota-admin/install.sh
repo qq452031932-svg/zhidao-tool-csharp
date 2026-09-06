@@ -3,10 +3,12 @@ set -euo pipefail
 umask 077
 
 SERVICE_NAME="superpan-ota-admin.service"
+MOUNT_UNIT_NAME="var-lib-otaadmin-releases.mount"
 SERVICE_USER="superpan-ota-admin"
 SERVICE_GROUP="superpan-ota-admin"
 BINARY_TARGET="/opt/superpan-ota-admin/ota-admin"
 UNIT_TARGET="/etc/systemd/system/superpan-ota-admin.service"
+MOUNT_UNIT_TARGET="/etc/systemd/system/${MOUNT_UNIT_NAME}"
 CONFIG_DIR="/etc/superpan-ota-admin"
 CONFIG_TARGET="${CONFIG_DIR}/config.json"
 CERTIFICATE_TARGET="${CONFIG_DIR}/publisher.cer"
@@ -14,10 +16,11 @@ HMAC_TARGET="${CONFIG_DIR}/source-hmac.key"
 NGINX_SNIPPET_TARGET="${CONFIG_DIR}/ota.fanfh.cn.admin.nginx.conf"
 ACTIVE_VHOST="/www/server/panel/vhost/nginx/ota.fanfh.cn.conf"
 DATA_ROOT="/var/lib/superpan-ota-admin"
-DATABASE_PATH="${DATA_ROOT}/state.db"
 STAGING_ROOT="${DATA_ROOT}/staging"
 RELEASE_ROOT="/www/wwwroot/ota.fanfh.cn/releases/win-x64"
+RELEASE_VIEW_ROOT="/var/lib/otaadmin/releases"
 INITIAL_PASSWORD_FILE="/root/superpan-ota-admin.initial-password"
+PASSWORD_TEMP="${INITIAL_PASSWORD_FILE}.new"
 NGINX_BIN="${NGINX_BIN:-/www/server/nginx/sbin/nginx}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +77,7 @@ done
 [ -f "$BINARY_SOURCE" ] && [ ! -L "$BINARY_SOURCE" ] || die "binary source must be a regular non-symlink file"
 [ -f "$CERTIFICATE_SOURCE" ] && [ ! -L "$CERTIFICATE_SOURCE" ] || die "certificate source must be a regular non-symlink file"
 [ -f "$SCRIPT_DIR/superpan-ota-admin.service" ] || die "unit template is missing"
+[ -f "$SCRIPT_DIR/var-lib-otaadmin-releases.mount" ] || die "mount unit template is missing"
 [ -f "$SCRIPT_DIR/ota.fanfh.cn.admin.nginx.conf" ] || die "Nginx include template is missing"
 [ -f "$SCRIPT_DIR/config.example.json" ] || die "configuration template is missing"
 [ -f "$ACTIVE_VHOST" ] || die "the existing OTA virtual host was not found"
@@ -82,6 +86,8 @@ command -v sha256sum >/dev/null || die "sha256sum is required"
 command -v openssl >/dev/null || die "openssl is required"
 command -v runuser >/dev/null || die "runuser is required"
 command -v curl >/dev/null || die "curl is required"
+command -v mountpoint >/dev/null || die "mountpoint is required"
+command -v find >/dev/null || die "find is required"
 
 verify_sha256() {
     local source="$1"
@@ -169,11 +175,14 @@ backup_target() {
 # Only individually enumerated OTA administration targets are backed up.
 backup_target "$BINARY_TARGET" "ota-admin"
 backup_target "$UNIT_TARGET" "superpan-ota-admin.service"
+backup_target "$MOUNT_UNIT_TARGET" "var-lib-otaadmin-releases.mount"
 backup_target "$NGINX_SNIPPET_TARGET" "ota.fanfh.cn.admin.nginx.conf"
 backup_target "$CONFIG_TARGET" "config.json"
 backup_target "$CERTIFICATE_TARGET" "publisher.cer"
 backup_target "$HMAC_TARGET" "source-hmac.key"
 backup_target "$ACTIVE_VHOST" "ota.fanfh.cn.conf"
+backup_target "$INITIAL_PASSWORD_FILE" "superpan-ota-admin.initial-password"
+backup_target "$PASSWORD_TEMP" "superpan-ota-admin.initial-password.new"
 sha256sum -- "$ACTIVE_VHOST" >"${BACKUP_DIR}/ota.fanfh.cn.conf.sha256"
 stat -c '%u %g %a %n' "$RELEASE_ROOT" >"${BACKUP_DIR}/release-directory-metadata.txt"
 if [ "$GENERATIONS_EXISTED" = true ]; then
@@ -181,6 +190,16 @@ if [ "$GENERATIONS_EXISTED" = true ]; then
 else
     printf 'absent absent absent %s\n' "${RELEASE_ROOT}/generations" >>"${BACKUP_DIR}/release-directory-metadata.txt"
 fi
+
+record_unit_enabled_state() {
+    local unit="$1"
+    local state
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    [ -n "$state" ] || state="not-found"
+    printf '%s %s\n' "$unit" "$state" >>"${BACKUP_DIR}/unit-enabled-state.txt"
+}
+record_unit_enabled_state "$SERVICE_NAME"
+record_unit_enabled_state "$MOUNT_UNIT_NAME"
 
 if ! getent group superpan-ota-admin >/dev/null; then
     groupadd --system "$SERVICE_GROUP"
@@ -199,8 +218,28 @@ install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "${RELEASE_ROOT}/gener
 chown "$SERVICE_USER":"$SERVICE_GROUP" "$RELEASE_ROOT" "${RELEASE_ROOT}/generations"
 chmod 0755 "$RELEASE_ROOT" "${RELEASE_ROOT}/generations"
 
+if [ -e /var/lib/otaadmin ] || [ -L /var/lib/otaadmin ]; then
+    [ -d /var/lib/otaadmin ] && [ ! -L /var/lib/otaadmin ] &&
+       [ "$(stat -c '%U:%G' /var/lib/otaadmin)" = "root:root" ] && [ "$(stat -c '%a' /var/lib/otaadmin)" = "755" ] ||
+        die "release bind parent metadata is unsafe"
+else
+    install -d -m 0755 -o root -g root /var/lib/otaadmin
+fi
+if [ -e "$RELEASE_VIEW_ROOT" ] || [ -L "$RELEASE_VIEW_ROOT" ]; then
+    [ -d "$RELEASE_VIEW_ROOT" ] && [ ! -L "$RELEASE_VIEW_ROOT" ] || die "release bind target is unsafe"
+    if mountpoint -q "$RELEASE_VIEW_ROOT"; then
+        [ "$(stat -Lc '%d:%i' "$RELEASE_VIEW_ROOT")" = "$(stat -Lc '%d:%i' "$RELEASE_ROOT")" ] ||
+            die "existing release bind target points elsewhere"
+    else
+        [ -z "$(find "$RELEASE_VIEW_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ] || die "release bind target is not empty"
+    fi
+else
+    install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$RELEASE_VIEW_ROOT"
+fi
+
 install -m 0755 -o root -g root "$BINARY_SOURCE" "$BINARY_TARGET"
 install -m 0644 -o root -g root "$SCRIPT_DIR/superpan-ota-admin.service" "$UNIT_TARGET"
+install -m 0644 -o root -g root "$SCRIPT_DIR/var-lib-otaadmin-releases.mount" "$MOUNT_UNIT_TARGET"
 install -m 0644 -o root -g root "$SCRIPT_DIR/ota.fanfh.cn.admin.nginx.conf" "$NGINX_SNIPPET_TARGET"
 install -m 0640 -o root -g "$SERVICE_GROUP" "$CERTIFICATE_SOURCE" "$CERTIFICATE_TARGET"
 
@@ -220,12 +259,15 @@ chmod 0640 "$CONFIG_TARGET"
 # Initialize according to the administrator row, not the database file. If an
 # earlier run committed the row but stopped before installing the password file,
 # recover the root-only temporary output before invoking the idempotent command.
-PASSWORD_TEMP="${INITIAL_PASSWORD_FILE}.new"
 if [ -e "$PASSWORD_TEMP" ] || [ -L "$PASSWORD_TEMP" ]; then
-    [ -s "$PASSWORD_TEMP" ] && [ -f "$PASSWORD_TEMP" ] && [ ! -L "$PASSWORD_TEMP" ] &&
+    [ -f "$PASSWORD_TEMP" ] && [ ! -L "$PASSWORD_TEMP" ] &&
        [ "$(stat -c '%U:%G' "$PASSWORD_TEMP")" = "root:root" ] && [ "$(stat -c '%a' "$PASSWORD_TEMP")" = "600" ] ||
         die "unsafe interrupted initial-password file: ${PASSWORD_TEMP}"
-    mv -f -- "$PASSWORD_TEMP" "$INITIAL_PASSWORD_FILE"
+    if [ -s "$PASSWORD_TEMP" ]; then
+        mv -f -- "$PASSWORD_TEMP" "$INITIAL_PASSWORD_FILE"
+    else
+        unlink "$PASSWORD_TEMP"
+    fi
 fi
 runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" init-admin --if-missing --config "$CONFIG_TARGET" >"$PASSWORD_TEMP"
 if [ -s "$PASSWORD_TEMP" ]; then
@@ -241,6 +283,11 @@ if ! "$NGINX_BIN" -t; then
 fi
 
 systemctl daemon-reload
+systemctl enable "$MOUNT_UNIT_NAME" >/dev/null
+systemctl restart "$MOUNT_UNIT_NAME"
+mountpoint -q "$RELEASE_VIEW_ROOT" || die "OTA release bind mount did not become active"
+[ "$(stat -Lc '%d:%i' "$RELEASE_VIEW_ROOT")" = "$(stat -Lc '%d:%i' "$RELEASE_ROOT")" ] ||
+    die "OTA release bind mount does not reference the audited release root"
 systemctl enable "$SERVICE_NAME" >/dev/null
 systemctl restart "$SERVICE_NAME"
 
@@ -265,9 +312,11 @@ Backup: ${BACKUP_DIR}
 
 Rollback (run as root):
   systemctl stop ${SERVICE_NAME}
+  systemctl stop ${MOUNT_UNIT_NAME}
   restore only the named files listed in ${BACKUP_DIR}/present-targets.txt
   remove only targets listed in ${BACKUP_DIR}/absent-targets.txt
   restore uid/gid/mode from ${BACKUP_DIR}/release-directory-metadata.txt (never remove a non-empty generations directory)
+  restore the service and mount-unit enablement states recorded in ${BACKUP_DIR}/unit-enabled-state.txt
   ${NGINX_BIN} -t && systemctl reload nginx
   systemctl daemon-reload && systemctl start ${SERVICE_NAME}
 Do not roll back or delete the published release tree.

@@ -88,8 +88,10 @@ ADMIN_CACHE="$(header_value "$ADMIN_URL" "Cache-Control")"
 assert_no_cache "$MANIFEST_URL"
 assert_no_cache "$SIGNATURE_URL"
 
-CERT_SHA256="$(echo | openssl s_client -connect ota.fanfh.cn:443 -servername ota.fanfh.cn -verify_hostname ota.fanfh.cn 2>/dev/null | openssl x509 -outform DER | sha256sum | awk '{print $1}')"
-[ "$CERT_SHA256" = "$EXPECTED_CERT_SHA256" ] || die "HTTPS certificate baseline changed"
+LOCAL_CERT_SHA256="$(echo | openssl s_client -connect 127.0.0.1:443 -servername ota.fanfh.cn -verify_hostname ota.fanfh.cn 2>/dev/null | openssl x509 -outform DER | sha256sum | awk '{print $1}')"
+[ "$LOCAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256" ] || die "local Nginx HTTPS certificate baseline changed"
+PUBLIC_CERT_SHA256="$(echo | openssl s_client -connect ota.fanfh.cn:443 -servername ota.fanfh.cn -verify_hostname ota.fanfh.cn 2>/dev/null | openssl x509 -outform DER | sha256sum | awk '{print $1}')"
+[ "$PUBLIC_CERT_SHA256" = "$EXPECTED_CERT_SHA256" ] || die "public HTTPS certificate baseline changed"
 [ "$(body_sha256 "$HEALTH_URL")" = "$EXPECTED_HEALTH_SHA256" ] || die "health baseline changed"
 [ "$(body_sha256 "$STABLE_PROBE_URL")" = "$EXPECTED_STABLE_SHA256" ] || die "stable content baseline changed"
 

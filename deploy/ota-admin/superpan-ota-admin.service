@@ -1,6 +1,8 @@
 [Unit]
 Description=SuperPan OTA administration service
 After=network.target
+After=var-lib-otaadmin-releases.mount
+Requires=var-lib-otaadmin-releases.mount
 
 [Service]
 Type=simple
@@ -20,11 +22,11 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=full
 ProtectHome=true
-# Hide every existing web root from the service, then expose only the OTA
-# release directory it is allowed to publish. Both directives exist in v219.
+# The release tree is made available through a separate bind-mount unit. This
+# avoids the nested path exceptions that old systemd mount namespaces reject.
 InaccessibleDirectories=/www/wwwroot
 ReadWriteDirectories=/var/lib/superpan-ota-admin
-ReadWriteDirectories=/www/wwwroot/ota.fanfh.cn/releases/win-x64
+ReadWriteDirectories=/var/lib/otaadmin/releases
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitNOFILE=4096

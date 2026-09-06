@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind the SuperPan OTA release tree into the publisher namespace
+Before=superpan-ota-admin.service
+
+[Mount]
+What=/www/wwwroot/ota.fanfh.cn/releases/win-x64
+Where=/var/lib/otaadmin/releases
+Type=none
+Options=bind
+
+[Install]
+WantedBy=multi-user.target

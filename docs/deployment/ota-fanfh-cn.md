@@ -8,7 +8,7 @@
 - 使用独立的 `superpan-ota-admin` 用户和组。配置及密钥位于 `/etc/superpan-ota-admin`，状态及暂存位于 `/var/lib/superpan-ota-admin`，二进制位于 `/opt/superpan-ota-admin`。
 - Nginx 文件是 server block 内的 include 片段，不是完整虚拟主机。它不能替换现有 vhost，也不包含 `/health`、ACME、证书、站点根或静态发布规则。
 - `/admin/` 强制 `Cache-Control: no-store`。现有静态配置必须继续对 `upload-manifest.sha256` 及 `upload-manifest.sha256.sig` 返回 no-cache；安装器不会修改该静态缓存规则。
-- systemd unit 只使用 CentOS 7 systemd v219 支持的隔离指令；服务看不到 `/www/wwwroot` 的其他站点，只重新开放自己的 `releases/win-x64` 发布目录。
+- systemd unit 只使用 CentOS 7 systemd v219 支持的隔离指令。独立 mount unit 先把唯一的 OTA 发布目录 bind 到 `/var/lib/otaadmin/releases`，后台只通过该别名发布；随后服务 namespace 屏蔽整个 `/www/wwwroot`，因此看不到其他站点。这里没有使用 v219 不支持的“屏蔽父目录后再对子目录开洞”。
 
 ## 部署前记录只读基线
 
@@ -61,9 +61,9 @@ export EXPECTED_CERT_SHA256 EXPECTED_HEALTH_SHA256 STABLE_PROBE_URL EXPECTED_STA
      --active-vhost-sha256 "$ACTIVE_VHOST_SHA256"
    ```
 
-安装器在任何持久化修改前校验二进制、证书及 SPKI；重复执行会保留已有 HMAC 密钥和数据库。配置为 `root:superpan-ota-admin`、`0640`，状态目录为服务用户独占的 `0700`。32 字节 source HMAC 密钥只写入 root 管理的配置目录，不输出。管理员初始化以数据库中的管理员记录为准，而不是以数据库文件是否存在为准；幂等重试可修复“数据库已创建但管理员尚未写入”的中断状态。一次性密码只写入 root-only 的 `/root/superpan-ota-admin.initial-password`，不会经过 systemd 或 journald。
+安装器在任何持久化修改前校验二进制、证书及 SPKI；重复执行会保留已有 HMAC 密钥和数据库。配置为 `root:superpan-ota-admin`、`0640`，状态目录为服务用户独占的 `0700`。32 字节 source HMAC 密钥只写入 root 管理的配置目录，不输出。管理员初始化以数据库中的管理员记录为准，而不是以数据库文件是否存在为准；幂等重试可修复“数据库已创建但管理员尚未写入”的中断状态。一次性密码只写入 root-only 的 `/root/superpan-ota-admin.initial-password`，不会经过 systemd 或 journald；安全的中断临时文件会恢复或清空后重试。
 
-每次执行只逐个备份管理后台的二进制、unit、include、配置、公开证书、HMAC 文件，以及本次手工加入 include 后的 OTA vhost 和只读哈希。备份固定存放在校验为 `root:root`、`0700` 的 `/var/backups/superpan-ota-admin`，不接受任意备份根参数。成功与备份后发生的任何失败都会显示精确备份目录和回滚提示。安装器不会改写 vhost 的任何内容。发布代、stable 链接和静态站点不进入安装备份。`releases/win-x64` 与 `generations` 由专用服务用户拥有并保持 `0755`：只有 owner 可发布，Nginx 仍可只读下载，且满足服务启动时对 group/other 不可写的校验。
+每次执行只逐个备份管理后台的二进制、service/mount unit、include、配置、公开证书、HMAC、一次性密码文件及其中断临时文件，以及本次手工加入 include 后的 OTA vhost 和只读哈希；两个 unit 原先的 enabled 状态也写入 `unit-enabled-state.txt`。备份固定存放在校验为 `root:root`、`0700` 的 `/var/backups/superpan-ota-admin`，不接受任意备份根参数。成功与备份后发生的任何失败都会显示精确备份目录和回滚提示。安装器不会改写 vhost 的任何内容。发布代、stable 链接和静态站点不进入安装备份。`releases/win-x64` 与 `generations` 由专用服务用户拥有并保持 `0755`：只有 owner 可发布，Nginx 仍可只读下载，且满足服务启动时对 group/other 不可写的校验。
 
 安装器重启服务后先等待 `systemctl is-active` 和 loopback `/admin/` 同时就绪，最多 30 秒；只有就绪且 `nginx -t` 已通过才 reload Nginx。服务未就绪时现有 Nginx 配置不会被 reload。
 
@@ -76,7 +76,7 @@ sudo --preserve-env=EXPECTED_CERT_SHA256,EXPECTED_HEALTH_SHA256,EXPECTED_STABLE_
   bash deploy/ota-admin/verify.sh
 ```
 
-验证脚本检查：systemd 服务状态；端口只在 loopback 监听且公网不可达；HTTP `/admin/` 只能跳转到 HTTPS；HTTPS `/admin/` 为 no-store；两份签名元数据不可缓存；证书、`/health` 和稳定文件与部署前哈希一致。站内 HTTP/HTTPS 检查通过 `curl --resolve` 固定到 `127.0.0.1`，验证当前机器的 Nginx，不受公网 DNS/CDN 影响；证书基线仍通过公网 TLS 连接单独检查。脚本随后先武装恢复 trap 再停止后台服务、再次下载稳定文件及检查健康页，并无论中途成功或失败都恢复后台服务；恢复失败会让验证明确失败。它只读取基线，不修改证书、健康页或静态缓存配置。
+验证脚本检查：systemd 服务状态；端口只在 loopback 监听且公网不可达；HTTP `/admin/` 只能跳转到 HTTPS；HTTPS `/admin/` 为 no-store；两份签名元数据不可缓存；证书、`/health` 和稳定文件与部署前哈希一致。站内 HTTP/HTTPS 检查通过 `curl --resolve` 固定到 `127.0.0.1`，验证当前机器的 Nginx，不受公网 DNS/CDN 影响；证书基线同时检查本机 `127.0.0.1:443`（保留 SNI/主机名验证）和公网 TLS。脚本随后先武装恢复 trap 再停止后台服务、再次下载稳定文件及检查健康页，并无论中途成功或失败都恢复后台服务；恢复失败会让验证明确失败。它只读取基线，不修改证书、健康页或静态缓存配置。
 
 ## 回滚
 
@@ -85,8 +85,9 @@ sudo --preserve-env=EXPECTED_CERT_SHA256,EXPECTED_HEALTH_SHA256,EXPECTED_STABLE_
 1. 停止 `superpan-ota-admin.service`。
 2. 只恢复 `present-targets.txt` 中列出的精确文件，并只删除 `absent-targets.txt` 中本次新建的精确目标。
 3. 根据 `release-directory-metadata.txt` 中记录的数字 uid、gid、mode 恢复两个发布目录的元数据。若记录显示 `generations` 原先不存在但现在含有发布内容，不得删除它。
-4. 对现有 OTA vhost 移除本次增加的 include 行；不要替换整个 vhost。
-5. 执行 `/www/server/nginx/sbin/nginx -t`，成功后才 reload Nginx。
-6. 执行 `systemctl daemon-reload`。需要回到旧后台版本时再启动服务。
+4. 根据 `unit-enabled-state.txt` 恢复 service 和 mount unit 原先的 enabled/disabled 状态；首次安装前不存在的 unit 应 disable 并移除其 wants 链接。
+5. 对现有 OTA vhost 移除本次增加的 include 行；不要替换整个 vhost。
+6. 执行 `/www/server/nginx/sbin/nginx -t`，成功后才 reload Nginx。
+7. 执行 `systemctl daemon-reload`。需要回到旧后台版本时再启动服务。
 
 回滚后台不得删除或回滚 `releases/win-x64` 下已经发布的 generation 或 stable 链接。若配置检查失败，保持 Nginx 不 reload，并先恢复 include 片段或移除 include 行。

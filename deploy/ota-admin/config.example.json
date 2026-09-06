@@ -3,7 +3,7 @@
   "listen_address": "127.0.0.1:18091",
   "public_origin": "https://ota.fanfh.cn",
   "staging_root": "/var/lib/superpan-ota-admin/staging",
-  "release_root": "/www/wwwroot/ota.fanfh.cn/releases/win-x64",
+  "release_root": "/var/lib/otaadmin/releases",
   "publisher_certificate_path": "/etc/superpan-ota-admin/publisher.cer",
   "publisher_spki_sha256": "f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff",
   "source_hmac_key_path": "/etc/superpan-ota-admin/source-hmac.key",

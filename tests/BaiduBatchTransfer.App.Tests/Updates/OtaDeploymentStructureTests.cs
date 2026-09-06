@@ -40,9 +40,17 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("ProtectHome=true", unit, StringComparison.Ordinal);
         Assert.Contains("InaccessibleDirectories=/www/wwwroot", unit, StringComparison.Ordinal);
         Assert.Contains("ReadWriteDirectories=/var/lib/superpan-ota-admin", unit, StringComparison.Ordinal);
-        Assert.Contains("ReadWriteDirectories=/www/wwwroot/ota.fanfh.cn/releases/win-x64", unit, StringComparison.Ordinal);
+        Assert.Contains("Requires=var-lib-otaadmin-releases.mount", unit, StringComparison.Ordinal);
+        Assert.Contains("ReadWriteDirectories=/var/lib/otaadmin/releases", unit, StringComparison.Ordinal);
+        Assert.DoesNotContain("ReadWriteDirectories=/www/wwwroot", unit, StringComparison.Ordinal);
         foreach (var unsupported in new[] { "ReadWritePaths=", "StateDirectory=", "ProtectKernelTunables=", "ProtectControlGroups=", "RestrictNamespaces=", "LockPersonality=", "MemoryDenyWriteExecute=" })
             Assert.DoesNotContain(unsupported, unit, StringComparison.Ordinal);
+
+        var mount = ReadDeploymentFile("var-lib-otaadmin-releases.mount");
+        Assert.Contains("What=/www/wwwroot/ota.fanfh.cn/releases/win-x64", mount, StringComparison.Ordinal);
+        Assert.Contains("Where=/var/lib/otaadmin/releases", mount, StringComparison.Ordinal);
+        Assert.Contains("Options=bind", mount, StringComparison.Ordinal);
+        Assert.Contains("Before=superpan-ota-admin.service", mount, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -55,7 +63,7 @@ public sealed class OtaDeploymentStructureTests
         Assert.Equal("127.0.0.1:18091", root.GetProperty("listen_address").GetString());
         Assert.Equal("https://ota.fanfh.cn", root.GetProperty("public_origin").GetString());
         Assert.Equal("/var/lib/superpan-ota-admin/staging", root.GetProperty("staging_root").GetString());
-        Assert.Equal("/www/wwwroot/ota.fanfh.cn/releases/win-x64", root.GetProperty("release_root").GetString());
+        Assert.Equal("/var/lib/otaadmin/releases", root.GetProperty("release_root").GetString());
         Assert.Equal("/etc/superpan-ota-admin/publisher.cer", root.GetProperty("publisher_certificate_path").GetString());
         Assert.Equal("f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff", root.GetProperty("publisher_spki_sha256").GetString());
         Assert.Equal("/etc/superpan-ota-admin/source-hmac.key", root.GetProperty("source_hmac_key_path").GetString());
@@ -86,6 +94,7 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("INITIAL_PASSWORD_FILE", install, StringComparison.Ordinal);
         Assert.Contains(">\"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
         Assert.Contains("unsafe interrupted initial-password file", install, StringComparison.Ordinal);
+        Assert.Contains("unlink \"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
         Assert.Contains("Rollback", install, StringComparison.Ordinal);
         Assert.Contains("require_value \"$1\" \"${2:-}\"", install, StringComparison.Ordinal);
         Assert.Contains("COMPILED_PUBLISHER_SPKI_SHA256=\"f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff\"", install, StringComparison.Ordinal);
@@ -104,9 +113,17 @@ public sealed class OtaDeploymentStructureTests
 
         Assert.Contains("backup_target \"$BINARY_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_target \"$UNIT_TARGET\"", install, StringComparison.Ordinal);
+        Assert.Contains("backup_target \"$MOUNT_UNIT_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_target \"$NGINX_SNIPPET_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_target \"$CONFIG_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("backup_target \"$ACTIVE_VHOST\"", install, StringComparison.Ordinal);
+        Assert.Contains("backup_target \"$INITIAL_PASSWORD_FILE\"", install, StringComparison.Ordinal);
+        Assert.Contains("backup_target \"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
+        Assert.Contains("unit-enabled-state.txt", install, StringComparison.Ordinal);
+        Assert.Contains("systemctl is-enabled", install, StringComparison.Ordinal);
+        Assert.Contains("systemctl restart \"$MOUNT_UNIT_NAME\"", install, StringComparison.Ordinal);
+        Assert.Contains("mountpoint -q \"$RELEASE_VIEW_ROOT\"", install, StringComparison.Ordinal);
+        Assert.Contains("stat -Lc '%d:%i'", install, StringComparison.Ordinal);
         Assert.Contains("sha256sum -- \"$ACTIVE_VHOST\"", install, StringComparison.Ordinal);
         Assert.Contains("mktemp -d \"${BACKUP_ROOT}/${TIMESTAMP}.XXXXXX\"", install, StringComparison.Ordinal);
         Assert.Contains("release-directory-metadata.txt", install, StringComparison.Ordinal);
@@ -143,6 +160,7 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("EXPECTED_HEALTH_SHA256", verify, StringComparison.Ordinal);
         Assert.Contains("EXPECTED_STABLE_SHA256", verify, StringComparison.Ordinal);
         Assert.Contains("-verify_hostname ota.fanfh.cn", verify, StringComparison.Ordinal);
+        Assert.Contains("-connect 127.0.0.1:443", verify, StringComparison.Ordinal);
         Assert.Contains("--resolve 'ota.fanfh.cn:443:127.0.0.1'", verify, StringComparison.Ordinal);
         Assert.Contains("--resolve 'ota.fanfh.cn:80:127.0.0.1'", verify, StringComparison.Ordinal);
         Assert.Contains("--max-time", verify, StringComparison.Ordinal);
@@ -159,7 +177,7 @@ public sealed class OtaDeploymentStructureTests
     {
         foreach (var relativePath in new[]
         {
-            "superpan-ota-admin.service", "ota.fanfh.cn.admin.nginx.conf", "config.example.json", "install.sh", "verify.sh"
+            "superpan-ota-admin.service", "var-lib-otaadmin-releases.mount", "ota.fanfh.cn.admin.nginx.conf", "config.example.json", "install.sh", "verify.sh"
         })
             Assert.DoesNotContain("f.fanfh.cn", ReadDeploymentFile(relativePath), StringComparison.OrdinalIgnoreCase);
     }
