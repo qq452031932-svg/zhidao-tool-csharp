@@ -62,6 +62,31 @@ type blockingGenerationRemover struct {
 	release chan struct{}
 }
 
+type blockingFinalizationStore struct {
+	target  store.ReleaseHistoryItem
+	release chan struct{}
+}
+
+func (storage *blockingFinalizationStore) InFlightRetentionCleanup(context.Context) (store.ReleaseHistoryItem, string, bool, error) {
+	return store.ReleaseHistoryItem{}, "", false, nil
+}
+func (storage *blockingFinalizationStore) BeginRetentionCleanup(context.Context, string, time.Time) (store.ReleaseHistoryItem, bool, error) {
+	target := storage.target
+	storage.target = store.ReleaseHistoryItem{}
+	if target.ID == "" {
+		return store.ReleaseHistoryItem{}, false, nil
+	}
+	return target, true, nil
+}
+func (storage *blockingFinalizationStore) FinishRetentionCleanup(ctx context.Context, _, _ string, _ bool, _ time.Time) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-storage.release:
+		return nil
+	}
+}
+
 func (remover *blockingGenerationRemover) mutationLockKey() string { return "blocking-retention-root" }
 func (remover *blockingGenerationRemover) RemoveRetainedGeneration(string) error {
 	close(remover.entered)
@@ -153,6 +178,31 @@ func TestRetentionHoldsMutationLockThroughGenerationRemoval(t *testing.T) {
 	close(remover.release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRetentionFinalizationUsesAFreshBoundedContext(t *testing.T) {
+	target := store.ReleaseHistoryItem{Release: store.Release{ID: testReleaseID, GenerationName: "release-" + testReleaseID}, State: "removed"}
+	storage := &blockingFinalizationStore{target: target, release: make(chan struct{})}
+	retention, err := NewRetention(RetentionOptions{
+		Store: storage, Generations: &fakeGenerationRemover{}, Random: bytes.NewReader(make([]byte, 32)), Now: time.Now,
+		AttemptTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- retention.Run(ctx) }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Run error=%v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		close(storage.release)
+		t.Fatal("retention finalization escaped its configured bound")
 	}
 }
 

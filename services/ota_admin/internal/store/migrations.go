@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/release"
 )
 
 type migration struct {
@@ -22,7 +24,7 @@ const schemaVersion = 6
 
 func applyV6Migration(ctx context.Context, tx *sql.Tx) error {
 	statements := []string{
-		`ALTER TABLE releases ADD COLUMN notes TEXT NOT NULL DEFAULT '' CHECK (length(notes) <= 65536)`,
+		`ALTER TABLE releases ADD COLUMN notes TEXT NOT NULL DEFAULT '' CHECK (length(notes) <= ` + itoa(release.MaximumNotesBytes) + `)`,
 		`DROP TRIGGER audit_events_append_only_update`,
 		`DROP TRIGGER audit_events_append_only_delete`,
 		`DROP TRIGGER audit_events_no_replace`,
@@ -361,6 +363,9 @@ func integerCheckSQL(column string) string {
 func itoa(value int) string {
 	if value == 64 {
 		return "64"
+	}
+	if value == release.MaximumNotesBytes {
+		return "65536"
 	}
 	panic("unsupported schema constant")
 }

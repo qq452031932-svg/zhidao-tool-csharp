@@ -26,6 +26,11 @@ var (
 	ErrVersionFloor  = errors.New("version does not exceed historical floor")
 )
 
+// MaximumNotesBytes is shared with persistence. Validation uses bytes while
+// SQLite length counts characters; valid UTF-8 with this byte cap always fits
+// the database character cap.
+const MaximumNotesBytes = 65_536
+
 type Validator struct{ trust *publisher.Trust }
 
 type ReportFile struct {
@@ -387,7 +392,7 @@ func validateReleaseAssets(assets []releaseAsset, files map[string]*verifiedFile
 	}
 	currentFull := packageID + "-" + currentText + "-full.nupkg"
 	currentAsset, ok := releaseFiles[currentFull]
-	if !ok || currentAsset.NotesMarkdown == nil || len(*currentAsset.NotesMarkdown) > maxMetadataBytes {
+	if !ok || currentAsset.NotesMarkdown == nil || len(*currentAsset.NotesMarkdown) > MaximumNotesBytes {
 		return "", "", nil, nil, ErrMetadata
 	}
 	notesMarkdown := *currentAsset.NotesMarkdown

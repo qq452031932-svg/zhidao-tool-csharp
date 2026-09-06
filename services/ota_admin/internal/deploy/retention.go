@@ -138,7 +138,9 @@ func (retention *Retention) Run(ctx context.Context) error {
 			return store.ErrInvalidTransition
 		}
 		removeErr := retention.generations.RemoveRetainedGeneration(target.GenerationName)
-		finishErr := retention.store.FinishRetentionCleanup(context.WithoutCancel(ctx), operationID, target.ID, removeErr == nil, retention.now().UTC())
+		finishContext, cancel := context.WithTimeout(context.Background(), retention.attemptTimeout)
+		finishErr := retention.store.FinishRetentionCleanup(finishContext, operationID, target.ID, removeErr == nil, retention.now().UTC())
+		cancel()
 		if removeErr != nil || finishErr != nil {
 			return errors.Join(removeErr, finishErr)
 		}

@@ -284,6 +284,26 @@ func TestValidationReportIncludesSignedCurrentReleaseNotes(t *testing.T) {
 	}
 }
 
+func TestValidationRejectsReleaseNotesThatCannotBePersisted(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{{name: "exact limit", size: MaximumNotesBytes}, {name: "one byte too large", size: MaximumNotesBytes + 1, wantErr: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newBundleFixture(t, "1.2.3", false)
+			notes := strings.Repeat("n", test.size)
+			fixture.files[releaseFeedName] = bytes.ReplaceAll(fixture.files[releaseFeedName], []byte(`"NotesMarkdown":"notes"`), []byte(`"NotesMarkdown":`+strconv.Quote(notes)))
+			fixture.reseal()
+			fixture.writeCurrentFiles()
+			_, err := fixture.validator.Validate(context.Background(), fixture.envelope, "")
+			if errorsIs(err, ErrMetadata) != test.wantErr {
+				t.Fatalf("size=%d error=%v", test.size, err)
+			}
+		})
+	}
+}
+
 func (fixture *bundleFixture) reseal() {
 	fixture.t.Helper()
 	delete(fixture.files, manifestName)
