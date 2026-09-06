@@ -1,0 +1,80 @@
+# 2026-09-06 Web OTA 发布后台阶段性验收
+
+## 结论
+
+`https://ota.fanfh.cn/admin/` 的隔离发布后台已经部署并通过服务、权限、反向代理和既有站点不变性检查。生产稳定渠道尚未发布任何版本：首次管理员改密、正式 `1.0.6` 上传/确认发布、客户端更新验收和停服静态下载验收仍未执行。因此当前状态是“后台可用、发布门禁保持关闭”，不能标记为 OTA 全链路上线完成。
+
+本记录不包含管理员一次性密码、正式密码、HMAC、会话 Cookie、私钥或其他秘密。验收期间没有读取或输出管理员密码。
+
+## 已通过的本地与隔离验证
+
+- Windows 更新测试：`dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter FullyQualifiedName~Updates` 共 `370` 项，`368` 通过、`2` 项因本机证书存储环境跳过、`0` 失败。
+- Linux 服务端全包测试：在独立 CentOS 7 验证根执行 `CGO_ENABLED=0 go test -shuffle=on -count=10 ./...`，所有包通过，退出码为 `0`。
+- 官方不可变 Git-object 快照构建通过了 `go test -p=1 ./...`、`go vet ./...`、静态 `linux/amd64` 交叉编译、源码快照指纹复核和原子产物发布。
+- Linux 后台二进制 SHA-256：`80627c3962d8f858cfedf5432ea06751644ef5796faee830ef985a2f10c63219`。
+- 可审计源码包 SHA-256：`ae1217c301ad152d301ac21cea9b5d5a71d9471de71d97509ac3c04e385f7e36`。
+- 公共发布证书 SHA-256：`9db0923f308826fcd16f1147ee7843446184d7efa4c4ccd83e9650c95c625b82`；固定 SPKI SHA-256：`f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff`。
+- 真实签名候选在隔离 Linux 发布根完成全部七个 durability boundary 故障注入与重启恢复验证：`file_synced`、`candidate_dir_synced`、`generation_renamed`、`generations_dir_synced`、`stable_temp_created` 在提交前失败并幂等恢复；`stable_replaced`、`win_x64_parent_synced` 在提交后恢复为已发布。验收二进制及所有隔离发布根已在取证后删除。
+- 部署结构测试 `OtaDeploymentStructureTests` 为 `7/7` 通过；服务器原生 `bash -n deploy/ota-admin/install.sh` 通过。
+
+## 部署前基线
+
+- OTA vhost SHA-256：`3b6b8f00b9476aca0edbda97c69077acf793ae68f41cf5c8cc7f8c3ef25a0210`。
+- OTA `/health` 响应 SHA-256：`31e6dc23df83ebfed036bba3fda706b8f1e8c5c7fef9ef0a602e6fac43c71cfb`。
+- OTA TLS 叶证书 DER SHA-256：`a8991c8980169a67245942fd4153cb68c392a7cbf00b1b40a504d6752a444faa`。
+- `f.fanfh.cn` vhost SHA-256：`1df7a78877eb37a896166c900b23a7f30c27c8dc959949f6ed6939116d09e05b`。
+- `f.fanfh.cn` fullchain 文件 SHA-256：`67872e19e42938a94f371c46b8949f33161c9dbca5c7953b5c01e3c9c0a02434`。
+- Windows 可信外部请求取得的 `f.fanfh.cn` 正文 SHA-256：`2d3495515de1c91186a799994d494e261efda5adeb7e4d2ac16d85bb373e2bfb`。
+- `releases/win-x64/stable` 是 `www:www 0755` 的空真实目录；服务器没有后台服务、配置、数据库或已提交版本 floor；`127.0.0.1:18091` 未占用。
+- CentOS 7 自带 curl/NSS 对 `f.fanfh.cn` 报旧客户端 key-usage 兼容错误，因此没有用 `-k` 伪造可信正文基线；正文基线来自 Windows 可信 TLS 请求，服务器端保留 vhost、证书文件和公开 TLS 检查。
+
+## 生产部署与当前状态
+
+部署前再次核对 vhost、健康页、证书、空发布目录、端口和 `nginx -t`，均未漂移。原发布目录 metadata 和原 OTA vhost 已保存到 root-only 暂存；确认目录内容和 inode 未变后，只把空的 `win-x64` 所有者从 `www:www` 调整为安装器允许接管的 `root:root`，模式仍为 `0755`，Nginx 读取权限未变。
+
+第一次安装在二进制/证书/SPKI、`nginx -t`、systemd 服务和 loopback readiness 均通过后，暴露宝塔 CentOS 7 的真实兼容差异：`nginx.service` 是 inactive 的 SysV generator unit，`systemctl reload nginx` 返回 `Job for nginx.service invalid`。Nginx 没有 reload，公网 `/admin/` 当时仍为 `404`；精确备份保存在：
+
+- `/var/backups/superpan-ota-admin/20260906T122110Z.gyZATC`
+
+安装器随后改为在 `nginx -t` 之后通过绝对路径执行 `/www/server/nginx/sbin/nginx -s reload`，并校验 reload 前后真实 master PID 不变且本机 HTTPS `/admin/` 已生效。修复提交 `58359cb` 已通过独立复审；幂等重试成功，第二份精确备份为：
+
+- `/var/backups/superpan-ota-admin/20260906T122927Z.AftBAe`
+
+最终只读核对结果：
+
+- `superpan-ota-admin.service` 与 `var-lib-otaadmin-releases.mount` 均为 `active`、`enabled`。
+- 发布目录通过 bind mount 暴露给后台；服务状态/暂存目录为专用用户 `0700`，配置、公开证书和 HMAC 为 `root:superpan-ota-admin 0640`，一次性密码文件为 `root:root 0600`。
+- 后台只监听 `127.0.0.1:18091`；未发现 `0.0.0.0:18091` 或 `[::]:18091` 监听。
+- `/www/server/nginx/sbin/nginx -t` 通过；reload 前后的真实 master PID 均为 `9117`，进程名为 `nginx`。
+- `https://ota.fanfh.cn/admin/` 返回 `200`，同时具有 `Cache-Control: no-store, max-age=0`、CSP 和 `X-Frame-Options: DENY`。
+- OTA vhost 仅增加一次 `/etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf` include；部署后 SHA-256 为 `23046876bdd83b91eb64156c6b8a1ec7eaa321bcb42f14db3dcedbab58971786`。
+- OTA `/health`、TLS 叶证书、`f.fanfh.cn` vhost 和 fullchain 哈希与部署前完全一致。
+- 旧空 `stable` 目录已按迁移逻辑移除，当前发布树只有空的 `generations` 目录；尚无 `stable` 相对链接、release JSON、RELEASES、Setup、Portable 或任何正式版本。
+- 服务日志只有安装/幂等重试产生的正常 stop/start 和 loopback listen 记录，没有发布或恢复错误。
+
+## 已准备但未上传的正式候选
+
+本机已生成正式签名候选：
+
+- 版本：`1.0.6`
+- 文件：`.artifacts/ota-production-20260906-task5-v21-final/SuperPan.BaiduBatchTransfer-1.0.6-win-x64-stable-upload.zip`
+- 大小：`762190421` 字节
+- SHA-256：`83d4e8723f201499793d218bc3512439c00e56403a0eac5174bf5c05f46ec592`
+
+该文件没有上传到服务器，服务器发布树也没有写入其任何内容。
+
+## 尚未完成的生产验收
+
+以下步骤必须后续显式完成，当前不得写成已通过：
+
+1. 在真实 `/admin/` 页面使用一次性凭据登录，由用户完成首次密码修改；不得把密码写入 Git、文档、日志或聊天记录。
+2. 从真实网页选择上述 `1.0.6` ZIP，等待七项固定 validation gate 全部显示明确证据，再执行一次明确发布确认。
+3. 发布后核验 release JSON、manifest/signature、asset catalog、RELEASES、Setup/Portable、哈希/大小/引用闭包、相对 `stable` 链接和全部缓存头。
+4. 用客户端固定 SPKI 的 SignedFeed 链路验证接受正式 feed，并验证错钥、坏签名、元数据/包篡改和已签名 replay 均在 updater 启动前被拒绝。
+5. 完成检查更新、下载、pending-update 的不重启 dry run；不要在未确认前强制用户应用重启。
+6. 停止后台服务，证明 Nginx 静态 stable 仍可下载；随后启动服务，验证恢复、旧会话失效和 read-only 状态清除。
+7. 在发布存在后执行完整 `deploy/ota-admin/verify.sh`，复核 stable 下载哈希、元数据 no-cache、版本资产 immutable、端口隔离、停服恢复 trap 和本机/公网 TLS。
+8. 重新取得部署后的 Windows 可信 `f.fanfh.cn` 正文哈希，并执行既有证书续期 dry-run，补齐三项不可变基线与续期健康的最终证据。
+9. 在用户可见浏览器中打开真实页面完成视觉验收。此前一次自动页面读取卡住并被终止；该问题没有影响安装器、服务或服务器状态，不能算视觉验收完成。
+
+完成以上步骤前，最终门禁仍是关闭状态；不得把生产 OTA 标记为完整上线。
