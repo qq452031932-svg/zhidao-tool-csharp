@@ -31,12 +31,14 @@ type UploadReceiver interface {
 	Receive(context.Context, io.Reader, int64) (*upload.Envelope, error)
 }
 
-// EnvelopeAcceptor is the Task 9 integration seam. Implementations must verify
-// that sessionID is active and unexpired in the same transaction that adopts
-// the envelope, returning session.ErrUnauthorized when that condition fails.
-// A successful result transfers ownership and the cleanup obligation and is
-// returned idempotently for the same active session and operation ID.
+// EnvelopeAcceptor is the Task 9 integration seam. Reserve must atomically bind
+// the active session and idempotency key before request bytes are consumed.
+// Accept must reverify the same session at its commit boundary; a successful
+// result transfers ownership and the cleanup obligation. Pending and terminal
+// results are replayed for the same active session and operation ID.
 type EnvelopeAcceptor interface {
+	ReserveEnvelopeForActiveSession(context.Context, string, string) (candidate.Summary, bool, error)
+	FailEnvelopeForActiveSession(context.Context, string, string, string) (candidate.Summary, error)
 	CandidateForOperationForActiveSession(context.Context, string, string) (candidate.Summary, bool, error)
 	AcceptEnvelopeForActiveSession(context.Context, string, string, *upload.Envelope) (candidate.Summary, error)
 	CurrentForActiveSession(context.Context, string) (candidate.Summary, error)

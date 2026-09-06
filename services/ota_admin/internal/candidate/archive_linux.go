@@ -71,8 +71,8 @@ func adoptCandidatePaths(root, sourceArchive, sourceExtraction, destinationArchi
 		return err
 	}
 	directory := os.NewFile(uintptr(directoryFD), sourceExtraction)
-	entries, err := directory.ReadDir(-1)
-	if err != nil || len(entries) != len(entryNames) {
+	entries, err := directory.ReadDir(257)
+	if err != nil && !errors.Is(err, io.EOF) || len(entries) > 256 || len(entries) != len(entryNames) {
 		directory.Close()
 		return errors.New("candidate extraction closure changed")
 	}

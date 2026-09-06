@@ -57,6 +57,7 @@ type Summary struct {
 	CreatedAt   time.Time      `json:"created_at"`
 	ExpiresAt   time.Time      `json:"expires_at"`
 	Report      release.Report `json:"report"`
+	ResultCode  string         `json:"result_code,omitempty"`
 }
 
 type Prepared struct {
@@ -111,13 +112,25 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 		return Summary{}, errors.New("candidate request is invalid")
 	}
 	now := service.now().UTC()
-	if existing, found, err := service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, now); err != nil {
+	existing, found, err := service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, now)
+	if err != nil {
 		return Summary{}, mapStoreError(err)
-	} else if found {
+	}
+	if found && existing.State != store.CandidateUploading {
 		if err := envelope.Cleanup(); err != nil {
 			return Summary{}, err
 		}
 		return summaryFromRecord(existing)
+	}
+	if !found {
+		_, _, err := service.ReserveEnvelopeForActiveSession(ctx, sessionID, operationID)
+		if err != nil {
+			return Summary{}, err
+		}
+		existing, found, err = service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, service.now().UTC())
+		if err != nil || !found {
+			return Summary{}, errors.Join(err, errors.New("candidate reservation disappeared"))
+		}
 	}
 	floor, _, err := service.store.HighestCommittedVersion(ctx)
 	if err != nil {
@@ -125,22 +138,24 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	}
 	report, err := service.validator.Validate(ctx, envelope, floor)
 	if err != nil {
+		service.failBestEffort(sessionID, operationID, validationFailureCode(err))
 		return Summary{}, err
 	}
 	reportJSON, err := json.Marshal(report)
 	if err != nil {
 		return Summary{}, errors.New("encode candidate validation report")
 	}
-	candidateID, err := service.nextCandidateID()
-	if err != nil {
-		return Summary{}, err
-	}
+	candidateID := existing.ID
 	paths := service.paths(candidateID)
 	if err := service.adoptEnvelope(envelope, paths); err != nil {
 		return Summary{}, err
 	}
 	cleanupAfterAdoption := func(cause error) (Summary, error) {
+		service.failBestEffort(sessionID, operationID, validationFailureCode(cause))
 		return Summary{}, errors.Join(cause, deleteCandidatePaths(service.stagingRoot, candidateID))
+	}
+	if err := syncStagingRoot(service.stagingRoot); err != nil {
+		return cleanupAfterAdoption(err)
 	}
 	adoptedDigest, adoptedSize, err := hashCandidateArchive(service.stagingRoot, filepath.Base(paths.archive))
 	if err != nil || adoptedDigest != envelope.SHA256 || adoptedSize != envelope.CompressedBytes {
@@ -156,11 +171,16 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	accepted, created, err := service.store.AcceptCandidateForActiveSession(ctx, store.CandidateAcceptance{
 		CandidateID: candidateID, SessionID: sessionID, OperationID: operationID,
 		UploadDigest: envelope.SHA256, ValidationReport: string(reportJSON), Version: report.Version,
-		CreatedAt: now, ExpiresAt: now.Add(service.lifetime),
+		CreatedAt: existing.CreatedAt, ExpiresAt: existing.ExpiresAt, CommittedAt: service.now().UTC(),
 	})
 	if err != nil || !created {
 		cleanupErr := deleteCandidatePaths(service.stagingRoot, candidateID)
 		if err != nil {
+			code := validationFailureCode(err)
+			if errors.Is(err, store.ErrSessionInactive) || errors.Is(err, store.ErrCandidateExpired) {
+				code = "expired"
+			}
+			service.failBestEffort(sessionID, operationID, code)
 			return Summary{}, errors.Join(mapStoreError(err), cleanupErr)
 		}
 		if cleanupErr != nil {
@@ -169,6 +189,52 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 		return summaryFromRecord(accepted)
 	}
 	return summaryFromRecord(accepted)
+}
+
+func (service *Service) FailEnvelopeForActiveSession(ctx context.Context, sessionID, operationID, code string) (Summary, error) {
+	record, err := service.store.FailReservedCandidate(ctx, sessionID, operationID, code, service.now().UTC())
+	if err != nil {
+		return Summary{}, mapStoreError(err)
+	}
+	return summaryFromRecord(record)
+}
+
+func (service *Service) failBestEffort(sessionID, operationID, code string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = service.FailEnvelopeForActiveSession(ctx, sessionID, operationID, code)
+}
+
+func validationFailureCode(err error) string {
+	switch {
+	case errors.Is(err, release.ErrSignature):
+		return "signature_mismatch"
+	case errors.Is(err, release.ErrVersionFloor):
+		return "version_floor"
+	case errors.Is(err, ErrDigestMismatch):
+		return "hash_mismatch"
+	default:
+		return "internal_failure"
+	}
+}
+
+// ReserveEnvelopeForActiveSession atomically binds an idempotency key before
+// the HTTP handler consumes any request bytes.
+func (service *Service) ReserveEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string) (Summary, bool, error) {
+	if service == nil || !canonicalUUID.MatchString(operationID) {
+		return Summary{}, false, errors.New("candidate request is invalid")
+	}
+	now := service.now().UTC()
+	candidateID, err := service.nextCandidateID()
+	if err != nil {
+		return Summary{}, false, err
+	}
+	record, created, err := service.store.ReserveCandidateForActiveSession(ctx, store.CandidateReservation{CandidateID: candidateID, SessionID: sessionID, OperationID: operationID, CreatedAt: now, ExpiresAt: now.Add(service.lifetime)})
+	if err != nil {
+		return Summary{}, false, mapStoreError(err)
+	}
+	summary, err := summaryFromRecord(record)
+	return summary, created, err
 }
 
 func (service *Service) CandidateForOperationForActiveSession(ctx context.Context, sessionID, operationID string) (Summary, bool, error) {
@@ -326,8 +392,13 @@ func envelopeFromCandidate(paths candidatePaths, digest string, archiveSize int6
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("candidate extraction root changed")
 	}
-	directory, err := os.ReadDir(paths.extraction)
-	if err != nil || len(directory) == 0 {
+	handle, err := os.Open(paths.extraction)
+	if err != nil {
+		return nil, errors.New("candidate extraction is unreadable")
+	}
+	defer handle.Close()
+	directory, err := handle.ReadDir(257)
+	if err != nil && !errors.Is(err, io.EOF) || len(directory) == 0 || len(directory) > 256 {
 		return nil, errors.New("candidate extraction is unreadable")
 	}
 	sort.Slice(directory, func(left, right int) bool { return directory[left].Name() < directory[right].Name() })
@@ -347,10 +418,14 @@ func envelopeFromCandidate(paths candidatePaths, digest string, archiveSize int6
 
 func summaryFromRecord(record store.CandidateRecord) (Summary, error) {
 	var report release.Report
-	if err := json.Unmarshal([]byte(record.ValidationReport), &report); err != nil || !report.Verified || report.Version != record.Version {
+	if record.ValidationReport != "" {
+		if err := json.Unmarshal([]byte(record.ValidationReport), &report); err != nil || !report.Verified || report.Version != record.Version {
+			return Summary{}, errors.New("stored candidate report is invalid")
+		}
+	} else if record.State == store.CandidateValidated || record.State == store.CandidatePublishing || record.State == store.CandidatePublished {
 		return Summary{}, errors.New("stored candidate report is invalid")
 	}
-	return Summary{CandidateID: record.ID, OperationID: record.OperationID, State: string(record.State), CreatedAt: record.CreatedAt, ExpiresAt: record.ExpiresAt, Report: report}, nil
+	return Summary{CandidateID: record.ID, OperationID: record.OperationID, State: string(record.State), CreatedAt: record.CreatedAt, ExpiresAt: record.ExpiresAt, Report: report, ResultCode: record.ResultCode}, nil
 }
 
 func mapStoreError(err error) error {

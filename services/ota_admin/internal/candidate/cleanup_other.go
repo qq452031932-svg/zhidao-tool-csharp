@@ -4,6 +4,7 @@ package candidate
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -24,7 +25,19 @@ func deleteCandidatePaths(root, id string) error {
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	entries, readErr := os.ReadDir(extraction)
+	handle, openErr := os.Open(extraction)
+	var entries []os.DirEntry
+	readErr := openErr
+	if openErr == nil {
+		entries, readErr = handle.ReadDir(257)
+		_ = handle.Close()
+	}
+	if len(entries) > 256 {
+		return errors.New("candidate extraction contains too many members")
+	}
+	if errors.Is(readErr, io.EOF) {
+		readErr = nil
+	}
 	if readErr == nil {
 		info, statErr := os.Lstat(extraction)
 		if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {

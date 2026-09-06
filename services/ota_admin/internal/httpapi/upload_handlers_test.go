@@ -43,6 +43,23 @@ type fakeEnvelopeAcceptor struct {
 	err         error
 }
 
+func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.Context, sessionID, operationID string) (candidate.Summary, bool, error) {
+	acceptor.lookupCalls++
+	acceptor.sessionID = sessionID
+	acceptor.operationID = operationID
+	if acceptor.err != nil && acceptor.existing != nil {
+		return candidate.Summary{}, false, acceptor.err
+	}
+	if acceptor.existing != nil {
+		return *acceptor.existing, false, nil
+	}
+	return candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "uploading"}, true, nil
+}
+
+func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string) (candidate.Summary, error) {
+	return candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "failed", ResultCode: code}, nil
+}
+
 func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope) (candidate.Summary, error) {
 	acceptor.calls++
 	acceptor.sessionID = sessionID

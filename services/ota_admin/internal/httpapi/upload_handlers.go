@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/release"
@@ -20,20 +22,25 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		writeCandidateError(response, http.StatusBadRequest, "invalid_request", "请求标识无效", operationID)
 		return
 	}
-	if existing, found, err := router.uploadEnvelopes.CandidateForOperationForActiveSession(request.Context(), principal.IDHash, operationID); err != nil {
-		writeUploadOperationError(response, err, operationID)
-		return
-	} else if found {
-		writeCandidateSummary(response, http.StatusAccepted, existing)
-		return
-	}
 	contentTypes := request.Header.Values("Content-Type")
 	if len(contentTypes) != 1 || contentTypes[0] != "application/zip" {
 		writeError(response, http.StatusUnsupportedMediaType, "invalid_request")
 		return
 	}
+	reserved, created, err := router.uploadEnvelopes.ReserveEnvelopeForActiveSession(request.Context(), principal.IDHash, operationID)
+	if err != nil {
+		writeUploadOperationError(response, err, operationID)
+		return
+	}
+	if !created {
+		writeCandidateSummary(response, http.StatusAccepted, reserved)
+		return
+	}
 	envelope, err := router.uploads.Receive(request.Context(), request.Body, request.ContentLength)
 	if err != nil {
+		finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, principal.IDHash, operationID, "internal_failure")
+		cancel()
 		writeUploadError(response, err)
 		return
 	}

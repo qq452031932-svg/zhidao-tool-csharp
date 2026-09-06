@@ -16,9 +16,26 @@ type migration struct {
 	apply    func(context.Context, *sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}}
 
-const schemaVersion = 2
+const schemaVersion = 3
+
+var schemaV3 = `
+CREATE TABLE candidate_cleanups (
+    candidate_id TEXT PRIMARY KEY REFERENCES candidates(id) ON DELETE RESTRICT,
+    operation_id TEXT UNIQUE CHECK (operation_id IS NULL OR ` + uuidCheckSQL("operation_id") + `),
+    state TEXT NOT NULL CHECK (state IN ('pending','completed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (` + integerCheckSQL("attempt_count") + `),
+    claim_token TEXT NOT NULL DEFAULT '' CHECK (claim_token = '' OR ` + uuidCheckSQL("claim_token") + `),
+    claim_expires_at INTEGER CHECK (claim_expires_at IS NULL OR (` + integerCheckSQL("claim_expires_at") + `)),
+    last_error_code TEXT NOT NULL DEFAULT '' CHECK (last_error_code IN ('','internal_failure')),
+    updated_at INTEGER NOT NULL CHECK (` + integerCheckSQL("updated_at") + `),
+    completed_at INTEGER CHECK (completed_at IS NULL OR (` + integerCheckSQL("completed_at") + `)),
+    CHECK ((claim_token='' AND claim_expires_at IS NULL) OR (claim_token<>'' AND claim_expires_at IS NOT NULL)),
+    CHECK ((state='pending' AND completed_at IS NULL) OR (state='completed' AND completed_at IS NOT NULL AND claim_token='' AND claim_expires_at IS NULL AND last_error_code=''))
+);
+CREATE INDEX candidate_cleanups_pending ON candidate_cleanups(state,claim_expires_at,candidate_id);
+`
 
 var schemaV2 = `
 CREATE TABLE administrators (

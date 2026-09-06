@@ -62,35 +62,62 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 		return errors.New("janitor is nil")
 	}
 	now := janitor.now().UTC()
-	ids, err := janitor.store.ExpireCandidates(ctx, now)
-	if err != nil {
+	if err := cleanupStaleUploadArtifacts(janitor.stagingRoot, now.Add(-24*time.Hour)); err != nil {
 		return err
 	}
+	const pageSize = 64
+	for {
+		ids, err := janitor.store.QueueExpiredCandidateCleanups(ctx, now, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(ids) < pageSize {
+			break
+		}
+	}
 	var failures []error
-	for _, id := range ids {
-		if err := ctx.Err(); err != nil {
-			return errors.Join(append(failures, err)...)
+	for {
+		claimToken, err := janitor.nextOperationID()
+		if err != nil {
+			return errors.Join(errors.Join(failures...), err)
 		}
-		present, inspectErr := candidatePathsPresent(janitor.stagingRoot, id)
-		if !present && inspectErr == nil {
-			continue
-		}
-		operationID, operationErr := janitor.nextOperationID()
-		if operationErr != nil {
-			failures = append(failures, operationErr)
-			continue
-		}
-		cleanupErr := inspectErr
-		if cleanupErr == nil {
-			cleanupErr = janitor.deleteCandidate(id)
-		}
-		operationErr = janitor.store.RecordCleanupResult(ctx, operationID, cleanupErr == nil, now)
-		if cleanupErr != nil || operationErr != nil {
-			var cleanupFailure error
-			if cleanupErr != nil {
-				cleanupFailure = fmt.Errorf("clean candidate %s: %w", id, cleanupErr)
+		operationIDs := make([]string, pageSize)
+		for index := range operationIDs {
+			operationIDs[index], err = janitor.nextOperationID()
+			if err != nil {
+				return errors.Join(errors.Join(failures...), err)
 			}
-			failures = append(failures, errors.Join(cleanupFailure, operationErr))
+		}
+		claims, err := janitor.store.ClaimCandidateCleanups(ctx, now, 5*time.Minute, pageSize, claimToken, operationIDs)
+		if err != nil {
+			return errors.Join(errors.Join(failures...), err)
+		}
+		if len(claims) == 0 {
+			break
+		}
+		batchFailed := false
+		for _, claim := range claims {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(errors.Join(failures...), err)
+			}
+			cleanupErr := janitor.deleteCandidate(claim.CandidateID)
+			var ledgerErr error
+			if cleanupErr == nil {
+				ledgerErr = janitor.store.CompleteCandidateCleanup(ctx, claim, janitor.now().UTC())
+			} else {
+				ledgerErr = janitor.store.FailCandidateCleanup(ctx, claim, janitor.now().UTC())
+			}
+			if cleanupErr != nil || ledgerErr != nil {
+				batchFailed = true
+				var cleanupFailure error
+				if cleanupErr != nil {
+					cleanupFailure = fmt.Errorf("clean candidate %s: %w", claim.CandidateID, cleanupErr)
+				}
+				failures = append(failures, errors.Join(cleanupFailure, ledgerErr))
+			}
+		}
+		if batchFailed || len(claims) < pageSize {
+			break
 		}
 	}
 	return errors.Join(failures...)

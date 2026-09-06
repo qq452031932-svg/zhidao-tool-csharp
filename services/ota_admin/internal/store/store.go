@@ -84,6 +84,8 @@ type Candidate struct {
 type CandidateRecord struct {
 	Candidate
 	UploadDigest, ValidationReport, Version, OperationID string
+	OperationState                                       OperationState
+	ResultCode                                           string
 }
 
 type CandidateAcceptance struct {
@@ -91,6 +93,17 @@ type CandidateAcceptance struct {
 	UploadDigest, ValidationReport      string
 	Version                             string
 	CreatedAt, ExpiresAt                time.Time
+	CommittedAt                         time.Time
+}
+
+type CandidateReservation struct {
+	CandidateID, SessionID, OperationID string
+	CreatedAt, ExpiresAt                time.Time
+}
+
+type CleanupClaim struct {
+	CandidateID, OperationID, ClaimToken string
+	AttemptCount                         int
 }
 
 type SessionState string
@@ -514,9 +527,102 @@ func (s *Store) CreateCandidate(ctx context.Context, candidate Candidate) error 
 	return wrapWrite("create candidate", err)
 }
 
+func (s *Store) ReserveCandidateForActiveSession(ctx context.Context, request CandidateReservation) (CandidateRecord, bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	if request.CreatedAt.IsZero() || !request.ExpiresAt.After(request.CreatedAt) || request.ExpiresAt.Sub(request.CreatedAt) > 24*time.Hour {
+		return CandidateRecord{}, false, errors.New("candidate lifetime is invalid")
+	}
+	started, err := audit.NewUploadStarted(request.OperationID, request.CandidateID, request.CreatedAt)
+	if err != nil {
+		return CandidateRecord{}, false, err
+	}
+	var record CandidateRecord
+	created := false
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, request.SessionID, request.CreatedAt); err != nil {
+			return err
+		}
+		existing, found, err := candidateByOperationTx(ctx, tx, request.OperationID)
+		if err != nil {
+			return err
+		}
+		if found {
+			if existing.SessionID != request.SessionID {
+				return ErrSessionInactive
+			}
+			record = existing
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, request.CandidateID, request.SessionID, timestamp(request.CreatedAt), timestamp(request.ExpiresAt)); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, request.OperationID, request.CandidateID, timestamp(request.CreatedAt)); err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, started); err != nil {
+			return err
+		}
+		record = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateUploading, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, OperationID: request.OperationID, OperationState: OperationPending}
+		created = true
+		return nil
+	})
+	return record, created, err
+}
+
+func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationID, resultCode string, at time.Time) (CandidateRecord, error) {
+	if resultCode != "hash_mismatch" && resultCode != "signature_mismatch" && resultCode != "version_floor" && resultCode != "internal_failure" && resultCode != "expired" {
+		return CandidateRecord{}, errors.New("candidate failure code is invalid")
+	}
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var record CandidateRecord
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var found bool
+		var err error
+		record, found, err = candidateByOperationTx(ctx, tx, operationID)
+		if err != nil {
+			return err
+		}
+		if !found || record.SessionID != sessionID {
+			return ErrSessionInactive
+		}
+		if record.State != CandidateUploading || record.OperationState != OperationPending {
+			return nil
+		}
+		uploadCode := audit.CodeInternalFailure
+		if resultCode == "hash_mismatch" {
+			uploadCode = audit.CodeHashMismatch
+		}
+		if resultCode == "expired" {
+			uploadCode = audit.CodeExpired
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='failed' WHERE id=? AND state='uploading'`, record.ID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND state='pending'`, resultCode, timestamp(at), operationID); err != nil {
+			return err
+		}
+		event, err := audit.NewUploadCompleted(audit.OutcomeFailure, operationID, record.ID, uploadCode, at)
+		if err != nil {
+			return err
+		}
+		if err := insertAudit(ctx, tx, event); err != nil {
+			return err
+		}
+		record.State, record.OperationState, record.ResultCode = CandidateFailed, OperationFailed, resultCode
+		return nil
+	})
+	return record, err
+}
+
 func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request CandidateAcceptance) (CandidateRecord, bool, error) {
 	s.candidateMu.Lock()
 	defer s.candidateMu.Unlock()
+	commitAt := request.CommittedAt.UTC()
+	if commitAt.IsZero() {
+		return CandidateRecord{}, false, errors.New("candidate commit time is required")
+	}
 	if request.CreatedAt.IsZero() || !request.ExpiresAt.After(request.CreatedAt) || request.ExpiresAt.Sub(request.CreatedAt) > 24*time.Hour {
 		return CandidateRecord{}, false, errors.New("candidate lifetime is invalid")
 	}
@@ -538,17 +644,20 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 	if err != nil {
 		return CandidateRecord{}, false, err
 	}
-	uploadCompleted, err := audit.NewUploadCompleted(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeCompleted, request.CreatedAt)
+	uploadCompleted, err := audit.NewUploadCompleted(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeCompleted, commitAt)
 	if err != nil {
 		return CandidateRecord{}, false, err
 	}
-	gateAccepted, err := audit.NewGateResult(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeAccepted, request.CreatedAt)
+	gateAccepted, err := audit.NewGateResult(audit.OutcomeSuccess, request.OperationID, request.CandidateID, audit.CodeAccepted, commitAt)
 	if err != nil {
 		return CandidateRecord{}, false, err
 	}
 	var accepted CandidateRecord
 	created := false
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, request.SessionID, commitAt); err != nil {
+			return err
+		}
 		existing, found, err := candidateByOperationTx(ctx, tx, request.OperationID)
 		if err != nil {
 			return err
@@ -557,11 +666,13 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 			if existing.SessionID != request.SessionID {
 				return ErrSessionInactive
 			}
-			accepted = existing
-			return nil
-		}
-		if err := requireActiveSessionTx(ctx, tx, request.SessionID, request.CreatedAt); err != nil {
-			return err
+			if existing.State != CandidateUploading {
+				accepted = existing
+				return nil
+			}
+			if existing.ID != request.CandidateID || !commitAt.Before(existing.ExpiresAt) {
+				return ErrCandidateExpired
+			}
 		}
 		var major, minor, patch int64
 		floorErr := tx.QueryRowContext(ctx, `SELECT major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&major, &minor, &patch)
@@ -571,14 +682,16 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 		if floorErr != nil && !errors.Is(floorErr, sql.ErrNoRows) {
 			return floorErr
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, request.CandidateID, request.SessionID, timestamp(request.CreatedAt), timestamp(request.ExpiresAt)); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, request.OperationID, request.CandidateID, timestamp(request.CreatedAt)); err != nil {
-			return err
-		}
-		if err := insertAudit(ctx, tx, uploadStarted); err != nil {
-			return err
+		if !found {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, request.CandidateID, request.SessionID, timestamp(request.CreatedAt), timestamp(request.ExpiresAt)); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, request.OperationID, request.CandidateID, timestamp(request.CreatedAt)); err != nil {
+				return err
+			}
+			if err := insertAudit(ctx, tx, uploadStarted); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=?`, request.OperationID); err != nil {
 			return err
@@ -589,13 +702,13 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 		if err := insertAudit(ctx, tx, gateAccepted); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='succeeded',result_code='completed',finished_at=? WHERE id=?`, timestamp(request.CreatedAt), request.OperationID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='succeeded',result_code='completed',finished_at=? WHERE id=?`, timestamp(commitAt), request.OperationID); err != nil {
 			return err
 		}
 		if err := insertAudit(ctx, tx, uploadCompleted); err != nil {
 			return err
 		}
-		accepted = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateValidated, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, UploadDigest: request.UploadDigest, ValidationReport: request.ValidationReport, Version: request.Version, OperationID: request.OperationID}
+		accepted = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateValidated, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, UploadDigest: request.UploadDigest, ValidationReport: request.ValidationReport, Version: request.Version, OperationID: request.OperationID, OperationState: OperationSucceeded, ResultCode: "completed"}
 		created = true
 		return nil
 	})
@@ -701,6 +814,200 @@ func (s *Store) ExpireCandidates(ctx context.Context, now time.Time) ([]string, 
 	return ids, err
 }
 
+// QueueExpiredCandidateCleanups advances at most limit due candidates and
+// durably records cleanup work. Repeated calls are idempotent.
+func (s *Store) QueueExpiredCandidateCleanups(ctx context.Context, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 || limit > 256 {
+		return nil, errors.New("cleanup page limit is invalid")
+	}
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var ids []string
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT c.id,c.state FROM candidates c LEFT JOIN candidate_cleanups x ON x.candidate_id=c.id WHERE x.candidate_id IS NULL AND ((c.state IN ('uploading','validated') AND c.expires_at<=?) OR c.state IN ('failed','expired')) ORDER BY c.id LIMIT ?`, timestamp(now), limit)
+		if err != nil {
+			return err
+		}
+		type due struct {
+			id    string
+			state CandidateState
+		}
+		var selected []due
+		for rows.Next() {
+			var item due
+			if err := rows.Scan(&item.id, &item.state); err != nil {
+				rows.Close()
+				return err
+			}
+			selected = append(selected, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, item := range selected {
+			if item.state == CandidateUploading || item.state == CandidateValidated {
+				if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='expired' WHERE id=? AND state IN ('uploading','validated')`, item.id); err != nil {
+					return err
+				}
+				if item.state == CandidateUploading {
+					var operationID string
+					if err := tx.QueryRowContext(ctx, `SELECT id FROM operations WHERE candidate_id=? AND kind='upload'`, item.id).Scan(&operationID); err != nil {
+						return err
+					}
+					if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code='expired',finished_at=? WHERE id=? AND state='pending'`, timestamp(now), operationID); err != nil {
+						return err
+					}
+					event, err := audit.NewUploadCompleted(audit.OutcomeFailure, operationID, item.id, audit.CodeExpired, now)
+					if err != nil {
+						return err
+					}
+					if err := insertAudit(ctx, tx, event); err != nil {
+						return err
+					}
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_cleanups(candidate_id,state,updated_at) VALUES(?,'pending',?) ON CONFLICT(candidate_id) DO NOTHING`, item.id, timestamp(now)); err != nil {
+				return err
+			}
+			ids = append(ids, item.id)
+		}
+		return nil
+	})
+	return ids, err
+}
+
+func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease time.Duration, limit int, claimToken string, operationIDs []string) ([]CleanupClaim, error) {
+	if lease <= 0 || lease > time.Hour || limit <= 0 || limit > 256 || len(operationIDs) < limit {
+		return nil, errors.New("cleanup claim request is invalid")
+	}
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	var claims []CleanupClaim
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT candidate_id,attempt_count,operation_id,claim_token FROM candidate_cleanups WHERE state='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?) ORDER BY candidate_id LIMIT ?`, timestamp(now), limit)
+		if err != nil {
+			return err
+		}
+		type ready struct {
+			id           string
+			attempts     int
+			oldOperation sql.NullString
+			oldClaim     string
+		}
+		var selected []ready
+		for rows.Next() {
+			var item ready
+			if err := rows.Scan(&item.id, &item.attempts, &item.oldOperation, &item.oldClaim); err != nil {
+				rows.Close()
+				return err
+			}
+			selected = append(selected, item)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for index, item := range selected {
+			if item.oldOperation.Valid && item.oldClaim != "" {
+				result, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=? AND state='running'`, timestamp(now), item.oldOperation.String)
+				if err != nil {
+					return err
+				}
+				changed, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if changed == 1 {
+					event, err := audit.NewCleanupResult(audit.OutcomeFailure, item.oldOperation.String, "", audit.CodeInternalFailure, now)
+					if err != nil {
+						return err
+					}
+					if err := insertAudit(ctx, tx, event); err != nil {
+						return err
+					}
+				}
+			}
+			opID := operationIDs[index]
+			result, err := tx.ExecContext(ctx, `UPDATE candidate_cleanups SET operation_id=?,attempt_count=attempt_count+1,claim_token=?,claim_expires_at=?,last_error_code='',updated_at=? WHERE candidate_id=? AND state='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?)`, opID, claimToken, timestamp(now.Add(lease)), timestamp(now), item.id, timestamp(now))
+			if err != nil {
+				return err
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if changed != 1 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, opID, timestamp(now)); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='running' WHERE id=?`, opID); err != nil {
+				return err
+			}
+			claims = append(claims, CleanupClaim{CandidateID: item.id, OperationID: opID, ClaimToken: claimToken, AttemptCount: item.attempts + 1})
+		}
+		return nil
+	})
+	return claims, err
+}
+
+func (s *Store) CompleteCandidateCleanup(ctx context.Context, claim CleanupClaim, at time.Time) error {
+	event, err := audit.NewCleanupResult(audit.OutcomeSuccess, claim.OperationID, "", audit.CodeCompleted, at)
+	if err != nil {
+		return err
+	}
+	return s.finishCandidateCleanup(ctx, claim, at, true, event)
+}
+
+func (s *Store) FailCandidateCleanup(ctx context.Context, claim CleanupClaim, at time.Time) error {
+	event, err := audit.NewCleanupResult(audit.OutcomeFailure, claim.OperationID, "", audit.CodeInternalFailure, at)
+	if err != nil {
+		return err
+	}
+	return s.finishCandidateCleanup(ctx, claim, at, false, event)
+}
+
+func (s *Store) finishCandidateCleanup(ctx context.Context, claim CleanupClaim, at time.Time, success bool, event audit.Event) error {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		terminal, code := OperationFailed, audit.CodeInternalFailure
+		if success {
+			terminal, code = OperationSucceeded, audit.CodeCompleted
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE operations SET state=?,result_code=?,finished_at=? WHERE id=? AND state='running'`, terminal, code, timestamp(at), claim.OperationID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		if err := insertAudit(ctx, tx, event); err != nil {
+			return err
+		}
+		if success {
+			result, err = tx.ExecContext(ctx, `UPDATE candidate_cleanups SET state='completed',claim_token='',claim_expires_at=NULL,last_error_code='',updated_at=?,completed_at=? WHERE candidate_id=? AND operation_id=? AND claim_token=? AND state='pending'`, timestamp(at), timestamp(at), claim.CandidateID, claim.OperationID, claim.ClaimToken)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE candidate_cleanups SET claim_token='',claim_expires_at=NULL,last_error_code='internal_failure',updated_at=? WHERE candidate_id=? AND operation_id=? AND claim_token=? AND state='pending'`, timestamp(at), claim.CandidateID, claim.OperationID, claim.ClaimToken)
+		}
+		if err != nil {
+			return err
+		}
+		rows, err = result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		return nil
+	})
+}
+
 func (s *Store) RecordCleanupResult(ctx context.Context, operationID string, success bool, at time.Time) error {
 	outcome, code, terminal := audit.OutcomeFailure, audit.CodeInternalFailure, OperationFailed
 	if success {
@@ -724,14 +1031,14 @@ func (s *Store) RecordCleanupResult(ctx context.Context, operationID string, suc
 	})
 }
 
-const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,COALESCE(json_extract(c.validation_report,'$.version'),''),o.id FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload'`
+const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,CASE WHEN c.validation_report='' THEN '' ELSE COALESCE(json_extract(c.validation_report,'$.version'),'') END,o.id,o.state,o.result_code FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload'`
 
 type rowScanner interface{ Scan(...any) error }
 
 func scanCandidateRecord(row rowScanner) (CandidateRecord, error) {
 	var record CandidateRecord
 	var createdAt, expiresAt int64
-	err := row.Scan(&record.ID, &record.SessionID, &record.State, &createdAt, &expiresAt, &record.UploadDigest, &record.ValidationReport, &record.Version, &record.OperationID)
+	err := row.Scan(&record.ID, &record.SessionID, &record.State, &createdAt, &expiresAt, &record.UploadDigest, &record.ValidationReport, &record.Version, &record.OperationID, &record.OperationState, &record.ResultCode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CandidateRecord{}, ErrNotFound
 	}

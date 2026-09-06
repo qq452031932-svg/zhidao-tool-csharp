@@ -18,7 +18,7 @@ func TestAcceptCandidateForActiveSessionBindsEvidenceAndUploadOperationAtomicall
 	record, created, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"schemaVersion":1,"verified":true,"version":"1.2.3"}`,
-		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
 	})
 	if err != nil || !created {
 		t.Fatalf("accept created=%v err=%v", created, err)
@@ -70,7 +70,7 @@ func TestAcceptCandidateForActiveSessionRejectsRevokedAndExpiredSessionsWithoutP
 			_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 				CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 				UploadDigest: digest1, ValidationReport: `{"schemaVersion":1,"verified":true,"version":"1.2.3"}`,
-				Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+				Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
 			})
 			if !errors.Is(err, ErrSessionInactive) {
 				t.Fatalf("err=%v, want %v", err, ErrSessionInactive)
@@ -85,6 +85,29 @@ func TestAcceptCandidateForActiveSessionRejectsRevokedAndExpiredSessionsWithoutP
 	}
 }
 
+func TestAcceptCandidateUsesFreshCommitTimeForNewAndReservedOperations(t *testing.T) {
+	for _, reserved := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new", true: "reserved"}[reserved], func(t *testing.T) {
+			s := openStore(t)
+			now := time.Unix(2_000_000_000, 0).UTC()
+			createCandidateSession(t, s, sessionHash1, now, now.Add(time.Minute))
+			if reserved {
+				if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(time.Minute)})
+			if !errors.Is(err, ErrSessionInactive) {
+				t.Fatalf("err=%v", err)
+			}
+			var validated int
+			if err := s.db.QueryRow(`SELECT count(*) FROM candidates WHERE state='validated'`).Scan(&validated); err != nil || validated != 0 {
+				t.Fatalf("validated=%d err=%v", validated, err)
+			}
+		})
+	}
+}
+
 func TestAcceptCandidateRejectsUnverifiedValidationReport(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
@@ -92,7 +115,7 @@ func TestAcceptCandidateRejectsUnverifiedValidationReport(t *testing.T) {
 	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
 		UploadDigest: digest1, ValidationReport: `{"verified":false,"version":"1.2.3"}`,
-		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now,
 	})
 	if err == nil {
 		t.Fatal("unverified report accepted")
@@ -105,8 +128,8 @@ func TestAcceptCandidateOperationIDIsConcurrentAndSessionBoundIdempotent(t *test
 	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
 	createCandidateSession(t, s, sessionHash2, now, now.Add(time.Hour))
 	requests := []CandidateAcceptance{
-		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
-		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
+		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now},
+		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now},
 	}
 	var wait sync.WaitGroup
 	results := make(chan CandidateRecord, len(requests))
@@ -143,6 +166,83 @@ func TestAcceptCandidateOperationIDIsConcurrentAndSessionBoundIdempotent(t *test
 	}
 }
 
+func TestReserveCandidateAtomicallyClaimsIdempotencyKeyBeforeUpload(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	requests := []CandidateReservation{
+		{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
+		{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)},
+	}
+	var wait sync.WaitGroup
+	created := make(chan bool, 2)
+	ids := make(chan string, 2)
+	for _, request := range requests {
+		wait.Add(1)
+		go func(request CandidateReservation) {
+			defer wait.Done()
+			record, fresh, err := s.ReserveCandidateForActiveSession(context.Background(), request)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			created <- fresh
+			ids <- record.ID
+		}(request)
+	}
+	wait.Wait()
+	close(created)
+	close(ids)
+	createdCount := 0
+	for value := range created {
+		if value {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count=%d", createdCount)
+	}
+	var first string
+	for id := range ids {
+		if first == "" {
+			first = id
+		}
+		if id != first {
+			t.Fatalf("reservation IDs differ: %s/%s", first, id)
+		}
+	}
+	var candidates, operations, audits int
+	if err := s.db.QueryRow(`SELECT count(*) FROM candidates`).Scan(&candidates); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM operations`).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='upload_started'`).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if candidates != 1 || operations != 1 || audits != 1 {
+		t.Fatalf("rows candidates=%d operations=%d audits=%d", candidates, operations, audits)
+	}
+}
+
+func TestFailedReservationIsTerminalAndReplayable(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	if _, _, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "internal_failure", now.Add(time.Second))
+	if err != nil || failed.State != CandidateFailed || failed.OperationState != OperationFailed {
+		t.Fatalf("failed=%+v err=%v", failed, err)
+	}
+	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(2 * time.Second), ExpiresAt: now.Add(24 * time.Hour)})
+	if err != nil || created || replayed.ID != candidateID1 || replayed.ResultCode != "internal_failure" {
+		t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
+	}
+}
+
 func TestCandidateConfirmReadAndExpiryAreSessionBoundTransactions(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
@@ -150,7 +250,7 @@ func TestCandidateConfirmReadAndExpiryAreSessionBoundTransactions(t *testing.T) 
 	createCandidateSession(t, s, sessionHash2, now, now.Add(time.Hour))
 	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
-		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(30 * time.Minute),
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(30 * time.Minute), CommittedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +274,7 @@ func TestCandidateStatusReadIsSessionBoundButAllowsExpiredState(t *testing.T) {
 	createCandidateSession(t, s, sessionHash2, now, now.Add(2*time.Hour))
 	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
 		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
-		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(time.Minute), CommittedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)

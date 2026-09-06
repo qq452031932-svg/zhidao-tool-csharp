@@ -31,7 +31,7 @@ func TestOpenMigratesRequiredTablesAndPragmas(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	ctx := context.Background()
-	for _, table := range []string{"administrators", "highest_committed_version", "releases", "release_assets", "candidates", "sessions", "operations", "audit_events"} {
+	for _, table := range []string{"administrators", "highest_committed_version", "releases", "release_assets", "candidates", "sessions", "operations", "audit_events", "candidate_cleanups"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table %q count/error = %d/%v", table, count, err)
@@ -95,11 +95,11 @@ func TestMigrationChainIsOrderedAndComplete(t *testing.T) {
 	}
 }
 
-func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
+func TestFreshAndLegacyDatabasesEndAtSchemaV3(t *testing.T) {
 	t.Parallel()
 	fresh := openStore(t)
 	var version int
-	if err := fresh.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err := fresh.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("fresh schema=%d err=%v", version, err)
 	}
 	assertIntegerTimestampColumns(t, fresh.db)
@@ -139,7 +139,7 @@ func TestFreshAndLegacyDatabasesEndAtSchemaV2(t *testing.T) {
 		t.Fatalf("upgrade: %v", err)
 	}
 	defer upgraded.Close()
-	if err = upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err = upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("upgraded schema=%d err=%v", version, err)
 	}
 	assertIntegerTimestampColumns(t, upgraded.db)
@@ -217,7 +217,7 @@ func TestHardenedCommittedV1DatabaseMigratesToV2(t *testing.T) {
 	}
 	defer upgraded.Close()
 	var version int
-	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 2 {
+	if err := upgraded.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("upgraded schema=%d err=%v", version, err)
 	}
 	if got, ok, err := upgraded.HighestCommittedVersion(context.Background()); err != nil || !ok || got != "1.2.3" {

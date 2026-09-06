@@ -45,9 +45,17 @@ func adoptCandidatePaths(root, sourceArchive, sourceExtraction, destinationArchi
 		}
 	}
 	extraction := filepath.Join(root, sourceExtraction)
-	entries, err := os.ReadDir(extraction)
-	if err != nil || len(entries) != len(entryNames) {
+	handle, err := os.Open(extraction)
+	if err != nil {
 		return errors.New("candidate extraction closure changed")
+	}
+	entries, err := handle.ReadDir(257)
+	closeErr := handle.Close()
+	if err != nil && !errors.Is(err, io.EOF) || len(entries) > 256 || len(entries) != len(entryNames) {
+		return errors.New("candidate extraction closure changed")
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	wanted := make(map[string]bool, len(entryNames))
 	for _, name := range entryNames {

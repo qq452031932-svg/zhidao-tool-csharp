@@ -5,6 +5,7 @@ package candidate
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -43,8 +44,8 @@ func deleteCandidatePaths(root, id string) error {
 			return err
 		}
 		directory := os.NewFile(uintptr(directoryFD), extraction.name)
-		entries, err := directory.ReadDir(-1)
-		if err != nil {
+		entries, err := directory.ReadDir(257)
+		if err != nil && !errors.Is(err, io.EOF) || len(entries) > 256 {
 			directory.Close()
 			return err
 		}
@@ -84,7 +85,7 @@ func deleteCandidatePaths(root, id string) error {
 			return err
 		}
 	}
-	return nil
+	return unix.Fsync(rootFD)
 }
 
 func openCandidateRoot(root string) (int, error) {
