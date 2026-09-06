@@ -189,11 +189,18 @@ func preflightInnerArchive(reader io.ReaderAt, size int64) (uint64, error) {
 	}
 	eocdIndex := -1
 	for index := len(tail) - 22; index >= 0; index-- {
-		if binary.LittleEndian.Uint32(tail[index:]) == 0x06054b50 &&
-			index+22+int(binary.LittleEndian.Uint16(tail[index+20:])) == len(tail) {
-			eocdIndex = index
-			break
+		if binary.LittleEndian.Uint32(tail[index:]) != 0x06054b50 {
+			continue
 		}
+		end := index + 22 + int(binary.LittleEndian.Uint16(tail[index+20:]))
+		if end > len(tail) {
+			return 0, errors.New("inner package has a truncated later ZIP end record")
+		}
+		if end != len(tail) {
+			return 0, errors.New("inner package has an ambiguous later ZIP end record")
+		}
+		eocdIndex = index
+		break
 	}
 	if eocdIndex < 0 {
 		return 0, errors.New("inner package has no valid ZIP end record")
@@ -398,6 +405,9 @@ func canonicalInnerWindowsPath(name string) (string, bool) {
 	parts := strings.Split(name, "/")
 	canonicalParts := make([]string, 0, len(parts))
 	for _, rawPart := range parts {
+		if len(utf16.Encode([]rune(rawPart))) > 255 {
+			return "", false
+		}
 		part := norm.NFC.String(rawPart)
 		if part == "" || part == "." || part == ".." || len(utf16.Encode([]rune(part))) > 255 || strings.HasSuffix(part, " ") || strings.HasSuffix(part, ".") ||
 			strings.ContainsAny(part, `<>:"|?*`) {

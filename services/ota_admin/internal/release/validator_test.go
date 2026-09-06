@@ -598,6 +598,9 @@ func TestCanonicalInnerWindowsPathUsesNFCAndUTF16Lengths(t *testing.T) {
 	if _, ok := canonicalInnerWindowsPath(strings.Repeat("界", 256)); ok {
 		t.Fatal("component above 255 UTF-16 units was accepted")
 	}
+	if _, ok := canonicalInnerWindowsPath(strings.Repeat("e\u0301", 128)); ok {
+		t.Fatal("raw component above 255 UTF-16 units was accepted after NFC contraction")
+	}
 }
 
 func TestInnerZipPreflightRejectsEntryCountAndZIP64SizeBeforeReader(t *testing.T) {
@@ -645,6 +648,18 @@ func TestInnerZipPreflightRejectsEntryCountAndZIP64SizeBeforeReader(t *testing.T
 	binary.LittleEndian.PutUint32(central[79:], 67)
 	if _, err := preflightInnerArchive(bytes.NewReader(central), int64(len(central))); err == nil {
 		t.Fatal("preflight accepted overflowing ZIP64 entry sizes")
+	}
+
+	nested := zipBytes(t, map[string][]byte{"safe.txt": []byte("safe")})
+	fakeEnd := make([]byte, 22)
+	binary.LittleEndian.PutUint32(fakeEnd, 0x06054b50)
+	binary.LittleEndian.PutUint16(fakeEnd[8:], math.MaxUint16)
+	binary.LittleEndian.PutUint16(fakeEnd[10:], math.MaxUint16)
+	comment := append(fakeEnd, make([]byte, 22)...)
+	binary.LittleEndian.PutUint16(nested[len(nested)-2:], uint16(len(comment)))
+	nested = append(nested, comment...)
+	if _, err := preflightInnerArchive(bytes.NewReader(nested), int64(len(nested))); err == nil {
+		t.Fatal("preflight accepted a later fake EOCD that archive/zip would select")
 	}
 }
 
