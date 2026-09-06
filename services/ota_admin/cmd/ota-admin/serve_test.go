@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"math/big"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,7 +40,11 @@ func TestDecodeSourceHMACKeyRequiresOneLowercaseHexKey(t *testing.T) {
 
 func TestInitializeAdminIfMissingIsIdempotentAgainstActualAdministratorRow(t *testing.T) {
 	t.Parallel()
-	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	stateRoot := t.TempDir()
+	if err := os.Chmod(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(context.Background(), filepath.Join(stateRoot, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
