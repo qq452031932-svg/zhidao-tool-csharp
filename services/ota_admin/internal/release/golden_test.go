@@ -22,8 +22,8 @@ func TestCommittedPowerShellProductionGoldenBundle(t *testing.T) {
 	if !ok {
 		t.Fatal("resolve test source path")
 	}
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", "..", ".."))
-	fixtureRoot := filepath.Join(repositoryRoot, "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction")
+	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
+	fixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
 	bundlePath := filepath.Join(fixtureRoot, "valid-upload.zip")
 	certificateBytes, err := os.ReadFile(filepath.Join(fixtureRoot, "publisher.cer"))
 	if err != nil {

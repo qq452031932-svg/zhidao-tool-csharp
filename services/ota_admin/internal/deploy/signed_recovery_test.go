@@ -48,8 +48,8 @@ func signedGenerationFixture(t *testing.T) (*upload.Envelope, *release.Validator
 	if !ok {
 		t.Fatal("resolve test source path")
 	}
-	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", "..", "..", ".."))
-	fixtureRoot := filepath.Join(repositoryRoot, "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction")
+	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
+	fixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
 	certificateBytes, err := os.ReadFile(filepath.Join(fixtureRoot, "publisher.cer"))
 	if err != nil {
 		t.Fatal(err)

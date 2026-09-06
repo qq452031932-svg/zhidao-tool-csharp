@@ -81,6 +81,8 @@ function Get-TrackedSourcePaths {
         $moduleRelativePath = $_.Substring($modulePrefix.Length)
         return $moduleRelativePath -eq 'go.mod' -or
             $moduleRelativePath -eq 'go.sum' -or
+            $moduleRelativePath -ceq 'cmd/ota-admin-acceptance/testdata/valid-upload.zip' -or
+            $moduleRelativePath -ceq 'cmd/ota-admin-acceptance/testdata/publisher.cer' -or
             $moduleRelativePath.EndsWith('.go', [System.StringComparison]::Ordinal) -or
             $moduleRelativePath.EndsWith('.ps1', [System.StringComparison]::Ordinal) -or
             $moduleRelativePath.EndsWith('.sh', [System.StringComparison]::Ordinal) -or

@@ -28,7 +28,7 @@ function Get-AcceptanceSourcePaths {
     foreach ($path in $fixtures.Keys) {
         $blob = (& git -C $RepositoryRoot rev-parse "HEAD:$path") -join "`n"
         if ($LASTEXITCODE -ne 0 -or $blob -cne $fixtures[$path][0]) { throw "Acceptance fixture Git blob mismatch: $path" }
-        $paths += $path
+        if (-not $paths.Contains($path)) { $paths += $path }
     }
     [System.Array]::Sort($paths, [System.StringComparer]::Ordinal)
     return $paths

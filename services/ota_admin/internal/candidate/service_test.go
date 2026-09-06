@@ -268,5 +268,5 @@ func goldenFixturePath(t *testing.T, name string) string {
 	if !ok {
 		t.Fatal("resolve source path")
 	}
-	return filepath.Join(filepath.Dir(source), "..", "..", "..", "..", "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction", name)
+	return filepath.Join(filepath.Dir(source), "..", "..", "cmd", "ota-admin-acceptance", "testdata", name)
 }

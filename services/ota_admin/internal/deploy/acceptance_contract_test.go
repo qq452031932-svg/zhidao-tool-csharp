@@ -42,7 +42,7 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 		}
 	}
 	productionScript := readTask10Script(t, filepath.Join(moduleRoot, "scripts", "build_linux_amd64.ps1"))
-	for _, required := range []string{"Assert-AcceptanceHarnessExcluded", "./cmd/ota-admin", "superpan-ota-admin-linux-amd64"} {
+	for _, required := range []string{"Assert-AcceptanceHarnessExcluded", "./cmd/ota-admin", "superpan-ota-admin-linux-amd64", "cmd/ota-admin-acceptance/testdata/valid-upload.zip", "cmd/ota-admin-acceptance/testdata/publisher.cer"} {
 		if !strings.Contains(productionScript, required) {
 			t.Fatalf("production build script missing isolation proof %q", required)
 		}
@@ -54,14 +54,14 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 
 func TestAcceptanceHarnessFixturesExactlyMatchTrackedPowerShellGolden(t *testing.T) {
 	moduleRoot := filepath.Clean(filepath.Join("..", ".."))
-	repositoryRoot := filepath.Clean(filepath.Join(moduleRoot, "..", ".."))
 	acceptanceFixtureRoot := filepath.Join(moduleRoot, "cmd", "ota-admin-acceptance", "testdata")
-	productionFixtureRoot := filepath.Join(repositoryRoot, "tests", "BaiduBatchTransfer.App.Tests", "Updates", "Fixtures", "OtaProduction")
-	for _, name := range []string{"valid-upload.zip", "publisher.cer"} {
-		want := fixtureSHA256(t, filepath.Join(productionFixtureRoot, name))
+	for name, want := range map[string]string{
+		"valid-upload.zip": "b01dd17f87ade73bcefacedf55fe688fc8dd7bc222bb4bb7c264790633afff95",
+		"publisher.cer":    "54250feb9125e34f5f48ffaa2210f7c6d251a6475bf09cef34b0aee9e57f3d53",
+	} {
 		got := fixtureSHA256(t, filepath.Join(acceptanceFixtureRoot, name))
 		if got != want {
-			t.Fatalf("acceptance fixture %s hash = %s, want tracked golden %s", name, got, want)
+			t.Fatalf("acceptance fixture %s hash = %s, want audited golden %s", name, got, want)
 		}
 	}
 	entries, err := os.ReadDir(acceptanceFixtureRoot)
