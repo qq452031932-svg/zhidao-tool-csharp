@@ -154,7 +154,7 @@ report_install_result() {
     if [ "$INSTALL_SUCCEEDED" != true ]; then
         cat >&2 <<EOF
 Installation did not complete. Backup: ${BACKUP_DIR}
-Rollback (run as root): restore only the named targets listed in ${BACKUP_DIR}, validate Nginx, then restart ${SERVICE_NAME}.
+Rollback (run as root): restore only the named targets and prior unit states recorded in ${BACKUP_DIR}, then validate Nginx.
 EOF
     fi
     exit "$status"
@@ -172,6 +172,20 @@ backup_target() {
     fi
 }
 
+# The database is deliberately never rolled back. Credentials that authorize or
+# authenticate its retained state therefore share its lifecycle: existing values
+# are backed up, while newly created values are explicitly kept on rollback.
+backup_persistent_target() {
+    local target="$1"
+    local name="$2"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        cp -a -- "$target" "${BACKUP_DIR}/${name}"
+        printf '%s\n' "$target" >>"${BACKUP_DIR}/present-targets.txt"
+    else
+        printf '%s\n' "$target" >>"${BACKUP_DIR}/persistent-new-targets.txt"
+    fi
+}
+
 # Only individually enumerated OTA administration targets are backed up.
 backup_target "$BINARY_TARGET" "ota-admin"
 backup_target "$UNIT_TARGET" "superpan-ota-admin.service"
@@ -179,10 +193,10 @@ backup_target "$MOUNT_UNIT_TARGET" "var-lib-otaadmin-releases.mount"
 backup_target "$NGINX_SNIPPET_TARGET" "ota.fanfh.cn.admin.nginx.conf"
 backup_target "$CONFIG_TARGET" "config.json"
 backup_target "$CERTIFICATE_TARGET" "publisher.cer"
-backup_target "$HMAC_TARGET" "source-hmac.key"
 backup_target "$ACTIVE_VHOST" "ota.fanfh.cn.conf"
-backup_target "$INITIAL_PASSWORD_FILE" "superpan-ota-admin.initial-password"
-backup_target "$PASSWORD_TEMP" "superpan-ota-admin.initial-password.new"
+backup_persistent_target "$HMAC_TARGET" "source-hmac.key"
+backup_persistent_target "$INITIAL_PASSWORD_FILE" "superpan-ota-admin.initial-password"
+backup_persistent_target "$PASSWORD_TEMP" "superpan-ota-admin.initial-password.new"
 sha256sum -- "$ACTIVE_VHOST" >"${BACKUP_DIR}/ota.fanfh.cn.conf.sha256"
 stat -c '%u %g %a %n' "$RELEASE_ROOT" >"${BACKUP_DIR}/release-directory-metadata.txt"
 if [ "$GENERATIONS_EXISTED" = true ]; then
@@ -200,6 +214,16 @@ record_unit_enabled_state() {
 }
 record_unit_enabled_state "$SERVICE_NAME"
 record_unit_enabled_state "$MOUNT_UNIT_NAME"
+record_unit_active_state() {
+    local unit="$1"
+    local state="inactive"
+    if systemctl is-active --quiet "$unit"; then
+        state="active"
+    fi
+    printf '%s %s\n' "$unit" "$state" >>"${BACKUP_DIR}/unit-active-state.txt"
+}
+record_unit_active_state "$SERVICE_NAME"
+record_unit_active_state "$MOUNT_UNIT_NAME"
 
 if ! getent group superpan-ota-admin >/dev/null; then
     groupadd --system "$SERVICE_GROUP"
@@ -231,10 +255,12 @@ if [ -e "$RELEASE_VIEW_ROOT" ] || [ -L "$RELEASE_VIEW_ROOT" ]; then
         [ "$(stat -Lc '%d:%i' "$RELEASE_VIEW_ROOT")" = "$(stat -Lc '%d:%i' "$RELEASE_ROOT")" ] ||
             die "existing release bind target points elsewhere"
     else
+        [ "$(stat -c '%U:%G' "$RELEASE_VIEW_ROOT")" = "root:root" ] && [ "$(stat -c '%a' "$RELEASE_VIEW_ROOT")" = "755" ] ||
+            die "release bind target metadata is unsafe"
         [ -z "$(find "$RELEASE_VIEW_ROOT" -mindepth 1 -maxdepth 1 -print -quit)" ] || die "release bind target is not empty"
     fi
 else
-    install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$RELEASE_VIEW_ROOT"
+    install -d -m 0755 -o root -g root "$RELEASE_VIEW_ROOT"
 fi
 
 install -m 0755 -o root -g root "$BINARY_SOURCE" "$BINARY_TARGET"
@@ -315,10 +341,12 @@ Rollback (run as root):
   systemctl stop ${MOUNT_UNIT_NAME}
   restore only the named files listed in ${BACKUP_DIR}/present-targets.txt
   remove only targets listed in ${BACKUP_DIR}/absent-targets.txt
+  keep credentials listed in ${BACKUP_DIR}/persistent-new-targets.txt because the database is retained
   restore uid/gid/mode from ${BACKUP_DIR}/release-directory-metadata.txt (never remove a non-empty generations directory)
   restore the service and mount-unit enablement states recorded in ${BACKUP_DIR}/unit-enabled-state.txt
+  restore each unit's active/inactive state recorded in ${BACKUP_DIR}/unit-active-state.txt
   ${NGINX_BIN} -t && systemctl reload nginx
-  systemctl daemon-reload && systemctl start ${SERVICE_NAME}
+  systemctl daemon-reload
 Do not roll back or delete the published release tree.
 EOF
 INSTALL_SUCCEEDED=true
