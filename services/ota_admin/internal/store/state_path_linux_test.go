@@ -70,6 +70,12 @@ func TestOpenRejectsInsecureStateParentAndLinkedDatabase(t *testing.T) {
 	if err := os.WriteFile(badSidecar, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
+	// Make the fixture independent of a restrictive service/root umask. On
+	// hardened CentOS hosts an umask of 0077 otherwise turns 0640 into 0600
+	// and the test no longer creates the insecure file it claims to test.
+	if err := os.Chmod(badSidecar, 0o640); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Open(context.Background(), filepath.Join(root, "sidecar.db")); err == nil {
 		t.Fatal("Open accepted insecure preexisting WAL before SQLite use")
 	}
