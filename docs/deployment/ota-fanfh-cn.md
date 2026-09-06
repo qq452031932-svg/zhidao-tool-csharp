@@ -65,7 +65,7 @@ export EXPECTED_CERT_SHA256 EXPECTED_HEALTH_SHA256 STABLE_PROBE_URL EXPECTED_STA
 
 每次执行只逐个备份管理后台的二进制、service/mount unit、include、配置、公开证书、HMAC、一次性密码文件，以及本次手工加入 include 后的 OTA vhost 和只读哈希；两个 unit 原先的 enabled 与 active 状态分别写入 `unit-enabled-state.txt` 和 `unit-active-state.txt`。数据库不会回滚，因此 HMAC 和一次性密码无论原先存在还是本次新建，都使用独立的 `persistent-existing-targets.txt` / `persistent-new-targets.txt` 审计账本，绝不进入 present/absent 恢复清单；回滚保留它们的安装后值，使其与保留的数据库同生命周期。`.new` 密码临时文件只在 `transient-targets.txt` 记录是否存在，不备份也不恢复，避免旧临时密码与保留的新管理员哈希错配。备份固定存放在校验为 `root:root`、`0700` 的 `/var/backups/superpan-ota-admin`，不接受任意备份根参数。成功与备份后发生的任何失败都会显示精确备份目录和回滚提示。安装器不会改写 vhost 的任何内容。发布代、stable 链接和静态站点不进入安装备份。`releases/win-x64` 与 `generations` 由专用服务用户拥有并保持 `0755`：只有 owner 可发布，Nginx 仍可只读下载，且满足服务启动时对 group/other 不可写的校验。
 
-安装器重启服务后先等待 `systemctl is-active` 和 loopback `/admin/` 同时就绪，最多 30 秒；只有就绪且 `nginx -t` 已通过才 reload Nginx。服务未就绪时现有 Nginx 配置不会被 reload。
+安装器重启服务后先等待 `systemctl is-active` 和 loopback `/admin/` 同时就绪，最多 30 秒；只有就绪且 `nginx -t` 已通过，才通过宝塔 Nginx 的绝对路径执行 `nginx -s reload`。安装器在 reload 前后绑定并检查真实 master PID，并等待本机 HTTPS `/admin/` 生效；服务未就绪、master 异常或代理未生效时会失败并保留精确备份/回滚信息。它不依赖 CentOS 7 上可能仅由 SysV generator 生成且不支持 reload 的 `nginx.service`。
 
 ## 验证
 
@@ -87,7 +87,7 @@ sudo --preserve-env=EXPECTED_CERT_SHA256,EXPECTED_HEALTH_SHA256,EXPECTED_STABLE_
 3. 根据 `release-directory-metadata.txt` 中记录的数字 uid、gid、mode 恢复两个发布目录的元数据。若记录显示 `generations` 原先不存在但现在含有发布内容，不得删除它。
 4. 根据 `unit-enabled-state.txt` 恢复 service 和 mount unit 原先的 enabled/disabled 状态，并根据 `unit-active-state.txt` 恢复原先的 active/inactive 状态；首次安装前不存在的 unit 应 disable 并移除其 wants 链接，不得无条件启动。不要用备份覆盖 `persistent-existing-targets.txt` 或删除 `persistent-new-targets.txt` 中的 HMAC/一次性密码；必须保留安装后的凭据，因为数据库会保留。
 5. 对现有 OTA vhost 移除本次增加的 include 行；不要替换整个 vhost。
-6. 执行 `/www/server/nginx/sbin/nginx -t`，成功后才 reload Nginx。
+6. 执行 `/www/server/nginx/sbin/nginx -t`，成功后才执行 `/www/server/nginx/sbin/nginx -s reload`；不要依赖宝塔环境中可能不支持 reload 的 `nginx.service`。
 7. 执行 `systemctl daemon-reload`。需要回到旧后台版本时再启动服务。
 
 回滚后台不得删除或回滚 `releases/win-x64` 下已经发布的 generation 或 stable 链接。若配置检查失败，保持 Nginx 不 reload，并先恢复 include 片段或移除 include 行。

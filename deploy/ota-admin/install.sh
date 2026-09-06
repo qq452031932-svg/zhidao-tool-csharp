@@ -22,6 +22,7 @@ RELEASE_VIEW_ROOT="/var/lib/otaadmin/releases"
 INITIAL_PASSWORD_FILE="/root/superpan-ota-admin.initial-password"
 PASSWORD_TEMP="${INITIAL_PASSWORD_FILE}.new"
 NGINX_BIN="${NGINX_BIN:-/www/server/nginx/sbin/nginx}"
+NGINX_PID_FILE="${NGINX_PID_FILE:-/www/server/nginx/logs/nginx.pid}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_SOURCE=""
@@ -88,6 +89,7 @@ command -v runuser >/dev/null || die "runuser is required"
 command -v curl >/dev/null || die "curl is required"
 command -v mountpoint >/dev/null || die "mountpoint is required"
 command -v find >/dev/null || die "find is required"
+command -v ps >/dev/null || die "ps is required"
 
 verify_sha256() {
     local source="$1"
@@ -95,6 +97,37 @@ verify_sha256() {
     local actual
     actual="$(sha256sum -- "$source" | awk '{print $1}')"
     [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $source"
+}
+
+read_nginx_master_pid() {
+    [ -f "$NGINX_PID_FILE" ] && [ ! -L "$NGINX_PID_FILE" ] || return 1
+    local pid command_name
+    pid="$(tr -d '[:space:]' <"$NGINX_PID_FILE")"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    command_name="$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')"
+    [ "$command_name" = "nginx" ] || return 1
+    printf '%s\n' "$pid"
+}
+
+reload_nginx_and_verify() {
+    local before_pid after_pid attempt
+    before_pid="$(read_nginx_master_pid)" || die "Nginx master PID is unavailable before reload"
+    "$NGINX_BIN" -s reload || die "Nginx executable reload failed"
+
+    attempt=0
+    while [ "$attempt" -lt 10 ]; do
+        attempt=$((attempt + 1))
+        after_pid="$(read_nginx_master_pid 2>/dev/null || true)"
+        if [ "$after_pid" = "$before_pid" ] &&
+           curl --noproxy '*' --fail --silent --show-error --max-time 2 \
+             --resolve ota.fanfh.cn:443:127.0.0.1 \
+             https://ota.fanfh.cn/admin/ >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    die "Nginx reload did not preserve a healthy master and expose HTTPS /admin/"
 }
 
 # Authentication of both supplied artifacts is the mutation boundary. Nothing
@@ -336,7 +369,7 @@ while [ "$READINESS_ATTEMPT" -lt 30 ]; do
     sleep 1
 done
 [ "$SERVICE_READY" = true ] || die "OTA admin service did not become ready; Nginx was not reloaded"
-systemctl reload nginx
+reload_nginx_and_verify
 
 cat <<EOF
 Installed ${SERVICE_NAME}.
@@ -352,7 +385,7 @@ Rollback (run as root):
   restore uid/gid/mode from ${BACKUP_DIR}/release-directory-metadata.txt (never remove a non-empty generations directory)
   restore the service and mount-unit enablement states recorded in ${BACKUP_DIR}/unit-enabled-state.txt
   restore each unit's active/inactive state recorded in ${BACKUP_DIR}/unit-active-state.txt
-  ${NGINX_BIN} -t && systemctl reload nginx
+  ${NGINX_BIN} -t && ${NGINX_BIN} -s reload
   systemctl daemon-reload
 Do not roll back or delete the published release tree.
 EOF

@@ -86,8 +86,13 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("chown root:superpan-ota-admin \"$CONFIG_TARGET\"", install, StringComparison.Ordinal);
         Assert.Contains("chmod 0640 \"$CONFIG_TARGET\"", install, StringComparison.Ordinal);
         var nginxGate = install.IndexOf("if ! \"$NGINX_BIN\" -t; then", StringComparison.Ordinal);
-        var nginxReload = install.IndexOf("\nsystemctl reload nginx\n", StringComparison.Ordinal);
+        var nginxReload = install.IndexOf("\nreload_nginx_and_verify\n", StringComparison.Ordinal);
         Assert.True(nginxGate >= 0 && nginxReload > nginxGate, "The executable nginx test must gate the executable reload.");
+        Assert.Contains("\"$NGINX_BIN\" -s reload", install, StringComparison.Ordinal);
+        Assert.Contains("NGINX_PID_FILE=", install, StringComparison.Ordinal);
+        Assert.Contains("read_nginx_master_pid", install, StringComparison.Ordinal);
+        Assert.Contains("https://ota.fanfh.cn/admin/", install, StringComparison.Ordinal);
+        Assert.DoesNotContain("systemctl reload nginx", install, StringComparison.Ordinal);
         Assert.Contains("init-admin --if-missing --config", install, StringComparison.Ordinal);
         Assert.DoesNotContain("if [ ! -e \"$DATABASE_PATH\" ]", install, StringComparison.Ordinal);
         Assert.Contains("install -d -m 0700 -o \"$SERVICE_USER\" -g \"$SERVICE_GROUP\" \"$DATA_ROOT\"", install, StringComparison.Ordinal);
