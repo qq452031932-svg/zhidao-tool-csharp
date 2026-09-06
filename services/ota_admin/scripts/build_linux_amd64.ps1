@@ -287,7 +287,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'go mod verify failed.' }
 
     Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
-    & $GoExe -C $SnapshotDirectory test ./...
+    # Windows package-level parallelism races temporary-directory security
+    # probes with the two real-browser suites (including Chrome GPU caches).
+    # Keep test-internal concurrency, but serialize packages so the audited
+    # snapshot gate is deterministic on the production build host.
+    & $GoExe -C $SnapshotDirectory test -p=1 ./...
     if ($LASTEXITCODE -ne 0) { throw 'go test failed.' }
 
     Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity

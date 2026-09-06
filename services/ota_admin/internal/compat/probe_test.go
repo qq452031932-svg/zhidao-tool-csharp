@@ -301,7 +301,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		"ExpectedArchiveSha256",
 		"go version go1.27.1 windows/amd64",
 		"mod verify",
-		"test ./...",
+		"test -p=1 ./...",
 		"vet ./...",
 		"build -buildvcs=false",
 		"Get-SnapshotFingerprint",
