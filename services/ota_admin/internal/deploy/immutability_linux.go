@@ -5,8 +5,7 @@ package deploy
 import (
 	"errors"
 	"os"
-
-	"golang.org/x/sys/unix"
+	"syscall"
 )
 
 func validateImmutableGeneration(info os.FileInfo, directory bool) error {
@@ -20,7 +19,7 @@ func validateImmutableGeneration(info os.FileInfo, directory bool) error {
 		return errors.New("generation member is not regular")
 	}
 	if !directory {
-		stat, ok := info.Sys().(*unix.Stat_t)
+		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok || stat.Nlink != 1 {
 			return errors.New("generation member must have one link")
 		}

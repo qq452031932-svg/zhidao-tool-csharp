@@ -187,7 +187,8 @@ func exercise(root isolatedRoot, failure deploy.Boundary, result evidence) (evid
 		database.Close()
 		return result, err
 	}
-	if _, publishErr := otaPublisher.PublishForActiveSession(context.Background(), acceptanceSessionID, accepted.CandidateID, acceptancePublishID); publishErr == nil {
+	_, publishErr := otaPublisher.PublishForActiveSession(context.Background(), acceptanceSessionID, accepted.CandidateID, acceptancePublishID)
+	if publishErr == nil {
 		database.Close()
 		return result, errors.New("faulted publish unexpectedly succeeded")
 	}
@@ -196,7 +197,7 @@ func exercise(root isolatedRoot, failure deploy.Boundary, result evidence) (evid
 	faultMu.Unlock()
 	if !result.FaultObserved {
 		database.Close()
-		return result, errors.New("requested failure point was not reached")
+		return result, fmt.Errorf("requested failure point was not reached: %w", publishErr)
 	}
 	if err := database.Close(); err != nil {
 		return result, err

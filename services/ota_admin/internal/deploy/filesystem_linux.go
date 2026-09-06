@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"syscall"
 
 	"fanfh.cn/superpan/ota-admin/internal/upload"
 	"golang.org/x/sys/unix"
@@ -299,7 +300,7 @@ func (disk *Disk) verifyOpenedGeneration(name string, descriptor *os.File) error
 }
 
 func (bound *boundRoots) verifyGenerationIdentity(name string, opened os.FileInfo) error {
-	openedStat, ok := opened.Sys().(*unix.Stat_t)
+	openedStat, ok := opened.Sys().(*syscall.Stat_t)
 	if !ok {
 		return errors.New("opened generation identity unavailable")
 	}
@@ -311,8 +312,8 @@ func (bound *boundRoots) verifyGenerationIdentity(name string, opened os.FileInf
 }
 
 func sameFilesystem(left, right os.FileInfo) bool {
-	leftStat, leftOK := left.Sys().(*unix.Stat_t)
-	rightStat, rightOK := right.Sys().(*unix.Stat_t)
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
 	return leftOK && rightOK && leftStat.Dev == rightStat.Dev
 }
 
