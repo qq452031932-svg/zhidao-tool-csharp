@@ -13,9 +13,13 @@ $GoExe = Join-Path $RepositoryRoot ".tools\go-$GoVersion\go\bin\go.exe"
 $ArtifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.artifacts'))
 $OutputDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot 'ota-admin'))
 $invocationId = [guid]::NewGuid().ToString('N')
-$StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-staging-$invocationId"))
-$SnapshotDirectory = Join-Path $StagingDirectory 'snapshot'
-$StagedPublishDirectory = Join-Path $StagingDirectory 'publish'
+$stagingId = $invocationId.Substring(0, 12)
+# Keep the immutable Windows test snapshot short. Several security tests use
+# additional nested temporary paths, and the previous descriptive staging
+# names exceeded legacy Win32 path budgets before the Linux cross-build began.
+$StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".o-$stagingId"))
+$SnapshotDirectory = Join-Path $StagingDirectory 's'
+$StagedPublishDirectory = Join-Path $StagingDirectory 'p'
 $BackupDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-backup-$invocationId"))
 $FixedZipTimestamp = [System.DateTimeOffset]::Parse('1980-01-01T00:00:00Z')
 
@@ -274,8 +278,8 @@ try {
     $stagedSourceBundleHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip.sha256'
 
     $env:GOTOOLCHAIN = 'local'
-    $env:GOCACHE = Join-Path $StagingDirectory 'go-build-cache'
-    $env:GOMODCACHE = Join-Path $StagingDirectory 'go-module-cache'
+    $env:GOCACHE = Join-Path $StagingDirectory 'g'
+    $env:GOMODCACHE = Join-Path $StagingDirectory 'm'
     & powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript
     if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
     $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'

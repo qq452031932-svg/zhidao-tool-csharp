@@ -286,6 +286,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		"git", "diff", "--quiet", "HEAD", "ls-tree", "ls-files", "--others",
 		"archive", "--format=zip", "HEAD:services/ota_admin", "core.autocrlf=false", "core.eol=lf",
 		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
+		"Substring(0, 12)", `Join-Path $ArtifactsRoot ".o-$stagingId"`, "Join-Path $StagingDirectory 's'",
 		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
 		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
 	} {
