@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/release"
 )
 
 const (
@@ -162,6 +165,41 @@ func TestReleaseHistoryReturnsPersistedSignedNotes(t *testing.T) {
 	}
 	if len(history) == 0 || history[0].Notes != "修复批量转存。" {
 		t.Fatalf("history=%+v", history)
+	}
+}
+
+func TestReconcileReleaseNotesBackfillsLegacyBlankAndRejectsDrift(t *testing.T) {
+	s := openStore(t)
+	now := time.Now().UTC()
+	seedReleaseHistory(t, s, now)
+
+	const signedNotes = "修复批量转存，并提升更新稳定性。"
+	if err := s.ReconcileReleaseNotes(context.Background(), releaseID4, signedNotes); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReconcileReleaseNotes(context.Background(), releaseID4, signedNotes); err != nil {
+		t.Fatalf("idempotent reconciliation failed: %v", err)
+	}
+	current, _, found, err := s.CurrentRelease(context.Background())
+	if err != nil || !found || current.Notes != signedNotes {
+		t.Fatalf("current=%+v found=%v err=%v", current, found, err)
+	}
+	if err := s.ReconcileReleaseNotes(context.Background(), releaseID4, "被篡改的说明"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("drift reconciliation err=%v", err)
+	}
+	item, found, err := s.ReleaseByID(context.Background(), releaseID4)
+	if err != nil || !found || item.Notes != signedNotes {
+		t.Fatalf("release=%+v found=%v err=%v", item, found, err)
+	}
+}
+
+func TestReconcileReleaseNotesRejectsInvalidUTF8AndOversizeInput(t *testing.T) {
+	s := openStore(t)
+	seedReleaseHistory(t, s, time.Now().UTC())
+	for _, notes := range []string{string([]byte{0xff}), strings.Repeat("a", release.MaximumNotesBytes+1)} {
+		if err := s.ReconcileReleaseNotes(context.Background(), releaseID4, notes); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("notes length=%d err=%v", len(notes), err)
+		}
 	}
 }
 

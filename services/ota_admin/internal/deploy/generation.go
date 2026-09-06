@@ -100,7 +100,21 @@ func (disk *Disk) RecoverGeneration(ctx context.Context, validator Validator) (G
 	if err != nil {
 		return Generation{}, err
 	}
-	path, _ := disk.GenerationPath(name)
+	return disk.ValidateGeneration(ctx, name, validator)
+}
+
+// ValidateGeneration fully validates one named immutable generation while it
+// remains bound to the opened directory descriptor. It is used at startup to
+// reconcile retained release metadata with the same signed source of truth as
+// the current stable generation.
+func (disk *Disk) ValidateGeneration(ctx context.Context, name string, validator Validator) (Generation, error) {
+	if disk == nil || validator == nil {
+		return Generation{}, errors.New("generation validator is required")
+	}
+	path, err := disk.GenerationPath(name)
+	if err != nil {
+		return Generation{}, err
+	}
 	envelope, rootDescriptor, closeEnvelope, err := disk.openGenerationEnvelope(name)
 	if err != nil {
 		return Generation{}, err

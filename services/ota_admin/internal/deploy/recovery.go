@@ -52,6 +52,9 @@ func (publisher *Publisher) recoverLocked(ctx context.Context) error {
 				return publisher.recoveryFailure(err)
 			}
 		}
+		if err := publisher.reconcileReleaseHistory(ctx, generation); err != nil {
+			return publisher.recoveryFailure(err)
+		}
 		publisher.clearProtection()
 		return nil
 	}
@@ -76,13 +79,42 @@ func (publisher *Publisher) recoverLocked(ctx context.Context) error {
 		if assetErr != nil || !sameAssets(assets, generation.Assets) {
 			return publisher.recoveryFailure(errors.Join(assetErr, errors.New("stable generation assets do not match rollback target")))
 		}
+		if err := publisher.store.ReconcileReleaseNotes(ctx, target.ID, generation.Report.NotesMarkdown); err != nil {
+			return publisher.recoveryFailure(errors.Join(err, errors.New("stable generation notes do not match rollback target")))
+		}
 		if err := publisher.store.CommitRollback(ctx, inflight.OperationID, inflight.ReleaseID, publisher.now().UTC()); err != nil {
 			return publisher.recoveryFailure(err)
 		}
 	default:
 		return publisher.recoveryFailure(errors.New("unknown in-flight release operation"))
 	}
+	if err := publisher.reconcileReleaseHistory(ctx, generation); err != nil {
+		return publisher.recoveryFailure(err)
+	}
 	publisher.clearProtection()
+	return nil
+}
+
+func (publisher *Publisher) reconcileReleaseHistory(ctx context.Context, current Generation) error {
+	history, err := publisher.store.ReleaseHistory(ctx, 3)
+	if err != nil {
+		return err
+	}
+	for _, item := range history {
+		generation := current
+		if item.ID != strings.TrimPrefix(current.Name, "release-") {
+			generation, err = publisher.disk.ValidateGeneration(ctx, item.GenerationName, publisher.validator)
+			if err != nil {
+				return err
+			}
+		}
+		if item.ID != strings.TrimPrefix(generation.Name, "release-") || item.GenerationName != generation.Name || item.Version != generation.Report.Version || !sameAssets(item.Assets, generation.Assets) {
+			return errors.New("release history does not match its validated generation")
+		}
+		if err := publisher.store.ReconcileReleaseNotes(ctx, item.ID, generation.Report.NotesMarkdown); err != nil {
+			return errors.Join(err, errors.New("release notes do not match their validated generation"))
+		}
+	}
 	return nil
 }
 

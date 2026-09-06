@@ -30,6 +30,30 @@ type fixedValidator struct {
 	err    error
 }
 
+type markerValidator map[string]release.Report
+
+func (validator markerValidator) Validate(_ context.Context, envelope *upload.Envelope, _ string) (release.Report, error) {
+	for _, entry := range envelope.Entries {
+		if entry.Name != "asset.nupkg" {
+			continue
+		}
+		value, err := os.ReadFile(entry.Path)
+		if err != nil {
+			return release.Report{}, err
+		}
+		report, ok := validator[string(value)]
+		if !ok {
+			return release.Report{}, errors.New("unknown generation marker")
+		}
+		return report, nil
+	}
+	return release.Report{}, errors.New("generation marker is missing")
+}
+
+func (validator markerValidator) ValidateOpenedDirectory(ctx context.Context, envelope *upload.Envelope, _ *os.File, floor string) (release.Report, error) {
+	return validator.Validate(ctx, envelope, floor)
+}
+
 func (validator fixedValidator) Validate(context.Context, *upload.Envelope, string) (release.Report, error) {
 	if validator.err != nil {
 		return release.Report{}, validator.err
@@ -404,6 +428,127 @@ func TestRecoveryRejectsMissingStableWhenSQLiteHasCurrentRelease(t *testing.T) {
 	if publisher.ReadOnlyError() == nil {
 		t.Fatal("missing stable did not enable read-only protection")
 	}
+}
+
+func TestRecoveryBackfillsLegacyCurrentAndRetainedNotesFromValidatedGenerations(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real generation recovery path is Linux-only")
+	}
+	publisher, database, _, root, now := newPublisherHarness(t, nil)
+	reports := markerValidator{}
+	first := release.Report{SchemaVersion: 1, Verified: true, PackageID: "SuperPan.BaiduBatchTransfer", Channel: "win-x64-stable", Version: "1.2.3", NotesMarkdown: "第一版签名说明", FileCount: 2, Files: []release.ReportFile{{Name: "asset.nupkg", Size: 5, SHA256: strings.Repeat("a", 64)}, {Name: "releases.win-x64-stable.json", Size: 5, SHA256: strings.Repeat("b", 64)}}}
+	second := first
+	second.Version = "1.2.4"
+	second.NotesMarkdown = "第二版签名说明"
+	second.Files = append([]release.ReportFile(nil), first.Files...)
+	second.Files[0].Size = 6
+	reports["first"] = first
+	reports["second"] = second
+
+	installLegacyNotesRelease(t, publisher, database, deployCandidateID, deployPublishID, first, "", markedSourceEnvelope(t, "first"), now)
+	secondCandidate := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	secondUpload := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	secondPublish := "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	reserveValidatedCandidate(t, database, secondCandidate, secondUpload, second, now.Add(time.Minute))
+	installLegacyNotesRelease(t, publisher, database, secondCandidate, secondPublish, second, "", markedSourceEnvelope(t, "second"), now.Add(time.Minute))
+
+	disk, err := NewDisk(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPublisher(PublisherOptions{Disk: disk, Store: database, Candidates: publisher.candidates, Validator: reports, Now: func() time.Time { return now.Add(2 * time.Minute) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for releaseID, want := range map[string]string{deployPublishID: first.NotesMarkdown, secondPublish: second.NotesMarkdown} {
+		item, found, err := database.ReleaseByID(context.Background(), releaseID)
+		if err != nil || !found || item.Notes != want {
+			t.Fatalf("release=%+v found=%v err=%v want notes=%q", item, found, err, want)
+		}
+	}
+}
+
+func TestRecoveryRejectsPersistedNotesDriftFromValidatedGeneration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real generation recovery path is Linux-only")
+	}
+	publisher, database, _, root, now := newPublisherHarness(t, nil)
+	report := release.Report{SchemaVersion: 1, Verified: true, PackageID: "SuperPan.BaiduBatchTransfer", Channel: "win-x64-stable", Version: "1.2.3", NotesMarkdown: "权威签名说明", FileCount: 2, Files: []release.ReportFile{{Name: "asset.nupkg", Size: 5, SHA256: strings.Repeat("a", 64)}, {Name: "releases.win-x64-stable.json", Size: 5, SHA256: strings.Repeat("b", 64)}}}
+	installLegacyNotesRelease(t, publisher, database, deployCandidateID, deployPublishID, report, "数据库漂移说明", markedSourceEnvelope(t, "first"), now)
+	disk, err := NewDisk(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPublisher(PublisherOptions{Disk: disk, Store: database, Candidates: publisher.candidates, Validator: markerValidator{"first": report}, Now: func() time.Time { return now.Add(time.Minute) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(context.Background()); !errors.Is(err, store.ErrInvalidTransition) {
+		t.Fatalf("recovery err=%v", err)
+	}
+	if restarted.ReadOnlyError() == nil {
+		t.Fatal("notes drift did not enable read-only protection")
+	}
+}
+
+func installLegacyNotesRelease(t *testing.T, publisher *Publisher, database *store.Store, candidateID, publishID string, report release.Report, persistedNotes string, envelope *upload.Envelope, at time.Time) {
+	t.Helper()
+	if _, created, err := database.BeginPublishForActiveSession(context.Background(), deploySessionID, candidateID, publishID, at); err != nil || !created {
+		t.Fatalf("begin publish created=%v err=%v", created, err)
+	}
+	generation, switched, err := publisher.disk.PublishGeneration(context.Background(), envelope, publishID, report, markerValidator{string(mustReadEntry(t, envelope, "asset.nupkg")): report})
+	if err != nil || !switched {
+		t.Fatalf("publish generation switched=%v err=%v", switched, err)
+	}
+	if err := database.CommitPublishedRelease(context.Background(), store.PublishCommit{Release: store.Release{ID: publishID, Version: report.Version, GenerationName: generation.Name, CommittedAt: at, Notes: persistedNotes}, OperationID: publishID, CandidateID: candidateID, Assets: generation.Assets}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func reserveValidatedCandidate(t *testing.T, database *store.Store, candidateID, uploadID string, report release.Report, at time.Time) {
+	t.Helper()
+	if _, acquired, err := database.ReserveCandidateForActiveSession(context.Background(), store.CandidateReservation{CandidateID: candidateID, SessionID: deploySessionID, OperationID: uploadID, LeaseOwner: candidateID, CreatedAt: at, ExpiresAt: at.Add(24 * time.Hour), LeaseExpiresAt: at.Add(5 * time.Minute)}); err != nil || !acquired {
+		t.Fatalf("reserve candidate acquired=%v err=%v", acquired, err)
+	}
+	reportJSON, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := database.AcceptCandidateForActiveSession(context.Background(), store.CandidateAcceptance{CandidateID: candidateID, SessionID: deploySessionID, OperationID: uploadID, LeaseOwner: candidateID, UploadDigest: strings.Repeat("d", 64), ValidationReport: string(reportJSON), Version: report.Version, CreatedAt: at, ExpiresAt: at.Add(24 * time.Hour), CommittedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func markedSourceEnvelope(t *testing.T, marker string) *upload.Envelope {
+	t.Helper()
+	root := t.TempDir()
+	entries := make([]upload.Entry, 0, 2)
+	for _, item := range []struct{ name, content string }{{"asset.nupkg", marker}, {"releases.win-x64-stable.json", "index"}} {
+		path := filepath.Join(root, item.name)
+		if err := os.WriteFile(path, []byte(item.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, upload.Entry{Name: item.name, Path: path, Size: int64(len(item.content))})
+	}
+	return &upload.Envelope{ExtractionRoot: root, Entries: entries}
+}
+
+func mustReadEntry(t *testing.T, envelope *upload.Envelope, name string) []byte {
+	t.Helper()
+	for _, entry := range envelope.Entries {
+		if entry.Name == name {
+			value, err := os.ReadFile(entry.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return value
+		}
+	}
+	t.Fatalf("entry %q missing", name)
+	return nil
 }
 
 func TestPublishersForOneRootShareTheProcessLockAndReplayOneCommit(t *testing.T) {

@@ -166,6 +166,16 @@ func TestV5ToV6MigrationAddsReleaseNotesAndRollbackFailureAuditIdempotently(t *t
 	if _, err = db.Exec(`INSERT INTO audit_events(occurred_at,event_type,outcome,code,source_pseudonym) VALUES(?,'login_result','success','login_accepted',?)`, timestamp(time.Now().UTC()), "hmac-sha256:"+strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
+	migratedAt := time.Unix(1_900_000_000, 0).UTC()
+	if _, err = db.Exec(`INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?,?,?,'current',?)`, releaseID1, "1.0.1", "release-"+releaseID1, timestamp(migratedAt)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`UPDATE releases SET state='retained' WHERE id=?`, releaseID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO releases(id,version,generation_name,state,committed_at) VALUES(?,?,?,'current',?)`, releaseID2, "1.0.2", "release-"+releaseID2, timestamp(migratedAt.Add(time.Minute))); err != nil {
+		t.Fatal(err)
+	}
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +211,15 @@ func TestV5ToV6MigrationAddsReleaseNotesAndRollbackFailureAuditIdempotently(t *t
 	}
 	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type='login_result'`).Scan(&loginCount); err != nil || loginCount != 1 {
 		t.Fatalf("preserved login audit count=%d err=%v", loginCount, err)
+	}
+	for _, releaseID := range []string{releaseID1, releaseID2} {
+		item, found, err := s.ReleaseByID(context.Background(), releaseID)
+		if err != nil || !found || item.Notes != "" {
+			t.Fatalf("legacy release=%+v found=%v err=%v", item, found, err)
+		}
+		if err := s.ReconcileReleaseNotes(context.Background(), releaseID, "已签名的更新说明 "+releaseID); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

@@ -18,8 +18,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"fanfh.cn/superpan/ota-admin/internal/audit"
+	"fanfh.cn/superpan/ota-admin/internal/release"
 	"golang.org/x/crypto/argon2"
 	_ "modernc.org/sqlite"
 )
@@ -2001,7 +2003,7 @@ func (s *Store) InFlightPublish(ctx context.Context) (PublishOperation, bool, er
 func (s *Store) CurrentRelease(ctx context.Context) (Release, []ReleaseAsset, bool, error) {
 	var value Release
 	var committed int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at FROM releases WHERE state='current'`).Scan(&value.ID, &value.Version, &value.GenerationName, &committed)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at,notes FROM releases WHERE state='current'`).Scan(&value.ID, &value.Version, &value.GenerationName, &committed, &value.Notes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, nil, false, nil
 	}
@@ -2028,9 +2030,43 @@ func (s *Store) CurrentRelease(ctx context.Context) (Release, []ReleaseAsset, bo
 	return value, assets, true, nil
 }
 
+// ReconcileReleaseNotes binds legacy blank release notes to the authoritative
+// notes from a fully validated signed generation. Once populated, notes are
+// immutable: any disagreement is treated as persistent state drift.
+func (s *Store) ReconcileReleaseNotes(ctx context.Context, releaseID, authoritative string) error {
+	if !uuidPatternStore.MatchString(releaseID) || !utf8.ValidString(authoritative) || len([]byte(authoritative)) > release.MaximumNotesBytes {
+		return ErrInvalidTransition
+	}
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var stored string
+		if err := tx.QueryRowContext(ctx, `SELECT notes FROM releases WHERE id=? AND state IN ('current','retained')`, releaseID).Scan(&stored); errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		} else if err != nil {
+			return err
+		}
+		if stored == authoritative {
+			return nil
+		}
+		if stored != "" {
+			return ErrInvalidTransition
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE releases SET notes=? WHERE id=? AND state IN ('current','retained') AND notes=''`, authoritative, releaseID)
+		if err != nil {
+			return err
+		}
+		if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+			return errors.Join(err, ErrInvalidTransition)
+		}
+		return nil
+	})
+}
+
 func (s *Store) CommitPublishedRelease(ctx context.Context, request PublishCommit) error {
 	if len(request.Assets) == 0 {
 		return errors.New("published release requires at least one asset")
+	}
+	if !utf8.ValidString(request.Release.Notes) || len([]byte(request.Release.Notes)) > release.MaximumNotesBytes {
+		return ErrInvalidTransition
 	}
 	if request.Release.ID != request.OperationID || request.Release.GenerationName != "release-"+request.Release.ID {
 		return ErrInvalidTransition
@@ -2119,7 +2155,7 @@ func queuePublishedCandidateCleanup(ctx context.Context, tx *sql.Tx, candidateID
 func (s *Store) PublishedRelease(ctx context.Context, id string) (Release, bool, error) {
 	var value Release
 	var committed int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at FROM releases WHERE id=?`, id).Scan(&value.ID, &value.Version, &value.GenerationName, &committed)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,generation_name,committed_at,notes FROM releases WHERE id=?`, id).Scan(&value.ID, &value.Version, &value.GenerationName, &committed, &value.Notes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, false, nil
 	}
