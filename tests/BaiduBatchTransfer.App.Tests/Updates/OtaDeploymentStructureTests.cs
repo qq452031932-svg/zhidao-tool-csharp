@@ -124,6 +124,9 @@ public sealed class OtaDeploymentStructureTests
         Assert.DoesNotContain("backup_target \"$HMAC_TARGET\"", install, StringComparison.Ordinal);
         Assert.DoesNotContain("backup_target \"$INITIAL_PASSWORD_FILE\"", install, StringComparison.Ordinal);
         Assert.Contains("persistent-new-targets.txt", install, StringComparison.Ordinal);
+        Assert.Contains("persistent-existing-targets.txt", install, StringComparison.Ordinal);
+        var persistentFunction = install[install.IndexOf("backup_persistent_target()", StringComparison.Ordinal)..install.IndexOf("# Only individually enumerated", StringComparison.Ordinal)];
+        Assert.DoesNotContain("present-targets.txt", persistentFunction, StringComparison.Ordinal);
         Assert.Contains("unit-enabled-state.txt", install, StringComparison.Ordinal);
         Assert.Contains("unit-active-state.txt", install, StringComparison.Ordinal);
         Assert.Contains("systemctl is-enabled", install, StringComparison.Ordinal);

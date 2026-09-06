@@ -180,7 +180,7 @@ backup_persistent_target() {
     local name="$2"
     if [ -e "$target" ] || [ -L "$target" ]; then
         cp -a -- "$target" "${BACKUP_DIR}/${name}"
-        printf '%s\n' "$target" >>"${BACKUP_DIR}/present-targets.txt"
+        printf '%s\n' "$target" >>"${BACKUP_DIR}/persistent-existing-targets.txt"
     else
         printf '%s\n' "$target" >>"${BACKUP_DIR}/persistent-new-targets.txt"
     fi
@@ -348,7 +348,7 @@ Rollback (run as root):
   systemctl stop ${MOUNT_UNIT_NAME}
   restore only the named files listed in ${BACKUP_DIR}/present-targets.txt
   remove only targets listed in ${BACKUP_DIR}/absent-targets.txt
-  keep credentials listed in ${BACKUP_DIR}/persistent-new-targets.txt because the database is retained
+  keep post-install credentials listed in ${BACKUP_DIR}/persistent-existing-targets.txt and persistent-new-targets.txt because the database is retained
   restore uid/gid/mode from ${BACKUP_DIR}/release-directory-metadata.txt (never remove a non-empty generations directory)
   restore the service and mount-unit enablement states recorded in ${BACKUP_DIR}/unit-enabled-state.txt
   restore each unit's active/inactive state recorded in ${BACKUP_DIR}/unit-active-state.txt
