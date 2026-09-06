@@ -34,6 +34,16 @@ func TestCandidateCurrentAndStatusRequireSessionAndReturnSafeSummary(t *testing.
 		if !ok || report["notes_markdown"] != "修复批量转存。" || report["manifest_sha256"] != "manifest-hash" || report["publisher_spki_sha256"] != "publisher-pin" {
 			t.Fatalf("%s report=%#v", path, body["report"])
 		}
+		gates, ok := report["gates"].(map[string]any)
+		if !ok || len(gates) != 7 {
+			t.Fatalf("%s gates=%#v", path, report["gates"])
+		}
+		for _, name := range []string{"package", "channel", "version", "signature", "files", "references", "storage"} {
+			gate, ok := gates[name].(map[string]any)
+			if !ok || gate["passed"] != true || gate["evidence"] == "" {
+				t.Errorf("%s gate %s=%#v", path, name, gates[name])
+			}
+		}
 	}
 }
 

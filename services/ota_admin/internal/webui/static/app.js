@@ -9,7 +9,8 @@ const state = {
   rollbackRelease: "",
   rollbackOperations: new Map(),
   readOnly: false,
-  busy: false
+  busy: false,
+  candidatePublishBlocked: false
 };
 
 const byId = (id) => document.getElementById(id);
@@ -67,6 +68,7 @@ function setReadOnly(active, error) {
   state.readOnly = active;
   byId("readonly-state").hidden = !active;
   for (const id of ["release-file", "upload-button", "publish-button"]) byId(id).disabled = active || byId(id).disabled;
+  for (const button of document.querySelectorAll("#history-body button")) button.disabled = active;
   if (active && error) showToast(messageFor(error, "后台处于只读保护状态。"));
   updateActions();
 }
@@ -149,6 +151,7 @@ async function login(event) {
     state.csrf = result.csrf_token;
     if (result.must_change_password) {
       byId("current-password").value = form.elements.password.value;
+      form.elements.password.value = "";
       showView("password-view");
       byId("new-password").focus();
     } else {
@@ -179,6 +182,9 @@ async function changePassword(event) {
     });
     state.csrf = result.csrf_token;
     form.reset();
+    byId("login-password").value = "";
+    byId("current-password").value = "";
+    byId("new-password").value = "";
     showView("console-view");
     await loadDashboard();
     showToast("密码已更新。以后请使用新密码登录。");
@@ -191,9 +197,19 @@ async function changePassword(event) {
 }
 
 async function logout() {
-  try { await api("/admin/api/session/logout", { method: "POST", body: "{}" }); } catch (_) { /* local state still clears */ }
+  try {
+    await api("/admin/api/session/logout", { method: "POST", body: "{}" });
+  } catch (error) {
+    if (error.status !== 401) {
+      showPageError(messageFor(error, "退出失败，当前登录仍然有效，请重试。"));
+      showToast("退出失败，未清除当前登录。 ");
+      return;
+    }
+  }
   state.csrf = "";
+  state.candidate = null;
   showView("login-view");
+  byId("login-password").value = "";
   byId("login-password").focus();
 }
 
@@ -275,9 +291,26 @@ function formatBytes(bytes) {
 
 function resetChecks(status = "pending") {
   for (const item of byId("validation-list").children) {
+    const description = item.querySelector("small");
+    if (description && !item.dataset.defaultEvidence) item.dataset.defaultEvidence = description.textContent;
+    if (description && item.dataset.defaultEvidence) description.textContent = item.dataset.defaultEvidence;
     item.classList.remove("passed", "failed");
     item.firstElementChild.textContent = status === "failed" ? "×" : "○";
     if (status === "failed") item.classList.add("failed");
+  }
+}
+
+function renderGateEvidence(candidate) {
+  const gates = candidate && candidate.report && candidate.report.gates ? candidate.report.gates : {};
+  for (const item of byId("validation-list").children) {
+    const gate = gates[item.dataset.check];
+    const passed = Boolean(gate && gate.passed === true);
+    const failed = candidate && (candidate.state === "failed" || (candidate.state === "validated" && !passed));
+    item.classList.toggle("passed", passed);
+    item.classList.toggle("failed", Boolean(failed));
+    item.firstElementChild.textContent = passed ? "✓" : failed ? "×" : "○";
+    const description = item.querySelector("small");
+    if (description && gate && gate.evidence) description.textContent = gate.evidence;
   }
 }
 
@@ -302,11 +335,7 @@ function renderCandidate(candidate) {
   byId("candidate-files").textContent = Number.isInteger(report.file_count) ? String(report.file_count) : "—";
   byId("candidate-expiry").textContent = formatDate(candidate.expires_at);
   byId("candidate-notes").textContent = report.notes_markdown || report.notesMarkdown || "签名包未提供可显示的更新说明";
-  for (const item of byId("validation-list").children) {
-    item.classList.toggle("passed", passed);
-    item.classList.toggle("failed", candidate.state === "failed");
-    item.firstElementChild.textContent = passed ? "✓" : candidate.state === "failed" ? "×" : "○";
-  }
+  renderGateEvidence(candidate);
   updateActions();
 }
 
@@ -314,7 +343,7 @@ function updateActions() {
   const file = byId("release-file").files && byId("release-file").files[0];
   byId("release-file").disabled = state.readOnly || state.busy;
   byId("upload-button").disabled = !file || state.readOnly || state.busy;
-  const canPublish = state.candidate && state.candidate.state === "validated" && state.candidate.report && state.candidate.report.verified;
+  const canPublish = !state.candidatePublishBlocked && state.candidate && state.candidate.state === "validated" && state.candidate.report && state.candidate.report.verified;
   byId("publish-button").disabled = !canPublish || state.readOnly || state.busy;
 }
 
@@ -345,9 +374,23 @@ function selectedFileChanged() {
   const file = byId("release-file").files[0];
   state.uploadOperation = "";
   state.publishOperation = "";
+  state.candidatePublishBlocked = Boolean(file);
+  if (file) renderCandidate(null);
   byId("selected-file").textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "尚未选择文件";
   byId("upload-progress-wrap").hidden = true;
   updateActions();
+}
+
+async function restoreAuthoritativeCandidate() {
+  state.candidatePublishBlocked = true;
+  try {
+    const authoritative = await api("/admin/api/candidates/current", { method: "GET" });
+    renderCandidate(authoritative);
+    byId("candidate-state").textContent = "旧候选已保留（不可发布）";
+    byId("publish-button").disabled = true;
+  } catch (error) {
+    if (error.status === 404) renderCandidate(null);
+  }
 }
 
 function uploadSelected() {
@@ -381,6 +424,7 @@ function uploadSelected() {
     if (request.status === 202) {
       progress.value = 100;
       byId("upload-progress-text").textContent = "上传完成，校验已通过";
+      state.candidatePublishBlocked = false;
       renderCandidate(result);
       showToast("发布包校验通过，请核对后确认发布。");
     } else {
@@ -388,13 +432,13 @@ function uploadSelected() {
       showPageError(messageFor(result, "上传或校验失败。"));
       if (request.status === 401) expiredSession();
       if (request.status === 503) setReadOnly(true, result);
-      updateActions();
+      restoreAuthoritativeCandidate();
     }
   });
-  request.addEventListener("error", () => {
+  request.addEventListener("error", async () => {
     state.busy = false;
     showPageError("网络中断，未确认发布。可使用同一文件重试上传。");
-    updateActions();
+    await restoreAuthoritativeCandidate();
   });
   request.send(file);
 }
@@ -468,13 +512,21 @@ async function rollback(event) {
     errorBox.hidden = false;
     if (error.code === "password_rejected") byId("rollback-password").focus();
   } finally {
+    byId("rollback-password").value = "";
     button.disabled = false;
   }
 }
 
+function clearRollbackPassword() {
+  byId("rollback-password").value = "";
+}
+
 function closeDialog(event) {
   const dialog = byId(event.currentTarget.dataset.closeDialog);
-  if (dialog) dialog.close();
+  if (dialog) {
+    if (dialog.id === "rollback-dialog") clearRollbackPassword();
+    dialog.close();
+  }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -488,6 +540,7 @@ document.addEventListener("DOMContentLoaded", () => {
   byId("publish-button").addEventListener("click", openPublish);
   byId("publish-form").addEventListener("submit", publishCandidate);
   byId("rollback-form").addEventListener("submit", rollback);
+  byId("rollback-dialog").addEventListener("close", clearRollbackPassword);
   for (const button of document.querySelectorAll("[data-close-dialog]")) button.addEventListener("click", closeDialog);
   initialize();
 });

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -65,8 +66,23 @@ func writeCandidateSummary(response http.ResponseWriter, status int, summary can
 			"notes_markdown":        summary.Report.NotesMarkdown,
 			"manifest_sha256":       summary.Report.ManifestSHA256,
 			"publisher_spki_sha256": summary.Report.PublisherSPKISHA256,
+			"gates":                 candidateGateEvidence(summary),
 		},
 	})
+}
+
+func candidateGateEvidence(summary candidate.Summary) map[string]map[string]any {
+	report := summary.Report
+	validated := summary.State == string(store.CandidateValidated) && report.Verified
+	return map[string]map[string]any{
+		"package":    {"passed": validated && report.PackageID != "", "evidence": fmt.Sprintf("包 ID：%s", report.PackageID)},
+		"channel":    {"passed": validated && report.Channel != "", "evidence": fmt.Sprintf("渠道：%s", report.Channel)},
+		"version":    {"passed": validated && report.Version != "", "evidence": fmt.Sprintf("候选版本：v%s，已通过历史版本门禁", report.Version)},
+		"signature":  {"passed": validated && report.PublisherSPKISHA256 != "", "evidence": "发布清单签名与固定发布公钥匹配"},
+		"files":      {"passed": validated && report.ManifestSHA256 != "" && report.FileCount > 0, "evidence": fmt.Sprintf("清单闭包与哈希一致，共 %d 个文件", report.FileCount)},
+		"references": {"passed": validated, "evidence": "Feed、资产目录与 RELEASES 引用闭包一致"},
+		"storage":    {"passed": validated, "evidence": "上传、解压与候选归档已安全落盘"},
+	}
 }
 
 func writeCandidateError(response http.ResponseWriter, status int, code, message, operationID string) {

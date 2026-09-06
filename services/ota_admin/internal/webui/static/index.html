@@ -99,7 +99,7 @@
           </div>
           <p class="section-help">只接受本机发布脚本生成并签名的完整发布包，不支持浏览服务器目录。</p>
           <div class="file-picker">
-            <input id="release-file" name="release_zip" type="file" accept=".zip,application/zip" aria-describedby="file-help selected-file" hidden>
+            <input id="release-file" class="visually-hidden-file" name="release_zip" type="file" accept=".zip,application/zip" aria-describedby="file-help selected-file">
             <label class="button secondary" for="release-file">选择 ZIP 文件</label>
             <span id="selected-file">尚未选择文件</span>
           </div>
@@ -123,7 +123,7 @@
             <li data-check="channel"><span aria-hidden="true">○</span><div><strong>发布渠道</strong><small>win-x64-stable</small></div></li>
             <li data-check="version"><span aria-hidden="true">○</span><div><strong>版本递增</strong><small>高于历史最高版本</small></div></li>
             <li data-check="signature"><span aria-hidden="true">○</span><div><strong>发布签名</strong><small>固定 RSA 公钥</small></div></li>
-            <li data-check="manifest"><span aria-hidden="true">○</span><div><strong>文件与哈希</strong><small>完整 manifest 闭包</small></div></li>
+            <li data-check="files"><span aria-hidden="true">○</span><div><strong>文件与哈希</strong><small>完整 manifest 闭包</small></div></li>
             <li data-check="references"><span aria-hidden="true">○</span><div><strong>引用关系</strong><small>Feed、目录和 RELEASES 一致</small></div></li>
             <li data-check="storage"><span aria-hidden="true">○</span><div><strong>空间检查</strong><small>可安全生成新版本</small></div></li>
           </ol>
