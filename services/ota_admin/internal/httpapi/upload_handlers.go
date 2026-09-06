@@ -36,9 +36,12 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		writeReservedCandidateResult(response, reserved)
 		return
 	}
-	envelope, err := router.uploads.Receive(request.Context(), request.Body, request.ContentLength)
+	leaseOwner := reserved.LeaseOwner
+	receiveContext, stopLease := router.maintainUploadLease(request.Context(), principal.IDHash, operationID, leaseOwner)
+	defer stopLease()
+	envelope, err := router.uploads.Receive(receiveContext, request.Body, request.ContentLength)
 	if err != nil {
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, uploadPublicFailureCode(err)) {
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, uploadPublicFailureCode(err)) {
 			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
 			return
 		}
@@ -49,11 +52,20 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		if envelope != nil {
 			_ = envelope.Cleanup()
 		}
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, "operation_failed") {
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
 			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
 			return
 		}
 		writeError(response, http.StatusInternalServerError, "operation_failed")
+		return
+	}
+	if err := router.uploadEnvelopes.RenewEnvelopeLeaseForActiveSession(request.Context(), principal.IDHash, operationID, leaseOwner); err != nil {
+		_ = envelope.Cleanup()
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
+			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+			return
+		}
+		writeUploadOperationError(response, err, operationID)
 		return
 	}
 	currentPrincipal, err := router.sessions.Authenticate(request.Context(), sessionToken, csrfToken, true)
@@ -62,31 +74,63 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		if err == nil {
 			err = session.ErrUnauthorized
 		}
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, "operation_failed") {
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, "operation_failed") {
 			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
 			return
 		}
 		writeUploadError(response, err)
 		return
 	}
-	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope)
+	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope, leaseOwner)
 	if err != nil {
 		_ = envelope.Cleanup()
-		if !router.terminalizeUploadFailure(principal.IDHash, operationID, candidatePublicFailureCode(err)) {
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, leaseOwner, candidatePublicFailureCode(err)) {
 			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
 			return
 		}
 		writeUploadOperationError(response, err, operationID)
 		return
 	}
-	writeCandidateSummary(response, http.StatusAccepted, summary)
+	writeReservedCandidateResult(response, summary)
 }
 
-func (router *Router) terminalizeUploadFailure(sessionID, operationID, code string) bool {
+func (router *Router) terminalizeUploadFailure(sessionID, operationID, leaseOwner, code string) bool {
 	finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code)
+	_, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code, leaseOwner)
 	return err == nil
+}
+
+func (router *Router) maintainUploadLease(parent context.Context, sessionID, operationID, leaseOwner string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				renewContext, renewCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				err := router.uploadEnvelopes.RenewEnvelopeLeaseForActiveSession(renewContext, sessionID, operationID, leaseOwner)
+				renewCancel()
+				if err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		close(stop)
+		cancel()
+		<-done
+	}
 }
 
 func writeReservedCandidateResult(response http.ResponseWriter, summary candidate.Summary) {

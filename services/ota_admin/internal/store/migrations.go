@@ -16,9 +16,20 @@ type migration struct {
 	apply    func(context.Context, *sql.Tx) error
 }
 
-var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}, {version: 4, sql: schemaV4}}
+var migrations = []migration{{version: 1, sql: legacyV1DDL}, {version: 2, apply: applyV2Migration}, {version: 3, sql: schemaV3}, {version: 4, sql: schemaV4}, {version: 5, sql: schemaV5}}
 
-const schemaVersion = 4
+const schemaVersion = 5
+
+var schemaV5 = `
+CREATE TABLE candidate_upload_leases (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE RESTRICT,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(id) ON DELETE RESTRICT,
+    owner_token TEXT NOT NULL UNIQUE CHECK (` + uuidCheckSQL("owner_token") + `),
+    lease_expires_at INTEGER NOT NULL CHECK (` + integerCheckSQL("lease_expires_at") + `),
+    updated_at INTEGER NOT NULL CHECK (` + integerCheckSQL("updated_at") + ` AND updated_at < lease_expires_at)
+);
+CREATE INDEX candidate_upload_leases_expiry ON candidate_upload_leases(lease_expires_at,operation_id);
+`
 
 var schemaV3 = `
 CREATE TABLE candidate_cleanups (
@@ -55,7 +66,7 @@ CREATE TABLE candidate_cleanup_attempts (
 );
 CREATE INDEX candidate_cleanup_attempts_candidate ON candidate_cleanup_attempts(candidate_id,attempt_number);
 INSERT INTO candidate_cleanup_attempts(operation_id,candidate_id,attempt_number,started_at,finished_at,outcome)
-SELECT x.operation_id,x.candidate_id,x.attempt_count,x.updated_at,
+SELECT x.operation_id,x.candidate_id,x.attempt_count,o.created_at,
        CASE WHEN o.state IN ('succeeded','failed') THEN o.finished_at ELSE NULL END,
        CASE WHEN o.state='succeeded' THEN 'success' WHEN o.state='failed' THEN 'failure' ELSE '' END
 FROM candidate_cleanups x JOIN operations o ON o.id=x.operation_id

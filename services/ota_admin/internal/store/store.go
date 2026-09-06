@@ -86,6 +86,7 @@ type CandidateRecord struct {
 	UploadDigest, ValidationReport, Version, OperationID string
 	OperationState                                       OperationState
 	ResultCode                                           string
+	LeaseOwner                                           string
 }
 
 type CandidateAcceptance struct {
@@ -94,11 +95,12 @@ type CandidateAcceptance struct {
 	Version                             string
 	CreatedAt, ExpiresAt                time.Time
 	CommittedAt                         time.Time
+	LeaseOwner                          string
 }
 
 type CandidateReservation struct {
-	CandidateID, SessionID, OperationID string
-	CreatedAt, ExpiresAt                time.Time
+	CandidateID, SessionID, OperationID, LeaseOwner string
+	CreatedAt, ExpiresAt, LeaseExpiresAt            time.Time
 }
 
 type CleanupClaim struct {
@@ -533,6 +535,9 @@ func (s *Store) ReserveCandidateForActiveSession(ctx context.Context, request Ca
 	if request.CreatedAt.IsZero() || !request.ExpiresAt.After(request.CreatedAt) || request.ExpiresAt.Sub(request.CreatedAt) > 24*time.Hour {
 		return CandidateRecord{}, false, errors.New("candidate lifetime is invalid")
 	}
+	if request.LeaseOwner != "" && (!uuidPatternStore.MatchString(request.LeaseOwner) || !request.LeaseExpiresAt.After(request.CreatedAt) || request.LeaseExpiresAt.Sub(request.CreatedAt) > 30*time.Minute) {
+		return CandidateRecord{}, false, errors.New("candidate upload lease is invalid")
+	}
 	started, err := audit.NewUploadStarted(request.OperationID, request.CandidateID, request.CreatedAt)
 	if err != nil {
 		return CandidateRecord{}, false, err
@@ -551,6 +556,21 @@ func (s *Store) ReserveCandidateForActiveSession(ctx context.Context, request Ca
 			if existing.SessionID != request.SessionID {
 				return ErrSessionInactive
 			}
+			if existing.State == CandidateUploading && existing.OperationState == OperationPending && request.LeaseOwner != "" {
+				var leaseExpiry int64
+				err := tx.QueryRowContext(ctx, `SELECT lease_expires_at FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=?`, request.OperationID, existing.ID).Scan(&leaseExpiry)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if errors.Is(err, sql.ErrNoRows) || leaseExpiry <= timestamp(request.CreatedAt) {
+					failed, err := failReservedCandidateTx(ctx, tx, existing, "operation_failed", request.CreatedAt)
+					if err != nil {
+						return err
+					}
+					record = failed
+					return nil
+				}
+			}
 			record = existing
 			return nil
 		}
@@ -560,21 +580,22 @@ func (s *Store) ReserveCandidateForActiveSession(ctx context.Context, request Ca
 		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'upload','pending',?,?)`, request.OperationID, request.CandidateID, timestamp(request.CreatedAt)); err != nil {
 			return err
 		}
+		if request.LeaseOwner != "" {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_upload_leases(operation_id,candidate_id,owner_token,lease_expires_at,updated_at) VALUES(?,?,?,?,?)`, request.OperationID, request.CandidateID, request.LeaseOwner, timestamp(request.LeaseExpiresAt), timestamp(request.CreatedAt)); err != nil {
+				return err
+			}
+		}
 		if err := insertAudit(ctx, tx, started); err != nil {
 			return err
 		}
-		record = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateUploading, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, OperationID: request.OperationID, OperationState: OperationPending}
+		record = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateUploading, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, OperationID: request.OperationID, OperationState: OperationPending, LeaseOwner: request.LeaseOwner}
 		created = true
 		return nil
 	})
 	return record, created, err
 }
 
-func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationID, resultCode string, at time.Time) (CandidateRecord, error) {
-	operationCode, publicCode, gateCode, valid := candidateFailureCodes(resultCode)
-	if !valid {
-		return CandidateRecord{}, errors.New("candidate failure code is invalid")
-	}
+func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationID, resultCode string, at time.Time, leaseOwner ...string) (CandidateRecord, error) {
 	s.candidateMu.Lock()
 	defer s.candidateMu.Unlock()
 	var record CandidateRecord
@@ -591,42 +612,114 @@ func (s *Store) FailReservedCandidate(ctx context.Context, sessionID, operationI
 		if record.State != CandidateUploading || record.OperationState != OperationPending {
 			return nil
 		}
-		uploadCode := audit.CodeInternalFailure
-		if operationCode == "hash_mismatch" {
-			uploadCode = audit.CodeHashMismatch
+		if len(leaseOwner) > 1 {
+			return errors.New("candidate upload lease owner is invalid")
 		}
-		if operationCode == "expired" {
-			uploadCode = audit.CodeExpired
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE candidates SET state='failed' WHERE id=? AND state='uploading'`, record.ID); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_upload_failures(operation_id,candidate_id,public_code) VALUES(?,?,?)`, operationID, record.ID, publicCode); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND state='pending'`, operationCode, timestamp(at), operationID); err != nil {
-			return err
-		}
-		if operationCode != "expired" {
-			gateEvent, err := audit.NewGateResult(audit.OutcomeFailure, operationID, record.ID, gateCode, at)
-			if err != nil {
+		if len(leaseOwner) == 1 {
+			if !uuidPatternStore.MatchString(leaseOwner[0]) {
+				return errors.New("candidate upload lease owner is invalid")
+			}
+			var matches int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=? AND owner_token=? AND lease_expires_at>?`, operationID, record.ID, leaseOwner[0], timestamp(at)).Scan(&matches); err != nil {
 				return err
 			}
-			if err := insertAudit(ctx, tx, gateEvent); err != nil {
-				return err
+			if matches != 1 {
+				return ErrInvalidTransition
 			}
 		}
-		event, err := audit.NewUploadCompleted(audit.OutcomeFailure, operationID, record.ID, uploadCode, at)
+		failed, err := failReservedCandidateTx(ctx, tx, record, resultCode, at)
 		if err != nil {
 			return err
 		}
-		if err := insertAudit(ctx, tx, event); err != nil {
-			return err
-		}
-		record.State, record.OperationState, record.ResultCode = CandidateFailed, OperationFailed, publicCode
+		record = failed
 		return nil
 	})
 	return record, err
+}
+
+func failReservedCandidateTx(ctx context.Context, tx *sql.Tx, record CandidateRecord, resultCode string, at time.Time) (CandidateRecord, error) {
+	operationCode, publicCode, gateCode, valid := candidateFailureCodes(resultCode)
+	if !valid {
+		return CandidateRecord{}, errors.New("candidate failure code is invalid")
+	}
+	uploadCode := audit.CodeInternalFailure
+	if operationCode == "hash_mismatch" {
+		uploadCode = audit.CodeHashMismatch
+	}
+	if operationCode == "expired" {
+		uploadCode = audit.CodeExpired
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE candidates SET state='failed' WHERE id=? AND state='uploading'`, record.ID)
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	if rows != 1 {
+		return CandidateRecord{}, ErrInvalidTransition
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO candidate_upload_failures(operation_id,candidate_id,public_code) VALUES(?,?,?)`, record.OperationID, record.ID, publicCode); err != nil {
+		return CandidateRecord{}, err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code=?,finished_at=? WHERE id=? AND state='pending'`, operationCode, timestamp(at), record.OperationID)
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	if rows != 1 {
+		return CandidateRecord{}, ErrInvalidTransition
+	}
+	if operationCode != "expired" {
+		gateEvent, err := audit.NewGateResult(audit.OutcomeFailure, record.OperationID, record.ID, gateCode, at)
+		if err != nil {
+			return CandidateRecord{}, err
+		}
+		if err := insertAudit(ctx, tx, gateEvent); err != nil {
+			return CandidateRecord{}, err
+		}
+	}
+	event, err := audit.NewUploadCompleted(audit.OutcomeFailure, record.OperationID, record.ID, uploadCode, at)
+	if err != nil {
+		return CandidateRecord{}, err
+	}
+	if err := insertAudit(ctx, tx, event); err != nil {
+		return CandidateRecord{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=?`, record.OperationID, record.ID); err != nil {
+		return CandidateRecord{}, err
+	}
+	record.State, record.OperationState, record.ResultCode, record.LeaseOwner = CandidateFailed, OperationFailed, publicCode, ""
+	return record, nil
+}
+
+func (s *Store) RenewCandidateUploadLease(ctx context.Context, sessionID, operationID, leaseOwner string, now, expiresAt time.Time) error {
+	if !uuidPatternStore.MatchString(leaseOwner) || !expiresAt.After(now) || expiresAt.Sub(now) > 30*time.Minute {
+		return errors.New("candidate upload lease renewal is invalid")
+	}
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := requireActiveSessionTx(ctx, tx, sessionID, now); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE candidate_upload_leases SET lease_expires_at=?,updated_at=? WHERE operation_id=? AND owner_token=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM operations o JOIN candidates c ON c.id=o.candidate_id WHERE o.id=candidate_upload_leases.operation_id AND o.candidate_id=candidate_upload_leases.candidate_id AND o.kind='upload' AND o.state='pending' AND c.state='uploading' AND c.session_id=?)`, timestamp(expiresAt), timestamp(now), operationID, leaseOwner, timestamp(now), sessionID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return ErrInvalidTransition
+		}
+		return nil
+	})
 }
 
 func candidateFailureCodes(code string) (operationCode, publicCode string, gateCode audit.Code, ok bool) {
@@ -662,6 +755,9 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 	}
 	if !exactLowerHex(request.UploadDigest, 64) {
 		return CandidateRecord{}, false, errors.New("candidate digest is invalid")
+	}
+	if request.LeaseOwner != "" && !uuidPatternStore.MatchString(request.LeaseOwner) {
+		return CandidateRecord{}, false, errors.New("candidate upload lease owner is invalid")
 	}
 	parsed, err := parseVersion(request.Version)
 	if err != nil {
@@ -708,6 +804,18 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 				return ErrCandidateExpired
 			}
 		}
+		if request.LeaseOwner != "" {
+			if !found {
+				return ErrInvalidTransition
+			}
+			var matches int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=? AND owner_token=? AND lease_expires_at>?`, request.OperationID, request.CandidateID, request.LeaseOwner, timestamp(commitAt)).Scan(&matches); err != nil {
+				return err
+			}
+			if matches != 1 {
+				return ErrInvalidTransition
+			}
+		}
 		var major, minor, patch int64
 		floorErr := tx.QueryRowContext(ctx, `SELECT major,minor,patch FROM highest_committed_version WHERE singleton_id=1`).Scan(&major, &minor, &patch)
 		if floorErr == nil && parsed.compare(numericVersion{major, minor, patch}) <= 0 {
@@ -740,6 +848,9 @@ func (s *Store) AcceptCandidateForActiveSession(ctx context.Context, request Can
 			return err
 		}
 		if err := insertAudit(ctx, tx, uploadCompleted); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=?`, request.OperationID, request.CandidateID); err != nil {
 			return err
 		}
 		accepted = CandidateRecord{Candidate: Candidate{ID: request.CandidateID, SessionID: request.SessionID, State: CandidateValidated, CreatedAt: request.CreatedAt.UTC(), ExpiresAt: request.ExpiresAt.UTC()}, UploadDigest: request.UploadDigest, ValidationReport: request.ValidationReport, Version: request.Version, OperationID: request.OperationID, OperationState: OperationSucceeded, ResultCode: "completed"}
@@ -891,6 +1002,9 @@ func (s *Store) QueueExpiredCandidateCleanups(ctx context.Context, now time.Time
 					if _, err := tx.ExecContext(ctx, `UPDATE operations SET state='failed',result_code='expired',finished_at=? WHERE id=? AND state='pending'`, timestamp(now), operationID); err != nil {
 						return err
 					}
+					if _, err := tx.ExecContext(ctx, `DELETE FROM candidate_upload_leases WHERE operation_id=? AND candidate_id=?`, operationID, item.id); err != nil {
+						return err
+					}
 					event, err := audit.NewUploadCompleted(audit.OutcomeFailure, operationID, item.id, audit.CodeExpired, now)
 					if err != nil {
 						return err
@@ -949,7 +1063,7 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 	defer s.candidateMu.Unlock()
 	var claims []CleanupClaim
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT candidate_id,attempt_count,operation_id,claim_token FROM candidate_cleanups WHERE state='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?) ORDER BY candidate_id LIMIT ?`, timestamp(now), limit)
+		rows, err := tx.QueryContext(ctx, `SELECT candidate_id,attempt_count,operation_id,claim_token FROM candidate_cleanups WHERE state='pending' AND (claim_expires_at IS NULL OR claim_expires_at<=?) AND (last_error_code='' OR updated_at<=?) ORDER BY candidate_id LIMIT ?`, timestamp(now), timestamp(now.Add(-5*time.Minute)), limit)
 		if err != nil {
 			return err
 		}
@@ -981,13 +1095,20 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 				if err != nil {
 					return err
 				}
-				if changed == 1 {
+				if changed == 0 {
+					if err := verifyFailedCleanupAttemptTx(ctx, tx, item.oldOperation.String, item.id, item.attempts); err != nil {
+						return err
+					}
+				} else {
 					attemptResult, err := tx.ExecContext(ctx, `UPDATE candidate_cleanup_attempts SET outcome='failure',finished_at=? WHERE operation_id=? AND candidate_id=? AND outcome=''`, timestamp(now), item.oldOperation.String, item.id)
 					if err != nil {
 						return err
 					}
 					attemptRows, err := attemptResult.RowsAffected()
-					if err != nil || attemptRows != 1 {
+					if err != nil {
+						return err
+					}
+					if attemptRows != 1 {
 						return ErrInvalidTransition
 					}
 					event, err := audit.NewCleanupResult(audit.OutcomeFailure, item.oldOperation.String, "", audit.CodeInternalFailure, now)
@@ -1009,7 +1130,7 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 				return err
 			}
 			if changed != 1 {
-				continue
+				return ErrInvalidTransition
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, opID, timestamp(now)); err != nil {
 				return err
@@ -1025,6 +1146,20 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 		return nil
 	})
 	return claims, err
+}
+
+func verifyFailedCleanupAttemptTx(ctx context.Context, tx *sql.Tx, operationID, candidateID string, attemptNumber int) error {
+	var kind, state, resultCode, attemptCandidate, outcome string
+	var storedAttempt int
+	var finishedAt sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT o.kind,o.state,o.result_code,a.candidate_id,a.attempt_number,a.outcome,a.finished_at FROM operations o JOIN candidate_cleanup_attempts a ON a.operation_id=o.id WHERE o.id=?`, operationID).Scan(&kind, &state, &resultCode, &attemptCandidate, &storedAttempt, &outcome, &finishedAt)
+	if err != nil {
+		return ErrInvalidTransition
+	}
+	if kind != string(OperationCleanup) || state != string(OperationFailed) || resultCode != string(audit.CodeInternalFailure) || attemptCandidate != candidateID || storedAttempt != attemptNumber || outcome != "failure" || !finishedAt.Valid {
+		return ErrInvalidTransition
+	}
+	return nil
 }
 
 func (s *Store) CompleteCandidateCleanup(ctx context.Context, claim CleanupClaim, at time.Time) error {

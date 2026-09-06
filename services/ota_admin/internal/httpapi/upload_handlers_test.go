@@ -33,16 +33,17 @@ type blockingUploadReceiver struct {
 }
 
 type fakeEnvelopeAcceptor struct {
-	calls       int
-	lookupCalls int
-	failCalls   int
-	sessionID   string
-	operationID string
-	envelope    *upload.Envelope
-	result      candidate.Summary
-	existing    *candidate.Summary
-	err         error
-	failErr     error
+	calls           int
+	lookupCalls     int
+	failCalls       int
+	sessionID       string
+	operationID     string
+	envelope        *upload.Envelope
+	result          candidate.Summary
+	existing        *candidate.Summary
+	err             error
+	failErr         error
+	takeoverExpired bool
 }
 
 func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.Context, sessionID, operationID string) (candidate.Summary, bool, error) {
@@ -53,12 +54,24 @@ func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.
 		return candidate.Summary{}, false, acceptor.err
 	}
 	if acceptor.existing != nil {
+		if acceptor.takeoverExpired && acceptor.existing.State == "uploading" {
+			failed := *acceptor.existing
+			failed.State = "failed"
+			failed.ResultCode = "operation_failed"
+			acceptor.existing = &failed
+		}
 		return *acceptor.existing, false, nil
 	}
-	return candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "uploading"}, true, nil
+	created := candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "uploading", LeaseOwner: testLeaseOwner}
+	acceptor.existing = &created
+	return created, true, nil
 }
 
-func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string) (candidate.Summary, error) {
+func (acceptor *fakeEnvelopeAcceptor) RenewEnvelopeLeaseForActiveSession(context.Context, string, string, string) error {
+	return nil
+}
+
+func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string, _ ...string) (candidate.Summary, error) {
 	acceptor.failCalls++
 	if acceptor.failErr != nil {
 		return candidate.Summary{}, acceptor.failErr
@@ -68,13 +81,17 @@ func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Con
 	return failed, nil
 }
 
-func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope) (candidate.Summary, error) {
+func (acceptor *fakeEnvelopeAcceptor) AcceptEnvelopeForActiveSession(_ context.Context, sessionID, operationID string, envelope *upload.Envelope, _ ...string) (candidate.Summary, error) {
 	acceptor.calls++
 	acceptor.sessionID = sessionID
 	acceptor.operationID = operationID
 	acceptor.envelope = envelope
 	if acceptor.result.CandidateID == "" {
 		acceptor.result = testCandidateSummary(operationID)
+	}
+	if acceptor.err == nil {
+		accepted := acceptor.result
+		acceptor.existing = &accepted
 	}
 	return acceptor.result, acceptor.err
 }
@@ -178,7 +195,7 @@ func TestUploadEndpointStreamsRawZIPAndReturnsValidatedCandidateSummary(t *testi
 		t.Fatalf("ownership handoff calls=%d session=%q operation=%q envelope=%p", acceptor.calls, acceptor.sessionID, acceptor.operationID, acceptor.envelope)
 	}
 	body := response.Body.String()
-	if strings.Contains(body, `C:\\secret`) || strings.Contains(body, "/srv/secret") {
+	if strings.Contains(body, `C:\\secret`) || strings.Contains(body, "/srv/secret") || strings.Contains(body, testLeaseOwner) || strings.Contains(body, "lease") {
 		t.Fatalf("response leaked paths or verification claim: %s", body)
 	}
 	decoded := decodeBody(t, response)
@@ -206,6 +223,30 @@ func TestUploadEndpointReturnsSafeChineseValidationErrorWithOperationID(t *testi
 	replayed := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
 	if replayed.Code != http.StatusUnprocessableEntity || decodeBody(t, replayed)["code"] != "signature_mismatch" || receiver.calls != 1 {
 		t.Fatalf("replay status=%d receiver=%d body=%s", replayed.Code, receiver.calls, replayed.Body.String())
+	}
+}
+
+func TestUploadEndpointMapsAConcurrentTerminalCandidateIdenticallyOnFirstResponseAndReplay(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{result: testEnvelope()}
+	terminal := testCandidateSummary(testOperationID)
+	terminal.State = "failed"
+	terminal.ResultCode = "candidate_expired"
+	acceptor := &fakeEnvelopeAcceptor{result: terminal}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	first := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	replayed := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
+	for name, response := range map[string]*httptest.ResponseRecorder{"first": first, "replay": replayed} {
+		body := decodeBody(t, response)
+		if response.Code != http.StatusGone || body["code"] != "candidate_expired" || body["operation_id"] != testOperationID {
+			t.Fatalf("%s status=%d body=%s", name, response.Code, response.Body.String())
+		}
+	}
+	if receiver.calls != 1 || acceptor.calls != 1 {
+		t.Fatalf("receiver=%d acceptor=%d", receiver.calls, acceptor.calls)
 	}
 }
 
@@ -243,6 +284,25 @@ func TestUploadEndpointDoesNotReportOriginalFailureBeforeTerminalizationCommits(
 	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
 	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" || acceptor.failCalls != 1 {
 		t.Fatalf("status=%d failCalls=%d body=%s", response.Code, acceptor.failCalls, response.Body.String())
+	}
+}
+
+func TestUploadEndpointReplaysARecoverableTerminalResultAfterFailurePersistenceWasLost(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
+	acceptor := &fakeEnvelopeAcceptor{failErr: errors.New("injected persistence failure")}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	first := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	if first.Code != http.StatusInternalServerError || receiver.calls != 1 {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	acceptor.takeoverExpired = true
+	replayed := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
+	if replayed.Code != http.StatusInternalServerError || decodeBody(t, replayed)["code"] != "operation_failed" || receiver.calls != 1 {
+		t.Fatalf("replay status=%d receiver=%d body=%s", replayed.Code, receiver.calls, replayed.Body.String())
 	}
 }
 
@@ -482,6 +542,7 @@ func newUploadRequest(body []byte, csrf string, cookie *http.Cookie) *http.Reque
 const (
 	testOperationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	testCandidateID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	testLeaseOwner  = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 )
 
 func testCandidateSummary(operationID string) candidate.Summary {

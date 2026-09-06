@@ -227,6 +227,102 @@ func TestReserveCandidateAtomicallyClaimsIdempotencyKeyBeforeUpload(t *testing.T
 	}
 }
 
+func TestUploadOwnerLeaseRenewsAndAnExpiredReplayTerminalizesWithoutReceivingAgain(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	first, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID1,
+		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute),
+	})
+	if err != nil || !acquired || first.LeaseOwner != releaseID1 {
+		t.Fatalf("first=%+v acquired=%v err=%v", first, acquired, err)
+	}
+	active, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
+		CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(6 * time.Minute),
+	})
+	if err != nil || acquired || active.State != CandidateUploading {
+		t.Fatalf("active=%+v acquired=%v err=%v", active, acquired, err)
+	}
+	if err := s.RenewCandidateUploadLease(context.Background(), sessionHash1, operationID1, releaseID1, now.Add(4*time.Minute), now.Add(9*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "operation_failed", now.Add(4*time.Minute), releaseID2); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("wrong owner fail err=%v", err)
+	}
+	if _, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3",
+		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(4 * time.Minute),
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("wrong owner accept err=%v", err)
+	}
+	stillActive, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
+		CreatedAt: now.Add(6 * time.Minute), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(11 * time.Minute),
+	})
+	if err != nil || acquired || stillActive.State != CandidateUploading {
+		t.Fatalf("still active=%+v acquired=%v err=%v", stillActive, acquired, err)
+	}
+	if _, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID1,
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3",
+		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), CommittedAt: now.Add(10 * time.Minute),
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("expired owner accept err=%v", err)
+	}
+	failed, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
+		CreatedAt: now.Add(10 * time.Minute), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(15 * time.Minute),
+	})
+	if err != nil || acquired || failed.State != CandidateFailed || failed.ResultCode != "operation_failed" {
+		t.Fatalf("failed=%+v acquired=%v err=%v", failed, acquired, err)
+	}
+	if err := s.RenewCandidateUploadLease(context.Background(), sessionHash1, operationID1, releaseID1, now.Add(10*time.Minute), now.Add(15*time.Minute)); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("old owner renewal err=%v", err)
+	}
+	if _, err := s.FailReservedCandidate(context.Background(), sessionHash1, operationID1, "operation_failed", now.Add(10*time.Minute), releaseID1); err != nil {
+		t.Fatalf("terminal replay must remain readable, err=%v", err)
+	}
+	var leases, failures, terminalAudits int
+	if err := s.db.QueryRow(`SELECT count(*) FROM candidate_upload_leases`).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM candidate_upload_failures WHERE operation_id=? AND public_code='operation_failed'`, operationID1).Scan(&failures); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE operation_id=? AND event_type='upload_completed' AND outcome='failure'`, operationID1).Scan(&terminalAudits); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 || failures != 1 || terminalAudits != 1 {
+		t.Fatalf("leases=%d failures=%d terminalAudits=%d", leases, failures, terminalAudits)
+	}
+}
+
+func TestPendingUploadWithoutLeaseIsRecoveredAsTerminalFailureOnReplay(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	_, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID1,
+		CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(5 * time.Minute),
+	})
+	if err != nil || !acquired {
+		t.Fatalf("reserve acquired=%v err=%v", acquired, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM candidate_upload_leases WHERE operation_id=?`, operationID1); err != nil {
+		t.Fatal(err)
+	}
+	replayed, acquired, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{
+		CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, LeaseOwner: releaseID2,
+		CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(24 * time.Hour), LeaseExpiresAt: now.Add(6 * time.Minute),
+	})
+	if err != nil || acquired || replayed.State != CandidateFailed || replayed.OperationState != OperationFailed || replayed.ResultCode != "operation_failed" {
+		t.Fatalf("replayed=%+v acquired=%v err=%v", replayed, acquired, err)
+	}
+}
+
 func TestFailedReservationIsTerminalAndReplayable(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()
@@ -285,10 +381,19 @@ func TestUploadReplayRemainsValidatedAfterLaterPublishFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, created, err := s.BeginPublishForActiveSession(context.Background(), sessionHash1, candidateID1, releaseID1, now); err != nil || !created {
-		t.Fatalf("begin created=%v err=%v", created, err)
+	if _, err := s.db.Exec(`INSERT INTO operations(id,kind,state,candidate_id,created_at) VALUES(?,'publish','pending',?,?)`, releaseID1, candidateID1, timestamp(now)); err != nil {
+		t.Fatal(err)
 	}
-	if err := s.FailPublish(context.Background(), releaseID1, candidateID1, "internal_failure", now.Add(time.Second)); err != nil {
+	if _, err := s.db.Exec(`UPDATE candidates SET state='publishing' WHERE id=?`, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE operations SET state='running' WHERE id=?`, releaseID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE candidates SET state='failed' WHERE id=?`, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=?`, timestamp(now.Add(time.Second)), releaseID1); err != nil {
 		t.Fatal(err)
 	}
 	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Hour)})

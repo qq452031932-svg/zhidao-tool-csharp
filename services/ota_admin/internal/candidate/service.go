@@ -22,10 +22,13 @@ import (
 )
 
 var (
-	ErrDigestMismatch = errors.New("candidate upload digest changed")
-	ErrExpired        = errors.New("candidate expired")
-	canonicalUUID     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	ErrDigestMismatch   = errors.New("candidate upload digest changed")
+	ErrExpired          = errors.New("candidate expired")
+	ErrUploadInProgress = errors.New("candidate upload is already in progress")
+	canonicalUUID       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
+
+const uploadLeaseDuration = 5 * time.Minute
 
 type releaseValidator interface {
 	Validate(context.Context, *upload.Envelope, string) (release.Report, error)
@@ -58,6 +61,7 @@ type Summary struct {
 	ExpiresAt   time.Time      `json:"expires_at"`
 	Report      release.Report `json:"report"`
 	ResultCode  string         `json:"result_code,omitempty"`
+	LeaseOwner  string         `json:"-"`
 }
 
 type Prepared struct {
@@ -107,10 +111,28 @@ func secureStagingRoot(path string) (string, error) {
 	return root, nil
 }
 
-func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string, envelope *upload.Envelope) (Summary, error) {
+func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sessionID, operationID string, envelope *upload.Envelope, leaseOwners ...string) (Summary, error) {
 	if service == nil || envelope == nil || envelope.Verified || !canonicalUUID.MatchString(operationID) {
 		return Summary{}, errors.New("candidate request is invalid")
 	}
+	if len(leaseOwners) > 1 || len(leaseOwners) == 1 && !canonicalUUID.MatchString(leaseOwners[0]) {
+		return Summary{}, errors.New("candidate upload lease owner is invalid")
+	}
+	if len(leaseOwners) == 0 {
+		reserved, acquired, err := service.ReserveEnvelopeForActiveSession(ctx, sessionID, operationID)
+		if err != nil {
+			return Summary{}, err
+		}
+		if !acquired {
+			_ = envelope.Cleanup()
+			if reserved.State != string(store.CandidateUploading) {
+				return reserved, nil
+			}
+			return Summary{}, ErrUploadInProgress
+		}
+		return service.AcceptEnvelopeForActiveSession(ctx, sessionID, operationID, envelope, reserved.LeaseOwner)
+	}
+	leaseOwner := leaseOwners[0]
 	now := service.now().UTC()
 	existing, found, err := service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, now)
 	if err != nil {
@@ -121,38 +143,37 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 		return summaryFromRecord(existing)
 	}
 	if !found {
-		_, _, err := service.ReserveEnvelopeForActiveSession(ctx, sessionID, operationID)
-		if err != nil {
-			return Summary{}, err
-		}
-		existing, found, err = service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, service.now().UTC())
-		if err != nil || !found {
-			return Summary{}, errors.Join(err, errors.New("candidate reservation disappeared"))
-		}
+		return Summary{}, errors.New("candidate reservation disappeared")
+	}
+	if err := service.RenewEnvelopeLeaseForActiveSession(ctx, sessionID, operationID, leaseOwner); err != nil {
+		return Summary{}, err
 	}
 	floor, _, err := service.store.HighestCommittedVersion(ctx)
 	if err != nil {
-		service.failBestEffort(sessionID, operationID, "internal_failure")
+		service.failBestEffort(sessionID, operationID, leaseOwner, "internal_failure")
 		return Summary{}, err
 	}
 	report, err := service.validator.Validate(ctx, envelope, floor)
 	if err != nil {
-		service.failBestEffort(sessionID, operationID, validationFailureCode(err))
+		service.failBestEffort(sessionID, operationID, leaseOwner, validationFailureCode(err))
 		return Summary{}, err
 	}
 	reportJSON, err := json.Marshal(report)
 	if err != nil {
-		service.failBestEffort(sessionID, operationID, "internal_failure")
+		service.failBestEffort(sessionID, operationID, leaseOwner, "internal_failure")
 		return Summary{}, errors.New("encode candidate validation report")
+	}
+	if err := service.RenewEnvelopeLeaseForActiveSession(ctx, sessionID, operationID, leaseOwner); err != nil {
+		return Summary{}, err
 	}
 	candidateID := existing.ID
 	paths := service.paths(candidateID)
 	if err := service.adoptEnvelope(envelope, paths); err != nil {
-		service.failBestEffort(sessionID, operationID, "internal_failure")
+		service.failBestEffort(sessionID, operationID, leaseOwner, "internal_failure")
 		return Summary{}, err
 	}
 	cleanupAfterAdoption := func(cause error) (Summary, error) {
-		service.failBestEffort(sessionID, operationID, validationFailureCode(cause))
+		service.failBestEffort(sessionID, operationID, leaseOwner, validationFailureCode(cause))
 		return Summary{}, errors.Join(cause, deleteCandidatePaths(service.stagingRoot, candidateID))
 	}
 	if err := syncStagingRoot(service.stagingRoot); err != nil {
@@ -169,10 +190,13 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	if !reflect.DeepEqual(adoptedReport, report) {
 		return cleanupAfterAdoption(ErrDigestMismatch)
 	}
+	if err := service.RenewEnvelopeLeaseForActiveSession(ctx, sessionID, operationID, leaseOwner); err != nil {
+		return cleanupAfterAdoption(err)
+	}
 	accepted, created, err := service.store.AcceptCandidateForActiveSession(ctx, store.CandidateAcceptance{
 		CandidateID: candidateID, SessionID: sessionID, OperationID: operationID,
 		UploadDigest: envelope.SHA256, ValidationReport: string(reportJSON), Version: report.Version,
-		CreatedAt: existing.CreatedAt, ExpiresAt: existing.ExpiresAt, CommittedAt: service.now().UTC(),
+		CreatedAt: existing.CreatedAt, ExpiresAt: existing.ExpiresAt, CommittedAt: service.now().UTC(), LeaseOwner: leaseOwner,
 	})
 	if err != nil || !created {
 		cleanupErr := deleteCandidatePaths(service.stagingRoot, candidateID)
@@ -181,7 +205,7 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 			if errors.Is(err, store.ErrSessionInactive) || errors.Is(err, store.ErrCandidateExpired) {
 				code = "expired"
 			}
-			service.failBestEffort(sessionID, operationID, code)
+			service.failBestEffort(sessionID, operationID, leaseOwner, code)
 			return Summary{}, errors.Join(mapStoreError(err), cleanupErr)
 		}
 		if cleanupErr != nil {
@@ -192,18 +216,18 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 	return summaryFromRecord(accepted)
 }
 
-func (service *Service) FailEnvelopeForActiveSession(ctx context.Context, sessionID, operationID, code string) (Summary, error) {
-	record, err := service.store.FailReservedCandidate(ctx, sessionID, operationID, code, service.now().UTC())
+func (service *Service) FailEnvelopeForActiveSession(ctx context.Context, sessionID, operationID, code string, leaseOwners ...string) (Summary, error) {
+	record, err := service.store.FailReservedCandidate(ctx, sessionID, operationID, code, service.now().UTC(), leaseOwners...)
 	if err != nil {
 		return Summary{}, mapStoreError(err)
 	}
 	return summaryFromRecord(record)
 }
 
-func (service *Service) failBestEffort(sessionID, operationID, code string) {
+func (service *Service) failBestEffort(sessionID, operationID, leaseOwner, code string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = service.FailEnvelopeForActiveSession(ctx, sessionID, operationID, code)
+	_, _ = service.FailEnvelopeForActiveSession(ctx, sessionID, operationID, code, leaseOwner)
 }
 
 func validationFailureCode(err error) string {
@@ -228,16 +252,39 @@ func (service *Service) ReserveEnvelopeForActiveSession(ctx context.Context, ses
 		return Summary{}, false, errors.New("candidate request is invalid")
 	}
 	now := service.now().UTC()
-	candidateID, err := service.nextCandidateID()
+	existing, found, err := service.store.CandidateByOperationForActiveSession(ctx, sessionID, operationID, now)
+	if err != nil {
+		return Summary{}, false, mapStoreError(err)
+	}
+	if found && existing.State != store.CandidateUploading {
+		summary, err := summaryFromRecord(existing)
+		return summary, false, err
+	}
+	candidateID := existing.ID
+	if !found {
+		candidateID, err = service.nextCandidateID()
+		if err != nil {
+			return Summary{}, false, err
+		}
+	}
+	leaseOwner, err := service.nextOwnerID()
 	if err != nil {
 		return Summary{}, false, err
 	}
-	record, created, err := service.store.ReserveCandidateForActiveSession(ctx, store.CandidateReservation{CandidateID: candidateID, SessionID: sessionID, OperationID: operationID, CreatedAt: now, ExpiresAt: now.Add(service.lifetime)})
+	record, created, err := service.store.ReserveCandidateForActiveSession(ctx, store.CandidateReservation{CandidateID: candidateID, SessionID: sessionID, OperationID: operationID, LeaseOwner: leaseOwner, CreatedAt: now, ExpiresAt: now.Add(service.lifetime), LeaseExpiresAt: now.Add(uploadLeaseDuration)})
 	if err != nil {
 		return Summary{}, false, mapStoreError(err)
 	}
 	summary, err := summaryFromRecord(record)
 	return summary, created, err
+}
+
+func (service *Service) RenewEnvelopeLeaseForActiveSession(ctx context.Context, sessionID, operationID, leaseOwner string) error {
+	if service == nil || !canonicalUUID.MatchString(operationID) || !canonicalUUID.MatchString(leaseOwner) {
+		return errors.New("candidate upload lease request is invalid")
+	}
+	now := service.now().UTC()
+	return mapStoreError(service.store.RenewCandidateUploadLease(ctx, sessionID, operationID, leaseOwner, now, now.Add(uploadLeaseDuration)))
 }
 
 func (service *Service) CandidateForOperationForActiveSession(ctx context.Context, sessionID, operationID string) (Summary, bool, error) {
@@ -346,6 +393,16 @@ func (service *Service) nextCandidateID() (string, error) {
 	return "", errors.New("candidate ID collisions exhausted")
 }
 
+func (service *Service) nextOwnerID() (string, error) {
+	service.randomMu.Lock()
+	defer service.randomMu.Unlock()
+	id, err := readUUID(service.random)
+	if err != nil {
+		return "", fmt.Errorf("generate upload lease owner: %w", err)
+	}
+	return id, nil
+}
+
 func (service *Service) adoptEnvelope(envelope *upload.Envelope, destination candidatePaths) error {
 	_, err := validateDirectChild(envelope.ArchivePath, service.stagingRoot, true, ".upload-")
 	if err != nil {
@@ -428,7 +485,7 @@ func summaryFromRecord(record store.CandidateRecord) (Summary, error) {
 	} else if record.State == store.CandidateValidated || record.State == store.CandidatePublishing || record.State == store.CandidatePublished {
 		return Summary{}, errors.New("stored candidate report is invalid")
 	}
-	return Summary{CandidateID: record.ID, OperationID: record.OperationID, State: string(record.State), CreatedAt: record.CreatedAt, ExpiresAt: record.ExpiresAt, Report: report, ResultCode: record.ResultCode}, nil
+	return Summary{CandidateID: record.ID, OperationID: record.OperationID, State: string(record.State), CreatedAt: record.CreatedAt, ExpiresAt: record.ExpiresAt, Report: report, ResultCode: record.ResultCode, LeaseOwner: record.LeaseOwner}, nil
 }
 
 func mapStoreError(err error) error {

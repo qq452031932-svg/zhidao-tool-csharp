@@ -31,7 +31,7 @@ func TestOpenMigratesRequiredTablesAndPragmas(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	ctx := context.Background()
-	for _, table := range []string{"administrators", "highest_committed_version", "releases", "release_assets", "candidates", "sessions", "operations", "audit_events", "candidate_cleanups", "candidate_upload_failures", "candidate_cleanup_attempts"} {
+	for _, table := range []string{"administrators", "highest_committed_version", "releases", "release_assets", "candidates", "sessions", "operations", "audit_events", "candidate_cleanups", "candidate_upload_failures", "candidate_cleanup_attempts", "candidate_upload_leases"} {
 		var count int
 		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table %q count/error = %d/%v", table, count, err)

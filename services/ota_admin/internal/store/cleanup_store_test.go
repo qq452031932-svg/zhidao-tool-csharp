@@ -95,6 +95,37 @@ func TestV3ToV4MigrationPreservesCleanupLedgerAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestV4ToV5MigrationAddsConstrainedUploadLeaseLedgerIdempotently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(schemaV2 + schemaV3 + schemaV4 + `PRAGMA user_version=4;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secureMigrationFixture(t, path)
+	for range 2 {
+		s, err := Open(context.Background(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var version, tables int
+		if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+			t.Fatalf("version=%d err=%v", version, err)
+		}
+		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='candidate_upload_leases'`).Scan(&tables); err != nil || tables != 1 {
+			t.Fatalf("lease tables=%d err=%v", tables, err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestV4MigrationBackfillsV3CleanupAttemptStates(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -137,10 +168,11 @@ func TestV4MigrationBackfillsV3CleanupAttemptStates(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			cleanupUpdatedAt := now.Add(30 * time.Second)
 			if test.cleanupState == "completed" {
-				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,updated_at,completed_at) VALUES(?,?,'completed',1,?,?)`, candidateID1, operationID1, timestamp(now.Add(time.Minute)), timestamp(now.Add(time.Minute)))
+				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,updated_at,completed_at) VALUES(?,?,'completed',1,?,?)`, candidateID1, operationID1, timestamp(cleanupUpdatedAt), timestamp(now.Add(time.Minute)))
 			} else {
-				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,claim_token,claim_expires_at,updated_at,last_error_code) VALUES(?,?,'pending',1,?,?,?,?)`, candidateID1, operationID1, candidateID2, timestamp(now.Add(time.Minute)), timestamp(now), map[string]string{"failed": "internal_failure"}[test.operationState])
+				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,claim_token,claim_expires_at,updated_at,last_error_code) VALUES(?,?,'pending',1,?,?,?,?)`, candidateID1, operationID1, candidateID2, timestamp(now.Add(time.Minute)), timestamp(cleanupUpdatedAt), map[string]string{"failed": "internal_failure"}[test.operationState])
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -157,12 +189,13 @@ func TestV4MigrationBackfillsV3CleanupAttemptStates(t *testing.T) {
 			var candidate string
 			var attempt int
 			var outcome string
+			var started int64
 			var finished sql.NullInt64
-			if err := s.db.QueryRow(`SELECT candidate_id,attempt_number,outcome,finished_at FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1).Scan(&candidate, &attempt, &outcome, &finished); err != nil {
+			if err := s.db.QueryRow(`SELECT candidate_id,attempt_number,outcome,started_at,finished_at FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1).Scan(&candidate, &attempt, &outcome, &started, &finished); err != nil {
 				t.Fatal(err)
 			}
-			if candidate != candidateID1 || attempt != 1 || outcome != test.wantOutcome || finished.Valid != (test.wantOutcome != "") {
-				t.Fatalf("backfilled candidate=%s attempt=%d outcome=%q finished=%v", candidate, attempt, outcome, finished)
+			if candidate != candidateID1 || attempt != 1 || outcome != test.wantOutcome || started != timestamp(now) || finished.Valid != (test.wantOutcome != "") {
+				t.Fatalf("backfilled candidate=%s attempt=%d outcome=%q started=%d finished=%v", candidate, attempt, outcome, started, finished)
 			}
 		})
 	}
@@ -292,5 +325,85 @@ func TestExpiredCleanupLeaseFailsClosedWhenAttemptLedgerIsMissing(t *testing.T) 
 	}
 	if operationState != "running" || ledgerOperation != operationID1 || claimToken != candidateID2 {
 		t.Fatalf("reclaim partially committed: operation=%q ledger=%q token=%q", operationState, ledgerOperation, claimToken)
+	}
+}
+
+func TestExpiredCleanupLeaseAcceptsOnlyAConsistentPreviouslyFailedAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		finishBoth bool
+		wantError  bool
+	}{
+		{name: "consistent", finishBoth: true},
+		{name: "operation only", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := openStore(t)
+			now := time.Unix(2_000_000_000, 0).UTC()
+			createCandidateSession(t, s, sessionHash1, now, now.Add(time.Hour))
+			if _, err := s.db.Exec(`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, candidateID1, sessionHash1, timestamp(now.Add(-time.Hour)), timestamp(now.Add(time.Hour))); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`UPDATE candidates SET state='failed' WHERE id=?`, candidateID1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.QueueExpiredCandidateCleanups(context.Background(), now, 1); err != nil {
+				t.Fatal(err)
+			}
+			first, err := s.ClaimCandidateCleanups(context.Background(), now, time.Minute, 1, candidateID2, []string{operationID1})
+			if err != nil || len(first) != 1 {
+				t.Fatalf("first=%+v err=%v", first, err)
+			}
+			if _, err := s.db.Exec(`UPDATE operations SET state='failed',result_code='internal_failure',finished_at=? WHERE id=?`, timestamp(now.Add(time.Minute)), operationID1); err != nil {
+				t.Fatal(err)
+			}
+			if test.finishBoth {
+				if _, err := s.db.Exec(`UPDATE candidate_cleanup_attempts SET outcome='failure',finished_at=? WHERE operation_id=?`, timestamp(now.Add(time.Minute)), operationID1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			second, err := s.ClaimCandidateCleanups(context.Background(), now.Add(2*time.Minute), time.Minute, 1, releaseID1, []string{releaseID2})
+			if test.wantError {
+				if !errors.Is(err, ErrInvalidTransition) || len(second) != 0 {
+					t.Fatalf("second=%+v err=%v", second, err)
+				}
+				return
+			}
+			if err != nil || len(second) != 1 || second[0].CandidateID != candidateID1 {
+				t.Fatalf("second=%+v err=%v", second, err)
+			}
+		})
+	}
+}
+
+func TestCleanupClaimFailsClosedWhenLedgerCASChangesNoRows(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(time.Hour))
+	if _, err := s.db.Exec(`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, candidateID1, sessionHash1, timestamp(now.Add(-time.Hour)), timestamp(now.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE candidates SET state='failed' WHERE id=?`, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueueExpiredCandidateCleanups(context.Background(), now, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`CREATE TRIGGER ignore_cleanup_claim BEFORE UPDATE ON candidate_cleanups WHEN NEW.claim_token<>'' BEGIN SELECT RAISE(IGNORE); END;`); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.ClaimCandidateCleanups(context.Background(), now, time.Minute, 1, candidateID2, []string{operationID1})
+	if !errors.Is(err, ErrInvalidTransition) || len(claims) != 0 {
+		t.Fatalf("claims=%+v err=%v", claims, err)
+	}
+	var attempts, operations int
+	if err := s.db.QueryRow(`SELECT attempt_count FROM candidate_cleanups WHERE candidate_id=?`, candidateID1).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM operations WHERE id=?`, operationID1).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || operations != 0 {
+		t.Fatalf("claim partially committed: attempts=%d operations=%d", attempts, operations)
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
 func TestJanitorExpiresAndDeletesOnlyDerivedCandidatePaths(t *testing.T) {
@@ -22,7 +24,8 @@ func TestJanitorExpiresAndDeletesOnlyDerivedCandidatePaths(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return now.Add(24 * time.Hour) }})
+	current := now.Add(24 * time.Hour)
+	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return current }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +49,8 @@ func TestJanitorAuditsFailureAndRetriesCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return now.Add(24 * time.Hour) }})
+	current := now.Add(24 * time.Hour)
+	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return current }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +62,7 @@ func TestJanitorAuditsFailureAndRetriesCleanup(t *testing.T) {
 	if _, err := os.Stat(service.paths(summary.CandidateID).archive); err != nil {
 		t.Fatalf("failed cleanup removed retry evidence: %v", err)
 	}
+	current = current.Add(6 * time.Minute)
 	janitor.deleteCandidate = realDelete
 	if err := janitor.RunOnce(context.Background()); err != nil {
 		t.Fatalf("retry: %v", err)
@@ -279,4 +284,66 @@ func TestJanitorRequeuesCompletedCleanupWhenLateAdoptionRestoresCandidatePaths(t
 			t.Fatalf("late-adopted candidate path remains %s: %v", path, err)
 		}
 	}
+}
+
+func TestJanitorContinuesPastOneCleanupFailureAndBacksOffItsRetry(t *testing.T) {
+	service, database, staging, base := newCandidateHarness(t)
+	first, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID := "99999999-9999-4999-8999-999999999999"
+	if err := database.CreateCandidate(context.Background(), store.Candidate{ID: secondID, SessionID: testSessionID, State: store.CandidateUploading, CreatedAt: base, ExpiresAt: base.Add(24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.TransitionCandidate(context.Background(), secondID, store.CandidateFailed); err != nil {
+		t.Fatal(err)
+	}
+	secondPaths := service.paths(secondID)
+	if err := os.WriteFile(secondPaths.archive, []byte("candidate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(secondPaths.extraction, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := base.Add(24 * time.Hour)
+	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return now }, Random: uniqueUUIDReader(16)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	janitor.deleteCandidate = func(id string) error {
+		if id == first.CandidateID {
+			attempts++
+			return errors.New("injected cleanup failure")
+		}
+		return deleteCandidatePaths(staging, id)
+	}
+	if err := janitor.RunOnce(context.Background()); err == nil {
+		t.Fatal("cleanup failure was not reported")
+	}
+	if attempts != 1 {
+		t.Fatalf("failed cleanup attempts=%d", attempts)
+	}
+	for _, path := range []string{secondPaths.archive, secondPaths.extraction} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("later candidate starved at %s: %v", path, err)
+		}
+	}
+	if err := janitor.RunOnce(context.Background()); err != nil {
+		t.Fatalf("backoff run err=%v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("failed cleanup retried without backoff: %d", attempts)
+	}
+}
+
+func uniqueUUIDReader(count int) *bytes.Reader {
+	data := make([]byte, count*16)
+	for index := range count {
+		for offset := range 16 {
+			data[index*16+offset] = byte(index + 1)
+		}
+	}
+	return bytes.NewReader(data)
 }

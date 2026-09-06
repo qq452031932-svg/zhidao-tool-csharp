@@ -100,7 +100,6 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 		if len(claims) == 0 {
 			break
 		}
-		batchFailed := false
 		for _, claim := range claims {
 			if err := ctx.Err(); err != nil {
 				return errors.Join(errors.Join(failures...), err)
@@ -113,16 +112,12 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 				ledgerErr = janitor.store.FailCandidateCleanup(ctx, claim, janitor.now().UTC())
 			}
 			if cleanupErr != nil || ledgerErr != nil {
-				batchFailed = true
 				var cleanupFailure error
 				if cleanupErr != nil {
 					cleanupFailure = fmt.Errorf("clean candidate %s: %w", claim.CandidateID, cleanupErr)
 				}
 				failures = append(failures, errors.Join(cleanupFailure, ledgerErr))
 			}
-		}
-		if batchFailed {
-			break
 		}
 	}
 	return errors.Join(failures...)
