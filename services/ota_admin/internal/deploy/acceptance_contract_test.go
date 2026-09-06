@@ -14,7 +14,8 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(mainSource), "//go:build linux && ota_admin_acceptance\n") {
+	firstLine, _, hasNewline := strings.Cut(string(mainSource), "\n")
+	if !hasNewline || strings.TrimSuffix(firstLine, "\r") != "//go:build linux && ota_admin_acceptance" {
 		t.Fatal("acceptance harness is not protected by its Linux-only opt-in build tag")
 	}
 	acceptanceScript := readTask10Script(t, filepath.Join(moduleRoot, "scripts", "build_linux_acceptance.ps1"))
