@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SuperPan OTA 发布后台</title>
+  <link rel="stylesheet" href="/admin/styles.css">
+  <script src="/admin/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <div><strong>SuperPan</strong><span>OTA 发布后台</span></div>
+    </div>
+    <div class="top-actions">
+      <span id="connection-state" class="status-pill" aria-live="polite">正在连接</span>
+      <button id="logout-button" class="button ghost" type="button" hidden>退出登录</button>
+    </div>
+  </header>
+
+  <main id="main-content" class="page" tabindex="-1">
+    <section id="loading-state" class="state-banner loading" role="status" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span><span>正在读取后台状态…</span>
+    </section>
+    <section id="error-state" class="state-banner error" role="alert" hidden>
+      <div><strong>加载失败</strong><p id="error-message">暂时无法读取数据，请稍后重试。</p></div>
+      <button id="retry-button" class="button secondary" type="button">重新加载</button>
+    </section>
+    <section id="readonly-state" class="state-banner warning" role="alert" hidden>
+      <div><strong>后台处于只读保护状态</strong><p>当前数据仍可查看，恢复完成前无法上传、发布或回滚。</p></div>
+    </section>
+    <section id="empty-state" class="state-banner neutral" role="status" hidden>
+      <div><strong>还没有已发布版本</strong><p>上传第一个已签名 ZIP，并在校验通过后确认发布。</p></div>
+    </section>
+
+    <section id="login-view" class="auth-card" aria-labelledby="login-title" hidden>
+      <div class="auth-copy">
+        <span class="eyebrow">管理员登录</span>
+        <h1 id="login-title">登录 OTA 发布后台</h1>
+        <p>上传、发布和回滚都需要管理员身份。后台不会读取服务器上的其他站点。</p>
+      </div>
+      <form id="login-form" class="form-stack">
+        <div class="field">
+          <label for="login-username">管理员账号</label>
+          <input id="login-username" name="username" autocomplete="username" value="admin" required maxlength="128">
+        </div>
+        <div class="field">
+          <label for="login-password">密码</label>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="1024" aria-describedby="login-help">
+          <small id="login-help">连续输错多次会短时锁定，请确认后再提交。</small>
+        </div>
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+        <button class="button primary full" type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="password-view" class="auth-card" aria-labelledby="password-title" hidden>
+      <div class="auth-copy">
+        <span class="eyebrow">首次登录</span>
+        <h1 id="password-title">请先修改临时密码</h1>
+        <p>新密码保存后，旧登录会话会失效，然后才能上传发布包。</p>
+      </div>
+      <form id="password-form" class="form-stack">
+        <div class="field">
+          <label for="current-password">当前临时密码</label>
+          <input id="current-password" name="current_password" type="password" autocomplete="current-password" required maxlength="1024">
+        </div>
+        <div class="field">
+          <label for="new-password">新密码</label>
+          <input id="new-password" name="new_password" type="password" autocomplete="new-password" required minlength="16" maxlength="1024" aria-describedby="new-password-help">
+          <small id="new-password-help">请使用至少 16 位、与临时密码不同的密码。</small>
+        </div>
+        <p id="password-error" class="form-error" role="alert" hidden></p>
+        <button class="button primary full" type="submit">保存新密码</button>
+      </form>
+    </section>
+
+    <div id="console-view" hidden>
+      <section class="hero-grid" aria-label="发布概况">
+        <article class="card current-card">
+          <div class="section-heading">
+            <div><span class="eyebrow">线上状态</span><h1>当前版本</h1></div>
+            <span id="current-status" class="status-pill success">尚未发布</span>
+          </div>
+          <div class="version-line"><strong id="current-version">—</strong><span id="current-time">等待首次发布</span></div>
+          <p id="current-notes" class="notes">暂无更新说明</p>
+          <div class="metric-row">
+            <span><small>资产数量</small><strong id="current-assets">0</strong></span>
+            <span><small>操作者</small><strong id="current-actor">—</strong></span>
+          </div>
+        </article>
+
+        <article class="card upload-card">
+          <div class="section-heading">
+            <div><span class="eyebrow">第一步</span><h2>选择发布包</h2></div>
+            <span class="safe-badge">仅 ZIP</span>
+          </div>
+          <p class="section-help">只接受本机发布脚本生成并签名的完整发布包，不支持浏览服务器目录。</p>
+          <div class="file-picker">
+            <input id="release-file" name="release_zip" type="file" accept=".zip,application/zip" aria-describedby="file-help selected-file" hidden>
+            <label class="button secondary" for="release-file">选择 ZIP 文件</label>
+            <span id="selected-file">尚未选择文件</span>
+          </div>
+          <small id="file-help">更新说明来自签名发布包，上传校验后自动显示，不能在网页中改写。</small>
+          <button id="upload-button" class="button primary" type="button" disabled>上传并校验</button>
+          <div id="upload-progress-wrap" class="progress-block" hidden>
+            <div><span id="upload-progress-text">上传进度 0%</span><span id="upload-size-text"></span></div>
+            <progress id="upload-progress" max="100" value="0" aria-label="上传进度">0%</progress>
+          </div>
+        </article>
+      </section>
+
+      <section class="card validation-card" aria-labelledby="validation-title">
+        <div class="section-heading">
+          <div><span class="eyebrow">第二步</span><h2 id="validation-title">校验清单</h2></div>
+          <span id="candidate-state" class="status-pill">等待上传</span>
+        </div>
+        <div class="validation-layout">
+          <ol id="validation-list" class="check-list">
+            <li data-check="package"><span aria-hidden="true">○</span><div><strong>包身份</strong><small>固定产品包 ID</small></div></li>
+            <li data-check="channel"><span aria-hidden="true">○</span><div><strong>发布渠道</strong><small>win-x64-stable</small></div></li>
+            <li data-check="version"><span aria-hidden="true">○</span><div><strong>版本递增</strong><small>高于历史最高版本</small></div></li>
+            <li data-check="signature"><span aria-hidden="true">○</span><div><strong>发布签名</strong><small>固定 RSA 公钥</small></div></li>
+            <li data-check="manifest"><span aria-hidden="true">○</span><div><strong>文件与哈希</strong><small>完整 manifest 闭包</small></div></li>
+            <li data-check="references"><span aria-hidden="true">○</span><div><strong>引用关系</strong><small>Feed、目录和 RELEASES 一致</small></div></li>
+            <li data-check="storage"><span aria-hidden="true">○</span><div><strong>空间检查</strong><small>可安全生成新版本</small></div></li>
+          </ol>
+          <div class="candidate-summary">
+            <dl>
+              <div><dt>候选版本</dt><dd id="candidate-version">—</dd></div>
+              <div><dt>文件数量</dt><dd id="candidate-files">—</dd></div>
+              <div><dt>有效期至</dt><dd id="candidate-expiry">—</dd></div>
+            </dl>
+            <div>
+              <span class="field-label">更新说明</span>
+              <p id="candidate-notes" class="signed-notes" aria-label="签名更新说明">上传后显示签名内容</p>
+            </div>
+            <button id="publish-button" class="button danger full" type="button" disabled>确认发布</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card history-card" aria-labelledby="history-title">
+        <div class="section-heading">
+          <div><span class="eyebrow">版本管理</span><h2 id="history-title">版本历史</h2></div>
+          <button id="refresh-button" class="button ghost" type="button">刷新状态</button>
+        </div>
+        <p class="section-help">保留当前版本和前两个版本。回滚只阻止未升级客户端继续获取坏版本，不会让已升级客户端自动降级。</p>
+        <div class="table-scroll" tabindex="0" aria-label="可横向滚动的版本历史表格">
+          <table>
+            <thead><tr><th scope="col">版本</th><th scope="col">状态</th><th scope="col">发布时间</th><th scope="col">更新说明</th><th scope="col">资产</th><th scope="col">操作</th></tr></thead>
+            <tbody id="history-body"><tr><td colspan="6" class="table-empty">正在加载版本历史…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="publish-dialog" aria-labelledby="publish-dialog-title" aria-describedby="publish-dialog-description">
+    <form id="publish-form" method="dialog">
+      <span class="eyebrow">最终确认</span>
+      <h2 id="publish-dialog-title">确认发布这个版本？</h2>
+      <p id="publish-dialog-description">发布会原子切换线上 stable 版本。请确认候选版本和更新说明无误。</p>
+      <label class="confirm-check"><input id="publish-confirm-check" type="checkbox" required> 我已核对签名校验结果和目标版本</label>
+      <div class="dialog-actions"><button class="button ghost" value="cancel" type="button" data-close-dialog="publish-dialog">取消</button><button id="publish-confirm-button" class="button danger" type="submit">立即发布</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="rollback-dialog" aria-labelledby="rollback-dialog-title" aria-describedby="rollback-dialog-description">
+    <form id="rollback-form">
+      <span class="eyebrow">高风险操作</span>
+      <h2 id="rollback-dialog-title">回滚到此版本</h2>
+      <p id="rollback-dialog-description">目标版本：<strong id="rollback-version">—</strong>。此操作不会让已升级客户端自动降级。</p>
+      <div class="field">
+        <label for="rollback-password">当前管理员密码</label>
+        <input id="rollback-password" name="current_password" type="password" autocomplete="current-password" required maxlength="1024" aria-describedby="rollback-help">
+        <small id="rollback-help">需要重新验证密码，并再次确认目标版本。</small>
+      </div>
+      <label class="confirm-check"><input id="rollback-confirm-check" type="checkbox" required> 我确认回滚到上方显示的版本</label>
+      <p id="rollback-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="rollback-dialog">取消</button><button id="rollback-confirm-button" class="button danger" type="submit">确认回滚</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

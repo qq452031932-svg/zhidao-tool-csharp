@@ -21,8 +21,11 @@ type fakePublisher struct {
 	publishResult               deploy.PublishResult
 	rollbackResult              deploy.RollbackResult
 	publishErr, rollbackErr     error
+	readOnlyErr                 error
 	publishCalls, rollbackCalls int
 }
+
+func (publisher *fakePublisher) ReadOnlyError() error { return publisher.readOnlyErr }
 
 func (publisher *fakePublisher) PublishForActiveSession(context.Context, string, string, string) (deploy.PublishResult, error) {
 	publisher.publishCalls++
@@ -97,5 +100,16 @@ func TestHistoryIsCappedAtCurrentPlusTwoPrevious(t *testing.T) {
 	items, err := service.ReleaseHistory(context.Background())
 	if err != nil || len(items) != 1 || history.limit != 3 {
 		t.Fatalf("items=%+v limit=%d err=%v", items, history.limit, err)
+	}
+}
+
+func TestServiceReportsPublisherReadOnlyProtection(t *testing.T) {
+	want := errors.New("recovery required")
+	service, err := NewService(Options{Publisher: &fakePublisher{readOnlyErr: want}, Passwords: &fakePasswordVerifier{}, History: &fakeHistory{}, Retention: &fakeRetainer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(service.ReadOnlyError(), want) {
+		t.Fatalf("read-only error=%v", service.ReadOnlyError())
 	}
 }

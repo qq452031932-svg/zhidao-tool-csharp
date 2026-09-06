@@ -30,6 +30,10 @@ func TestCandidateCurrentAndStatusRequireSessionAndReturnSafeSummary(t *testing.
 		if body["candidate_id"] != testCandidateID || body["operation_id"] != testOperationID || body["state"] != "validated" {
 			t.Fatalf("%s summary=%v", path, body)
 		}
+		report, ok := body["report"].(map[string]any)
+		if !ok || report["notes_markdown"] != "修复批量转存。" || report["manifest_sha256"] != "manifest-hash" || report["publisher_spki_sha256"] != "publisher-pin" {
+			t.Fatalf("%s report=%#v", path, body["report"])
+		}
 	}
 }
 

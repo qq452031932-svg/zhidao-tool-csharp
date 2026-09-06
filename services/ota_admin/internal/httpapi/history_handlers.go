@@ -23,7 +23,11 @@ func (router *Router) releaseHistory(response http.ResponseWriter, request *http
 		writeError(response, http.StatusInternalServerError, "operation_failed")
 		return
 	}
-	writeJSON(response, http.StatusOK, map[string]any{"releases": items, "client_auto_downgrade": false})
+	readOnly := false
+	if reporter, ok := router.releaseOperations.(interface{ ReadOnlyError() error }); ok {
+		readOnly = reporter.ReadOnlyError() != nil
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"releases": items, "client_auto_downgrade": false, "read_only": readOnly})
 }
 
 func (router *Router) rollbackRelease(response http.ResponseWriter, request *http.Request, principal session.Principal) {

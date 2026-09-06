@@ -68,3 +68,10 @@ func (service *Service) RollbackForActiveSession(ctx context.Context, principal 
 func (service *Service) ReleaseHistory(ctx context.Context) ([]store.ReleaseHistoryItem, error) {
 	return service.history.ReleaseHistory(ctx, 3)
 }
+
+func (service *Service) ReadOnlyError() error {
+	if reporter, ok := service.publisher.(interface{ ReadOnlyError() error }); ok {
+		return reporter.ReadOnlyError()
+	}
+	return nil
+}

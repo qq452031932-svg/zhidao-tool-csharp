@@ -2,8 +2,10 @@ package httpapi_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,11 +28,14 @@ type fakeReleaseOperations struct {
 	releaseID     string
 	operationID   string
 	password      string
+	readOnly      error
 }
 
 func (operations *fakeReleaseOperations) ReleaseHistory(context.Context) ([]store.ReleaseHistoryItem, error) {
 	return operations.history, operations.err
 }
+
+func (operations *fakeReleaseOperations) ReadOnlyError() error { return operations.readOnly }
 
 func (operations *fakeReleaseOperations) RollbackForActiveSession(_ context.Context, principal session.Principal, releaseID, operationID, password string) (deploy.RollbackResult, error) {
 	operations.rollbackCalls++
@@ -56,6 +61,9 @@ func TestHistoryEndpointReturnsThreeRetainedReleasesAndNoDowngradePromise(t *tes
 	if response.Code != http.StatusOK || body["client_auto_downgrade"] != false {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
+	if body["read_only"] != false {
+		t.Fatalf("read_only=%#v", body["read_only"])
+	}
 	releases, ok := body["releases"].([]any)
 	if !ok || len(releases) != 1 {
 		t.Fatalf("releases=%#v", body["releases"])
@@ -67,6 +75,22 @@ func TestHistoryEndpointReturnsThreeRetainedReleasesAndNoDowngradePromise(t *tes
 	assets, ok := item["assets"].([]any)
 	if !ok || len(assets) != 1 {
 		t.Fatalf("assets=%#v", item["assets"])
+	}
+}
+
+func TestHistoryEndpointExposesReadOnlyProtectionWithoutInternalDetails(t *testing.T) {
+	h := newHarness(t)
+	operations := &fakeReleaseOperations{readOnly: errors.New("private filesystem detail")}
+	installReleaseOperations(t, h, operations)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, _ = changeTestPassword(t, h, cookie, csrf)
+	request := httptest.NewRequest(http.MethodGet, "http://backend/admin/api/releases", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	body := decodeBody(t, response)
+	if response.Code != http.StatusOK || body["read_only"] != true || strings.Contains(response.Body.String(), "private filesystem detail") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

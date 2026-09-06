@@ -57,11 +57,14 @@ func writeCandidateSummary(response http.ResponseWriter, status int, summary can
 		"created_at":   summary.CreatedAt,
 		"expires_at":   summary.ExpiresAt,
 		"report": map[string]any{
-			"package_id": summary.Report.PackageID,
-			"channel":    summary.Report.Channel,
-			"version":    summary.Report.Version,
-			"file_count": summary.Report.FileCount,
-			"verified":   summary.Report.Verified,
+			"package_id":            summary.Report.PackageID,
+			"channel":               summary.Report.Channel,
+			"version":               summary.Report.Version,
+			"file_count":            summary.Report.FileCount,
+			"verified":              summary.Report.Verified,
+			"notes_markdown":        summary.Report.NotesMarkdown,
+			"manifest_sha256":       summary.Report.ManifestSHA256,
+			"publisher_spki_sha256": summary.Report.PublisherSPKISHA256,
 		},
 	})
 }

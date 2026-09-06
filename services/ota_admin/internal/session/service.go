@@ -327,6 +327,27 @@ func (service *Service) Authenticate(ctx context.Context, token, csrfToken strin
 	return Principal{IDHash: idHash, MustChangePassword: administrator.MustChangePassword}, nil
 }
 
+// RotateCSRF issues the authenticated browser a fresh mutation token after a
+// page reload. The session cookie remains HttpOnly; only the CSRF secret is
+// returned to same-origin script by the authenticated current-session API.
+func (service *Service) RotateCSRF(principal Principal) (string, error) {
+	service.loginMu.Lock()
+	defer service.loginMu.Unlock()
+	token, err := security.NewRandomToken(service.random)
+	if err != nil {
+		return "", err
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	runtime, found := service.sessions[principal.IDHash]
+	if !found {
+		return "", ErrUnauthorized
+	}
+	runtime.csrfHash = security.HashToken(token)
+	service.sessions[principal.IDHash] = runtime
+	return token, nil
+}
+
 func (service *Service) Logout(ctx context.Context, principal Principal) error {
 	err := service.store.TransitionSession(ctx, principal.IDHash, store.SessionRevoked)
 	service.forgetSession(principal.IDHash)

@@ -14,6 +14,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 	"fanfh.cn/superpan/ota-admin/internal/upload"
+	"fanfh.cn/superpan/ota-admin/internal/webui"
 )
 
 const (
@@ -69,6 +70,7 @@ type Router struct {
 	uploadEnvelopes   EnvelopeAcceptor
 	publisher         CandidatePublisher
 	releaseOperations ReleaseOperations
+	web               http.Handler
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -88,6 +90,7 @@ func NewRouter(options Options) (http.Handler, error) {
 	router := &Router{
 		sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes,
 		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes, publisher: publisher, releaseOperations: options.ReleaseOperations,
+		web: webui.Handler(),
 	}
 	return withAdminSecurityHeaders(router), nil
 }
@@ -96,6 +99,10 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	if request.Method != http.MethodGet && request.Method != http.MethodPost {
 		response.Header().Set("Allow", "GET, POST")
 		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if request.Method == http.MethodGet && isWebAssetPath(request.URL.Path) {
+		router.web.ServeHTTP(response, request)
 		return
 	}
 	switch {
@@ -107,6 +114,15 @@ func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		router.authenticated(response, request)
 	default:
 		writeError(response, http.StatusNotFound, "not_found")
+	}
+}
+
+func isWebAssetPath(path string) bool {
+	switch path {
+	case "/admin/", "/admin/index.html", "/admin/styles.css", "/admin/app.js":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -145,7 +161,16 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 			writeMethodNotAllowed(response, http.MethodGet)
 			return
 		}
-		writeJSON(response, http.StatusOK, map[string]any{"authenticated": true, "must_change_password": principal.MustChangePassword})
+		csrfToken, err := router.sessions.RotateCSRF(principal)
+		if err != nil {
+			if errors.Is(err, session.ErrUnauthorized) {
+				writeError(response, http.StatusUnauthorized, "authentication_failed")
+			} else {
+				writeError(response, http.StatusInternalServerError, "operation_failed")
+			}
+			return
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"authenticated": true, "must_change_password": principal.MustChangePassword, "csrf_token": csrfToken})
 	case request.URL.Path == "/admin/api/session/logout":
 		if request.Method != http.MethodPost {
 			writeMethodNotAllowed(response, http.MethodPost)

@@ -658,12 +658,15 @@ func testCandidateSummary(operationID string) candidate.Summary {
 		CreatedAt:   time.Unix(2_000_000_000, 0).UTC(),
 		ExpiresAt:   time.Unix(2_000_000_000, 0).UTC().Add(24 * time.Hour),
 		Report: release.Report{
-			SchemaVersion: 1,
-			Verified:      true,
-			PackageID:     "SuperPan",
-			Channel:       "stable",
-			Version:       "21.0.0",
-			FileCount:     7,
+			SchemaVersion:       1,
+			Verified:            true,
+			PackageID:           "SuperPan",
+			Channel:             "stable",
+			Version:             "21.0.0",
+			FileCount:           7,
+			NotesMarkdown:       "修复批量转存。",
+			ManifestSHA256:      "manifest-hash",
+			PublisherSPKISHA256: "publisher-pin",
 		},
 	}
 }

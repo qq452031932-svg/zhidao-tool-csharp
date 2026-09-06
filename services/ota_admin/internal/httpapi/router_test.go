@@ -332,6 +332,24 @@ func TestForcedPasswordChangeBlocksPrivilegeAndRotationRevokesEveryOldSession(t 
 	}
 }
 
+func TestCurrentSessionRotatesCSRFSoARefreshedPageCanMutate(t *testing.T) {
+	h := newHarness(t)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+	current := h.request(http.MethodGet, "/admin/api/session/current", "", "", cookie)
+	body := decodeBody(t, current)
+	refreshed, _ := body["csrf_token"].(string)
+	if current.Code != http.StatusOK || refreshed == "" || refreshed == csrf {
+		t.Fatalf("status=%d csrf=%q old=%q body=%s", current.Code, refreshed, csrf, current.Body.String())
+	}
+	if response := h.request(http.MethodPost, "/admin/api/future-mutation", `{}`, csrf, cookie); response.Code != http.StatusForbidden {
+		t.Fatalf("old csrf status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := h.request(http.MethodPost, "/admin/api/future-mutation", `{}`, refreshed, cookie); response.Code != http.StatusNotFound {
+		t.Fatalf("refreshed csrf status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestMutationsRequireFormalCSRFAndSameOrigin(t *testing.T) {
 	h := newHarness(t)
 	cookie, csrf, _, _ := login(t, h, oldPassword)
