@@ -34,8 +34,7 @@ usage() {
     cat >&2 <<'USAGE'
 Usage: install.sh --binary PATH --binary-sha256 HEX \
   --certificate PATH --certificate-sha256 HEX --publisher-spki-sha256 HEX \
-  --active-vhost-sha256 HEX \
-  [--backup-root ABSOLUTE_PATH]
+  --active-vhost-sha256 HEX
 
 The existing OTA HTTPS server block must already contain exactly this line:
   include /etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf;
@@ -59,7 +58,6 @@ while [ "$#" -gt 0 ]; do
         --certificate-sha256) require_value "$1" "${2:-}"; CERTIFICATE_SHA256="$2"; shift 2 ;;
         --publisher-spki-sha256) require_value "$1" "${2:-}"; EXPECTED_SPKI_SHA256="$2"; shift 2 ;;
         --active-vhost-sha256) require_value "$1" "${2:-}"; ACTIVE_VHOST_SHA256="$2"; shift 2 ;;
-        --backup-root) require_value "$1" "${2:-}"; BACKUP_ROOT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
     esac
@@ -73,7 +71,6 @@ done
 [[ "$EXPECTED_SPKI_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "publisher SPKI SHA-256 must be 64 lowercase hexadecimal characters"
 [ "$EXPECTED_SPKI_SHA256" = "$COMPILED_PUBLISHER_SPKI_SHA256" ] || die "publisher SPKI does not match the compiled production trust pin"
 [[ "$ACTIVE_VHOST_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "active vhost SHA-256 must be 64 lowercase hexadecimal characters"
-[[ "$BACKUP_ROOT" = /* ]] || die "backup root must be absolute"
 [ -f "$BINARY_SOURCE" ] && [ ! -L "$BINARY_SOURCE" ] || die "binary source must be a regular non-symlink file"
 [ -f "$CERTIFICATE_SOURCE" ] && [ ! -L "$CERTIFICATE_SOURCE" ] || die "certificate source must be a regular non-symlink file"
 [ -f "$SCRIPT_DIR/superpan-ota-admin.service" ] || die "unit template is missing"
@@ -84,6 +81,7 @@ done
 command -v sha256sum >/dev/null || die "sha256sum is required"
 command -v openssl >/dev/null || die "openssl is required"
 command -v runuser >/dev/null || die "runuser is required"
+command -v curl >/dev/null || die "curl is required"
 
 verify_sha256() {
     local source="$1"
@@ -129,10 +127,33 @@ if [ -e "${RELEASE_ROOT}/generations" ] || [ -L "${RELEASE_ROOT}/generations" ];
 fi
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-install -d -m 0700 -o root -g root "$BACKUP_ROOT"
+validate_backup_root() {
+    if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
+        [ -d "$BACKUP_ROOT" ] && [ ! -L "$BACKUP_ROOT" ] || die "fixed backup root is not a real directory"
+        [ "$(stat -c '%U:%G' "$BACKUP_ROOT")" = "root:root" ] || die "fixed backup root owner must be root:root"
+        [ "$(stat -c '%a' "$BACKUP_ROOT")" = "700" ] || die "fixed backup root mode must be 0700"
+    else
+        install -d -m 0700 -o root -g root "$BACKUP_ROOT"
+    fi
+}
+validate_backup_root
 BACKUP_DIR="$(mktemp -d "${BACKUP_ROOT}/${TIMESTAMP}.XXXXXX")"
 chown root:root "$BACKUP_DIR"
 chmod 0700 "$BACKUP_DIR"
+
+INSTALL_SUCCEEDED=false
+report_install_result() {
+    local status=$?
+    trap - EXIT
+    if [ "$INSTALL_SUCCEEDED" != true ]; then
+        cat >&2 <<EOF
+Installation did not complete. Backup: ${BACKUP_DIR}
+Rollback (run as root): restore only the named targets listed in ${BACKUP_DIR}, validate Nginx, then restart ${SERVICE_NAME}.
+EOF
+    fi
+    exit "$status"
+}
+trap report_install_result EXIT
 
 backup_target() {
     local target="$1"
@@ -171,7 +192,7 @@ fi
 
 install -d -m 0755 -o root -g root /opt/superpan-ota-admin
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
-install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_ROOT"
+install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_ROOT"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STAGING_ROOT"
 [ -d "$RELEASE_ROOT" ] || die "existing OTA release root is missing: $RELEASE_ROOT"
 install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "${RELEASE_ROOT}/generations"
@@ -196,14 +217,22 @@ install -m 0640 -o root -g "$SERVICE_GROUP" "$SCRIPT_DIR/config.example.json" "$
 chown root:superpan-ota-admin "$CONFIG_TARGET"
 chmod 0640 "$CONFIG_TARGET"
 
-# Initialize directly under the service identity exactly once. Standard output
-# contains the generated password and is captured in a root-only file, never by
-# systemd or journald.
-if [ ! -e "$DATABASE_PATH" ]; then
-    PASSWORD_TEMP="${INITIAL_PASSWORD_FILE}.new"
-    runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" init-admin --config "$CONFIG_TARGET" >"$PASSWORD_TEMP"
+# Initialize according to the administrator row, not the database file. If an
+# earlier run committed the row but stopped before installing the password file,
+# recover the root-only temporary output before invoking the idempotent command.
+PASSWORD_TEMP="${INITIAL_PASSWORD_FILE}.new"
+if [ -e "$PASSWORD_TEMP" ] || [ -L "$PASSWORD_TEMP" ]; then
+    [ -s "$PASSWORD_TEMP" ] && [ -f "$PASSWORD_TEMP" ] && [ ! -L "$PASSWORD_TEMP" ] &&
+       [ "$(stat -c '%U:%G' "$PASSWORD_TEMP")" = "root:root" ] && [ "$(stat -c '%a' "$PASSWORD_TEMP")" = "600" ] ||
+        die "unsafe interrupted initial-password file: ${PASSWORD_TEMP}"
+    mv -f -- "$PASSWORD_TEMP" "$INITIAL_PASSWORD_FILE"
+fi
+runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" init-admin --if-missing --config "$CONFIG_TARGET" >"$PASSWORD_TEMP"
+if [ -s "$PASSWORD_TEMP" ]; then
     chmod 0600 "$PASSWORD_TEMP"
     mv -f -- "$PASSWORD_TEMP" "$INITIAL_PASSWORD_FILE"
+else
+    unlink "$PASSWORD_TEMP"
 fi
 
 # Safety gate: nginx -t must succeed before any reload.
@@ -214,6 +243,19 @@ fi
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null
 systemctl restart "$SERVICE_NAME"
+
+SERVICE_READY=false
+READINESS_ATTEMPT=0
+while [ "$READINESS_ATTEMPT" -lt 30 ]; do
+    READINESS_ATTEMPT=$((READINESS_ATTEMPT + 1))
+    if systemctl is-active --quiet "$SERVICE_NAME" &&
+       curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18091/admin/ >/dev/null; then
+        SERVICE_READY=true
+        break
+    fi
+    sleep 1
+done
+[ "$SERVICE_READY" = true ] || die "OTA admin service did not become ready; Nginx was not reloaded"
 systemctl reload nginx
 
 cat <<EOF
@@ -230,3 +272,4 @@ Rollback (run as root):
   systemctl daemon-reload && systemctl start ${SERVICE_NAME}
 Do not roll back or delete the published release tree.
 EOF
+INSTALL_SUCCEEDED=true

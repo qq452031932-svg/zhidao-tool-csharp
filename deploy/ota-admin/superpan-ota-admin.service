@@ -20,6 +20,9 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=full
 ProtectHome=true
+# Hide every existing web root from the service, then expose only the OTA
+# release directory it is allowed to publish. Both directives exist in v219.
+InaccessibleDirectories=/www/wwwroot
 ReadWriteDirectories=/var/lib/superpan-ota-admin
 ReadWriteDirectories=/www/wwwroot/ota.fanfh.cn/releases/win-x64
 CapabilityBoundingSet=

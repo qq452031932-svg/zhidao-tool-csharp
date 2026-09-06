@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -104,11 +105,12 @@ func runInitAdmin(arguments []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("init-admin", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "root-owned service configuration file")
+	ifMissing := flags.Bool("if-missing", false, "succeed without output when an administrator already exists")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
 	if *configPath == "" || flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: ota-admin init-admin --config PATH")
+		fmt.Fprintln(stderr, "usage: ota-admin init-admin [--if-missing] --config PATH")
 		return 2
 	}
 	cfg, err := config.Load(*configPath)
@@ -122,11 +124,19 @@ func runInitAdmin(arguments []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer database.Close()
-	if err := database.InitializeAdminWithGeneratedPassword(context.Background(), stdout, rand.Reader); err != nil {
+	if err := initializeAdmin(database, stdout, rand.Reader, *ifMissing); err != nil {
 		fmt.Fprintf(stderr, "init-admin: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func initializeAdmin(database *store.Store, output io.Writer, random io.Reader, ifMissing bool) error {
+	err := database.InitializeAdminWithGeneratedPassword(context.Background(), output, random)
+	if ifMissing && errors.Is(err, store.ErrAdminAlreadyInitialized) {
+		return nil
+	}
+	return err
 }
 
 func writeUsage(writer io.Writer) {

@@ -43,14 +43,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 body_sha256() {
-    curl --noproxy '*' --fail --silent --show-error --location --max-time 120 "$1" | sha256sum | awk '{print $1}'
+    curl --resolve 'ota.fanfh.cn:443:127.0.0.1' --noproxy '*' --fail --silent --show-error --location --max-time 120 "$1" | sha256sum | awk '{print $1}'
 }
 
 header_value() {
     local url="$1"
     local name="$2"
     : >"$HEADERS_FILE"
-    curl --noproxy '*' --fail --silent --show-error --location --max-time 120 --output /dev/null --dump-header "$HEADERS_FILE" "$url"
+    curl --resolve 'ota.fanfh.cn:443:127.0.0.1' --noproxy '*' --fail --silent --show-error --location --max-time 120 --output /dev/null --dump-header "$HEADERS_FILE" "$url"
     awk -v wanted="$name" 'BEGIN { IGNORECASE=1 } $0 ~ "^" wanted ":" { sub(/^[^:]+:[[:space:]]*/, ""); sub(/\r$/, ""); value=$0 } END { print value }' "$HEADERS_FILE"
 }
 
@@ -75,7 +75,7 @@ if curl --noproxy '*' --silent --show-error --connect-timeout 3 --max-time 5 --o
 fi
 
 : >"$HEADERS_FILE"
-HTTP_ADMIN_STATUS="$(curl --noproxy '*' --silent --show-error --max-time 15 --output /dev/null --dump-header "$HEADERS_FILE" --write-out '%{http_code}' "$HTTP_ADMIN_URL")"
+HTTP_ADMIN_STATUS="$(curl --resolve 'ota.fanfh.cn:80:127.0.0.1' --noproxy '*' --silent --show-error --max-time 15 --output /dev/null --dump-header "$HEADERS_FILE" --write-out '%{http_code}' "$HTTP_ADMIN_URL")"
 case "$HTTP_ADMIN_STATUS" in
     301|302|307|308) ;;
     *) die "HTTP /admin did not redirect to HTTPS (status ${HTTP_ADMIN_STATUS})" ;;

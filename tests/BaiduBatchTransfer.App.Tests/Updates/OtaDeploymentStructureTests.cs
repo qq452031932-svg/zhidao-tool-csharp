@@ -38,6 +38,7 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("PrivateDevices=true", unit, StringComparison.Ordinal);
         Assert.Contains("ProtectSystem=full", unit, StringComparison.Ordinal);
         Assert.Contains("ProtectHome=true", unit, StringComparison.Ordinal);
+        Assert.Contains("InaccessibleDirectories=/www/wwwroot", unit, StringComparison.Ordinal);
         Assert.Contains("ReadWriteDirectories=/var/lib/superpan-ota-admin", unit, StringComparison.Ordinal);
         Assert.Contains("ReadWriteDirectories=/www/wwwroot/ota.fanfh.cn/releases/win-x64", unit, StringComparison.Ordinal);
         foreach (var unsupported in new[] { "ReadWritePaths=", "StateDirectory=", "ProtectKernelTunables=", "ProtectControlGroups=", "RestrictNamespaces=", "LockPersonality=", "MemoryDenyWriteExecute=" })
@@ -79,13 +80,21 @@ public sealed class OtaDeploymentStructureTests
         var nginxGate = install.IndexOf("if ! \"$NGINX_BIN\" -t; then", StringComparison.Ordinal);
         var nginxReload = install.IndexOf("\nsystemctl reload nginx\n", StringComparison.Ordinal);
         Assert.True(nginxGate >= 0 && nginxReload > nginxGate, "The executable nginx test must gate the executable reload.");
-        Assert.Contains("init-admin --config", install, StringComparison.Ordinal);
+        Assert.Contains("init-admin --if-missing --config", install, StringComparison.Ordinal);
+        Assert.DoesNotContain("if [ ! -e \"$DATABASE_PATH\" ]", install, StringComparison.Ordinal);
+        Assert.Contains("install -d -m 0700 -o \"$SERVICE_USER\" -g \"$SERVICE_GROUP\" \"$DATA_ROOT\"", install, StringComparison.Ordinal);
         Assert.Contains("INITIAL_PASSWORD_FILE", install, StringComparison.Ordinal);
         Assert.Contains(">\"$PASSWORD_TEMP\"", install, StringComparison.Ordinal);
+        Assert.Contains("unsafe interrupted initial-password file", install, StringComparison.Ordinal);
         Assert.Contains("Rollback", install, StringComparison.Ordinal);
         Assert.Contains("require_value \"$1\" \"${2:-}\"", install, StringComparison.Ordinal);
         Assert.Contains("COMPILED_PUBLISHER_SPKI_SHA256=\"f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff\"", install, StringComparison.Ordinal);
         Assert.Contains("EXPECTED_SPKI_SHA256\" = \"$COMPILED_PUBLISHER_SPKI_SHA256", install, StringComparison.Ordinal);
+        var readiness = install.IndexOf("curl --noproxy '*' --fail --silent --show-error --max-time 2 http://127.0.0.1:18091/admin/", StringComparison.Ordinal);
+        Assert.True(readiness >= 0 && readiness < nginxReload, "Local readiness must gate Nginx reload.");
+        Assert.Contains("systemctl is-active --quiet \"$SERVICE_NAME\"", install, StringComparison.Ordinal);
+        Assert.Contains("INSTALL_SUCCEEDED=false", install, StringComparison.Ordinal);
+        Assert.Contains("trap report_install_result EXIT", install, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -103,7 +112,8 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("release-directory-metadata.txt", install, StringComparison.Ordinal);
         Assert.Contains("Unexpected release root", install, StringComparison.Ordinal);
         Assert.Contains("if [ ! -s \"$HMAC_TARGET\" ]", install, StringComparison.Ordinal);
-        Assert.Contains("if [ ! -e \"$DATABASE_PATH\" ]", install, StringComparison.Ordinal);
+        Assert.DoesNotContain("--backup-root", install, StringComparison.Ordinal);
+        Assert.Contains("validate_backup_root", install, StringComparison.Ordinal);
         Assert.Contains("chown \"$SERVICE_USER\":\"$SERVICE_GROUP\" \"$RELEASE_ROOT\" \"${RELEASE_ROOT}/generations\"", install, StringComparison.Ordinal);
         Assert.Contains("chmod 0755 \"$RELEASE_ROOT\" \"${RELEASE_ROOT}/generations\"", install, StringComparison.Ordinal);
         Assert.DoesNotContain("chmod 2775", install, StringComparison.Ordinal);
@@ -133,6 +143,8 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("EXPECTED_HEALTH_SHA256", verify, StringComparison.Ordinal);
         Assert.Contains("EXPECTED_STABLE_SHA256", verify, StringComparison.Ordinal);
         Assert.Contains("-verify_hostname ota.fanfh.cn", verify, StringComparison.Ordinal);
+        Assert.Contains("--resolve 'ota.fanfh.cn:443:127.0.0.1'", verify, StringComparison.Ordinal);
+        Assert.Contains("--resolve 'ota.fanfh.cn:80:127.0.0.1'", verify, StringComparison.Ordinal);
         Assert.Contains("--max-time", verify, StringComparison.Ordinal);
         Assert.DoesNotMatch(@"(?m)^\s*rm\s", verify);
         Assert.DoesNotMatch(@"(?m)^\s*mv\s", verify);

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -9,9 +10,12 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"math/big"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
 func TestDecodeSourceHMACKeyRequiresOneLowercaseHexKey(t *testing.T) {
@@ -30,6 +34,23 @@ func TestDecodeSourceHMACKeyRequiresOneLowercaseHexKey(t *testing.T) {
 		if _, err := decodeSourceHMACKey(invalid); err == nil {
 			t.Fatalf("decodeSourceHMACKey accepted %q", invalid)
 		}
+	}
+}
+
+func TestInitializeAdminIfMissingIsIdempotentAgainstActualAdministratorRow(t *testing.T) {
+	t.Parallel()
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var first, replay bytes.Buffer
+	random := bytes.NewReader(bytes.Repeat([]byte{0x42}, 128))
+	if err := initializeAdmin(database, &first, random, true); err != nil || strings.TrimSpace(first.String()) == "" {
+		t.Fatalf("first initialize = %q, %v", first.String(), err)
+	}
+	if err := initializeAdmin(database, &replay, random, true); err != nil || replay.Len() != 0 {
+		t.Fatalf("idempotent initialize = %q, %v", replay.String(), err)
 	}
 }
 
