@@ -71,6 +71,41 @@ func TestBoundGenerationDescriptorFailsClosedWhenNamedDirectoryIsReplaced(t *tes
 	}
 }
 
+func TestStableTempBoundaryGenerationSwapDoesNotReplaceStable(t *testing.T) {
+	root := publicationRoot(t)
+	generations := filepath.Join(root, "generations")
+	moved := generations + ".moved"
+	attacker := filepath.Join(t.TempDir(), "attacker")
+	if err := os.Mkdir(attacker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var swapped bool
+	disk, err := NewDisk(root, func(boundary Boundary) error {
+		if boundary != BoundaryStableTemp || swapped {
+			return nil
+		}
+		swapped = true
+		if err := os.Rename(generations, moved); err != nil {
+			return err
+		}
+		return os.Symlink(attacker, generations)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := linuxTestReport()
+	_, switched, err := disk.PublishGeneration(context.Background(), sourceEnvelope(t), testReleaseID, report, fixedValidator{report: report})
+	if err == nil || switched || !errors.Is(err, ErrCleanupIncomplete) {
+		t.Fatalf("publish switched=%v err=%v", switched, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "stable")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stable was replaced after generations swap: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".stable-"+testReleaseID+".tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary stable link remains after refused switch: %v", err)
+	}
+}
+
 func linuxTestReport() release.Report {
 	return release.Report{SchemaVersion: 1, Verified: true, PackageID: "SuperPan.BaiduBatchTransfer", Channel: "win-x64-stable", Version: "1.2.3", FileCount: 2, Files: []release.ReportFile{{Name: "asset.nupkg", Size: 12, SHA256: strings.Repeat("a", 64)}, {Name: "releases.win-x64-stable.json", Size: 31, SHA256: strings.Repeat("b", 64)}}}
 }

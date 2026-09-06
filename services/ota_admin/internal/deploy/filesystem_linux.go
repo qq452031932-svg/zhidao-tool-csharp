@@ -246,17 +246,17 @@ func (bound *boundRoots) removeGeneration(name string) error {
 	return unix.Fsync(bound.generationsFD)
 }
 
-func (disk *Disk) openGenerationEnvelope(name string) (*upload.Envelope, func() error, error) {
+func (disk *Disk) openGenerationEnvelope(name string) (*upload.Envelope, *os.File, func() error, error) {
 	if err := disk.bound.verify(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	fd, err := unix.Openat(disk.bound.generationsFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	directory := os.NewFile(uintptr(fd), name)
-	fail := func(cause error) (*upload.Envelope, func() error, error) {
-		return nil, nil, errors.Join(cause, directory.Close())
+	fail := func(cause error) (*upload.Envelope, *os.File, func() error, error) {
+		return nil, nil, nil, errors.Join(cause, directory.Close())
 	}
 	info, err := directory.Stat()
 	if err != nil || validateImmutableGeneration(info, true) != nil {
@@ -284,7 +284,30 @@ func (disk *Disk) openGenerationEnvelope(name string) (*upload.Envelope, func() 
 	closeEnvelope := func() error {
 		return errors.Join(directory.Close(), disk.bound.verify())
 	}
-	return envelope, closeEnvelope, nil
+	return envelope, directory, closeEnvelope, nil
+}
+
+func (disk *Disk) verifyOpenedGeneration(name string, descriptor *os.File) error {
+	if descriptor == nil {
+		return errors.New("opened generation descriptor is missing")
+	}
+	opened, err := descriptor.Stat()
+	if err != nil {
+		return err
+	}
+	return errors.Join(disk.bound.verify(), disk.bound.verifyGenerationIdentity(name, opened))
+}
+
+func (bound *boundRoots) verifyGenerationIdentity(name string, opened os.FileInfo) error {
+	openedStat, ok := opened.Sys().(*unix.Stat_t)
+	if !ok {
+		return errors.New("opened generation identity unavailable")
+	}
+	var named unix.Stat_t
+	if err := unix.Fstatat(bound.generationsFD, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil || named.Mode&unix.S_IFMT != unix.S_IFDIR || named.Dev != openedStat.Dev || named.Ino != openedStat.Ino {
+		return errors.New("generation identity changed during validation")
+	}
+	return nil
 }
 
 func sameFilesystem(left, right os.FileInfo) bool {

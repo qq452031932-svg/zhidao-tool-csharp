@@ -97,13 +97,15 @@ func (bound *boundRoots) removeGeneration(name string) error {
 	return removeGeneration(bound.generations, name)
 }
 
-func (disk *Disk) openGenerationEnvelope(name string) (*upload.Envelope, func() error, error) {
+func (disk *Disk) openGenerationEnvelope(name string) (*upload.Envelope, *os.File, func() error, error) {
 	envelope, err := generationEnvelope(filepath.Join(disk.generations, name))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return envelope, func() error { return disk.bound.verify() }, nil
+	return envelope, nil, func() error { return disk.bound.verify() }, nil
 }
+
+func (disk *Disk) verifyOpenedGeneration(string, *os.File) error { return disk.bound.verify() }
 
 func sameFilesystem(os.FileInfo, os.FileInfo) bool { return true }
 

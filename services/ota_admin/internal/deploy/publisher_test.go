@@ -37,6 +37,10 @@ func (validator fixedValidator) Validate(context.Context, *upload.Envelope, stri
 	return validator.report, nil
 }
 
+func (validator fixedValidator) ValidateOpenedDirectory(ctx context.Context, envelope *upload.Envelope, _ *os.File, floor string) (release.Report, error) {
+	return validator.Validate(ctx, envelope, floor)
+}
+
 type fixedPreparer struct {
 	mu       sync.Mutex
 	calls    int

@@ -18,12 +18,38 @@ Assert-SafeArtifactDirectory -Path $AcceptanceOutputDirectory
 Assert-SafeArtifactDirectory -Path $AcceptanceStagingDirectory
 Assert-SafeArtifactDirectory -Path $AcceptanceBackupDirectory
 Assert-NoUntrackedModuleFiles
-$acceptanceSourcePaths = @(Get-TrackedSourcePaths)
+
+function Get-AcceptanceSourcePaths {
+    [string[]] $paths = @(Get-TrackedSourcePaths)
+    $fixtures = [ordered]@{
+        'services/ota_admin/cmd/ota-admin-acceptance/testdata/valid-upload.zip' = @('37ecc3c225d343f15e3e2b6eb1d8aa17d0635afe', 'b01dd17f87ade73bcefacedf55fe688fc8dd7bc222bb4bb7c264790633afff95')
+        'services/ota_admin/cmd/ota-admin-acceptance/testdata/publisher.cer' = @('8deb84e5c9dc71d5bd1f8fe1bf3eb72636430923', '54250feb9125e34f5f48ffaa2210f7c6d251a6475bf09cef34b0aee9e57f3d53')
+    }
+    foreach ($path in $fixtures.Keys) {
+        $blob = (& git -C $RepositoryRoot rev-parse "HEAD:$path") -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $blob -cne $fixtures[$path][0]) { throw "Acceptance fixture Git blob mismatch: $path" }
+        $paths += $path
+    }
+    [System.Array]::Sort($paths, [System.StringComparer]::Ordinal)
+    return $paths
+}
+
+$acceptanceSourcePaths = @(Get-AcceptanceSourcePaths)
 Assert-SourcePathsClean -SourcePaths $acceptanceSourcePaths
 
 New-Item -ItemType Directory -Path $AcceptanceStagingDirectory | Out-Null
 try {
     New-GitObjectSourceSnapshot -SourcePaths $acceptanceSourcePaths -DestinationRoot $AcceptanceSnapshotDirectory
+    $snapshotFixtures = [ordered]@{
+        'cmd/ota-admin-acceptance/testdata/valid-upload.zip' = 'b01dd17f87ade73bcefacedf55fe688fc8dd7bc222bb4bb7c264790633afff95'
+        'cmd/ota-admin-acceptance/testdata/publisher.cer' = '54250feb9125e34f5f48ffaa2210f7c6d251a6475bf09cef34b0aee9e57f3d53'
+    }
+    foreach ($relativePath in $snapshotFixtures.Keys) {
+        $fixturePath = Join-Path $AcceptanceSnapshotDirectory $relativePath
+        if (-not (Test-Path -LiteralPath $fixturePath -PathType Leaf)) { throw "Acceptance fixture missing from snapshot: $relativePath" }
+        $fixtureHash = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($fixtureHash -cne $snapshotFixtures[$relativePath]) { throw "Acceptance fixture SHA-256 mismatch: $relativePath" }
+    }
     $acceptanceSnapshotFingerprint = Get-SnapshotFingerprint -SnapshotRoot $AcceptanceSnapshotDirectory
     New-Item -ItemType Directory -Path $AcceptancePublishDirectory | Out-Null
     $stagedAcceptancePath = Join-Path $AcceptancePublishDirectory 'superpan-ota-admin-acceptance-linux-amd64'

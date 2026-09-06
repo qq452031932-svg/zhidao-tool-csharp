@@ -19,6 +19,10 @@ type Validator interface {
 	Validate(context.Context, *upload.Envelope, string) (release.Report, error)
 }
 
+type openedDirectoryValidator interface {
+	ValidateOpenedDirectory(context.Context, *upload.Envelope, *os.File, string) (release.Report, error)
+}
+
 type Generation struct {
 	Name, Path string
 	Report     release.Report
@@ -46,19 +50,22 @@ func (disk *Disk) publishGeneration(ctx context.Context, source *upload.Envelope
 	}
 	path, _ := disk.GenerationPath(name)
 	stagedName := "." + name + ".tmp"
-	envelope, closeEnvelope, err := disk.openGenerationEnvelope(stagedName)
+	envelope, rootDescriptor, closeEnvelope, err := disk.openGenerationEnvelope(stagedName)
 	if err != nil {
 		if cleanupErr := cleanup(); cleanupErr != nil {
 			return Generation{}, false, errors.Join(err, ErrCleanupIncomplete, cleanupErr)
 		}
 		return Generation{}, false, err
 	}
-	report, err := validator.Validate(ctx, envelope, "")
-	closeErr := closeEnvelope()
-	if closeErr != nil {
-		err = errors.Join(err, closeErr)
+	report, err := validateOpenedGeneration(ctx, validator, envelope, rootDescriptor)
+	if identityErr := disk.verifyOpenedGeneration(stagedName, rootDescriptor); identityErr != nil {
+		err = errors.Join(err, identityErr)
 	}
 	if err != nil || !reflect.DeepEqual(report, expected) {
+		closeErr := closeEnvelope()
+		if closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		cleanupErr := cleanup()
 		if err != nil {
 			if cleanupErr != nil {
@@ -76,12 +83,15 @@ func (disk *Disk) publishGeneration(ctx context.Context, source *upload.Envelope
 	for _, file := range report.Files {
 		assets = append(assets, store.ReleaseAsset{FileName: file.Name, SizeBytes: file.Size, SHA256: file.SHA256})
 	}
-	switched, err := disk.commitAuthorized(name, cleanup, func() error {
+	switched, err := disk.commitOpenedAuthorized(name, cleanup, func() error {
 		if authorize == nil {
 			return nil
 		}
 		return authorize(ctx)
-	})
+	}, rootDescriptor)
+	if closeErr := closeEnvelope(); closeErr != nil {
+		err = errors.Join(err, closeErr)
+	}
 	return Generation{Name: name, Path: path, Report: report, Assets: assets}, switched, err
 }
 
@@ -91,11 +101,14 @@ func (disk *Disk) RecoverGeneration(ctx context.Context, validator Validator) (G
 		return Generation{}, err
 	}
 	path, _ := disk.GenerationPath(name)
-	envelope, closeEnvelope, err := disk.openGenerationEnvelope(name)
+	envelope, rootDescriptor, closeEnvelope, err := disk.openGenerationEnvelope(name)
 	if err != nil {
 		return Generation{}, err
 	}
-	report, err := validator.Validate(ctx, envelope, "")
+	report, err := validateOpenedGeneration(ctx, validator, envelope, rootDescriptor)
+	if identityErr := disk.verifyOpenedGeneration(name, rootDescriptor); identityErr != nil {
+		err = errors.Join(err, identityErr)
+	}
 	closeErr := closeEnvelope()
 	if closeErr != nil {
 		err = errors.Join(err, closeErr)
@@ -108,6 +121,17 @@ func (disk *Disk) RecoverGeneration(ctx context.Context, validator Validator) (G
 		assets = append(assets, store.ReleaseAsset{FileName: file.Name, SizeBytes: file.Size, SHA256: file.SHA256})
 	}
 	return Generation{Name: name, Path: path, Report: report, Assets: assets}, nil
+}
+
+func validateOpenedGeneration(ctx context.Context, validator Validator, envelope *upload.Envelope, rootDescriptor *os.File) (release.Report, error) {
+	if rootDescriptor == nil {
+		return validator.Validate(ctx, envelope, "")
+	}
+	descriptorValidator, ok := validator.(openedDirectoryValidator)
+	if !ok {
+		return release.Report{}, errors.New("Linux generation validator must accept an opened directory")
+	}
+	return descriptorValidator.ValidateOpenedDirectory(ctx, envelope, rootDescriptor, "")
 }
 
 func generationEnvelope(root string) (*upload.Envelope, error) {

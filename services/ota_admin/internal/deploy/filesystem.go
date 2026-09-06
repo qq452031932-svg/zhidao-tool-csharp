@@ -172,10 +172,14 @@ func (disk *Disk) stage(ctx context.Context, source *upload.Envelope, releaseID 
 }
 
 func (disk *Disk) commit(name string, cleanup func() error) (bool, error) {
-	return disk.commitAuthorized(name, cleanup, nil)
+	return disk.commitOpenedAuthorized(name, cleanup, nil, nil)
 }
 
 func (disk *Disk) commitAuthorized(name string, cleanup func() error, authorize func() error) (bool, error) {
+	return disk.commitOpenedAuthorized(name, cleanup, authorize, nil)
+}
+
+func (disk *Disk) commitOpenedAuthorized(name string, cleanup func() error, authorize func() error, validatedRoot *os.File) (bool, error) {
 	fail := func(cause error) (bool, error) {
 		if cleanupErr := cleanup(); cleanupErr != nil {
 			return false, errors.Join(cause, ErrCleanupIncomplete, cleanupErr)
@@ -186,6 +190,11 @@ func (disk *Disk) commitAuthorized(name string, cleanup func() error, authorize 
 		return fail(err)
 	}
 	temporaryName := "." + name + ".tmp"
+	if validatedRoot != nil {
+		if err := disk.verifyOpenedGeneration(temporaryName, validatedRoot); err != nil {
+			return fail(err)
+		}
+	}
 	if err := disk.bound.renameGeneration(temporaryName, name); err != nil {
 		return fail(err)
 	}
@@ -203,6 +212,11 @@ func (disk *Disk) commitAuthorized(name string, cleanup func() error, authorize 
 			return fail(err)
 		}
 		return false, err
+	}
+	if validatedRoot != nil {
+		if err := disk.verifyOpenedGeneration(name, validatedRoot); err != nil {
+			return fail(err)
+		}
 	}
 	if authorize != nil {
 		if err := authorize(); err != nil {
@@ -228,6 +242,24 @@ func (disk *Disk) commitAuthorized(name string, cleanup func() error, authorize 
 			return fail(err)
 		}
 		return false, err
+	}
+	if err := disk.bound.verify(); err != nil {
+		removeErr := disk.bound.unlinkRoot(tempLinkName)
+		syncErr := disk.bound.syncRoot()
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) || syncErr != nil {
+			return false, errors.Join(err, ErrCleanupIncomplete, removeErr, syncErr)
+		}
+		return fail(err)
+	}
+	if validatedRoot != nil {
+		if err := disk.verifyOpenedGeneration(name, validatedRoot); err != nil {
+			removeErr := disk.bound.unlinkRoot(tempLinkName)
+			syncErr := disk.bound.syncRoot()
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) || syncErr != nil {
+				return false, errors.Join(err, ErrCleanupIncomplete, removeErr, syncErr)
+			}
+			return fail(err)
+		}
 	}
 	if err := disk.bound.renameRoot(tempLinkName, "stable"); err != nil {
 		removeErr := disk.bound.unlinkRoot(tempLinkName)

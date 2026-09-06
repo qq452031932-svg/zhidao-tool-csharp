@@ -57,19 +57,35 @@ type verifiedFile struct {
 }
 
 type loadedEnvelope struct {
-	rootPath string
-	root     *os.File
-	rootInfo os.FileInfo
-	files    map[string]*verifiedFile
+	rootPath       string
+	root           *os.File
+	rootInfo       os.FileInfo
+	descriptorRoot bool
+	files          map[string]*verifiedFile
 }
 
 func NewValidator(trust *publisher.Trust) *Validator { return &Validator{trust: trust} }
 
 func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envelope, highestCommittedVersion string) (Report, error) {
+	return validator.validate(ctx, envelope, nil, highestCommittedVersion)
+}
+
+// ValidateOpenedDirectory validates an envelope against a caller-owned,
+// already opened directory descriptor. It is used by the Linux publisher so
+// validation never has to reopen a generation through /proc or a mutable path.
+// The caller retains ownership of directory.
+func (validator *Validator) ValidateOpenedDirectory(ctx context.Context, envelope *upload.Envelope, directory *os.File, highestCommittedVersion string) (Report, error) {
+	if directory == nil {
+		return Report{}, fmt.Errorf("%w: opened directory is required", ErrManifest)
+	}
+	return validator.validate(ctx, envelope, directory, highestCommittedVersion)
+}
+
+func (validator *Validator) validate(ctx context.Context, envelope *upload.Envelope, directory *os.File, highestCommittedVersion string) (Report, error) {
 	if validator == nil || validator.trust == nil || envelope == nil || envelope.Verified {
 		return Report{}, fmt.Errorf("%w: validator input", ErrManifest)
 	}
-	loaded, err := loadEnvelope(ctx, envelope)
+	loaded, err := loadEnvelope(ctx, envelope, directory)
 	if err != nil {
 		return Report{}, fmt.Errorf("%w: %v", ErrManifest, err)
 	}
@@ -191,26 +207,36 @@ func (validator *Validator) Validate(ctx context.Context, envelope *upload.Envel
 	}, nil
 }
 
-func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (*loadedEnvelope, error) {
+func loadEnvelope(ctx context.Context, envelope *upload.Envelope, openedRoot *os.File) (*loadedEnvelope, error) {
 	root, err := filepath.Abs(envelope.ExtractionRoot)
 	if err != nil || !filepath.IsAbs(root) {
 		return nil, errors.New("extraction root is invalid")
 	}
 	root = filepath.Clean(root)
-	rootInfo, err := os.Lstat(root)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("extraction root changed")
+	rootFile := openedRoot
+	descriptorRoot := rootFile != nil
+	var rootInfo os.FileInfo
+	if descriptorRoot {
+		rootInfo, err = rootFile.Stat()
+		if err != nil || !rootInfo.IsDir() {
+			return nil, errors.New("opened extraction root is invalid")
+		}
+	} else {
+		pathInfo, pathErr := os.Lstat(root)
+		if pathErr != nil || !pathInfo.IsDir() || pathInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("extraction root changed")
+		}
+		rootFile, err = openDirectoryNoFollow(root)
+		if err != nil {
+			return nil, errors.New("extraction root cannot be securely opened")
+		}
+		rootInfo, err = rootFile.Stat()
+		if err != nil || !rootInfo.IsDir() || !os.SameFile(pathInfo, rootInfo) {
+			rootFile.Close()
+			return nil, errors.New("extraction root identity changed")
+		}
 	}
-	rootFile, err := openDirectoryNoFollow(root)
-	if err != nil {
-		return nil, errors.New("extraction root cannot be securely opened")
-	}
-	openedRootInfo, err := rootFile.Stat()
-	if err != nil || !openedRootInfo.IsDir() || !os.SameFile(rootInfo, openedRootInfo) {
-		rootFile.Close()
-		return nil, errors.New("extraction root identity changed")
-	}
-	loaded := &loadedEnvelope{rootPath: root, root: rootFile, rootInfo: openedRootInfo, files: make(map[string]*verifiedFile, len(envelope.Entries))}
+	loaded := &loadedEnvelope{rootPath: root, root: rootFile, rootInfo: rootInfo, descriptorRoot: descriptorRoot, files: make(map[string]*verifiedFile, len(envelope.Entries))}
 	failed := true
 	defer func() {
 		if failed {
@@ -229,16 +255,19 @@ func loadEnvelope(ctx context.Context, envelope *upload.Envelope) (*loadedEnvelo
 		if _, duplicate := folded[key]; duplicate {
 			return nil, errors.New("duplicate entry")
 		}
-		pathInfo, err := os.Lstat(entry.Path)
-		if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() != entry.Size {
-			return nil, errors.New("entry metadata changed")
+		var pathInfo os.FileInfo
+		if !descriptorRoot {
+			pathInfo, err = os.Lstat(entry.Path)
+			if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() != entry.Size {
+				return nil, errors.New("entry metadata changed")
+			}
 		}
 		file, err := openChildNoFollow(rootFile, entry.Path, entry.Name)
 		if err != nil {
 			return nil, errors.New("entry cannot be securely opened")
 		}
 		info, err := file.Stat()
-		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size || !os.SameFile(pathInfo, info) {
+		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size || !descriptorRoot && !os.SameFile(pathInfo, info) {
 			file.Close()
 			return nil, errors.New("entry descriptor identity changed")
 		}
@@ -256,24 +285,33 @@ func (loaded *loadedEnvelope) close() {
 	for _, file := range loaded.files {
 		_ = file.file.Close()
 	}
-	if loaded.root != nil {
+	if loaded.root != nil && !loaded.descriptorRoot {
 		_ = loaded.root.Close()
 	}
 }
 
 func (loaded *loadedEnvelope) verifyStable() error {
 	rootDescriptor, err := loaded.root.Stat()
-	rootPath, pathErr := os.Lstat(loaded.rootPath)
-	if err != nil || pathErr != nil || !os.SameFile(loaded.rootInfo, rootDescriptor) || !os.SameFile(rootDescriptor, rootPath) || rootPath.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !os.SameFile(loaded.rootInfo, rootDescriptor) {
 		return errors.New("extraction root identity changed")
+	}
+	if !loaded.descriptorRoot {
+		rootPath, pathErr := os.Lstat(loaded.rootPath)
+		if pathErr != nil || !os.SameFile(rootDescriptor, rootPath) || rootPath.Mode()&os.ModeSymlink != 0 {
+			return errors.New("extraction root identity changed")
+		}
 	}
 	for _, file := range loaded.files {
 		descriptor, descriptorErr := file.file.Stat()
-		pathInfo, pathErr := os.Lstat(file.path)
-		if descriptorErr != nil || pathErr != nil || !descriptor.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 ||
-			!os.SameFile(file.info, descriptor) || !os.SameFile(descriptor, pathInfo) || descriptor.Size() != file.size ||
+		if descriptorErr != nil || !descriptor.Mode().IsRegular() || !os.SameFile(file.info, descriptor) || descriptor.Size() != file.size ||
 			descriptor.ModTime() != file.info.ModTime() {
 			return fmt.Errorf("entry identity changed: %s", file.name)
+		}
+		if !loaded.descriptorRoot {
+			pathInfo, pathErr := os.Lstat(file.path)
+			if pathErr != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(descriptor, pathInfo) {
+				return fmt.Errorf("entry identity changed: %s", file.name)
+			}
 		}
 	}
 	return nil

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"testing"
 
@@ -86,6 +87,18 @@ func validatePowerShellGolden(t *testing.T, bundlePath string, trust *publisher.
 	report, err := NewValidator(trust).Validate(context.Background(), envelope, "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	rootDescriptor, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptorReport, descriptorErr := NewValidator(trust).ValidateOpenedDirectory(context.Background(), envelope, rootDescriptor, "")
+	closeErr := rootDescriptor.Close()
+	if descriptorErr != nil || closeErr != nil {
+		t.Fatalf("descriptor validation=%v close=%v", descriptorErr, closeErr)
+	}
+	if !reflect.DeepEqual(descriptorReport, report) {
+		t.Fatalf("descriptor report differs from path report")
 	}
 	if !report.Verified || report.PackageID != packageID || report.Channel != channel {
 		t.Fatalf("report = %#v", report)
