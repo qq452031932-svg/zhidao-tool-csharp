@@ -10,8 +10,11 @@ const state = {
   rollbackOperations: new Map(),
   readOnly: false,
   busy: false,
-  candidatePublishBlocked: false
+  candidatePublishBlocked: false,
+  dashboardEpoch: 0
 };
+
+const gateNames = ["package", "channel", "version", "signature", "files", "references", "storage"];
 
 const byId = (id) => document.getElementById(id);
 const views = ["login-view", "password-view", "console-view"];
@@ -130,7 +133,7 @@ async function initialize() {
       showView("login-view");
     }
   } finally {
-    setLoading(false);
+    if (epoch === state.dashboardEpoch) setLoading(false);
   }
 }
 
@@ -244,7 +247,7 @@ function renderHistory() {
   if (!state.releases.length) {
     const row = document.createElement("tr");
     const value = cell("暂无版本记录");
-    value.colSpan = 6;
+    value.colSpan = 7;
     value.className = "table-empty";
     row.append(value);
     body.append(row);
@@ -263,6 +266,7 @@ function renderHistory() {
     assetList.textContent = values.length ? `${values.length} 个文件 · ${formatBytes(values.reduce((sum, asset) => sum + (asset.size_bytes || 0), 0))}` : "无资产摘要";
     assets.append(assetList);
     row.append(assets);
+    row.append(cell(item.actor || "管理员"));
     const action = document.createElement("td");
     if (item.state === "current") {
       action.textContent = "—";
@@ -315,7 +319,13 @@ function renderGateEvidence(candidate) {
   }
 }
 
+function allGatesPassed(candidate) {
+  const gates = candidate && candidate.report && candidate.report.gates;
+  return Boolean(gates && gateNames.every((name) => gates[name] && gates[name].passed === true));
+}
+
 function renderCandidate(candidate) {
+  if (candidate && candidate.state === "published") candidate = null;
   state.candidate = candidate;
   if (!candidate) {
     byId("candidate-state").textContent = "等待上传";
@@ -329,7 +339,7 @@ function renderCandidate(candidate) {
     return;
   }
   const report = candidate.report || {};
-  const passed = candidate.state === "validated" && report.verified === true;
+  const passed = candidate.state === "validated" && report.verified === true && allGatesPassed(candidate);
   byId("candidate-state").textContent = passed ? "全部通过" : candidate.state === "uploading" ? "校验中" : "校验失败";
   byId("candidate-state").className = passed ? "status-pill success" : candidate.state === "failed" ? "status-pill danger" : "status-pill";
   byId("candidate-version").textContent = report.version ? `v${report.version}` : "—";
@@ -344,11 +354,12 @@ function updateActions() {
   const file = byId("release-file").files && byId("release-file").files[0];
   byId("release-file").disabled = state.readOnly || state.busy;
   byId("upload-button").disabled = !file || state.readOnly || state.busy;
-  const canPublish = !state.candidatePublishBlocked && state.candidate && state.candidate.state === "validated" && state.candidate.report && state.candidate.report.verified;
+  const canPublish = !state.candidatePublishBlocked && state.candidate && state.candidate.state === "validated" && state.candidate.report && state.candidate.report.verified && allGatesPassed(state.candidate);
   byId("publish-button").disabled = !canPublish || state.readOnly || state.busy;
 }
 
 async function loadDashboard() {
+  const epoch = ++state.dashboardEpoch;
   clearPageError();
   setLoading(true);
   try {
@@ -356,6 +367,7 @@ async function loadDashboard() {
       api("/admin/api/releases", { method: "GET" }),
       api("/admin/api/candidates/current", { method: "GET" })
     ]);
+    if (epoch !== state.dashboardEpoch) return;
     if (historyResult.status === "rejected") throw historyResult.reason;
     state.releases = Array.isArray(historyResult.value.releases) ? historyResult.value.releases.slice(0, 3) : [];
 	setReadOnly(historyResult.value.read_only === true);
@@ -372,6 +384,7 @@ async function loadDashboard() {
 }
 
 function selectedFileChanged() {
+  state.dashboardEpoch += 1;
   const file = byId("release-file").files[0];
   state.uploadOperation = "";
   state.publishOperation = "";
@@ -383,13 +396,16 @@ function selectedFileChanged() {
 }
 
 async function restoreAuthoritativeCandidate() {
+  const epoch = ++state.dashboardEpoch;
   state.candidatePublishBlocked = true;
   try {
     const authoritative = await api("/admin/api/candidates/current", { method: "GET" });
+    if (epoch !== state.dashboardEpoch) return;
     renderCandidate(authoritative);
     byId("candidate-state").textContent = "旧候选已保留（不可发布）";
     byId("publish-button").disabled = true;
   } catch (error) {
+    if (epoch !== state.dashboardEpoch) return;
     if (error.status === 404) renderCandidate(null);
   }
 }
@@ -397,6 +413,7 @@ async function restoreAuthoritativeCandidate() {
 function uploadSelected() {
   const file = byId("release-file").files[0];
   if (!file || state.readOnly || state.busy) return;
+  state.dashboardEpoch += 1;
   state.busy = true;
   state.uploadOperation = state.uploadOperation || crypto.randomUUID();
   updateActions();
@@ -423,6 +440,7 @@ function uploadSelected() {
     let result = {};
     try { result = JSON.parse(request.responseText || "{}"); } catch (_) { result = {}; }
     if (request.status === 202) {
+      state.dashboardEpoch += 1;
       progress.value = 100;
       byId("upload-progress-text").textContent = "上传完成，校验已通过";
       state.candidatePublishBlocked = false;

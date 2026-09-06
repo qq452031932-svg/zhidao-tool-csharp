@@ -14,7 +14,7 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	for _, required := range []string{
 		`lang="zh-CN"`, `id="login-view"`, `id="password-view"`, `id="console-view"`,
 		`当前版本`, `选择发布包`, `accept=".zip,application/zip"`, `更新说明`, `上传进度`,
-		`校验清单`, `确认发布`, `版本历史`, `回滚到此版本`, `当前管理员密码`,
+		`校验清单`, `确认发布`, `版本历史`, `操作者`, `回滚到此版本`, `当前管理员密码`,
 		`id="loading-state"`, `id="empty-state"`, `id="error-state"`, `id="readonly-state"`,
 		`aria-live="polite"`, `aria-describedby=`, `<progress`, `<dialog`, `<label`,
 		`class="visually-hidden-file"`,
@@ -37,7 +37,7 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	}
 
 	script := requestAsset(t, handler, "/admin/app.js")
-	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "restoreAuthoritativeCandidate", "renderGateEvidence", "XMLHttpRequest", "crypto.randomUUID", "showModal"} {
+	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "XMLHttpRequest", "crypto.randomUUID", "showModal"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("script missing %q", required)
 		}
