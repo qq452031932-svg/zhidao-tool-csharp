@@ -42,6 +42,7 @@ type fakeEnvelopeAcceptor struct {
 	result      candidate.Summary
 	existing    *candidate.Summary
 	err         error
+	failErr     error
 }
 
 func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.Context, sessionID, operationID string) (candidate.Summary, bool, error) {
@@ -59,6 +60,9 @@ func (acceptor *fakeEnvelopeAcceptor) ReserveEnvelopeForActiveSession(_ context.
 
 func (acceptor *fakeEnvelopeAcceptor) FailEnvelopeForActiveSession(_ context.Context, _, operationID, code string) (candidate.Summary, error) {
 	acceptor.failCalls++
+	if acceptor.failErr != nil {
+		return candidate.Summary{}, acceptor.failErr
+	}
 	failed := candidate.Summary{CandidateID: testCandidateID, OperationID: operationID, State: "failed", ResultCode: code}
 	acceptor.existing = &failed
 	return failed, nil
@@ -229,6 +233,33 @@ func TestUploadEndpointTerminalizesEveryPostReservationFailure(t *testing.T) {
 	}
 }
 
+func TestUploadEndpointDoesNotReportOriginalFailureBeforeTerminalizationCommits(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{err: upload.ErrInvalidArchive}
+	acceptor := &fakeEnvelopeAcceptor{failErr: errors.New("injected persistence failure")}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+	response := uploadRequest(h, []byte("zip"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusInternalServerError || decodeBody(t, response)["code"] != "operation_failed" || acceptor.failCalls != 1 {
+		t.Fatalf("status=%d failCalls=%d body=%s", response.Code, acceptor.failCalls, response.Body.String())
+	}
+}
+
+func TestUploadEndpointReportsAnExistingReservationAsInProgress(t *testing.T) {
+	h := newHarness(t)
+	receiver := &fakeUploadReceiver{result: testEnvelope()}
+	pending := candidate.Summary{CandidateID: testCandidateID, OperationID: testOperationID, State: "uploading"}
+	acceptor := &fakeEnvelopeAcceptor{existing: &pending}
+	installUploadReceiver(t, h, receiver, acceptor)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+	response := uploadRequest(h, []byte("must not be consumed"), "application/zip", csrf, cookie)
+	if response.Code != http.StatusConflict || decodeBody(t, response)["code"] != "upload_in_progress" || receiver.calls != 0 {
+		t.Fatalf("status=%d receiver=%d body=%s", response.Code, receiver.calls, response.Body.String())
+	}
+}
+
 func TestUploadEndpointRequiresCanonicalIdempotencyKeyAndReturnsExistingWithoutReceiving(t *testing.T) {
 	h := newHarness(t)
 	receiver := &fakeUploadReceiver{result: testEnvelope()}
@@ -310,6 +341,9 @@ func TestUploadEndpointRevalidatesSessionAfterBlockedReceive(t *testing.T) {
 			}
 			if acceptor.calls != 0 {
 				t.Fatalf("acceptor called for stale session: %d", acceptor.calls)
+			}
+			if acceptor.failCalls != 1 {
+				t.Fatalf("reservation terminalizations=%d", acceptor.failCalls)
 			}
 		})
 	}

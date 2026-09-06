@@ -117,9 +117,7 @@ func (service *Service) AcceptEnvelopeForActiveSession(ctx context.Context, sess
 		return Summary{}, mapStoreError(err)
 	}
 	if found && existing.State != store.CandidateUploading {
-		if err := envelope.Cleanup(); err != nil {
-			return Summary{}, err
-		}
+		_ = envelope.Cleanup()
 		return summaryFromRecord(existing)
 	}
 	if !found {

@@ -92,6 +92,28 @@ func TestCandidateOperationLookupIsIdempotentAndSessionBound(t *testing.T) {
 	}
 }
 
+func TestTerminalUploadReplayIgnoresCallerCleanupFailure(t *testing.T) {
+	service, _, staging, _ := newCandidateHarness(t)
+	accepted, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry := receiveGolden(t, staging)
+	if err := os.Remove(retry.ArchivePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(retry.ArchivePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retry.ArchivePath, "cannot-remove"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, retry)
+	if err != nil || replayed.CandidateID != accepted.CandidateID || replayed.State != string(store.CandidateValidated) {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+}
+
 func TestCurrentCandidateDistinguishesAnEmptyActiveSession(t *testing.T) {
 	service, _, _, _ := newCandidateHarness(t)
 	if _, err := service.CurrentForActiveSession(context.Background(), testSessionID); !errors.Is(err, store.ErrNotFound) {

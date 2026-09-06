@@ -54,6 +54,12 @@ CREATE TABLE candidate_cleanup_attempts (
     UNIQUE(candidate_id,attempt_number)
 );
 CREATE INDEX candidate_cleanup_attempts_candidate ON candidate_cleanup_attempts(candidate_id,attempt_number);
+INSERT INTO candidate_cleanup_attempts(operation_id,candidate_id,attempt_number,started_at,finished_at,outcome)
+SELECT x.operation_id,x.candidate_id,x.attempt_count,x.updated_at,
+       CASE WHEN o.state IN ('succeeded','failed') THEN o.finished_at ELSE NULL END,
+       CASE WHEN o.state='succeeded' THEN 'success' WHEN o.state='failed' THEN 'failure' ELSE '' END
+FROM candidate_cleanups x JOIN operations o ON o.id=x.operation_id
+WHERE x.operation_id IS NOT NULL AND x.attempt_count>0;
 `
 
 var schemaV2 = `

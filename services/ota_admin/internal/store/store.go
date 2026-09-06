@@ -910,6 +910,37 @@ func (s *Store) QueueExpiredCandidateCleanups(ctx context.Context, now time.Time
 	return ids, err
 }
 
+func (s *Store) RequeueCandidateCleanupIfDue(ctx context.Context, candidateID string, now time.Time) (bool, error) {
+	s.candidateMu.Lock()
+	defer s.candidateMu.Unlock()
+	requeued := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var state CandidateState
+		var expiresAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT state,expires_at FROM candidates WHERE id=?`, candidateID).Scan(&state, &expiresAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		due := state == CandidateFailed || state == CandidateExpired || (state == CandidateUploading || state == CandidateValidated) && timestamp(now) >= expiresAt
+		if !due {
+			return nil
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE candidate_cleanups SET state='pending',operation_id=NULL,claim_token='',claim_expires_at=NULL,last_error_code='',updated_at=?,completed_at=NULL WHERE candidate_id=? AND state='completed'`, timestamp(now), candidateID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		requeued = rows == 1
+		return nil
+	})
+	return requeued, err
+}
+
 func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease time.Duration, limit int, claimToken string, operationIDs []string) ([]CleanupClaim, error) {
 	if lease <= 0 || lease > time.Hour || limit <= 0 || limit > 256 || len(operationIDs) < limit {
 		return nil, errors.New("cleanup claim request is invalid")
@@ -951,8 +982,13 @@ func (s *Store) ClaimCandidateCleanups(ctx context.Context, now time.Time, lease
 					return err
 				}
 				if changed == 1 {
-					if _, err := tx.ExecContext(ctx, `UPDATE candidate_cleanup_attempts SET outcome='failure',finished_at=? WHERE operation_id=? AND candidate_id=? AND outcome=''`, timestamp(now), item.oldOperation.String, item.id); err != nil {
+					attemptResult, err := tx.ExecContext(ctx, `UPDATE candidate_cleanup_attempts SET outcome='failure',finished_at=? WHERE operation_id=? AND candidate_id=? AND outcome=''`, timestamp(now), item.oldOperation.String, item.id)
+					if err != nil {
 						return err
+					}
+					attemptRows, err := attemptResult.RowsAffected()
+					if err != nil || attemptRows != 1 {
+						return ErrInvalidTransition
 					}
 					event, err := audit.NewCleanupResult(audit.OutcomeFailure, item.oldOperation.String, "", audit.CodeInternalFailure, now)
 					if err != nil {
@@ -1087,6 +1123,7 @@ func (s *Store) RecordCleanupResult(ctx context.Context, operationID string, suc
 }
 
 const candidateRecordSQL = `SELECT c.id,c.session_id,c.state,c.created_at,c.expires_at,c.upload_digest,c.validation_report,CASE WHEN c.validation_report='' THEN '' ELSE COALESCE(json_extract(c.validation_report,'$.version'),'') END,o.id,o.state,COALESCE(f.public_code,o.result_code) FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload' LEFT JOIN candidate_upload_failures f ON f.operation_id=o.id`
+const candidateUploadOperationRecordSQL = `SELECT c.id,c.session_id,CASE WHEN o.state='succeeded' THEN 'validated' WHEN o.state='failed' THEN 'failed' ELSE 'uploading' END,c.created_at,c.expires_at,c.upload_digest,c.validation_report,CASE WHEN c.validation_report='' THEN '' ELSE COALESCE(json_extract(c.validation_report,'$.version'),'') END,o.id,o.state,COALESCE(f.public_code,o.result_code) FROM candidates c JOIN operations o ON o.candidate_id=c.id AND o.kind='upload' LEFT JOIN candidate_upload_failures f ON f.operation_id=o.id`
 
 type rowScanner interface{ Scan(...any) error }
 
@@ -1106,7 +1143,7 @@ func scanCandidateRecord(row rowScanner) (CandidateRecord, error) {
 }
 
 func candidateByOperationTx(ctx context.Context, tx *sql.Tx, operationID string) (CandidateRecord, bool, error) {
-	record, err := scanCandidateRecord(tx.QueryRowContext(ctx, candidateRecordSQL+` WHERE o.id=?`, operationID))
+	record, err := scanCandidateRecord(tx.QueryRowContext(ctx, candidateUploadOperationRecordSQL+` WHERE o.id=?`, operationID))
 	if errors.Is(err, ErrNotFound) {
 		return CandidateRecord{}, false, nil
 	}

@@ -245,3 +245,38 @@ func TestJanitorUsesFreshTimeWhenClaimingExpiredCleanupLease(t *testing.T) {
 		t.Fatalf("freshly expired cleanup lease was not reclaimed: %v", err)
 	}
 }
+
+func TestJanitorRequeuesCompletedCleanupWhenLateAdoptionRestoresCandidatePaths(t *testing.T) {
+	service, database, staging, base := newCandidateHarness(t)
+	summary, err := service.AcceptEnvelopeForActiveSession(context.Background(), testSessionID, testOperationID, receiveGolden(t, staging))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := base.Add(24 * time.Hour)
+	janitor, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return expired }, Random: bytes.NewReader(bytes.Repeat([]byte{0x81}, 4096))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := janitor.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	paths := service.paths(summary.CandidateID)
+	if err := os.WriteFile(paths.archive, []byte("late archive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(paths.extraction, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewJanitor(JanitorOptions{Store: database, StagingRoot: staging, Now: func() time.Time { return expired }, Random: bytes.NewReader(bytes.Repeat([]byte{0x82}, 4096))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{paths.archive, paths.extraction} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("late-adopted candidate path remains %s: %v", path, err)
+		}
+	}
+}

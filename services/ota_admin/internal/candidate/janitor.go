@@ -64,6 +64,12 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 	if err := cleanupStaleUploadArtifacts(janitor.stagingRoot, janitor.now().UTC().Add(-24*time.Hour)); err != nil {
 		return err
 	}
+	if err := scanCandidateArtifacts(janitor.stagingRoot, func(candidateID string) error {
+		_, err := janitor.store.RequeueCandidateCleanupIfDue(ctx, candidateID, janitor.now().UTC())
+		return err
+	}); err != nil {
+		return err
+	}
 	const pageSize = 64
 	for {
 		ids, err := janitor.store.QueueExpiredCandidateCleanups(ctx, janitor.now().UTC(), pageSize)
@@ -80,14 +86,14 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 		if err != nil {
 			return errors.Join(errors.Join(failures...), err)
 		}
-		operationIDs := make([]string, pageSize)
+		operationIDs := make([]string, 1)
 		for index := range operationIDs {
 			operationIDs[index], err = janitor.nextOperationID()
 			if err != nil {
 				return errors.Join(errors.Join(failures...), err)
 			}
 		}
-		claims, err := janitor.store.ClaimCandidateCleanups(ctx, janitor.now().UTC(), 5*time.Minute, pageSize, claimToken, operationIDs)
+		claims, err := janitor.store.ClaimCandidateCleanups(ctx, janitor.now().UTC(), 5*time.Minute, 1, claimToken, operationIDs)
 		if err != nil {
 			return errors.Join(errors.Join(failures...), err)
 		}
@@ -115,7 +121,7 @@ func (janitor *Janitor) RunOnce(ctx context.Context) error {
 				failures = append(failures, errors.Join(cleanupFailure, ledgerErr))
 			}
 		}
-		if batchFailed || len(claims) < pageSize {
+		if batchFailed {
 			break
 		}
 	}

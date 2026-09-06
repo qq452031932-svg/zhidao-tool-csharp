@@ -274,6 +274,29 @@ func TestFailedValidationRecordsSeparateTruthfulGateAndUploadTerminalAudits(t *t
 	}
 }
 
+func TestUploadReplayRemainsValidatedAfterLaterPublishFailure(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(2*time.Hour))
+	_, _, err := s.AcceptCandidateForActiveSession(context.Background(), CandidateAcceptance{
+		CandidateID: candidateID1, SessionID: sessionHash1, OperationID: operationID1,
+		UploadDigest: digest1, ValidationReport: `{"verified":true,"version":"1.2.3"}`, Version: "1.2.3", CreatedAt: now, ExpiresAt: now.Add(time.Hour), CommittedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := s.BeginPublishForActiveSession(context.Background(), sessionHash1, candidateID1, releaseID1, now); err != nil || !created {
+		t.Fatalf("begin created=%v err=%v", created, err)
+	}
+	if err := s.FailPublish(context.Background(), releaseID1, candidateID1, "internal_failure", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	replayed, created, err := s.ReserveCandidateForActiveSession(context.Background(), CandidateReservation{CandidateID: candidateID2, SessionID: sessionHash1, OperationID: operationID1, CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Hour)})
+	if err != nil || created || replayed.State != CandidateValidated || replayed.OperationState != OperationSucceeded || replayed.ResultCode != "completed" {
+		t.Fatalf("replayed=%+v created=%v err=%v", replayed, created, err)
+	}
+}
+
 func TestCandidateConfirmReadAndExpiryAreSessionBoundTransactions(t *testing.T) {
 	s := openStore(t)
 	now := time.Unix(2_000_000_000, 0).UTC()

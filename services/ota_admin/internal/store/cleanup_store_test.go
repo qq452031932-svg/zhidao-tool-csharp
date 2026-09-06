@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -91,6 +92,79 @@ func TestV3ToV4MigrationPreservesCleanupLedgerAndIsIdempotent(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestV4MigrationBackfillsV3CleanupAttemptStates(t *testing.T) {
+	tests := []struct {
+		name           string
+		operationState string
+		cleanupState   string
+		wantOutcome    string
+	}{
+		{name: "running", operationState: "running", cleanupState: "pending"},
+		{name: "failed", operationState: "failed", cleanupState: "pending", wantOutcome: "failure"},
+		{name: "completed", operationState: "succeeded", cleanupState: "completed", wantOutcome: "success"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Unix(2_000_000_000, 0).UTC()
+			if _, err = db.Exec(schemaV2 + schemaV3 + `PRAGMA user_version=3;`); err != nil {
+				t.Fatal(err)
+			}
+			statements := []struct {
+				query string
+				args  []any
+			}{
+				{`INSERT INTO sessions(id_hash,state,created_at,last_seen_at,idle_expires_at,absolute_expires_at) VALUES(?, 'active', ?, ?, ?, ?)`, []any{sessionHash1, timestamp(now), timestamp(now), timestamp(now.Add(time.Hour)), timestamp(now.Add(2 * time.Hour))}},
+				{`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, []any{candidateID1, sessionHash1, timestamp(now), timestamp(now.Add(time.Hour))}},
+				{`UPDATE candidates SET state='failed' WHERE id=?`, []any{candidateID1}},
+				{`INSERT INTO operations(id,kind,state,created_at) VALUES(?,'cleanup','pending',?)`, []any{operationID1, timestamp(now)}},
+				{`UPDATE operations SET state='running' WHERE id=?`, []any{operationID1}},
+			}
+			for _, statement := range statements {
+				if _, err := db.Exec(statement.query, statement.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.operationState != "running" {
+				if _, err := db.Exec(`UPDATE operations SET state=?,result_code=?,finished_at=? WHERE id=?`, test.operationState, map[string]string{"failed": "internal_failure", "succeeded": "completed"}[test.operationState], timestamp(now.Add(time.Minute)), operationID1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.cleanupState == "completed" {
+				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,updated_at,completed_at) VALUES(?,?,'completed',1,?,?)`, candidateID1, operationID1, timestamp(now.Add(time.Minute)), timestamp(now.Add(time.Minute)))
+			} else {
+				_, err = db.Exec(`INSERT INTO candidate_cleanups(candidate_id,operation_id,state,attempt_count,claim_token,claim_expires_at,updated_at,last_error_code) VALUES(?,?,'pending',1,?,?,?,?)`, candidateID1, operationID1, candidateID2, timestamp(now.Add(time.Minute)), timestamp(now), map[string]string{"failed": "internal_failure"}[test.operationState])
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			secureMigrationFixture(t, path)
+			s, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			var candidate string
+			var attempt int
+			var outcome string
+			var finished sql.NullInt64
+			if err := s.db.QueryRow(`SELECT candidate_id,attempt_number,outcome,finished_at FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1).Scan(&candidate, &attempt, &outcome, &finished); err != nil {
+				t.Fatal(err)
+			}
+			if candidate != candidateID1 || attempt != 1 || outcome != test.wantOutcome || finished.Valid != (test.wantOutcome != "") {
+				t.Fatalf("backfilled candidate=%s attempt=%d outcome=%q finished=%v", candidate, attempt, outcome, finished)
+			}
+		})
 	}
 }
 
@@ -183,5 +257,40 @@ func TestExpiredCleanupLeaseIsFailedAndAuditedBeforeRetryClaim(t *testing.T) {
 	}
 	if firstCandidate != candidateID1 || secondCandidate != candidateID1 {
 		t.Fatalf("cleanup attempt association lost: first=%s second=%s", firstCandidate, secondCandidate)
+	}
+}
+
+func TestExpiredCleanupLeaseFailsClosedWhenAttemptLedgerIsMissing(t *testing.T) {
+	s := openStore(t)
+	now := time.Unix(2_000_000_000, 0).UTC()
+	createCandidateSession(t, s, sessionHash1, now, now.Add(time.Hour))
+	if _, err := s.db.Exec(`INSERT INTO candidates(id,session_id,state,created_at,expires_at) VALUES(?,?,'uploading',?,?)`, candidateID1, sessionHash1, timestamp(now.Add(-time.Hour)), timestamp(now.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE candidates SET state='failed' WHERE id=?`, candidateID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueueExpiredCandidateCleanups(context.Background(), now, 1); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.ClaimCandidateCleanups(context.Background(), now, time.Minute, 1, candidateID2, []string{operationID1})
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM candidate_cleanup_attempts WHERE operation_id=?`, operationID1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimCandidateCleanups(context.Background(), now.Add(2*time.Minute), time.Minute, 1, releaseID1, []string{releaseID2}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("claim err=%v", err)
+	}
+	var operationState, ledgerOperation, claimToken string
+	if err := s.db.QueryRow(`SELECT state FROM operations WHERE id=?`, operationID1).Scan(&operationState); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT operation_id,claim_token FROM candidate_cleanups WHERE candidate_id=?`, candidateID1).Scan(&ledgerOperation, &claimToken); err != nil {
+		t.Fatal(err)
+	}
+	if operationState != "running" || ledgerOperation != operationID1 || claimToken != candidateID2 {
+		t.Fatalf("reclaim partially committed: operation=%q ledger=%q token=%q", operationState, ledgerOperation, claimToken)
 	}
 }

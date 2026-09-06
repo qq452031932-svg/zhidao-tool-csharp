@@ -36,60 +36,65 @@ func (router *Router) receiveUpload(response http.ResponseWriter, request *http.
 		writeReservedCandidateResult(response, reserved)
 		return
 	}
-	terminal := false
-	failureCode := "operation_failed"
-	defer func() {
-		if terminal {
-			return
-		}
-		finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, principal.IDHash, operationID, failureCode)
-	}()
 	envelope, err := router.uploads.Receive(request.Context(), request.Body, request.ContentLength)
 	if err != nil {
-		failureCode = uploadPublicFailureCode(err)
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, uploadPublicFailureCode(err)) {
+			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+			return
+		}
 		writeUploadError(response, err)
 		return
 	}
 	if envelope == nil || envelope.Verified {
 		if envelope != nil {
-			if err := envelope.Cleanup(); err != nil {
-				writeError(response, http.StatusInternalServerError, "operation_failed")
-				return
-			}
+			_ = envelope.Cleanup()
+		}
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, "operation_failed") {
+			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+			return
 		}
 		writeError(response, http.StatusInternalServerError, "operation_failed")
 		return
 	}
 	currentPrincipal, err := router.sessions.Authenticate(request.Context(), sessionToken, csrfToken, true)
 	if err != nil || currentPrincipal.IDHash != principal.IDHash || currentPrincipal.MustChangePassword {
-		if cleanupErr := envelope.Cleanup(); cleanupErr != nil {
-			writeError(response, http.StatusInternalServerError, "operation_failed")
-			return
-		}
+		_ = envelope.Cleanup()
 		if err == nil {
 			err = session.ErrUnauthorized
+		}
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, "operation_failed") {
+			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
+			return
 		}
 		writeUploadError(response, err)
 		return
 	}
 	summary, err := router.uploadEnvelopes.AcceptEnvelopeForActiveSession(request.Context(), currentPrincipal.IDHash, operationID, envelope)
 	if err != nil {
-		failureCode = candidatePublicFailureCode(err)
-		if cleanupErr := envelope.Cleanup(); cleanupErr != nil {
-			writeError(response, http.StatusInternalServerError, "operation_failed")
+		_ = envelope.Cleanup()
+		if !router.terminalizeUploadFailure(principal.IDHash, operationID, candidatePublicFailureCode(err)) {
+			writeCandidateError(response, http.StatusInternalServerError, "operation_failed", "操作失败，请重试", operationID)
 			return
 		}
 		writeUploadOperationError(response, err, operationID)
 		return
 	}
-	terminal = true
 	writeCandidateSummary(response, http.StatusAccepted, summary)
+}
+
+func (router *Router) terminalizeUploadFailure(sessionID, operationID, code string) bool {
+	finishContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := router.uploadEnvelopes.FailEnvelopeForActiveSession(finishContext, sessionID, operationID, code)
+	return err == nil
 }
 
 func writeReservedCandidateResult(response http.ResponseWriter, summary candidate.Summary) {
 	if summary.State != "failed" {
+		if summary.State == "uploading" {
+			writeCandidateError(response, http.StatusConflict, "upload_in_progress", "上传处理中，请稍后重试", summary.OperationID)
+			return
+		}
 		writeCandidateSummary(response, http.StatusAccepted, summary)
 		return
 	}
