@@ -286,7 +286,7 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 		"git", "diff", "--quiet", "HEAD", "ls-tree", "ls-files", "--others",
 		"archive", "--format=zip", "HEAD:services/ota_admin", "core.autocrlf=false", "core.eol=lf",
 		"SnapshotDirectory", "Get-SnapshotFingerprint", "Publish-StagedArtifacts",
-		"Substring(0, 12)", `Join-Path $ArtifactsRoot ".o-$stagingId"`, "Join-Path $StagingDirectory 's'",
+		"Substring(0, 12)", `[System.IO.Path]::GetTempPath()`, `Join-Path $SystemTempRoot "spota-$stagingId"`, "Join-Path $StagingDirectory 's'",
 		"bootstrap_go_toolchain.ps1", "vet ./...", "backup preserved at",
 		"EndsWith('.html'", "EndsWith('.css'", "EndsWith('.js'", "EndsWith('.sql'",
 	} {
@@ -320,6 +320,17 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	if strings.Contains(buildScript, "Copy-Item -LiteralPath $sourcePath") {
 		t.Fatal("build snapshot still copies mutable working-tree bytes")
 	}
+	if strings.Contains(buildScript, `Join-Path $ArtifactsRoot ".o-$stagingId"`) {
+		t.Fatal("build staging root still inherits the long repository path")
+	}
+	for _, artifactContract := range []string{
+		`$OutputDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot 'ota-admin'))`,
+		`$BackupDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-backup-$invocationId"))`,
+	} {
+		if !strings.Contains(buildScript, artifactContract) {
+			t.Errorf("build output moved outside the artifact root; missing %q", artifactContract)
+		}
+	}
 }
 
 func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testing.T) {
@@ -339,7 +350,7 @@ func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testi
 	}
 	requireSubstringsInOrder(t, buildScript,
 		`$TestTempDirectory = Join-Path $StagingDirectory 't'`,
-		`New-Item -ItemType Directory -Path $StagingDirectory`,
+		`New-SafeStagingDirectory -Path $StagingDirectory`,
 		`New-Item -ItemType Directory -Path $TestTempDirectory`,
 		`$env:TEMP = $TestTempDirectory`,
 		`$env:TMP = $TestTempDirectory`,
@@ -347,6 +358,78 @@ func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testi
 		`& powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript`,
 		`test -p=1 ./...`,
 	)
+}
+
+func TestBuildOnlyRemovesValidatedUniqueSystemTempStagingRoot(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	for _, required := range []string{
+		"function Assert-SafeStagingDirectory",
+		"function New-SafeStagingDirectory",
+		"function Remove-SafeStagingDirectory",
+		`'^spota-[0-9a-f]{12}$'`,
+		`[System.IO.FileAttributes]::ReparsePoint`,
+		`Remove-SafeStagingDirectory -Path $StagingDirectory`,
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("build script does not contain safe staging contract %q", required)
+		}
+	}
+	if strings.Contains(buildScript, `Remove-Item -LiteralPath $StagingDirectory -Recurse`) {
+		t.Fatal("build cleanup bypasses the staging-specific validator")
+	}
+
+	protectedRoot := filepath.Join(testLocalTempDir(t), "protected")
+	if err := os.Mkdir(protectedRoot, 0o700); err != nil {
+		t.Fatalf("create protected root: %v", err)
+	}
+	protectedMarker := filepath.Join(protectedRoot, "marker.txt")
+	if err := os.WriteFile(protectedMarker, []byte("preserve"), 0o600); err != nil {
+		t.Fatalf("write protected marker: %v", err)
+	}
+	harnessPath := filepath.Join(testLocalTempDir(t), "staging-cleanup-harness.ps1")
+	harness := `param([string] $BuildScript, [string] $ProtectedRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+
+try { Remove-SafeStagingDirectory -Path $ProtectedRoot; throw 'outside removal unexpectedly succeeded' }
+catch { if ($_.Exception.Message -eq 'outside removal unexpectedly succeeded') { throw } }
+if (-not (Test-Path -LiteralPath (Join-Path $ProtectedRoot 'marker.txt') -PathType Leaf)) { throw 'outside marker was removed' }
+
+$nested = Join-Path $ProtectedRoot 'spota-0123456789ab'
+try { Remove-SafeStagingDirectory -Path $nested; throw 'nested removal unexpectedly succeeded' }
+catch { if ($_.Exception.Message -eq 'nested removal unexpectedly succeeded') { throw } }
+
+$invalidLeaf = Join-Path ([System.IO.Path]::GetTempPath()) 'spota-0123456789ab-extra'
+try { Remove-SafeStagingDirectory -Path $invalidLeaf; throw 'invalid leaf removal unexpectedly succeeded' }
+catch { if ($_.Exception.Message -eq 'invalid leaf removal unexpectedly succeeded') { throw } }
+
+$valid = Join-Path ([System.IO.Path]::GetTempPath()) ('spota-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+try {
+  New-SafeStagingDirectory -Path $valid
+  Set-Content -LiteralPath (Join-Path $valid 'marker.txt') -Value staging
+  try { New-SafeStagingDirectory -Path $valid; throw 'preexisting staging root unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'preexisting staging root unexpectedly accepted') { throw } }
+}
+finally {
+  if (Test-Path -LiteralPath $valid) { Remove-SafeStagingDirectory -Path $valid }
+}
+if (Test-Path -LiteralPath $valid) { throw 'validated staging root was not removed' }
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write staging cleanup harness: %v", err)
+	}
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, filepath.Join(testModuleRoot(t), "scripts", "build_linux_amd64.ps1"), protectedRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("staging cleanup harness failed: %v; output:\n%s", runErr, output)
+	}
+	if _, err := os.Stat(protectedMarker); err != nil {
+		t.Fatalf("staging cleanup touched protected marker: %v", err)
+	}
 }
 
 func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
@@ -642,7 +725,7 @@ func requireSubstringsInOrder(t *testing.T, text string, required ...string) {
 
 func testLocalTempDir(t *testing.T) string {
 	t.Helper()
-	path, err := os.MkdirTemp(filepath.Join(testModuleRoot(t), "internal", "compat"), ".compat-test-")
+	path, err := os.MkdirTemp("", "ota-compat-")
 	if err != nil {
 		t.Fatalf("create package-local temporary directory: %v", err)
 	}

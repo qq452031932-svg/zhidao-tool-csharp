@@ -14,10 +14,10 @@ $ArtifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.arti
 $OutputDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot 'ota-admin'))
 $invocationId = [guid]::NewGuid().ToString('N')
 $stagingId = $invocationId.Substring(0, 12)
-# Keep the immutable Windows test snapshot short. Several security tests use
-# additional nested temporary paths, and the previous descriptive staging
-# names exceeded legacy Win32 path budgets before the Linux cross-build began.
-$StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".o-$stagingId"))
+# Keep the entire immutable Windows build tree independent of the repository
+# path. Security tests and Chromium add several nested temporary directories.
+$SystemTempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+$StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $SystemTempRoot "spota-$stagingId"))
 $SnapshotDirectory = Join-Path $StagingDirectory 's'
 $StagedPublishDirectory = Join-Path $StagingDirectory 'p'
 $TestTempDirectory = Join-Path $StagingDirectory 't'
@@ -38,6 +38,44 @@ function Remove-SafeArtifactDirectory {
     param([Parameter(Mandatory)][string] $Path)
 
     Assert-SafeArtifactDirectory -Path $Path
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
+function Assert-SafeStagingDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $parentPath = [System.IO.Path]::GetFullPath([System.IO.Path]::GetDirectoryName($fullPath)).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $parentPath.Equals($SystemTempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to modify a staging path outside the system temporary directory $SystemTempRoot"
+    }
+    $leaf = [System.IO.Path]::GetFileName($fullPath)
+    if ($leaf -cnotmatch '^spota-[0-9a-f]{12}$') {
+        throw 'Refusing to modify a staging path without the required unique name.'
+    }
+    if (Test-Path -LiteralPath $fullPath) {
+        $item = Get-Item -LiteralPath $fullPath -Force
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Refusing to modify a staging path that is not a regular directory.'
+        }
+    }
+}
+
+function New-SafeStagingDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-SafeStagingDirectory -Path $Path
+    if (Test-Path -LiteralPath $Path) { throw 'Staging path unexpectedly exists.' }
+    New-Item -ItemType Directory -Path $Path | Out-Null
+    Assert-SafeStagingDirectory -Path $Path
+}
+
+function Remove-SafeStagingDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-SafeStagingDirectory -Path $Path
     if (Test-Path -LiteralPath $Path) {
         Remove-Item -LiteralPath $Path -Recurse -Force
     }
@@ -262,13 +300,13 @@ if ($FunctionsOnly) {
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
 Assert-SafeArtifactDirectory -Path $OutputDirectory
-Assert-SafeArtifactDirectory -Path $StagingDirectory
+Assert-SafeStagingDirectory -Path $StagingDirectory
 Assert-SafeArtifactDirectory -Path $BackupDirectory
 Assert-NoUntrackedModuleFiles
 $sourcePaths = @(Get-TrackedSourcePaths)
 Assert-SourcePathsClean -SourcePaths $sourcePaths
 
-New-Item -ItemType Directory -Path $StagingDirectory | Out-Null
+New-SafeStagingDirectory -Path $StagingDirectory
 try {
     New-Item -ItemType Directory -Path $TestTempDirectory | Out-Null
     New-GitObjectSourceSnapshot -SourcePaths $sourcePaths -DestinationRoot $SnapshotDirectory
@@ -329,7 +367,7 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $StagingDirectory) {
-        Remove-SafeArtifactDirectory -Path $StagingDirectory
+        Remove-SafeStagingDirectory -Path $StagingDirectory
     }
 }
 

@@ -20,11 +20,14 @@ func TestBrowserTestArgumentsDisableGpuDiskCache(t *testing.T) {
 	if !slices.Contains(arguments, "--disable-gpu-shader-disk-cache") {
 		t.Fatalf("browser arguments %v do not disable the GPU shader/persistent disk cache", arguments)
 	}
+	if !slices.Contains(arguments, "--disable-features=SkiaGraphiteUsePersistentCache,GpuPersistentCache") {
+		t.Fatalf("browser arguments %v do not disable Chromium persistent GPU caches", arguments)
+	}
 }
 
 func browserTestArguments(profile, url string) []string {
 	return []string{
-		"--headless=new", "--disable-gpu", "--disable-gpu-shader-disk-cache", "--no-first-run", "--no-default-browser-check",
+		"--headless=new", "--disable-gpu", "--disable-gpu-shader-disk-cache", "--disable-features=SkiaGraphiteUsePersistentCache,GpuPersistentCache", "--no-first-run", "--no-default-browser-check",
 		"--user-data-dir=" + profile, "--window-size=420,900", "--virtual-time-budget=10000", "--dump-dom", url,
 	}
 }
