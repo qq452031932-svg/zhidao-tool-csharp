@@ -8,11 +8,26 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestBrowserTestArgumentsDisableGpuDiskCache(t *testing.T) {
+	arguments := browserTestArguments(`C:\test-profile`, "http://127.0.0.1/admin/")
+	if !slices.Contains(arguments, "--disable-gpu-shader-disk-cache") {
+		t.Fatalf("browser arguments %v do not disable the GPU shader/persistent disk cache", arguments)
+	}
+}
+
+func browserTestArguments(profile, url string) []string {
+	return []string{
+		"--headless=new", "--disable-gpu", "--disable-gpu-shader-disk-cache", "--no-first-run", "--no-default-browser-check",
+		"--user-data-dir=" + profile, "--window-size=420,900", "--virtual-time-budget=10000", "--dump-dom", url,
+	}
+}
 
 func TestAdminConsoleInRealBrowser(t *testing.T) {
 	chrome := installedTestBrowser()
@@ -26,9 +41,7 @@ func TestAdminConsoleInRealBrowser(t *testing.T) {
 			profile := t.TempDir()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			command := exec.CommandContext(ctx, chrome,
-				"--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-				"--user-data-dir="+profile, "--window-size=420,900", "--virtual-time-budget=10000", "--dump-dom", server.URL+"/admin/?mode="+mode)
+			command := exec.CommandContext(ctx, chrome, browserTestArguments(profile, server.URL+"/admin/?mode="+mode)...)
 			output, err := command.CombinedOutput()
 			if ctx.Err() != nil {
 				t.Fatalf("browser timed out: %v\n%s", ctx.Err(), output)

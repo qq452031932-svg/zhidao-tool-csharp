@@ -322,6 +322,33 @@ func TestBuildPinsToolchainUsesCleanInputsAndStagesCompleteOutputSet(t *testing.
 	}
 }
 
+func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testing.T) {
+	t.Parallel()
+
+	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	for _, required := range []string{
+		`$TestTempDirectory = Join-Path $StagingDirectory 't'`,
+		`New-Item -ItemType Directory -Path $TestTempDirectory`,
+		`$env:TEMP = $TestTempDirectory`,
+		`$env:TMP = $TestTempDirectory`,
+		`$env:GOTMPDIR = $TestTempDirectory`,
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("build script does not contain isolated temporary-directory contract %q", required)
+		}
+	}
+	requireSubstringsInOrder(t, buildScript,
+		`$TestTempDirectory = Join-Path $StagingDirectory 't'`,
+		`New-Item -ItemType Directory -Path $StagingDirectory`,
+		`New-Item -ItemType Directory -Path $TestTempDirectory`,
+		`$env:TEMP = $TestTempDirectory`,
+		`$env:TMP = $TestTempDirectory`,
+		`$env:GOTMPDIR = $TestTempDirectory`,
+		`& powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript`,
+		`test -p=1 ./...`,
+	)
+}
+
 func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
 	powerShell, err := exec.LookPath("powershell")
 	if err != nil {

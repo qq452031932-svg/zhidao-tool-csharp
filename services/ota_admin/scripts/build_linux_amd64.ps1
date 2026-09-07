@@ -20,6 +20,7 @@ $stagingId = $invocationId.Substring(0, 12)
 $StagingDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".o-$stagingId"))
 $SnapshotDirectory = Join-Path $StagingDirectory 's'
 $StagedPublishDirectory = Join-Path $StagingDirectory 'p'
+$TestTempDirectory = Join-Path $StagingDirectory 't'
 $BackupDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot ".ota-admin-backup-$invocationId"))
 $FixedZipTimestamp = [System.DateTimeOffset]::Parse('1980-01-01T00:00:00Z')
 
@@ -269,6 +270,7 @@ Assert-SourcePathsClean -SourcePaths $sourcePaths
 
 New-Item -ItemType Directory -Path $StagingDirectory | Out-Null
 try {
+    New-Item -ItemType Directory -Path $TestTempDirectory | Out-Null
     New-GitObjectSourceSnapshot -SourcePaths $sourcePaths -DestinationRoot $SnapshotDirectory
     $snapshotFingerprint = Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory
     New-Item -ItemType Directory -Path $StagedPublishDirectory | Out-Null
@@ -277,6 +279,9 @@ try {
     $stagedSourceBundlePath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip'
     $stagedSourceBundleHashPath = Join-Path $StagedPublishDirectory 'superpan-ota-admin-source.zip.sha256'
 
+    $env:TEMP = $TestTempDirectory
+    $env:TMP = $TestTempDirectory
+    $env:GOTMPDIR = $TestTempDirectory
     $env:GOTOOLCHAIN = 'local'
     $env:GOCACHE = Join-Path $StagingDirectory 'g'
     $env:GOMODCACHE = Join-Path $StagingDirectory 'm'
