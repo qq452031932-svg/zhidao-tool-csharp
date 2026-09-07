@@ -112,4 +112,14 @@
 
 `f.fanfh.cn` vhost SHA-256 仍为 `1df7a78877eb37a896166c900b23a7f30c27c8dc959949f6ed6939116d09e05b`，可信正文 SHA-256 仍为 `2d3495515de1c91186a799994d494e261efda5adeb7e4d2ac16d85bb373e2bfb`；OTA vhost SHA-256 仍为 `23046876bdd83b91eb64156c6b8a1ec7eaa321bcb42f14db3dcedbab58971786`。本次只删除了三个本任务创建并已核实为 root-only 的临时测试/部署目录；两份恢复证据与安装器回滚备份继续保留。服务重启按设计撤销旧后台会话，浏览器需要重新登录一次。
 
-客户端固定 SPKI 的真实生产 feed 读取测试已接受 `1.0.6` 并识别 canonical full nupkg；尚未执行真实已安装客户端的下载、应用更新和自动重启，因此这三项仍属于后续客户端验收，不应写成已经通过。
+截至该阶段，客户端固定 SPKI 的真实生产 feed 读取测试已接受 `1.0.6` 并识别 canonical full nupkg，但尚未执行下载、应用更新和自动重启；这些后续结果见下一节。
+
+## 2026-09-07 正式 `1.0.5 → 1.0.6` 客户端链路验收
+
+使用 Velopack `TestVelopackLocator` 在工作树忽略目录 `.artifacts/ota-e2e-run-20260907T1530` 中构造正式包 ID `SuperPan.BaiduBatchTransfer`、正式渠道 `win-x64-stable` 和当前版本 `1.0.5` 的独立安装根。测试直接读取真实 `https://ota.fanfh.cn/releases/win-x64/stable/`，生产固定公钥签名链接受 manifest 和 release feed，正确发现 `1.0.6`；随后下载 canonical full nupkg，下载文件为 `95613046` 字节，SHA-256 为 `d7911cc0a7af42a3d944006e0a7010927362f590684f85d6cc1f1f8811633fe1`。`SignedFeedPackageGate` 的下载授权与 pending 二次校验均通过，原生 `Update.exe` 成功应用；隔离根 `current/BaiduBatchTransfer.App.dll` 和 `.exe` 的文件版本/产品版本均为 `1.0.6.0` / `1.0.6`，最终本地 full package 也被识别为 `1.0.6`。
+
+首次隔离器运行把 `localPackage` 固定为 `1.0.5`，导致已下载的 `1.0.6` 未被识别为 pending；诊断证明 packages 目录同时存在两个版本，而 locator 的 latest 仍固定返回 `1.0.5`。将测试 locator 改为从 packages 目录重新发现本地最新版后，同一真实 feed 在不重复网络下载的情况下得到 pending `1.0.6` 并完成应用。这是验收夹具配置问题，不是服务端资产或客户端签名链失败。
+
+原生 updater 的 apply 命令按产品默认行为自动重启了隔离根中的 `1.0.6` 客户端。虽然程序文件完全位于隔离根，普通正式构建的数据根仍固定为 `%LOCALAPPDATA%\BaiduBatchTransfer`，因此该短暂重启打开并写入了正式 SQLite；发现后立即通过窗口正常关闭，未强杀进程。正式数据库 SHA-256 从验收前 `b917eadc88b29d64a70d99789f135291715dddbcff1a19d3320a1527863bd534` 变为关闭后 `dda45d939639f4fd8d9750b02a72369401bca30727185ede138807555db02af4`，修改时间为 `2026-09-07T08:09:02.1346372Z`，所以本次不能宣称正式数据“完全未触碰”。关闭后 `PRAGMA quick_check=ok`；批次状态仍为 Active 1、Completed 2、CompletedWithShortfall 2、Paused 3、Queued 1，转存操作仍为 Failed 6、Succeeded 12、Waiting 1，分享操作仍为 Succeeded 12、WaitingTransfer 1，独立分享操作仍为 0，均与启动前计数相同。没有修改任务状态、恢复数据库或删除正式数据，验收结束后相关客户端进程数为 0。
+
+新鲜聚焦回归命令覆盖 `SignedFeedUpdateSourceTests`、`SignedFeedPackageGateTests`、`VelopackUpdateRuntimeTests`、`UpdateShutdownIntegrationTests`、`ApplicationShutdownCoordinatorTests`、`StartupDataRootSelectorTests`、`OtaProductionBuildConfigurationTests` 和 `OtaProductionReleaseScriptTests`，结果为 `150/150` 通过、0 失败、0 跳过。真实生产链路的“检查、签名验证、full 包下载、pending 校验、原生应用、自动重启到 1.0.6”已完成；后续若再次执行此类正式包隔离验收，必须同时隔离 Windows 用户数据根或明确禁用 updater 重启，不能只隔离 Velopack 安装根。
