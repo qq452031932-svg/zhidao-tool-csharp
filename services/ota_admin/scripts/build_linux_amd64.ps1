@@ -81,6 +81,39 @@ function Remove-SafeStagingDirectory {
     }
 }
 
+function Assert-SafeStagedPublishDirectory {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-SafeStagingDirectory -Path $StagingDirectory
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $expectedPath = [System.IO.Path]::GetFullPath($StagedPublishDirectory)
+    if (-not $fullPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to publish from outside the validated staging output directory.'
+    }
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) {
+        throw 'Staged artifact path is not a directory.'
+    }
+    $item = Get-Item -LiteralPath $fullPath -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Staged artifact path must not be a reparse point.'
+    }
+}
+
+function Assert-SameVolumeArtifactPublish {
+    param(
+        [Parameter(Mandatory)][string] $StagedPath,
+        [Parameter(Mandatory)][string] $PublishedPath
+    )
+
+    $stagedRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($StagedPath))
+    $publishedRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($PublishedPath))
+    if ([string]::IsNullOrWhiteSpace($stagedRoot) -or
+        [string]::IsNullOrWhiteSpace($publishedRoot) -or
+        -not $stagedRoot.Equals($publishedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Staged and published artifact directories must be on the same volume for atomic publication.'
+    }
+}
+
 function Assert-PinnedGoToolchain {
     param(
         [Parameter(Mandatory)][string] $ExpectedSha256,
@@ -262,9 +295,10 @@ function Publish-StagedArtifacts {
         [Parameter(Mandatory)][string] $PreviousPath
     )
 
-    Assert-SafeArtifactDirectory -Path $StagedPath
+    Assert-SafeStagedPublishDirectory -Path $StagedPath
     Assert-SafeArtifactDirectory -Path $PublishedPath
     Assert-SafeArtifactDirectory -Path $PreviousPath
+    Assert-SameVolumeArtifactPublish -StagedPath $StagedPath -PublishedPath $PublishedPath
     if (Test-Path -LiteralPath $PreviousPath) { throw 'Artifact backup path unexpectedly exists.' }
 
     $movedPrevious = $false

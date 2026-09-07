@@ -432,6 +432,41 @@ if (Test-Path -LiteralPath $valid) { throw 'validated staging root was not remov
 	}
 }
 
+func TestBuildPublishesOnlyFromValidatedStagingOutput(t *testing.T) {
+	t.Parallel()
+
+	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	for _, required := range []string{
+		"function Assert-SafeStagedPublishDirectory",
+		"function Assert-SameVolumeArtifactPublish",
+		"Assert-SafeStagingDirectory -Path $StagingDirectory",
+		"$fullPath.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)",
+		"Assert-SafeStagedPublishDirectory -Path $StagedPath",
+		"Assert-SameVolumeArtifactPublish -StagedPath $StagedPath -PublishedPath $PublishedPath",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("build script does not contain staged-publication safety contract %q", required)
+		}
+	}
+	publishOffset := strings.Index(buildScript, "function Publish-StagedArtifacts")
+	if publishOffset < 0 {
+		t.Fatal("build script does not contain artifact publication function")
+	}
+	publishEnd := strings.Index(buildScript[publishOffset:], "\n}\n\nif ($FunctionsOnly)")
+	if publishEnd < 0 {
+		t.Fatal("could not isolate artifact publication function")
+	}
+	publishFunction := buildScript[publishOffset : publishOffset+publishEnd]
+	if strings.Contains(publishFunction, "Assert-SafeArtifactDirectory -Path $StagedPath") {
+		t.Fatal("temporary staged output is still incorrectly required to live under the artifact root")
+	}
+	requireSubstringsInOrder(t, publishFunction,
+		"Assert-SafeStagedPublishDirectory -Path $StagedPath",
+		"Assert-SameVolumeArtifactPublish -StagedPath $StagedPath -PublishedPath $PublishedPath",
+		"Move-Item -LiteralPath $PublishedPath -Destination $PreviousPath",
+	)
+}
+
 func TestBuildRejectsAnyUntrackedModuleFile(t *testing.T) {
 	powerShell, err := exec.LookPath("powershell")
 	if err != nil {
@@ -599,9 +634,11 @@ $ErrorActionPreference = 'Stop'
 . $BuildScript -FunctionsOnly
 $ArtifactsRoot = [System.IO.Path]::GetFullPath($TestArtifactRoot)
 $published = Join-Path $ArtifactsRoot 'published'
-$staged = Join-Path $ArtifactsRoot 'staged'
 $backup = Join-Path $ArtifactsRoot 'backup'
-New-Item -ItemType Directory -Path $published, $staged -Force | Out-Null
+$StagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('spota-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+$StagedPublishDirectory = Join-Path $StagingDirectory 'p'
+$staged = $StagedPublishDirectory
+New-Item -ItemType Directory -Path $published, $StagingDirectory, $staged -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $published 'old.txt') -Value old
 $script:moveCount = 0
 function Move-Item {
