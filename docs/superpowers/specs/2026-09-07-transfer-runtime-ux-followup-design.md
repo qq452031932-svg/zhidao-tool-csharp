@@ -24,7 +24,7 @@ The managed browser share submission path gains a fixed `embed extraction code i
 The observed successful share result is normalized at the trusted boundary:
 
 - A URL that already contains `pwd=<effective code>` is preserved.
-- A successful result that provides a base share URL and a separately verified effective code is stored and exported as the canonical URL plus `?pwd=<code>`.
+- A successful result that provides a base share URL and a separately verified effective code is stored and exported with a query-aware `pwd=<code>` upsert. Existing query parameters and fragments are preserved; `pwd` is never duplicated.
 - A URL containing a different `pwd` than the verified effective code is rejected as inconsistent.
 - Query parameters are never duplicated and the extraction code is never logged.
 
@@ -48,6 +48,15 @@ Immediately after a batch is created:
 - when the batch reaches a terminal status, unresolved presentation rows show `任务已结束，请查看结果`, avoiding a false per-row success claim.
 
 For replication, multiple operations can correspond to one source row, so authoritative per-account success and failure remain on the result page. The pending page is a batch-stage summary, not a replacement for operation results.
+
+When exact results are available, all operations for the same candidate sequence are aggregated deterministically:
+
+- show `已完成` only when every required transfer and share for every participating account succeeded, including reuse of a valid existing share;
+- show `有问题，请查看结果` if any operation failed, was cancelled, paused, or entered an uncertain/reconcile-required state, even when another account succeeded;
+- otherwise show `处理中` while any operation is queued, reserved, preparing, submitting, or waiting for its linked share;
+- if the batch is terminal but the current import page has no exact loaded operation details, show `任务已结束，请查看结果` rather than guessing success.
+
+Tests cover one candidate sequence with success plus failure, success plus running, and success plus uncertain results so a partial outcome can never appear as full success.
 
 ## Batch paste input
 
