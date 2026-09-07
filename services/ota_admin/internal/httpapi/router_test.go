@@ -332,6 +332,72 @@ func TestForcedPasswordChangeBlocksPrivilegeAndRotationRevokesEveryOldSession(t 
 	}
 }
 
+func TestPasswordChangeEnforcesCharacterMinimum(t *testing.T) {
+	const (
+		sevenCodePoints = "密码密码密码a"
+		eightCodePoints = "密码密码密码ab"
+	)
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *harness) (*http.Cookie, string, string)
+	}{
+		{
+			name: "forced first change",
+			prepare: func(t *testing.T, h *harness) (*http.Cookie, string, string) {
+				cookie, csrf, mustChange, response := login(t, h, oldPassword)
+				if response.Code != http.StatusOK || !mustChange {
+					t.Fatalf("initial login status=%d must_change=%v body=%s", response.Code, mustChange, response.Body.String())
+				}
+				return cookie, csrf, oldPassword
+			},
+		},
+		{
+			name: "later voluntary change",
+			prepare: func(t *testing.T, h *harness) (*http.Cookie, string, string) {
+				cookie, csrf, mustChange, response := login(t, h, oldPassword)
+				if response.Code != http.StatusOK || !mustChange {
+					t.Fatalf("initial login status=%d must_change=%v body=%s", response.Code, mustChange, response.Body.String())
+				}
+				body, _ := json.Marshal(map[string]string{"current_password": oldPassword, "new_password": newPassword})
+				changed := h.request(http.MethodPost, "/admin/api/session/password", string(body), csrf, cookie)
+				if changed.Code != http.StatusOK {
+					t.Fatalf("initial password change status=%d body=%s", changed.Code, changed.Body.String())
+				}
+				return cookieNamed(t, changed, "ota_admin_session"), decodeBody(t, changed)["csrf_token"].(string), newPassword
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			cookie, csrf, currentPassword := test.prepare(t, h)
+
+			rejectedBody, _ := json.Marshal(map[string]string{"current_password": currentPassword, "new_password": sevenCodePoints})
+			rejected := h.request(http.MethodPost, "/admin/api/session/password", string(rejectedBody), csrf, cookie)
+			if rejected.Code != http.StatusBadRequest || decodeBody(t, rejected)["code"] != "password_rejected" {
+				t.Fatalf("seven-code-point change status=%d body=%s", rejected.Code, rejected.Body.String())
+			}
+
+			acceptedBody, _ := json.Marshal(map[string]string{"current_password": currentPassword, "new_password": eightCodePoints})
+			accepted := h.request(http.MethodPost, "/admin/api/session/password", string(acceptedBody), csrf, cookie)
+			if accepted.Code != http.StatusOK || decodeBody(t, accepted)["must_change_password"] != false {
+				t.Fatalf("eight-code-point change status=%d body=%s", accepted.Code, accepted.Body.String())
+			}
+			rotated := cookieNamed(t, accepted, "ota_admin_session")
+			rotatedCSRF, _ := decodeBody(t, accepted)["csrf_token"].(string)
+			if rotated.Value == cookie.Value || rotatedCSRF == "" || rotatedCSRF == csrf {
+				t.Fatal("successful password change did not rotate session and CSRF credentials")
+			}
+			if response := h.request(http.MethodGet, "/admin/api/session/current", "", "", cookie); response.Code != http.StatusUnauthorized {
+				t.Fatalf("pre-rotation session remained valid: %d", response.Code)
+			}
+			if _, _, mustChange, response := login(t, h, eightCodePoints); response.Code != http.StatusOK || mustChange {
+				t.Fatalf("accepted password login status=%d must_change=%v body=%s", response.Code, mustChange, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestCurrentSessionRotatesCSRFSoARefreshedPageCanMutate(t *testing.T) {
 	h := newHarness(t)
 	cookie, csrf, _, _ := login(t, h, oldPassword)

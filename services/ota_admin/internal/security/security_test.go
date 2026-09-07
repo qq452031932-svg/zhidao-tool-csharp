@@ -29,6 +29,32 @@ func TestPasswordAndRandomTokensAreHashedAndComparedSafely(t *testing.T) {
 	}
 }
 
+func TestHashPasswordEnforcesCharacterMinimum(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		wantOK   bool
+	}{
+		{name: "seven ASCII characters", password: "1234567"},
+		{name: "eight ASCII characters", password: "12345678", wantOK: true},
+		{name: "seven Unicode code points", password: "密码密码密码a"},
+		{name: "eight Unicode code points", password: "密码密码密码ab", wantOK: true},
+		{name: "1024 UTF-8 bytes", password: strings.Repeat("密", 341) + "a", wantOK: true},
+		{name: "1025 UTF-8 bytes", password: strings.Repeat("密", 341) + "ab"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hash, err := HashPassword(test.password, bytes.NewReader(bytes.Repeat([]byte{1}, 16)))
+			if test.wantOK && (err != nil || hash == "") {
+				t.Fatalf("HashPassword() hash=%q err=%v, want success", hash, err)
+			}
+			if !test.wantOK && err == nil {
+				t.Fatalf("HashPassword() succeeded for %d bytes, want rejection", len(test.password))
+			}
+		})
+	}
+}
+
 func TestOriginValidationAndForwardedSourceTrustAreStrict(t *testing.T) {
 	request := httptest.NewRequest("POST", "http://backend/admin/api/test", nil)
 	request.Header.Set("Origin", "https://ota.fanfh.cn:443")

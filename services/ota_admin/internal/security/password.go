@@ -7,17 +7,18 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
 
 const (
-	MinimumPasswordBytes = 16
-	MaximumPasswordBytes = 1024
+	MinimumPasswordCharacters = 8
+	MaximumPasswordBytes      = 1024
 )
 
 func HashPassword(password string, random io.Reader) (string, error) {
-	if len(password) < MinimumPasswordBytes || len(password) > MaximumPasswordBytes {
+	if utf8.RuneCountInString(password) < MinimumPasswordCharacters || len(password) > MaximumPasswordBytes {
 		return "", errors.New("password length is outside the allowed range")
 	}
 	if random == nil {
