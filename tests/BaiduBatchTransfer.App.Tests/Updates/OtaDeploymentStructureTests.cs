@@ -32,6 +32,8 @@ public sealed class OtaDeploymentStructureTests
 
         Assert.Contains("User=superpan-ota-admin", unit, StringComparison.Ordinal);
         Assert.Contains("Group=superpan-ota-admin", unit, StringComparison.Ordinal);
+        Assert.Contains("UMask=0077", unit, StringComparison.Ordinal);
+        Assert.DoesNotContain("UMask=0027", unit, StringComparison.Ordinal);
         Assert.Contains("ExecStart=/opt/superpan-ota-admin/ota-admin serve --config /etc/superpan-ota-admin/config.json", unit, StringComparison.Ordinal);
         Assert.Contains("NoNewPrivileges=true", unit, StringComparison.Ordinal);
         Assert.Contains("PrivateTmp=true", unit, StringComparison.Ordinal);
@@ -109,6 +111,18 @@ public sealed class OtaDeploymentStructureTests
         Assert.Contains("systemctl is-active --quiet \"$SERVICE_NAME\"", install, StringComparison.Ordinal);
         Assert.Contains("INSTALL_SUCCEEDED=false", install, StringComparison.Ordinal);
         Assert.Contains("trap report_install_result EXIT", install, StringComparison.Ordinal);
+        Assert.Contains("SERVICE_WAS_ACTIVE=false", install, StringComparison.Ordinal);
+        Assert.Contains("SERVICE_STOP_REQUESTED=false", install, StringComparison.Ordinal);
+        Assert.Contains("if [ \"$SERVICE_WAS_ACTIVE\" = true ] && [ \"$SERVICE_STOP_REQUESTED\" = true ]", install, StringComparison.Ordinal);
+        Assert.Contains("systemctl start \"$SERVICE_NAME\"", install, StringComparison.Ordinal);
+        Assert.True(
+            install.IndexOf("record_unit_active_state \"$SERVICE_NAME\"", StringComparison.Ordinal) is var recordActive && recordActive >= 0 &&
+            install.IndexOf("SERVICE_WAS_ACTIVE=true", recordActive, StringComparison.Ordinal) is var rememberActive && rememberActive > recordActive &&
+            install.IndexOf("SERVICE_STOP_REQUESTED=true", rememberActive, StringComparison.Ordinal) is var requestStop && requestStop > rememberActive &&
+            install.IndexOf("systemctl stop \"$SERVICE_NAME\"", requestStop, StringComparison.Ordinal) is var stopService && stopService > requestStop &&
+            install.IndexOf("runuser -u \"$SERVICE_USER\" -- \"$BINARY_TARGET\" init-admin", stopService, StringComparison.Ordinal) is var initializeAdmin && initializeAdmin > stopService &&
+            install.IndexOf("systemctl restart \"$SERVICE_NAME\"", initializeAdmin, StringComparison.Ordinal) > initializeAdmin,
+            "A live OTA service must be stopped before the installer opens SQLite and restarted afterward.");
     }
 
     [Fact]

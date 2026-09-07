@@ -181,10 +181,20 @@ chown root:root "$BACKUP_DIR"
 chmod 0700 "$BACKUP_DIR"
 
 INSTALL_SUCCEEDED=false
+SERVICE_WAS_ACTIVE=false
+SERVICE_STOP_REQUESTED=false
 report_install_result() {
     local status=$?
     trap - EXIT
     if [ "$INSTALL_SUCCEEDED" != true ]; then
+        if [ "$SERVICE_WAS_ACTIVE" = true ] && [ "$SERVICE_STOP_REQUESTED" = true ] &&
+           ! systemctl is-active --quiet "$SERVICE_NAME"; then
+            if systemctl start "$SERVICE_NAME"; then
+                printf '%s\n' "Recovered previously active ${SERVICE_NAME} after installation failure." >&2
+            else
+                printf '%s\n' "WARNING: failed to recover previously active ${SERVICE_NAME}." >&2
+            fi
+        fi
         cat >&2 <<EOF
 Installation did not complete. Backup: ${BACKUP_DIR}
 Rollback (run as root): restore only the named targets and prior unit states recorded in ${BACKUP_DIR}, then validate Nginx.
@@ -264,6 +274,9 @@ record_unit_active_state() {
 }
 record_unit_active_state "$SERVICE_NAME"
 record_unit_active_state "$MOUNT_UNIT_NAME"
+if systemctl is-active --quiet "$SERVICE_NAME"; then
+    SERVICE_WAS_ACTIVE=true
+fi
 
 if ! getent group superpan-ota-admin >/dev/null; then
     groupadd --system "$SERVICE_GROUP"
@@ -334,6 +347,11 @@ if [ -e "$PASSWORD_TEMP" ] || [ -L "$PASSWORD_TEMP" ]; then
     else
         unlink "$PASSWORD_TEMP"
     fi
+fi
+if [ "$SERVICE_WAS_ACTIVE" = true ]; then
+    SERVICE_STOP_REQUESTED=true
+    systemctl stop "$SERVICE_NAME"
+    systemctl is-active --quiet "$SERVICE_NAME" && die "failed to stop ${SERVICE_NAME} before database initialization"
 fi
 runuser -u "$SERVICE_USER" -- "$BINARY_TARGET" init-admin --if-missing --config "$CONFIG_TARGET" >"$PASSWORD_TEMP"
 if [ -s "$PASSWORD_TEMP" ]; then

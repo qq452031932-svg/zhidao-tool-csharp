@@ -70,6 +70,7 @@ type evidence struct {
 }
 
 func main() {
+	unix.Umask(0o077)
 	rootFlag := flag.String("root", "", "caller-created empty isolated publication root")
 	failureFlag := flag.String("failure-point", "", "enumerated durability boundary")
 	flag.Parse()

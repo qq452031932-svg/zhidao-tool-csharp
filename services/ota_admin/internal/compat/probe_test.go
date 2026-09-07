@@ -178,6 +178,10 @@ func TestDeploymentScriptsPinRemoteVerificationInputs(t *testing.T) {
 	}
 
 	runner := readRepositoryFile(t, "deploy", "probe", "run-centos7-probe.sh")
+	normalizedRunner := strings.ReplaceAll(runner, "\r\n", "\n")
+	if !strings.HasPrefix(normalizedRunner, "#!/usr/bin/env bash\nset -euo pipefail\numask 077\n") {
+		t.Fatal("CentOS runner does not establish a private umask before Linux Go tests")
+	}
 	for _, required := range []string{
 		"go1.27.1.linux-amd64.tar.gz",
 		"63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445",
@@ -358,6 +362,31 @@ func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testi
 		`& powershell -NoProfile -ExecutionPolicy Bypass -File $BootstrapScript`,
 		`test -p=1 ./...`,
 	)
+}
+
+func TestLinuxStateVerificationDoesNotOpenSQLiteTargetsAfterConnection(t *testing.T) {
+	t.Parallel()
+
+	source := strings.ReplaceAll(readRepositoryFile(t, "internal", "store", "state_path_linux.go"), "\r\n", "\n")
+	start := strings.Index(source, "func verifyPinnedStateFiles")
+	if start < 0 {
+		t.Fatal("Linux state path implementation does not define verifyPinnedStateFiles")
+	}
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not isolate verifyPinnedStateFiles")
+	}
+	verification := source[start : start+end]
+	for _, prohibited := range []string{"unix.Openat", "unix.Close", "unix.Fchmod"} {
+		if strings.Contains(verification, prohibited) {
+			t.Errorf("post-open SQLite state verification still uses %s", prohibited)
+		}
+	}
+	for _, required := range []string{"unix.Fstatat", "unix.AT_SYMLINK_NOFOLLOW"} {
+		if !strings.Contains(verification, required) {
+			t.Errorf("post-open SQLite state verification does not use %s", required)
+		}
+	}
 }
 
 func TestBuildOnlyRemovesValidatedUniqueSystemTempStagingRoot(t *testing.T) {

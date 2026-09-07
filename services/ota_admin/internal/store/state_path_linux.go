@@ -65,7 +65,7 @@ func prepareStatePath(path string) (*statePathHandle, error) {
 	}
 	h := &statePathHandle{sqlitePath: fmt.Sprintf("/proc/self/fd/%d/%s", dirFD, base), close: func() error { return unix.Close(dirFD) }}
 	h.verify = func() error {
-		return verifyPinnedStateFiles(dirFD, base, existed, databaseIdentity.Dev, databaseIdentity.Ino)
+		return verifyPinnedStateFiles(dirFD, base, databaseIdentity.Dev, databaseIdentity.Ino)
 	}
 	return h, nil
 }
@@ -107,9 +107,10 @@ func validateOpenedStateFile(fd int) error {
 	return validateStateFileMetadata(stat.Uid, uint32(os.Geteuid()), os.FileMode(stat.Mode), stat.Mode&unix.S_IFMT == unix.S_IFREG, false, uint64(stat.Nlink))
 }
 
-func verifyPinnedStateFiles(dirFD int, base string, existed map[string]bool, databaseDevice uint64, databaseInode uint64) error {
+func verifyPinnedStateFiles(dirFD int, base string, databaseDevice uint64, databaseInode uint64) error {
 	for _, name := range []string{base, base + "-wal", base + "-shm"} {
-		fd, err := unix.Openat(dirFD, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		var stat unix.Stat_t
+		err := unix.Fstatat(dirFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 		if errors.Is(err, unix.ENOENT) {
 			if name == base {
 				return errors.New("main database disappeared after secure open")
@@ -119,26 +120,12 @@ func verifyPinnedStateFiles(dirFD int, base string, existed map[string]bool, dat
 		if err != nil {
 			return err
 		}
-		var stat unix.Stat_t
-		if err := unix.Fstat(fd, &stat); err != nil {
-			unix.Close(fd)
-			return err
-		}
-		if !existed[name] && stat.Uid == uint32(os.Geteuid()) && stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Nlink == 1 {
-			if err := unix.Fchmod(fd, 0o600); err != nil {
-				unix.Close(fd)
-				return err
-			}
-		}
-		if err := validateOpenedStateFile(fd); err != nil {
-			unix.Close(fd)
+		if err := validateStateFileMetadata(stat.Uid, uint32(os.Geteuid()), os.FileMode(stat.Mode), stat.Mode&unix.S_IFMT == unix.S_IFREG, stat.Mode&unix.S_IFMT == unix.S_IFLNK, uint64(stat.Nlink)); err != nil {
 			return err
 		}
 		if name == base && (uint64(stat.Dev) != databaseDevice || stat.Ino != databaseInode) {
-			unix.Close(fd)
 			return errors.New("database identity changed after secure open")
 		}
-		unix.Close(fd)
 	}
 	return nil
 }

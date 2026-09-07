@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 readonly VERIFY_ROOT="/root/superpan-ota-admin-verify"
 readonly UNIT_NAME="superpan-ota-admin-probe.service"

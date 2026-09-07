@@ -4,11 +4,133 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
+
+const siblingSQLitePathEnvironment = "OTA_ADMIN_SIBLING_SQLITE_PATH"
+
+func TestMain(m *testing.M) {
+	previous := unix.Umask(0o077)
+	code := m.Run()
+	unix.Umask(previous)
+	os.Exit(code)
+}
+
+func TestOpenKeepsSQLitePOSIXLockAcrossStatePathVerification(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "state.db")
+	database, err := Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.statePath.Verify(); err != nil {
+		t.Fatalf("verify live state path: %v", err)
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=^TestSQLiteExclusiveLockHelper$")
+	command.Env = append(os.Environ(), siblingSQLitePathEnvironment+"="+databasePath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("SQLite shared lock was lost after state-path verification: %v\n%s", err, output)
+	}
+}
+
+func TestSQLiteExclusiveLockHelper(t *testing.T) {
+	databasePath := os.Getenv(siblingSQLitePathEnvironment)
+	if databasePath == "" {
+		t.Skip("SQLite lock helper")
+	}
+	fd, err := unix.Open(databasePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0x40000000, Len: 512}
+	if err := unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &lock); errors.Is(err, unix.EACCES) || errors.Is(err, unix.EAGAIN) {
+		return
+	} else if err != nil {
+		t.Fatalf("probe SQLite lock: %v", err)
+	}
+	t.Fatal("acquired an exclusive SQLite lock while Store remained open")
+}
+
+func TestOpenKeepsSQLiteWALSidecarsPinnedAcrossSiblingConnectionClose(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(root, "state.db")
+	database, err := Open(context.Background(), databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.statePath.Verify(); err != nil {
+		t.Fatalf("verify live state path: %v", err)
+	}
+
+	type identity struct{ device, inode uint64 }
+	before := make(map[string]identity)
+	for _, path := range []string{databasePath + "-wal", databasePath + "-shm"} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("stat live SQLite sidecar %s: %v", path, err)
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		before[path] = identity{device: uint64(stat.Dev), inode: stat.Ino}
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=^TestSiblingSQLiteOpenCloseHelper$")
+	command.Env = append(os.Environ(), siblingSQLitePathEnvironment+"="+databasePath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("sibling SQLite connection failed: %v\n%s", err, output)
+	}
+
+	for path, want := range before {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("live SQLite sidecar was removed after sibling close: %s: %v", path, err)
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		if got := (identity{device: uint64(stat.Dev), inode: stat.Ino}); got != want {
+			t.Fatalf("live SQLite sidecar identity changed after sibling close: %s: got %+v, want %+v", path, got, want)
+		}
+	}
+}
+
+func TestSiblingSQLiteOpenCloseHelper(t *testing.T) {
+	databasePath := os.Getenv(siblingSQLitePathEnvironment)
+	if databasePath == "" {
+		t.Skip("sibling SQLite helper")
+	}
+	database, err := sql.Open("sqlite", databaseURI(databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := database.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		_ = database.Close()
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestOpenCreatesPrivateUnlinkedStateFiles(t *testing.T) {
 	root := t.TempDir()

@@ -28,6 +28,7 @@ func TestAcceptanceHarnessIsBuildTaggedAndIsolatedFromProduction(t *testing.T) {
 		"upload.NewReceiver",
 		"candidate.NewService",
 		"RevalidateForConfirm",
+		"unix.Umask(0o077)",
 		"/proc/self/cgroup",
 		"/proc/1/comm",
 	} {
