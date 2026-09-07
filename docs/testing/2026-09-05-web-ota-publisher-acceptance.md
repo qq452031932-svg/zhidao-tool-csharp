@@ -97,3 +97,19 @@
 更新后 `superpan-ota-admin.service` 与 `var-lib-otaadmin-releases.mount` 仍为 `active`、`enabled`，端口仍仅绑定 loopback；部署二进制与预期 SHA-256 一致，Nginx 配置检查通过。真实公网 `https://ota.fanfh.cn/admin/` 返回 `200`，保留 `Cache-Control: no-store`、CSP 和 `X-Frame-Options: DENY`，页面包含“至少 8 位”且不包含“至少 16 位”。OTA `/health`、TLS 证书、两个 vhost、`f.fanfh.cn` fullchain、可信正文及完整业务目录 metadata 均与变更前一致。更新时间窗内服务日志的秘密关键词扫描为零。
 
 远端部署暂存目录在确认绝对路径、`0700 root:root`、无符号链接且无挂载后已删除；临时只读数据库校验器也已从本机忽略目录删除。安装器备份继续保留。生产稳定渠道仍未发布版本，上一节列出的首次登录改密、正式候选上传发布及客户端验收步骤仍未完成。
+
+## 2026-09-07 首次 `1.0.6` 生产发布与 WAL 锁修复
+
+用户在真实 `https://ota.fanfh.cn/admin/` 登录后，上传并明确确认发布重新从当前审核源码构建的 `1.0.6`。上传包为 `287037100` 字节，SHA-256 为 `805018e169f2ff2561b6fa73ee2c137b0898cfb8ef5cedf954a7f2eb5e8ffb53`；后台七项校验全部通过。生产 `stable` 当前指向 `generations/release-d32d1b26-f69c-4664-9c17-d93b8e7b4130`，包含三个 feed/catalog 文件、Setup、Portable、full nupkg、manifest 与 manifest 签名共八个常规文件。`upload-manifest.sha256` 引用的六项资产均通过服务器端 `sha256sum -c`，公网逐文件哈希与本地上传包一致，RSA 签名验证通过。
+
+发布后验收发现服务进程仍持有已 unlink 的非空 `state.db-wal`，路径上的 WAL 则为另一 inode 的空文件；外部只读连接因此暂时看不到已经提交的发布账本。根因定位为 Linux `store.Open` 在 SQLite 打开后执行安全校验时，对 DB/WAL/SHM 使用裸 `open/close`，触发 POSIX“同进程关闭同 inode 任一 fd 会释放该进程全部 record locks”的语义。修复提交 `815faac` 将 post-open 校验改为 `Fstatat(AT_SYMLINK_NOFOLLOW)`，保留 owner、类型、模式、链接数及主库 dev/inode 校验但不再打开目标 fd；生产 unit、安装器、验收程序和 CentOS probe 统一使用 `umask 077`，安装器也会在任何外部 `init-admin` SQLite 打开之前先停止原 active 服务，并在安装失败时恢复原状态。
+
+恢复前在服务短暂 `SIGSTOP` 的一致窗口内，从 `/proc/27373/fd/6` 与仍存活的 deleted WAL fd10 取得主库和 WAL 字节快照并逐一 fsync；原始证据保存在 root-only `/root/ota-recovery-evidence-20260907T0618Z`，早期对照证据保存在 `/root/ota-postpublish-evidence-20260907T0606Z`。不复制 SHM 作为恢复输入。两个独立 clone 均由现代 SQLite 完成 WAL replay/checkpoint；`integrity_check=ok`、schema v6、floor/current release `1.0.6`、六项 release asset、published candidate、upload/publish 两项 succeeded/completed operation、零 pending/lease 均通过，关闭后仅靠主库再次打开仍得到相同业务状态。
+
+在恢复副本验证完成后执行受控 graceful stop；SQLite 成功把 orphan WAL 落回主库并移除 sidecar，因此没有执行数据库替换。停服后的主库复制品再次得到 `integrity_check=ok`、schema v6、floor/current `1.0.6`、六项 asset、published candidate、全部 operation terminal、零 pending。随后部署 `815faac` 构建的 Linux/amd64 修复二进制，SHA-256 为 `27ac208e19a60c3db1c11532522c1e9d2264211d6e659ebdab0086cbffba4e25`；安装器备份为 `/var/backups/superpan-ota-admin/20260907T070515Z.JT1qku`。
+
+修复门禁包括：不可变 Git archive 源码快照的 `go test ./... -count=1` 和 `go vet ./...` 全通过；Windows `OtaDeploymentStructureTests` 为 `7/7`；Linux store 回归二进制在真实 CentOS 7 上对 POSIX 锁保持和 sibling SQLite open/close 后 WAL/SHM inode 不变连续运行十轮并通过。重启后的生产进程二进制哈希与预期一致，unit 为 `UMask=0077`，DB/WAL/SHM 均为服务用户 `0600`、nlink 1，三个 fd 均指向有名字的当前文件；再执行一次外部 PHP SQLite read-only open/close 后 WAL/SHM inode 保持不变。服务和 bind mount 均为 active/enabled，后台只监听 loopback，loopback 与公网 `/admin/` 均返回 `200`，Nginx 配置检查通过，staging 已为空。
+
+`f.fanfh.cn` vhost SHA-256 仍为 `1df7a78877eb37a896166c900b23a7f30c27c8dc959949f6ed6939116d09e05b`，可信正文 SHA-256 仍为 `2d3495515de1c91186a799994d494e261efda5adeb7e4d2ac16d85bb373e2bfb`；OTA vhost SHA-256 仍为 `23046876bdd83b91eb64156c6b8a1ec7eaa321bcb42f14db3dcedbab58971786`。本次只删除了三个本任务创建并已核实为 root-only 的临时测试/部署目录；两份恢复证据与安装器回滚备份继续保留。服务重启按设计撤销旧后台会话，浏览器需要重新登录一次。
+
+客户端固定 SPKI 的真实生产 feed 读取测试已接受 `1.0.6` 并识别 canonical full nupkg；尚未执行真实已安装客户端的下载、应用更新和自动重启，因此这三项仍属于后续客户端验收，不应写成已经通过。
