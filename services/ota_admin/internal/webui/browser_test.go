@@ -72,6 +72,7 @@ func newBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 	loggedIn := mode == "failure"
 	releaseReads := 0
 	candidateReads := 0
+	passwordRequests := 0
 	published := false
 	refreshRelease := make(chan struct{})
 	var refreshReleaseOnce sync.Once
@@ -130,6 +131,7 @@ func newBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 		case "/admin/api/session/password":
 			mu.Lock()
 			recordMutation(request, false)
+			passwordRequests++
 			csrf = "csrf-password"
 			mu.Unlock()
 			writeBrowserJSON(response, http.StatusOK, map[string]any{"csrf_token": "csrf-password"})
@@ -175,7 +177,7 @@ func newBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 		case "/test/assertions":
 			mu.Lock()
 			defer mu.Unlock()
-			writeBrowserJSON(response, http.StatusOK, map[string]any{"publish_keys": publishKeys, "rollback_keys": rollbackKeys, "protocol_failures": protocolFailures})
+			writeBrowserJSON(response, http.StatusOK, map[string]any{"password_requests": passwordRequests, "publish_keys": publishKeys, "rollback_keys": rollbackKeys, "protocol_failures": protocolFailures})
 		default:
 			if strings.HasSuffix(request.URL.Path, "/publish") {
 				mu.Lock()
@@ -297,7 +299,15 @@ try {
     document.getElementById("login-form").requestSubmit();
     await waitFor(() => !document.getElementById("password-view").hidden, "首次强制改密");
     assert(document.getElementById("login-password").value === "", "登录密码未及时清空");
-    document.getElementById("new-password").value = "replacement-browser-password";
+    const newPassword = document.getElementById("new-password");
+    newPassword.value = "密码密码密码a";
+    document.getElementById("password-form").requestSubmit();
+    await waitFor(() => !document.getElementById("password-error").hidden, "七位密码客户端拒绝");
+    assert(document.activeElement === newPassword, "客户端拒绝后未聚焦新密码");
+    assert(!document.getElementById("password-view").hidden, "七位密码错误离开改密页");
+    const rejectedPassword = await (await fetch("/test/assertions")).json();
+    assert(rejectedPassword.password_requests === 0, "七位密码错误请求了改密接口");
+    newPassword.value = "密码密码密码ab";
     document.getElementById("password-form").requestSubmit();
     await waitFor(() => !document.getElementById("console-view").hidden, "改密后控制台");
     assert(document.getElementById("current-password").value === "" && document.getElementById("new-password").value === "", "改密后密码字段未清空");
@@ -380,6 +390,7 @@ try {
   const protocol = await (await fetch("/test/assertions")).json();
   assert(protocol.protocol_failures.length === 0, "浏览器请求缺少安全头或Cookie：" + protocol.protocol_failures.join(","));
   if (window.__mode === "happy") {
+    assert(protocol.password_requests === 1, "八位密码未恰好请求一次改密接口");
     assert(protocol.publish_keys.length === 2 && protocol.publish_keys[0] === protocol.publish_keys[1], "重复发布未沿用幂等键");
     assert(protocol.rollback_keys.length === 2 && protocol.rollback_keys[0] === protocol.rollback_keys[1], "重复回滚未沿用幂等键");
   }

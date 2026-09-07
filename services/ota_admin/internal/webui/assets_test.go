@@ -17,13 +17,13 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 		`校验清单`, `确认发布`, `版本历史`, `操作者`, `回滚到此版本`, `当前管理员密码`,
 		`id="loading-state"`, `id="empty-state"`, `id="error-state"`, `id="readonly-state"`,
 		`aria-live="polite"`, `aria-describedby=`, `<progress`, `<dialog`, `<label`,
-		`class="visually-hidden-file"`,
+		`class="visually-hidden-file"`, `至少 8 位`,
 	} {
 		if !strings.Contains(index, required) {
 			t.Errorf("index missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"webkitdirectory", `type="text" name="path"`, "http://", "https://", "document.write", "eval("} {
+	for _, forbidden := range []string{"webkitdirectory", `type="text" name="path"`, `至少 16 位`, `minlength="16"`, "http://", "https://", "document.write", "eval("} {
 		if strings.Contains(index, forbidden) {
 			t.Errorf("index contains forbidden capability %q", forbidden)
 		}
@@ -37,7 +37,7 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	}
 
 	script := requestAsset(t, handler, "/admin/app.js")
-	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "XMLHttpRequest", "crypto.randomUUID", "showModal"} {
+	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "Array.from(value).length", "XMLHttpRequest", "crypto.randomUUID", "showModal"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("script missing %q", required)
 		}

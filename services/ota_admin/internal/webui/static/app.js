@@ -18,6 +18,7 @@ const gateNames = ["package", "channel", "version", "signature", "files", "refer
 
 const byId = (id) => document.getElementById(id);
 const views = ["login-view", "password-view", "console-view"];
+const passwordGuidance = "请使用至少 8 位、与临时密码不同的密码。";
 const errorMessages = {
   authentication_failed: "账号或密码不正确，或者登录已经失效。",
   password_rejected: "当前密码不正确，或新密码不符合要求。",
@@ -58,6 +59,10 @@ function clearPageError() { byId("error-state").hidden = true; }
 function messageFor(error, fallback) {
   if (error && error.code && errorMessages[error.code]) return errorMessages[error.code];
   return fallback || "操作失败，请稍后重试。";
+}
+
+function codePointLength(value) {
+  return Array.from(value).length;
 }
 
 function showToast(message) {
@@ -174,8 +179,15 @@ async function login(event) {
 async function changePassword(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const button = form.querySelector("button[type='submit']");
   const errorBox = byId("password-error");
+  const newPassword = form.elements.new_password;
+  if (codePointLength(newPassword.value) < 8) {
+    errorBox.textContent = passwordGuidance;
+    errorBox.hidden = false;
+    newPassword.focus();
+    return;
+  }
+  const button = form.querySelector("button[type='submit']");
   button.disabled = true;
   errorBox.hidden = true;
   try {
