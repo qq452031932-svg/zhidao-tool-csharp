@@ -77,3 +77,23 @@
 7. 在发布存在后执行完整 `deploy/ota-admin/verify.sh`，复核 stable 下载哈希、元数据 no-cache、版本资产 immutable、端口隔离、停服恢复 trap 和本机/公网 TLS。
 8. 重新取得部署后的 Windows 可信 `f.fanfh.cn` 正文哈希，并执行既有证书续期 dry-run，补齐三项不可变基线与续期健康的最终证据。
 完成以上步骤前，最终门禁仍是关闭状态；不得把生产 OTA 标记为完整上线。
+
+## 2026-09-07 八位密码最低长度更新
+
+本次仅更新隔离的 `ota.fanfh.cn` OTA 管理后台，使管理员密码最低长度由十六位调整为八个 Unicode 字符；1024 字节上限及其他安全控制均未改变。没有上传或发布 `1.0.6`，没有创建 `stable`，没有修改 `f.fanfh.cn` 业务文件，也没有读取、输出、哈希或修改管理员密码、初始密码、HMAC、Cookie 或私钥。
+
+部署前的本地全量 `go test ./... -count=1` 覆盖 `15` 个 Go 包并全部通过，`go vet ./...` 通过。部署使用的正式 Linux/amd64 二进制 SHA-256 为 `1e76d2e504ccef00bd6b43ad8e1d0fa0a8fe82ca07b26686535318cd4224cd73`，可审计源码包 SHA-256 为 `888a383fd45cb74a9f4e3d5b9d32507afa0653a8b3db7ed59ab365075f1596b9`；公共发布证书 SHA-256 仍为 `9db0923f308826fcd16f1147ee7843446184d7efa4c4ccd83e9650c95c625b82`，固定 SPKI SHA-256 仍为 `f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff`。
+
+生产变更前重新建立并核对基线：服务与发布目录挂载均为 `active`、`enabled`，后台仅监听 `127.0.0.1:18091`；OTA vhost SHA-256 为 `23046876bdd83b91eb64156c6b8a1ec7eaa321bcb42f14db3dcedbab58971786`，公网 `/health` SHA-256 为 `31e6dc23df83ebfed036bba3fda706b8f1e8c5c7fef9ef0a602e6fac43c71cfb`，TLS 叶证书 DER SHA-256 为 `a8991c8980169a67245942fd4153cb68c392a7cbf00b1b40a504d6752a444faa`。`f.fanfh.cn` vhost、fullchain 和 Windows 可信正文基线分别仍为 `1df7a78877eb37a896166c900b23a7f30c27c8dc959949f6ed6939116d09e05b`、`67872e19e42938a94f371c46b8949f33161c9dbca5c7953b5c01e3c9c0a02434`、`2d3495515de1c91186a799994d494e261efda5adeb7e4d2ac16d85bb373e2bfb`；可信正文为 `200`、`60838` 字节。
+
+发布树基线包含空的 `generations`，以及部署前已存在且内容为空的 `.Recycle_bin`。后者以目录类型、`root:root`、模式 `0600`、大小、修改时间和空内容作为明确允许基线；安装器执行前后完整发布树逐行一致，两目录均保持为空，没有新增版本资产。
+
+生产数据库通过 SQLite Online Backup API 分别取得变更前后的一致快照，并以项目锁定的现代 SQLite 驱动完成 `PRAGMA quick_check`。除允许因服务重启变化的 `sessions`、`audit_events` 和 `sqlite_sequence` 外，数据库 schema 与全部表行完全一致；管理员密码哈希、`must_change_password`、永久版本 floor、releases/assets、candidates、operations、leases、cleanup 和 failure 状态均未改变。HMAC、初始密码文件和管理配置仅使用 `cmp` 做等同性判断，三项均通过且未输出内容或哈希。
+
+幂等安装器成功完成更新，保留的 root-only 回滚备份为：
+
+- `/var/backups/superpan-ota-admin/20260907T045239Z.tjZX1A`
+
+更新后 `superpan-ota-admin.service` 与 `var-lib-otaadmin-releases.mount` 仍为 `active`、`enabled`，端口仍仅绑定 loopback；部署二进制与预期 SHA-256 一致，Nginx 配置检查通过。真实公网 `https://ota.fanfh.cn/admin/` 返回 `200`，保留 `Cache-Control: no-store`、CSP 和 `X-Frame-Options: DENY`，页面包含“至少 8 位”且不包含“至少 16 位”。OTA `/health`、TLS 证书、两个 vhost、`f.fanfh.cn` fullchain、可信正文及完整业务目录 metadata 均与变更前一致。更新时间窗内服务日志的秘密关键词扫描为零。
+
+远端部署暂存目录在确认绝对路径、`0700 root:root`、无符号链接且无挂载后已删除；临时只读数据库校验器也已从本机忽略目录删除。安装器备份继续保留。生产稳定渠道仍未发布版本，上一节列出的首次登录改密、正式候选上传发布及客户端验收步骤仍未完成。
