@@ -142,7 +142,7 @@ scp -r deploy/ota-admin "root@106.52.168.109:$remoteStage/deploy/"
 On the server, require `0700 root:root` staging metadata, compare `sha256sum` of the transferred binary/certificate to `$binaryHash`/`$certificateHash`, and stop before mutation on any mismatch:
 
 ```powershell
-ssh root@106.52.168.109 "set -eu; cd '$remoteStage'; test \"`$(stat -c '%a:%U:%G' .)\" = '700:root:root'; test \"`$(sha256sum superpan-ota-admin-linux-amd64 | cut -d' ' -f1)\" = '$binaryHash'; test \"`$(sha256sum publisher.cer | cut -d' ' -f1)\" = '$certificateHash'; bash -n deploy/ota-admin/install.sh"
+ssh root@106.52.168.109 "set -eu; cd '$remoteStage'; test `"`$(stat -c '%a:%U:%G' .)`" = '700:root:root'; test `"`$(sha256sum superpan-ota-admin-linux-amd64 | cut -d' ' -f1)`" = '$binaryHash'; test `"`$(sha256sum publisher.cer | cut -d' ' -f1)`" = '$certificateHash'; bash -n deploy/ota-admin/install.sh"
 ```
 
 Use `python -c` with `sqlite3.connect('file:/var/lib/superpan-ota-admin/state.db?mode=ro', uri=True)` and `Connection.backup()` to create `$remoteStage/baseline/pre.db`. Copy `/etc/superpan-ota-admin/source-hmac.key`, `/root/superpan-ota-admin.initial-password`, and `/etc/superpan-ota-admin/config.json` into `baseline/` with mode `0600`; create sorted `find -printf '%P|%y|%u|%g|%m|%s\n'` snapshots for the OTA release tree and both business roots. Record `$sourceHash` only as build provenance; the installer does not receive the source bundle.
