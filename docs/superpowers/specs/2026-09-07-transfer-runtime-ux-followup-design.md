@@ -1,81 +1,82 @@
-# Transfer Runtime UX Follow-up Design
+# 批量转存运行体验补充设计
 
-## Goal
+## 目标
 
-Close four user-visible gaps in the direct-background transfer workflow:
+解决后台直连转存流程中五个用户可见的问题：
 
-1. Every newly created Baidu share is created with “分享链接自动填充提取码” enabled, so the generated URL itself carries the extraction code.
-2. The run log follows the newest entry and the app gives one clear completion notification.
-3. The import-facing “待处理链接” page no longer remains visually frozen after a batch starts.
-4. The toolbar accepts and imports many pasted links at once.
+1. 百度网盘创建分享时，必须勾选“分享链接自动填充提取码”，让生成的链接本身带有提取码。
+2. 运行日志自动跟随最新一条，并在整批任务结束后明确提示一次。
+3. 批次开始后，“待处理链接”界面不能一直停留在“就绪”。
+4. 顶部粘贴区域支持一次粘贴并导入多条链接。
+5. 导出的表格同时保留可直接使用的完整分享链接和独立提取码。
 
-## Scope and invariants
+## 范围与固定规则
 
-- Direct-background sharing remains permanent, access-unlimited, random-code, and regenerate-existing-share.
-- Embedding the extraction code in the generated URL is mandatory and has no user toggle.
-- The result workbook keeps both the generated share-link column and the extraction-code column. The link column must contain the distributable URL with `pwd`; the independent code column remains useful for searching and manual recovery.
-- The share action still has one authoritative dispatch. Failure to prove the embed-code option before dispatch is a pre-dispatch failure; an uncertain post-click state follows the existing reconcile/retry rules.
-- Existing imported rows remain immutable evidence. Runtime status is presentation state and must not rewrite original URLs, codes, or import decisions.
+- 后台直连分享继续使用：永久有效、不限制访问人数、随机提取码、重新生成已有分享。
+- 分享链接自动携带提取码是固定规则，不增加用户开关。
+- 结果表格同时保留“生成的分享链接”和“提取码”两列。链接列必须包含 `pwd` 参数，提取码列用于检索和手动处理。
+- 分享动作仍然只能提交一次。点击创建分享之前，如果无法确认“自动填充提取码”已被选中，则按提交前失败处理；点击后的结果如果不明确，则沿用现有的核对和重试规则。
+- 已导入的数据属于原始记录，不修改原链接、原提取码或导入判断。运行状态只作为界面展示状态。
 
-## Share creation and exported link
+## 创建分享与导出链接
 
-The managed browser share submission path gains a fixed `embed extraction code in link` invariant. Before the sole create-share click, the page bridge must select the matching Baidu option and prove it is selected together with permanent validity, unlimited access, and random/fixed code settings. The fixed helper protocol does not accept a caller-controlled selector or optional boolean.
+浏览器辅助程序增加固定规则：分享链接必须自动带上提取码。执行唯一一次“创建链接”点击之前，程序必须在百度网盘页面上选择并确认以下设置：永久有效、访问人数不限制、随机或指定提取码，以及“分享链接自动填充提取码”。调用方不能传入自定义选择器，也不能关闭这一规则。
 
-The observed successful share result is normalized at the trusted boundary:
+成功取得分享结果后，在可信边界统一处理链接：
 
-- A URL that already contains `pwd=<effective code>` is preserved.
-- A successful result that provides a base share URL and a separately verified effective code is stored and exported with a query-aware `pwd=<code>` upsert. Existing query parameters and fragments are preserved; `pwd` is never duplicated.
-- A URL containing a different `pwd` than the verified effective code is rejected as inconsistent.
-- Query parameters are never duplicated and the extraction code is never logged.
+- 如果链接已经包含 `pwd=<实际提取码>`，直接保留。
+- 如果返回的是基础分享链接和单独确认过的提取码，则按 URL 查询参数规则写入或更新 `pwd=<提取码>`；保留链接原有的其他查询参数和片段，不重复添加 `pwd`。
+- 如果链接中的 `pwd` 与实际确认的提取码不一致，则判定结果不一致，不能当作成功导出。
+- 日志中不记录提取码。
 
-This gives the recipient a directly usable link while preserving the independent extraction-code column.
+这样，接收方可以直接打开完整链接，同时表格中仍保留独立提取码列。
 
-## Live status, log following, and completion notification
+## 实时状态、日志跟随与完成提示
 
-`WorkspaceRunPanelViewModel` already refreshes the selected running batch. It will treat a transition from `Queued` or `Active` to a terminal status as a lifecycle event. A completed batch updates its status message and raises one completion notification for that batch during the current app session. Reopening an already completed historical batch must not show the notification again.
+`WorkspaceRunPanelViewModel` 已经会刷新当前运行批次。后续把状态从“排队中”或“运行中”转为终态视为一次生命周期事件。批次结束时更新状态文字，并且在当前软件运行期间只提示一次。重新打开已经结束的历史批次时，不重复弹出完成提示。
 
-The transfer workspace consumes the lifecycle event through the existing dialog abstraction and shows one concise message containing completion and failure counts when available. The same message is appended to the run log.
+转存界面通过现有弹窗机制接收该事件，显示一条简洁提示；能取得统计时，提示中包含完成数和失败数。同样的信息也写入运行日志。
 
-The log list follows its observable collection at the view layer. When a new entry arrives, the view scrolls that entry into view on the UI dispatcher. Subscriptions are removed when the view unloads, and reopening the view does not create duplicate handlers.
+日志列表在界面层监听日志集合。新增日志后，通过界面线程自动滚动到最后一条。界面关闭时解除监听，再次打开时不能重复注册监听事件。
 
-## Pending-list presentation
+## 待处理列表的状态展示
 
-Immediately after a batch is created:
+批次创建成功后立即执行以下变化：
 
-- the workspace switches to `处理结果` explicitly rather than depending on an indirect property-change race;
-- visible included import rows show `已进入任务`/`处理中` instead of remaining `就绪`;
-- periodic result refresh updates the current page’s presentation state where exact candidate-sequence results are available;
-- when the batch reaches a terminal status, unresolved presentation rows show `任务已结束，请查看结果`, avoiding a false per-row success claim.
+- 明确切换到“处理结果”页，不再依赖间接的属性变化触发。
+- 当前可见且参与任务的导入记录显示“已进入任务”或“处理中”，不再停留为“就绪”。
+- 定时刷新任务结果时，如果已经取得当前页对应序号的准确结果，就同步更新展示状态。
+- 批次结束后，对仍无法取得逐条准确结果的记录显示“任务已结束，请查看结果”，避免误报逐条成功。
 
-For replication, multiple operations can correspond to one source row, so authoritative per-account success and failure remain on the result page. The pending page is a batch-stage summary, not a replacement for operation results.
+多账号复制时，一条原始链接会对应多个账号操作，因此每个账号的准确成功或失败结果仍以“处理结果”页为准。“待处理链接”页只展示整条资源当前所处的批次阶段，不能代替详细结果。
 
-When exact results are available, all operations for the same candidate sequence are aggregated deterministically:
+取得准确结果时，同一个原始序号（`CandidateSequence`）下的全部操作按以下规则汇总：
 
-- show `已完成` only when every required transfer and share for every participating account succeeded, including reuse of a valid existing share;
-- show `有问题，请查看结果` if any operation failed, was cancelled, paused, or entered an uncertain/reconcile-required state, even when another account succeeded;
-- otherwise show `处理中` while any operation is queued, reserved, preparing, submitting, or waiting for its linked share;
-- if the batch is terminal but the current import page has no exact loaded operation details, show `任务已结束，请查看结果` rather than guessing success.
+- 只有全部参与账号的转存和分享操作都成功，或复用了仍然有效的已有分享时，才显示“已完成”。
+- 只要其中任何操作失败、取消、暂停、结果不明确或需要核对，即使其他账号已经成功，也显示“有问题，请查看结果”。
+- 如果还有操作处于排队、已占用、准备、提交或等待分享阶段，则显示“处理中”。
+- 如果批次已经结束，但当前导入页没有加载到准确的逐条操作明细，则显示“任务已结束，请查看结果”，不能猜测为成功。
 
-Tests cover one candidate sequence with success plus failure, success plus running, and success plus uncertain results so a partial outcome can never appear as full success.
+测试必须覆盖同一原始序号下“成功加失败”“成功加运行中”“成功加结果不明确”三种组合，确保部分成功永远不会显示成全部成功。
 
-## Batch paste input
+## 批量粘贴导入
 
-The current text parser already supports multiple lines. The toolbar will expose that capability with a visible multiline text box, vertical scrolling, and a short hint that each line may contain a title, link, and extraction code. Pasting many lines followed by one click imports the entire text as one session. Existing single-link paste behavior remains valid.
+现有文本解析器已经支持多行内容。顶部工具栏把输入框改为明显可见的多行文本框，支持垂直滚动，并提示每行可以包含标题、链接和提取码。用户一次粘贴多行，再点击一次导入，即可作为同一批数据处理；单条链接的用法保持不变。
 
-The import button remains disabled only for blank text or an active import. No per-line button click is introduced.
+只有输入为空或正在导入时，导入按钮才禁用，不增加逐条点击步骤。
 
-## Error handling
+## 异常处理
 
-- If the Baidu embed-code option cannot be found, selected, or proven, do not dispatch the share click; use the existing automatic retry, then mark failure.
-- If a generated URL/code pair is inconsistent, do not export a misleading link; keep the operation failed/reconcilable according to the existing state machine.
-- UI auto-scroll and completion notification failures must not affect transfer execution or result persistence.
-- Batch-paste parse failures use the existing row-level import statistics and do not discard valid rows.
+- 如果找不到“分享链接自动填充提取码”选项，或无法选择、无法确认已选中，则不点击创建分享；按现有规则自动重试，重试仍失败后直接标记失败。
+- 如果生成的分享链接与提取码不一致，不能导出误导性链接；按现有状态机标记失败或进入核对流程。
+- 日志自动滚动或完成提示发生异常时，不能影响转存执行和结果保存。
+- 批量粘贴中某些行解析失败时，沿用现有的逐行导入统计，不能丢弃其他有效行。
 
-## Verification
+## 验证要求
 
-- Helper tests prove the embed-code invariant is set before the sole click and that failure to prove it remains pre-dispatch.
-- Application tests prove canonical share URLs contain the verified extraction code and replacement workbooks export both the full URL and the separate code.
-- Run-panel tests prove terminal transition notification is emitted exactly once and not for already-terminal history.
-- Transfer workspace tests prove explicit result-tab selection and pending-row stage updates.
-- WPF structure/interaction tests prove multiline input and log auto-follow without duplicate subscriptions.
-- Existing focused direct-background, result export, import, and Release packaging tests remain green.
+- 浏览器辅助程序测试：证明唯一一次创建分享点击前，已经选中并确认“自动填充提取码”；无法确认时仍属于提交前失败。
+- 应用层测试：证明规范化后的分享链接包含实际提取码，并且结果表格同时导出完整链接和独立提取码。
+- 运行面板测试：证明批次进入终态时只发出一次完成通知，打开已结束的历史批次不会通知。
+- 转存界面测试：证明任务创建后明确切换到“处理结果”页，并正确更新待处理记录的阶段状态。
+- WPF 结构与交互测试：证明支持多行输入，日志会自动跟随且不会重复监听。
+- 现有后台直连、结果导出、数据导入和 Release 打包相关测试必须继续通过。
