@@ -10,6 +10,7 @@ import (
 
 	"fanfh.cn/superpan/ota-admin/internal/candidate"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
+	"fanfh.cn/superpan/ota-admin/internal/licenseadmin"
 	"fanfh.cn/superpan/ota-admin/internal/security"
 	"fanfh.cn/superpan/ota-admin/internal/session"
 	"fanfh.cn/superpan/ota-admin/internal/store"
@@ -30,6 +31,7 @@ type Options struct {
 	UploadEnvelopes   EnvelopeAcceptor
 	Publisher         CandidatePublisher
 	ReleaseOperations ReleaseOperations
+	LicenseAdmin      *licenseadmin.Client
 }
 
 type CandidatePublisher interface {
@@ -63,14 +65,15 @@ type EnvelopeAcceptor interface {
 var canonicalOperationID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 type Router struct {
-	sessions          *session.Service
-	publicOrigin      string
-	maxJSONBytes      int64
-	uploads           UploadReceiver
-	uploadEnvelopes   EnvelopeAcceptor
-	publisher         CandidatePublisher
-	releaseOperations ReleaseOperations
-	web               http.Handler
+	sessions           *session.Service
+	publicOrigin       string
+	maxJSONBytes       int64
+	uploads            UploadReceiver
+	uploadEnvelopes    EnvelopeAcceptor
+	publisher          CandidatePublisher
+	releaseOperations  ReleaseOperations
+	licenseAdminClient *licenseadmin.Client
+	web                http.Handler
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -90,13 +93,16 @@ func NewRouter(options Options) (http.Handler, error) {
 	router := &Router{
 		sessions: options.Sessions, publicOrigin: options.PublicOrigin, maxJSONBytes: options.MaxJSONBytes,
 		uploads: options.Uploads, uploadEnvelopes: options.UploadEnvelopes, publisher: publisher, releaseOperations: options.ReleaseOperations,
-		web: webui.Handler(),
+		licenseAdminClient: options.LicenseAdmin,
+		web:                webui.Handler(),
 	}
 	return withAdminSecurityHeaders(router), nil
 }
 
 func (router *Router) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet && request.Method != http.MethodPost {
+	licensePath := request.URL.Path == licenseAdminPrefix || strings.HasPrefix(request.URL.Path, licenseAdminPrefix+"/")
+	allowedMethod := request.Method == http.MethodGet || request.Method == http.MethodPost || licensePath && (request.Method == http.MethodPatch || request.Method == http.MethodPut || request.Method == http.MethodDelete)
+	if !allowedMethod {
 		response.Header().Set("Allow", "GET, POST")
 		writeError(response, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -127,7 +133,7 @@ func isWebAssetPath(path string) bool {
 }
 
 func (router *Router) authenticated(response http.ResponseWriter, request *http.Request) {
-	mutating := request.Method == http.MethodPost
+	mutating := request.Method != http.MethodGet
 	if mutating && !security.SameOriginRequest(request, router.publicOrigin) {
 		writeError(response, http.StatusForbidden, "request_rejected")
 		return
@@ -185,6 +191,8 @@ func (router *Router) authenticated(response http.ResponseWriter, request *http.
 		router.changePassword(response, request, principal)
 	case principal.MustChangePassword:
 		writeError(response, http.StatusForbidden, "password_change_required")
+	case request.URL.Path == licenseAdminPrefix || strings.HasPrefix(request.URL.Path, licenseAdminPrefix+"/"):
+		router.licenseAdmin(response, request, principal)
 	case request.URL.Path == "/admin/api/uploads":
 		if request.Method != http.MethodPost {
 			writeMethodNotAllowed(response, http.MethodPost)

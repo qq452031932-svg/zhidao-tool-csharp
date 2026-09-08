@@ -19,7 +19,48 @@ func productionConfig() config.Config {
 	cfg.PublisherCertificatePath = "/etc/superpan-ota-admin/publisher.cer"
 	cfg.PublisherSPKISHA256 = "f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff"
 	cfg.SourceHMACKeyPath = "/etc/superpan-ota-admin/source-hmac.key"
+	cfg.LicenseAdminBaseURL = "http://127.0.0.1:19091"
+	cfg.LicenseAdminSecretPath = "/etc/superpan-license/admin.secret"
 	return cfg
+}
+
+func TestLicenseAdminConfigParsesAndRequiresStrictIsolation(t *testing.T) {
+	t.Parallel()
+	body := `{"database_path":"/var/lib/superpan-ota-admin/state.db","license_admin_base_url":"http://127.0.0.1:19091","license_admin_secret_path":"/etc/superpan-license/admin.secret"}`
+	cfg, err := config.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.LicenseAdminBaseURL != "http://127.0.0.1:19091" || cfg.LicenseAdminSecretPath != "/etc/superpan-license/admin.secret" {
+		t.Fatalf("license admin config = %#v", cfg)
+	}
+
+	for _, test := range []struct {
+		name string
+		edit func(*config.Config)
+	}{
+		{"missing URL", func(c *config.Config) { c.LicenseAdminBaseURL = "" }},
+		{"hostname", func(c *config.Config) { c.LicenseAdminBaseURL = "http://localhost:19091" }},
+		{"HTTPS", func(c *config.Config) { c.LicenseAdminBaseURL = "https://127.0.0.1:19091" }},
+		{"wildcard", func(c *config.Config) { c.LicenseAdminBaseURL = "http://0.0.0.0:19091" }},
+		{"missing port", func(c *config.Config) { c.LicenseAdminBaseURL = "http://127.0.0.1" }},
+		{"path", func(c *config.Config) { c.LicenseAdminBaseURL = "http://127.0.0.1:19091/internal" }},
+		{"OTA admin self-loop", func(c *config.Config) { c.LicenseAdminBaseURL = "http://" + c.ListenAddress }},
+		{"relative secret", func(c *config.Config) { c.LicenseAdminSecretPath = "admin.secret" }},
+		{"secret in release", func(c *config.Config) { c.LicenseAdminSecretPath = filepath.Join(c.ReleaseRoot, "admin.secret") }},
+		{"secret in staging", func(c *config.Config) { c.LicenseAdminSecretPath = filepath.Join(c.StagingRoot, "admin.secret") }},
+		{"secret equals OTA HMAC", func(c *config.Config) { c.LicenseAdminSecretPath = c.SourceHMACKeyPath }},
+		{"secret equals OTA certificate", func(c *config.Config) { c.LicenseAdminSecretPath = c.PublisherCertificatePath }},
+		{"secret equals database", func(c *config.Config) { c.LicenseAdminSecretPath = c.DatabasePath }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := productionConfig()
+			test.edit(&cfg)
+			if err := cfg.ValidateServe(); err == nil {
+				t.Fatal("ValidateServe accepted unsafe license admin configuration")
+			}
+		})
+	}
 }
 
 func TestCompiledHardMaxima(t *testing.T) {

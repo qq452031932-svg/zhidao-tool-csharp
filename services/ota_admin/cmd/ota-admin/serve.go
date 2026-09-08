@@ -22,6 +22,7 @@ import (
 	"fanfh.cn/superpan/ota-admin/internal/config"
 	"fanfh.cn/superpan/ota-admin/internal/deploy"
 	"fanfh.cn/superpan/ota-admin/internal/httpapi"
+	"fanfh.cn/superpan/ota-admin/internal/licenseadmin"
 	"fanfh.cn/superpan/ota-admin/internal/operation"
 	"fanfh.cn/superpan/ota-admin/internal/publisher"
 	"fanfh.cn/superpan/ota-admin/internal/release"
@@ -31,10 +32,12 @@ import (
 )
 
 const (
-	maximumTrustedCertificateBytes = 1 << 20
-	maximumSourceHMACKeyBytes      = 65
-	maximumAPIJSONBytes            = 64 << 10
-	loginPreauthorizationLifetime  = 5 * time.Minute
+	maximumTrustedCertificateBytes   = 1 << 20
+	maximumSourceHMACKeyBytes        = 65
+	maximumAPIJSONBytes              = 64 << 10
+	maximumLicenseAdminResponseBytes = 8 << 20
+	licenseAdminSecretBytes          = 32
+	loginPreauthorizationLifetime    = 5 * time.Minute
 )
 
 func runServe(arguments []string, stdout, stderr io.Writer) int {
@@ -96,6 +99,15 @@ func serve(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) err
 		return err
 	}
 	defer clear(sourceHMACKey)
+	licenseSecret, err := config.ReadTrustedFile(cfg.LicenseAdminSecretPath, licenseAdminSecretBytes)
+	if err != nil {
+		return errors.New("load license admin credential")
+	}
+	licenseClient, err := buildLicenseAdminClient(cfg, licenseSecret)
+	clear(licenseSecret)
+	if err != nil {
+		return errors.New("initialize license admin client")
+	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddress)
 	if err != nil {
@@ -168,6 +180,7 @@ func serve(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) err
 	handler, err := httpapi.NewRouter(httpapi.Options{
 		Sessions: sessions, PublicOrigin: cfg.PublicOrigin, MaxJSONBytes: maximumAPIJSONBytes,
 		Uploads: receiver, UploadEnvelopes: candidates, Publisher: operations, ReleaseOperations: operations,
+		LicenseAdmin: licenseClient,
 	})
 	if err != nil {
 		return errors.New("initialize HTTP API")
@@ -198,6 +211,15 @@ func serve(ctx context.Context, cfg config.Config, stdout, stderr io.Writer) err
 		return nil
 	}
 	return serveErr
+}
+
+func buildLicenseAdminClient(cfg config.Config, rawSecret []byte) (*licenseadmin.Client, error) {
+	return licenseadmin.NewClient(licenseadmin.Options{
+		BaseURL:          cfg.LicenseAdminBaseURL,
+		Secret:           rawSecret,
+		MaxRequestBytes:  maximumAPIJSONBytes,
+		MaxResponseBytes: maximumLicenseAdminResponseBytes,
+	})
 }
 
 func decodeSourceHMACKey(data []byte) ([]byte, error) {

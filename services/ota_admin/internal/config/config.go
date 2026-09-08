@@ -38,6 +38,8 @@ type Config struct {
 	PublisherCertificatePath string `json:"publisher_certificate_path,omitempty"`
 	PublisherSPKISHA256      string `json:"publisher_spki_sha256,omitempty"`
 	SourceHMACKeyPath        string `json:"source_hmac_key_path,omitempty"`
+	LicenseAdminBaseURL      string `json:"license_admin_base_url,omitempty"`
+	LicenseAdminSecretPath   string `json:"license_admin_secret_path,omitempty"`
 	Limits                   Limits `json:"limits"`
 }
 
@@ -104,6 +106,7 @@ var topLevelConfigKeys = map[string]bool{
 	"database_path": true, "listen_address": true, "public_origin": true,
 	"staging_root": true, "release_root": true, "publisher_certificate_path": true,
 	"publisher_spki_sha256": true, "source_hmac_key_path": true, "limits": true,
+	"license_admin_base_url": true, "license_admin_secret_path": true,
 }
 
 var limitConfigKeys = map[string]bool{
@@ -255,6 +258,7 @@ func (c Config) ValidateServe() error {
 		{"release_root", c.ReleaseRoot},
 		{"publisher_certificate_path", c.PublisherCertificatePath},
 		{"source_hmac_key_path", c.SourceHMACKeyPath},
+		{"license_admin_secret_path", c.LicenseAdminSecretPath},
 	}
 	for _, item := range paths {
 		if err := validateLiteralAbsolutePath(item.name, item.value); err != nil {
@@ -263,6 +267,15 @@ func (c Config) ValidateServe() error {
 	}
 	if pathsOverlap(c.StagingRoot, c.ReleaseRoot) {
 		return errors.New("staging_root and release_root must be disjoint")
+	}
+	if err := validateLicenseAdminOrigin(c.LicenseAdminBaseURL); err != nil {
+		return err
+	}
+	if c.LicenseAdminBaseURL == "http://"+c.ListenAddress {
+		return errors.New("license_admin_base_url cannot point back to the OTA admin listener")
+	}
+	if pathsOverlap(c.StagingRoot, c.LicenseAdminSecretPath) || pathsOverlap(c.ReleaseRoot, c.LicenseAdminSecretPath) {
+		return errors.New("license_admin_secret_path must be disjoint from staging_root and release_root")
 	}
 	for _, privatePath := range []struct {
 		name string
@@ -279,6 +292,11 @@ func (c Config) ValidateServe() error {
 	if samePath(c.PublisherCertificatePath, c.SourceHMACKeyPath) {
 		return errors.New("publisher certificate and source HMAC key must be different files")
 	}
+	for _, path := range []string{c.DatabasePath, c.PublisherCertificatePath, c.SourceHMACKeyPath} {
+		if samePath(c.LicenseAdminSecretPath, path) {
+			return errors.New("license admin secret must use a distinct file")
+		}
+	}
 	if len(c.PublisherSPKISHA256) != 64 {
 		return errors.New("publisher_spki_sha256 must be 64 lowercase hexadecimal characters")
 	}
@@ -286,6 +304,19 @@ func (c Config) ValidateServe() error {
 		if !strings.ContainsRune("0123456789abcdef", value) {
 			return errors.New("publisher_spki_sha256 must be 64 lowercase hexadecimal characters")
 		}
+	}
+	return nil
+}
+
+func validateLicenseAdminOrigin(raw string) error {
+	origin, err := url.Parse(raw)
+	if err != nil || origin.Scheme != "http" || origin.User != nil || origin.Path != "" || origin.RawPath != "" || origin.RawQuery != "" || origin.Fragment != "" || origin.Opaque != "" || origin.ForceQuery || origin.String() != raw {
+		return errors.New("license_admin_base_url must be an explicit loopback HTTP origin")
+	}
+	ip := net.ParseIP(origin.Hostname())
+	port, portErr := strconv.ParseUint(origin.Port(), 10, 16)
+	if ip == nil || !ip.IsLoopback() || portErr != nil || port == 0 {
+		return errors.New("license_admin_base_url must be an explicit loopback HTTP origin")
 	}
 	return nil
 }

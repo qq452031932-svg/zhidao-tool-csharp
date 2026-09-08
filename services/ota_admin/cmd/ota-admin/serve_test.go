@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/config"
 	"fanfh.cn/superpan/ota-admin/internal/store"
 )
 
@@ -98,5 +99,18 @@ func TestServeRequiresConfigPathWithoutPrintingSecrets(t *testing.T) {
 	}
 	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "serve --config PATH") {
 		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestBuildLicenseAdminClientFailsClosedWithoutExactRawSecret(t *testing.T) {
+	t.Parallel()
+	cfg := config.Default()
+	cfg.LicenseAdminBaseURL = "http://127.0.0.1:19091"
+	if _, err := buildLicenseAdminClient(cfg, make([]byte, 31)); err == nil {
+		t.Fatal("buildLicenseAdminClient accepted a short secret")
+	}
+	client, err := buildLicenseAdminClient(cfg, make([]byte, 32))
+	if err != nil || client == nil {
+		t.Fatalf("buildLicenseAdminClient() = %v, %v", client, err)
 	}
 }
