@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
-	"sync"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
+	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
 )
 
 type Clock interface {
@@ -49,9 +49,7 @@ type AdminService interface {
 }
 
 type AdminIdempotencyStore interface {
-	GetAdminIdempotency(context.Context, string, time.Time) (model.AdminIdempotencyRecord, bool, error)
-	PutAdminIdempotency(context.Context, string, model.AdminIdempotencyRecord, time.Time, int) error
-	CompleteAdminIdempotency(context.Context, string, string, model.AdminIdempotencyRecord) error
+	BeginAdminMutation(context.Context, string, string, time.Time, time.Time, int) (*licensestore.AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error)
 }
 
 type ReplayStore interface {
@@ -84,11 +82,10 @@ type Options struct {
 }
 
 type api struct {
-	options       Options
-	activation    *fixedWindowLimiter
-	validation    *fixedWindowLimiter
-	admin         *fixedWindowLimiter
-	adminMutation sync.Mutex
+	options    Options
+	activation *fixedWindowLimiter
+	validation *fixedWindowLimiter
+	admin      *fixedWindowLimiter
 }
 
 func NewRouter(options Options) (http.Handler, error) {

@@ -71,6 +71,34 @@ type AdminStore interface {
 	GetDevice(context.Context, string) (model.DeviceRecord, error)
 }
 
+// AdminMutationTransaction is deliberately limited to license-database
+// mutations. HTTP idempotency installs one in the request context so the
+// business mutation and encrypted replay record share one SQLite transaction.
+type AdminMutationTransaction interface {
+	CreateSoftwareAt(context.Context, string, time.Time) (model.Software, error)
+	RenameSoftware(context.Context, string, string) error
+	SetSoftwareEnabled(context.Context, string, bool) error
+	CreatePackageAt(context.Context, string, []string, time.Time) (model.Package, error)
+	RenamePackage(context.Context, string, string) error
+	ReplacePackageMembers(context.Context, string, []string) error
+	GenerateCards(context.Context, model.GenerateCardsRequest, []model.SealedCard) ([]model.Card, error)
+	SetCardNote(context.Context, string, *string) error
+	RenewCard(context.Context, string, int, time.Time) error
+	UnbindCard(context.Context, string) error
+	DeleteCard(context.Context, string) error
+}
+
+type adminMutationTransactionKey struct{}
+
+func WithAdminMutationTransaction(ctx context.Context, tx AdminMutationTransaction) context.Context {
+	return context.WithValue(ctx, adminMutationTransactionKey{}, tx)
+}
+
+func adminMutationTransaction(ctx context.Context) (AdminMutationTransaction, bool) {
+	tx, ok := ctx.Value(adminMutationTransactionKey{}).(AdminMutationTransaction)
+	return tx, ok && !isNil(tx)
+}
+
 func (s *Service) ListPackages(ctx context.Context, page, pageSize int) ([]model.Package, int, error) {
 	if page < 1 || pageSize < 1 {
 		return nil, 0, ErrInvalidRequest
@@ -87,21 +115,28 @@ func (s *Service) CreatePackage(ctx context.Context, name string, softwareIDs []
 	if model.ValidatePackageName(name) != nil || !validUUIDIDs(softwareIDs, 100) {
 		return model.Package{}, ErrInvalidRequest
 	}
-	admin, ok := s.store.(AdminStore)
-	if !ok {
-		return model.Package{}, errors.New("admin store unavailable")
-	}
 	now := s.clock.Now().UTC()
 	if now.IsZero() {
 		return model.Package{}, ErrInvalidRequest
 	}
-	item, err := admin.CreatePackageAt(ctx, name, softwareIDs, now)
+	var item model.Package
+	var err error
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		item, err = tx.CreatePackageAt(ctx, name, softwareIDs, now)
+	} else if admin, ok := s.store.(AdminStore); ok {
+		item, err = admin.CreatePackageAt(ctx, name, softwareIDs, now)
+	} else {
+		return model.Package{}, errors.New("admin store unavailable")
+	}
 	return item, classifyStoreError(err)
 }
 
 func (s *Service) RenamePackage(ctx context.Context, id, name string) error {
 	if !validUUID(id) || model.ValidatePackageName(name) != nil {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.RenamePackage(ctx, id, name))
 	}
 	admin, ok := s.store.(AdminStore)
 	if !ok {
@@ -113,6 +148,9 @@ func (s *Service) RenamePackage(ctx context.Context, id, name string) error {
 func (s *Service) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {
 	if !validUUID(id) || !validUUIDIDs(softwareIDs, 100) {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.ReplacePackageMembers(ctx, id, softwareIDs))
 	}
 	admin, ok := s.store.(AdminStore)
 	if !ok {
@@ -226,6 +264,9 @@ func (s *Service) ExportCards(ctx context.Context, ids []string, maximum int) ([
 func (s *Service) RemarkCard(ctx context.Context, id string, note *string) error {
 	if !validUUID(id) || !validNote(note) {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.SetCardNote(ctx, id, cloneString(note)))
 	}
 	admin, ok := s.store.(AdminStore)
 	if !ok {
@@ -400,7 +441,14 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 		}
 		plaintext[i] = cardText
 	}
-	cards, err := s.store.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: packageID, Count: count, BaseDays: durationDays, Note: cloneString(defaultNote), CreatedAt: createdAt}, sealed)
+	request := model.GenerateCardsRequest{PackageID: packageID, Count: count, BaseDays: durationDays, Note: cloneString(defaultNote), CreatedAt: createdAt}
+	var cards []model.Card
+	var err error
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		cards, err = tx.GenerateCards(ctx, request, sealed)
+	} else {
+		cards, err = s.store.GenerateCards(ctx, request, sealed)
+	}
 	if err != nil {
 		clearStrings(plaintext)
 		return nil, classifyStoreError(err)
@@ -491,6 +539,9 @@ func (s *Service) RenewCard(ctx context.Context, cardID string, days int) error 
 	if now.IsZero() {
 		return ErrInvalidRequest
 	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.RenewCard(ctx, cardID, days, now))
+	}
 	return classifyStoreError(s.store.RenewCard(ctx, cardID, days, now))
 }
 
@@ -498,12 +549,18 @@ func (s *Service) UnbindCard(ctx context.Context, cardID string) error {
 	if !validUUID(cardID) {
 		return ErrInvalidRequest
 	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.UnbindCard(ctx, cardID))
+	}
 	return classifyStoreError(s.store.UnbindCard(ctx, cardID))
 }
 
 func (s *Service) DeleteCard(ctx context.Context, cardID string) error {
 	if !validUUID(cardID) {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.DeleteCard(ctx, cardID))
 	}
 	return classifyStoreError(s.store.DeleteCard(ctx, cardID))
 }
@@ -524,21 +581,28 @@ func (s *Service) CreateSoftware(ctx context.Context, name string) (model.Softwa
 	if model.ValidateAdminName(name) != nil {
 		return model.Software{}, ErrInvalidRequest
 	}
-	admin, ok := s.store.(AdminStore)
-	if !ok {
-		return model.Software{}, errors.New("admin store unavailable")
-	}
 	now := s.clock.Now().UTC()
 	if now.IsZero() {
 		return model.Software{}, ErrInvalidRequest
 	}
-	item, err := admin.CreateSoftwareAt(ctx, name, now)
+	var item model.Software
+	var err error
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		item, err = tx.CreateSoftwareAt(ctx, name, now)
+	} else if admin, ok := s.store.(AdminStore); ok {
+		item, err = admin.CreateSoftwareAt(ctx, name, now)
+	} else {
+		return model.Software{}, errors.New("admin store unavailable")
+	}
 	return item, classifyStoreError(err)
 }
 
 func (s *Service) RenameSoftware(ctx context.Context, id, name string) error {
 	if !validUUID(id) || model.ValidateAdminName(name) != nil {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.RenameSoftware(ctx, id, name))
 	}
 	admin, ok := s.store.(AdminStore)
 	if !ok {
@@ -550,6 +614,9 @@ func (s *Service) RenameSoftware(ctx context.Context, id, name string) error {
 func (s *Service) SetSoftwareEnabled(ctx context.Context, id string, enabled bool) error {
 	if !validUUID(id) {
 		return ErrInvalidRequest
+	}
+	if tx, ok := adminMutationTransaction(ctx); ok {
+		return classifyStoreError(tx.SetSoftwareEnabled(ctx, id, enabled))
 	}
 	admin, ok := s.store.(AdminStore)
 	if !ok {

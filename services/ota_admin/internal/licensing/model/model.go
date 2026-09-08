@@ -111,6 +111,15 @@ type AdminIdempotencyRecord struct {
 	ExpiresAt          time.Time
 }
 
+type AdminIdempotencyOutcome string
+
+const (
+	AdminIdempotencyNew      AdminIdempotencyOutcome = "new"
+	AdminIdempotencyReplay   AdminIdempotencyOutcome = "replay"
+	AdminIdempotencyConflict AdminIdempotencyOutcome = "conflict"
+	AdminIdempotencyPending  AdminIdempotencyOutcome = "pending"
+)
+
 type GenerateCardsRequest struct {
 	PackageID string    `json:"package_id"`
 	Count     int       `json:"count"`

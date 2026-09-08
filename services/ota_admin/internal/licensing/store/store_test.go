@@ -86,7 +86,7 @@ func TestAdminSchemaMigratesV1AndIdempotencyIsPersistentBoundedAndPruned(t *test
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	record := model.AdminIdempotencyRecord{Fingerprint: strings.Repeat("a", 64), Status: 201, Body: []byte(`{"ok":true}`), ContentType: "application/json", ExpiresAt: now.Add(time.Hour)}
+	record := model.AdminIdempotencyRecord{Fingerprint: strings.Repeat("a", 64), Status: 201, Body: []byte(`{"ok":true}`), ContentType: "application/json", ExpiresAt: now.Add(10 * time.Hour)}
 	key := uuid.NewString()
 	if err := s.PutAdminIdempotency(ctx, key, record, now, 2); err != nil {
 		t.Fatal(err)
@@ -103,25 +103,77 @@ func TestAdminSchemaMigratesV1AndIdempotencyIsPersistentBoundedAndPruned(t *test
 	if err != nil || !found || got.Status != record.Status || string(got.Body) != string(record.Body) || got.ContentType != record.ContentType {
 		t.Fatalf("persistent record=%+v found=%v err=%v", got, found, err)
 	}
-	for _, fingerprint := range []string{strings.Repeat("b", 64), strings.Repeat("c", 64)} {
-		record.Fingerprint = fingerprint
-		if err := s.PutAdminIdempotency(ctx, uuid.NewString(), record, now, 2); err != nil {
-			t.Fatal(err)
-		}
+	expiringKey := uuid.NewString()
+	record.Fingerprint = strings.Repeat("b", 64)
+	record.ExpiresAt = now.Add(time.Hour)
+	if err := s.PutAdminIdempotency(ctx, expiringKey, record, now, 3); err != nil {
+		t.Fatal(err)
+	}
+	pendingKey := uuid.NewString()
+	record.Fingerprint = strings.Repeat("c", 64)
+	record.Status = 102
+	record.ExpiresAt = now.Add(time.Hour)
+	if err := s.PutAdminIdempotency(ctx, pendingKey, record, now, 3); err != nil {
+		t.Fatal(err)
+	}
+	pressure := record
+	pressure.Fingerprint = strings.Repeat("d", 64)
+	pressure.Status = 201
+	pressure.ExpiresAt = now.Add(10 * time.Hour)
+	if err := s.PutAdminIdempotency(ctx, uuid.NewString(), pressure, now, 3); !errors.Is(err, ErrAdminIdempotencyCapacity) {
+		t.Fatalf("capacity error=%v, want ErrAdminIdempotencyCapacity", err)
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 2 {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 3 {
 		t.Fatalf("bounded count=%d err=%v", count, err)
+	}
+	if replay, found, err := s.GetAdminIdempotency(ctx, key, now); err != nil || !found || string(replay.Body) != string(got.Body) {
+		t.Fatalf("live replay evicted or changed: found=%v record=%+v err=%v", found, replay, err)
 	}
 	if _, _, err := s.GetAdminIdempotency(ctx, uuid.NewString(), now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("pruned count=%d err=%v", count, err)
+	if pending, found, err := s.GetAdminIdempotency(ctx, pendingKey, now.Add(2*time.Hour)); err != nil || !found || pending.Status != 102 {
+		t.Fatalf("pending reservation was pruned: found=%v record=%+v err=%v", found, pending, err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("completed-expired prune count=%d err=%v", count, err)
 	}
 	var version int
 	if err := s.db.QueryRowContext(ctx, `SELECT version FROM license_schema_version WHERE singleton_id=1`).Scan(&version); err != nil || version != licenseSchemaVersion {
 		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
+func TestAdminMutationRollsBackWhenIdempotencyCompletionFails(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.db.ExecContext(ctx, `CREATE TRIGGER license_test_fail_admin_completion BEFORE INSERT ON license_admin_idempotency BEGIN SELECT RAISE(ABORT,'forced completion failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 9, 13, 0, 0, 0, time.UTC)
+	key := uuid.NewString()
+	fingerprint := strings.Repeat("f", 64)
+	tx, _, outcome, err := s.BeginAdminMutation(ctx, key, fingerprint, now, now.Add(time.Hour), 10)
+	if err != nil || outcome != model.AdminIdempotencyNew {
+		t.Fatalf("begin outcome=%q err=%v", outcome, err)
+	}
+	if _, err := tx.CreateSoftwareAt(ctx, "Rollback Product", now); err != nil {
+		t.Fatal(err)
+	}
+	record := model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: 201, Body: []byte("encrypted"), ContentType: "application/json", ExpiresAt: now.Add(time.Hour)}
+	if err := tx.Complete(ctx, key, record); err == nil {
+		t.Fatal("completion failure was accepted")
+	}
+	var software, idempotency int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software WHERE name='Rollback Product'`).Scan(&software); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency WHERE key=?`, key).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if software != 0 || idempotency != 0 {
+		t.Fatalf("partial commit software=%d idempotency=%d", software, idempotency)
 	}
 }
 

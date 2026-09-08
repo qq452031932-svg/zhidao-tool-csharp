@@ -18,20 +18,349 @@ import (
 )
 
 var (
-	ErrNotFound            = errors.New("license record not found")
-	ErrMachineBound        = errors.New("card is bound to another machine")
-	ErrLeaseNotBound       = errors.New("lease has no current activation binding")
-	ErrSoftwareNotAllowed  = errors.New("software is not authorized by the card package")
-	ErrSoftwareDisabled    = errors.New("software is disabled")
-	ErrLicenseExpired      = errors.New("license is expired")
-	ErrReplayNonceCapacity = errors.New("replay nonce capacity reached")
-	ErrConflict            = errors.New("license record conflicts with existing state")
+	ErrNotFound                 = errors.New("license record not found")
+	ErrMachineBound             = errors.New("card is bound to another machine")
+	ErrLeaseNotBound            = errors.New("lease has no current activation binding")
+	ErrSoftwareNotAllowed       = errors.New("software is not authorized by the card package")
+	ErrSoftwareDisabled         = errors.New("software is disabled")
+	ErrLicenseExpired           = errors.New("license is expired")
+	ErrReplayNonceCapacity      = errors.New("replay nonce capacity reached")
+	ErrConflict                 = errors.New("license record conflicts with existing state")
+	ErrAdminIdempotencyCapacity = errors.New("admin idempotency capacity reached")
 )
 
 const busyTimeoutMilliseconds = 10_000
 
 type Store struct {
 	db *sql.DB
+}
+
+type AdminTransaction struct {
+	conn      *sql.Conn
+	active    bool
+	dirty     bool
+	failed    bool
+	createdAt time.Time
+}
+
+func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string, now, expiresAt time.Time, maximum int) (*AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error) {
+	if !validCanonicalUUID(key) || len(fingerprint) != 64 || !expiresAt.After(now) || maximum < 1 {
+		return nil, model.AdminIdempotencyRecord{}, "", errors.New("invalid admin mutation reservation")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, model.AdminIdempotencyRecord{}, "", err
+	}
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		_ = conn.Close()
+		return nil, model.AdminIdempotencyRecord{}, "", err
+	}
+	tx := &AdminTransaction{conn: conn, active: true, createdAt: canonicalTime(now)}
+	fail := func(err error) (*AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error) {
+		tx.Rollback()
+		return nil, model.AdminIdempotencyRecord{}, "", err
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=? AND status<>102`, unixTime(now)); err != nil {
+		return fail(err)
+	}
+	var record model.AdminIdempotencyRecord
+	var storedExpires int64
+	err = conn.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ContentType, &record.ContentDisposition, &storedExpires)
+	if err == nil {
+		record.ExpiresAt = time.Unix(storedExpires, 0).UTC()
+		outcome := model.AdminIdempotencyReplay
+		if record.Fingerprint != fingerprint {
+			outcome = model.AdminIdempotencyConflict
+		} else if record.Status == httpStatusProcessing {
+			outcome = model.AdminIdempotencyPending
+		}
+		tx.Rollback()
+		return nil, record, outcome, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fail(err)
+	}
+	var count int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil {
+		return fail(err)
+	}
+	if count >= maximum {
+		return fail(ErrAdminIdempotencyCapacity)
+	}
+	return tx, model.AdminIdempotencyRecord{}, model.AdminIdempotencyNew, nil
+}
+
+const httpStatusProcessing = 102
+
+func (tx *AdminTransaction) Rollback() {
+	if tx == nil || !tx.active {
+		return
+	}
+	_, _ = tx.conn.ExecContext(context.Background(), `ROLLBACK`)
+	_ = tx.conn.Close()
+	tx.active = false
+}
+
+func (tx *AdminTransaction) Complete(ctx context.Context, key string, record model.AdminIdempotencyRecord) error {
+	if tx == nil || !tx.active {
+		return errors.New("admin transaction is not active")
+	}
+	if tx.failed {
+		tx.Rollback()
+		return errors.New("admin transaction mutation failed")
+	}
+	_, err := tx.conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(tx.createdAt))
+	if err == nil {
+		_, err = tx.conn.ExecContext(ctx, `COMMIT`)
+	}
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	_ = tx.conn.Close()
+	tx.active = false
+	return nil
+}
+
+func (tx *AdminTransaction) CreateSoftwareAt(ctx context.Context, name string, createdAt time.Time) (model.Software, error) {
+	if tx == nil || !tx.active || model.ValidateAdminName(name) != nil || createdAt.IsZero() {
+		return model.Software{}, errors.New("invalid software")
+	}
+	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
+	if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, software.ID, software.Name, unixTime(software.CreatedAt)); err != nil {
+		if isUniqueConstraint(err) {
+			return model.Software{}, ErrConflict
+		}
+		return model.Software{}, err
+	}
+	tx.dirty = true
+	return software, nil
+}
+
+func (tx *AdminTransaction) RenameSoftware(ctx context.Context, id, name string) error {
+	if tx == nil || !tx.active || model.ValidateAdminName(name) != nil {
+		return errors.New("invalid software")
+	}
+	result, err := tx.conn.ExecContext(ctx, `UPDATE license_software SET name=? WHERE id=?`, name, id)
+	if err != nil {
+		if isUniqueConstraint(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	if err := requireAffected(result); err != nil {
+		return err
+	}
+	tx.dirty = true
+	return nil
+}
+
+func (tx *AdminTransaction) SetSoftwareEnabled(ctx context.Context, id string, enabled bool) error {
+	if tx == nil || !tx.active {
+		return errors.New("admin transaction is not active")
+	}
+	result, err := tx.conn.ExecContext(ctx, `UPDATE license_software SET enabled=? WHERE id=?`, enabled, id)
+	if err != nil {
+		return err
+	}
+	if err := requireAffected(result); err != nil {
+		return err
+	}
+	tx.dirty = true
+	return nil
+}
+
+func (tx *AdminTransaction) CreatePackageAt(ctx context.Context, name string, softwareIDs []string, createdAt time.Time) (model.Package, error) {
+	if tx == nil || !tx.active || model.ValidatePackageName(name) != nil || createdAt.IsZero() {
+		return model.Package{}, errors.New("invalid package")
+	}
+	ids, err := normalizedIDs(softwareIDs)
+	if err != nil {
+		return model.Package{}, err
+	}
+	if err := tx.ensureSoftwareExists(ctx, ids); err != nil {
+		return model.Package{}, err
+	}
+	pkg := model.Package{ID: uuid.NewString(), Name: strings.TrimSpace(name), SoftwareIDs: ids, CreatedAt: canonicalTime(createdAt)}
+	if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_packages(id,name,created_at) VALUES(?,?,?)`, pkg.ID, pkg.Name, unixTime(pkg.CreatedAt)); err != nil {
+		if isUniqueConstraint(err) {
+			return model.Package{}, ErrConflict
+		}
+		return model.Package{}, err
+	}
+	tx.dirty = true
+	if err := insertPackageMembers(ctx, tx.conn, pkg.ID, ids); err != nil {
+		tx.failed = true
+		return model.Package{}, err
+	}
+	return pkg, nil
+}
+
+func (tx *AdminTransaction) RenamePackage(ctx context.Context, id, name string) error {
+	if tx == nil || !tx.active || model.ValidatePackageName(name) != nil {
+		return errors.New("invalid package")
+	}
+	result, err := tx.conn.ExecContext(ctx, `UPDATE license_packages SET name=? WHERE id=?`, name, id)
+	if err != nil {
+		if isUniqueConstraint(err) {
+			return ErrConflict
+		}
+		return err
+	}
+	if err := requireAffected(result); err != nil {
+		return err
+	}
+	tx.dirty = true
+	return nil
+}
+
+func (tx *AdminTransaction) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {
+	if tx == nil || !tx.active {
+		return errors.New("admin transaction is not active")
+	}
+	ids, err := normalizedIDs(softwareIDs)
+	if err != nil {
+		return err
+	}
+	var exists int
+	if err := tx.conn.QueryRowContext(ctx, `SELECT count(*) FROM license_packages WHERE id=?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if err := tx.ensureSoftwareExists(ctx, ids); err != nil {
+		return err
+	}
+	if _, err := tx.conn.ExecContext(ctx, `DELETE FROM license_package_members WHERE package_id=?`, id); err != nil {
+		return err
+	}
+	tx.dirty = true
+	if err := insertPackageMembers(ctx, tx.conn, id, ids); err != nil {
+		tx.failed = true
+		return err
+	}
+	return nil
+}
+
+func (tx *AdminTransaction) GenerateCards(ctx context.Context, req model.GenerateCardsRequest, sealed []model.SealedCard) ([]model.Card, error) {
+	if tx == nil || !tx.active || req.Count <= 0 || req.Count != len(sealed) || req.BaseDays <= 0 || req.CreatedAt.IsZero() {
+		return nil, errors.New("invalid generated cards")
+	}
+	createdAt := canonicalTime(req.CreatedAt)
+	cards := make([]model.Card, 0, len(sealed))
+	for _, item := range sealed {
+		if _, err := uuid.Parse(item.ID); err != nil || len(item.Ciphertext) == 0 || item.FullDigest == "" || len(item.Prefix8) != 8 || len(item.Last4) != 4 {
+			return nil, errors.New("sealed card is invalid")
+		}
+	}
+	for _, item := range sealed {
+		note := req.Note
+		if item.Note != nil {
+			note = item.Note
+		}
+		if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
+			if tx.dirty {
+				tx.failed = true
+			}
+			if isForeignKeyConstraint(err) {
+				return nil, ErrNotFound
+			}
+			if isUniqueConstraint(err) {
+				return nil, ErrConflict
+			}
+			return nil, err
+		}
+		tx.dirty = true
+		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(note), CreatedAt: createdAt})
+	}
+	return cards, nil
+}
+
+func (tx *AdminTransaction) ensureSoftwareExists(ctx context.Context, ids []string) error {
+	for _, id := range ids {
+		var exists int
+		if err := tx.conn.QueryRowContext(ctx, `SELECT count(*) FROM license_software WHERE id=?`, id).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
+func (tx *AdminTransaction) SetCardNote(ctx context.Context, id string, note *string) error {
+	return tx.singleCardMutation(ctx, `UPDATE license_cards SET note=? WHERE id=?`, note, id)
+}
+
+func (tx *AdminTransaction) UnbindCard(ctx context.Context, id string) error {
+	return tx.singleCardMutation(ctx, `UPDATE license_cards SET machine_hash=NULL WHERE id=?`, id)
+}
+
+func (tx *AdminTransaction) DeleteCard(ctx context.Context, id string) error {
+	return tx.singleCardMutation(ctx, `DELETE FROM license_cards WHERE id=?`, id)
+}
+
+func (tx *AdminTransaction) singleCardMutation(ctx context.Context, statement string, args ...any) error {
+	if tx == nil || !tx.active {
+		return errors.New("admin transaction is not active")
+	}
+	result, err := tx.conn.ExecContext(ctx, statement, args...)
+	if err != nil {
+		return err
+	}
+	if err := requireAffected(result); err != nil {
+		return err
+	}
+	tx.dirty = true
+	return nil
+}
+
+func (tx *AdminTransaction) RenewCard(ctx context.Context, id string, days int, now time.Time) error {
+	if tx == nil || !tx.active || days <= 0 || now.IsZero() {
+		return errors.New("invalid renewal")
+	}
+	var activatedAt, expiresAt sql.NullInt64
+	var unactivatedDays int64
+	if err := tx.conn.QueryRowContext(ctx, `SELECT activated_at,expires_at,unactivated_total_days FROM license_cards WHERE id=?`, id).Scan(&activatedAt, &expiresAt, &unactivatedDays); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if !activatedAt.Valid {
+		if int64(days) > maximumInt64-unactivatedDays {
+			return errors.New("unactivated renewal days overflow")
+		}
+		return tx.singleCardMutation(ctx, `UPDATE license_cards SET unactivated_total_days=unactivated_total_days+? WHERE id=?`, days, id)
+	}
+	if int64(days) > maximumInt64/secondsPerDay {
+		return errors.New("renewal duration overflow")
+	}
+	base := now.UTC()
+	if expiry := time.Unix(expiresAt.Int64, 0).UTC(); expiry.After(base) {
+		base = expiry
+	}
+	deltaSeconds := int64(days) * secondsPerDay
+	if base.Unix() > maximumInt64-deltaSeconds {
+		return errors.New("renewal expiry overflow")
+	}
+	newExpiry := time.Unix(base.Unix()+deltaSeconds, 0).UTC()
+	if _, err := tx.conn.ExecContext(ctx, `UPDATE license_cards SET expires_at=? WHERE id=?`, unixTime(newExpiry), id); err != nil {
+		return err
+	}
+	tx.dirty = true
+	if _, err := tx.conn.ExecContext(ctx, `UPDATE license_activation_bindings SET expires_at=? WHERE card_id=?`, unixTime(newExpiry), id); err != nil {
+		tx.failed = true
+		return err
+	}
+	return nil
+}
+
+func validCanonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -300,7 +629,7 @@ func (s *Store) PackageRemovalImpact(ctx context.Context, id string, replacement
 }
 
 func (s *Store) GetAdminIdempotency(ctx context.Context, key string, now time.Time) (model.AdminIdempotencyRecord, bool, error) {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=?`, unixTime(now)); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=? AND status<>102`, unixTime(now)); err != nil {
 		return model.AdminIdempotencyRecord{}, false, fmt.Errorf("prune admin idempotency: %w", err)
 	}
 	var record model.AdminIdempotencyRecord
@@ -321,7 +650,7 @@ func (s *Store) PutAdminIdempotency(ctx context.Context, key string, record mode
 		return errors.New("invalid admin idempotency record")
 	}
 	return s.immediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=?`, unixTime(now)); err != nil {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=? AND status<>102`, unixTime(now)); err != nil {
 			return err
 		}
 		var count int
@@ -329,9 +658,7 @@ func (s *Store) PutAdminIdempotency(ctx context.Context, key string, record mode
 			return err
 		}
 		if count >= maximum {
-			if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE key IN (SELECT key FROM license_admin_idempotency ORDER BY expires_at,key LIMIT 1)`); err != nil {
-				return err
-			}
+			return ErrAdminIdempotencyCapacity
 		}
 		_, err := conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(now))
 		return err
@@ -1052,6 +1379,10 @@ func (s *Store) immediate(ctx context.Context, fn func(*sql.Conn) error) (err er
 	return nil
 }
 
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 type queryRower interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
@@ -1088,7 +1419,7 @@ func scanCardSummary(row rowScanner) (model.CardSummary, error) {
 	return card, nil
 }
 
-func insertPackageMembers(ctx context.Context, tx *sql.Tx, packageID string, softwareIDs []string) error {
+func insertPackageMembers(ctx context.Context, tx sqlExecer, packageID string, softwareIDs []string) error {
 	for _, softwareID := range softwareIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO license_package_members(package_id,software_id) VALUES(?,?)`, packageID, softwareID); err != nil {
 			if isForeignKeyConstraint(err) {

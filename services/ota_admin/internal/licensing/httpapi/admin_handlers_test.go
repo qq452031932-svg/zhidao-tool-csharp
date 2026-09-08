@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -30,17 +31,25 @@ type adminHarness struct {
 	store   *licensestore.Store
 	service *service.Service
 	handler http.Handler
+	dbPath  string
 }
 
 func newAdminHarness(t *testing.T, limit int) *adminHarness {
 	t.Helper()
 	ctx := context.Background()
-	st, err := licensestore.Open(ctx, t.TempDir()+`\license.db`)
+	dbPath := t.TempDir() + `\license.db`
+	st, err := licensestore.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	clock := &testClock{now: time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)}
+	svc, handler := newAdminRouterForStore(t, st, clock, limit)
+	return &adminHarness{t: t, clock: clock, store: st, service: svc, handler: handler, dbPath: dbPath}
+}
+
+func newAdminRouterForStore(t *testing.T, st *licensestore.Store, clock *testClock, limit int) (*service.Service, http.Handler) {
+	t.Helper()
 	svc, err := service.New(st, clock, rand.Reader, bytes.Repeat([]byte{0x31}, 32), bytes.Repeat([]byte{0x32}, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +73,7 @@ func newAdminHarness(t *testing.T, limit int) *adminHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &adminHarness{t: t, clock: clock, store: st, service: svc, handler: handler}
+	return svc, handler
 }
 
 func AntragRate(requests int) RateLimit {
@@ -458,6 +467,12 @@ func TestAdminStrictHeadersJSONAndUnknownRoutes(t *testing.T) {
 
 func TestAdminConflictsAndConcurrentIdempotency(t *testing.T) {
 	h := newAdminHarness(t, 100)
+	secondStore, err := licensestore.Open(context.Background(), h.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	_, secondHandler := newAdminRouterForStore(t, secondStore, h.clock, 100)
 	first := h.request(http.MethodPost, "/internal/v1/software", `{"name":"Unique Product"}`, true)
 	if first.Code != http.StatusCreated {
 		t.Fatal(first.Body.String())
@@ -472,7 +487,7 @@ func TestAdminConflictsAndConcurrentIdempotency(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
 			r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"Concurrent Admin Product"}`))
 			r.RemoteAddr = "127.0.0.1:6"
@@ -480,9 +495,13 @@ func TestAdminConflictsAndConcurrentIdempotency(t *testing.T) {
 			r.Header.Set("Content-Type", "application/json")
 			r.Header.Set("Idempotency-Key", key)
 			w := httptest.NewRecorder()
-			h.handler.ServeHTTP(w, r)
+			if worker%2 == 0 {
+				h.handler.ServeHTTP(w, r)
+			} else {
+				secondHandler.ServeHTTP(w, r)
+			}
 			results <- w
-		}()
+		}(i)
 	}
 	wg.Wait()
 	close(results)
@@ -501,6 +520,69 @@ func TestAdminConflictsAndConcurrentIdempotency(t *testing.T) {
 	_ = items
 	if err != nil || total != 2 {
 		t.Fatalf("software total=%d err=%v", total, err)
+	}
+}
+
+type lostResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (w *lostResponseWriter) Header() http.Header { return w.header }
+func (w *lostResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *lostResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	_, _ = w.body.Write(p)
+	return 0, errors.New("simulated client disconnect")
+}
+
+func TestAdminLostResponseAfterCommitReplaysExactlyAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + `\license.db`
+	clock := &testClock{now: time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)}
+	firstStore, err := licensestore.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, firstHandler := newAdminRouterForStore(t, firstStore, clock, 100)
+	key := uuid.NewString()
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"Restart Replay Product"}`))
+		r.RemoteAddr = "127.0.0.1:7"
+		r.Header.Set("Authorization", "Bearer "+adminSecret)
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Idempotency-Key", key)
+		return r
+	}
+	lost := &lostResponseWriter{header: make(http.Header)}
+	firstHandler.ServeHTTP(lost, request())
+	if lost.status != http.StatusCreated {
+		t.Fatalf("lost response status=%d body=%s", lost.status, lost.body.String())
+	}
+	if err := firstStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secondStore, err := licensestore.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	_, secondHandler := newAdminRouterForStore(t, secondStore, clock, 100)
+	replayed := httptest.NewRecorder()
+	secondHandler.ServeHTTP(replayed, request())
+	if replayed.Code != lost.status || replayed.Body.String() != lost.body.String() {
+		t.Fatalf("restart replay differs: lost=%d %q replay=%d %q", lost.status, lost.body.String(), replayed.Code, replayed.Body.String())
+	}
+	_, total, err := secondStore.ListSoftware(ctx, 0, 10)
+	if err != nil || total != 1 {
+		t.Fatalf("lost response repeated mutation: total=%d err=%v", total, err)
 	}
 }
 

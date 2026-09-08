@@ -143,48 +143,43 @@ func (a *api) serveAdminMutation(w http.ResponseWriter, r *http.Request, next ht
 	sum := sha256.Sum256(append(prefix, body...))
 	fingerprint := hex.EncodeToString(sum[:])
 
-	a.adminMutation.Lock()
-	defer a.adminMutation.Unlock()
 	now := a.options.Clock.Now().UTC()
-	record, found, err := a.options.AdminIdempotencyStore.GetAdminIdempotency(r.Context(), key, now)
+	expiresAt := now.Add(24 * time.Hour)
+	tx, record, outcome, err := a.options.AdminIdempotencyStore.BeginAdminMutation(r.Context(), key, fingerprint, now, expiresAt, a.options.MaxReplayNonces)
 	if err != nil {
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
-	if found {
-		if record.Fingerprint != fingerprint {
-			a.writeAdminError(w, http.StatusConflict, "idempotency_conflict")
-			return
-		}
-		if record.Status == http.StatusProcessing {
-			a.writeAdminError(w, http.StatusConflict, "operation_in_progress")
-			return
-		}
-		body, err := a.options.AdminService.OpenAdminReplay(key, record.Body)
+	switch outcome {
+	case model.AdminIdempotencyConflict:
+		a.writeAdminError(w, http.StatusConflict, "idempotency_conflict")
+		return
+	case model.AdminIdempotencyPending:
+		a.writeAdminError(w, http.StatusConflict, "operation_in_progress")
+		return
+	case model.AdminIdempotencyReplay:
+		replayBody, err := a.options.AdminService.OpenAdminReplay(key, record.Body)
 		if err != nil {
 			a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 			return
 		}
-		defer clear(body)
+		defer clear(replayBody)
 		w.Header().Set("Content-Type", record.ContentType)
 		w.Header().Set("Cache-Control", "no-store")
 		if record.ContentDisposition != "" {
 			w.Header().Set("Content-Disposition", record.ContentDisposition)
 		}
 		w.WriteHeader(record.Status)
-		_, _ = w.Write(body)
+		_, _ = w.Write(replayBody)
 		return
-	}
-	pendingBody, err := a.options.AdminService.ProtectAdminReplay(key, nil)
-	if err != nil {
+	case model.AdminIdempotencyNew:
+		// Continue below with the SQLite write transaction held.
+	default:
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
-	pending := model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: http.StatusProcessing, Body: pendingBody, ContentType: "application/json", ExpiresAt: now.Add(24 * time.Hour)}
-	if err := a.options.AdminIdempotencyStore.PutAdminIdempotency(r.Context(), key, pending, now, a.options.MaxReplayNonces); err != nil {
-		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
-		return
-	}
+	defer tx.Rollback()
+	r = r.WithContext(service.WithAdminMutationTransaction(r.Context(), tx))
 	buffered := &bufferedAdminResponse{header: make(http.Header)}
 	next.ServeHTTP(buffered, r)
 	if buffered.status == 0 {
@@ -195,8 +190,8 @@ func (a *api) serveAdminMutation(w http.ResponseWriter, r *http.Request, next ht
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
-	record = model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: buffered.status, Body: protected, ContentType: buffered.header.Get("Content-Type"), ContentDisposition: buffered.header.Get("Content-Disposition"), ExpiresAt: now.Add(24 * time.Hour)}
-	if err := a.options.AdminIdempotencyStore.CompleteAdminIdempotency(r.Context(), key, fingerprint, record); err != nil {
+	record = model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: buffered.status, Body: protected, ContentType: buffered.header.Get("Content-Type"), ContentDisposition: buffered.header.Get("Content-Disposition"), ExpiresAt: expiresAt}
+	if err := tx.Complete(r.Context(), key, record); err != nil {
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
