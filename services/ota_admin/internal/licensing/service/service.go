@@ -34,7 +34,7 @@ type Store interface {
 	FindCardByDigest(context.Context, string) (model.Card, error)
 	GetSoftwareAuthorization(context.Context, string, string) (model.Software, bool, error)
 	Activate(context.Context, model.ActivationMutation) (model.ActivationState, error)
-	RecordLease(context.Context, model.Lease) (model.Lease, error)
+	ValidateAndRecordLease(context.Context, model.Lease) (model.ActivationState, error)
 	RenewCard(context.Context, string, int, time.Time) error
 	UnbindCard(context.Context, string) error
 	DeleteCard(context.Context, string) error
@@ -156,14 +156,11 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 	if leaseUntil.After(*card.ExpiresAt) {
 		leaseUntil = *card.ExpiresAt
 	}
-	lease, err := s.store.RecordLease(ctx, model.Lease{CardID: card.ID, SoftwareID: strings.TrimSpace(softwareID), MachineHash: strings.TrimSpace(machineHash), LastSeenAt: now, LeaseUntil: leaseUntil})
+	state, err := s.store.ValidateAndRecordLease(ctx, model.Lease{CardID: card.ID, SoftwareID: strings.TrimSpace(softwareID), MachineHash: strings.TrimSpace(machineHash), LastSeenAt: now, LeaseUntil: leaseUntil})
 	if err != nil {
-		if errors.Is(err, licensestore.ErrLeaseNotBound) {
-			return model.ActivationState{}, ErrNotFound
-		}
 		return model.ActivationState{}, classifyStoreError(err)
 	}
-	return model.ActivationState{CardID: card.ID, SoftwareID: strings.TrimSpace(softwareID), MachineHash: strings.TrimSpace(machineHash), ActivatedAt: *card.ActivatedAt, ExpiresAt: *card.ExpiresAt, LeaseUntil: lease.LeaseUntil}, nil
+	return state, nil
 }
 
 func (s *Service) RenewCard(ctx context.Context, cardID string, days int) error {
@@ -263,6 +260,14 @@ func classifyStoreError(err error) error {
 		return ErrNotFound
 	case errors.Is(err, licensestore.ErrMachineBound):
 		return ErrMachineMismatch
+	case errors.Is(err, licensestore.ErrLeaseNotBound):
+		return ErrNotFound
+	case errors.Is(err, licensestore.ErrSoftwareNotAllowed):
+		return ErrAppNotAllowed
+	case errors.Is(err, licensestore.ErrSoftwareDisabled):
+		return ErrAppDisabled
+	case errors.Is(err, licensestore.ErrLicenseExpired):
+		return ErrExpired
 	default:
 		return err
 	}

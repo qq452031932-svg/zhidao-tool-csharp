@@ -18,9 +18,12 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("license record not found")
-	ErrMachineBound  = errors.New("card is bound to another machine")
-	ErrLeaseNotBound = errors.New("lease has no current activation binding")
+	ErrNotFound           = errors.New("license record not found")
+	ErrMachineBound       = errors.New("card is bound to another machine")
+	ErrLeaseNotBound      = errors.New("lease has no current activation binding")
+	ErrSoftwareNotAllowed = errors.New("software is not authorized by the card package")
+	ErrSoftwareDisabled   = errors.New("software is disabled")
+	ErrLicenseExpired     = errors.New("license is expired")
 )
 
 const busyTimeoutMilliseconds = 10_000
@@ -460,6 +463,77 @@ lease_until=CASE WHEN excluded.lease_until>license_leases.lease_until THEN exclu
 	lease.LastSeenAt = time.Unix(seen, 0).UTC()
 	lease.LeaseUntil = time.Unix(until, 0).UTC()
 	return lease, nil
+}
+
+// ValidateAndRecordLease atomically establishes a product-specific binding for
+// an already activated card and records its lease. The immediate transaction is
+// serialized with UnbindCard's write, so an authorization that observed a stale
+// preflight read cannot recreate bindings or leases after an admin unbind.
+func (s *Store) ValidateAndRecordLease(ctx context.Context, lease model.Lease) (state model.ActivationState, err error) {
+	if lease.CardID == "" || lease.SoftwareID == "" || lease.MachineHash == "" || lease.LastSeenAt.IsZero() || lease.LeaseUntil.IsZero() {
+		return state, errors.New("validation lease fields are required")
+	}
+	lease.LastSeenAt = canonicalTime(lease.LastSeenAt)
+	lease.LeaseUntil = canonicalTime(lease.LeaseUntil)
+	err = s.immediate(ctx, func(conn *sql.Conn) error {
+		var packageID string
+		var machine sql.NullString
+		var activatedAt, expiresAt sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT package_id,machine_hash,activated_at,expires_at FROM license_cards WHERE id=?`, lease.CardID).Scan(&packageID, &machine, &activatedAt, &expiresAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !machine.Valid || !activatedAt.Valid || !expiresAt.Valid {
+			return ErrLeaseNotBound
+		}
+		if machine.String != lease.MachineHash {
+			return ErrMachineBound
+		}
+
+		var enabled, member int
+		if err := conn.QueryRowContext(ctx, `SELECT enabled,EXISTS(SELECT 1 FROM license_package_members WHERE package_id=? AND software_id=license_software.id) FROM license_software WHERE id=?`, packageID, lease.SoftwareID).Scan(&enabled, &member); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrSoftwareNotAllowed
+			}
+			return err
+		}
+		if member == 0 {
+			return ErrSoftwareNotAllowed
+		}
+		if enabled == 0 {
+			return ErrSoftwareDisabled
+		}
+
+		activationTime := time.Unix(activatedAt.Int64, 0).UTC()
+		expiryTime := time.Unix(expiresAt.Int64, 0).UTC()
+		if !expiryTime.After(lease.LastSeenAt) {
+			return ErrLicenseExpired
+		}
+		if lease.LeaseUntil.After(expiryTime) {
+			lease.LeaseUntil = expiryTime
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_bindings(card_id,software_id,machine_hash,activated_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id) DO UPDATE SET machine_hash=excluded.machine_hash,activated_at=excluded.activated_at,expires_at=excluded.expires_at`, lease.CardID, lease.SoftwareID, lease.MachineHash, activatedAt.Int64, expiresAt.Int64); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until) VALUES(?,?,?,?,?)
+ON CONFLICT(card_id,software_id,machine_hash) DO UPDATE SET
+last_seen_at=CASE WHEN excluded.last_seen_at>=license_leases.last_seen_at+3600 THEN excluded.last_seen_at ELSE license_leases.last_seen_at END,
+lease_until=CASE WHEN excluded.lease_until>license_leases.lease_until THEN excluded.lease_until ELSE license_leases.lease_until END`, lease.CardID, lease.SoftwareID, lease.MachineHash, unixTime(lease.LastSeenAt), unixTime(lease.LeaseUntil)); err != nil {
+			return err
+		}
+		var leaseUntil int64
+		if err := conn.QueryRowContext(ctx, `SELECT lease_until FROM license_leases WHERE card_id=? AND software_id=? AND machine_hash=?`, lease.CardID, lease.SoftwareID, lease.MachineHash).Scan(&leaseUntil); err != nil {
+			return err
+		}
+		state = model.ActivationState{CardID: lease.CardID, SoftwareID: lease.SoftwareID, MachineHash: lease.MachineHash, ActivatedAt: activationTime, ExpiresAt: expiryTime, LeaseUntil: time.Unix(leaseUntil, 0).UTC()}
+		return nil
+	})
+	if err != nil {
+		return model.ActivationState{}, fmt.Errorf("validate card: %w", err)
+	}
+	return state, nil
 }
 
 func (s *Store) immediate(ctx context.Context, fn func(*sql.Conn) error) (err error) {

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,18 +26,32 @@ type fakeClock struct{ now time.Time }
 
 func (c *fakeClock) Now() time.Time { return c.now }
 
+type delayedValidationStore struct {
+	*licensestore.Store
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (s *delayedValidationStore) ValidateAndRecordLease(ctx context.Context, lease model.Lease) (model.ActivationState, error) {
+	close(s.entered)
+	<-s.proceed
+	return s.Store.ValidateAndRecordLease(ctx, lease)
+}
+
 type harness struct {
-	t     *testing.T
-	ctx   context.Context
-	store *licensestore.Store
-	clock *fakeClock
-	svc   *Service
+	t      *testing.T
+	ctx    context.Context
+	store  *licensestore.Store
+	clock  *fakeClock
+	svc    *Service
+	dbPath string
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx := context.Background()
-	st, err := licensestore.Open(ctx, t.TempDir()+`\license.db`)
+	dbPath := t.TempDir() + `\license.db`
+	st, err := licensestore.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +65,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{t: t, ctx: ctx, store: st, clock: clock, svc: svc}
+	return &harness{t: t, ctx: ctx, store: st, clock: clock, svc: svc, dbPath: dbPath}
 }
 
 func (h *harness) software(name string) model.Software {
@@ -205,8 +222,27 @@ func TestPackageAuthorizationAndSoftwareEnabledStateAreDynamic(t *testing.T) {
 	if err := h.store.ReplacePackageMembers(h.ctx, pkg.ID, []string{softwareA.ID, softwareB.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.svc.Activate(h.ctx, "request-b", card.Plaintext, softwareB.ID, "machine-a"); err != nil {
+	validatedB, err := h.svc.Validate(h.ctx, card.Plaintext, softwareB.ID, "machine-a")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !validatedB.ActivatedAt.Equal(h.clock.now) || !validatedB.ExpiresAt.Equal(h.clock.now.Add(90*24*time.Hour)) {
+		t.Fatal("cross-product validation changed the original lifetime")
+	}
+	raw := h.rawDB()
+	defer raw.Close()
+	var requests, bindings, leases int
+	if err := raw.QueryRow(`SELECT count(*) FROM license_activation_requests WHERE card_id=?`, card.Card.ID).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.QueryRow(`SELECT count(*) FROM license_activation_bindings WHERE card_id=? AND software_id=?`, card.Card.ID, softwareB.ID).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.QueryRow(`SELECT count(*) FROM license_leases WHERE card_id=? AND software_id=?`, card.Card.ID, softwareB.ID).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || bindings != 1 || leases != 1 {
+		t.Fatalf("cross-product requests/bindings/leases = %d/%d/%d, want 1/1/1", requests, bindings, leases)
 	}
 	if err := h.store.ReplacePackageMembers(h.ctx, pkg.ID, []string{softwareB.ID}); err != nil {
 		t.Fatal(err)
@@ -219,6 +255,55 @@ func TestPackageAuthorizationAndSoftwareEnabledStateAreDynamic(t *testing.T) {
 	}
 	if _, err := h.svc.Validate(h.ctx, card.Plaintext, softwareB.ID, "machine-a"); !errors.Is(err, ErrAppDisabled) {
 		t.Fatalf("disabled software error = %v, want ErrAppDisabled", err)
+	}
+}
+
+func TestCrossProductValidationCannotRecreateStateAfterConcurrentUnbind(t *testing.T) {
+	h := newHarness(t)
+	softwareA := h.software("Unbind A")
+	softwareB := h.software("Unbind B")
+	pkg := h.packageWith(softwareA, softwareB)
+	card := h.generate(pkg.ID, 30)
+	if _, err := h.svc.Activate(h.ctx, "request-a", card.Plaintext, softwareA.ID, "machine-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	delayed := &delayedValidationStore{Store: h.store, entered: make(chan struct{}), proceed: make(chan struct{})}
+	defer func() {
+		select {
+		case <-delayed.proceed:
+		default:
+			close(delayed.proceed)
+		}
+	}()
+	svc, err := New(delayed, h.clock, rand.Reader, bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validationDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Validate(h.ctx, card.Plaintext, softwareB.ID, "machine-a")
+		validationDone <- err
+	}()
+	<-delayed.entered
+	if err := h.svc.UnbindCard(h.ctx, card.Card.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(delayed.proceed)
+	if err := <-validationDone; !errors.Is(err, ErrNotFound) {
+		t.Fatalf("validation racing after unbind error = %v, want ErrNotFound", err)
+	}
+
+	raw := h.rawDB()
+	defer raw.Close()
+	for _, table := range []string{"license_activation_bindings", "license_leases"} {
+		var count int
+		if err := raw.QueryRow(`SELECT count(*) FROM `+table+` WHERE card_id=?`, card.Card.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows after concurrent unbind = %d, want 0", table, count)
+		}
 	}
 }
 
@@ -246,19 +331,41 @@ func TestRenewalRulesForUnusedAndActivatedCards(t *testing.T) {
 	if err := h.svc.RenewCard(h.ctx, active.Card.ID, 30); err != nil {
 		t.Fatal(err)
 	}
+	summaries, err := h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: active.Card.Prefix8})
+	if err != nil || len(summaries) != 1 {
+		t.Fatalf("SearchCards returned %d rows, error %v", len(summaries), err)
+	}
+	wantFutureExpiry := state.ExpiresAt.Add(30 * 24 * time.Hour)
+	if summaries[0].ExpiresAt == nil || !summaries[0].ExpiresAt.Equal(wantFutureExpiry) {
+		t.Fatalf("future-expiry renewal = %v, want %v", summaries[0].ExpiresAt, wantFutureExpiry)
+	}
 	// The second renewal happens after the first renewed expiry, so it must
 	// extend from the server's current time rather than the stale expiry.
 	h.clock.now = state.ExpiresAt.Add(40 * 24 * time.Hour)
 	if err := h.svc.RenewCard(h.ctx, active.Card.ID, 90); err != nil {
 		t.Fatal(err)
 	}
-	summaries, err := h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: active.Card.Prefix8})
+	summaries, err = h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: active.Card.Prefix8})
 	if err != nil || len(summaries) != 1 {
 		t.Fatalf("SearchCards returned %d rows, error %v", len(summaries), err)
 	}
 	want := h.clock.now.Add(90 * 24 * time.Hour)
 	if summaries[0].ExpiresAt == nil || !summaries[0].ExpiresAt.Equal(want) {
 		t.Fatalf("activated renewal expiry = %v, want %v", summaries[0].ExpiresAt, want)
+	}
+
+	for _, days := range []int{180, 365} {
+		candidate := h.generate(pkg.ID, 30)
+		if err := h.svc.RenewCard(h.ctx, candidate.Card.ID, days); err != nil {
+			t.Fatalf("accepted RenewCard(%d) error = %v", days, err)
+		}
+		rows, err := h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: candidate.Card.Prefix8})
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("SearchCards after RenewCard(%d) returned %d rows, error %v", days, len(rows), err)
+		}
+		if rows[0].UnactivatedTotalDays != 30+days {
+			t.Fatalf("RenewCard(%d) unused total = %d, want %d", days, rows[0].UnactivatedTotalDays, 30+days)
+		}
 	}
 
 	for _, days := range []int{-1, 0, 1, 31, 364} {
@@ -367,6 +474,70 @@ func TestCardProtectionEncryptsAndUsesNormalizedKeyedDigest(t *testing.T) {
 	}
 }
 
+func TestGenerateCardsPersistsOnlyEncryptedCardMaterial(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("At Rest")
+	pkg := h.packageWith(software)
+	card := h.generate(pkg.ID, 30)
+	raw := h.rawDB()
+	defer raw.Close()
+
+	var ciphertext []byte
+	var digest string
+	if err := raw.QueryRow(`SELECT ciphertext,full_digest FROM license_cards WHERE id=?`, card.Card.ID).Scan(&ciphertext, &digest); err != nil {
+		t.Fatal(err)
+	}
+	compact := strings.ReplaceAll(card.Plaintext, "-", "")
+	if len(ciphertext) == 0 || bytes.Equal(ciphertext, []byte(card.Plaintext)) || bytes.Contains(ciphertext, []byte(card.Plaintext)) || bytes.Contains(ciphertext, []byte(compact)) {
+		t.Fatal("persisted ciphertext exposed plaintext card material")
+	}
+	if digest == card.Plaintext || digest == compact || digest != h.svc.protector.digest(card.Plaintext) {
+		t.Fatal("persisted full-card digest was not the keyed normalized digest")
+	}
+	rawDigest := sha256.Sum256([]byte(compact))
+	if digest == hex.EncodeToString(rawDigest[:]) {
+		t.Fatal("persisted full-card digest used an unkeyed hash")
+	}
+	opened, err := h.svc.protector.open(ciphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened != card.Plaintext {
+		t.Fatal("persisted AES-GCM ciphertext did not round-trip")
+	}
+
+	rows, err := raw.Query(`PRAGMA table_info(license_cards)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	allowedColumns := map[string]bool{
+		"id": true, "package_id": true, "ciphertext": true, "full_digest": true,
+		"prefix8": true, "last4": true, "base_days": true, "unactivated_total_days": true,
+		"note": true, "activated_at": true, "expires_at": true, "machine_hash": true, "created_at": true,
+	}
+	seenColumns := make(map[string]bool, len(allowedColumns))
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		name = strings.ToLower(name)
+		if !allowedColumns[name] {
+			t.Fatalf("license_cards contains unexpected secret-bearing column %q", name)
+		}
+		seenColumns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(seenColumns) != len(allowedColumns) {
+		t.Fatalf("license_cards column count = %d, want %d approved metadata/ciphertext columns", len(seenColumns), len(allowedColumns))
+	}
+}
+
 func TestNormalListOmitsPlaintextAndErrorsAreRedacted(t *testing.T) {
 	h := newHarness(t)
 	software := h.software("Redaction")
@@ -428,4 +599,13 @@ func TestNewAndServiceInputsRejectInvalidRequests(t *testing.T) {
 	if err := h.svc.RenewCard(h.ctx, card.Card.ID, 30); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("zero server clock renewal error = %v, want ErrInvalidRequest", err)
 	}
+}
+
+func (h *harness) rawDB() *sql.DB {
+	h.t.Helper()
+	db, err := sql.Open("sqlite", h.dbPath)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return db
 }
