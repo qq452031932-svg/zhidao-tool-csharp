@@ -46,6 +46,9 @@ This plan ends with both Go processes and the desktop client running against loo
 - `scripts/run_local_license_stack.ps1`: create disposable keys/config/databases, start both local processes, and print URLs/password.
 - `scripts/stop_local_license_stack.ps1`: stop only PIDs recorded by the local runner.
 - `.gitignore`: ignore `.tmp/license-local/` runtime secrets and databases.
+- `tools/license_client_harness/SuperPan.Licensing.AcceptanceHarness.csproj`: command-line consumer of the real reusable client.
+- `tools/license_client_harness/Program.cs`: activate/validate/authorize commands with injectable product, store root, machine fixture, and UTC time.
+- `tools/license_client_harness/packages.lock.json`: locked harness dependencies.
 
 ### Reusable Windows client
 
@@ -82,6 +85,8 @@ This plan ends with both Go processes and the desktop client running against loo
 - Create: `src/SuperPan.Licensing.Client/SuperPan.Licensing.Client.csproj`
 - Create: `src/SuperPan.Licensing.Client/LicenseContracts.cs`
 - Create: `tests/SuperPan.Licensing.Client.Tests/SuperPan.Licensing.Client.Tests.csproj`
+- Create: `src/SuperPan.Licensing.Client/packages.lock.json`
+- Create: `tests/SuperPan.Licensing.Client.Tests/packages.lock.json`
 - Create: `tests/SuperPan.Licensing.Client.Tests/LicenseContractTests.cs`
 - Modify: `BaiduBatchTransfer.sln`
 - Modify: `Directory.Packages.props`
@@ -105,8 +110,10 @@ The payload record fields are `protocol_version`, `request_id`, `server_time`, `
 Run:
 
 ```powershell
+Push-Location services/ota_admin
 go test ./internal/licensing/model
-dotnet test tests/SuperPan.Licensing.Client.Tests/SuperPan.Licensing.Client.Tests.csproj --no-restore
+Pop-Location
+dotnet test tests/SuperPan.Licensing.Client.Tests/SuperPan.Licensing.Client.Tests.csproj
 ```
 
 Expected: FAIL because contract types/projects do not exist.
@@ -121,11 +128,11 @@ Use a Windows target for the client library:
 <ImplicitUsings>enable</ImplicitUsings>
 ```
 
-Add central versions for `System.Management` and reference `System.Security.Cryptography.ProtectedData`. Keep HTTP/JSON types dependency-free.
+Add central versions for `System.Management` and reference `System.Security.Cryptography.ProtectedData`. Keep HTTP/JSON types dependency-free. Add both projects to `BaiduBatchTransfer.sln`, run `dotnet restore` once, and commit the generated lock files.
 
 - [ ] **Step 4: Run the focused tests and verify pass**
 
-Expected: both commands PASS.
+Run `dotnet restore BaiduBatchTransfer.sln`, then repeat the focused tests with `--no-restore`. Expected: both Go and .NET commands PASS and both new `packages.lock.json` files exist.
 
 - [ ] **Step 5: Commit only Task 1 files**
 
@@ -159,7 +166,13 @@ Cover:
 
 - [ ] **Step 2: Run and verify the tests fail**
 
-Run: `go test ./internal/licensing/store -run Test -count=1`
+Run:
+
+```powershell
+Push-Location services/ota_admin
+go test ./internal/licensing/store -run Test -count=1
+Pop-Location
+```
 
 Expected: FAIL because the store does not exist.
 
@@ -185,8 +198,10 @@ SearchCards(ctx context.Context, filter model.CardFilter) ([]model.CardSummary, 
 Run:
 
 ```powershell
+Push-Location services/ota_admin
 go test ./internal/licensing/store -count=1
 go test -race ./internal/licensing/store -count=1
+Pop-Location
 ```
 
 Expected: PASS; no `busy/locked` error in concurrent activation tests.
@@ -213,7 +228,7 @@ Also prove that cards are generated with cryptographic randomness, normalized be
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `go test ./internal/licensing/service -run Test -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/licensing/service -run Test -count=1; Pop-Location`
 
 - [ ] **Step 3: Implement the smallest service satisfying the rules**
 
@@ -221,7 +236,7 @@ Use injected `Clock`, `Random`, store interface, 32-byte encryption key, and dis
 
 - [ ] **Step 4: Run tests**
 
-Run: `go test ./internal/licensing/service -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/licensing/service -count=1; Pop-Location`
 
 Expected: PASS with no logged card plaintext.
 
@@ -249,11 +264,11 @@ git commit -m "feat: enforce license lifecycle rules"
 
 - [ ] **Step 1: Write failing API security tests**
 
-Exercise exact routes `/license-api/v1/activate` and `/license-api/v1/validate`. Assert body/header limits, JSON unknown-field rejection, request timestamps, nonce replay rejection, `activation_request_id` idempotency, per-route rate limits with `Retry-After`, stable HTTP/code mapping, and signed success/business-rejection responses.
+Exercise exact routes `/license-api/v1/activate` and `/license-api/v1/validate`. Assert body/header limits, JSON unknown-field rejection, request timestamps, nonce replay rejection, `activation_request_id` idempotency, independent activation/validation rate-limit buckets with `Retry-After`, stable HTTP/code mapping, and signed success/business-rejection responses.
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `go test ./internal/licensing/config ./internal/licensing/signing ./internal/licensing/httpapi ./cmd/license-service -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/licensing/config ./internal/licensing/signing ./internal/licensing/httpapi ./cmd/license-service -count=1; Pop-Location`
 
 - [ ] **Step 3: Implement byte-exact ECDSA envelopes**
 
@@ -261,15 +276,17 @@ Serialize the claims once into exact UTF-8 bytes, sign those bytes with ECDSA P-
 
 - [ ] **Step 4: Implement error and cache semantics**
 
-`400/403/409` are signed definitive rejections. `429` includes `Retry-After`; `500/502/503/504` map to `service_unavailable`. No endpoint exposes stack traces, paths, card plaintext, raw machine values, or key contents.
+`400/403/409` are signed definitive rejections. `429` includes `Retry-After`; `500/502/503/504` map to `service_unavailable`. Add an import-boundary test using `go list -deps` or AST imports to prove `cmd/license-service` and `internal/licensing/*` do not import OTA candidate, deploy, publisher, release, upload, operation, session, or main store packages. No endpoint exposes stack traces, paths, card plaintext, raw machine values, or key contents.
 
 - [ ] **Step 5: Run tests and the race detector**
 
 Run:
 
 ```powershell
+Push-Location services/ota_admin
 go test ./internal/licensing/config ./internal/licensing/signing ./internal/licensing/httpapi ./cmd/license-service -count=1
 go test -race ./internal/licensing/httpapi -count=1
+Pop-Location
 ```
 
 Expected: PASS.
@@ -289,19 +306,19 @@ git commit -m "feat: expose signed license activation API"
 
 - [ ] **Step 1: Write failing internal API tests**
 
-Require an exact bearer token read from the root-owned/group-readable secret file and loopback source address. Cover list/create/rename/enable software; list/create/update packages; generate/search/copy/export/remark/renew/unbind/delete cards; and read device binding summaries.
+Require an exact bearer token read from the root-owned/group-readable secret file and loopback source address. Cover list/create/rename/enable software; list/create/update packages plus package-removal impact preview; generate/search/copy/export/remark/renew/unbind/delete cards; all required card filters; and read device binding summaries.
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `go test ./internal/licensing/httpapi -run 'TestAdmin' -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/licensing/httpapi -run TestAdmin -count=1; Pop-Location`
 
 - [ ] **Step 3: Implement strict routes**
 
-Use `/internal/v1/software`, `/internal/v1/packages`, `/internal/v1/cards`, and resource action suffixes. Mutations require UUID idempotency keys. CSV export must encode UTF-8 BOM, quote formula-leading cells, and include complete card, package, type, state, expiry, binding short ID, and note.
+Use `/internal/v1/software`, `/internal/v1/packages`, `/internal/v1/packages/{id}/impact`, `/internal/v1/cards`, `/internal/v1/devices`, and resource action suffixes. Mutations require UUID idempotency keys. CSV export must encode UTF-8 BOM, quote formula-leading cells, and include complete card, package, type, state, expiry, binding short ID, and note.
 
 - [ ] **Step 4: Run tests**
 
-Expected: PASS; non-loopback or wrong bearer requests return generic 404/401 without details.
+Expected: PASS; non-loopback or wrong bearer requests return generic 404/401 without details. Use a distinct `internal-admin` limiter, separate from activation and validation, and prove its threshold and reset behavior.
 
 - [ ] **Step 5: Commit Task 5**
 
@@ -330,7 +347,7 @@ Prove all `/admin/api/license/*` calls require the existing admin session and CS
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `go test ./internal/licenseadmin ./internal/httpapi ./internal/config ./cmd/ota-admin -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/licenseadmin ./internal/httpapi ./internal/config ./cmd/ota-admin -count=1; Pop-Location`
 
 - [ ] **Step 3: Add strict config and typed client**
 
@@ -342,7 +359,7 @@ Pass the current session principal only for audit attribution; never trust actor
 
 - [ ] **Step 5: Run tests**
 
-Expected: PASS.
+Expected: PASS, including proof that `MustChangePassword` continues to block license routes until password rotation is complete.
 
 - [ ] **Step 6: Commit Task 6**
 
@@ -362,21 +379,21 @@ git commit -m "feat: integrate licensing with OTA admin session"
 
 - [ ] **Step 1: Extend the real-browser test and verify failure**
 
-The browser driver must log in, land on “卡密管理”, create software, create a multi-software package, generate cards with a batch note, search by note and fixed prefix/last4, copy/export, renew, unbind, permanently delete with confirmation, and switch to the “OTA 更新” tab without losing current OTA functions.
+The browser driver must log in, land on “卡密管理”, create and rename software, disable/re-enable one software item, create a multi-software package, preview the affected-valid-card count before removing a package member, generate cards with a batch note, filter by complete card/prefix8/last4/note/package/card type/state, copy/export, renew, inspect and unbind a device, permanently delete with confirmation, and switch to the “OTA 更新” tab without losing current OTA functions. It must also prove `429 Retry-After` disables repeated mutation clicks until the server permits retry.
 
 - [ ] **Step 2: Run the browser test**
 
-Run: `go test ./internal/webui -run TestAdminConsoleInRealBrowser -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/webui -run TestAdminConsoleInRealBrowser -count=1; Pop-Location`
 
 Expected: FAIL because license tabs/actions do not exist.
 
 - [ ] **Step 3: Implement the compact Chinese UI**
 
-Navigation order: `卡密管理 | 软件管理 | 套餐管理 | OTA 更新`. Default to card management after login. Use a single dense toolbar for package, card type, quantity, default note, and generate. Use a table for masked key, package, days, state, activation, expiry, binding, and note. Destructive delete is a two-step confirmation; no recycle/restore control exists.
+Navigation order: `卡密管理 | 软件管理 | 套餐管理 | 设备绑定 | OTA 更新`. Default to card management after login. Use a single dense toolbar for package, card type, quantity, default note, and generate. Filters cover complete card, fixed first 8/last 4, note, package, card type, and state. Use a table for masked key, package, days, state, activation, expiry, binding, and note. Software rows expose rename and enable/disable only. Package membership removal first calls an impact-preview endpoint and shows the number of affected valid cards plus the possible 30-minute offline delay. Device binding shows only card short ID, machine short ID, bound time, last successful validation, and administrator unbind. When an endpoint returns 429, disable only the affected action, show the retry time, and use capped exponential retry with random jitter for automatic reads; never spin or poll continuously. Destructive delete is a two-step confirmation; no recycle/restore control exists.
 
 - [ ] **Step 4: Run asset and browser tests**
 
-Run: `go test ./internal/webui -count=1`
+Run: `Push-Location services/ota_admin; go test ./internal/webui -count=1; Pop-Location`
 
 Expected: PASS in both happy and service-unavailable browser scenarios.
 
@@ -405,7 +422,9 @@ Assert the local host has a build tag, refuses non-loopback binds, uses disposab
 Run:
 
 ```powershell
+Push-Location services/ota_admin
 go test -tags license_local_acceptance ./cmd/license-admin-local -count=1
+Pop-Location
 dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~LicenseLocalStack" --no-restore
 ```
 
@@ -435,7 +454,7 @@ git commit -m "test: add local license acceptance stack"
 
 - [ ] **Step 1: Write failing client security tests**
 
-Test valid ECDSA envelope, wrong signer, changed payload, mismatched request/software/machine, unknown key ID/code, stale/future server time, lease beyond 30 minutes or card expiry, every HTTP mapping, and 429/5xx/transport failures. Test two SPKI pins and rejection of unpinned certificates.
+Test valid ECDSA envelope, wrong signer, changed payload, mismatched request/software/machine, unknown key ID/code, stale/future server time, lease beyond 30 minutes or card expiry, every HTTP mapping, and 429/5xx/transport failures. Test two SPKI pins and rejection of unpinned certificates. Use an injected delay/random source to prove retry timing without sleeping: at most three attempts, exponential delays of `250 ms * 2^(attempt-1)` plus `0..250 ms` jitter, cancellation, and `Retry-After` capped at 10 seconds.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -443,7 +462,7 @@ Run: `dotnet test tests/SuperPan.Licensing.Client.Tests/SuperPan.Licensing.Clien
 
 - [ ] **Step 3: Implement fail-closed verification**
 
-Parse the outer envelope, base64-decode exact payload bytes, verify ECDSA before parsing claims, then bind all expected fields. Production options require HTTPS plus exactly two valid lowercase SPKI SHA-256 pins. A separate explicit `AllowLoopbackHttpForAcceptance` option may allow only `http://127.0.0.1` and only in acceptance builds.
+Parse the outer envelope, base64-decode exact payload bytes, verify ECDSA before parsing claims, then bind all expected fields. Production options require HTTPS plus exactly two valid lowercase SPKI SHA-256 pins. A separate explicit `AllowLoopbackHttpForAcceptance` option may allow only `http://127.0.0.1` and only in acceptance builds. For transport failure, 429, or 5xx, attempt at most three total sends with cancellation-aware delays of `250 ms * 2^(attempt-1)` plus injected 0–250 ms jitter; honor a larger `Retry-After` up to a 10-second cap. Reuse the activation business request ID but generate a fresh timestamp and nonce on every send. Never retry definitive 4xx business rejections. After the retry budget, return the temporary-failure result so the gate may evaluate its local lease.
 
 - [ ] **Step 4: Run tests**
 
@@ -541,34 +560,47 @@ git commit -m "feat: add Chinese license activation experience"
 - Modify: `src/BaiduBatchTransfer.App/BaiduBatchTransfer.App.csproj`
 - Modify: `src/BaiduBatchTransfer.App/AppBootstrap.cs`
 - Modify: `src/BaiduBatchTransfer.App/App.xaml.cs`
+- Modify: `src/BaiduBatchTransfer.App/AppStartupController.cs`
+- Create: `src/BaiduBatchTransfer.App/Features/Licensing/LicenseRuntimeAuthorizationState.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/Transfers/TransferWorkspaceViewModel.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/Shares/ShareWorkspaceViewModel.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/ShareAnalytics/ShareAnalyticsViewModel.cs`
+- Modify: `src/BaiduBatchTransfer.App/Features/Common/WorkspaceRunPanelViewModel.cs`
+- Modify: `src/BaiduBatchTransfer.App/Features/Jobs/JobResultsViewModel.cs`
+- Modify: `src/BaiduBatchTransfer.App/Services/TransferCoordinatorHostedService.cs`
+- Modify: `src/BaiduBatchTransfer.App/Services/StandaloneShareCoordinatorHostedService.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/AppBootstrapTests.cs`
+- Modify: `tests/BaiduBatchTransfer.App.Tests/AppStartupControllerTests.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/Features/TransferWorkspaceViewModelTests.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/Features/ShareWorkspaceViewModelTests.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/Features/ShareAnalyticsViewModelTests.cs`
+- Modify: `tests/BaiduBatchTransfer.App.Tests/Features/WorkspaceRunPanelViewModelTests.cs`
+- Modify: `tests/BaiduBatchTransfer.App.Tests/Features/JobResultsViewModelTests.cs`
+- Modify: `tests/BaiduBatchTransfer.App.Tests/Services/TransferCoordinatorHostedServiceTests.cs`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Services/StandaloneShareCoordinatorHostedServiceTests.cs`
+- Modify: `tests/BaiduBatchTransfer.App.Tests/Updates/OtaBuildConfigurationTests.cs`
 - Create: `tests/BaiduBatchTransfer.App.Tests/Features/LicenseOperationBoundaryTests.cs`
+- Create: `scripts/build_local_license_acceptance.ps1`
 
 - [ ] **Step 1: Write failing boundary tests**
 
-Assert startup validates once but still opens local UI on rejection; transfer/share start, manual resume, manual retry, and analytics remote refresh call the gate before creating remote work; an already-running batch and scheduler-owned automatic retry do not revalidate; a process-restart recovery or new batch does. A failed gate must not mutate job state or send Baidu requests.
+Assert startup validates once before hosted coordinators may dispatch recovered work, but still opens the local UI on rejection. `LicenseRuntimeAuthorizationState` keeps both coordinator hosted services waiting until startup validation or later activation succeeds. Transfer/share start, workspace manual resume/retry, job-results manual retry, and every newly-created analytics refresh flight (initial or manual) call the gate before creating remote work. An already-running batch and scheduler-owned automatic retry do not revalidate; process-restart recovery and a new batch do. A failed gate must not mutate job state or send Baidu requests.
 
 - [ ] **Step 2: Run and verify failure**
 
 Run:
 
 ```powershell
-dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~LicenseOperationBoundary|FullyQualifiedName~TransferWorkspaceViewModel|FullyQualifiedName~ShareWorkspaceViewModel|FullyQualifiedName~ShareAnalyticsViewModel" --no-restore
+dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~LicenseOperationBoundary|FullyQualifiedName~TransferWorkspaceViewModel|FullyQualifiedName~ShareWorkspaceViewModel|FullyQualifiedName~ShareAnalyticsViewModel|FullyQualifiedName~WorkspaceRunPanelViewModel|FullyQualifiedName~JobResultsViewModel|FullyQualifiedName~CoordinatorHostedService" --no-restore
 ```
 
 - [ ] **Step 3: Register a permanent product ID and acceptance configuration**
 
-Generate the current app's product UUID once and commit it as assembly metadata; the display name remains changeable. Add `LicenseServiceUrl`, `LicenseSigningPublicKey`, `LicenseCurrentSpkiPin`, `LicenseNextSpkiPin`, and `LicenseAcceptanceBuild` validation analogous to OTA build validation. Production builds fail if any trust setting is absent/invalid; local acceptance builds read only the generated loopback settings file.
+Generate the current app's product UUID once and commit it as assembly metadata; the display name remains changeable. Add three explicit build modes: Debug developer builds default to `Disabled`; local acceptance builds set `LicenseAcceptanceBuild=true` and may read only a command-line-selected loopback public configuration file; Release production builds require HTTPS `LicenseServiceUrl`, signing public key, current SPKI pin, and next SPKI pin and fail when any trust setting is absent/invalid. Add MSBuild tests proving Release fails closed and acceptance mode cannot target a non-loopback HTTP URL.
 
-- [ ] **Step 4: Gate only user-initiated remote boundaries**
+- [ ] **Step 4: Gate every boundary that can create or recover remote work**
 
-Inject `ILicenseAuthorizationGate` into the three view models. Keep coordinator internal loops free of license calls so idle software creates no traffic and active automatic retries continue. Convert failures to one Chinese dialog/status without exposing raw API codes.
+Inject `ILicenseAuthorizationGate` into the transfer/share/analytics view models plus the shared run and results controls. Gate the creation of a new analytics refresh flight for both initial and manual refresh, but do not re-gate callers that merely join the same in-flight operation. Hosted coordinators must await `LicenseRuntimeAuthorizationState` before their first recovery/dispatch cycle and resume when activation signals authorization; their internal scheduling and automatic retries remain free of network validation. Convert failures to one Chinese dialog/status without exposing raw API codes.
 
 - [ ] **Step 5: Run app tests and build**
 
@@ -576,7 +608,8 @@ Run:
 
 ```powershell
 dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --no-restore
-dotnet build BaiduBatchTransfer.sln --no-restore
+dotnet build BaiduBatchTransfer.sln -c Debug --no-restore
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build_local_license_acceptance.ps1
 ```
 
 Expected: PASS with zero errors.
@@ -584,7 +617,7 @@ Expected: PASS with zero errors.
 - [ ] **Step 6: Commit Task 12**
 
 ```powershell
-git add src/BaiduBatchTransfer.App tests/BaiduBatchTransfer.App.Tests
+git add src/BaiduBatchTransfer.App tests/BaiduBatchTransfer.App.Tests scripts/build_local_license_acceptance.ps1
 git commit -m "feat: require licensing for remote operations"
 ```
 
@@ -593,12 +626,18 @@ git commit -m "feat: require licensing for remote operations"
 **Files:**
 - Create: `docs/testing/2026-09-08-local-license-acceptance.md`
 - Create: `scripts/test_local_license_stack.ps1`
+- Modify: `scripts/build_local_license_acceptance.ps1`
+- Create: `tools/license_client_harness/SuperPan.Licensing.AcceptanceHarness.csproj`
+- Create: `tools/license_client_harness/Program.cs`
+- Create: `tools/license_client_harness/packages.lock.json`
 - Modify: `services/ota_admin/internal/webui/browser_test.go`
 - Modify: `tests/SuperPan.Licensing.Client.Tests/LicenseAuthorizationGateTests.cs`
 
 - [ ] **Step 1: Write the end-to-end test before the final wiring**
 
-The script must start the disposable stack, log in, create two software records and one package, generate a 30-day card with note, activate the Windows client for software A, validate software B on the same machine without rebinding, exercise renewal/unbind/delete, confirm online rejection after delete, confirm a pre-issued lease lasts no more than 30 minutes under simulated outage, and stop all local processes in `finally`.
+The script must start the disposable stack, perform the real login/CSRF flow, create software A and B plus one package, generate a 30-day card with a note, and drive the real reusable client through the command-line harness. Activate A in store `user-a`, validate B with the same store without entering the card again, then use an empty store `user-b` with the same deterministic machine fixture to simulate another Windows user's empty DPAPI store and prove the server accepts the same physical machine without admin unbind. Unit tests still verify actual DPAPI `CurrentUser` protection; an existing second Windows account may be used for the documented manual check without creating or deleting OS accounts.
+
+The same script must remove B from the package and observe signed `app_not_allowed`, re-add B, disable it and observe signed `app_disabled`, then re-enable it. Snapshot a valid encrypted lease store, delete the card, and prove an online request is rejected immediately. Stop the license service and use the harness's injected `TimeProvider` (`--utc-now`) against the pre-delete store snapshot to prove temporary use before 30 minutes and rejection after 30 minutes without sleeping. Exercise renewal and unbind on a separate card, and stop all local processes in `finally`.
 
 - [ ] **Step 2: Run and verify the test exposes any missing wiring**
 
@@ -608,7 +647,7 @@ Expected before final corrections: FAIL at the first incomplete seam, without to
 
 - [ ] **Step 3: Make only the corrections required by end-to-end evidence**
 
-Do not add server deploy artifacts. Record exact commands, generated product ID (not secrets), ports, expected UI actions, and result counts in the acceptance document.
+Implement the harness as a small `net8.0-windows` executable referencing `SuperPan.Licensing.Client`; it accepts only explicit loopback acceptance config, product ID, store root, machine fixture, and optional UTC time. Run `dotnet restore` after adding it and commit its lock file. Make `scripts/build_local_license_acceptance.ps1` build the real WPF app with `LicenseAcceptanceBuild=true` and the generated loopback public-key config. Do not add server deploy artifacts. Record exact commands, generated product ID (not secrets), ports, expected UI actions, and result counts in the acceptance document.
 
 - [ ] **Step 4: Run complete verification**
 
@@ -618,8 +657,12 @@ Run:
 Push-Location services/ota_admin
 go test ./... -count=1
 Pop-Location
+dotnet restore BaiduBatchTransfer.sln
+dotnet restore tools/license_client_harness/SuperPan.Licensing.AcceptanceHarness.csproj
 dotnet test BaiduBatchTransfer.sln --no-restore
 dotnet build BaiduBatchTransfer.sln --no-restore
+dotnet build tools/license_client_harness/SuperPan.Licensing.AcceptanceHarness.csproj --no-restore
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build_local_license_acceptance.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test_local_license_stack.ps1
 git diff --check
 ```
@@ -629,7 +672,7 @@ Expected: all commands exit 0; no generated secret or database is tracked; local
 - [ ] **Step 5: Commit local acceptance artifacts**
 
 ```powershell
-git add docs/testing/2026-09-08-local-license-acceptance.md scripts/test_local_license_stack.ps1 services/ota_admin/internal/webui/browser_test.go tests/SuperPan.Licensing.Client.Tests/LicenseAuthorizationGateTests.cs
+git add docs/testing/2026-09-08-local-license-acceptance.md scripts/test_local_license_stack.ps1 scripts/build_local_license_acceptance.ps1 tools/license_client_harness services/ota_admin/internal/webui/browser_test.go tests/SuperPan.Licensing.Client.Tests/LicenseAuthorizationGateTests.cs
 git commit -m "test: verify local multi-product licensing end to end"
 ```
 
