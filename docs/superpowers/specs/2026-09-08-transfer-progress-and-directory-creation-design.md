@@ -22,7 +22,7 @@ Finish the current transfer workflow with two focused improvements:
 - The first successful snapshot for every newly presented batch is always emitted, including `0/N`.
 - The result view model owns the last-emitted snapshot and its batch ID. It resets that comparison state when a different batch is initialized. The workspace remains the single owner that turns the resulting status change into a log entry.
 - Repeating the same snapshot produces no new log entry, including an explicit manual refresh with unchanged counts. Manual refresh still exposes its existing busy state while it runs.
-- A failed refresh preserves the last successful snapshot and emits at most one safe failure status until the status changes. A later successful refresh may re-emit the current progress once to show recovery, even when its counts did not change.
+- A failed refresh preserves the last successful snapshot and emits at most one safe failure status for that consecutive failure episode. The first later successful refresh must emit the current progress once, even when its counts did not change, then clear the recovery flag so subsequent unchanged snapshots are suppressed again.
 - Result refreshes remain single-flight through the existing busy gate and use the existing batch/generation fence. An older result may not overwrite or log after a newer batch/result.
 - The existing terminal completion notification remains the final summary.
 - The final successful result refresh is applied before that terminal notification. Once the terminal notification is published, automatic polling stops and no later progress line may be appended for that batch.
@@ -52,7 +52,7 @@ Finish the current transfer workflow with two focused improvements:
 - Opening the picker with zero selected accounts is a no-op with `请先选择参与账号。` and performs no read or write.
 - The participant account IDs and first browsing account are captured when the modal picker opens. The main window is blocked while it is open; confirmation applies only to that captured participant set that is still present.
 - A newly created folder is created immediately only in that browsing account.
-- After the user confirms the path, it is applied only to selected accounts.
+- After the user confirms the path, it is applied only to the captured participant accounts that are still present.
 - Other selected accounts create a missing destination later through the existing transfer-directory preparation flow. Unselected account paths remain untouched.
 
 ## Architecture
