@@ -411,11 +411,12 @@ git commit -m "feat: add license management admin console"
 - Create: `services/ota_admin/cmd/license-admin-local/main_test.go`
 - Create: `scripts/run_local_license_stack.ps1`
 - Create: `scripts/stop_local_license_stack.ps1`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Updates/LicenseLocalStackScriptTests.cs`
 - Modify: `.gitignore`
 
 - [ ] **Step 1: Write failing structure/safety tests**
 
-Assert the local host has a build tag, refuses non-loopback binds, uses disposable `.tmp/license-local`, records exact child PIDs, and the stop script kills only those PIDs after verifying executable paths and command lines. Assert secrets/databases are ignored by Git.
+Assert the local host has a build tag, refuses non-loopback binds, uses disposable `.tmp/license-local`, records exact child PIDs, and the stop script kills only those PIDs after verifying executable paths and command lines. `LicenseLocalStackScriptTests` reads both PowerShell scripts and asserts literal loopback ports, validated PID manifest paths, executable/command-line identity checks before `Stop-Process`, `try/finally` cleanup, no wildcard process kill, no production hostname/SSH/Nginx/systemd command, and ignored secret/database output paths. Assert secrets/databases are ignored by Git.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -425,7 +426,7 @@ Run:
 Push-Location services/ota_admin
 go test -tags license_local_acceptance ./cmd/license-admin-local -count=1
 Pop-Location
-dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~LicenseLocalStack" --no-restore
+dotnet test tests/BaiduBatchTransfer.App.Tests/BaiduBatchTransfer.App.Tests.csproj --filter "FullyQualifiedName~LicenseLocalStackScriptTests" --no-restore
 ```
 
 - [ ] **Step 3: Implement local runner and real-login host**
@@ -439,7 +440,7 @@ Run the start script, query both loopback health endpoints, log in through a bro
 - [ ] **Step 5: Commit Task 8**
 
 ```powershell
-git add .gitignore services/ota_admin/cmd/license-admin-local scripts/run_local_license_stack.ps1 scripts/stop_local_license_stack.ps1
+git add .gitignore services/ota_admin/cmd/license-admin-local scripts/run_local_license_stack.ps1 scripts/stop_local_license_stack.ps1 tests/BaiduBatchTransfer.App.Tests/Updates/LicenseLocalStackScriptTests.cs
 git commit -m "test: add local license acceptance stack"
 ```
 
@@ -487,7 +488,7 @@ git commit -m "feat: verify signed license responses on Windows"
 
 - [ ] **Step 1: Write failing policy tests**
 
-Cover normalized `MachineGuid` + BIOS UUID, one-field fallback, both-missing failure, no random fallback, same-user shared storage, card redaction, durable activation UUID reuse, successful lease persistence, definitive rejection clearing the affected lease, 429/5xx/transport use of an unexpired lease, lease expiry, startup validation, and no idle polling.
+Cover normalized `MachineGuid` + BIOS UUID, one-field fallback, both-missing failure, no random fallback, same-user shared storage, durable activation UUID reuse, successful lease persistence, definitive rejection clearing the affected lease, 429/5xx/transport use of an unexpired lease, lease expiry, startup validation, and no idle polling. Add explicit redaction assertions for card values, machine hashes, serialized lease contents, signed payloads, and raw service/internal errors across `ToString`, exceptions, status events, and logs.
 
 Define operation scopes:
 
@@ -562,6 +563,7 @@ git commit -m "feat: add Chinese license activation experience"
 - Modify: `src/BaiduBatchTransfer.App/App.xaml.cs`
 - Modify: `src/BaiduBatchTransfer.App/AppStartupController.cs`
 - Create: `src/BaiduBatchTransfer.App/Features/Licensing/LicenseRuntimeAuthorizationState.cs`
+- Create: `src/BaiduBatchTransfer.App/Features/Licensing/LicenseAcceptanceSmokeRunner.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/Transfers/TransferWorkspaceViewModel.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/Shares/ShareWorkspaceViewModel.cs`
 - Modify: `src/BaiduBatchTransfer.App/Features/ShareAnalytics/ShareAnalyticsViewModel.cs`
@@ -580,11 +582,12 @@ git commit -m "feat: add Chinese license activation experience"
 - Create: `tests/BaiduBatchTransfer.App.Tests/Services/StandaloneShareCoordinatorHostedServiceTests.cs`
 - Modify: `tests/BaiduBatchTransfer.App.Tests/Updates/OtaBuildConfigurationTests.cs`
 - Create: `tests/BaiduBatchTransfer.App.Tests/Features/LicenseOperationBoundaryTests.cs`
+- Create: `tests/BaiduBatchTransfer.App.Tests/Features/LicenseAcceptanceSmokeRunnerTests.cs`
 - Create: `scripts/build_local_license_acceptance.ps1`
 
 - [ ] **Step 1: Write failing boundary tests**
 
-Assert startup validates once before hosted coordinators may dispatch recovered work, but still opens the local UI on rejection. `LicenseRuntimeAuthorizationState` keeps both coordinator hosted services waiting until startup validation or later activation succeeds. Transfer/share start, workspace manual resume/retry, job-results manual retry, and every newly-created analytics refresh flight (initial or manual) call the gate before creating remote work. An already-running batch and scheduler-owned automatic retry do not revalidate; process-restart recovery and a new batch do. A failed gate must not mutate job state or send Baidu requests.
+Assert startup validates once before hosted coordinators may dispatch recovered work, but still opens the local UI on rejection. `LicenseRuntimeAuthorizationState` keeps both coordinator hosted services waiting until startup validation or later activation succeeds. Transfer/share start, workspace manual resume/retry, job-results manual retry, and every newly-created analytics refresh flight (`Initial`, `Manual`, `AutomaticDue`, or delayed `Retry`) call the gate before creating remote work. Callers joining an existing authorized analytics flight do not revalidate. An already-running batch and scheduler-owned automatic retry do not revalidate; process-restart recovery and a new batch do. A failed gate must not mutate job state or send Baidu requests. In an acceptance-stamped build only, `--license-acceptance-smoke --license-acceptance-config=ABSOLUTE_PATH` runs the real startup gate once and exits 0 on authorized or activation-required states, and nonzero on malformed trust/config; production and Debug-disabled builds reject this switch.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -600,7 +603,7 @@ Generate the current app's product UUID once and commit it as assembly metadata;
 
 - [ ] **Step 4: Gate every boundary that can create or recover remote work**
 
-Inject `ILicenseAuthorizationGate` into the transfer/share/analytics view models plus the shared run and results controls. Gate the creation of a new analytics refresh flight for both initial and manual refresh, but do not re-gate callers that merely join the same in-flight operation. Hosted coordinators must await `LicenseRuntimeAuthorizationState` before their first recovery/dispatch cycle and resume when activation signals authorization; their internal scheduling and automatic retries remain free of network validation. Convert failures to one Chinese dialog/status without exposing raw API codes.
+Inject `ILicenseAuthorizationGate` into the transfer/share/analytics view models plus the shared run and results controls. Gate the creation of every new analytics refresh flight regardless of origin (`Initial`, `Manual`, `AutomaticDue`, or delayed `Retry`), but do not re-gate callers that merely join the same in-flight operation. Hosted coordinators must await `LicenseRuntimeAuthorizationState` before their first recovery/dispatch cycle and resume when activation signals authorization; their internal scheduling and automatic retries remain free of network validation. Convert failures to one Chinese dialog/status without exposing raw API codes.
 
 - [ ] **Step 5: Run app tests and build**
 
@@ -637,7 +640,7 @@ git commit -m "feat: require licensing for remote operations"
 
 The script must start the disposable stack, perform the real login/CSRF flow, create software A and B plus one package, generate a 30-day card with a note, and drive the real reusable client through the command-line harness. Activate A in store `user-a`, validate B with the same store without entering the card again, then use an empty store `user-b` with the same deterministic machine fixture to simulate another Windows user's empty DPAPI store and prove the server accepts the same physical machine without admin unbind. Unit tests still verify actual DPAPI `CurrentUser` protection; an existing second Windows account may be used for the documented manual check without creating or deleting OS accounts.
 
-The same script must remove B from the package and observe signed `app_not_allowed`, re-add B, disable it and observe signed `app_disabled`, then re-enable it. Snapshot a valid encrypted lease store, delete the card, and prove an online request is rejected immediately. Stop the license service and use the harness's injected `TimeProvider` (`--utc-now`) against the pre-delete store snapshot to prove temporary use before 30 minutes and rejection after 30 minutes without sleeping. Exercise renewal and unbind on a separate card, and stop all local processes in `finally`.
+The same script must launch the generated WPF acceptance build with `--license-acceptance-smoke` and the loopback client config, assert its exit code and embedded immutable product ID, then remove B from the package and observe signed `app_not_allowed`, re-add B, disable it and observe signed `app_disabled`, then re-enable it. Snapshot a valid encrypted lease store, delete the card, and prove an online request is rejected immediately. Stop the license service and use the harness's injected `TimeProvider` (`--utc-now`) against the pre-delete store snapshot to prove temporary use before 30 minutes and rejection after 30 minutes without sleeping. Exercise renewal and unbind on a separate card, and stop all local processes in `finally`.
 
 - [ ] **Step 2: Run and verify the test exposes any missing wiring**
 
