@@ -142,6 +142,8 @@ public sealed class ShareAnalyticsViewStructureTests
 
         Assert.Equal("DataGridRow", Attribute(rowStyle, "TargetType"));
         Assert.Equal("{StaticResource ShareAnalyticsRowStyle}", Attribute(grid, "RowStyle"));
+        Assert.Equal("Transparent", SetterValue(rowStyle, "Background"));
+        Assert.Equal("{StaticResource TextBrush}", SetterValue(rowStyle, "Foreground"));
         Assert.Equal("DataGridCell", Attribute(cellStyle, "TargetType"));
         Assert.Equal("{StaticResource ShareAnalyticsCellStyle}", Attribute(sortedCellStyle, "BasedOn"));
 
