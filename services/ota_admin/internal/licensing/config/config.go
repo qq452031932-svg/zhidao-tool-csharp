@@ -26,6 +26,7 @@ type Limits struct {
 	MaxHeaderBytes           int   `json:"max_header_bytes"`
 	TimestampWindowSeconds   int   `json:"timestamp_window_seconds"`
 	NonceLifetimeSeconds     int   `json:"nonce_lifetime_seconds"`
+	MaxReplayNonces          int   `json:"max_replay_nonces"`
 	ActivationRequests       int   `json:"activation_requests"`
 	ValidationRequests       int   `json:"validation_requests"`
 	RateWindowSeconds        int   `json:"rate_window_seconds"`
@@ -121,6 +122,9 @@ func (c Config) Validate() error {
 	}
 	if c.Limits.NonceLifetimeSeconds < c.Limits.TimestampWindowSeconds || c.Limits.NonceLifetimeSeconds > 24*60*60 {
 		return errors.New("nonce lifetime is outside the safe range")
+	}
+	if c.Limits.MaxReplayNonces < 1 || c.Limits.MaxReplayNonces > 1_000_000 {
+		return errors.New("replay nonce cap is outside the safe range")
 	}
 	if c.Limits.ActivationRequests < 1 || c.Limits.ActivationRequests > 10000 || c.Limits.ValidationRequests < 1 || c.Limits.ValidationRequests > 10000 {
 		return errors.New("rate limits are outside the safe range")

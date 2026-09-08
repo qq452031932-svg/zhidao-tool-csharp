@@ -21,7 +21,7 @@ type LicenseService interface {
 }
 
 type ReplayStore interface {
-	ClaimReplayNonce(context.Context, string, time.Time, time.Time) (bool, error)
+	ClaimReplayNonce(context.Context, string, time.Time, time.Time, int) (bool, error)
 }
 
 type ClaimsSigner interface {
@@ -37,6 +37,7 @@ type Options struct {
 	MaxHeaderBytes    int
 	TimestampWindow   time.Duration
 	NonceLifetime     time.Duration
+	MaxReplayNonces   int
 	ActivationRate    RateLimit
 	ValidationRate    RateLimit
 	MaxLimiterEntries int
@@ -52,7 +53,7 @@ func NewRouter(options Options) (http.Handler, error) {
 	if options.Service == nil || options.ReplayStore == nil || options.Signer == nil || options.Clock == nil {
 		return nil, errors.New("license API dependencies are required")
 	}
-	if options.MaxBodyBytes < 1 || options.MaxHeaderBytes < 1 || options.TimestampWindow <= 0 || options.NonceLifetime < options.TimestampWindow || options.ActivationRate.Requests < 1 || options.ActivationRate.Window <= 0 || options.ValidationRate.Requests < 1 || options.ValidationRate.Window <= 0 || options.MaxLimiterEntries < 1 {
+	if options.MaxBodyBytes < 1 || options.MaxHeaderBytes < 1 || options.TimestampWindow <= 0 || options.NonceLifetime < options.TimestampWindow || options.MaxReplayNonces < 1 || options.ActivationRate.Requests < 1 || options.ActivationRate.Window <= 0 || options.ValidationRate.Requests < 1 || options.ValidationRate.Window <= 0 || options.MaxLimiterEntries < 1 {
 		return nil, errors.New("license API limits are invalid")
 	}
 	a := &api{options: options}

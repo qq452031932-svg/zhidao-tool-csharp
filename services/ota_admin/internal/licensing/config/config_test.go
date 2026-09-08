@@ -64,6 +64,8 @@ func TestValidateRejectsRemoteRelativeAndOverlappingPaths(t *testing.T) {
 		{name: "unsafe timestamp window", mutate: func(c *Config) { c.Limits.TimestampWindowSeconds = 3601 }},
 		{name: "missing activation limit", mutate: func(c *Config) { c.Limits.ActivationRequests = 0 }},
 		{name: "missing validation limit", mutate: func(c *Config) { c.Limits.ValidationRequests = 0 }},
+		{name: "missing replay cap", mutate: func(c *Config) { c.Limits.MaxReplayNonces = 0 }},
+		{name: "excessive replay cap", mutate: func(c *Config) { c.Limits.MaxReplayNonces = 1_000_001 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -118,6 +120,7 @@ func validConfig(t *testing.T) Config {
 		Limits: Limits{
 			MaxBodyBytes: 8192, MaxHeaderBytes: 16384,
 			TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600,
+			MaxReplayNonces:    10_000,
 			ActivationRequests: 10, ValidationRequests: 60, RateWindowSeconds: 60,
 			ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 10, WriteTimeoutSeconds: 10,
 			IdleTimeoutSeconds: 30, ShutdownTimeoutSeconds: 10,

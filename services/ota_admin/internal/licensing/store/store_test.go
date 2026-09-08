@@ -524,15 +524,15 @@ func TestReplayNonceClaimPersistsUntilExpiry(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
-	claimed, err := s.ClaimReplayNonce(ctx, "nonce-1", now.Add(time.Minute), now)
+	claimed, err := s.ClaimReplayNonce(ctx, "nonce-1", now.Add(time.Minute), now, 100)
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %v, %v", claimed, err)
 	}
-	claimed, err = s.ClaimReplayNonce(ctx, "nonce-1", now.Add(2*time.Minute), now.Add(30*time.Second))
+	claimed, err = s.ClaimReplayNonce(ctx, "nonce-1", now.Add(2*time.Minute), now.Add(30*time.Second), 100)
 	if err != nil || claimed {
 		t.Fatalf("replay claim = %v, %v; want rejected", claimed, err)
 	}
-	claimed, err = s.ClaimReplayNonce(ctx, "nonce-1", now.Add(3*time.Minute), now.Add(61*time.Second))
+	claimed, err = s.ClaimReplayNonce(ctx, "nonce-1", now.Add(3*time.Minute), now.Add(61*time.Second), 100)
 	if err != nil || !claimed {
 		t.Fatalf("post-expiry claim = %v, %v; want accepted", claimed, err)
 	}
@@ -544,16 +544,16 @@ func TestReplayNonceDoesNotExpireEarlyAtSubsecondBoundary(t *testing.T) {
 	second := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
 	firstNow := second.Add(100 * time.Millisecond)
 	expiresAt := second.Add(900 * time.Millisecond)
-	claimed, err := s.ClaimReplayNonce(ctx, "subsecond-nonce", expiresAt, firstNow)
+	claimed, err := s.ClaimReplayNonce(ctx, "subsecond-nonce", expiresAt, firstNow, 100)
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %v, %v", claimed, err)
 	}
 
-	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(2*time.Second), second.Add(800*time.Millisecond))
+	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(2*time.Second), second.Add(800*time.Millisecond), 100)
 	if err != nil || claimed {
 		t.Fatalf("claim before precise expiry = %v, %v; want replay rejected", claimed, err)
 	}
-	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(3*time.Second), second.Add(time.Second))
+	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(3*time.Second), second.Add(time.Second), 100)
 	if err != nil || !claimed {
 		t.Fatalf("claim after conservative stored expiry = %v, %v; want accepted", claimed, err)
 	}
@@ -564,12 +564,12 @@ func TestClaimReplayNoncePrunesExpiredEntries(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 9, 5, 0, 0, 0, time.UTC)
 	for index := 0; index < 20; index++ {
-		claimed, err := s.ClaimReplayNonce(ctx, fmt.Sprintf("expired-%d", index), now.Add(time.Second), now)
+		claimed, err := s.ClaimReplayNonce(ctx, fmt.Sprintf("expired-%d", index), now.Add(time.Second), now, 100)
 		if err != nil || !claimed {
 			t.Fatalf("seed nonce %d: claimed=%v err=%v", index, claimed, err)
 		}
 	}
-	claimed, err := s.ClaimReplayNonce(ctx, "current", now.Add(2*time.Minute), now.Add(2*time.Second))
+	claimed, err := s.ClaimReplayNonce(ctx, "current", now.Add(2*time.Minute), now.Add(2*time.Second), 100)
 	if err != nil || !claimed {
 		t.Fatalf("claim current: claimed=%v err=%v", claimed, err)
 	}
@@ -580,6 +580,116 @@ func TestClaimReplayNoncePrunesExpiredEntries(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("replay nonce rows = %d, want only current row", count)
 	}
+}
+
+func TestReplayNonceCapacityDistinguishesReplayAndFreesExpiredSpace(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 6, 0, 0, 0, time.UTC)
+	claimed, err := s.ClaimReplayNonce(ctx, "first", now.Add(time.Minute), now, 1)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+	claimed, err = s.ClaimReplayNonce(ctx, "first", now.Add(time.Minute), now, 1)
+	if err != nil || claimed {
+		t.Fatalf("live replay = %v, %v; want replay without capacity error", claimed, err)
+	}
+	claimed, err = s.ClaimReplayNonce(ctx, "second", now.Add(time.Minute), now, 1)
+	if claimed || !errors.Is(err, ErrReplayNonceCapacity) {
+		t.Fatalf("capacity claim = %v, %v; want ErrReplayNonceCapacity", claimed, err)
+	}
+	claimed, err = s.ClaimReplayNonce(ctx, "second", now.Add(2*time.Minute), now.Add(time.Minute), 1)
+	if err != nil || !claimed {
+		t.Fatalf("claim after expiry = %v, %v; want accepted", claimed, err)
+	}
+}
+
+func TestReplayNonceConcurrentClaimsAreAtomicAndBounded(t *testing.T) {
+	t.Run("same nonce", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 6, 30, 0, 0, time.UTC)
+		start := make(chan struct{})
+		results := make(chan struct {
+			claimed bool
+			err     error
+		}, 32)
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				claimed, err := s.ClaimReplayNonce(ctx, "same", now.Add(time.Minute), now, 64)
+				results <- struct {
+					claimed bool
+					err     error
+				}{claimed, err}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		claims := 0
+		for result := range results {
+			if result.err != nil {
+				t.Fatalf("concurrent same-nonce error: %v", result.err)
+			}
+			if result.claimed {
+				claims++
+			}
+		}
+		if claims != 1 {
+			t.Fatalf("successful same-nonce claims = %d, want 1", claims)
+		}
+	})
+
+	t.Run("unique nonces", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		now := time.Date(2026, 9, 9, 7, 0, 0, 0, time.UTC)
+		const capacity = 10
+		start := make(chan struct{})
+		results := make(chan error, 40)
+		var wg sync.WaitGroup
+		for i := 0; i < 40; i++ {
+			index := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				claimed, err := s.ClaimReplayNonce(ctx, fmt.Sprintf("unique-%02d", index), now.Add(time.Minute), now, capacity)
+				if err == nil && !claimed {
+					err = errors.New("unique nonce was treated as replay")
+				}
+				results <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		accepted, capacityErrors := 0, 0
+		for err := range results {
+			switch {
+			case err == nil:
+				accepted++
+			case errors.Is(err, ErrReplayNonceCapacity):
+				capacityErrors++
+			default:
+				t.Fatalf("unexpected concurrent error (must not leak busy/locked state): %v", err)
+			}
+		}
+		if accepted != capacity || capacityErrors != 40-capacity {
+			t.Fatalf("accepted/capacity errors = %d/%d, want %d/%d", accepted, capacityErrors, capacity, 40-capacity)
+		}
+		var rows int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_replay_nonces`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows > capacity {
+			t.Fatalf("replay rows = %d, cap %d", rows, capacity)
+		}
+	})
 }
 
 func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T) {

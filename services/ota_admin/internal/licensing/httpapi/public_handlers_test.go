@@ -90,6 +90,7 @@ func newAPIHarness(t *testing.T, activationLimit, validationLimit int) *apiHarne
 		Service: svc, ReplayStore: st, Signer: signer, Clock: clock,
 		MaxBodyBytes: 2048, MaxHeaderBytes: 2048,
 		TimestampWindow: 5 * time.Minute, NonceLifetime: 10 * time.Minute,
+		MaxReplayNonces:   10_000,
 		ActivationRate:    RateLimit{Requests: activationLimit, Window: time.Minute},
 		ValidationRate:    RateLimit{Requests: validationLimit, Window: time.Minute},
 		MaxLimiterEntries: 32,
@@ -239,8 +240,126 @@ func (s *fakeService) Validate(context.Context, string, string, string) (model.A
 
 type acceptingReplayStore struct{}
 
-func (acceptingReplayStore) ClaimReplayNonce(context.Context, string, time.Time, time.Time) (bool, error) {
+func (acceptingReplayStore) ClaimReplayNonce(context.Context, string, time.Time, time.Time, int) (bool, error) {
 	return true, nil
+}
+
+type trackingReplayStore struct {
+	mu      sync.Mutex
+	nonces  []string
+	lastMax int
+	err     error
+}
+
+func (s *trackingReplayStore) ClaimReplayNonce(_ context.Context, nonce string, _ time.Time, _ time.Time, maximum int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nonces = append(s.nonces, nonce)
+	s.lastMax = maximum
+	if s.err != nil {
+		return false, s.err
+	}
+	return true, nil
+}
+
+func (s *trackingReplayStore) snapshot() ([]string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.nonces...), s.lastMax
+}
+
+func TestRateLimitedValidRequestsKeepRequestIDWithoutClaimingNonceOrCallingService(t *testing.T) {
+	for _, route := range []string{"activate", "validate"} {
+		t.Run(route, func(t *testing.T) {
+			clock := &testClock{now: time.Date(2026, 9, 9, 2, 30, 0, 0, time.UTC)}
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer, err := signing.New("rate-key", key, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			svc := &fakeService{}
+			replays := &trackingReplayStore{}
+			handler, err := NewRouter(Options{
+				Service: svc, ReplayStore: replays, Signer: signer, Clock: clock,
+				MaxBodyBytes: 2048, MaxHeaderBytes: 2048,
+				TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 7,
+				ActivationRate: RateLimit{Requests: 1, Window: time.Minute},
+				ValidationRate: RateLimit{Requests: 1, Window: time.Minute}, MaxLimiterEntries: 8,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestBody := func(requestID, requestNonce string) string {
+				idField := "request_id"
+				if route == "activate" {
+					idField = "activation_request_id"
+				}
+				return fmt.Sprintf(`{"protocol_version":1,%q:%q,"card":"CARD-PLAINTEXT","software_id":"software","machine_hash":"machine","timestamp":%q,"nonce":%q}`, idField, requestID, clock.Now().Format(time.RFC3339), requestNonce)
+			}
+			do := func(body string) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, "/license-api/v1/"+route, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.RemoteAddr = "127.0.0.1:41000"
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, req)
+				return recorder
+			}
+			if first := do(requestBody("first-"+route, nonce(300))); first.Code != http.StatusOK {
+				t.Fatalf("first status = %d body=%s", first.Code, first.Body.String())
+			}
+			limited := do(requestBody("limited-"+route, nonce(301)))
+			if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") != "60" {
+				t.Fatalf("limited response = %d retry=%q body=%s", limited.Code, limited.Header().Get("Retry-After"), limited.Body.String())
+			}
+			claims := decodeClaims(t, limited, &key.PublicKey)
+			if claims.Code != model.CodeRateLimited || claims.RequestID != "limited-"+route {
+				t.Fatalf("rate-limit claims = %#v", claims)
+			}
+			nonces, maximum := replays.snapshot()
+			if len(nonces) != 1 || nonces[0] != nonce(300) || maximum != 7 {
+				t.Fatalf("replay calls = %v max=%d; limited nonce was consumed", nonces, maximum)
+			}
+			if svc.calls.Load() != 1 {
+				t.Fatalf("service calls = %d, want 1", svc.calls.Load())
+			}
+		})
+	}
+}
+
+func TestReplayCapacityFailureIsSignedGenericAndRedacted(t *testing.T) {
+	clock := &testClock{now: time.Date(2026, 9, 9, 2, 45, 0, 0, time.UTC)}
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signer, _ := signing.New("capacity-key", key, rand.Reader)
+	svc := &fakeService{}
+	replays := &trackingReplayStore{err: errors.New(`replay state full at C:\private\license.db for CARD-PLAINTEXT machine-raw`)}
+	handler, err := NewRouter(Options{
+		Service: svc, ReplayStore: replays, Signer: signer, Clock: clock,
+		MaxBodyBytes: 2048, MaxHeaderBytes: 2048,
+		TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 3,
+		ActivationRate: RateLimit{Requests: 10, Window: time.Minute}, ValidationRate: RateLimit{Requests: 10, Window: time.Minute}, MaxLimiterEntries: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"protocol_version":1,"activation_request_id":"capacity-request","card":"CARD-PLAINTEXT","software_id":"software","machine_hash":"machine-raw","timestamp":%q,"nonce":%q}`, clock.Now().Format(time.RFC3339), nonce(400))
+	req := httptest.NewRequest(http.MethodPost, "/license-api/v1/activate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 body=%s", recorder.Code, recorder.Body.String())
+	}
+	claims := decodeClaims(t, recorder, &key.PublicKey)
+	if claims.Code != model.CodeServiceUnavailable || claims.RequestID != "capacity-request" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	if svc.calls.Load() != 0 {
+		t.Fatalf("service calls = %d, want 0", svc.calls.Load())
+	}
+	assertNotContains(t, recorder.Body.String(), "CARD-PLAINTEXT", "machine-raw", "private", "license.db", replays.err.Error())
 }
 
 func TestBusinessErrorMappingAndUnexpectedErrorRedaction(t *testing.T) {
@@ -263,7 +382,7 @@ func TestBusinessErrorMappingAndUnexpectedErrorRedaction(t *testing.T) {
 			key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			signer, _ := signing.New("test", key, rand.Reader)
 			svc := &fakeService{err: tt.err}
-			handler, err := NewRouter(Options{Service: svc, ReplayStore: acceptingReplayStore{}, Signer: signer, Clock: clock, MaxBodyBytes: 2048, MaxHeaderBytes: 2048, TimestampWindow: time.Minute, NonceLifetime: time.Minute, ActivationRate: RateLimit{Requests: 10, Window: time.Minute}, ValidationRate: RateLimit{Requests: 10, Window: time.Minute}, MaxLimiterEntries: 8})
+			handler, err := NewRouter(Options{Service: svc, ReplayStore: acceptingReplayStore{}, Signer: signer, Clock: clock, MaxBodyBytes: 2048, MaxHeaderBytes: 2048, TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 10_000, ActivationRate: RateLimit{Requests: 10, Window: time.Minute}, ValidationRate: RateLimit{Requests: 10, Window: time.Minute}, MaxLimiterEntries: 8})
 			if err != nil {
 				t.Fatal(err)
 			}

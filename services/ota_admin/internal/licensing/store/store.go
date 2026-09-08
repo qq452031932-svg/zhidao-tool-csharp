@@ -18,12 +18,13 @@ import (
 )
 
 var (
-	ErrNotFound           = errors.New("license record not found")
-	ErrMachineBound       = errors.New("card is bound to another machine")
-	ErrLeaseNotBound      = errors.New("lease has no current activation binding")
-	ErrSoftwareNotAllowed = errors.New("software is not authorized by the card package")
-	ErrSoftwareDisabled   = errors.New("software is disabled")
-	ErrLicenseExpired     = errors.New("license is expired")
+	ErrNotFound            = errors.New("license record not found")
+	ErrMachineBound        = errors.New("card is bound to another machine")
+	ErrLeaseNotBound       = errors.New("lease has no current activation binding")
+	ErrSoftwareNotAllowed  = errors.New("software is not authorized by the card package")
+	ErrSoftwareDisabled    = errors.New("software is disabled")
+	ErrLicenseExpired      = errors.New("license is expired")
+	ErrReplayNonceCapacity = errors.New("replay nonce capacity reached")
 )
 
 const busyTimeoutMilliseconds = 10_000
@@ -461,22 +462,37 @@ func (s *Store) SearchCards(ctx context.Context, filter model.CardFilter) ([]mod
 
 // ClaimReplayNonce atomically removes expired copies of nonce and claims the
 // nonce until expiresAt. A false result means it is still live and is a replay.
-func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, now time.Time) (bool, error) {
-	if nonce == "" || !expiresAt.After(now) {
+func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, now time.Time, maximum int) (bool, error) {
+	if nonce == "" || !expiresAt.After(now) || maximum < 1 {
 		return false, errors.New("invalid replay nonce or expiry")
 	}
 	claimed := false
-	err := s.immediate(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx, `DELETE FROM license_replay_nonces WHERE expires_at<=?`, unixTime(now)); err != nil {
-			return err
-		}
-		result, err := conn.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO NOTHING`, nonce, ceilUnixSecond(expiresAt))
-		if err != nil {
-			return err
-		}
-		affected, err := result.RowsAffected()
-		claimed = affected == 1
-		return err
+	err := retrySQLiteBusy(ctx, func() error {
+		claimed = false
+		return s.immediate(ctx, func(conn *sql.Conn) error {
+			if _, err := conn.ExecContext(ctx, `DELETE FROM license_replay_nonces WHERE expires_at<=?`, unixTime(now)); err != nil {
+				return err
+			}
+			var exists int
+			if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM license_replay_nonces WHERE nonce=?)`, nonce).Scan(&exists); err != nil {
+				return err
+			}
+			if exists != 0 {
+				return nil
+			}
+			var count int
+			if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM license_replay_nonces`).Scan(&count); err != nil {
+				return err
+			}
+			if count >= maximum {
+				return ErrReplayNonceCapacity
+			}
+			if _, err := conn.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?)`, nonce, ceilUnixSecond(expiresAt)); err != nil {
+				return err
+			}
+			claimed = true
+			return nil
+		})
 	})
 	if err != nil {
 		return false, fmt.Errorf("claim replay nonce: %w", err)

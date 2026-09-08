@@ -114,6 +114,7 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		MaxBodyBytes: cfg.Limits.MaxBodyBytes, MaxHeaderBytes: cfg.Limits.MaxHeaderBytes,
 		TimestampWindow:   time.Duration(cfg.Limits.TimestampWindowSeconds) * time.Second,
 		NonceLifetime:     time.Duration(cfg.Limits.NonceLifetimeSeconds) * time.Second,
+		MaxReplayNonces:   cfg.Limits.MaxReplayNonces,
 		ActivationRate:    licensehttp.RateLimit{Requests: cfg.Limits.ActivationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
 		ValidationRate:    licensehttp.RateLimit{Requests: cfg.Limits.ValidationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
 		MaxLimiterEntries: maximumLimiterEntries,

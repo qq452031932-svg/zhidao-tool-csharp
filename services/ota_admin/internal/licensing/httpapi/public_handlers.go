@@ -46,11 +46,6 @@ type validateRequest struct {
 }
 
 func (a *api) activate(w http.ResponseWriter, r *http.Request) {
-	if ok, retry := a.activation.allow(clientKey(r.RemoteAddr)); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		a.writeClaims(w, http.StatusTooManyRequests, fallbackRequestID, model.CodeRateLimited, nil)
-		return
-	}
 	var request activateRequest
 	if err := a.decodeRequest(w, r, &request); err != nil {
 		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
@@ -65,7 +60,12 @@ func (a *api) activate(w http.ResponseWriter, r *http.Request) {
 		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
-	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC())
+	if ok, retry := a.activation.allow(clientKey(r.RemoteAddr)); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
+		return
+	}
+	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
 	if err != nil {
 		a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
 		return
@@ -84,11 +84,6 @@ func (a *api) activate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) validate(w http.ResponseWriter, r *http.Request) {
-	if ok, retry := a.validation.allow(clientKey(r.RemoteAddr)); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		a.writeClaims(w, http.StatusTooManyRequests, fallbackRequestID, model.CodeRateLimited, nil)
-		return
-	}
 	var request validateRequest
 	if err := a.decodeRequest(w, r, &request); err != nil {
 		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
@@ -103,7 +98,12 @@ func (a *api) validate(w http.ResponseWriter, r *http.Request) {
 		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
-	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC())
+	if ok, retry := a.validation.allow(clientKey(r.RemoteAddr)); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
+		return
+	}
+	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
 	if err != nil {
 		a.writeClaims(w, http.StatusServiceUnavailable, requestID, model.CodeServiceUnavailable, nil)
 		return
