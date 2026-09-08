@@ -1,0 +1,503 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
+)
+
+var (
+	ErrNotFound     = errors.New("license record not found")
+	ErrMachineBound = errors.New("card is bound to another machine")
+)
+
+const busyTimeoutMilliseconds = 10_000
+
+type Store struct {
+	db *sql.DB
+}
+
+func Open(ctx context.Context, path string) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("license database path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve license database path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+		return nil, fmt.Errorf("create license database directory: %w", err)
+	}
+	uriPath := filepath.ToSlash(abs)
+	if volume := filepath.VolumeName(abs); volume != "" && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	u := &url.URL{Scheme: "file", Path: uriPath}
+	query := u.Query()
+	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMilliseconds))
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, fmt.Errorf("open license sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
+	closeOnError := func(err error) (*Store, error) {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		return closeOnError(fmt.Errorf("connect license sqlite: %w", err))
+	}
+	if err := migrate(ctx, db); err != nil {
+		return closeOnError(err)
+	}
+	var mode string
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode); err != nil {
+		return closeOnError(fmt.Errorf("enable license sqlite WAL: %w", err))
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return closeOnError(fmt.Errorf("license sqlite journal mode is %q, want WAL", mode))
+	}
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) CreateSoftware(ctx context.Context, name string) (model.Software, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return model.Software{}, errors.New("software name is required")
+	}
+	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, software.ID, software.Name, unixTime(software.CreatedAt))
+	if err != nil {
+		return model.Software{}, fmt.Errorf("create software: %w", err)
+	}
+	return software, nil
+}
+
+func (s *Store) SetSoftwareEnabled(ctx context.Context, id string, enabled bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE license_software SET enabled=? WHERE id=?`, enabled, id)
+	if err != nil {
+		return fmt.Errorf("set software enabled: %w", err)
+	}
+	return requireAffected(result)
+}
+
+func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []string) (model.Package, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return model.Package{}, errors.New("package name is required")
+	}
+	ids, err := normalizedIDs(softwareIDs)
+	if err != nil {
+		return model.Package{}, err
+	}
+	pkg := model.Package{ID: uuid.NewString(), Name: name, SoftwareIDs: ids, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Package{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO license_packages(id,name,created_at) VALUES(?,?,?)`, pkg.ID, pkg.Name, unixTime(pkg.CreatedAt)); err != nil {
+		return model.Package{}, fmt.Errorf("create package: %w", err)
+	}
+	if err := insertPackageMembers(ctx, tx, pkg.ID, ids); err != nil {
+		return model.Package{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Package{}, fmt.Errorf("commit package: %w", err)
+	}
+	return pkg, nil
+}
+
+func (s *Store) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {
+	ids, err := normalizedIDs(softwareIDs)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM license_packages WHERE id=?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM license_package_members WHERE package_id=?`, id); err != nil {
+		return fmt.Errorf("clear package members: %w", err)
+	}
+	if err := insertPackageMembers(ctx, tx, id, ids); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit package members: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GenerateCards(ctx context.Context, req model.GenerateCardsRequest, sealed []model.SealedCard) ([]model.Card, error) {
+	if req.Count <= 0 || req.Count != len(sealed) {
+		return nil, errors.New("card count must match sealed cards")
+	}
+	if req.BaseDays <= 0 {
+		return nil, errors.New("base days must be positive")
+	}
+	createdAt := time.Now().UTC().Truncate(time.Second)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cards := make([]model.Card, 0, len(sealed))
+	for _, item := range sealed {
+		if _, err := uuid.Parse(item.ID); err != nil {
+			return nil, fmt.Errorf("invalid card id: %w", err)
+		}
+		if len(item.Ciphertext) == 0 || item.FullDigest == "" || len(item.Prefix8) != 8 || len(item.Last4) != 4 {
+			return nil, errors.New("sealed card is incomplete")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, req.Note, unixTime(createdAt)); err != nil {
+			return nil, fmt.Errorf("store sealed card: %w", err)
+		}
+		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(req.Note), CreatedAt: createdAt})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit generated cards: %w", err)
+	}
+	return cards, nil
+}
+
+func (s *Store) Activate(ctx context.Context, req model.ActivationMutation) (state model.ActivationState, err error) {
+	if req.RequestID == "" || req.CardID == "" || req.SoftwareID == "" || req.MachineHash == "" {
+		return state, errors.New("activation identifiers are required")
+	}
+	if req.ActivatedAt.IsZero() || req.ExpiresAt.Before(req.ActivatedAt) || req.LeaseUntil.IsZero() {
+		return state, errors.New("invalid activation times")
+	}
+	err = s.immediate(ctx, func(conn *sql.Conn) error {
+		found, existing, err := queryActivationRequest(ctx, conn, req)
+		if err != nil {
+			return err
+		}
+		if found {
+			state = existing
+			return nil
+		}
+
+		var machine sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT machine_hash FROM license_cards WHERE id=?`, req.CardID).Scan(&machine); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if machine.Valid && machine.String != req.MachineHash {
+			return ErrMachineBound
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE license_cards SET activated_at=?,expires_at=?,machine_hash=?,unactivated_total_days=0 WHERE id=?`, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt), req.MachineHash, req.CardID); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_bindings(card_id,software_id,machine_hash,activated_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id) DO UPDATE SET machine_hash=excluded.machine_hash,activated_at=excluded.activated_at,expires_at=excluded.expires_at`, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt)); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id,machine_hash) DO UPDATE SET last_seen_at=excluded.last_seen_at,lease_until=excluded.lease_until`, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.LeaseUntil)); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_requests(request_id,card_id,software_id,machine_hash,activated_at,expires_at,lease_until) VALUES(?,?,?,?,?,?,?)`, req.RequestID, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt), unixTime(req.LeaseUntil)); err != nil {
+			return err
+		}
+		state = activationState(req)
+		return nil
+	})
+	if err != nil {
+		return model.ActivationState{}, fmt.Errorf("activate card: %w", err)
+	}
+	return state, nil
+}
+
+func (s *Store) RenewCard(ctx context.Context, id string, days int, now time.Time) error {
+	if days <= 0 || now.IsZero() {
+		return errors.New("renewal days and time must be positive")
+	}
+	return s.immediate(ctx, func(conn *sql.Conn) error {
+		var activatedAt, expiresAt sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT activated_at,expires_at FROM license_cards WHERE id=?`, id).Scan(&activatedAt, &expiresAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !activatedAt.Valid {
+			_, err := conn.ExecContext(ctx, `UPDATE license_cards SET unactivated_total_days=unactivated_total_days+? WHERE id=?`, days, id)
+			return err
+		}
+		base := now.UTC()
+		if expiry := time.Unix(expiresAt.Int64, 0).UTC(); expiry.After(base) {
+			base = expiry
+		}
+		newExpiry := base.Add(time.Duration(days) * 24 * time.Hour)
+		if _, err := conn.ExecContext(ctx, `UPDATE license_cards SET expires_at=? WHERE id=?`, unixTime(newExpiry), id); err != nil {
+			return err
+		}
+		_, err := conn.ExecContext(ctx, `UPDATE license_activation_bindings SET expires_at=? WHERE card_id=?`, unixTime(newExpiry), id)
+		return err
+	})
+}
+
+func (s *Store) UnbindCard(ctx context.Context, id string) error {
+	// The AFTER trigger removes all machine-specific state in the same SQLite
+	// statement while preserving the card's activation and expiry.
+	result, err := s.db.ExecContext(ctx, `UPDATE license_cards SET machine_hash=NULL WHERE id=?`, id)
+	if err != nil {
+		return fmt.Errorf("unbind card: %w", err)
+	}
+	return requireAffected(result)
+}
+
+func (s *Store) DeleteCard(ctx context.Context, id string) error {
+	return s.immediate(ctx, func(conn *sql.Conn) error {
+		result, err := conn.ExecContext(ctx, `DELETE FROM license_cards WHERE id=?`, id)
+		if err != nil {
+			return err
+		}
+		return requireAffected(result)
+	})
+}
+
+func (s *Store) SearchCards(ctx context.Context, filter model.CardFilter) ([]model.CardSummary, error) {
+	query := `SELECT id,package_id,prefix8,last4,base_days,unactivated_total_days,note,activated_at,expires_at,machine_hash,created_at FROM license_cards WHERE 1=1`
+	args := make([]any, 0, 5)
+	if filter.FullDigest != "" {
+		query += ` AND full_digest=?`
+		args = append(args, filter.FullDigest)
+	}
+	if filter.Prefix8 != "" {
+		query += ` AND prefix8=?`
+		args = append(args, filter.Prefix8)
+	}
+	if filter.Last4 != "" {
+		query += ` AND last4=?`
+		args = append(args, filter.Last4)
+	}
+	if filter.NoteContains != "" {
+		// SQLite lower() gives deterministic ASCII case-insensitive semantics;
+		// instr treats %, _, and all other input as literal text.
+		query += ` AND note IS NOT NULL AND instr(lower(note),lower(?))>0`
+		args = append(args, filter.NoteContains)
+	}
+	if filter.PackageID != "" {
+		query += ` AND package_id=?`
+		args = append(args, filter.PackageID)
+	}
+	query += ` ORDER BY created_at,id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search cards: %w", err)
+	}
+	defer rows.Close()
+	var cards []model.CardSummary
+	for rows.Next() {
+		card, err := scanCardSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		cards = append(cards, card)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cards, nil
+}
+
+// ClaimReplayNonce atomically removes expired copies of nonce and claims the
+// nonce until expiresAt. A false result means it is still live and is a replay.
+func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, now time.Time) (bool, error) {
+	if nonce == "" || !expiresAt.After(now) {
+		return false, errors.New("invalid replay nonce or expiry")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO UPDATE SET expires_at=excluded.expires_at WHERE license_replay_nonces.expires_at<=?`, nonce, unixTime(expiresAt), unixTime(now))
+	if err != nil {
+		return false, fmt.Errorf("claim replay nonce: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+// RecordLease persists a service-side lease. To avoid making every validation
+// a write, last_seen advances at most once per hour; lease_until may advance on
+// every call so a freshly issued lease is faithfully represented.
+func (s *Store) RecordLease(ctx context.Context, lease model.Lease) (model.Lease, error) {
+	if lease.CardID == "" || lease.SoftwareID == "" || lease.MachineHash == "" || lease.LastSeenAt.IsZero() || lease.LeaseUntil.IsZero() {
+		return model.Lease{}, errors.New("lease fields are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until) VALUES(?,?,?,?,?)
+ON CONFLICT(card_id,software_id,machine_hash) DO UPDATE SET
+last_seen_at=CASE WHEN excluded.last_seen_at>=license_leases.last_seen_at+3600 THEN excluded.last_seen_at ELSE license_leases.last_seen_at END,
+lease_until=CASE WHEN excluded.lease_until>license_leases.lease_until THEN excluded.lease_until ELSE license_leases.lease_until END`,
+		lease.CardID, lease.SoftwareID, lease.MachineHash, unixTime(lease.LastSeenAt), unixTime(lease.LeaseUntil))
+	if err != nil {
+		return model.Lease{}, fmt.Errorf("record lease: %w", err)
+	}
+	var seen, until int64
+	if err := s.db.QueryRowContext(ctx, `SELECT last_seen_at,lease_until FROM license_leases WHERE card_id=? AND software_id=? AND machine_hash=?`, lease.CardID, lease.SoftwareID, lease.MachineHash).Scan(&seen, &until); err != nil {
+		return model.Lease{}, err
+	}
+	lease.LastSeenAt = time.Unix(seen, 0).UTC()
+	lease.LeaseUntil = time.Unix(until, 0).UTC()
+	return lease, nil
+}
+
+func (s *Store) immediate(ctx context.Context, fn func(*sql.Conn) error) (err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if err := fn(conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func queryActivationRequest(ctx context.Context, q queryRower, req model.ActivationMutation) (bool, model.ActivationState, error) {
+	var activatedAt, expiresAt, leaseUntil int64
+	err := q.QueryRowContext(ctx, `SELECT activated_at,expires_at,lease_until FROM license_activation_requests WHERE request_id=? AND card_id=? AND software_id=? AND machine_hash=?`, req.RequestID, req.CardID, req.SoftwareID, req.MachineHash).Scan(&activatedAt, &expiresAt, &leaseUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, model.ActivationState{}, nil
+	}
+	if err != nil {
+		return false, model.ActivationState{}, err
+	}
+	return true, model.ActivationState{RequestID: req.RequestID, CardID: req.CardID, SoftwareID: req.SoftwareID, MachineHash: req.MachineHash, ActivatedAt: time.Unix(activatedAt, 0).UTC(), ExpiresAt: time.Unix(expiresAt, 0).UTC(), LeaseUntil: time.Unix(leaseUntil, 0).UTC()}, nil
+}
+
+func activationState(req model.ActivationMutation) model.ActivationState {
+	return model.ActivationState{RequestID: req.RequestID, CardID: req.CardID, SoftwareID: req.SoftwareID, MachineHash: req.MachineHash, ActivatedAt: req.ActivatedAt.UTC(), ExpiresAt: req.ExpiresAt.UTC(), LeaseUntil: req.LeaseUntil.UTC()}
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanCardSummary(row rowScanner) (model.CardSummary, error) {
+	var card model.CardSummary
+	var note, machine sql.NullString
+	var activated, expires sql.NullInt64
+	var created int64
+	if err := row.Scan(&card.ID, &card.PackageID, &card.Prefix8, &card.Last4, &card.BaseDays, &card.UnactivatedTotalDays, &note, &activated, &expires, &machine, &created); err != nil {
+		return card, err
+	}
+	card.Note = nullableString(note)
+	card.ActivatedAt = nullableTime(activated)
+	card.ExpiresAt = nullableTime(expires)
+	card.MachineHash = nullableString(machine)
+	card.CreatedAt = time.Unix(created, 0).UTC()
+	return card, nil
+}
+
+func insertPackageMembers(ctx context.Context, tx *sql.Tx, packageID string, softwareIDs []string) error {
+	for _, softwareID := range softwareIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO license_package_members(package_id,software_id) VALUES(?,?)`, packageID, softwareID); err != nil {
+			return fmt.Errorf("insert package member: %w", err)
+		}
+	}
+	return nil
+}
+
+func normalizedIDs(ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("package requires at least one software member")
+	}
+	seen := make(map[string]struct{}, len(ids))
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, err := uuid.Parse(id); err != nil {
+			return nil, fmt.Errorf("invalid software id: %w", err)
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func requireAffected(result sql.Result) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func unixTime(value time.Time) int64 { return value.UTC().Unix() }
+
+func nullableTime(value sql.NullInt64) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	t := time.Unix(value.Int64, 0).UTC()
+	return &t
+}
+
+func nullableString(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	result := value.String
+	return &result
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
+}

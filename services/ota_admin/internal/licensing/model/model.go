@@ -66,6 +66,107 @@ type Claims struct {
 	LeaseUntil      *time.Time `json:"lease_until"`
 }
 
+// Software is an independently licensed product. Its ID never changes; Enabled
+// is used instead of deleting a product that may be referenced by licenses.
+type Software struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Package groups the products authorized by a card. Membership is deliberately
+// represented as IDs so the service can evaluate the current package contents.
+type Package struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	SoftwareIDs []string  `json:"software_ids"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type GenerateCardsRequest struct {
+	PackageID string  `json:"package_id"`
+	Count     int     `json:"count"`
+	BaseDays  int     `json:"base_days"`
+	Note      *string `json:"note"`
+}
+
+// SealedCard contains the at-rest representation prepared by the service. The
+// store never receives or indexes the plaintext full card value.
+type SealedCard struct {
+	ID         string `json:"id"`
+	Ciphertext []byte `json:"ciphertext"`
+	FullDigest string `json:"full_digest"`
+	Prefix8    string `json:"prefix8"`
+	Last4      string `json:"last4"`
+}
+
+type Card struct {
+	ID                   string     `json:"id"`
+	PackageID            string     `json:"package_id"`
+	FullDigest           string     `json:"-"`
+	Prefix8              string     `json:"prefix8"`
+	Last4                string     `json:"last4"`
+	BaseDays             int        `json:"base_days"`
+	UnactivatedTotalDays int        `json:"unactivated_total_days"`
+	Note                 *string    `json:"note"`
+	ActivatedAt          *time.Time `json:"activated_at"`
+	ExpiresAt            *time.Time `json:"expires_at"`
+	MachineHash          *string    `json:"machine_hash"`
+	CreatedAt            time.Time  `json:"created_at"`
+}
+
+type CardFilter struct {
+	FullDigest   string `json:"full_digest"`
+	Prefix8      string `json:"prefix8"`
+	Last4        string `json:"last4"`
+	NoteContains string `json:"note_contains"`
+	PackageID    string `json:"package_id"`
+}
+
+// CardSummary intentionally omits ciphertext and the full-card digest.
+type CardSummary struct {
+	ID                   string     `json:"id"`
+	PackageID            string     `json:"package_id"`
+	Prefix8              string     `json:"prefix8"`
+	Last4                string     `json:"last4"`
+	BaseDays             int        `json:"base_days"`
+	UnactivatedTotalDays int        `json:"unactivated_total_days"`
+	Note                 *string    `json:"note"`
+	ActivatedAt          *time.Time `json:"activated_at"`
+	ExpiresAt            *time.Time `json:"expires_at"`
+	MachineHash          *string    `json:"machine_hash"`
+	CreatedAt            time.Time  `json:"created_at"`
+}
+
+type ActivationMutation struct {
+	RequestID   string    `json:"request_id"`
+	CardID      string    `json:"card_id"`
+	SoftwareID  string    `json:"software_id"`
+	MachineHash string    `json:"machine_hash"`
+	ActivatedAt time.Time `json:"activated_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	LeaseUntil  time.Time `json:"lease_until"`
+}
+
+type ActivationState struct {
+	RequestID   string    `json:"request_id"`
+	CardID      string    `json:"card_id"`
+	SoftwareID  string    `json:"software_id"`
+	MachineHash string    `json:"machine_hash"`
+	ActivatedAt time.Time `json:"activated_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	LeaseUntil  time.Time `json:"lease_until"`
+}
+
+type Lease struct {
+	CardID      string    `json:"card_id"`
+	SoftwareID  string    `json:"software_id"`
+	MachineHash string    `json:"machine_hash"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+	LeaseUntil  time.Time `json:"lease_until"`
+}
+
 func (c Claims) Validate() error {
 	if c.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("protocol_version must be %d", ProtocolVersion)
