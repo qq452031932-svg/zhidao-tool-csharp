@@ -18,8 +18,9 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("license record not found")
-	ErrMachineBound = errors.New("card is bound to another machine")
+	ErrNotFound      = errors.New("license record not found")
+	ErrMachineBound  = errors.New("card is bound to another machine")
+	ErrLeaseNotBound = errors.New("lease has no current activation binding")
 )
 
 const busyTimeoutMilliseconds = 10_000
@@ -65,7 +66,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return closeOnError(err)
 	}
 	var mode string
-	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode); err != nil {
+	if err := retrySQLiteBusy(ctx, func() error {
+		return db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode)
+	}); err != nil {
 		return closeOnError(fmt.Errorf("enable license sqlite WAL: %w", err))
 	}
 	if !strings.EqualFold(mode, "wal") {
@@ -198,6 +201,9 @@ func (s *Store) Activate(ctx context.Context, req model.ActivationMutation) (sta
 	if req.ActivatedAt.IsZero() || req.ExpiresAt.Before(req.ActivatedAt) || req.LeaseUntil.IsZero() {
 		return state, errors.New("invalid activation times")
 	}
+	req.ActivatedAt = canonicalTime(req.ActivatedAt)
+	req.ExpiresAt = canonicalTime(req.ExpiresAt)
+	req.LeaseUntil = canonicalTime(req.LeaseUntil)
 	err = s.immediate(ctx, func(conn *sql.Conn) error {
 		found, existing, err := queryActivationRequest(ctx, conn, req)
 		if err != nil {
@@ -209,7 +215,8 @@ func (s *Store) Activate(ctx context.Context, req model.ActivationMutation) (sta
 		}
 
 		var machine sql.NullString
-		if err := conn.QueryRowContext(ctx, `SELECT machine_hash FROM license_cards WHERE id=?`, req.CardID).Scan(&machine); err != nil {
+		var storedActivatedAt, storedExpiresAt sql.NullInt64
+		if err := conn.QueryRowContext(ctx, `SELECT machine_hash,activated_at,expires_at FROM license_cards WHERE id=?`, req.CardID).Scan(&machine, &storedActivatedAt, &storedExpiresAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -218,19 +225,28 @@ func (s *Store) Activate(ctx context.Context, req model.ActivationMutation) (sta
 		if machine.Valid && machine.String != req.MachineHash {
 			return ErrMachineBound
 		}
-		if _, err := conn.ExecContext(ctx, `UPDATE license_cards SET activated_at=?,expires_at=?,machine_hash=?,unactivated_total_days=0 WHERE id=?`, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt), req.MachineHash, req.CardID); err != nil {
+		effectiveActivatedAt := req.ActivatedAt
+		effectiveExpiresAt := req.ExpiresAt
+		if storedActivatedAt.Valid || storedExpiresAt.Valid {
+			if !storedActivatedAt.Valid || !storedExpiresAt.Valid {
+				return errors.New("card has incomplete activation lifetime")
+			}
+			effectiveActivatedAt = time.Unix(storedActivatedAt.Int64, 0).UTC()
+			effectiveExpiresAt = time.Unix(storedExpiresAt.Int64, 0).UTC()
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE license_cards SET activated_at=?,expires_at=?,machine_hash=?,unactivated_total_days=0 WHERE id=?`, unixTime(effectiveActivatedAt), unixTime(effectiveExpiresAt), req.MachineHash, req.CardID); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_bindings(card_id,software_id,machine_hash,activated_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id) DO UPDATE SET machine_hash=excluded.machine_hash,activated_at=excluded.activated_at,expires_at=excluded.expires_at`, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt)); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_bindings(card_id,software_id,machine_hash,activated_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id) DO UPDATE SET machine_hash=excluded.machine_hash,activated_at=excluded.activated_at,expires_at=excluded.expires_at`, req.CardID, req.SoftwareID, req.MachineHash, unixTime(effectiveActivatedAt), unixTime(effectiveExpiresAt)); err != nil {
 			return err
 		}
 		if _, err := conn.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until) VALUES(?,?,?,?,?) ON CONFLICT(card_id,software_id,machine_hash) DO UPDATE SET last_seen_at=excluded.last_seen_at,lease_until=excluded.lease_until`, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.LeaseUntil)); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_requests(request_id,card_id,software_id,machine_hash,activated_at,expires_at,lease_until) VALUES(?,?,?,?,?,?,?)`, req.RequestID, req.CardID, req.SoftwareID, req.MachineHash, unixTime(req.ActivatedAt), unixTime(req.ExpiresAt), unixTime(req.LeaseUntil)); err != nil {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_activation_requests(request_id,card_id,software_id,machine_hash,activated_at,expires_at,lease_until) VALUES(?,?,?,?,?,?,?)`, req.RequestID, req.CardID, req.SoftwareID, req.MachineHash, unixTime(effectiveActivatedAt), unixTime(effectiveExpiresAt), unixTime(req.LeaseUntil)); err != nil {
 			return err
 		}
-		state = activationState(req)
+		state = activationState(req, effectiveActivatedAt, effectiveExpiresAt)
 		return nil
 	})
 	if err != nil {
@@ -245,13 +261,17 @@ func (s *Store) RenewCard(ctx context.Context, id string, days int, now time.Tim
 	}
 	return s.immediate(ctx, func(conn *sql.Conn) error {
 		var activatedAt, expiresAt sql.NullInt64
-		if err := conn.QueryRowContext(ctx, `SELECT activated_at,expires_at FROM license_cards WHERE id=?`, id).Scan(&activatedAt, &expiresAt); err != nil {
+		var unactivatedDays int64
+		if err := conn.QueryRowContext(ctx, `SELECT activated_at,expires_at,unactivated_total_days FROM license_cards WHERE id=?`, id).Scan(&activatedAt, &expiresAt, &unactivatedDays); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
 		}
 		if !activatedAt.Valid {
+			if int64(days) > maximumInt64-unactivatedDays {
+				return errors.New("unactivated renewal days overflow")
+			}
 			_, err := conn.ExecContext(ctx, `UPDATE license_cards SET unactivated_total_days=unactivated_total_days+? WHERE id=?`, days, id)
 			return err
 		}
@@ -259,7 +279,15 @@ func (s *Store) RenewCard(ctx context.Context, id string, days int, now time.Tim
 		if expiry := time.Unix(expiresAt.Int64, 0).UTC(); expiry.After(base) {
 			base = expiry
 		}
-		newExpiry := base.Add(time.Duration(days) * 24 * time.Hour)
+		deltaSeconds := int64(days)
+		if deltaSeconds > maximumInt64/secondsPerDay {
+			return errors.New("renewal duration overflow")
+		}
+		deltaSeconds *= secondsPerDay
+		if base.Unix() > maximumInt64-deltaSeconds {
+			return errors.New("renewal expiry overflow")
+		}
+		newExpiry := time.Unix(base.Unix()+deltaSeconds, 0).UTC()
 		if _, err := conn.ExecContext(ctx, `UPDATE license_cards SET expires_at=? WHERE id=?`, unixTime(newExpiry), id); err != nil {
 			return err
 		}
@@ -354,16 +382,29 @@ func (s *Store) RecordLease(ctx context.Context, lease model.Lease) (model.Lease
 	if lease.CardID == "" || lease.SoftwareID == "" || lease.MachineHash == "" || lease.LastSeenAt.IsZero() || lease.LeaseUntil.IsZero() {
 		return model.Lease{}, errors.New("lease fields are required")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until) VALUES(?,?,?,?,?)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO license_leases(card_id,software_id,machine_hash,last_seen_at,lease_until)
+SELECT ?,?,?,?,? WHERE EXISTS (
+    SELECT 1 FROM license_activation_bindings WHERE card_id=? AND software_id=? AND machine_hash=?
+)
 ON CONFLICT(card_id,software_id,machine_hash) DO UPDATE SET
 last_seen_at=CASE WHEN excluded.last_seen_at>=license_leases.last_seen_at+3600 THEN excluded.last_seen_at ELSE license_leases.last_seen_at END,
 lease_until=CASE WHEN excluded.lease_until>license_leases.lease_until THEN excluded.lease_until ELSE license_leases.lease_until END`,
-		lease.CardID, lease.SoftwareID, lease.MachineHash, unixTime(lease.LastSeenAt), unixTime(lease.LeaseUntil))
+		lease.CardID, lease.SoftwareID, lease.MachineHash, unixTime(lease.LastSeenAt), unixTime(lease.LeaseUntil), lease.CardID, lease.SoftwareID, lease.MachineHash)
 	if err != nil {
 		return model.Lease{}, fmt.Errorf("record lease: %w", err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return model.Lease{}, err
+	}
+	if affected == 0 {
+		return model.Lease{}, ErrLeaseNotBound
+	}
 	var seen, until int64
 	if err := s.db.QueryRowContext(ctx, `SELECT last_seen_at,lease_until FROM license_leases WHERE card_id=? AND software_id=? AND machine_hash=?`, lease.CardID, lease.SoftwareID, lease.MachineHash).Scan(&seen, &until); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Lease{}, ErrLeaseNotBound
+		}
 		return model.Lease{}, err
 	}
 	lease.LastSeenAt = time.Unix(seen, 0).UTC()
@@ -412,8 +453,8 @@ func queryActivationRequest(ctx context.Context, q queryRower, req model.Activat
 	return true, model.ActivationState{RequestID: req.RequestID, CardID: req.CardID, SoftwareID: req.SoftwareID, MachineHash: req.MachineHash, ActivatedAt: time.Unix(activatedAt, 0).UTC(), ExpiresAt: time.Unix(expiresAt, 0).UTC(), LeaseUntil: time.Unix(leaseUntil, 0).UTC()}, nil
 }
 
-func activationState(req model.ActivationMutation) model.ActivationState {
-	return model.ActivationState{RequestID: req.RequestID, CardID: req.CardID, SoftwareID: req.SoftwareID, MachineHash: req.MachineHash, ActivatedAt: req.ActivatedAt.UTC(), ExpiresAt: req.ExpiresAt.UTC(), LeaseUntil: req.LeaseUntil.UTC()}
+func activationState(req model.ActivationMutation, activatedAt, expiresAt time.Time) model.ActivationState {
+	return model.ActivationState{RequestID: req.RequestID, CardID: req.CardID, SoftwareID: req.SoftwareID, MachineHash: req.MachineHash, ActivatedAt: activatedAt, ExpiresAt: expiresAt, LeaseUntil: req.LeaseUntil}
 }
 
 type rowScanner interface {
@@ -477,6 +518,43 @@ func requireAffected(result sql.Result) error {
 }
 
 func unixTime(value time.Time) int64 { return value.UTC().Unix() }
+
+const (
+	maximumInt64  = int64(^uint64(0) >> 1)
+	secondsPerDay = int64(24 * 60 * 60)
+)
+
+func canonicalTime(value time.Time) time.Time {
+	return time.Unix(value.UTC().Unix(), 0).UTC()
+}
+
+func retrySQLiteBusy(ctx context.Context, operation func() error) error {
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		if err = operation(); err == nil || !isSQLiteBusy(err) {
+			return err
+		}
+		delay := time.Duration(attempt+1) * 5 * time.Millisecond
+		if delay > 100*time.Millisecond {
+			delay = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func isSQLiteBusy(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlite_busy") || strings.Contains(message, "database is locked") || strings.Contains(message, "database table is locked")
+}
 
 func nullableTime(value sql.NullInt64) *time.Time {
 	if !value.Valid {

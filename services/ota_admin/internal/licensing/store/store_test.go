@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -39,6 +40,13 @@ func TestOpenCreatesIsolatedLicenseSchemaAndConfiguresSQLite(t *testing.T) {
 	}
 	if busyTimeout < 1000 {
 		t.Fatalf("busy_timeout = %d, want at least 1000", busyTimeout)
+	}
+	var versionDDL string
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='license_schema_version'`).Scan(&versionDDL); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(strings.Join(strings.Fields(versionDDL), " ")), "check (version=1)") {
+		t.Fatalf("license_schema_version DDL pins version 1 and cannot support a later migration: %s", versionDDL)
 	}
 
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
@@ -299,6 +307,93 @@ func TestActivateRejectsACompetingMachineAtomically(t *testing.T) {
 	}
 }
 
+func TestActivationPreservesAuthoritativeLifetimeAfterRenewalAndUnbind(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	softwareA := mustSoftware(t, s, "Lifetime Product A")
+	softwareB := mustSoftware(t, s, "Lifetime Product B")
+	pkg, err := s.CreatePackage(ctx, "Lifetime Package", []string{softwareA.ID, softwareB.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := mustCard(t, s, pkg.ID, 30, nil)
+	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	initialExpiry := now.Add(10 * 24 * time.Hour)
+	initial := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("a", 64), ActivatedAt: now, ExpiresAt: initialExpiry, LeaseUntil: now.Add(time.Hour)}
+	if _, err := s.Activate(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenewCard(ctx, card.ID, 30, now); err != nil {
+		t.Fatal(err)
+	}
+	wantExpiry := initialExpiry.Add(30 * 24 * time.Hour)
+
+	stale := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareB.ID, MachineHash: initial.MachineHash, ActivatedAt: now.Add(5 * 24 * time.Hour), ExpiresAt: now.Add(6 * 24 * time.Hour), LeaseUntil: now.Add(2 * time.Hour)}
+	state, err := s.Activate(ctx, stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.ActivatedAt.Equal(now) || !state.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("second-product activation overwrote lifetime: %+v, want activated %v expiry %v", state, now, wantExpiry)
+	}
+	summary := mustSearchOne(t, s, model.CardFilter{FullDigest: card.FullDigest})
+	if summary.ActivatedAt == nil || !summary.ActivatedAt.Equal(now) || summary.ExpiresAt == nil || !summary.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("stored lifetime after second product = %+v", summary)
+	}
+	for table, predicate := range map[string]string{
+		"license_activation_bindings": `card_id=? AND software_id=?`,
+		"license_activation_requests": `card_id=? AND software_id=?`,
+	} {
+		var activatedAt, expiresAt int64
+		query := `SELECT activated_at,expires_at FROM ` + table + ` WHERE ` + predicate
+		if err := s.db.QueryRowContext(ctx, query, card.ID, softwareB.ID).Scan(&activatedAt, &expiresAt); err != nil {
+			t.Fatal(err)
+		}
+		if activatedAt != now.Unix() || expiresAt != wantExpiry.Unix() {
+			t.Fatalf("%s lifetime = %d/%d, want %d/%d", table, activatedAt, expiresAt, now.Unix(), wantExpiry.Unix())
+		}
+	}
+
+	if err := s.UnbindCard(ctx, card.ID); err != nil {
+		t.Fatal(err)
+	}
+	rebind := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("b", 64), ActivatedAt: now.Add(7 * 24 * time.Hour), ExpiresAt: now.Add(8 * 24 * time.Hour), LeaseUntil: now.Add(3 * time.Hour)}
+	state, err = s.Activate(ctx, rebind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.ActivatedAt.Equal(now) || !state.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("post-unbind activation overwrote lifetime: %+v, want activated %v expiry %v", state, now, wantExpiry)
+	}
+}
+
+func TestActivationReturnsCanonicalPersistedTimeOnFirstCallAndReplay(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	software := mustSoftware(t, s, "Canonical Time Product")
+	pkg, err := s.CreatePackage(ctx, "Canonical Time Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := mustCard(t, s, pkg.ID, 30, nil)
+	now := time.Date(2026, 9, 8, 10, 0, 0, 123456789, time.UTC)
+	mutation := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("c", 64), ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
+	first, err := s.Activate(ctx, mutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := s.Activate(ctx, mutation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != replay {
+		t.Fatalf("first activation = %+v, replay = %+v; want byte-stable persisted state", first, replay)
+	}
+	if first.ActivatedAt.Nanosecond() != 0 || first.ExpiresAt.Nanosecond() != 0 || first.LeaseUntil.Nanosecond() != 0 {
+		t.Fatalf("activation state was not normalized to SQLite precision: %+v", first)
+	}
+}
+
 func TestRenewCardExtendsActivatedFromMaxAndAccumulatesUnactivatedDays(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -346,6 +441,40 @@ func TestRenewCardExtendsActivatedFromMaxAndAccumulatesUnactivatedDays(t *testin
 	}
 }
 
+func TestRenewCardRejectsIntegerAndDurationOverflowWithoutMutation(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	software := mustSoftware(t, s, "Overflow Product")
+	pkg, err := s.CreatePackage(ctx, "Overflow Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	maxInt := int(^uint(0) >> 1)
+
+	unused := mustCard(t, s, pkg.ID, maxInt, nil)
+	if err := s.RenewCard(ctx, unused.ID, 1, now); err == nil {
+		t.Fatal("unactivated renewal overflow succeeded")
+	}
+	unusedSummary := mustSearchOne(t, s, model.CardFilter{FullDigest: unused.FullDigest})
+	if unusedSummary.UnactivatedTotalDays != maxInt {
+		t.Fatalf("failed unactivated renewal mutated total days to %d, want %d", unusedSummary.UnactivatedTotalDays, maxInt)
+	}
+
+	active := mustCard(t, s, pkg.ID, 30, nil)
+	expiry := now.Add(24 * time.Hour)
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: active.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("f", 64), ActivatedAt: now, ExpiresAt: expiry, LeaseUntil: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenewCard(ctx, active.ID, maxInt, now); err == nil {
+		t.Fatal("activated renewal duration overflow succeeded")
+	}
+	activeSummary := mustSearchOne(t, s, model.CardFilter{FullDigest: active.FullDigest})
+	if activeSummary.ExpiresAt == nil || !activeSummary.ExpiresAt.Equal(expiry) {
+		t.Fatalf("failed activated renewal mutated expiry to %v, want %v", activeSummary.ExpiresAt, expiry)
+	}
+}
+
 func TestReplayNonceClaimPersistsUntilExpiry(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -375,6 +504,9 @@ func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
 	lease := model.Lease{CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("d", 64), LastSeenAt: now, LeaseUntil: now.Add(30 * time.Minute)}
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: lease.MachineHash, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.RecordLease(ctx, lease); err != nil {
 		t.Fatal(err)
 	}
@@ -394,6 +526,143 @@ func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T
 	}
 	if !got.LastSeenAt.Equal(lease.LastSeenAt) {
 		t.Fatalf("hourly last_seen = %v, want %v", got.LastSeenAt, lease.LastSeenAt)
+	}
+}
+
+func TestLeaseRequiresCurrentActivationBindingAndCannotReappearAfterUnbind(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	softwareA := mustSoftware(t, s, "Lease Bound Product A")
+	softwareB := mustSoftware(t, s, "Lease Bound Product B")
+	pkg, err := s.CreatePackage(ctx, "Lease Bound Package", []string{softwareA.ID, softwareB.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := mustCard(t, s, pkg.ID, 30, nil)
+	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	machine := strings.Repeat("7", 64)
+	lease := model.Lease{CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: machine, LastSeenAt: now, LeaseUntil: now.Add(30 * time.Minute)}
+	if _, err := s.RecordLease(ctx, lease); err == nil {
+		t.Fatal("lease without activation binding succeeded")
+	}
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: machine, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordLease(ctx, lease); err != nil {
+		t.Fatalf("lease for exact binding failed: %v", err)
+	}
+	wrongSoftware := lease
+	wrongSoftware.SoftwareID = softwareB.ID
+	if _, err := s.RecordLease(ctx, wrongSoftware); err == nil {
+		t.Fatal("lease for an unactivated software binding succeeded")
+	}
+	wrongMachine := lease
+	wrongMachine.MachineHash = strings.Repeat("8", 64)
+	if _, err := s.RecordLease(ctx, wrongMachine); err == nil {
+		t.Fatal("lease for a different machine succeeded")
+	}
+
+	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = s.RecordLease(ctx, lease)
+			}
+		}
+	}()
+	if err := s.UnbindCard(ctx, card.ID); err != nil {
+		close(stop)
+		<-writerDone
+		t.Fatal(err)
+	}
+	if _, err := s.RecordLease(ctx, lease); err == nil {
+		close(stop)
+		<-writerDone
+		t.Fatal("lease recreated after unbind")
+	}
+	close(stop)
+	<-writerDone
+	var leases int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_leases WHERE card_id=?`, card.ID).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 {
+		t.Fatalf("leases after concurrent unbind = %d, want 0", leases)
+	}
+}
+
+func TestConcurrentOpenMigratesOneDatabaseWithoutBusyLeakage(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared-license.db")
+	const workers = 20
+	start := make(chan struct{})
+	stores := make(chan *Store, workers)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := Open(ctx, path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			stores <- s
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(stores)
+	close(errs)
+	for err := range errs {
+		if strings.Contains(strings.ToLower(err.Error()), "busy") || strings.Contains(strings.ToLower(err.Error()), "locked") {
+			t.Errorf("SQLite contention leaked from concurrent Open: %v", err)
+		} else {
+			t.Errorf("concurrent Open failed: %v", err)
+		}
+	}
+	opened := 0
+	for s := range stores {
+		opened++
+		if err := s.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}
+	if opened != workers {
+		t.Fatalf("successful opens = %d, want %d", opened, workers)
+	}
+}
+
+func TestCanceledImmediateTransactionRollsBackAndConnectionIsReusable(t *testing.T) {
+	s := openTestStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	id := uuid.NewString()
+	err := s.immediate(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, id, "Canceled Product", unixTime(time.Now())); err != nil {
+			return err
+		}
+		cancel()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled transaction error = %v, want context.Canceled", err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT count(*) FROM license_software WHERE id=?`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("canceled transaction retained %d rows, want rollback", count)
+	}
+	if _, err := s.CreateSoftware(context.Background(), "Reusable Product"); err != nil {
+		t.Fatalf("store was not reusable after canceled transaction: %v", err)
 	}
 }
 

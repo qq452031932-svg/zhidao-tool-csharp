@@ -13,7 +13,7 @@ const licenseSchemaVersion = 1
 const licenseSchemaV1 = `
 CREATE TABLE license_schema_version (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id=1),
-    version INTEGER NOT NULL CHECK (version=1)
+    version INTEGER NOT NULL CHECK (version>0)
 );
 INSERT INTO license_schema_version(singleton_id,version) VALUES(1,1);
 
@@ -113,6 +113,10 @@ END;
 `
 
 func migrate(ctx context.Context, db *sql.DB) error {
+	return retrySQLiteBusy(ctx, func() error { return migrateOnce(ctx, db) })
+}
+
+func migrateOnce(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin license migration: %w", err)
