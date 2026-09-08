@@ -28,7 +28,7 @@ func TestBrowserTestArgumentsDisableGpuDiskCache(t *testing.T) {
 func browserTestArguments(profile, url string) []string {
 	return []string{
 		"--headless=new", "--disable-gpu", "--disable-gpu-shader-disk-cache", "--disable-features=SkiaGraphiteUsePersistentCache,GpuPersistentCache", "--no-first-run", "--no-default-browser-check",
-		"--user-data-dir=" + profile, "--window-size=420,900", "--virtual-time-budget=10000", "--dump-dom", url,
+		"--user-data-dir=" + profile, "--window-size=420,900", "--virtual-time-budget=30000", "--dump-dom", url,
 	}
 }
 
@@ -58,6 +58,206 @@ func TestAdminConsoleInRealBrowser(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdminConsoleInRealBrowserLicenseManagement(t *testing.T) {
+	chrome := installedTestBrowser()
+	if chrome == "" {
+		t.Skip("Chrome or Edge is not installed")
+	}
+	for _, mode := range []string{"license-happy", "license-unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			server := newLicenseBrowserTestServer(t, mode)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, chrome, browserTestArguments(t.TempDir(), server.URL+"/admin/?mode="+mode)...)
+			output, err := command.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("browser timed out: %v\n%s", ctx.Err(), output)
+			}
+			if err != nil {
+				t.Fatalf("browser failed: %v\n%s", err, output)
+			}
+			document := string(output)
+			if !strings.Contains(document, `id="test-result">PASS `+mode) {
+				t.Fatalf("license browser scenario did not pass:\n%s", tail(document, 5000))
+			}
+		})
+	}
+}
+
+func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
+	t.Helper()
+	page, err := staticFiles.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modified := strings.Replace(string(page), `<script src="/admin/app.js" defer></script>`, `<script src="/license-test-bootstrap.js"></script><script src="/admin/app.js" defer></script><script type="module" src="/license-test-driver.js"></script>`, 1)
+	const softwareA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	const softwareB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	const packageID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	const cardID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	const cardText = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789"
+	now := time.Now().UTC()
+	var mu sync.Mutex
+	loggedIn := false
+	csrf := "license-csrf"
+	softwareCreateRequests := 0
+	securityFailures := []string{}
+	actions := map[string]int{}
+	searchBody := map[string]any{}
+	checkMutation := func(r *http.Request) {
+		if r.Header.Get("Origin") != "http://"+r.Host || r.Header.Get("X-CSRF-Token") != csrf || r.Header.Get("Idempotency-Key") == "" {
+			securityFailures = append(securityFailures, r.URL.Path)
+		}
+		if cookie, cookieErr := r.Cookie("license_browser_test"); cookieErr != nil || cookie.Value != "active" {
+			securityFailures = append(securityFailures, "cookie:"+r.URL.Path)
+		}
+	}
+	itemsSoftware := func() []map[string]any {
+		return []map[string]any{{"id": softwareA, "name": "SuperPan", "enabled": true, "created_at": now}, {"id": softwareB, "name": "助手", "enabled": true, "created_at": now}}
+	}
+	itemsPackages := func() []map[string]any {
+		return []map[string]any{{"id": packageID, "name": "全能套餐", "software_ids": []string{softwareA, softwareB}, "created_at": now}}
+	}
+	itemsCards := func() []map[string]any {
+		return []map[string]any{{"id": cardID, "package_id": packageID, "package_name": "全能套餐", "prefix8": "ABCDEFGH", "last4": "6789", "card_type": "month", "duration_days": 30, "state": "effective", "activated_at": now.Add(-time.Hour), "expires_at": now.Add(29 * 24 * time.Hour), "binding_short_id": "MACHINE1", "note": "张三", "created_at": now.Add(-2 * time.Hour)}}
+	}
+	web := Handler()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/admin/":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(modified))
+		case "/license-test-bootstrap.js":
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			_, _ = w.Write([]byte(licenseBrowserBootstrapScript))
+		case "/license-test-driver.js":
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			_, _ = w.Write([]byte(licenseBrowserDriverScript))
+		case "/admin/api/session/current":
+			if !loggedIn {
+				writeBrowserJSON(w, http.StatusUnauthorized, map[string]any{"code": "authentication_failed"})
+				return
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"authenticated": true, "must_change_password": false, "csrf_token": csrf})
+		case "/admin/api/session/bootstrap":
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"csrf_token": "license-preauth"})
+		case "/admin/api/session/login":
+			if r.Header.Get("Origin") != "http://"+r.Host || r.Header.Get("X-CSRF-Token") != "license-preauth" {
+				securityFailures = append(securityFailures, "login")
+			}
+			loggedIn = true
+			http.SetCookie(w, &http.Cookie{Name: "license_browser_test", Value: "active", Path: "/admin/", SameSite: http.SameSiteStrictMode})
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"csrf_token": csrf, "must_change_password": false})
+		case "/admin/api/license/software":
+			if mode == "license-unavailable" {
+				writeBrowserJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "license_service_unavailable", "message": "授权服务暂时不可用，请稍后重试。"})
+				return
+			}
+			if r.Method == http.MethodPost {
+				softwareCreateRequests++
+				checkMutation(r)
+				if softwareCreateRequests == 1 {
+					w.Header().Set("Retry-After", "1")
+					writeBrowserJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate_limited"})
+					return
+				}
+				actions["software_create"]++
+				writeBrowserJSON(w, http.StatusCreated, map[string]any{"id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "name": "限流软件", "enabled": true, "created_at": now})
+				return
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsSoftware(), "page": 1, "page_size": 100, "total": 2})
+		case "/admin/api/license/packages":
+			if r.Method == http.MethodPost {
+				checkMutation(r)
+				actions["package_create"]++
+				writeBrowserJSON(w, http.StatusCreated, itemsPackages()[0])
+				return
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsPackages(), "page": 1, "page_size": 100, "total": 1})
+		case "/admin/api/license/cards/search":
+			if r.URL.RawQuery != "" || r.Header.Get("Idempotency-Key") != "" || r.Header.Get("Origin") != "http://"+r.Host || r.Header.Get("X-CSRF-Token") != csrf {
+				securityFailures = append(securityFailures, "sensitive_search")
+			}
+			_ = json.NewDecoder(r.Body).Decode(&searchBody)
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsCards(), "page": 1, "page_size": 100, "total": 1})
+		case "/admin/api/license/cards/generate":
+			checkMutation(r)
+			actions["generate"]++
+			writeBrowserJSON(w, http.StatusCreated, map[string]any{"items": []map[string]any{{"card": itemsCards()[0], "plaintext": cardText}}})
+		case "/admin/api/license/cards/export":
+			checkMutation(r)
+			actions["export"]++
+			w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+			w.Header().Set("Content-Disposition", `attachment; filename="license-cards.csv"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(append([]byte{0xef, 0xbb, 0xbf}, []byte("完整卡密,套餐\r\n"+cardText+",全能套餐\r\n")...))
+		case "/admin/api/license/devices":
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"card_short_id": "dddddddd", "machine_short_id": "MACHINE1", "bound_at": now.Add(-time.Hour), "last_successful_validation": now, "expires_at": now.Add(29 * 24 * time.Hour)}}, "page": 1, "page_size": 100, "total": 1})
+		case "/admin/api/releases":
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"releases": browserReleases(), "read_only": false, "client_auto_downgrade": false})
+		case "/admin/api/candidates/current":
+			writeBrowserJSON(w, http.StatusNotFound, map[string]any{"code": "not_found"})
+		case "/test/license-assertions":
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"software_create_requests": softwareCreateRequests, "security_failures": securityFailures, "actions": actions, "search_body": searchBody})
+		default:
+			path := r.URL.Path
+			if strings.HasPrefix(path, "/admin/api/license/software/") {
+				checkMutation(r)
+				if strings.HasSuffix(path, "/disable") {
+					actions["software_disable"]++
+				} else if strings.HasSuffix(path, "/enable") {
+					actions["software_enable"]++
+				} else {
+					actions["software_rename"]++
+				}
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"id": softwareA})
+				return
+			}
+			if strings.HasPrefix(path, "/admin/api/license/packages/") {
+				checkMutation(r)
+				if strings.HasSuffix(path, "/impact") {
+					actions["impact"]++
+					writeBrowserJSON(w, http.StatusOK, map[string]any{"affected_valid_cards": 3, "max_offline_lease_delay_minutes": 30})
+				} else {
+					actions["members"]++
+					writeBrowserJSON(w, http.StatusOK, map[string]any{"id": packageID, "software_ids": []string{softwareB}})
+				}
+				return
+			}
+			if strings.HasPrefix(path, "/admin/api/license/cards/") {
+				if r.Method == http.MethodGet {
+					actions["copy"]++
+					writeBrowserJSON(w, http.StatusOK, map[string]any{"card": itemsCards()[0], "plaintext": cardText})
+					return
+				}
+				checkMutation(r)
+				if strings.HasSuffix(path, "/renew") {
+					actions["renew"]++
+				} else if strings.HasSuffix(path, "/remark") {
+					actions["remark"]++
+				} else if strings.HasSuffix(path, "/unbind") {
+					actions["card_unbind"]++
+				} else {
+					actions["delete"]++
+				}
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"id": cardID})
+				return
+			}
+			if strings.HasPrefix(path, "/admin/api/license/devices/") && strings.HasSuffix(path, "/unbind") {
+				checkMutation(r)
+				actions["device_unbind"]++
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"id": cardID})
+				return
+			}
+			web.ServeHTTP(w, r)
+		}
+	})
+	return httptest.NewServer(handler)
 }
 
 func installedTestBrowser() string {
@@ -328,6 +528,7 @@ try {
     await waitFor(() => !document.getElementById("console-view").hidden, "改密后控制台");
     assert(document.getElementById("current-password").value === "" && document.getElementById("new-password").value === "", "改密后密码字段未清空");
   }
+  document.getElementById("tab-ota").click();
   await waitFor(() => document.getElementById("loading-state").hidden, "初始化加载结束");
   await waitFor(() => document.querySelectorAll("#validation-list li.passed").length === 7, "逐项校验证据");
   const incomplete = window.__candidate("21.0.1");
@@ -341,7 +542,7 @@ try {
   assert(document.activeElement === fileInput, "ZIP选择器不能获得焦点");
   assert(document.documentElement.scrollWidth <= window.innerWidth + 1, "窄屏页面出现整体横向溢出");
   assert(getComputedStyle(document.querySelector("#history-body td")).whiteSpace === "nowrap", "版本号可被拆行");
-  assert(document.querySelector(".table-scroll").scrollWidth > document.querySelector(".table-scroll").clientWidth, "历史表缺少横向滚动");
+  assert(document.querySelector(".history-card .table-scroll").scrollWidth > document.querySelector(".history-card .table-scroll").clientWidth, "历史表缺少横向滚动");
   assert([...document.querySelectorAll("th")].some(cell => cell.textContent === "操作者"), "历史缺少操作者列");
 
   const rollback = document.querySelector("#history-body button");
@@ -414,5 +615,152 @@ try {
   result.textContent = "PASS " + window.__mode;
 } catch (error) {
   result.textContent = "FAIL " + window.__mode + ": " + error.message;
+}
+`
+
+const licenseBrowserBootstrapScript = `
+window.__licenseClipboard = "";
+window.__licenseDownloads = 0;
+Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async value => { window.__licenseClipboard = value; } } });
+URL.createObjectURL = () => { window.__licenseDownloads += 1; return "blob:license-test"; };
+URL.revokeObjectURL = () => {};
+HTMLAnchorElement.prototype.click = function() {};
+window.__licenseRuntimeErrors = [];
+window.addEventListener("error", event => window.__licenseRuntimeErrors.push(event.message || "window.error"));
+window.addEventListener("unhandledrejection", event => window.__licenseRuntimeErrors.push(String(event.reason || "unhandledrejection")));
+`
+
+const licenseBrowserDriverScript = `
+const waitForLicense = async (predicate, label, timeout = 9000) => {
+  const until = Date.now() + timeout;
+  while (Date.now() < until) { if (await predicate()) return; await new Promise(resolve => setTimeout(resolve, 20)); }
+  throw new Error("等待超时：" + label);
+};
+const assertLicense = (condition, message) => { if (!condition) throw new Error(message); };
+const clickTab = id => document.getElementById(id).click();
+const result = document.createElement("pre"); result.id = "test-result"; document.body.append(result);
+try {
+  await waitForLicense(() => !document.getElementById("login-view").hidden, "登录页");
+  document.getElementById("login-password").value = "browser-test-password";
+  document.getElementById("login-form").requestSubmit();
+  await waitForLicense(() => !document.getElementById("console-view").hidden, "控制台");
+  const navText = [...document.querySelectorAll("#admin-navigation [role=tab]")].map(item => item.textContent.trim()).join("|");
+  assertLicense(navText === "卡密管理|软件管理|套餐管理|设备绑定|OTA 更新", "导航顺序不正确：" + navText);
+  assertLicense(document.getElementById("tab-cards").getAttribute("aria-selected") === "true" && !document.getElementById("cards-panel").hidden, "登录后未默认进入卡密管理");
+
+  if (new URL(location.href).searchParams.get("mode") === "license-unavailable") {
+    await waitForLicense(() => !document.getElementById("license-error").hidden, "授权服务不可用提示");
+    assertLicense(document.getElementById("license-error").textContent.includes("授权服务暂时不可用"), "授权服务错误未中文化");
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden && document.getElementById("current-version").textContent === "v20.5.0", "授权故障时 OTA 仍可用");
+    assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
+    result.textContent = "PASS license-unavailable";
+  } else {
+    await waitForLicense(() => document.querySelectorAll("#cards-body tr[data-card-id]").length === 1, "卡密列表");
+    clickTab("tab-software");
+    await waitForLicense(() => document.querySelectorAll("#software-body tr[data-software-id]").length === 2, "软件列表");
+    document.getElementById("software-name").value = "限流软件";
+    document.getElementById("software-create-form").requestSubmit();
+    await waitForLicense(() => document.getElementById("software-create-button").disabled, "429 禁用受影响操作");
+    document.getElementById("software-create-form").requestSubmit();
+    let assertions = await (await fetch("/test/license-assertions")).json();
+    assertLicense(assertions.software_create_requests === 1, "429 期间重复提交未被阻止");
+    assertLicense(!document.getElementById("tab-cards").disabled, "429 错误地禁用了其他操作");
+    await waitForLicense(() => !document.getElementById("software-create-button").disabled, "429 重试时间");
+    document.getElementById("software-create-form").requestSubmit();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.software_create === 1, "创建软件");
+    const softwareRow = document.querySelector('#software-body tr[data-software-id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]');
+    softwareRow.querySelector("input").value = "SuperPan 新名";
+    softwareRow.querySelector('[data-action="software-save"]').click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.software_rename === 1, "软件改名");
+    softwareRow.querySelector('[data-action="software-toggle"]').click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.software_disable === 1, "停用软件");
+    await waitForLicense(() => document.querySelector('#software-body tr[data-software-id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] [data-action="software-toggle"]'), "软件重绘");
+    document.querySelector('#software-body tr[data-software-id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] [data-action="software-toggle"]').click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.software_enable === 1, "启用软件");
+
+    clickTab("tab-packages");
+    await waitForLicense(() => document.querySelectorAll("#package-create-members input").length === 2, "套餐软件成员");
+    document.getElementById("package-name").value = "新套餐";
+    for (const input of document.querySelectorAll("#package-create-members input")) input.checked = true;
+    document.getElementById("package-create-form").requestSubmit();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.package_create === 1, "创建多软件套餐");
+    const packageRow = document.querySelector('#packages-body tr[data-package-id="cccccccc-cccc-4ccc-8ccc-cccccccccccc"]');
+    const memberChecks = packageRow.querySelectorAll('[data-package-member]');
+    memberChecks[0].checked = false;
+    packageRow.querySelector('[data-action="package-preview"]').click();
+    await waitForLicense(() => document.getElementById("package-impact-dialog").open, "移除成员影响预览");
+    assertLicense(document.getElementById("package-impact-summary").textContent.includes("3") && document.getElementById("package-impact-summary").textContent.includes("30"), "影响预览缺少有效卡数或 30 分钟延迟");
+    document.getElementById("package-impact-confirm").click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.members === 1, "应用套餐成员");
+
+    clickTab("tab-cards");
+    await waitForLicense(() => document.getElementById("generate-package").options.length > 1, "生成套餐列表");
+    document.getElementById("generate-package").value = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    document.getElementById("generate-card-type").value = "30";
+    document.getElementById("generate-count").value = "2";
+    document.getElementById("generate-note").value = "批次备注";
+    document.getElementById("card-generate-form").requestSubmit();
+    await waitForLicense(() => !document.getElementById("generated-card-window").hidden, "明文安全窗口");
+    assertLicense(document.getElementById("generated-card-list").textContent.includes("ABCD-EFGH"), "生成后未显示明文");
+    document.getElementById("copy-generated-cards").click();
+    await waitForLicense(() => window.__licenseClipboard.includes("ABCD-EFGH"), "复制生成卡密");
+    document.querySelector("#cards-body input[type=checkbox]").checked = true;
+    document.querySelector("#cards-body input[type=checkbox]").dispatchEvent(new Event("change"));
+    document.getElementById("export-selected-cards").click();
+    await waitForLicense(() => window.__licenseDownloads === 1, "导出 CSV");
+
+    document.getElementById("filter-complete-card").value = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789";
+    document.getElementById("filter-prefix8").value = "ABCDEFGH";
+    document.getElementById("filter-last4").value = "6789";
+    document.getElementById("filter-note").value = "张三";
+    document.getElementById("filter-package").value = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    document.getElementById("filter-card-type").value = "month";
+    document.getElementById("filter-state").value = "effective";
+    document.getElementById("card-filter-form").requestSubmit();
+    await waitForLicense(async () => {
+      const body = (await (await fetch("/test/license-assertions")).json()).search_body;
+      return body.complete_card && body.prefix8 && body.last4 && body.note_contains && body.package_id && body.card_type && body.state;
+    }, "全部卡密筛选");
+    let cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
+    cardRow.querySelector('[data-action="card-copy"]').click();
+    await waitForLicense(() => window.__licenseClipboard.includes("ABCD-EFGH"), "复制单卡");
+    cardRow.querySelector('[data-action="card-renew"]').click();
+    document.getElementById("renew-duration").value = "90";
+    document.getElementById("renew-form").requestSubmit();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.renew === 1, "续期");
+    cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
+    cardRow.querySelector('[data-action="card-remark"]').click();
+    document.getElementById("remark-value").value = "新备注";
+    document.getElementById("remark-form").requestSubmit();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.remark === 1, "备注");
+    cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
+    cardRow.querySelector('[data-action="card-unbind"]').click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.card_unbind === 1, "卡密解绑");
+    cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
+    cardRow.querySelector('[data-action="card-delete"]').click();
+    assertLicense(document.getElementById("delete-card-dialog").open, "删除卡密未二次确认");
+    document.getElementById("delete-card-form").requestSubmit();
+    assertions = await (await fetch("/test/license-assertions")).json();
+    assertLicense(!assertions.actions.delete, "未勾选确认就删除");
+    document.getElementById("delete-card-confirm-check").checked = true;
+    document.getElementById("delete-card-form").requestSubmit();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.delete === 1, "永久删除");
+
+    clickTab("tab-devices");
+    await waitForLicense(() => document.querySelector("#devices-body [data-action=device-unbind]"), "设备列表");
+    document.querySelector("#devices-body [data-action=device-unbind]").click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.device_unbind === 1, "设备解绑");
+
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden && document.getElementById("current-version").textContent === "v20.5.0", "OTA 标签页");
+    assertLicense(document.getElementById("generated-card-window").hidden && !document.getElementById("generated-card-list").textContent.includes("ABCD-EFGH"), "离开卡密页后明文未清除");
+    assertions = await (await fetch("/test/license-assertions")).json();
+    assertLicense(assertions.security_failures.length === 0, "请求安全头缺失：" + assertions.security_failures.join(","));
+    assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
+    result.textContent = "PASS license-happy";
+  }
+} catch (error) {
+  result.textContent = "FAIL " + new URL(location.href).searchParams.get("mode") + ": " + error.message;
 }
 `

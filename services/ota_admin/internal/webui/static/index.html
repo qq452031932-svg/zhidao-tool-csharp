@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SuperPan OTA 发布后台</title>
+  <title>SuperPan 管理后台</title>
   <link rel="stylesheet" href="/admin/styles.css">
   <script src="/admin/app.js" defer></script>
 </head>
@@ -12,7 +12,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">S</span>
-      <div><strong>SuperPan</strong><span>OTA 发布后台</span></div>
+      <div><strong>SuperPan</strong><span>授权与 OTA 管理后台</span></div>
     </div>
     <div class="top-actions">
       <span id="connection-state" class="status-pill" aria-live="polite">正在连接</span>
@@ -38,8 +38,8 @@
     <section id="login-view" class="auth-card" aria-labelledby="login-title" hidden>
       <div class="auth-copy">
         <span class="eyebrow">管理员登录</span>
-        <h1 id="login-title">登录 OTA 发布后台</h1>
-        <p>上传、发布和回滚都需要管理员身份。后台不会读取服务器上的其他站点。</p>
+        <h1 id="login-title">登录管理后台</h1>
+        <p>卡密管理与 OTA 发布都需要管理员身份。后台不会读取服务器上的其他站点。</p>
       </div>
       <form id="login-form" class="form-stack">
         <div class="field">
@@ -78,6 +78,78 @@
     </section>
 
     <div id="console-view" hidden>
+      <nav id="admin-navigation" class="admin-navigation" role="tablist" aria-label="管理功能">
+        <button id="tab-cards" class="admin-tab active" role="tab" type="button" aria-selected="true" aria-controls="cards-panel" data-admin-tab="cards">卡密管理</button>
+        <button id="tab-software" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="software-panel" data-admin-tab="software">软件管理</button>
+        <button id="tab-packages" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="packages-panel" data-admin-tab="packages">套餐管理</button>
+        <button id="tab-devices" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="devices-panel" data-admin-tab="devices">设备绑定</button>
+        <button id="tab-ota" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="ota-panel" data-admin-tab="ota">OTA 更新</button>
+      </nav>
+
+      <section id="license-error" class="state-banner error compact-banner" role="alert" hidden>
+        <div><strong>卡密服务暂时不可用</strong><p id="license-error-message">授权服务暂时不可用，请稍后重试。</p></div>
+        <button id="license-retry-button" class="button secondary" type="button">重试</button>
+      </section>
+
+      <section id="cards-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-cards">
+        <section class="card compact-card">
+          <div class="section-heading dense-heading"><div><span class="eyebrow">授权中心</span><h1>卡密管理</h1></div><span id="cards-total" class="status-pill">0 张</span></div>
+          <form id="card-generate-form" class="dense-toolbar" aria-label="批量生成卡密">
+            <div class="compact-field"><label for="generate-package">套餐</label><select id="generate-package" name="package_id" required><option value="">选择套餐</option></select></div>
+            <div class="compact-field"><label for="generate-card-type">卡种</label><select id="generate-card-type" name="duration_days"><option value="30">月卡·30 天</option><option value="90">季卡·90 天</option><option value="180">半年卡·180 天</option><option value="365">年卡·365 天</option></select></div>
+            <div class="compact-field quantity-field"><label for="generate-count">数量</label><input id="generate-count" name="count" type="number" min="1" max="1000" value="1" required></div>
+            <div class="compact-field grow"><label for="generate-note">默认备注</label><input id="generate-note" name="default_note" maxlength="1024" placeholder="可选，例如用户姓名"></div>
+            <button id="generate-cards-button" class="button primary align-end" type="submit">生成卡密</button>
+          </form>
+          <p id="card-action-status" class="inline-status" aria-live="polite"></p>
+        </section>
+
+        <section id="generated-card-window" class="card secret-window" aria-labelledby="generated-card-title" hidden>
+          <div class="section-heading dense-heading"><div><h2 id="generated-card-title">请立即复制新卡密</h2><p>明文只在当前安全窗口临时显示，离开本页或 60 秒后清除。</p></div><div class="button-row"><button id="copy-generated-cards" class="button secondary" type="button">复制全部</button><button id="clear-generated-cards" class="button ghost" type="button">立即清除</button></div></div>
+          <pre id="generated-card-list" class="secret-list" aria-live="polite"></pre>
+        </section>
+
+        <section class="card compact-card">
+          <form id="card-filter-form" class="filter-grid" aria-label="卡密筛选">
+            <div class="compact-field wide"><label for="filter-complete-card">完整卡密</label><input id="filter-complete-card" autocomplete="off" maxlength="128"></div>
+            <div class="compact-field"><label for="filter-prefix8">前 8 位</label><input id="filter-prefix8" autocomplete="off" maxlength="8"></div>
+            <div class="compact-field short"><label for="filter-last4">后 4 位</label><input id="filter-last4" autocomplete="off" maxlength="4"></div>
+            <div class="compact-field"><label for="filter-note">备注</label><input id="filter-note" maxlength="1024"></div>
+            <div class="compact-field"><label for="filter-package">套餐</label><select id="filter-package"><option value="">全部套餐</option></select></div>
+            <div class="compact-field"><label for="filter-card-type">卡种</label><select id="filter-card-type"><option value="">全部卡种</option><option value="month">月卡</option><option value="quarter">季卡</option><option value="half_year">半年卡</option><option value="year">年卡</option></select></div>
+            <div class="compact-field"><label for="filter-state">状态</label><select id="filter-state"><option value="">全部状态</option><option value="unactivated">未激活</option><option value="effective">有效</option><option value="expired">已到期</option></select></div>
+            <div class="button-row align-end"><button id="search-cards-button" class="button secondary" type="submit">查询</button><button id="reset-card-filter" class="button ghost" type="button">重置</button></div>
+          </form>
+          <div class="table-actions"><label class="select-all"><input id="select-all-cards" type="checkbox"> 全选本页</label><button id="export-selected-cards" class="button secondary" type="button" disabled>导出所选 CSV</button><span id="card-selection-count">已选 0 张</span></div>
+          <div class="table-scroll license-table-scroll" tabindex="0" aria-label="可横向滚动的卡密表格">
+            <table class="license-table"><thead><tr><th scope="col"><span class="sr-only">选择</span></th><th scope="col">卡密</th><th scope="col">套餐</th><th scope="col">天数</th><th scope="col">状态</th><th scope="col">激活时间</th><th scope="col">到期时间</th><th scope="col">绑定</th><th scope="col">备注</th><th scope="col">操作</th></tr></thead>
+            <tbody id="cards-body"><tr><td colspan="10" class="table-empty">正在读取卡密…</td></tr></tbody></table>
+          </div>
+        </section>
+      </section>
+
+      <section id="software-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-software" hidden>
+        <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">授权对象</span><h1>软件管理</h1></div></div>
+          <form id="software-create-form" class="inline-form"><label for="software-name">软件名称</label><input id="software-name" maxlength="128" required placeholder="例如 SuperPan"><button id="software-create-button" class="button primary" type="submit">创建软件</button><span id="software-action-status" class="inline-status" aria-live="polite"></span></form>
+          <div class="table-scroll"><table class="license-table"><thead><tr><th>不可变 ID</th><th>名称</th><th>状态</th><th>操作</th></tr></thead><tbody id="software-body"><tr><td colspan="4" class="table-empty">正在读取…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section id="packages-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-packages" hidden>
+        <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">多软件授权</span><h1>套餐管理</h1></div></div>
+          <form id="package-create-form" class="package-form"><div class="compact-field"><label for="package-name">套餐名称</label><input id="package-name" maxlength="128" required></div><fieldset><legend>包含软件</legend><div id="package-create-members" class="check-grid"></div></fieldset><button id="package-create-button" class="button primary" type="submit">创建套餐</button><span id="package-action-status" class="inline-status" aria-live="polite"></span></form>
+          <div class="table-scroll"><table class="license-table"><thead><tr><th>套餐</th><th>软件成员</th><th>操作</th></tr></thead><tbody id="packages-body"><tr><td colspan="3" class="table-empty">正在读取…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section id="devices-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-devices" hidden>
+        <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">机器授权</span><h1>设备绑定</h1></div><button id="refresh-devices" class="button ghost" type="button">刷新</button></div>
+          <p id="device-action-status" class="inline-status" aria-live="polite"></p>
+          <div class="table-scroll"><table class="license-table"><thead><tr><th>卡密短号</th><th>机器短号</th><th>绑定时间</th><th>最后验证</th><th>操作</th></tr></thead><tbody id="devices-body"><tr><td colspan="5" class="table-empty">正在读取…</td></tr></tbody></table></div>
+        </section>
+      </section>
+
+      <section id="ota-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-ota" hidden>
       <section class="hero-grid" aria-label="发布概况">
         <article class="card current-card">
           <div class="section-heading">
@@ -155,6 +227,7 @@
           </table>
         </div>
       </section>
+      </section>
     </div>
   </main>
 
@@ -182,6 +255,27 @@
       <p id="rollback-error" class="form-error" role="alert" hidden></p>
       <div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="rollback-dialog">取消</button><button id="rollback-confirm-button" class="button danger" type="submit">确认回滚</button></div>
     </form>
+  </dialog>
+
+  <dialog id="package-impact-dialog" aria-labelledby="package-impact-title">
+    <form id="package-impact-form">
+      <span class="eyebrow">成员变更预览</span><h2 id="package-impact-title">确认更新套餐？</h2>
+      <p id="package-impact-summary">正在计算影响…</p>
+      <p class="section-help">移除软件后，客户端暂时离线时旧授权可能最长 30 分钟后失效。</p>
+      <div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="package-impact-dialog">取消</button><button id="package-impact-confirm" class="button danger" type="submit">确认更新</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="renew-card-dialog" aria-labelledby="renew-card-title">
+    <form id="renew-form"><span class="eyebrow">管理员操作</span><h2 id="renew-card-title">卡密续期</h2><div class="field"><label for="renew-duration">延长时长</label><select id="renew-duration"><option value="30">30 天</option><option value="90">90 天</option><option value="180">180 天</option><option value="365">365 天</option></select></div><div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="renew-card-dialog">取消</button><button class="button primary" type="submit">确认续期</button></div></form>
+  </dialog>
+
+  <dialog id="remark-card-dialog" aria-labelledby="remark-card-title">
+    <form id="remark-form"><span class="eyebrow">后台备注</span><h2 id="remark-card-title">修改备注</h2><div class="field"><label for="remark-value">备注</label><input id="remark-value" maxlength="1024"></div><div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="remark-card-dialog">取消</button><button class="button primary" type="submit">保存备注</button></div></form>
+  </dialog>
+
+  <dialog id="delete-card-dialog" aria-labelledby="delete-card-title" aria-describedby="delete-card-description">
+    <form id="delete-card-form"><span class="eyebrow">高风险操作</span><h2 id="delete-card-title">永久删除卡密</h2><p id="delete-card-description">将同时删除绑定和服务端租约，不可恢复。</p><label class="confirm-check"><input id="delete-card-confirm-check" type="checkbox" required> 我确认永久删除这张卡密</label><div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="delete-card-dialog">取消</button><button id="delete-card-confirm" class="button danger" type="submit">永久删除</button></div></form>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

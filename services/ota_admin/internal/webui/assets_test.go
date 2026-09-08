@@ -18,12 +18,17 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 		`id="loading-state"`, `id="empty-state"`, `id="error-state"`, `id="readonly-state"`,
 		`aria-live="polite"`, `aria-describedby=`, `<progress`, `<dialog`, `<label`,
 		`class="visually-hidden-file"`, `至少 8 位`,
+		`id="tab-cards"`, `卡密管理`, `软件管理`, `套餐管理`, `设备绑定`, `OTA 更新`,
+		`id="card-generate-form"`, `id="card-filter-form"`, `id="cards-body"`, `id="generated-card-window"`,
+		`id="software-panel"`, `id="packages-panel"`, `id="devices-panel"`, `id="ota-panel"`,
+		`完整卡密`, `前 8 位`, `后 4 位`, `默认备注`, `月卡`, `季卡`, `半年卡`, `年卡`,
+		`永久删除`, `可能最长 30 分钟`,
 	} {
 		if !strings.Contains(index, required) {
 			t.Errorf("index missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"webkitdirectory", `type="text" name="path"`, `至少 16 位`, `minlength="16"`, "http://", "https://", "document.write", "eval("} {
+	for _, forbidden := range []string{"webkitdirectory", `type="text" name="path"`, `至少 16 位`, `minlength="16"`, "http://", "https://", "document.write", "eval(", "回收站", "恢复卡密"} {
 		if strings.Contains(index, forbidden) {
 			t.Errorf("index contains forbidden capability %q", forbidden)
 		}
@@ -37,12 +42,13 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	}
 
 	script := requestAsset(t, handler, "/admin/app.js")
-	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "Array.from(value).length", "XMLHttpRequest", "crypto.randomUUID", "showModal"} {
+	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "Array.from(value).length", "XMLHttpRequest", "crypto.randomUUID", "showModal",
+		"/admin/api/license/software", "/admin/api/license/packages", "/admin/api/license/cards/search", "/admin/api/license/cards/generate", "/admin/api/license/cards/export", "/admin/api/license/devices", "Idempotency-Key", "Retry-After", "license_service_unavailable", "URL.createObjectURL"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("script missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"http://", "https://", "eval(", "new Function", "innerHTML"} {
+	for _, forbidden := range []string{"http://", "https://", "eval(", "new Function", "innerHTML", "localStorage", "sessionStorage"} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("script contains forbidden construct %q", forbidden)
 		}

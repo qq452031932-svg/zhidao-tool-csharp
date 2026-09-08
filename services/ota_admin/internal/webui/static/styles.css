@@ -21,8 +21,8 @@
 }
 
 * { box-sizing: border-box; }
-html { min-width: 320px; background: var(--bg); }
-body { margin: 0; color: var(--text); background: radial-gradient(circle at 85% -10%, #dff7f6 0, transparent 30rem), var(--bg); min-height: 100vh; }
+html { min-width: 320px; max-width: 100%; background: var(--bg); overflow-x: hidden; }
+body { margin: 0; color: var(--text); background: radial-gradient(circle at 85% -10%, #dff7f6 0, transparent 30rem), var(--bg); min-height: 100vh; overflow-x: hidden; }
 button, input { font: inherit; }
 button, label[for] { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, input:focus-visible, a:focus-visible, [tabindex="0"]:focus-visible { outline: 3px solid rgba(12, 143, 143, .28); outline-offset: 3px; }
@@ -155,4 +155,97 @@ dialog p { color: var(--muted); line-height: 1.6; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+/* 卡密为主的紧凑管理台 */
+.admin-navigation {
+  display: flex;
+  gap: .35rem;
+  margin: 0 0 .85rem;
+  padding: .3rem;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.admin-navigation, .admin-panel, #console-view { min-width: 0; max-width: 100%; }
+.admin-panel > *, .history-card { min-width: 0; }
+.admin-tab {
+  flex: 0 0 auto;
+  min-height: 2.45rem;
+  padding: .5rem .9rem;
+  border: 0;
+  border-radius: 9px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.admin-tab:hover { color: var(--text); background: var(--surface-soft); }
+.admin-tab.active { color: var(--brand); background: var(--brand-soft); }
+.admin-panel { display: grid; gap: .8rem; }
+.compact-card { padding: 1rem; }
+.dense-heading { margin-bottom: .7rem; }
+.dense-heading h1, .dense-heading h2 { margin: .12rem 0 0; }
+.dense-heading p { margin: .2rem 0 0; color: var(--muted); font-size: .86rem; }
+.compact-banner { margin-bottom: .75rem; }
+.dense-toolbar, .filter-grid {
+  display: grid;
+  grid-template-columns: minmax(9rem, 1.15fr) minmax(8rem, .85fr) 6rem minmax(11rem, 1.5fr) auto;
+  gap: .65rem;
+  align-items: end;
+}
+.filter-grid { grid-template-columns: minmax(12rem, 1.5fr) 8rem 6rem minmax(9rem, 1fr) minmax(9rem, 1fr) 8rem 8rem auto; }
+.compact-field { min-width: 0; display: grid; gap: .28rem; }
+.compact-field label, .inline-form > label { color: var(--muted); font-size: .78rem; font-weight: 700; }
+.compact-field input, .compact-field select, .inline-form input, .license-table input, .license-table select {
+  width: 100%; min-width: 0; min-height: 2.35rem; padding: .45rem .6rem;
+  border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--text); font: inherit;
+}
+.align-end { align-self: end; }
+.inline-form { display: grid; grid-template-columns: minmax(11rem, 24rem) auto minmax(8rem, 1fr); gap: .65rem; align-items: end; margin-bottom: .85rem; }
+.inline-form > label { grid-column: 1; }
+.inline-form > input { grid-column: 1; }
+.inline-form > button { grid-column: 2; }
+.inline-form > .inline-status { grid-column: 3; }
+.inline-status { min-height: 1.2rem; margin: .45rem 0 0; color: var(--muted); font-size: .84rem; overflow-wrap: anywhere; }
+.inline-status.warning { color: #9a5a00; }
+.inline-status.error { color: var(--danger); }
+.secret-window { border-color: #d9b65f; background: #fffaf0; }
+.secret-list { max-height: 11rem; margin: 0; padding: .8rem; overflow: auto; border: 1px solid #ead49d; border-radius: 8px; background: #fff; white-space: pre-wrap; overflow-wrap: anywhere; }
+.button-row, .table-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.table-actions { padding: .8rem 0 .65rem; color: var(--muted); font-size: .86rem; }
+.select-all { display: inline-flex; gap: .4rem; align-items: center; color: var(--text); }
+.license-table-scroll { max-height: 31rem; }
+.license-table { min-width: 68rem; }
+.license-table th { position: sticky; top: 0; z-index: 1; background: var(--surface-soft); }
+.license-table td, .license-table th { vertical-align: middle; }
+.license-table td:nth-child(-n+3) { white-space: nowrap; }
+.license-table .row-actions { display: flex; gap: .35rem; flex-wrap: wrap; min-width: 19rem; }
+.license-table .row-actions .button { padding: .42rem .58rem; min-height: 2rem; }
+.license-key-mask, .short-id { font-family: ui-monospace, Consolas, monospace; letter-spacing: .02em; }
+.state-dot { display: inline-flex; padding: .2rem .5rem; border-radius: 999px; background: var(--surface-soft); white-space: nowrap; }
+.state-dot.success { color: #147a42; background: #eaf8f0; }
+.state-dot.warning { color: #9a5a00; background: #fff5dc; }
+.state-dot.danger { color: var(--danger); background: #fff0f0; }
+.package-form { display: grid; grid-template-columns: minmax(10rem, 18rem) minmax(18rem, 1fr) auto; gap: .8rem; align-items: end; margin-bottom: 1rem; }
+.package-form fieldset { min-width: 0; margin: 0; padding: .55rem .7rem; border: 1px solid var(--line); border-radius: 8px; }
+.package-form legend { padding: 0 .25rem; color: var(--muted); font-size: .78rem; font-weight: 700; }
+.check-list-inline, .check-list-inline label, .check-list-inline span { display: inline-flex; gap: .35rem; align-items: center; }
+.check-list-inline { flex-wrap: wrap; }
+.check-list-inline label { padding: .28rem .5rem; border-radius: 7px; background: var(--surface-soft); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+
+@media (max-width: 980px) {
+  .dense-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .package-form { grid-template-columns: 1fr; }
+  .package-form > * { grid-column: 1; }
+}
+@media (max-width: 560px) {
+  .dense-toolbar, .filter-grid { grid-template-columns: 1fr; }
+  .inline-form { grid-template-columns: 1fr; }
+  .inline-form > * { grid-column: 1; }
+  .compact-card { padding: .75rem; }
 }
