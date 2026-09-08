@@ -69,6 +69,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := migrate(ctx, db); err != nil {
 		return closeOnError(err)
 	}
+	if err := validatePersistedPackageNames(ctx, db); err != nil {
+		return closeOnError(err)
+	}
 	var mode string
 	if err := retrySQLiteBusy(ctx, func() error {
 		return db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode)
@@ -111,8 +114,8 @@ func (s *Store) SetSoftwareEnabled(ctx context.Context, id string, enabled bool)
 
 func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []string) (model.Package, error) {
 	name = strings.TrimSpace(name)
-	if name == "" {
-		return model.Package{}, errors.New("package name is required")
+	if err := model.ValidatePackageName(name); err != nil {
+		return model.Package{}, errors.New("package name is invalid")
 	}
 	ids, err := normalizedIDs(softwareIDs)
 	if err != nil {
@@ -144,7 +147,28 @@ func (s *Store) GetPackageName(ctx context.Context, id string) (string, error) {
 		}
 		return "", fmt.Errorf("read package name: %w", err)
 	}
+	if err := model.ValidatePackageName(name); err != nil {
+		return "", errors.New("persisted package name is invalid")
+	}
 	return name, nil
+}
+
+func validatePersistedPackageNames(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM license_packages`)
+	if err != nil {
+		return errors.New("validate persisted package names")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil || model.ValidatePackageName(name) != nil {
+			return errors.New("persisted package name violates wire invariant")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return errors.New("validate persisted package names")
+	}
+	return nil
 }
 
 func (s *Store) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {

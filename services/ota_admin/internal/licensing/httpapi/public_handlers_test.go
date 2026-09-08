@@ -184,6 +184,27 @@ func TestStrictRequestAndReplayValidation(t *testing.T) {
 	}
 }
 
+func TestTimestampFreshnessRejectsExtremeTimesWithoutDurationOverflow(t *testing.T) {
+	now := time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)
+	for _, timestamp := range []time.Time{
+		time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		if validPublicFields("request", "card", "software", "machine", timestamp, nonce(500), now, 5*time.Minute) {
+			t.Fatalf("extreme timestamp %s was accepted", timestamp)
+		}
+	}
+}
+
+func TestRequestJSONKeysMustUseExactCanonicalNames(t *testing.T) {
+	h := newAPIHarness(t, 20, 20)
+	body := strings.Replace(h.activateBody("case-request", nonce(501)), `"protocol_version"`, `"PROTOCOL_VERSION"`, 1)
+	response := h.do(http.MethodPost, "/license-api/v1/activate", body)
+	if response.Code != http.StatusBadRequest || decodeClaims(t, response, &h.key.PublicKey).Code != model.CodeInvalidRequest {
+		t.Fatalf("case-variant key response = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestRoutesExposeOnlyTwoPostEndpoints(t *testing.T) {
 	h := newAPIHarness(t, 10, 10)
 	for _, tc := range []struct{ method, path string }{
@@ -268,7 +289,76 @@ func (s *trackingReplayStore) snapshot() ([]string, int) {
 	return append([]string(nil), s.nonces...), s.lastMax
 }
 
-func TestRateLimitedValidRequestsKeepRequestIDWithoutClaimingNonceOrCallingService(t *testing.T) {
+type countingSigner struct {
+	inner *signing.Signer
+	calls atomic.Int64
+}
+
+func (s *countingSigner) Sign(claims model.Claims) (model.SignedEnvelope, error) {
+	s.calls.Add(1)
+	return s.inner.Sign(claims)
+}
+
+func TestMalformedTrafficIsChargedBeforeSigningAndSigningStopsAfterFirst429(t *testing.T) {
+	for _, route := range []string{"activate", "validate"} {
+		t.Run(route, func(t *testing.T) {
+			clock := &testClock{now: time.Date(2026, 9, 9, 8, 30, 0, 0, time.UTC)}
+			key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			inner, _ := signing.New("count-key", key, rand.Reader)
+			counter := &countingSigner{inner: inner}
+			svc := &fakeService{}
+			replays := &trackingReplayStore{}
+			handler, err := NewRouter(Options{
+				Service: svc, ReplayStore: replays, Signer: counter, Clock: clock,
+				MaxBodyBytes: 256, MaxHeaderBytes: 256, TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 8,
+				ActivationRate: RateLimit{Requests: 1, Window: time.Minute}, ValidationRate: RateLimit{Requests: 1, Window: time.Minute}, MaxLimiterEntries: 8,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := "/license-api/v1/" + route
+			idName := "request_id"
+			if route == "activate" {
+				idName = "activation_request_id"
+			}
+			unsupported := fmt.Sprintf(`{"protocol_version":2,%q:"unsupported","card":"card","software_id":"software","machine_hash":"machine","timestamp":%q,"nonce":%q}`, idName, clock.Now().Format(time.RFC3339), nonce(510))
+			requests := []struct {
+				body   string
+				header string
+				want   int
+			}{
+				{body: `{`, want: 400},
+				{body: unsupported, want: 429},
+				{body: strings.Repeat("x", 257), want: 429},
+				{body: `{}`, header: strings.Repeat("h", 257), want: 429},
+			}
+			for index, item := range requests {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(item.body))
+				req.Header.Set("Content-Type", "application/json")
+				if item.header != "" {
+					req.Header.Set("X-Oversized", item.header)
+				}
+				req.RemoteAddr = "127.0.0.1:42000"
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, req)
+				if recorder.Code != item.want {
+					t.Fatalf("request %d status = %d, want %d body=%s", index, recorder.Code, item.want, recorder.Body.String())
+				}
+			}
+			if counter.calls.Load() != 2 {
+				t.Fatalf("signature calls = %d, want bounded 2", counter.calls.Load())
+			}
+			if svc.calls.Load() != 0 {
+				t.Fatalf("service calls = %d, want 0", svc.calls.Load())
+			}
+			if nonces, _ := replays.snapshot(); len(nonces) != 0 {
+				t.Fatalf("malformed/rate-limited traffic claimed nonces: %v", nonces)
+			}
+		})
+	}
+}
+
+func TestRateLimitedValidRequestsSignOnlyFirstDenialPerWindow(t *testing.T) {
 	for _, route := range []string{"activate", "validate"} {
 		t.Run(route, func(t *testing.T) {
 			clock := &testClock{now: time.Date(2026, 9, 9, 2, 30, 0, 0, time.UTC)}
@@ -276,10 +366,11 @@ func TestRateLimitedValidRequestsKeepRequestIDWithoutClaimingNonceOrCallingServi
 			if err != nil {
 				t.Fatal(err)
 			}
-			signer, err := signing.New("rate-key", key, rand.Reader)
+			innerSigner, err := signing.New("rate-key", key, rand.Reader)
 			if err != nil {
 				t.Fatal(err)
 			}
+			signer := &countingSigner{inner: innerSigner}
 			svc := &fakeService{}
 			replays := &trackingReplayStore{}
 			handler, err := NewRouter(Options{
@@ -318,12 +409,32 @@ func TestRateLimitedValidRequestsKeepRequestIDWithoutClaimingNonceOrCallingServi
 			if claims.Code != model.CodeRateLimited || claims.RequestID != "limited-"+route {
 				t.Fatalf("rate-limit claims = %#v", claims)
 			}
+			limitedAgain := do(requestBody("limited-again-"+route, nonce(302)))
+			var protective map[string]json.RawMessage
+			if limitedAgain.Code != http.StatusTooManyRequests || limitedAgain.Header().Get("Retry-After") != "60" || json.Unmarshal(limitedAgain.Body.Bytes(), &protective) != nil || len(protective) != 1 || string(protective["code"]) != `"rate_limited"` {
+				t.Fatalf("protective rate-limit response = %d headers=%v body=%s", limitedAgain.Code, limitedAgain.Header(), limitedAgain.Body.String())
+			}
+			if signer.calls.Load() != 2 {
+				t.Fatalf("signature calls after repeated denial = %d, want 2", signer.calls.Load())
+			}
+			clock.Advance(time.Minute)
+			if resetAllowed := do(requestBody("reset-allowed-"+route, nonce(303))); resetAllowed.Code != http.StatusOK {
+				t.Fatalf("first request after reset = %d body=%s", resetAllowed.Code, resetAllowed.Body.String())
+			}
+			resetDenied := do(requestBody("reset-denied-"+route, nonce(304)))
+			resetClaims := decodeClaims(t, resetDenied, &key.PublicKey)
+			if resetDenied.Code != http.StatusTooManyRequests || resetClaims.Code != model.CodeRateLimited || resetClaims.RequestID != "reset-denied-"+route {
+				t.Fatalf("first denial after reset = %d %#v", resetDenied.Code, resetClaims)
+			}
+			if signer.calls.Load() != 4 {
+				t.Fatalf("signature calls after reset denial = %d, want 4", signer.calls.Load())
+			}
 			nonces, maximum := replays.snapshot()
-			if len(nonces) != 1 || nonces[0] != nonce(300) || maximum != 7 {
+			if len(nonces) != 2 || nonces[0] != nonce(300) || nonces[1] != nonce(303) || maximum != 7 {
 				t.Fatalf("replay calls = %v max=%d; limited nonce was consumed", nonces, maximum)
 			}
-			if svc.calls.Load() != 1 {
-				t.Fatalf("service calls = %d, want 1", svc.calls.Load())
+			if svc.calls.Load() != 2 {
+				t.Fatalf("service calls = %d, want 2", svc.calls.Load())
 			}
 		})
 	}
@@ -429,6 +540,51 @@ func TestFixedWindowLimiterIsRaceSafeAndBounded(t *testing.T) {
 	limiter.mu.Unlock()
 	if entries > 16 {
 		t.Fatalf("limiter entries = %d, cap 16", entries)
+	}
+}
+
+func TestClientKeyTrustsCanonicalRealIPOnlyFromLoopbackPeer(t *testing.T) {
+	tests := []struct {
+		name, remote string
+		headers      []string
+		want         string
+	}{
+		{name: "normal IPv4", remote: "127.0.0.1:1", headers: []string{"203.0.113.9"}, want: "203.0.113.9"},
+		{name: "normal IPv6", remote: "[::1]:1", headers: []string{"2001:db8::5"}, want: "2001:db8::5"},
+		{name: "mapped IPv6", remote: "127.0.0.1:1", headers: []string{"::ffff:203.0.113.9"}, want: "203.0.113.9"},
+		{name: "spoof non-loopback", remote: "198.51.100.4:1", headers: []string{"203.0.113.9"}, want: "198.51.100.4"},
+		{name: "multiple headers", remote: "127.0.0.1:1", headers: []string{"203.0.113.1", "203.0.113.2"}, want: "127.0.0.1"},
+		{name: "comma list", remote: "127.0.0.1:1", headers: []string{"203.0.113.1, 203.0.113.2"}, want: "127.0.0.1"},
+		{name: "whitespace", remote: "127.0.0.1:1", headers: []string{" 203.0.113.1"}, want: "127.0.0.1"},
+		{name: "invalid", remote: "127.0.0.1:1", headers: []string{"not-an-ip"}, want: "127.0.0.1"},
+		{name: "oversized", remote: "127.0.0.1:1", headers: []string{strings.Repeat("1", 64)}, want: "127.0.0.1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = tt.remote
+			for _, value := range tt.headers {
+				req.Header.Add("X-Real-IP", value)
+			}
+			if got := clientKey(req); got != tt.want {
+				t.Fatalf("clientKey = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoopbackProxyClientsHaveIndependentRateBuckets(t *testing.T) {
+	h := newAPIHarness(t, 1, 10)
+	for index, ip := range []string{"203.0.113.10", "203.0.113.11"} {
+		req := httptest.NewRequest(http.MethodPost, "/license-api/v1/activate", strings.NewReader(h.activateBody(fmt.Sprintf("proxy-%d", index), nonce(520+index))))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Real-IP", ip)
+		req.RemoteAddr = "127.0.0.1:43000"
+		recorder := httptest.NewRecorder()
+		h.handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("proxy client %s status = %d body=%s", ip, recorder.Code, recorder.Body.String())
+		}
 	}
 }
 

@@ -62,6 +62,9 @@ func Load(path string) (Config, error) {
 	if err != nil || len(data) > maximumConfigBytes {
 		return Config{}, errors.New("read license service configuration")
 	}
+	if err := validateConfigJSONShape(data); err != nil {
+		return Config{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var cfg Config
@@ -76,6 +79,68 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func validateConfigJSONShape(data []byte) error {
+	topFields := map[string]struct{}{
+		"listen_address": {}, "license_database_path": {}, "encryption_key_path": {}, "lookup_hmac_key_path": {},
+		"signing_private_key_path": {}, "internal_secret_path": {}, "signing_key_id": {}, "public_api_base_path": {}, "limits": {},
+	}
+	values, err := strictJSONObject(data, topFields)
+	if err != nil {
+		return errors.New("configuration keys must be exact and unique")
+	}
+	limits, ok := values["limits"]
+	if !ok {
+		return errors.New("configuration limits are required")
+	}
+	limitFields := map[string]struct{}{
+		"max_body_bytes": {}, "max_header_bytes": {}, "timestamp_window_seconds": {}, "nonce_lifetime_seconds": {}, "max_replay_nonces": {},
+		"activation_requests": {}, "validation_requests": {}, "rate_window_seconds": {}, "read_header_timeout_seconds": {},
+		"read_timeout_seconds": {}, "write_timeout_seconds": {}, "idle_timeout_seconds": {}, "shutdown_timeout_seconds": {},
+	}
+	if _, err := strictJSONObject(limits, limitFields); err != nil {
+		return errors.New("configuration limit keys must be exact and unique")
+	}
+	return nil
+}
+
+func strictJSONObject(data []byte, allowed map[string]struct{}) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("JSON object required")
+	}
+	values := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, errors.New("JSON field name required")
+		}
+		if _, exists := values[name]; exists {
+			return nil, errors.New("duplicate JSON field")
+		}
+		if _, ok := allowed[name]; !ok {
+			return nil, errors.New("unknown JSON field")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		values[name] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("trailing JSON value")
+	}
+	return values, nil
 }
 
 func (c Config) Validate() error {
@@ -162,7 +227,7 @@ func ReadSecret32(path string) ([]byte, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() != 32 {
 		return nil, errors.New("secret file must contain exactly 32 raw bytes")
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 && info.Mode().Perm() != 0o640 {
 		return nil, errors.New("secret file permissions are too broad")
 	}
 	data, err := os.ReadFile(path)

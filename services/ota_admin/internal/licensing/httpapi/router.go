@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -67,19 +68,12 @@ func NewRouter(options Options) (http.Handler, error) {
 
 func (a *api) protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		deferred := true
 		defer func() {
-			if deferred && recover() != nil {
-				a.writeClaims(w, http.StatusServiceUnavailable, fallbackRequestID, model.CodeServiceUnavailable, nil)
+			if recover() != nil {
+				a.writeUnsignedCode(w, http.StatusServiceUnavailable, model.CodeServiceUnavailable)
 			}
 		}()
-		if headerBytes(r.Header) > a.options.MaxHeaderBytes {
-			deferred = false
-			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
-			return
-		}
 		next.ServeHTTP(w, r)
-		deferred = false
 	})
 }
 
@@ -94,13 +88,33 @@ func headerBytes(headers http.Header) int {
 	return total
 }
 
-func clientKey(remoteAddress string) string {
+func clientKey(request *http.Request) string {
+	peer := canonicalRemoteIP(request.RemoteAddr)
+	if peer.IsValid() && peer.IsLoopback() {
+		values := request.Header.Values("X-Real-IP")
+		if len(values) == 1 {
+			value := values[0]
+			if len(value) <= 45 && value == strings.TrimSpace(value) && !strings.Contains(value, ",") {
+				if forwarded, err := netip.ParseAddr(value); err == nil && forwarded.Zone() == "" {
+					return forwarded.Unmap().String()
+				}
+			}
+		}
+	}
+	if peer.IsValid() {
+		return peer.Unmap().String()
+	}
+	return "unknown-peer"
+}
+
+func canonicalRemoteIP(remoteAddress string) netip.Addr {
 	host, _, err := net.SplitHostPort(remoteAddress)
-	if err == nil && host != "" {
-		return host
+	if err != nil {
+		return netip.Addr{}
 	}
-	if len(remoteAddress) > 256 {
-		return remoteAddress[:256]
+	address, err := netip.ParseAddr(host)
+	if err != nil || address.Zone() != "" {
+		return netip.Addr{}
 	}
-	return strings.TrimSpace(remoteAddress)
+	return address.Unmap()
 }

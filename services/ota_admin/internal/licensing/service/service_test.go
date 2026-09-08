@@ -224,6 +224,35 @@ func TestActivationAndValidationReturnPackageNameForSignedClaims(t *testing.T) {
 	}
 }
 
+func TestActivationDoesNotMutateWhenPersistedPackageNameViolatesWireInvariant(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Invalid Package Claims")
+	pkg := h.packageWith(software)
+	card := h.generate(pkg.ID, 30)
+	raw, err := sql.Open("sqlite", h.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	raw.SetMaxOpenConns(1)
+	if _, err := raw.ExecContext(h.ctx, `PRAGMA ignore_check_constraints=ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(h.ctx, `UPDATE license_packages SET name=? WHERE id=?`, strings.Repeat("x", model.MaxPackageNameUTF8Bytes+1), pkg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Activate(h.ctx, "invalid-package", card.Plaintext, software.ID, "machine-invalid-package"); err == nil {
+		t.Fatal("Activate accepted an invalid persisted package name")
+	}
+	summary, err := h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: card.Card.Prefix8, Last4: card.Card.Last4})
+	if err != nil || len(summary) != 1 {
+		t.Fatalf("SearchCards = %#v, %v", summary, err)
+	}
+	if summary[0].ActivatedAt != nil || summary[0].MachineHash != nil {
+		t.Fatalf("activation mutated card before package invariant check: %#v", summary[0])
+	}
+}
+
 func TestReactivationClampsLeaseAndRecordsCurrentObservationTime(t *testing.T) {
 	h := newHarness(t)
 	softwareA := h.software("Lease Clamp A")

@@ -3,8 +3,10 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -43,6 +45,28 @@ func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
 	}
 	if _, err := Load(multiple); err == nil {
 		t.Fatal("Load accepted multiple JSON values")
+	}
+}
+
+func TestLoadRejectsDuplicateAndCaseVariantKeysAtEveryLevel(t *testing.T) {
+	encoded, err := json.Marshal(validConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := [][]byte{
+		bytes.Replace(encoded, []byte(`"listen_address":"127.0.0.1:18092"`), []byte(`"LISTEN_ADDRESS":"127.0.0.1:18092"`), 1),
+		bytes.Replace(encoded, []byte(`"listen_address":"127.0.0.1:18092"`), []byte(`"listen_address":"127.0.0.1:18092","listen_address":"127.0.0.1:18092"`), 1),
+		bytes.Replace(encoded, []byte(`"max_body_bytes":8192`), []byte(`"MAX_BODY_BYTES":8192`), 1),
+		bytes.Replace(encoded, []byte(`"max_body_bytes":8192`), []byte(`"max_body_bytes":8192,"max_body_bytes":8192`), 1),
+	}
+	for index, data := range tests {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("strict-%d.json", index))
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("Load accepted ambiguous config %s", data)
+		}
 	}
 }
 
@@ -98,6 +122,23 @@ func TestReadSecret32RequiresExactlyRaw32Bytes(t *testing.T) {
 		}
 		if _, err := ReadSecret32(path); err == nil {
 			t.Fatal("ReadSecret32 accepted a file other than exactly 32 raw bytes")
+		}
+	}
+}
+
+func TestReadSecret32UnixPermissionsAllowOnly0600Or0640(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs are not represented by Unix mode bits")
+	}
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o400, 0o440, 0o700, 0o650, 0o660, 0o604, 0o644} {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("secret-%o", mode))
+		if err := os.WriteFile(path, bytes.Repeat([]byte{0x42}, 32), mode); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ReadSecret32(path)
+		wantOK := mode == 0o600 || mode == 0o640
+		if (err == nil) != wantOK {
+			t.Fatalf("mode %o error = %v, wantOK=%v", mode, err, wantOK)
 		}
 	}
 }

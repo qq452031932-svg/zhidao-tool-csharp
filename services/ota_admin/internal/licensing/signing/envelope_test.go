@@ -132,7 +132,7 @@ func TestLoadPrivateKeyAcceptsOnlySingleP256ECPEM(t *testing.T) {
 	}
 }
 
-func TestLoadPrivateKeyRejectsBroadUnixPermissions(t *testing.T) {
+func TestLoadPrivateKeyUnixPermissionsAllowOnly0600Or0640(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows ACLs are not represented by Unix mode bits")
 	}
@@ -141,9 +141,13 @@ func TestLoadPrivateKeyRejectsBroadUnixPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	der, _ := x509.MarshalECPrivateKey(key)
-	path := writePEM(t, "broad.pem", &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}, 0o644)
-	if _, err := LoadPrivateKey(path); err == nil {
-		t.Fatal("LoadPrivateKey accepted group/world-readable key")
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o400, 0o440, 0o700, 0o650, 0o660, 0o604, 0o644} {
+		path := writePEM(t, "permissions.pem", &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}, mode)
+		_, err := LoadPrivateKey(path)
+		wantOK := mode == 0o600 || mode == 0o640
+		if (err == nil) != wantOK {
+			t.Fatalf("mode %o error = %v, wantOK=%v", mode, err, wantOK)
+		}
 	}
 }
 

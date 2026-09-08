@@ -152,6 +152,10 @@ func (s *Service) Activate(ctx context.Context, requestID, cardText, softwareID,
 	if err != nil {
 		return model.ActivationState{}, err
 	}
+	packageName, err := s.store.GetPackageName(ctx, card.PackageID)
+	if err != nil {
+		return model.ActivationState{}, classifyStoreError(err)
+	}
 	state, err := s.store.Activate(ctx, model.ActivationMutation{
 		RequestID: requestID, CardID: card.ID, SoftwareID: softwareID, MachineHash: machineHash,
 		ObservedAt: now, LeaseUntil: now.Add(validationLease),
@@ -159,10 +163,7 @@ func (s *Service) Activate(ctx context.Context, requestID, cardText, softwareID,
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
 	}
-	state.PackageName, err = s.store.GetPackageName(ctx, card.PackageID)
-	if err != nil {
-		return model.ActivationState{}, classifyStoreError(err)
-	}
+	state.PackageName = packageName
 	return state, nil
 }
 
@@ -181,6 +182,10 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 	if err != nil {
 		return model.ActivationState{}, err
 	}
+	packageName, err := s.store.GetPackageName(ctx, card.PackageID)
+	if err != nil {
+		return model.ActivationState{}, classifyStoreError(err)
+	}
 	if card.ActivatedAt == nil || card.ExpiresAt == nil || card.MachineHash == nil {
 		return model.ActivationState{}, ErrNotFound
 	}
@@ -192,10 +197,7 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
 	}
-	state.PackageName, err = s.store.GetPackageName(ctx, card.PackageID)
-	if err != nil {
-		return model.ActivationState{}, classifyStoreError(err)
-	}
+	state.PackageName = packageName
 	return state, nil
 }
 

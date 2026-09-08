@@ -25,6 +25,9 @@ const (
 
 var noncePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 
+var activateRequestFields = map[string]struct{}{"protocol_version": {}, "activation_request_id": {}, "card": {}, "software_id": {}, "machine_hash": {}, "timestamp": {}, "nonce": {}}
+var validateRequestFields = map[string]struct{}{"protocol_version": {}, "request_id": {}, "card": {}, "software_id": {}, "machine_hash": {}, "timestamp": {}, "nonce": {}}
+
 type activateRequest struct {
 	ProtocolVersion     int       `json:"protocol_version"`
 	ActivationRequestID string    `json:"activation_request_id"`
@@ -46,23 +49,33 @@ type validateRequest struct {
 }
 
 func (a *api) activate(w http.ResponseWriter, r *http.Request) {
+	if headerBytes(r.Header) > a.options.MaxHeaderBytes {
+		if a.charge(w, r, a.activation, fallbackRequestID) {
+			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+		}
+		return
+	}
 	var request activateRequest
-	if err := a.decodeRequest(w, r, &request); err != nil {
-		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+	if err := a.decodeRequest(w, r, &request, activateRequestFields); err != nil {
+		if a.charge(w, r, a.activation, fallbackRequestID) {
+			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+		}
 		return
 	}
 	requestID := validRequestID(request.ActivationRequestID)
 	if request.ProtocolVersion != model.ProtocolVersion {
-		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
+		if a.charge(w, r, a.activation, requestID) {
+			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
+		}
 		return
 	}
 	if !validPublicFields(request.ActivationRequestID, request.Card, request.SoftwareID, request.MachineHash, request.Timestamp, request.Nonce, a.options.Clock.Now(), a.options.TimestampWindow) {
-		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		if a.charge(w, r, a.activation, requestID) {
+			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		}
 		return
 	}
-	if ok, retry := a.activation.allow(clientKey(r.RemoteAddr)); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
+	if !a.charge(w, r, a.activation, requestID) {
 		return
 	}
 	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
@@ -84,23 +97,33 @@ func (a *api) activate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) validate(w http.ResponseWriter, r *http.Request) {
+	if headerBytes(r.Header) > a.options.MaxHeaderBytes {
+		if a.charge(w, r, a.validation, fallbackRequestID) {
+			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+		}
+		return
+	}
 	var request validateRequest
-	if err := a.decodeRequest(w, r, &request); err != nil {
-		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+	if err := a.decodeRequest(w, r, &request, validateRequestFields); err != nil {
+		if a.charge(w, r, a.validation, fallbackRequestID) {
+			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
+		}
 		return
 	}
 	requestID := validRequestID(request.RequestID)
 	if request.ProtocolVersion != model.ProtocolVersion {
-		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
+		if a.charge(w, r, a.validation, requestID) {
+			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
+		}
 		return
 	}
 	if !validPublicFields(request.RequestID, request.Card, request.SoftwareID, request.MachineHash, request.Timestamp, request.Nonce, a.options.Clock.Now(), a.options.TimestampWindow) {
-		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		if a.charge(w, r, a.validation, requestID) {
+			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
+		}
 		return
 	}
-	if ok, retry := a.validation.allow(clientKey(r.RemoteAddr)); !ok {
-		w.Header().Set("Retry-After", strconv.Itoa(retry))
-		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
+	if !a.charge(w, r, a.validation, requestID) {
 		return
 	}
 	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
@@ -121,7 +144,7 @@ func (a *api) validate(w http.ResponseWriter, r *http.Request) {
 	a.writeClaims(w, http.StatusOK, requestID, model.CodeOK, &state)
 }
 
-func (a *api) decodeRequest(w http.ResponseWriter, r *http.Request, destination any) error {
+func (a *api) decodeRequest(w http.ResponseWriter, r *http.Request, destination any, allowedFields map[string]struct{}) error {
 	mediaType, parameters, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" || (len(parameters) != 0 && !(len(parameters) == 1 && strings.EqualFold(parameters["charset"], "utf-8"))) {
 		return errors.New("invalid content type")
@@ -133,7 +156,7 @@ func (a *api) decodeRequest(w http.ResponseWriter, r *http.Request, destination 
 	if err != nil {
 		return errors.New("request body too large or unreadable")
 	}
-	if err := rejectDuplicateTopLevelFields(body); err != nil {
+	if err := rejectDuplicateTopLevelFields(body, allowedFields); err != nil {
 		return err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -148,7 +171,7 @@ func (a *api) decodeRequest(w http.ResponseWriter, r *http.Request, destination 
 	return nil
 }
 
-func rejectDuplicateTopLevelFields(body []byte) error {
+func rejectDuplicateTopLevelFields(body []byte, allowedFields map[string]struct{}) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	token, err := decoder.Token()
 	if err != nil {
@@ -170,6 +193,9 @@ func rejectDuplicateTopLevelFields(body []byte) error {
 		}
 		if _, duplicate := seen[name]; duplicate {
 			return errors.New("duplicate request JSON field")
+		}
+		if _, allowed := allowedFields[name]; !allowed {
+			return errors.New("unknown request JSON field")
 		}
 		seen[name] = struct{}{}
 		var value json.RawMessage
@@ -197,11 +223,9 @@ func validPublicFields(requestID, card, softwareID, machineHash string, timestam
 	if len(nonce) != nonceLength || !noncePattern.MatchString(nonce) || timestamp.IsZero() || now.IsZero() {
 		return false
 	}
-	delta := now.UTC().Sub(timestamp.UTC())
-	if delta < 0 {
-		delta = -delta
-	}
-	return delta <= window
+	now = now.UTC()
+	timestamp = timestamp.UTC()
+	return !timestamp.Before(now.Add(-window)) && !timestamp.After(now.Add(window))
 }
 
 func validIdentifier(value string) bool {
@@ -234,6 +258,31 @@ func mapServiceError(err error) (int, model.Code) {
 	default:
 		return http.StatusServiceUnavailable, model.CodeServiceUnavailable
 	}
+}
+
+// charge signs only the first denial for an endpoint/client/window. Later denials
+// use a minimal unsigned 429; clients must treat either form as temporary rate limiting.
+func (a *api) charge(w http.ResponseWriter, r *http.Request, limiter *fixedWindowLimiter, requestID string) bool {
+	allowed, retry, signRejection := limiter.charge(clientKey(r))
+	if allowed {
+		return true
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retry))
+	if signRejection {
+		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
+	} else {
+		a.writeUnsignedCode(w, http.StatusTooManyRequests, model.CodeRateLimited)
+	}
+	return false
+}
+
+func (a *api) writeUnsignedCode(w http.ResponseWriter, status int, code model.Code) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(struct {
+		Code model.Code `json:"code"`
+	}{Code: code})
 }
 
 func (a *api) writeClaims(w http.ResponseWriter, status int, requestID string, code model.Code, state *model.ActivationState) {

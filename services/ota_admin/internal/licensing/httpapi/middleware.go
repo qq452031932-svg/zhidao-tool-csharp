@@ -12,8 +12,9 @@ type RateLimit struct {
 }
 
 type rateEntry struct {
-	windowStart time.Time
-	count       int
+	windowStart  time.Time
+	count        int
+	denialSigned bool
 }
 
 type fixedWindowLimiter struct {
@@ -29,6 +30,11 @@ func newFixedWindowLimiter(limit RateLimit, maxEntries int, clock Clock) *fixedW
 }
 
 func (l *fixedWindowLimiter) allow(key string) (bool, int) {
+	allowed, retry, _ := l.charge(key)
+	return allowed, retry
+}
+
+func (l *fixedWindowLimiter) charge(key string) (bool, int, bool) {
 	now := l.clock.Now().UTC()
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -40,17 +46,20 @@ func (l *fixedWindowLimiter) allow(key string) (bool, int) {
 	entry, exists := l.entries[key]
 	if !exists {
 		if len(l.entries) >= l.maxEntries {
-			return false, retrySeconds(l.oldestReset(now))
+			return false, retrySeconds(l.oldestReset(now)), false
 		}
 		l.entries[key] = rateEntry{windowStart: now, count: 1}
-		return true, 0
+		return true, 0, false
 	}
 	if entry.count >= l.limit.Requests {
-		return false, retrySeconds(entry.windowStart.Add(l.limit.Window).Sub(now))
+		sign := !entry.denialSigned
+		entry.denialSigned = true
+		l.entries[key] = entry
+		return false, retrySeconds(entry.windowStart.Add(l.limit.Window).Sub(now)), sign
 	}
 	entry.count++
 	l.entries[key] = entry
-	return true, 0
+	return true, 0, false
 }
 
 func (l *fixedWindowLimiter) oldestReset(now time.Time) time.Duration {

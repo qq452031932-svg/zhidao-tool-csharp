@@ -3,13 +3,23 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	ProtocolVersion     = 1
-	MaxIdentifierLength = 128
+	ProtocolVersion         = 1
+	MaxIdentifierLength     = 128
+	MaxPackageNameUTF8Bytes = MaxIdentifierLength
 )
+
+func ValidatePackageName(value string) error {
+	if value == "" || strings.TrimSpace(value) != value || !utf8.ValidString(value) || len(value) > MaxPackageNameUTF8Bytes {
+		return fmt.Errorf("package name must be valid UTF-8 within %d bytes", MaxPackageNameUTF8Bytes)
+	}
+	return nil
+}
 
 type Decision string
 

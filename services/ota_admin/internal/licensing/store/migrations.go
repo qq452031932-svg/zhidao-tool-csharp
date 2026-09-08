@@ -30,7 +30,7 @@ BEGIN SELECT RAISE(ABORT, 'software is disabled, not deleted'); END;
 
 CREATE TABLE license_packages (
     id TEXT PRIMARY KEY CHECK (length(id)=36),
-    name TEXT NOT NULL UNIQUE CHECK (length(name)>0),
+    name TEXT NOT NULL UNIQUE CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 128),
     created_at INTEGER NOT NULL
 );
 CREATE TRIGGER license_package_id_immutable BEFORE UPDATE OF id ON license_packages

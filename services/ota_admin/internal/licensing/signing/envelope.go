@@ -66,7 +66,7 @@ func LoadPrivateKey(path string) (*ecdsa.PrivateKey, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maximumPrivateKeyBytes {
 		return nil, errors.New("signing private key file is invalid")
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 && info.Mode().Perm() != 0o640 {
 		return nil, errors.New("signing private key permissions are too broad")
 	}
 	data, err := os.ReadFile(path)

@@ -111,6 +111,58 @@ func TestSoftwareIdentifiersAreUUIDsImmutableAndSoftwareIsToggledNotDeleted(t *t
 	}
 }
 
+func TestPackageNamesUseBoundedUTF8WireLength(t *testing.T) {
+	s := openTestStore(t)
+	software := mustSoftware(t, s, "Package Name Product")
+	exact := strings.Repeat("界", 42) + "ab"
+	if len(exact) != model.MaxPackageNameUTF8Bytes {
+		t.Fatalf("test name bytes = %d", len(exact))
+	}
+	if _, err := s.CreatePackage(context.Background(), exact, []string{software.ID}); err != nil {
+		t.Fatalf("CreatePackage exact boundary: %v", err)
+	}
+	if _, err := s.CreatePackage(context.Background(), exact+"c", []string{software.ID}); err == nil {
+		t.Fatal("CreatePackage accepted an overlong UTF-8 package name")
+	}
+}
+
+func TestOpenRejectsPersistedPackageNameOutsideWireInvariant(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "corrupt-package.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	software, err := s.CreateSoftware(ctx, "Corrupt Package Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := s.CreatePackage(ctx, "valid", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA ignore_check_constraints=ON`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE license_packages SET name=? WHERE id=?`, strings.Repeat("x", model.MaxPackageNameUTF8Bytes+1), pkg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := Open(ctx, path); err == nil {
+		reopened.Close()
+		t.Fatal("Open accepted an existing package name outside the wire invariant")
+	}
+}
+
 func TestPackageMembershipReplacementIsAtomicAndIdentifiersAreImmutable(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
