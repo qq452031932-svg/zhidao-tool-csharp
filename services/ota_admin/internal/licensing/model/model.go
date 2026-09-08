@@ -161,6 +161,7 @@ type ActivationState struct {
 	CardID      string    `json:"card_id"`
 	SoftwareID  string    `json:"software_id"`
 	MachineHash string    `json:"machine_hash"`
+	PackageName string    `json:"package_name"`
 	ActivatedAt time.Time `json:"activated_at"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	LeaseUntil  time.Time `json:"lease_until"`

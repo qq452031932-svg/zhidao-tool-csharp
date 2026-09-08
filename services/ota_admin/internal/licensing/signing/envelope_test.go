@@ -1,0 +1,157 @@
+package signing
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+)
+
+func TestSignClaimsPreservesExactSerializedBytes(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := New("local-key-1", key, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := model.Claims{
+		ProtocolVersion: model.ProtocolVersion,
+		RequestID:       "request-1",
+		ServerTime:      time.Date(2026, 9, 9, 1, 2, 3, 0, time.UTC),
+		Decision:        model.DecisionDeny,
+		Code:            model.CodeLicenseNotFound,
+	}
+
+	envelope, err := signer.Sign(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(`{"protocol_version":1,"request_id":"request-1","server_time":"2026-09-09T01:02:03Z","decision":"deny","code":"license_not_found","card_id":null,"software_id":null,"machine_hash":null,"package_name":null,"expires_at":null,"lease_until":null}`)
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("decoded payload = %s, want byte-exact %s", payload, want)
+	}
+	signature, err := base64.StdEncoding.DecodeString(envelope.Signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(&key.PublicKey, digest[:], signature) {
+		t.Fatal("signature does not verify over decoded payload bytes")
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 3 || fields["key_id"] == nil || fields["payload"] == nil || fields["signature"] == nil {
+		t.Fatalf("outer envelope fields = %s", encoded)
+	}
+}
+
+func TestNewRejectsWrongCurveAndInvalidKeyID(t *testing.T) {
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New("key", p384, rand.Reader); err == nil {
+		t.Fatal("New accepted a non-P-256 key")
+	}
+	p256, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New("", p256, rand.Reader); err == nil {
+		t.Fatal("New accepted an empty key ID")
+	}
+}
+
+func TestLoadPrivateKeyAcceptsOnlySingleP256ECPEM(t *testing.T) {
+	p256, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(p256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validPath := writePEM(t, "valid.pem", &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}, 0o600)
+	loaded, err := LoadPrivateKey(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Curve != elliptic.P256() {
+		t.Fatal("loaded key curve is not P-256")
+	}
+
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p384DER, _ := x509.MarshalECPrivateKey(p384)
+	wrongCurve := writePEM(t, "p384.pem", &pem.Block{Type: "EC PRIVATE KEY", Bytes: p384DER}, 0o600)
+	if _, err := LoadPrivateKey(wrongCurve); err == nil {
+		t.Fatal("LoadPrivateKey accepted P-384")
+	}
+
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(p256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongFormat := writePEM(t, "pkcs8.pem", &pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}, 0o600)
+	if _, err := LoadPrivateKey(wrongFormat); err == nil {
+		t.Fatal("LoadPrivateKey accepted PKCS#8 instead of EC PRIVATE KEY")
+	}
+
+	trailing := filepath.Join(t.TempDir(), "trailing.pem")
+	if err := os.WriteFile(trailing, append(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), []byte("not-whitespace")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPrivateKey(trailing); err == nil {
+		t.Fatal("LoadPrivateKey accepted trailing non-whitespace data")
+	}
+}
+
+func TestLoadPrivateKeyRejectsBroadUnixPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs are not represented by Unix mode bits")
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalECPrivateKey(key)
+	path := writePEM(t, "broad.pem", &pem.Block{Type: "EC PRIVATE KEY", Bytes: der}, 0o644)
+	if _, err := LoadPrivateKey(path); err == nil {
+		t.Fatal("LoadPrivateKey accepted group/world-readable key")
+	}
+}
+
+func writePEM(t *testing.T, name string, block *pem.Block, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

@@ -559,6 +559,29 @@ func TestReplayNonceDoesNotExpireEarlyAtSubsecondBoundary(t *testing.T) {
 	}
 }
 
+func TestClaimReplayNoncePrunesExpiredEntries(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 5, 0, 0, 0, time.UTC)
+	for index := 0; index < 20; index++ {
+		claimed, err := s.ClaimReplayNonce(ctx, fmt.Sprintf("expired-%d", index), now.Add(time.Second), now)
+		if err != nil || !claimed {
+			t.Fatalf("seed nonce %d: claimed=%v err=%v", index, claimed, err)
+		}
+	}
+	claimed, err := s.ClaimReplayNonce(ctx, "current", now.Add(2*time.Minute), now.Add(2*time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("claim current: claimed=%v err=%v", claimed, err)
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_replay_nonces`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("replay nonce rows = %d, want only current row", count)
+	}
+}
+
 func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

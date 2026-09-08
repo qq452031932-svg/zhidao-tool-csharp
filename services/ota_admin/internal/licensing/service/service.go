@@ -39,6 +39,7 @@ type Store interface {
 	GenerateCards(context.Context, model.GenerateCardsRequest, []model.SealedCard) ([]model.Card, error)
 	FindCardByDigest(context.Context, string) (model.Card, error)
 	GetSoftwareAuthorization(context.Context, string, string) (model.Software, bool, error)
+	GetPackageName(context.Context, string) (string, error)
 	Activate(context.Context, model.ActivationMutation) (model.ActivationState, error)
 	ValidateAndRecordLease(context.Context, model.Lease) (model.ActivationState, error)
 	RenewCard(context.Context, string, int, time.Time) error
@@ -158,6 +159,10 @@ func (s *Service) Activate(ctx context.Context, requestID, cardText, softwareID,
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
 	}
+	state.PackageName, err = s.store.GetPackageName(ctx, card.PackageID)
+	if err != nil {
+		return model.ActivationState{}, classifyStoreError(err)
+	}
 	return state, nil
 }
 
@@ -184,6 +189,10 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 		leaseUntil = *card.ExpiresAt
 	}
 	state, err := s.store.ValidateAndRecordLease(ctx, model.Lease{CardID: card.ID, SoftwareID: softwareID, MachineHash: machineHash, LastSeenAt: now, LeaseUntil: leaseUntil})
+	if err != nil {
+		return model.ActivationState{}, classifyStoreError(err)
+	}
+	state.PackageName, err = s.store.GetPackageName(ctx, card.PackageID)
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
 	}

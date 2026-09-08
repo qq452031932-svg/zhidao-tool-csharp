@@ -135,6 +135,17 @@ func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []st
 	return pkg, nil
 }
 
+func (s *Store) GetPackageName(ctx context.Context, id string) (string, error) {
+	var name string
+	if err := s.db.QueryRowContext(ctx, `SELECT name FROM license_packages WHERE id=?`, id).Scan(&name); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("read package name: %w", err)
+	}
+	return name, nil
+}
+
 func (s *Store) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {
 	ids, err := normalizedIDs(softwareIDs)
 	if err != nil {
@@ -454,12 +465,23 @@ func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, n
 	if nonce == "" || !expiresAt.After(now) {
 		return false, errors.New("invalid replay nonce or expiry")
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO UPDATE SET expires_at=excluded.expires_at WHERE license_replay_nonces.expires_at<=?`, nonce, ceilUnixSecond(expiresAt), unixTime(now))
+	claimed := false
+	err := s.immediate(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM license_replay_nonces WHERE expires_at<=?`, unixTime(now)); err != nil {
+			return err
+		}
+		result, err := conn.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO NOTHING`, nonce, ceilUnixSecond(expiresAt))
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		claimed = affected == 1
+		return err
+	})
 	if err != nil {
 		return false, fmt.Errorf("claim replay nonce: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	return affected == 1, err
+	return claimed, nil
 }
 
 // RecordLease persists a service-side lease. To avoid making every validation

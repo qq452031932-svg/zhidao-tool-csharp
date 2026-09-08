@@ -202,6 +202,28 @@ func TestFirstUseStartsAtServerClockAndReusesLifetimeOnSameMachine(t *testing.T)
 	}
 }
 
+func TestActivationAndValidationReturnPackageNameForSignedClaims(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Claims Product")
+	pkg := h.packageWith(software)
+	card := h.generate(pkg.ID, 30)
+
+	activated, err := h.svc.Activate(h.ctx, "claims-activation", card.Plaintext, software.ID, "machine-claims")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated.PackageName != pkg.Name {
+		t.Fatalf("activation package name = %q, want %q", activated.PackageName, pkg.Name)
+	}
+	validated, err := h.svc.Validate(h.ctx, card.Plaintext, software.ID, "machine-claims")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validated.PackageName != pkg.Name {
+		t.Fatalf("validation package name = %q, want %q", validated.PackageName, pkg.Name)
+	}
+}
+
 func TestReactivationClampsLeaseAndRecordsCurrentObservationTime(t *testing.T) {
 	h := newHarness(t)
 	softwareA := h.software("Lease Clamp A")

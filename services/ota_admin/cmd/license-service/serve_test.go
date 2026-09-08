@@ -1,0 +1,223 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"go/parser"
+	"go/token"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	licenseconfig "fanfh.cn/superpan/ota-admin/internal/licensing/config"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+)
+
+func TestRunRequiresExplicitStrictConfigWithoutLeakingPath(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(nil, &stdout, &stderr); code != 2 {
+		t.Fatalf("run without arguments = %d, want 2", code)
+	}
+	secretPath := filepath.Join(t.TempDir(), "private-config-name.json")
+	stderr.Reset()
+	if code := run([]string{"serve", "--config", secretPath}, &stdout, &stderr); code != 1 {
+		t.Fatalf("run invalid config = %d, want 1", code)
+	}
+	if strings.Contains(stderr.String(), secretPath) || strings.Contains(stderr.String(), "private-config-name") {
+		t.Fatalf("stderr leaked config path: %s", stderr.String())
+	}
+}
+
+func TestServeBindsLoopbackServesSignedAPIAndShutsDown(t *testing.T) {
+	cfg := writeRuntimeConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr lockedBuffer
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, cfg, &stdout, &stderr) }()
+
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	baseURL := "http://" + cfg.ListenAddress
+	var response *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		body := strings.NewReader(`{"protocol_version":1,"activation_request_id":"serve-request","card":"AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA","software_id":"software","machine_hash":"machine","timestamp":"` + time.Now().UTC().Format(time.RFC3339) + `","nonce":"nonce_00000000000000000000000001"}`)
+		request, err := http.NewRequest(http.MethodPost, baseURL+"/license-api/v1/activate", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err = client.Do(request)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if response == nil {
+		cancel()
+		t.Fatalf("server did not start; stderr=%s", stderr.String())
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("activation status = %d, want 403", response.StatusCode)
+	}
+	var envelope model.SignedEnvelope
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := envelope.Validate(); err != nil {
+		t.Fatalf("invalid signed envelope: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not shut down promptly")
+	}
+	if !strings.Contains(stdout.String(), "loopback") {
+		t.Fatalf("startup output = %q", stdout.String())
+	}
+	assertNoRuntimeSecrets(t, stdout.String()+stderr.String(), cfg)
+}
+
+func TestServeRejectsNonLoopbackBeforeOpeningState(t *testing.T) {
+	cfg := writeRuntimeConfig(t)
+	cfg.ListenAddress = "0.0.0.0:18092"
+	if err := serve(context.Background(), cfg, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("serve accepted a non-loopback listener")
+	}
+	if _, err := os.Stat(cfg.LicenseDatabasePath); !os.IsNotExist(err) {
+		t.Fatalf("database was opened before config rejection: %v", err)
+	}
+}
+
+func TestLicenseServiceImportBoundary(t *testing.T) {
+	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbidden := []string{
+		"fanfh.cn/superpan/ota-admin/internal/candidate",
+		"fanfh.cn/superpan/ota-admin/internal/deploy",
+		"fanfh.cn/superpan/ota-admin/internal/publisher",
+		"fanfh.cn/superpan/ota-admin/internal/release",
+		"fanfh.cn/superpan/ota-admin/internal/upload",
+		"fanfh.cn/superpan/ota-admin/internal/operation",
+		"fanfh.cn/superpan/ota-admin/internal/session",
+		"fanfh.cn/superpan/ota-admin/internal/store",
+	}
+	roots := []string{filepath.Join(moduleRoot, "cmd", "license-service"), filepath.Join(moduleRoot, "internal", "licensing")}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+			if err != nil {
+				return err
+			}
+			for _, imported := range file.Imports {
+				value, err := strconv.Unquote(imported.Path.Value)
+				if err != nil {
+					return err
+				}
+				for _, denied := range forbidden {
+					if value == denied || strings.HasPrefix(value, denied+"/") {
+						t.Errorf("%s imports forbidden OTA package %s", path, value)
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(data)
+}
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func writeRuntimeConfig(t *testing.T) licenseconfig.Config {
+	t.Helper()
+	dir := t.TempDir()
+	address := unusedLoopbackAddress(t)
+	cfg := licenseconfig.Config{
+		ListenAddress: address, LicenseDatabasePath: filepath.Join(dir, "license.db"),
+		EncryptionKeyPath: filepath.Join(dir, "encryption.key"), LookupHMACKeyPath: filepath.Join(dir, "hmac.key"),
+		SigningPrivateKeyPath: filepath.Join(dir, "signing.pem"), InternalSecretPath: filepath.Join(dir, "internal.key"),
+		SigningKeyID: "serve-key", PublicAPIBasePath: "/license-api/v1",
+		Limits: licenseconfig.Limits{MaxBodyBytes: 8192, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, ActivationRequests: 20, ValidationRequests: 60, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 2, ReadTimeoutSeconds: 5, WriteTimeoutSeconds: 5, IdleTimeoutSeconds: 10, ShutdownTimeoutSeconds: 2},
+	}
+	for index, path := range []string{cfg.EncryptionKeyPath, cfg.LookupHMACKeyPath, cfg.InternalSecretPath} {
+		if err := os.WriteFile(path, bytes.Repeat([]byte{byte(0x41 + index)}, 32), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.SigningPrivateKeyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func unusedLoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func assertNoRuntimeSecrets(t *testing.T, output string, cfg licenseconfig.Config) {
+	t.Helper()
+	for _, secret := range []string{cfg.LicenseDatabasePath, cfg.EncryptionKeyPath, cfg.LookupHMACKeyPath, cfg.SigningPrivateKeyPath, cfg.InternalSecretPath, strings.Repeat("A", 32)} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("runtime output leaked %q: %s", secret, output)
+		}
+	}
+}
