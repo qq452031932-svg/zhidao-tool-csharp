@@ -145,6 +145,26 @@ func TestAllowedClaimsRequireSuccessOnlyFields(t *testing.T) {
 	}
 }
 
+func TestAllowedClaimsRequireRequestID(t *testing.T) {
+	claims := validClaims()
+	claims.RequestID = ""
+
+	if err := claims.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want missing request_id rejection")
+	}
+}
+
+func TestDenialClaimsRequireRequestID(t *testing.T) {
+	claims := validClaims()
+	claims.Decision = DecisionDeny
+	claims.Code = CodeLicenseNotFound
+	claims.RequestID = ""
+
+	if err := claims.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want missing request_id rejection")
+	}
+}
+
 func TestClaimsRejectOverlongIdentifiers(t *testing.T) {
 	claims := validClaims()
 	claims.RequestID = strings.Repeat("r", MaxIdentifierLength+1)

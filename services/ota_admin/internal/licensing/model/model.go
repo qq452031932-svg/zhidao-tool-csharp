@@ -80,7 +80,10 @@ func (c Claims) Validate() error {
 		{name: "machine_hash", value: c.MachineHash},
 		{name: "package_name", value: c.PackageName},
 	}
-	for _, identifier := range identifiers {
+	if err := validateIdentifier(identifiers[0].name, identifiers[0].value); err != nil {
+		return err
+	}
+	for _, identifier := range identifiers[1:] {
 		if err := validateOptionalIdentifier(identifier.name, identifier.value); err != nil {
 			return err
 		}
