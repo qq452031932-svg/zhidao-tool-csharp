@@ -82,6 +82,18 @@ func TestSoftwareIdentifiersAreUUIDsImmutableAndSoftwareIsToggledNotDeleted(t *t
 	if enabled {
 		t.Fatal("software remains enabled")
 	}
+	if err := s.SetSoftwareEnabled(ctx, software.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT enabled FROM license_software WHERE id=?`, software.ID).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Fatal("software remains disabled after re-enable")
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM license_software WHERE id=?`, software.ID); err == nil {
+		t.Fatal("direct software deletion succeeded, want deletion rejected")
+	}
 	if _, err := s.db.ExecContext(ctx, `UPDATE license_software SET id=? WHERE id=?`, uuid.NewString(), software.ID); err == nil {
 		t.Fatal("software identifier update succeeded, want immutable identifier")
 	}
@@ -317,6 +329,20 @@ func TestRenewCardExtendsActivatedFromMaxAndAccumulatesUnactivatedDays(t *testin
 	want := now.Add(30 * 24 * time.Hour)
 	if activeSummary.ExpiresAt == nil || !activeSummary.ExpiresAt.Equal(want) {
 		t.Fatalf("active expiry = %v, want %v", activeSummary.ExpiresAt, want)
+	}
+
+	futureActive := mustCard(t, s, pkg.ID, 30, nil)
+	futureExpiry := now.Add(10 * 24 * time.Hour)
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: futureActive.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("d", 64), ActivatedAt: now.Add(-20 * 24 * time.Hour), ExpiresAt: futureExpiry, LeaseUntil: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RenewCard(ctx, futureActive.ID, 90, now); err != nil {
+		t.Fatal(err)
+	}
+	futureSummary := mustSearchOne(t, s, model.CardFilter{FullDigest: futureActive.FullDigest})
+	wantFuture := futureExpiry.Add(90 * 24 * time.Hour)
+	if futureSummary.ExpiresAt == nil || !futureSummary.ExpiresAt.Equal(wantFuture) {
+		t.Fatalf("future active expiry = %v, want %v", futureSummary.ExpiresAt, wantFuture)
 	}
 }
 
