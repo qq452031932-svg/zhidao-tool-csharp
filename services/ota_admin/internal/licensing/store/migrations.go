@@ -130,6 +130,7 @@ UPDATE license_schema_version SET version=2 WHERE singleton_id=1;
 const licenseSchemaV3 = `
 ALTER TABLE license_admin_idempotency ADD COLUMN replay_key_id TEXT NOT NULL DEFAULT 'legacy-v2';
 ALTER TABLE license_cards ADD COLUMN encryption_key_id TEXT NOT NULL DEFAULT 'legacy-v2';
+DELETE FROM license_admin_idempotency;
 CREATE TABLE license_admin_idempotency_cards (
     idempotency_key TEXT NOT NULL REFERENCES license_admin_idempotency(key) ON DELETE CASCADE,
     card_id TEXT NOT NULL,

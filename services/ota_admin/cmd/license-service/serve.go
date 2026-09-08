@@ -75,17 +75,11 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	for index, path := range cfg.PreviousEncryptionKeyPaths {
 		previousEncryptionKeys[index], err = licenseconfig.ReadSecret32(path)
 		if err != nil {
-			for _, key := range previousEncryptionKeys {
-				clear(key)
-			}
+			clearPreviousEncryptionKeys(previousEncryptionKeys)
 			return errors.New("load previous card encryption key")
 		}
 	}
-	defer func() {
-		for _, key := range previousEncryptionKeys {
-			clear(key)
-		}
-	}()
+	defer clearPreviousEncryptionKeys(previousEncryptionKeys)
 	lookupKey, err := licenseconfig.ReadSecret32(cfg.LookupHMACKeyPath)
 	if err != nil {
 		return errors.New("load card lookup key")
@@ -122,6 +116,7 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	clock := systemClock{}
 	licenses, err := service.NewWithPreviousEncryptionKeys(database, clock, rand.Reader, encryptionKey, previousEncryptionKeys, lookupKey)
 	clear(encryptionKey)
+	clearPreviousEncryptionKeys(previousEncryptionKeys)
 	clear(lookupKey)
 	if err != nil {
 		return errors.New("initialize license service")
@@ -177,6 +172,12 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		return errors.New("license HTTP server stopped")
 	}
 	return nil
+}
+
+func clearPreviousEncryptionKeys(keys [][]byte) {
+	for _, key := range keys {
+		clear(key)
+	}
 }
 
 func writeUsage(writer io.Writer) {

@@ -646,14 +646,12 @@ func (s *Store) PackageRemovalImpact(ctx context.Context, id string, replacement
 	if err != nil {
 		return 0, err
 	}
-	for _, softwareID := range ids {
-		var exists int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software WHERE id=?`, softwareID).Scan(&exists); err != nil {
-			return 0, err
-		}
-		if exists == 0 {
-			return 0, ErrNotFound
-		}
+	existing, err := s.countExistingSoftwareIDs(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	if existing != len(ids) {
+		return 0, ErrNotFound
 	}
 	kept := make(map[string]struct{}, len(ids))
 	for _, value := range ids {
@@ -672,6 +670,22 @@ func (s *Store) PackageRemovalImpact(ctx context.Context, id string, replacement
 	var count int
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_cards WHERE package_id=? AND activated_at IS NOT NULL AND expires_at>?`, id, unixTime(now)).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count package impact: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) countExistingSoftwareIDs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for index, id := range ids {
+		args[index] = id
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software WHERE id IN (`+placeholders+`)`, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count candidate software: %w", err)
 	}
 	return count, nil
 }
@@ -1149,6 +1163,13 @@ func adminCardWhere(filter model.AdminCardFilter, now time.Time) (string, []any)
 	}
 	if filter.PackageID != "" {
 		add("c.package_id=?", filter.PackageID)
+	}
+	if filter.CardType != "" {
+		if days, ok := model.DurationDaysForCardType(filter.CardType); ok {
+			add("c.base_days=?", days)
+		} else {
+			clauses = append(clauses, "0=1")
+		}
 	}
 	switch filter.State {
 	case model.CardStateUnactivated:

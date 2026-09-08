@@ -376,8 +376,10 @@ func validAdminCardFilter(filter model.AdminCardFilter) bool {
 	if (filter.Prefix8 != "" && len(filter.Prefix8) != 8) || (filter.Last4 != "" && len(filter.Last4) != 4) || len(filter.NoteContains) > MaxNoteUTF8Bytes || (filter.PackageID != "" && !validUUID(filter.PackageID)) || !utf8.ValidString(filter.NoteContains) {
 		return false
 	}
-	if filter.CardType != "" && filter.CardType != "duration" {
-		return false
+	if filter.CardType != "" {
+		if _, ok := model.DurationDaysForCardType(filter.CardType); !ok {
+			return false
+		}
 	}
 	switch filter.State {
 	case "", model.CardStateUnactivated, model.CardStateEffective, model.CardStateExpired:
@@ -388,6 +390,10 @@ func validAdminCardFilter(filter model.AdminCardFilter) bool {
 }
 
 func adminCardSummary(record model.AdminCardRecord, now time.Time) model.AdminCardSummary {
+	cardType, ok := model.CardTypeForDurationDays(record.BaseDays)
+	if !ok {
+		cardType = "unknown"
+	}
 	state := model.CardStateUnactivated
 	if record.ActivatedAt != nil {
 		state = model.CardStateEffective
@@ -400,7 +406,7 @@ func adminCardSummary(record model.AdminCardRecord, now time.Time) model.AdminCa
 		value := shortOpaque("machine:" + *record.MachineHash)
 		binding = &value
 	}
-	return model.AdminCardSummary{ID: record.ID, PackageID: record.PackageID, PackageName: record.PackageName, Prefix8: record.Prefix8, Last4: record.Last4, CardType: "duration", DurationDays: record.BaseDays, State: state, ActivatedAt: record.ActivatedAt, ExpiresAt: record.ExpiresAt, BindingShortID: binding, Note: cloneString(record.Note), CreatedAt: record.CreatedAt}
+	return model.AdminCardSummary{ID: record.ID, PackageID: record.PackageID, PackageName: record.PackageName, Prefix8: record.Prefix8, Last4: record.Last4, CardType: cardType, DurationDays: record.BaseDays, State: state, ActivatedAt: record.ActivatedAt, ExpiresAt: record.ExpiresAt, BindingShortID: binding, Note: cloneString(record.Note), CreatedAt: record.CreatedAt}
 }
 
 func shortOpaque(value string) string {

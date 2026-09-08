@@ -107,6 +107,18 @@ func TestServeRejectsNonLoopbackBeforeOpeningState(t *testing.T) {
 	}
 }
 
+func TestClearPreviousEncryptionKeysZeroesEveryOriginalByte(t *testing.T) {
+	keys := [][]byte{bytes.Repeat([]byte{0x51}, 32), bytes.Repeat([]byte{0xa7}, 32)}
+	clearPreviousEncryptionKeys(keys)
+	for keyIndex, key := range keys {
+		for byteIndex, value := range key {
+			if value != 0 {
+				t.Fatalf("key %d byte %d was not cleared: %x", keyIndex, byteIndex, value)
+			}
+		}
+	}
+}
+
 func TestLicenseServiceImportBoundary(t *testing.T) {
 	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {

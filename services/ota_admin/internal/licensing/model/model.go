@@ -184,6 +184,43 @@ type AdminCardFilter struct {
 	State        CardState
 }
 
+const (
+	CardTypeMonth    = "month"
+	CardTypeQuarter  = "quarter"
+	CardTypeHalfYear = "half_year"
+	CardTypeYear     = "year"
+)
+
+func DurationDaysForCardType(cardType string) (int, bool) {
+	switch cardType {
+	case CardTypeMonth:
+		return 30, true
+	case CardTypeQuarter:
+		return 90, true
+	case CardTypeHalfYear:
+		return 180, true
+	case CardTypeYear:
+		return 365, true
+	default:
+		return 0, false
+	}
+}
+
+func CardTypeForDurationDays(days int) (string, bool) {
+	switch days {
+	case 30:
+		return CardTypeMonth, true
+	case 90:
+		return CardTypeQuarter, true
+	case 180:
+		return CardTypeHalfYear, true
+	case 365:
+		return CardTypeYear, true
+	default:
+		return "", false
+	}
+}
+
 type AdminCardRecord struct {
 	ID                   string     `json:"id"`
 	PackageID            string     `json:"package_id"`

@@ -145,6 +145,56 @@ func TestAdminSchemaMigratesV1AndIdempotencyIsPersistentBoundedAndPruned(t *test
 	}
 }
 
+func TestV2MigrationDropsLegacyAdminReplaysBeforeCardDeletion(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "license-v2.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, licenseSchemaV1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, licenseSchemaV2); err != nil {
+		t.Fatal(err)
+	}
+	softwareID, packageID, cardID, replayKey := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	if _, err := raw.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,1)`, softwareID, "Legacy Product"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO license_packages(id,name,created_at) VALUES(?,?,1)`, packageID, "Legacy Package"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO license_package_members(package_id,software_id) VALUES(?,?)`, packageID, softwareID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,created_at) VALUES(?,?,?,?,?,?,30,30,1)`, cardID, packageID, []byte("legacy-ciphertext"), strings.Repeat("a", 64), "ABCDEFGH", "WXYZ"); err != nil {
+		t.Fatal(err)
+	}
+	legacyPlaintext := []byte(`{"plaintext":"LEGACY-COMPLETE-CARD"}`)
+	if _, err := raw.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,200,?,'application/json','',9999999999,1)`, replayKey, strings.Repeat("b", 64), legacyPlaintext); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if replay, found, err := s.GetAdminIdempotency(ctx, replayKey, time.Unix(2, 0).UTC()); err != nil || found {
+		t.Fatalf("legacy replay survived v2 migration: found=%v replay=%+v err=%v", found, replay, err)
+	}
+	if err := s.DeleteCard(ctx, cardID); err != nil {
+		t.Fatal(err)
+	}
+	if replay, found, err := s.GetAdminIdempotency(ctx, replayKey, time.Unix(2, 0).UTC()); err != nil || found {
+		t.Fatalf("deleted card plaintext remained replayable: found=%v replay=%+v err=%v", found, replay, err)
+	}
+}
+
 func TestAdminMutationRollsBackWhenIdempotencyCompletionFails(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -315,6 +365,21 @@ func TestPackageMembershipReplacementIsAtomicAndIdentifiersAreImmutable(t *testi
 	assertStrings(t, packageMembers(t, s, pkg.ID), []string{b.ID, c.ID})
 	if _, err := s.db.ExecContext(ctx, `UPDATE license_packages SET id=? WHERE id=?`, uuid.NewString(), pkg.ID); err == nil {
 		t.Fatal("package identifier update succeeded")
+	}
+}
+
+func TestCountExistingSoftwareIDsReturnsOneAggregateForCandidateSet(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	one := mustSoftware(t, s, "Impact Aggregate One")
+	two := mustSoftware(t, s, "Impact Aggregate Two")
+	count, err := s.countExistingSoftwareIDs(ctx, []string{one.ID, two.ID, uuid.NewString()})
+	if err != nil || count != 2 {
+		t.Fatalf("existing count=%d err=%v, want 2", count, err)
+	}
+	count, err = s.countExistingSoftwareIDs(ctx, nil)
+	if err != nil || count != 0 {
+		t.Fatalf("empty count=%d err=%v, want 0", count, err)
 	}
 }
 

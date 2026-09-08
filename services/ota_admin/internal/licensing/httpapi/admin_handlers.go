@@ -103,6 +103,9 @@ func (a *api) authorizeInternal(next http.Handler) http.Handler {
 				status := http.StatusNotFound
 				if probe.status == http.StatusMethodNotAllowed {
 					status = http.StatusMethodNotAllowed
+					if allow := probe.header.Get("Allow"); allow != "" {
+						w.Header().Set("Allow", allow)
+					}
 				}
 				a.writeAdminError(w, status, map[bool]string{true: "method_not_allowed", false: "not_found"}[status == http.StatusMethodNotAllowed])
 				return

@@ -453,7 +453,7 @@ func TestAdminCardGenerateSearchFiltersAndNormalRedaction(t *testing.T) {
 	last4 := strings.ReplaceAll(plaintext, "-", "")[28:]
 	queries := []string{
 		"prefix8=" + prefix, "last4=" + last4, "note_contains=Needle", "package_id=" + pkg,
-		"card_type=duration", "state=unactivated", "complete_card=" + url.QueryEscape(plaintext),
+		"card_type=month", "state=unactivated", "complete_card=" + url.QueryEscape(plaintext),
 	}
 	for _, query := range queries {
 		response := h.request(http.MethodGet, "/internal/v1/cards?page=1&page_size=20&"+query, "", false)
@@ -466,6 +466,55 @@ func TestAdminCardGenerateSearchFiltersAndNormalRedaction(t *testing.T) {
 		response := h.request(http.MethodGet, "/internal/v1/cards?page=1&page_size=20&"+query, "", false)
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("partial exact filter %s status=%d body=%s", query, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestAdminCardTypeFiltersAndSummariesMapSupportedDurations(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	software, err := h.store.CreateSoftware(context.Background(), "Card Type Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := h.store.CreatePackage(context.Background(), "Card Type Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wants := []struct {
+		days     int
+		cardType string
+	}{
+		{days: 30, cardType: "month"},
+		{days: 90, cardType: "quarter"},
+		{days: 180, cardType: "half_year"},
+		{days: 365, cardType: "year"},
+	}
+	for _, want := range wants {
+		if _, err := h.service.GenerateCards(context.Background(), pkg.ID, want.days, 1, nil, nil); err != nil {
+			t.Fatalf("generate %d day card: %v", want.days, err)
+		}
+	}
+	for _, want := range wants {
+		t.Run(want.cardType, func(t *testing.T) {
+			response := h.request(http.MethodGet, "/internal/v1/cards?card_type="+want.cardType, "", false)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var page struct {
+				Items []model.AdminCardSummary `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Items) != 1 || page.Items[0].CardType != want.cardType || page.Items[0].DurationDays != want.days {
+				t.Fatalf("items=%+v, want one %s/%d card", page.Items, want.cardType, want.days)
+			}
+		})
+	}
+	for _, cardType := range []string{"duration", "MONTH", "monthly", "30"} {
+		invalid := h.request(http.MethodGet, "/internal/v1/cards?card_type="+cardType, "", false)
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("invalid card type %q status=%d body=%s", cardType, invalid.Code, invalid.Body.String())
 		}
 	}
 }
@@ -683,14 +732,14 @@ func TestAdminStrictHeadersJSONAndUnknownRoutes(t *testing.T) {
 func TestAdminMalformedPathsAndMethodMismatchNeverRedirectOrReturnPlainText(t *testing.T) {
 	h := newAdminHarness(t, 100)
 	tests := []struct {
-		name, method, path, authorization, remote string
-		want                                      int
+		name, method, path, authorization, remote, wantAllow string
+		want                                                 int
 	}{
 		{name: "nonloopback traversal hidden", method: http.MethodGet, path: "/internal/v1/../software", authorization: adminBearer, remote: "198.51.100.8:1", want: http.StatusNotFound},
 		{name: "bad auth repeated slash", method: http.MethodGet, path: "/internal//v1/software", authorization: "Bearer wrong", remote: "127.0.0.1:1", want: http.StatusUnauthorized},
 		{name: "authorized traversal", method: http.MethodGet, path: "/internal/v1/../software", authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusNotFound},
 		{name: "authorized repeated slash", method: http.MethodGet, path: "/internal//v1/software", authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusNotFound},
-		{name: "method mismatch", method: http.MethodDelete, path: "/internal/v1/packages/" + uuid.NewString(), authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusMethodNotAllowed},
+		{name: "method mismatch", method: http.MethodDelete, path: "/internal/v1/packages/" + uuid.NewString(), authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusMethodNotAllowed, wantAllow: http.MethodPatch},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -701,6 +750,9 @@ func TestAdminMalformedPathsAndMethodMismatchNeverRedirectOrReturnPlainText(t *t
 			h.handler.ServeHTTP(w, r)
 			if w.Code != tt.want || w.Header().Get("Location") != "" || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
 				t.Fatalf("status=%d want=%d location=%q type=%q cache=%q body=%q", w.Code, tt.want, w.Header().Get("Location"), w.Header().Get("Content-Type"), w.Header().Get("Cache-Control"), w.Body.String())
+			}
+			if got := w.Header().Get("Allow"); got != tt.wantAllow {
+				t.Fatalf("Allow=%q want=%q", got, tt.wantAllow)
 			}
 		})
 	}
