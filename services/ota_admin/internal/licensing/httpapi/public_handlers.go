@@ -49,33 +49,25 @@ type validateRequest struct {
 }
 
 func (a *api) activate(w http.ResponseWriter, r *http.Request) {
+	if !a.allowRequest(w, r, a.activation) {
+		return
+	}
 	if headerBytes(r.Header) > a.options.MaxHeaderBytes {
-		if a.charge(w, r, a.activation, fallbackRequestID) {
-			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	var request activateRequest
 	if err := a.decodeRequest(w, r, &request, activateRequestFields); err != nil {
-		if a.charge(w, r, a.activation, fallbackRequestID) {
-			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	requestID := validRequestID(request.ActivationRequestID)
 	if request.ProtocolVersion != model.ProtocolVersion {
-		if a.charge(w, r, a.activation, requestID) {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
 		return
 	}
 	if !validPublicFields(request.ActivationRequestID, request.Card, request.SoftwareID, request.MachineHash, request.Timestamp, request.Nonce, a.options.Clock.Now(), a.options.TimestampWindow) {
-		if a.charge(w, r, a.activation, requestID) {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
-		}
-		return
-	}
-	if !a.charge(w, r, a.activation, requestID) {
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
@@ -97,33 +89,25 @@ func (a *api) activate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) validate(w http.ResponseWriter, r *http.Request) {
+	if !a.allowRequest(w, r, a.validation) {
+		return
+	}
 	if headerBytes(r.Header) > a.options.MaxHeaderBytes {
-		if a.charge(w, r, a.validation, fallbackRequestID) {
-			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	var request validateRequest
 	if err := a.decodeRequest(w, r, &request, validateRequestFields); err != nil {
-		if a.charge(w, r, a.validation, fallbackRequestID) {
-			a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, fallbackRequestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	requestID := validRequestID(request.RequestID)
 	if request.ProtocolVersion != model.ProtocolVersion {
-		if a.charge(w, r, a.validation, requestID) {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
-		}
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeUnsupportedProtocol, nil)
 		return
 	}
 	if !validPublicFields(request.RequestID, request.Card, request.SoftwareID, request.MachineHash, request.Timestamp, request.Nonce, a.options.Clock.Now(), a.options.TimestampWindow) {
-		if a.charge(w, r, a.validation, requestID) {
-			a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
-		}
-		return
-	}
-	if !a.charge(w, r, a.validation, requestID) {
+		a.writeClaims(w, http.StatusBadRequest, requestID, model.CodeInvalidRequest, nil)
 		return
 	}
 	claimed, err := a.options.ReplayStore.ClaimReplayNonce(r.Context(), request.Nonce, a.options.Clock.Now().UTC().Add(a.options.NonceLifetime), a.options.Clock.Now().UTC(), a.options.MaxReplayNonces)
@@ -260,19 +244,15 @@ func mapServiceError(err error) (int, model.Code) {
 	}
 }
 
-// charge signs only the first denial for an endpoint/client/window. Later denials
-// use a minimal unsigned 429; clients must treat either form as temporary rate limiting.
-func (a *api) charge(w http.ResponseWriter, r *http.Request, limiter *fixedWindowLimiter, requestID string) bool {
-	allowed, retry, signRejection := limiter.charge(clientKey(r))
+// allowRequest is deliberately the first handler operation: protective 429s do
+// not read request bodies, consume nonces, call the service, or produce signatures.
+func (a *api) allowRequest(w http.ResponseWriter, r *http.Request, limiter *fixedWindowLimiter) bool {
+	allowed, retry := limiter.allow(clientKey(r))
 	if allowed {
 		return true
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(retry))
-	if signRejection {
-		a.writeClaims(w, http.StatusTooManyRequests, requestID, model.CodeRateLimited, nil)
-	} else {
-		a.writeUnsignedCode(w, http.StatusTooManyRequests, model.CodeRateLimited)
-	}
+	a.writeUnsignedCode(w, http.StatusTooManyRequests, model.CodeRateLimited)
 	return false
 }
 

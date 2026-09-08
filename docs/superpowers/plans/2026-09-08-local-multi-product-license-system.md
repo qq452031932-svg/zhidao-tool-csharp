@@ -276,7 +276,7 @@ Serialize the claims once into exact UTF-8 bytes, sign those bytes with ECDSA P-
 
 - [ ] **Step 4: Implement error and cache semantics**
 
-`400/403/409` are signed definitive rejections. `429` includes `Retry-After`; `500/502/503/504` map to `service_unavailable`. Add an import-boundary test using `go list -deps` or AST imports to prove `cmd/license-service` and `internal/licensing/*` do not import OTA candidate, deploy, publisher, release, upload, operation, session, or main store packages. No endpoint exposes stack traces, paths, card plaintext, raw machine values, or key contents.
+`400/403/409` are signed definitive rejections. Per the 2026-09-09 protective-rate-limit amendment, charge the endpoint/IP bucket at handler entry before reading or parsing the body. Every over-limit request returns only an unsigned `429` with `Retry-After`, `Content-Type: application/json`, `Cache-Control: no-store`, and `{"code":"rate_limited"}`; it has no request-ID correlation, signature, replay claim, or service call. Clients branch on HTTP `429` before envelope parsing and may only retain an existing unexpired lease. Signed `200` and definitive `400/403/409` remain authorization decisions and invalid signatures fail closed; `5xx` and transport failures are temporary and never grant authorization without an existing lease. Add an import-boundary test using `go list -deps` or AST imports to prove `cmd/license-service` and `internal/licensing/*` do not import OTA candidate, deploy, publisher, release, upload, operation, session, or main store packages. No endpoint exposes stack traces, paths, card plaintext, raw machine values, or key contents.
 
 - [ ] **Step 5: Run tests and the race detector**
 

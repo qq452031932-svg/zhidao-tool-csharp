@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -228,7 +229,7 @@ func TestRateLimitsHaveSeparateStableBuckets(t *testing.T) {
 		t.Fatalf("first activation = %d", got.Code)
 	}
 	limited := h.do(http.MethodPost, "/license-api/v1/activate", h.activateBody("rate-second", nonce(101)))
-	if limited.Code != 429 || limited.Header().Get("Retry-After") != "60" || decodeClaims(t, limited, &h.key.PublicKey).Code != model.CodeRateLimited {
+	if limited.Code != 429 || limited.Header().Get("Retry-After") != "60" || limited.Body.String() != "{\"code\":\"rate_limited\"}\n" {
 		t.Fatalf("limited = %d retry=%q body=%s", limited.Code, limited.Header().Get("Retry-After"), limited.Body.String())
 	}
 	if got := h.do(http.MethodPost, "/license-api/v1/validate", h.validateBody("rate-validation", nonce(102))); got.Code != 200 {
@@ -299,7 +300,77 @@ func (s *countingSigner) Sign(claims model.Claims) (model.SignedEnvelope, error)
 	return s.inner.Sign(claims)
 }
 
-func TestMalformedTrafficIsChargedBeforeSigningAndSigningStopsAfterFirst429(t *testing.T) {
+type forbiddenReadBody struct {
+	reads atomic.Int64
+}
+
+func (b *forbiddenReadBody) Read([]byte) (int, error) {
+	b.reads.Add(1)
+	return 0, errors.New("rate-limited request body was read")
+}
+
+func (*forbiddenReadBody) Close() error { return nil }
+
+func TestOverLimitRequestsAreUnsignedAndNeverReadBody(t *testing.T) {
+	for _, route := range []string{"activate", "validate"} {
+		t.Run(route, func(t *testing.T) {
+			clock := &testClock{now: time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)}
+			key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			inner, _ := signing.New("entry-limit-key", key, rand.Reader)
+			signer := &countingSigner{inner: inner}
+			svc := &fakeService{}
+			replays := &trackingReplayStore{}
+			handler, err := NewRouter(Options{
+				Service: svc, ReplayStore: replays, Signer: signer, Clock: clock,
+				MaxBodyBytes: 2048, MaxHeaderBytes: 2048, TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 8,
+				ActivationRate: RateLimit{Requests: 1, Window: time.Minute}, ValidationRate: RateLimit{Requests: 1, Window: time.Minute}, MaxLimiterEntries: 8,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requestBody := func(id string, requestNonce string) string {
+				idField := "request_id"
+				if route == "activate" {
+					idField = "activation_request_id"
+				}
+				return fmt.Sprintf(`{"protocol_version":1,%q:%q,"card":"card","software_id":"software","machine_hash":"machine","timestamp":%q,"nonce":%q}`, idField, id, clock.Now().Format(time.RFC3339), requestNonce)
+			}
+			do := func(body io.Reader) *httptest.ResponseRecorder {
+				req := httptest.NewRequest(http.MethodPost, "/license-api/v1/"+route, body)
+				req.Header.Set("Content-Type", "application/json")
+				req.RemoteAddr = "127.0.0.1:44000"
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, req)
+				return recorder
+			}
+			if first := do(strings.NewReader(requestBody("first", nonce(540)))); first.Code != http.StatusOK {
+				t.Fatalf("first status = %d body=%s", first.Code, first.Body.String())
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				body := &forbiddenReadBody{}
+				limited := do(body)
+				if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") != "60" || limited.Header().Get("Content-Type") != "application/json" || limited.Header().Get("Cache-Control") != "no-store" || limited.Body.String() != "{\"code\":\"rate_limited\"}\n" {
+					t.Fatalf("limited response = %d headers=%v body=%q", limited.Code, limited.Header(), limited.Body.String())
+				}
+				if body.reads.Load() != 0 {
+					t.Fatalf("limited body reads = %d, want 0", body.reads.Load())
+				}
+			}
+			if signer.calls.Load() != 1 || svc.calls.Load() != 1 {
+				t.Fatalf("limited dependency calls: signer=%d service=%d", signer.calls.Load(), svc.calls.Load())
+			}
+			if nonces, _ := replays.snapshot(); len(nonces) != 1 {
+				t.Fatalf("limited requests claimed replay nonces: %v", nonces)
+			}
+			clock.Advance(time.Minute)
+			if reset := do(strings.NewReader(requestBody("reset", nonce(541)))); reset.Code != http.StatusOK {
+				t.Fatalf("reset status = %d body=%s", reset.Code, reset.Body.String())
+			}
+		})
+	}
+}
+
+func TestMalformedTrafficConsumesBucketAndOverLimitIsUnsigned(t *testing.T) {
 	for _, route := range []string{"activate", "validate"} {
 		t.Run(route, func(t *testing.T) {
 			clock := &testClock{now: time.Date(2026, 9, 9, 8, 30, 0, 0, time.UTC)}
@@ -345,8 +416,8 @@ func TestMalformedTrafficIsChargedBeforeSigningAndSigningStopsAfterFirst429(t *t
 					t.Fatalf("request %d status = %d, want %d body=%s", index, recorder.Code, item.want, recorder.Body.String())
 				}
 			}
-			if counter.calls.Load() != 2 {
-				t.Fatalf("signature calls = %d, want bounded 2", counter.calls.Load())
+			if counter.calls.Load() != 1 {
+				t.Fatalf("signature calls = %d, want 1", counter.calls.Load())
 			}
 			if svc.calls.Load() != 0 {
 				t.Fatalf("service calls = %d, want 0", svc.calls.Load())
@@ -358,7 +429,7 @@ func TestMalformedTrafficIsChargedBeforeSigningAndSigningStopsAfterFirst429(t *t
 	}
 }
 
-func TestRateLimitedValidRequestsSignOnlyFirstDenialPerWindow(t *testing.T) {
+func TestRateLimitedValidRequestsAreAlwaysUnsigned(t *testing.T) {
 	for _, route := range []string{"activate", "validate"} {
 		t.Run(route, func(t *testing.T) {
 			clock := &testClock{now: time.Date(2026, 9, 9, 2, 30, 0, 0, time.UTC)}
@@ -405,29 +476,27 @@ func TestRateLimitedValidRequestsSignOnlyFirstDenialPerWindow(t *testing.T) {
 			if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") != "60" {
 				t.Fatalf("limited response = %d retry=%q body=%s", limited.Code, limited.Header().Get("Retry-After"), limited.Body.String())
 			}
-			claims := decodeClaims(t, limited, &key.PublicKey)
-			if claims.Code != model.CodeRateLimited || claims.RequestID != "limited-"+route {
-				t.Fatalf("rate-limit claims = %#v", claims)
+			if limited.Body.String() != "{\"code\":\"rate_limited\"}\n" {
+				t.Fatalf("rate-limit body = %q", limited.Body.String())
 			}
 			limitedAgain := do(requestBody("limited-again-"+route, nonce(302)))
 			var protective map[string]json.RawMessage
 			if limitedAgain.Code != http.StatusTooManyRequests || limitedAgain.Header().Get("Retry-After") != "60" || json.Unmarshal(limitedAgain.Body.Bytes(), &protective) != nil || len(protective) != 1 || string(protective["code"]) != `"rate_limited"` {
 				t.Fatalf("protective rate-limit response = %d headers=%v body=%s", limitedAgain.Code, limitedAgain.Header(), limitedAgain.Body.String())
 			}
-			if signer.calls.Load() != 2 {
-				t.Fatalf("signature calls after repeated denial = %d, want 2", signer.calls.Load())
+			if signer.calls.Load() != 1 {
+				t.Fatalf("signature calls after repeated denial = %d, want 1", signer.calls.Load())
 			}
 			clock.Advance(time.Minute)
 			if resetAllowed := do(requestBody("reset-allowed-"+route, nonce(303))); resetAllowed.Code != http.StatusOK {
 				t.Fatalf("first request after reset = %d body=%s", resetAllowed.Code, resetAllowed.Body.String())
 			}
 			resetDenied := do(requestBody("reset-denied-"+route, nonce(304)))
-			resetClaims := decodeClaims(t, resetDenied, &key.PublicKey)
-			if resetDenied.Code != http.StatusTooManyRequests || resetClaims.Code != model.CodeRateLimited || resetClaims.RequestID != "reset-denied-"+route {
-				t.Fatalf("first denial after reset = %d %#v", resetDenied.Code, resetClaims)
+			if resetDenied.Code != http.StatusTooManyRequests || resetDenied.Body.String() != "{\"code\":\"rate_limited\"}\n" {
+				t.Fatalf("first denial after reset = %d %s", resetDenied.Code, resetDenied.Body.String())
 			}
-			if signer.calls.Load() != 4 {
-				t.Fatalf("signature calls after reset denial = %d, want 4", signer.calls.Load())
+			if signer.calls.Load() != 2 {
+				t.Fatalf("signature calls after reset denial = %d, want 2", signer.calls.Load())
 			}
 			nonces, maximum := replays.snapshot()
 			if len(nonces) != 2 || nonces[0] != nonce(300) || nonces[1] != nonce(303) || maximum != 7 {
