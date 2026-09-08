@@ -3,6 +3,7 @@ package licenseadmin
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime"
@@ -44,14 +45,23 @@ type Page struct {
 }
 
 type CardSearch struct {
-	Page         Page
-	CompleteCard string
-	Prefix8      string
-	Last4        string
-	NoteContains string
-	PackageID    string
-	CardType     string
-	State        string
+	Page         Page   `json:"-"`
+	CompleteCard string `json:"complete_card,omitempty"`
+	Prefix8      string `json:"prefix8,omitempty"`
+	Last4        string `json:"last4,omitempty"`
+	NoteContains string `json:"note_contains,omitempty"`
+	PackageID    string `json:"package_id,omitempty"`
+	CardType     string `json:"card_type,omitempty"`
+	State        string `json:"state,omitempty"`
+}
+
+type CardList struct {
+	Page      Page
+	Prefix8   string
+	Last4     string
+	PackageID string
+	CardType  string
+	State     string
 }
 
 type Mutation struct {
@@ -64,6 +74,7 @@ type Result struct {
 	ContentType        string
 	ContentDisposition string
 	Body               []byte
+	RetryAfterSeconds  int
 }
 
 func NewClient(options Options) (*Client, error) {
@@ -138,8 +149,8 @@ func (c *Client) PackageImpact(ctx context.Context, id string, body []byte, muta
 	}
 	return c.mutate(ctx, http.MethodPost, path, body, mutation)
 }
-func (c *Client) SearchCards(ctx context.Context, search CardSearch) (Result, error) {
-	query, err := cardSearchQuery(search)
+func (c *Client) ListCards(ctx context.Context, list CardList) (Result, error) {
+	query, err := cardListQuery(list)
 	if err != nil {
 		return Result{}, err
 	}
@@ -148,6 +159,38 @@ func (c *Client) SearchCards(ctx context.Context, search CardSearch) (Result, er
 		return Result{}, errInvalidInput
 	}
 	return c.request(ctx, http.MethodGet, "/internal/v1/cards?"+encoded, nil, Mutation{})
+}
+func (c *Client) SearchCards(ctx context.Context, search CardSearch, actor string) (Result, error) {
+	if _, err := pageQuery(search.Page); err != nil || !validActor(actor) {
+		return Result{}, errInvalidInput
+	}
+	for _, field := range []struct {
+		value   string
+		maximum int
+	}{
+		{search.CompleteCard, 128}, {search.NoteContains, 1024}, {search.Prefix8, 128},
+		{search.Last4, 128}, {search.PackageID, 128}, {search.CardType, 128}, {search.State, 128},
+	} {
+		if len(field.value) > field.maximum || strings.ContainsAny(field.value, "\r\n\x00") {
+			return Result{}, errInvalidInput
+		}
+	}
+	wire := struct {
+		Page         int    `json:"page"`
+		PageSize     int    `json:"page_size"`
+		CompleteCard string `json:"complete_card,omitempty"`
+		Prefix8      string `json:"prefix8,omitempty"`
+		Last4        string `json:"last4,omitempty"`
+		NoteContains string `json:"note_contains,omitempty"`
+		PackageID    string `json:"package_id,omitempty"`
+		CardType     string `json:"card_type,omitempty"`
+		State        string `json:"state,omitempty"`
+	}{search.Page.Number, search.Page.Size, search.CompleteCard, search.Prefix8, search.Last4, search.NoteContains, search.PackageID, search.CardType, search.State}
+	body, err := json.Marshal(wire)
+	if err != nil || int64(len(body)) > c.maxRequestBytes {
+		return Result{}, errInvalidInput
+	}
+	return c.readOnlyPost(ctx, "/internal/v1/cards/search", body, actor)
 }
 func (c *Client) GenerateCards(ctx context.Context, body []byte, mutation Mutation) (Result, error) {
 	return c.mutate(ctx, http.MethodPost, "/internal/v1/cards/generate", body, mutation)
@@ -215,6 +258,13 @@ func (c *Client) mutate(ctx context.Context, method, path string, body []byte, m
 	return c.request(ctx, method, path, body, mutation)
 }
 
+func (c *Client) readOnlyPost(ctx context.Context, path string, body []byte, actor string) (Result, error) {
+	if len(body) == 0 || int64(len(body)) > c.maxRequestBytes || !validActor(actor) {
+		return Result{}, errInvalidInput
+	}
+	return c.request(ctx, http.MethodPost, path, body, Mutation{Actor: actor})
+}
+
 func (c *Client) request(ctx context.Context, method, path string, body []byte, mutation Mutation) (Result, error) {
 	if int64(len(path)) > c.maxRequestBytes {
 		return Result{}, errInvalidInput
@@ -228,11 +278,17 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 		return Result{}, errInvalidInput
 	}
 	request.Header.Set("Authorization", c.bearer)
-	request.Header.Set("Accept", "application/json, text/csv")
+	if method == http.MethodPost && strings.SplitN(path, "?", 2)[0] == "/internal/v1/cards/export" {
+		request.Header.Set("Accept", "text/csv, application/json")
+	} else {
+		request.Header.Set("Accept", "application/json")
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Idempotency-Key", mutation.IdempotencyKey)
 		request.Header.Set("X-Admin-Actor", mutation.Actor)
+		if mutation.IdempotencyKey != "" {
+			request.Header.Set("Idempotency-Key", mutation.IdempotencyKey)
+		}
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
@@ -244,9 +300,6 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 	if err != nil || int64(len(responseBody)) > c.maxResponseBytes {
 		return Result{}, errUnavailable
 	}
-	if response.StatusCode >= 500 || response.StatusCode >= 300 && response.StatusCode < 400 {
-		return Result{}, errUnavailable
-	}
 	wireToken := strings.TrimPrefix(c.bearer, "Bearer ")
 	if bytes.Contains(responseBody, []byte(c.bearer)) || bytes.Contains(responseBody, []byte(wireToken)) {
 		return Result{}, errUnavailable
@@ -256,20 +309,81 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte, 
 	if mediaTypeErr != nil || mediaType != "application/json" && mediaType != "text/csv" {
 		return Result{}, errUnavailable
 	}
+	pathOnly := strings.SplitN(path, "?", 2)[0]
+	isExport := method == http.MethodPost && pathOnly == "/internal/v1/cards/export"
+	if !allowedResponseStatus(method, pathOnly, response.StatusCode) {
+		return Result{}, errUnavailable
+	}
+	if isExport && response.StatusCode == http.StatusOK {
+		if mediaType != "text/csv" {
+			return Result{}, errUnavailable
+		}
+	} else if mediaType != "application/json" {
+		return Result{}, errUnavailable
+	}
+	retryAfter := 0
+	if response.StatusCode == http.StatusTooManyRequests {
+		retryAfter, err = parseRetryAfter(response.Header)
+		if err != nil {
+			return Result{}, errUnavailable
+		}
+	}
 	contentDisposition := ""
 	contentType = "application/json"
 	if mediaType == "text/csv" {
 		contentType = "text/csv; charset=utf-8"
+		if response.Header.Get("Content-Disposition") == `attachment; filename="license-cards.csv"` {
+			contentDisposition = response.Header.Get("Content-Disposition")
+		}
 	}
-	if mediaType == "text/csv" && response.Header.Get("Content-Disposition") == `attachment; filename="license-cards.csv"` {
-		contentDisposition = response.Header.Get("Content-Disposition")
+	return Result{StatusCode: response.StatusCode, ContentType: contentType, ContentDisposition: contentDisposition, Body: responseBody, RetryAfterSeconds: retryAfter}, nil
+}
+
+func allowedResponseStatus(method, path string, status int) bool {
+	if status == http.StatusTooManyRequests || status == http.StatusBadRequest {
+		return true
 	}
-	return Result{StatusCode: response.StatusCode, ContentType: contentType, ContentDisposition: contentDisposition, Body: responseBody}, nil
+	isCollectionRead := method == http.MethodGet && (path == "/internal/v1/software" || path == "/internal/v1/packages" || path == "/internal/v1/cards" || path == "/internal/v1/devices")
+	isSearch := method == http.MethodPost && path == "/internal/v1/cards/search"
+	if status == http.StatusNotFound {
+		return !isCollectionRead && !isSearch && !(method == http.MethodPost && path == "/internal/v1/software")
+	}
+	if status == http.StatusConflict {
+		return method != http.MethodGet && !isSearch
+	}
+	if status == http.StatusCreated {
+		return method == http.MethodPost && (path == "/internal/v1/software" || path == "/internal/v1/packages" || path == "/internal/v1/cards/generate")
+	}
+	if status != http.StatusOK {
+		return false
+	}
+	return !(method == http.MethodPost && (path == "/internal/v1/software" || path == "/internal/v1/packages" || path == "/internal/v1/cards/generate"))
+}
+
+func parseRetryAfter(header http.Header) (int, error) {
+	values := header.Values("Retry-After")
+	if len(values) != 1 || values[0] == "" || strings.TrimSpace(values[0]) != values[0] {
+		return 0, errUnavailable
+	}
+	for _, value := range values[0] {
+		if value < '0' || value > '9' {
+			return 0, errUnavailable
+		}
+	}
+	seconds, err := strconv.Atoi(values[0])
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return 0, errUnavailable
+	}
+	return seconds, nil
 }
 
 func validMutation(m Mutation) bool {
 	parsed, err := uuid.Parse(m.IdempotencyKey)
-	return err == nil && parsed.String() == m.IdempotencyKey && m.Actor != "" && len(m.Actor) <= 128 && m.Actor == strings.TrimSpace(m.Actor) && !strings.ContainsAny(m.Actor, "\r\n")
+	return err == nil && parsed.String() == m.IdempotencyKey && validActor(m.Actor)
+}
+
+func validActor(actor string) bool {
+	return actor != "" && len(actor) <= 128 && actor == strings.TrimSpace(actor) && !strings.ContainsAny(actor, "\r\n")
 }
 
 func resourcePath(prefix, id, suffix string) (string, error) {
@@ -287,16 +401,18 @@ func pageQuery(page Page) (url.Values, error) {
 	return url.Values{"page": {strconv.Itoa(page.Number)}, "page_size": {strconv.Itoa(page.Size)}}, nil
 }
 
-func cardSearchQuery(search CardSearch) (url.Values, error) {
-	query, err := pageQuery(search.Page)
+func cardListQuery(list CardList) (url.Values, error) {
+	query, err := pageQuery(list.Page)
 	if err != nil {
 		return nil, err
 	}
 	for name, value := range map[string]string{
-		"complete_card": search.CompleteCard, "prefix8": search.Prefix8, "last4": search.Last4,
-		"note_contains": search.NoteContains, "package_id": search.PackageID, "card_type": search.CardType, "state": search.State,
+		"prefix8": list.Prefix8, "last4": list.Last4, "package_id": list.PackageID, "card_type": list.CardType, "state": list.State,
 	} {
 		if value != "" {
+			if len(value) > 128 || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\x00") {
+				return nil, errInvalidInput
+			}
 			query.Set(name, value)
 		}
 	}

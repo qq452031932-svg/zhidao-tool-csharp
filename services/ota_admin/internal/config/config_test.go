@@ -46,6 +46,14 @@ func TestLicenseAdminConfigParsesAndRequiresStrictIsolation(t *testing.T) {
 		{"missing port", func(c *config.Config) { c.LicenseAdminBaseURL = "http://127.0.0.1" }},
 		{"path", func(c *config.Config) { c.LicenseAdminBaseURL = "http://127.0.0.1:19091/internal" }},
 		{"OTA admin self-loop", func(c *config.Config) { c.LicenseAdminBaseURL = "http://" + c.ListenAddress }},
+		{"IPv6 text self-loop", func(c *config.Config) {
+			c.ListenAddress = "[0:0:0:0:0:0:0:1]:19091"
+			c.LicenseAdminBaseURL = "http://[::1]:19091"
+		}},
+		{"numeric port self-loop", func(c *config.Config) {
+			c.ListenAddress = "127.0.0.1:19091"
+			c.LicenseAdminBaseURL = "http://127.0.0.1:019091"
+		}},
 		{"relative secret", func(c *config.Config) { c.LicenseAdminSecretPath = "admin.secret" }},
 		{"secret in release", func(c *config.Config) { c.LicenseAdminSecretPath = filepath.Join(c.ReleaseRoot, "admin.secret") }},
 		{"secret in staging", func(c *config.Config) { c.LicenseAdminSecretPath = filepath.Join(c.StagingRoot, "admin.secret") }},

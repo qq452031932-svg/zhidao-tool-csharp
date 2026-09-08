@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
@@ -29,6 +30,10 @@ var adminGenerateFields = map[string]struct{}{"package_id": {}, "duration_days":
 var adminExportFields = map[string]struct{}{"card_ids": {}}
 var adminRemarkFields = map[string]struct{}{"note": {}}
 var adminRenewFields = map[string]struct{}{"duration_days": {}}
+var adminCardSearchFields = map[string]struct{}{
+	"page": {}, "page_size": {}, "complete_card": {}, "prefix8": {}, "last4": {},
+	"note_contains": {}, "package_id": {}, "card_type": {}, "state": {},
+}
 
 type adminNameRequest struct {
 	Name string `json:"name"`
@@ -58,6 +63,17 @@ type adminRemarkRequest struct {
 }
 type adminRenewRequest struct {
 	DurationDays int `json:"duration_days"`
+}
+type adminCardSearchRequest struct {
+	Page         int             `json:"page"`
+	PageSize     int             `json:"page_size"`
+	CompleteCard string          `json:"complete_card"`
+	Prefix8      string          `json:"prefix8"`
+	Last4        string          `json:"last4"`
+	NoteContains string          `json:"note_contains"`
+	PackageID    string          `json:"package_id"`
+	CardType     string          `json:"card_type"`
+	State        model.CardState `json:"state"`
 }
 
 func (a *api) authorizeInternal(next http.Handler) http.Handler {
@@ -110,6 +126,10 @@ func (a *api) authorizeInternal(next http.Handler) http.Handler {
 				a.writeAdminError(w, status, map[bool]string{true: "method_not_allowed", false: "not_found"}[status == http.StatusMethodNotAllowed])
 				return
 			}
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/internal/v1/cards/search" {
+			next.ServeHTTP(w, r)
+			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			a.serveAdminMutation(w, r, next)
@@ -409,7 +429,7 @@ func (a *api) packageImpact(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) searchCards(w http.ResponseWriter, r *http.Request) {
-	allowed := map[string]struct{}{"page": {}, "page_size": {}, "complete_card": {}, "prefix8": {}, "last4": {}, "note_contains": {}, "package_id": {}, "card_type": {}, "state": {}}
+	allowed := map[string]struct{}{"page": {}, "page_size": {}, "prefix8": {}, "last4": {}, "package_id": {}, "card_type": {}, "state": {}}
 	if rejectUnknownOrDuplicateQuery(r, allowed) != nil {
 		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 		return
@@ -420,8 +440,8 @@ func (a *api) searchCards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	filter := model.AdminCardFilter{Prefix8: q.Get("prefix8"), Last4: q.Get("last4"), NoteContains: q.Get("note_contains"), PackageID: q.Get("package_id"), CardType: q.Get("card_type"), State: model.CardState(q.Get("state"))}
-	items, total, err := a.options.AdminService.SearchAdminCards(r.Context(), q.Get("complete_card"), filter, page, pageSize)
+	filter := model.AdminCardFilter{Prefix8: q.Get("prefix8"), Last4: q.Get("last4"), PackageID: q.Get("package_id"), CardType: q.Get("card_type"), State: model.CardState(q.Get("state"))}
+	items, total, err := a.options.AdminService.SearchAdminCards(r.Context(), "", filter, page, pageSize)
 	if err != nil {
 		a.writeAdminServiceError(w, err)
 		return
@@ -432,6 +452,51 @@ func (a *api) searchCards(w http.ResponseWriter, r *http.Request) {
 		PageSize int                      `json:"page_size"`
 		Total    int                      `json:"total"`
 	}{items, page, pageSize, total})
+}
+
+func (a *api) searchCardsSensitive(w http.ResponseWriter, r *http.Request) {
+	if values := r.Header.Values("Content-Type"); len(values) != 1 || values[0] != "application/json" {
+		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	var request adminCardSearchRequest
+	if a.decodeRequest(w, r, &request, adminCardSearchFields) != nil || !validAdminCardSearch(request, a.options.MaxAdminPageSize) {
+		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	filter := model.AdminCardFilter{
+		Prefix8: request.Prefix8, Last4: request.Last4, NoteContains: request.NoteContains,
+		PackageID: request.PackageID, CardType: request.CardType, State: request.State,
+	}
+	items, total, err := a.options.AdminService.SearchAdminCards(r.Context(), request.CompleteCard, filter, request.Page, request.PageSize)
+	if err != nil {
+		a.writeAdminServiceError(w, err)
+		return
+	}
+	a.writeAdminJSON(w, http.StatusOK, struct {
+		Items    []model.AdminCardSummary `json:"items"`
+		Page     int                      `json:"page"`
+		PageSize int                      `json:"page_size"`
+		Total    int                      `json:"total"`
+	}{items, request.Page, request.PageSize, total})
+}
+
+func validAdminCardSearch(request adminCardSearchRequest, maxPageSize int) bool {
+	if request.Page < 1 || request.PageSize < 1 || request.PageSize > maxPageSize {
+		return false
+	}
+	for _, field := range []struct {
+		value   string
+		maximum int
+	}{
+		{request.CompleteCard, 128}, {request.NoteContains, 1024}, {request.Prefix8, 128},
+		{request.Last4, 128}, {request.PackageID, 128}, {request.CardType, 128}, {string(request.State), 128},
+	} {
+		if len(field.value) > field.maximum || !utf8.ValidString(field.value) || strings.ContainsAny(field.value, "\r\n\x00") {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *api) generateCards(w http.ResponseWriter, r *http.Request) {

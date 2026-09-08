@@ -66,10 +66,16 @@ func (router *Router) licenseAdmin(response http.ResponseWriter, request *http.R
 	case len(segments) == 3 && segments[0] == "packages" && segments[2] == "impact" && request.Method == http.MethodPost:
 		result, err = router.licenseResourceMutation(response, request, principal, segments[1], router.licenseAdminClient.PackageImpact)
 	case len(segments) == 1 && segments[0] == "cards" && request.Method == http.MethodGet:
-		var search licenseadmin.CardSearch
-		search, err = licenseCardSearch(request.URL.Query())
+		var list licenseadmin.CardList
+		list, err = licenseCardList(request.URL.Query())
 		if err == nil {
-			result, err = router.licenseAdminClient.SearchCards(ctx, search)
+			result, err = router.licenseAdminClient.ListCards(ctx, list)
+		}
+	case len(segments) == 2 && segments[0] == "cards" && segments[1] == "search" && request.Method == http.MethodPost:
+		var search licenseadmin.CardSearch
+		search, err = router.readLicenseCardSearch(response, request)
+		if err == nil {
+			result, err = router.licenseAdminClient.SearchCards(ctx, search, principal.IDHash)
 		}
 	case len(segments) == 2 && segments[0] == "cards" && segments[1] == "generate" && request.Method == http.MethodPost:
 		result, err = router.licenseMutation(response, request, principal, router.licenseAdminClient.GenerateCards)
@@ -179,6 +185,9 @@ func (router *Router) readLicenseMutation(w http.ResponseWriter, r *http.Request
 
 func writeLicenseResult(w http.ResponseWriter, result licenseadmin.Result) {
 	w.Header().Set("Content-Type", result.ContentType)
+	if result.RetryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(result.RetryAfterSeconds))
+	}
 	if result.ContentDisposition != "" {
 		w.Header().Set("Content-Disposition", result.ContentDisposition)
 	}
@@ -248,13 +257,56 @@ func licensePage(query url.Values, additional map[string]struct{}) (licenseadmin
 	return licenseadmin.Page{Number: page, Size: size}, nil
 }
 
-func licenseCardSearch(query url.Values) (licenseadmin.CardSearch, error) {
-	additional := map[string]struct{}{"complete_card": {}, "prefix8": {}, "last4": {}, "note_contains": {}, "package_id": {}, "card_type": {}, "state": {}}
+func licenseCardList(query url.Values) (licenseadmin.CardList, error) {
+	additional := map[string]struct{}{"prefix8": {}, "last4": {}, "package_id": {}, "card_type": {}, "state": {}}
 	page, err := licensePage(query, additional)
 	if err != nil {
-		return licenseadmin.CardSearch{}, err
+		return licenseadmin.CardList{}, err
 	}
-	return licenseadmin.CardSearch{Page: page, CompleteCard: query.Get("complete_card"), Prefix8: query.Get("prefix8"), Last4: query.Get("last4"), NoteContains: query.Get("note_contains"), PackageID: query.Get("package_id"), CardType: query.Get("card_type"), State: query.Get("state")}, nil
+	return licenseadmin.CardList{Page: page, Prefix8: query.Get("prefix8"), Last4: query.Get("last4"), PackageID: query.Get("package_id"), CardType: query.Get("card_type"), State: query.Get("state")}, nil
+}
+
+type licenseCardSearchRequest struct {
+	Page         int    `json:"page"`
+	PageSize     int    `json:"page_size"`
+	CompleteCard string `json:"complete_card"`
+	Prefix8      string `json:"prefix8"`
+	Last4        string `json:"last4"`
+	NoteContains string `json:"note_contains"`
+	PackageID    string `json:"package_id"`
+	CardType     string `json:"card_type"`
+	State        string `json:"state"`
+}
+
+func (router *Router) readLicenseCardSearch(w http.ResponseWriter, r *http.Request) (licenseadmin.CardSearch, error) {
+	if len(r.Header.Values("Idempotency-Key")) != 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return licenseadmin.CardSearch{}, errLicenseBodyAlreadyWritten
+	}
+	var request licenseCardSearchRequest
+	if err := decodeStrictJSON(r, router.maxJSONBytes, &request); err != nil {
+		writeJSONDecodeError(w, err)
+		return licenseadmin.CardSearch{}, errLicenseBodyAlreadyWritten
+	}
+	if request.Page < 1 || request.PageSize < 1 || request.PageSize > 100 || !validLicenseSearchText(request.CompleteCard, 128) || !validLicenseSearchText(request.NoteContains, 1024) {
+		writeError(w, http.StatusBadRequest, "invalid_request")
+		return licenseadmin.CardSearch{}, errLicenseBodyAlreadyWritten
+	}
+	for _, value := range []string{request.Prefix8, request.Last4, request.PackageID, request.CardType, request.State} {
+		if !validLicenseSearchText(value, 128) {
+			writeError(w, http.StatusBadRequest, "invalid_request")
+			return licenseadmin.CardSearch{}, errLicenseBodyAlreadyWritten
+		}
+	}
+	return licenseadmin.CardSearch{
+		Page: licenseadmin.Page{Number: request.Page, Size: request.PageSize}, CompleteCard: request.CompleteCard,
+		Prefix8: request.Prefix8, Last4: request.Last4, NoteContains: request.NoteContains,
+		PackageID: request.PackageID, CardType: request.CardType, State: request.State,
+	}, nil
+}
+
+func validLicenseSearchText(value string, maximum int) bool {
+	return len(value) <= maximum && !strings.ContainsAny(value, "\r\n\x00")
 }
 
 func knownLicenseBrowserPath(parts []string) bool {
@@ -262,6 +314,9 @@ func knownLicenseBrowserPath(parts []string) bool {
 		return parts[0] == "software" || parts[0] == "packages" || parts[0] == "cards" || parts[0] == "devices"
 	}
 	if len(parts) == 2 {
+		if parts[0] == "cards" && parts[1] == "search" {
+			return true
+		}
 		return parts[0] == "software" || parts[0] == "packages" || parts[0] == "cards" || parts[0] == "devices"
 	}
 	if len(parts) == 3 {
@@ -271,6 +326,9 @@ func knownLicenseBrowserPath(parts []string) bool {
 }
 
 func allowedLicenseMethod(parts []string) string {
+	if len(parts) == 2 && parts[0] == "cards" && parts[1] == "search" {
+		return http.MethodPost
+	}
 	if len(parts) == 1 {
 		if parts[0] == "software" || parts[0] == "packages" {
 			return "GET, POST"

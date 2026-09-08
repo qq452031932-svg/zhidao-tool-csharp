@@ -124,6 +124,7 @@ func NewRouter(options Options) (http.Handler, error) {
 		adminMux.HandleFunc("PUT /internal/v1/packages/{id}/members", a.replacePackageMembers)
 		adminMux.HandleFunc("POST /internal/v1/packages/{id}/impact", a.packageImpact)
 		adminMux.HandleFunc("GET /internal/v1/cards", a.searchCards)
+		adminMux.HandleFunc("POST /internal/v1/cards/search", a.searchCardsSensitive)
 		adminMux.HandleFunc("POST /internal/v1/cards/generate", a.generateCards)
 		adminMux.HandleFunc("POST /internal/v1/cards/export", a.exportCards)
 		adminMux.HandleFunc("GET /internal/v1/cards/{id}/copy", a.copyCard)

@@ -3,8 +3,10 @@ package httpapi_test
 import (
 	"bytes"
 	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -136,6 +138,99 @@ func TestLicenseDowntimeDoesNotBreakOTAReleaseEndpoint(t *testing.T) {
 	releases := h.request(http.MethodGet, "/admin/api/releases", "", "", cookie)
 	if releases.Code != http.StatusOK {
 		t.Fatalf("release endpoint status=%d body=%s", releases.Code, releases.Body.String())
+	}
+}
+
+func TestSensitiveCardSearchUsesCSRFProtectedBodyAndNeverAURI(t *testing.T) {
+	const card = "ABCD-EFGH-IJKL-MNOP"
+	const note = "客户备注 张三"
+	var downstreamCalls atomic.Int32
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downstreamCalls.Add(1)
+		if r.Method != http.MethodPost || r.URL.RequestURI() != "/internal/v1/cards/search" {
+			t.Fatalf("downstream request = %s %s", r.Method, r.URL.RequestURI())
+		}
+		if strings.Contains(r.URL.RequestURI(), card) || strings.Contains(r.URL.RequestURI(), note) {
+			t.Fatal("sensitive search entered internal URI")
+		}
+		if r.Header.Get("Idempotency-Key") != "" || r.Header.Get("X-Admin-Actor") == "browser-supplied" {
+			t.Fatalf("read-only headers = %v", r.Header)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !bytes.Contains(body, []byte(card)) || !bytes.Contains(body, []byte(note)) {
+			t.Fatalf("downstream body = %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer downstream.Close()
+	h := newHarness(t)
+	installLicenseClient(t, h, newLicenseClient(t, downstream.URL, make([]byte, 32)), nil)
+	cookie, csrf, _, _ := login(t, h, oldPassword)
+	cookie, csrf = changeTestPassword(t, h, cookie, csrf)
+
+	searchBody := `{"page":1,"page_size":20,"complete_card":"` + card + `","note_contains":"` + note + `"}`
+	request := httptest.NewRequest(http.MethodPost, "http://backend/admin/api/license/cards/search", strings.NewReader(searchBody))
+	request.RemoteAddr = "127.0.0.1:43210"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", publicOrigin)
+	request.Header.Set("Referer", publicOrigin+"/admin/")
+	request.Header.Set("X-CSRF-Token", csrf)
+	request.Header.Set("X-Admin-Actor", "browser-supplied")
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("search status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(request.URL.RequestURI(), card) || strings.Contains(request.URL.RequestURI(), note) {
+		t.Fatal("sensitive search entered browser-facing URI")
+	}
+
+	get := h.request(http.MethodGet, "/admin/api/license/cards?complete_card="+url.QueryEscape(card)+"&note_contains="+url.QueryEscape(note), "", "", cookie)
+	if get.Code != http.StatusBadRequest {
+		t.Fatalf("sensitive GET status=%d body=%s", get.Code, get.Body.String())
+	}
+	if downstreamCalls.Load() != 1 {
+		t.Fatalf("sensitive GET reached downstream: %d calls", downstreamCalls.Load())
+	}
+}
+
+func TestLicenseProxyNormalizesRetryAfterAndTreatsCredentialResponsesAsUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		status     int
+		retryAfter []string
+		wantStatus int
+		wantRetry  string
+	}{
+		{"valid 429", http.StatusTooManyRequests, []string{"19"}, http.StatusTooManyRequests, "19"},
+		{"invalid 429", http.StatusTooManyRequests, []string{"19", "20"}, http.StatusServiceUnavailable, ""},
+		{"internal unauthorized", http.StatusUnauthorized, nil, http.StatusServiceUnavailable, ""},
+		{"internal forbidden", http.StatusForbidden, nil, http.StatusServiceUnavailable, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for _, value := range test.retryAfter {
+					w.Header().Add("Retry-After", value)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(`{"code":"test"}`))
+			}))
+			defer downstream.Close()
+			h := newHarness(t)
+			installLicenseClient(t, h, newLicenseClient(t, downstream.URL, make([]byte, 32)), nil)
+			cookie, csrf, _, _ := login(t, h, oldPassword)
+			cookie, _ = changeTestPassword(t, h, cookie, csrf)
+			response := h.request(http.MethodGet, "/admin/api/license/software?page=1&page_size=20", "", "", cookie)
+			if response.Code != test.wantStatus || response.Header().Get("Retry-After") != test.wantRetry {
+				t.Fatalf("status=%d retry=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+			}
+			if test.wantStatus == http.StatusServiceUnavailable && decodeBody(t, response)["code"] != "license_service_unavailable" {
+				t.Fatalf("unexpected unavailable body=%s", response.Body.String())
+			}
+		})
 	}
 }
 

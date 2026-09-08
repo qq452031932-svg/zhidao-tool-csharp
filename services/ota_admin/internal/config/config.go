@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -271,7 +272,7 @@ func (c Config) ValidateServe() error {
 	if err := validateLicenseAdminOrigin(c.LicenseAdminBaseURL); err != nil {
 		return err
 	}
-	if c.LicenseAdminBaseURL == "http://"+c.ListenAddress {
+	if sameLoopbackEndpoint(c.ListenAddress, c.LicenseAdminBaseURL) {
 		return errors.New("license_admin_base_url cannot point back to the OTA admin listener")
 	}
 	if pathsOverlap(c.StagingRoot, c.LicenseAdminSecretPath) || pathsOverlap(c.ReleaseRoot, c.LicenseAdminSecretPath) {
@@ -319,6 +320,25 @@ func validateLicenseAdminOrigin(raw string) error {
 		return errors.New("license_admin_base_url must be an explicit loopback HTTP origin")
 	}
 	return nil
+}
+
+func sameLoopbackEndpoint(listenAddress, rawOrigin string) bool {
+	listenHost, listenPort, err := net.SplitHostPort(listenAddress)
+	if err != nil {
+		return false
+	}
+	origin, err := url.Parse(rawOrigin)
+	if err != nil || origin.Scheme != "http" {
+		return false
+	}
+	listenIP, listenErr := netip.ParseAddr(listenHost)
+	originIP, originErr := netip.ParseAddr(origin.Hostname())
+	if listenErr != nil || originErr != nil || listenIP.Zone() != "" || originIP.Zone() != "" {
+		return false
+	}
+	listenPortNumber, listenPortErr := strconv.ParseUint(listenPort, 10, 16)
+	originPortNumber, originPortErr := strconv.ParseUint(origin.Port(), 10, 16)
+	return listenPortErr == nil && originPortErr == nil && listenPortNumber == originPortNumber && listenIP.Unmap() == originIP.Unmap()
 }
 
 func validateLiteralAbsolutePath(name, value string) error {

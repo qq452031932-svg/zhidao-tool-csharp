@@ -85,6 +85,55 @@ func newAdminRouterForStoreWithSecret(t *testing.T, st *licensestore.Store, cloc
 	return svc, handler
 }
 
+func TestAdminSensitiveCardSearchUsesStrictReadOnlyPostBody(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	const card = "ABCDEFGH-IJKLMNPQ-RSTUVWXY-Z234567A"
+	const note = "客户备注 张三"
+	body := `{"page":1,"page_size":20,"complete_card":"` + card + `","note_contains":"` + note + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/search", strings.NewReader(body))
+	request.RemoteAddr = "127.0.0.1:1"
+	request.Header.Set("Authorization", adminBearer)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	h.handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST search status=%d body=%s", response.Code, response.Body.String())
+	}
+	if request.Header.Get("Idempotency-Key") != "" {
+		t.Fatal("read-only search unexpectedly required idempotency")
+	}
+	if strings.Contains(request.URL.RequestURI(), card) || strings.Contains(request.URL.RequestURI(), note) {
+		t.Fatal("sensitive values entered internal request URI")
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/internal/v1/cards?complete_card="+url.QueryEscape(card)+"&note_contains="+url.QueryEscape(note), nil)
+	get.RemoteAddr = "127.0.0.1:1"
+	get.Header.Set("Authorization", adminBearer)
+	getResponse := httptest.NewRecorder()
+	h.handler.ServeHTTP(getResponse, get)
+	if getResponse.Code != http.StatusBadRequest {
+		t.Fatalf("sensitive GET status=%d body=%s", getResponse.Code, getResponse.Body.String())
+	}
+
+	for name, invalidBody := range map[string]string{
+		"unknown field":   `{"page":1,"page_size":20,"complete_card":"x","actor":"browser"}`,
+		"duplicate field": `{"page":1,"page":2,"page_size":20}`,
+		"overlong note":   `{"page":1,"page_size":20,"note_contains":"` + strings.Repeat("x", 1025) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/search", strings.NewReader(invalidBody))
+			r.RemoteAddr = "127.0.0.1:2"
+			r.Header.Set("Authorization", adminBearer)
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.handler.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func newAdminRouterWithEncryptionKeys(t *testing.T, st *licensestore.Store, clock *testClock, current []byte, previous [][]byte) (*service.Service, http.Handler) {
 	return newAdminRouterWithCapacity(t, st, clock, current, previous, 100, 1<<20)
 }
@@ -452,13 +501,23 @@ func TestAdminCardGenerateSearchFiltersAndNormalRedaction(t *testing.T) {
 	prefix := strings.ReplaceAll(plaintext, "-", "")[:8]
 	last4 := strings.ReplaceAll(plaintext, "-", "")[28:]
 	queries := []string{
-		"prefix8=" + prefix, "last4=" + last4, "note_contains=Needle", "package_id=" + pkg,
-		"card_type=month", "state=unactivated", "complete_card=" + url.QueryEscape(plaintext),
+		"prefix8=" + prefix, "last4=" + last4, "package_id=" + pkg,
+		"card_type=month", "state=unactivated",
 	}
 	for _, query := range queries {
 		response := h.request(http.MethodGet, "/internal/v1/cards?page=1&page_size=20&"+query, "", false)
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), cardID) {
 			t.Fatalf("query %s status=%d body=%s", query, response.Code, response.Body.String())
+		}
+		assertNotContains(t, response.Body.String(), plaintext, "full_digest", "ciphertext", "machine_hash")
+	}
+	for name, body := range map[string]string{
+		"note": `{"page":1,"page_size":20,"note_contains":"Needle"}`,
+		"card": `{"page":1,"page_size":20,"complete_card":"` + plaintext + `"}`,
+	} {
+		response := h.request(http.MethodPost, "/internal/v1/cards/search", body, false)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), cardID) {
+			t.Fatalf("sensitive %s status=%d body=%s", name, response.Code, response.Body.String())
 		}
 		assertNotContains(t, response.Body.String(), plaintext, "full_digest", "ciphertext", "machine_hash")
 	}
