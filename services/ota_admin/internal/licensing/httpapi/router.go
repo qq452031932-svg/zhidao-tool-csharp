@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
 )
 
 type Clock interface {
@@ -21,6 +23,37 @@ type LicenseService interface {
 	Validate(context.Context, string, string, string) (model.ActivationState, error)
 }
 
+type AdminService interface {
+	ListSoftware(context.Context, int, int) ([]model.Software, int, error)
+	CreateSoftware(context.Context, string) (model.Software, error)
+	RenameSoftware(context.Context, string, string) error
+	SetSoftwareEnabled(context.Context, string, bool) error
+	ListPackages(context.Context, int, int) ([]model.Package, int, error)
+	CreatePackage(context.Context, string, []string) (model.Package, error)
+	RenamePackage(context.Context, string, string) error
+	ReplacePackageMembers(context.Context, string, []string) error
+	PackageRemovalImpact(context.Context, string, []string) (int, error)
+	GenerateCards(context.Context, string, int, int, *string, []*string) ([]service.GeneratedCard, error)
+	SearchAdminCards(context.Context, string, model.AdminCardFilter, int, int) ([]model.AdminCardSummary, int, error)
+	CopyCard(context.Context, string) (model.AdminExportCard, error)
+	ExportCards(context.Context, []string, int) ([]model.AdminExportCard, error)
+	RemarkCard(context.Context, string, *string) error
+	RenewCard(context.Context, string, int) error
+	UnbindCard(context.Context, string) error
+	DeleteCard(context.Context, string) error
+	ListDevices(context.Context, int, int) ([]model.DeviceSummary, int, error)
+	GetDevice(context.Context, string) (model.DeviceSummary, error)
+	UnbindDevice(context.Context, string) error
+	ProtectAdminReplay(string, []byte) ([]byte, error)
+	OpenAdminReplay(string, []byte) ([]byte, error)
+}
+
+type AdminIdempotencyStore interface {
+	GetAdminIdempotency(context.Context, string, time.Time) (model.AdminIdempotencyRecord, bool, error)
+	PutAdminIdempotency(context.Context, string, model.AdminIdempotencyRecord, time.Time, int) error
+	CompleteAdminIdempotency(context.Context, string, string, model.AdminIdempotencyRecord) error
+}
+
 type ReplayStore interface {
 	ClaimReplayNonce(context.Context, string, time.Time, time.Time, int) (bool, error)
 }
@@ -30,24 +63,32 @@ type ClaimsSigner interface {
 }
 
 type Options struct {
-	Service           LicenseService
-	ReplayStore       ReplayStore
-	Signer            ClaimsSigner
-	Clock             Clock
-	MaxBodyBytes      int64
-	MaxHeaderBytes    int
-	TimestampWindow   time.Duration
-	NonceLifetime     time.Duration
-	MaxReplayNonces   int
-	ActivationRate    RateLimit
-	ValidationRate    RateLimit
-	MaxLimiterEntries int
+	Service               LicenseService
+	ReplayStore           ReplayStore
+	Signer                ClaimsSigner
+	Clock                 Clock
+	MaxBodyBytes          int64
+	MaxHeaderBytes        int
+	TimestampWindow       time.Duration
+	NonceLifetime         time.Duration
+	MaxReplayNonces       int
+	ActivationRate        RateLimit
+	ValidationRate        RateLimit
+	MaxLimiterEntries     int
+	AdminService          AdminService
+	AdminIdempotencyStore AdminIdempotencyStore
+	InternalSecret        []byte
+	AdminRate             RateLimit
+	MaxAdminPageSize      int
+	MaxExportCount        int
 }
 
 type api struct {
-	options    Options
-	activation *fixedWindowLimiter
-	validation *fixedWindowLimiter
+	options       Options
+	activation    *fixedWindowLimiter
+	validation    *fixedWindowLimiter
+	admin         *fixedWindowLimiter
+	adminMutation sync.Mutex
 }
 
 func NewRouter(options Options) (http.Handler, error) {
@@ -63,6 +104,37 @@ func NewRouter(options Options) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /license-api/v1/activate", a.activate)
 	mux.HandleFunc("POST /license-api/v1/validate", a.validate)
+	adminConfigured := options.AdminService != nil || options.AdminIdempotencyStore != nil || len(options.InternalSecret) != 0 || options.AdminRate.Requests != 0 || options.MaxAdminPageSize != 0 || options.MaxExportCount != 0
+	if adminConfigured {
+		if options.AdminService == nil || options.AdminIdempotencyStore == nil || len(options.InternalSecret) < 16 || options.AdminRate.Requests < 1 || options.AdminRate.Window <= 0 || options.MaxAdminPageSize < 1 || options.MaxExportCount < 1 {
+			return nil, errors.New("internal admin API dependencies are invalid")
+		}
+		a.options.InternalSecret = append([]byte(nil), options.InternalSecret...)
+		a.admin = newFixedWindowLimiter(options.AdminRate, options.MaxLimiterEntries, options.Clock)
+		adminMux := http.NewServeMux()
+		adminMux.HandleFunc("GET /internal/v1/software", a.listSoftware)
+		adminMux.HandleFunc("POST /internal/v1/software", a.createSoftware)
+		adminMux.HandleFunc("PATCH /internal/v1/software/{id}", a.renameSoftware)
+		adminMux.HandleFunc("POST /internal/v1/software/{id}/enable", a.enableSoftware)
+		adminMux.HandleFunc("POST /internal/v1/software/{id}/disable", a.disableSoftware)
+		adminMux.HandleFunc("GET /internal/v1/packages", a.listPackages)
+		adminMux.HandleFunc("POST /internal/v1/packages", a.createPackage)
+		adminMux.HandleFunc("PATCH /internal/v1/packages/{id}", a.renamePackage)
+		adminMux.HandleFunc("PUT /internal/v1/packages/{id}/members", a.replacePackageMembers)
+		adminMux.HandleFunc("POST /internal/v1/packages/{id}/impact", a.packageImpact)
+		adminMux.HandleFunc("GET /internal/v1/cards", a.searchCards)
+		adminMux.HandleFunc("POST /internal/v1/cards/generate", a.generateCards)
+		adminMux.HandleFunc("POST /internal/v1/cards/export", a.exportCards)
+		adminMux.HandleFunc("GET /internal/v1/cards/{id}/copy", a.copyCard)
+		adminMux.HandleFunc("PATCH /internal/v1/cards/{id}/remark", a.remarkCard)
+		adminMux.HandleFunc("POST /internal/v1/cards/{id}/renew", a.renewCard)
+		adminMux.HandleFunc("POST /internal/v1/cards/{id}/unbind", a.unbindCard)
+		adminMux.HandleFunc("DELETE /internal/v1/cards/{id}", a.deleteCard)
+		adminMux.HandleFunc("GET /internal/v1/devices", a.listDevices)
+		adminMux.HandleFunc("GET /internal/v1/devices/{id}", a.getDevice)
+		adminMux.HandleFunc("POST /internal/v1/devices/{id}/unbind", a.unbindDevice)
+		mux.Handle("/internal/", a.authorizeInternal(adminMux))
+	}
 	return a.protect(mux), nil
 }
 

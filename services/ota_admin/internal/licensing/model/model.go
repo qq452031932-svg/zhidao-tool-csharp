@@ -12,7 +12,15 @@ const (
 	ProtocolVersion         = 1
 	MaxIdentifierLength     = 128
 	MaxPackageNameUTF8Bytes = MaxIdentifierLength
+	MaxAdminNameUTF8Bytes   = MaxIdentifierLength
 )
+
+func ValidateAdminName(value string) error {
+	if value == "" || strings.TrimSpace(value) != value || !utf8.ValidString(value) || len(value) > MaxAdminNameUTF8Bytes {
+		return fmt.Errorf("name must be valid UTF-8 within %d bytes", MaxAdminNameUTF8Bytes)
+	}
+	return nil
+}
 
 func ValidatePackageName(value string) error {
 	if value == "" || strings.TrimSpace(value) != value || !utf8.ValidString(value) || len(value) > MaxPackageNameUTF8Bytes {
@@ -94,6 +102,15 @@ type Package struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+type AdminIdempotencyRecord struct {
+	Fingerprint        string
+	Status             int
+	Body               []byte
+	ContentType        string
+	ContentDisposition string
+	ExpiresAt          time.Time
+}
+
 type GenerateCardsRequest struct {
 	PackageID string    `json:"package_id"`
 	Count     int       `json:"count"`
@@ -135,6 +152,78 @@ type CardFilter struct {
 	Last4        string `json:"last4"`
 	NoteContains string `json:"note_contains"`
 	PackageID    string `json:"package_id"`
+}
+
+type CardState string
+
+const (
+	CardStateUnactivated CardState = "unactivated"
+	CardStateEffective   CardState = "effective"
+	CardStateExpired     CardState = "expired"
+)
+
+type AdminCardFilter struct {
+	FullDigest   string
+	Prefix8      string
+	Last4        string
+	NoteContains string
+	PackageID    string
+	CardType     string
+	State        CardState
+}
+
+type AdminCardRecord struct {
+	ID                   string     `json:"id"`
+	PackageID            string     `json:"package_id"`
+	PackageName          string     `json:"package_name"`
+	Ciphertext           []byte     `json:"-"`
+	FullDigest           string     `json:"-"`
+	Prefix8              string     `json:"prefix8"`
+	Last4                string     `json:"last4"`
+	BaseDays             int        `json:"base_days"`
+	UnactivatedTotalDays int        `json:"unactivated_total_days"`
+	Note                 *string    `json:"note"`
+	ActivatedAt          *time.Time `json:"activated_at"`
+	ExpiresAt            *time.Time `json:"expires_at"`
+	MachineHash          *string    `json:"-"`
+	CreatedAt            time.Time  `json:"created_at"`
+}
+
+type AdminCardSummary struct {
+	ID             string     `json:"id"`
+	PackageID      string     `json:"package_id"`
+	PackageName    string     `json:"package_name"`
+	Prefix8        string     `json:"prefix8"`
+	Last4          string     `json:"last4"`
+	CardType       string     `json:"card_type"`
+	DurationDays   int        `json:"duration_days"`
+	State          CardState  `json:"state"`
+	ActivatedAt    *time.Time `json:"activated_at"`
+	ExpiresAt      *time.Time `json:"expires_at"`
+	BindingShortID *string    `json:"binding_short_id"`
+	Note           *string    `json:"note"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+type AdminExportCard struct {
+	Summary   AdminCardSummary `json:"card"`
+	Plaintext string           `json:"plaintext"`
+}
+
+type DeviceRecord struct {
+	CardID      string    `json:"card_id"`
+	MachineHash string    `json:"-"`
+	BoundAt     time.Time `json:"bound_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+type DeviceSummary struct {
+	CardShortID              string    `json:"card_short_id"`
+	MachineShortID           string    `json:"machine_short_id"`
+	BoundAt                  time.Time `json:"bound_at"`
+	LastSuccessfulValidation time.Time `json:"last_successful_validation"`
+	ExpiresAt                time.Time `json:"expires_at"`
 }
 
 // CardSummary intentionally omits ciphertext and the full-card digest.

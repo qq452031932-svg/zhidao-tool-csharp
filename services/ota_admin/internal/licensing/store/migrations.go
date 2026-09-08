@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const licenseSchemaVersion = 1
+const licenseSchemaVersion = 2
 
 const licenseSchemaV1 = `
 CREATE TABLE license_schema_version (
@@ -112,6 +112,21 @@ BEGIN
 END;
 `
 
+const licenseSchemaV2 = `
+CREATE TABLE license_admin_idempotency (
+    key TEXT PRIMARY KEY CHECK (length(key)=36),
+    fingerprint TEXT NOT NULL CHECK (length(fingerprint)=64),
+    status INTEGER NOT NULL CHECK (status BETWEEN 100 AND 599),
+    response_body BLOB NOT NULL,
+    content_type TEXT NOT NULL,
+    content_disposition TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX license_admin_idempotency_expiry ON license_admin_idempotency(expires_at,key);
+UPDATE license_schema_version SET version=2 WHERE singleton_id=1;
+`
+
 func migrate(ctx context.Context, db *sql.DB) error {
 	return retrySQLiteBusy(ctx, func() error { return migrateOnce(ctx, db) })
 }
@@ -149,6 +164,9 @@ func migrateOnce(ctx context.Context, db *sql.DB) error {
 		if _, err := tx.ExecContext(ctx, licenseSchemaV1); err != nil {
 			return fmt.Errorf("create license schema: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, licenseSchemaV2); err != nil {
+			return fmt.Errorf("upgrade license schema: %w", err)
+		}
 	} else {
 		var version int
 		if err := tx.QueryRowContext(ctx, `SELECT version FROM license_schema_version WHERE singleton_id=1`).Scan(&version); err != nil {
@@ -156,6 +174,12 @@ func migrateOnce(ctx context.Context, db *sql.DB) error {
 				return errors.New("license schema has no version")
 			}
 			return fmt.Errorf("read license schema version: %w", err)
+		}
+		if version == 1 {
+			if _, err := tx.ExecContext(ctx, licenseSchemaV2); err != nil {
+				return fmt.Errorf("upgrade license schema: %w", err)
+			}
+			version = 2
 		}
 		if version != licenseSchemaVersion {
 			return fmt.Errorf("unsupported license schema version %d", version)

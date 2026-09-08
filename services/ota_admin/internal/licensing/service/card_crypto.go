@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	cardRandomBytes = 20
-	cardGroupSize   = 8
-	cardGroupCount  = 4
-	cardAADDomain   = "ota-license-card:v1:"
+	cardRandomBytes      = 20
+	cardGroupSize        = 8
+	cardGroupCount       = 4
+	cardAADDomain        = "ota-license-card:v1:"
+	adminReplayAADDomain = "ota-license-admin-replay:v1:"
 )
 
 var cardEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -105,6 +106,31 @@ func (p *cardProtector) open(cardID string, ciphertext []byte, expectedDigest st
 		return "", errors.New("invalid encrypted card")
 	}
 	return canonical, nil
+}
+
+func (p *cardProtector) sealAdminReplay(key string, plaintext []byte) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("idempotency key is required")
+	}
+	nonce := make([]byte, p.gcm.NonceSize())
+	if _, err := io.ReadFull(p.random, nonce); err != nil {
+		return nil, err
+	}
+	result := append([]byte(nil), nonce...)
+	result = p.gcm.Seal(result, nonce, plaintext, []byte(adminReplayAADDomain+key))
+	return result, nil
+}
+
+func (p *cardProtector) openAdminReplay(key string, ciphertext []byte) ([]byte, error) {
+	if key == "" || len(ciphertext) < p.gcm.NonceSize()+p.gcm.Overhead() {
+		return nil, errors.New("invalid admin replay")
+	}
+	nonce := ciphertext[:p.gcm.NonceSize()]
+	plaintext, err := p.gcm.Open(nil, nonce, ciphertext[p.gcm.NonceSize():], []byte(adminReplayAADDomain+key))
+	if err != nil {
+		return nil, errors.New("invalid admin replay")
+	}
+	return plaintext, nil
 }
 
 func (p *cardProtector) digest(cardText string) string {

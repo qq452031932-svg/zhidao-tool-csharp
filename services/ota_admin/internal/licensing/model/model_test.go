@@ -8,6 +8,24 @@ import (
 	"time"
 )
 
+func TestAdminStorageRecordsNeverSerializeSecretMaterial(t *testing.T) {
+	encoded, err := json.Marshal(struct {
+		Card   AdminCardRecord `json:"card"`
+		Device DeviceRecord    `json:"device"`
+	}{AdminCardRecord{ID: "card", Ciphertext: []byte("cipher-secret"), FullDigest: "digest-secret", MachineHash: stringPointerForTest("machine-secret")}, DeviceRecord{CardID: "card", MachineHash: "machine-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, secret := range []string{"cipher-secret", "digest-secret", "machine-secret", "Ciphertext", "FullDigest", "MachineHash"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("serialized admin storage secret %q: %s", secret, text)
+		}
+	}
+}
+
+func stringPointerForTest(value string) *string { return &value }
+
 func TestProtocolConstantsAreStable(t *testing.T) {
 	if ProtocolVersion != 1 {
 		t.Fatalf("ProtocolVersion = %d, want 1", ProtocolVersion)

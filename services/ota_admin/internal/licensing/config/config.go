@@ -29,6 +29,7 @@ type Limits struct {
 	MaxReplayNonces          int   `json:"max_replay_nonces"`
 	ActivationRequests       int   `json:"activation_requests"`
 	ValidationRequests       int   `json:"validation_requests"`
+	AdminRequests            int   `json:"admin_requests"`
 	RateWindowSeconds        int   `json:"rate_window_seconds"`
 	ReadHeaderTimeoutSeconds int   `json:"read_header_timeout_seconds"`
 	ReadTimeoutSeconds       int   `json:"read_timeout_seconds"`
@@ -96,7 +97,7 @@ func validateConfigJSONShape(data []byte) error {
 	}
 	limitFields := map[string]struct{}{
 		"max_body_bytes": {}, "max_header_bytes": {}, "timestamp_window_seconds": {}, "nonce_lifetime_seconds": {}, "max_replay_nonces": {},
-		"activation_requests": {}, "validation_requests": {}, "rate_window_seconds": {}, "read_header_timeout_seconds": {},
+		"activation_requests": {}, "validation_requests": {}, "admin_requests": {}, "rate_window_seconds": {}, "read_header_timeout_seconds": {},
 		"read_timeout_seconds": {}, "write_timeout_seconds": {}, "idle_timeout_seconds": {}, "shutdown_timeout_seconds": {},
 	}
 	if _, err := strictJSONObject(limits, limitFields); err != nil {
@@ -191,7 +192,7 @@ func (c Config) Validate() error {
 	if c.Limits.MaxReplayNonces < 1 || c.Limits.MaxReplayNonces > 1_000_000 {
 		return errors.New("replay nonce cap is outside the safe range")
 	}
-	if c.Limits.ActivationRequests < 1 || c.Limits.ActivationRequests > 10000 || c.Limits.ValidationRequests < 1 || c.Limits.ValidationRequests > 10000 {
+	if c.Limits.ActivationRequests < 1 || c.Limits.ActivationRequests > 10000 || c.Limits.ValidationRequests < 1 || c.Limits.ValidationRequests > 10000 || c.Limits.AdminRequests < 1 || c.Limits.AdminRequests > 10000 {
 		return errors.New("rate limits are outside the safe range")
 	}
 	if c.Limits.RateWindowSeconds < 1 || c.Limits.RateWindowSeconds > 3600 {

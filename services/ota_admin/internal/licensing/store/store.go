@@ -25,6 +25,7 @@ var (
 	ErrSoftwareDisabled    = errors.New("software is disabled")
 	ErrLicenseExpired      = errors.New("license is expired")
 	ErrReplayNonceCapacity = errors.New("replay nonce capacity reached")
+	ErrConflict            = errors.New("license record conflicts with existing state")
 )
 
 const busyTimeoutMilliseconds = 10_000
@@ -92,16 +93,67 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) CreateSoftware(ctx context.Context, name string) (model.Software, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	return s.CreateSoftwareAt(ctx, name, time.Now().UTC())
+}
+
+func (s *Store) CreateSoftwareAt(ctx context.Context, name string, createdAt time.Time) (model.Software, error) {
+	if err := model.ValidateAdminName(name); err != nil {
 		return model.Software{}, errors.New("software name is required")
 	}
-	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	software := model.Software{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: canonicalTime(createdAt)}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO license_software(id,name,enabled,created_at) VALUES(?,?,1,?)`, software.ID, software.Name, unixTime(software.CreatedAt))
 	if err != nil {
+		if isUniqueConstraint(err) {
+			return model.Software{}, ErrConflict
+		}
 		return model.Software{}, fmt.Errorf("create software: %w", err)
 	}
 	return software, nil
+}
+
+func (s *Store) ListSoftware(ctx context.Context, offset, limit int) ([]model.Software, int, error) {
+	if offset < 0 || limit < 1 {
+		return nil, 0, errors.New("invalid software page")
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count software: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,created_at FROM license_software ORDER BY created_at,id LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list software: %w", err)
+	}
+	defer rows.Close()
+	items := make([]model.Software, 0, limit)
+	for rows.Next() {
+		var item model.Software
+		var enabled int
+		var created int64
+		if err := rows.Scan(&item.ID, &item.Name, &enabled, &created); err != nil {
+			return nil, 0, fmt.Errorf("scan software: %w", err)
+		}
+		item.Enabled = enabled != 0
+		item.CreatedAt = time.Unix(created, 0).UTC()
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("list software: %w", err)
+	}
+	return items, total, nil
+}
+
+func (s *Store) RenameSoftware(ctx context.Context, id, name string) error {
+	if err := model.ValidateAdminName(name); err != nil {
+		return errors.New("software name is invalid")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE license_software SET name=? WHERE id=?`, name, id)
+	if err != nil {
+		if isUniqueConstraint(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("rename software: %w", err)
+	}
+	return requireAffected(result)
 }
 
 func (s *Store) SetSoftwareEnabled(ctx context.Context, id string, enabled bool) error {
@@ -113,6 +165,10 @@ func (s *Store) SetSoftwareEnabled(ctx context.Context, id string, enabled bool)
 }
 
 func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []string) (model.Package, error) {
+	return s.CreatePackageAt(ctx, name, softwareIDs, time.Now().UTC())
+}
+
+func (s *Store) CreatePackageAt(ctx context.Context, name string, softwareIDs []string, createdAt time.Time) (model.Package, error) {
 	name = strings.TrimSpace(name)
 	if err := model.ValidatePackageName(name); err != nil {
 		return model.Package{}, errors.New("package name is invalid")
@@ -121,13 +177,16 @@ func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []st
 	if err != nil {
 		return model.Package{}, err
 	}
-	pkg := model.Package{ID: uuid.NewString(), Name: name, SoftwareIDs: ids, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	pkg := model.Package{ID: uuid.NewString(), Name: name, SoftwareIDs: ids, CreatedAt: canonicalTime(createdAt)}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return model.Package{}, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO license_packages(id,name,created_at) VALUES(?,?,?)`, pkg.ID, pkg.Name, unixTime(pkg.CreatedAt)); err != nil {
+		if isUniqueConstraint(err) {
+			return model.Package{}, ErrConflict
+		}
 		return model.Package{}, fmt.Errorf("create package: %w", err)
 	}
 	if err := insertPackageMembers(ctx, tx, pkg.ID, ids); err != nil {
@@ -137,6 +196,154 @@ func (s *Store) CreatePackage(ctx context.Context, name string, softwareIDs []st
 		return model.Package{}, fmt.Errorf("commit package: %w", err)
 	}
 	return pkg, nil
+}
+
+func (s *Store) ListPackages(ctx context.Context, offset, limit int) ([]model.Package, int, error) {
+	if offset < 0 || limit < 1 {
+		return nil, 0, errors.New("invalid package page")
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_packages`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count packages: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id,p.name,p.created_at,COALESCE(group_concat(m.software_id,','),'')
+FROM (SELECT id,name,created_at FROM license_packages ORDER BY created_at,id LIMIT ? OFFSET ?) p
+LEFT JOIN license_package_members m ON m.package_id=p.id
+GROUP BY p.id,p.name,p.created_at ORDER BY p.created_at,p.id`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list packages: %w", err)
+	}
+	defer rows.Close()
+	items := make([]model.Package, 0, limit)
+	for rows.Next() {
+		item, err := scanPackage(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func (s *Store) GetPackage(ctx context.Context, id string) (model.Package, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT p.id,p.name,p.created_at,COALESCE(group_concat(m.software_id, ','), '') FROM license_packages p LEFT JOIN license_package_members m ON m.package_id=p.id WHERE p.id=? GROUP BY p.id,p.name,p.created_at`, id)
+	item, err := scanPackage(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Package{}, ErrNotFound
+	}
+	if err != nil {
+		return model.Package{}, fmt.Errorf("get package: %w", err)
+	}
+	return item, nil
+}
+
+func scanPackage(row rowScanner) (model.Package, error) {
+	var item model.Package
+	var created int64
+	var members string
+	if err := row.Scan(&item.ID, &item.Name, &created, &members); err != nil {
+		return item, err
+	}
+	item.CreatedAt = time.Unix(created, 0).UTC()
+	if members != "" {
+		item.SoftwareIDs = strings.Split(members, ",")
+		sort.Strings(item.SoftwareIDs)
+	}
+	return item, nil
+}
+
+func (s *Store) RenamePackage(ctx context.Context, id, name string) error {
+	if model.ValidatePackageName(name) != nil {
+		return errors.New("package name is invalid")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE license_packages SET name=? WHERE id=?`, name, id)
+	if err != nil {
+		if isUniqueConstraint(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("rename package: %w", err)
+	}
+	return requireAffected(result)
+}
+
+func (s *Store) PackageRemovalImpact(ctx context.Context, id string, replacement []string, now time.Time) (int, error) {
+	ids, err := normalizedIDs(replacement)
+	if err != nil {
+		return 0, err
+	}
+	pkg, err := s.GetPackage(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	kept := make(map[string]struct{}, len(ids))
+	for _, value := range ids {
+		kept[value] = struct{}{}
+	}
+	removed := false
+	for _, value := range pkg.SoftwareIDs {
+		if _, ok := kept[value]; !ok {
+			removed = true
+			break
+		}
+	}
+	if !removed {
+		return 0, nil
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_cards WHERE package_id=? AND activated_at IS NOT NULL AND expires_at>?`, id, unixTime(now)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count package impact: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) GetAdminIdempotency(ctx context.Context, key string, now time.Time) (model.AdminIdempotencyRecord, bool, error) {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=?`, unixTime(now)); err != nil {
+		return model.AdminIdempotencyRecord{}, false, fmt.Errorf("prune admin idempotency: %w", err)
+	}
+	var record model.AdminIdempotencyRecord
+	var expires int64
+	err := s.db.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ContentType, &record.ContentDisposition, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.AdminIdempotencyRecord{}, false, nil
+	}
+	if err != nil {
+		return model.AdminIdempotencyRecord{}, false, fmt.Errorf("read admin idempotency: %w", err)
+	}
+	record.ExpiresAt = time.Unix(expires, 0).UTC()
+	return record, true, nil
+}
+
+func (s *Store) PutAdminIdempotency(ctx context.Context, key string, record model.AdminIdempotencyRecord, now time.Time, maximum int) error {
+	if maximum < 1 || !record.ExpiresAt.After(now) {
+		return errors.New("invalid admin idempotency record")
+	}
+	return s.immediate(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE expires_at<=?`, unixTime(now)); err != nil {
+			return err
+		}
+		var count int
+		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil {
+			return err
+		}
+		if count >= maximum {
+			if _, err := conn.ExecContext(ctx, `DELETE FROM license_admin_idempotency WHERE key IN (SELECT key FROM license_admin_idempotency ORDER BY expires_at,key LIMIT 1)`); err != nil {
+				return err
+			}
+		}
+		_, err := conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(now))
+		return err
+	})
+}
+
+func (s *Store) CompleteAdminIdempotency(ctx context.Context, key, fingerprint string, record model.AdminIdempotencyRecord) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE license_admin_idempotency SET status=?,response_body=?,content_type=?,content_disposition=? WHERE key=? AND fingerprint=? AND status=102`, record.Status, record.Body, record.ContentType, record.ContentDisposition, key, fingerprint)
+	if err != nil {
+		return fmt.Errorf("complete admin idempotency: %w", err)
+	}
+	return requireAffected(result)
 }
 
 func (s *Store) GetPackageName(ctx context.Context, id string) (string, error) {
@@ -230,6 +437,12 @@ func (s *Store) GenerateCards(ctx context.Context, req model.GenerateCardsReques
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 			item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
+			if isForeignKeyConstraint(err) {
+				return nil, ErrNotFound
+			}
+			if isUniqueConstraint(err) {
+				return nil, ErrConflict
+			}
 			return nil, fmt.Errorf("store sealed card: %w", err)
 		}
 		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(note), CreatedAt: createdAt})
@@ -484,6 +697,188 @@ func (s *Store) SearchCards(ctx context.Context, filter model.CardFilter) ([]mod
 	return cards, nil
 }
 
+func (s *Store) SearchAdminCards(ctx context.Context, filter model.AdminCardFilter, now time.Time, offset, limit int) ([]model.AdminCardRecord, int, error) {
+	if offset < 0 || limit < 1 {
+		return nil, 0, errors.New("invalid card page")
+	}
+	where, args := adminCardWhere(filter, now)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_cards c WHERE `+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count admin cards: %w", err)
+	}
+	query := `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at
+FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE ` + where + ` ORDER BY c.created_at,c.id LIMIT ? OFFSET ?`
+	pageArgs := append(append([]any(nil), args...), limit, offset)
+	rows, err := s.db.QueryContext(ctx, query, pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("search admin cards: %w", err)
+	}
+	defer rows.Close()
+	items := make([]model.AdminCardRecord, 0, limit)
+	for rows.Next() {
+		item, err := scanAdminCard(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func adminCardWhere(filter model.AdminCardFilter, now time.Time) (string, []any) {
+	clauses := []string{"1=1"}
+	args := make([]any, 0, 7)
+	add := func(clause string, value any) { clauses = append(clauses, clause); args = append(args, value) }
+	if filter.FullDigest != "" {
+		add("c.full_digest=?", filter.FullDigest)
+	}
+	if filter.Prefix8 != "" {
+		add("c.prefix8=?", filter.Prefix8)
+	}
+	if filter.Last4 != "" {
+		add("c.last4=?", filter.Last4)
+	}
+	if filter.NoteContains != "" {
+		add("c.note IS NOT NULL AND instr(lower(c.note),lower(?))>0", filter.NoteContains)
+	}
+	if filter.PackageID != "" {
+		add("c.package_id=?", filter.PackageID)
+	}
+	switch filter.State {
+	case model.CardStateUnactivated:
+		clauses = append(clauses, "c.activated_at IS NULL")
+	case model.CardStateEffective:
+		add("c.activated_at IS NOT NULL AND c.expires_at>?", unixTime(now))
+	case model.CardStateExpired:
+		add("c.expires_at IS NOT NULL AND c.expires_at<=?", unixTime(now))
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+func (s *Store) GetAdminCard(ctx context.Context, id string) (model.AdminCardRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id=?`, id)
+	item, err := scanAdminCard(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.AdminCardRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return model.AdminCardRecord{}, fmt.Errorf("get admin card: %w", err)
+	}
+	return item, nil
+}
+
+func (s *Store) GetAdminCards(ctx context.Context, ids []string) ([]model.AdminCardRecord, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("card IDs are required")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get admin cards: %w", err)
+	}
+	defer rows.Close()
+	found := make(map[string]model.AdminCardRecord, len(ids))
+	for rows.Next() {
+		item, err := scanAdminCard(rows)
+		if err != nil {
+			return nil, err
+		}
+		found[item.ID] = item
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	items := make([]model.AdminCardRecord, len(ids))
+	for i, id := range ids {
+		item, ok := found[id]
+		if !ok {
+			return nil, ErrNotFound
+		}
+		items[i] = item
+	}
+	return items, nil
+}
+
+func scanAdminCard(row rowScanner) (model.AdminCardRecord, error) {
+	var item model.AdminCardRecord
+	var note, machine sql.NullString
+	var activated, expires sql.NullInt64
+	var created int64
+	if err := row.Scan(&item.ID, &item.PackageID, &item.PackageName, &item.Ciphertext, &item.FullDigest, &item.Prefix8, &item.Last4, &item.BaseDays, &item.UnactivatedTotalDays, &note, &activated, &expires, &machine, &created); err != nil {
+		return item, err
+	}
+	item.Note = nullableString(note)
+	item.MachineHash = nullableString(machine)
+	item.ActivatedAt = nullableTime(activated)
+	item.ExpiresAt = nullableTime(expires)
+	item.CreatedAt = time.Unix(created, 0).UTC()
+	return item, nil
+}
+
+func (s *Store) SetCardNote(ctx context.Context, id string, note *string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE license_cards SET note=? WHERE id=?`, note, id)
+	if err != nil {
+		return fmt.Errorf("set card note: %w", err)
+	}
+	return requireAffected(result)
+}
+
+func (s *Store) ListDevices(ctx context.Context, offset, limit int) ([]model.DeviceRecord, int, error) {
+	if offset < 0 || limit < 1 {
+		return nil, 0, errors.New("invalid device page")
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT card_id,machine_hash FROM license_activation_bindings GROUP BY card_id,machine_hash)`).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT b.card_id,b.machine_hash,min(b.activated_at),COALESCE(max(l.last_seen_at),min(b.activated_at)),max(b.expires_at)
+FROM license_activation_bindings b LEFT JOIN license_leases l ON l.card_id=b.card_id AND l.machine_hash=b.machine_hash
+GROUP BY b.card_id,b.machine_hash ORDER BY min(b.activated_at),b.card_id LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list devices: %w", err)
+	}
+	defer rows.Close()
+	items := make([]model.DeviceRecord, 0, limit)
+	for rows.Next() {
+		var item model.DeviceRecord
+		var bound, seen, expires int64
+		if err := rows.Scan(&item.CardID, &item.MachineHash, &bound, &seen, &expires); err != nil {
+			return nil, 0, err
+		}
+		item.BoundAt = time.Unix(bound, 0).UTC()
+		item.LastSeenAt = time.Unix(seen, 0).UTC()
+		item.ExpiresAt = time.Unix(expires, 0).UTC()
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func (s *Store) GetDevice(ctx context.Context, cardID string) (model.DeviceRecord, error) {
+	var item model.DeviceRecord
+	var bound, seen, expires int64
+	err := s.db.QueryRowContext(ctx, `SELECT b.card_id,b.machine_hash,min(b.activated_at),COALESCE(max(l.last_seen_at),min(b.activated_at)),max(b.expires_at) FROM license_activation_bindings b LEFT JOIN license_leases l ON l.card_id=b.card_id AND l.machine_hash=b.machine_hash WHERE b.card_id=? GROUP BY b.card_id,b.machine_hash`, cardID).Scan(&item.CardID, &item.MachineHash, &bound, &seen, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.DeviceRecord{}, ErrNotFound
+	}
+	if err != nil {
+		return model.DeviceRecord{}, fmt.Errorf("get device: %w", err)
+	}
+	item.BoundAt = time.Unix(bound, 0).UTC()
+	item.LastSeenAt = time.Unix(seen, 0).UTC()
+	item.ExpiresAt = time.Unix(expires, 0).UTC()
+	return item, nil
+}
+
 // ClaimReplayNonce atomically removes expired copies of nonce and claims the
 // nonce until expiresAt. A false result means it is still live and is a replay.
 func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, now time.Time, maximum int) (bool, error) {
@@ -696,6 +1091,9 @@ func scanCardSummary(row rowScanner) (model.CardSummary, error) {
 func insertPackageMembers(ctx context.Context, tx *sql.Tx, packageID string, softwareIDs []string) error {
 	for _, softwareID := range softwareIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO license_package_members(package_id,software_id) VALUES(?,?)`, packageID, softwareID); err != nil {
+			if isForeignKeyConstraint(err) {
+				return ErrNotFound
+			}
 			return fmt.Errorf("insert package member: %w", err)
 		}
 	}
@@ -789,6 +1187,14 @@ func retrySQLiteBusy(ctx context.Context, operation func() error) error {
 func isSQLiteBusy(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "sqlite_busy") || strings.Contains(message, "database is locked") || strings.Contains(message, "database table is locked")
+}
+
+func isUniqueConstraint(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
+}
+
+func isForeignKeyConstraint(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed")
 }
 
 func nullableTime(value sql.NullInt64) *time.Time {

@@ -23,6 +23,8 @@ import (
 )
 
 const maximumLimiterEntries = 4096
+const maximumAdminPageSize = 100
+const maximumAdminExportCount = 1000
 
 type systemClock struct{}
 
@@ -78,7 +80,7 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	if err != nil {
 		return errors.New("load internal API secret")
 	}
-	clear(internalSecret)
+	defer clear(internalSecret)
 	privateKey, err := signing.LoadPrivateKey(cfg.SigningPrivateKeyPath)
 	if err != nil {
 		return errors.New("load signing private key")
@@ -112,15 +114,19 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	handler, err := licensehttp.NewRouter(licensehttp.Options{
 		Service: licenses, ReplayStore: database, Signer: signer, Clock: clock,
 		MaxBodyBytes: cfg.Limits.MaxBodyBytes, MaxHeaderBytes: cfg.Limits.MaxHeaderBytes,
-		TimestampWindow:   time.Duration(cfg.Limits.TimestampWindowSeconds) * time.Second,
-		NonceLifetime:     time.Duration(cfg.Limits.NonceLifetimeSeconds) * time.Second,
-		MaxReplayNonces:   cfg.Limits.MaxReplayNonces,
-		ActivationRate:    licensehttp.RateLimit{Requests: cfg.Limits.ActivationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
-		ValidationRate:    licensehttp.RateLimit{Requests: cfg.Limits.ValidationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
+		TimestampWindow: time.Duration(cfg.Limits.TimestampWindowSeconds) * time.Second,
+		NonceLifetime:   time.Duration(cfg.Limits.NonceLifetimeSeconds) * time.Second,
+		MaxReplayNonces: cfg.Limits.MaxReplayNonces,
+		ActivationRate:  licensehttp.RateLimit{Requests: cfg.Limits.ActivationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
+		ValidationRate:  licensehttp.RateLimit{Requests: cfg.Limits.ValidationRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
+		AdminService:    licenses, AdminIdempotencyStore: database, InternalSecret: internalSecret,
+		AdminRate:        licensehttp.RateLimit{Requests: cfg.Limits.AdminRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
+		MaxAdminPageSize: maximumAdminPageSize, MaxExportCount: maximumAdminExportCount,
 		MaxLimiterEntries: maximumLimiterEntries,
 	})
+	clear(internalSecret)
 	if err != nil {
-		return errors.New("initialize public license API")
+		return errors.New("initialize license API")
 	}
 
 	serverContext, stopServer := context.WithCancel(ctx)

@@ -179,7 +179,7 @@ func writeRuntimeConfig(t *testing.T) licenseconfig.Config {
 		EncryptionKeyPath: filepath.Join(dir, "encryption.key"), LookupHMACKeyPath: filepath.Join(dir, "hmac.key"),
 		SigningPrivateKeyPath: filepath.Join(dir, "signing.pem"), InternalSecretPath: filepath.Join(dir, "internal.key"),
 		SigningKeyID: "serve-key", PublicAPIBasePath: "/license-api/v1",
-		Limits: licenseconfig.Limits{MaxBodyBytes: 8192, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 10_000, ActivationRequests: 20, ValidationRequests: 60, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 2, ReadTimeoutSeconds: 5, WriteTimeoutSeconds: 5, IdleTimeoutSeconds: 10, ShutdownTimeoutSeconds: 2},
+		Limits: licenseconfig.Limits{MaxBodyBytes: 8192, MaxHeaderBytes: 16384, TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600, MaxReplayNonces: 10_000, ActivationRequests: 20, ValidationRequests: 60, AdminRequests: 30, RateWindowSeconds: 60, ReadHeaderTimeoutSeconds: 2, ReadTimeoutSeconds: 5, WriteTimeoutSeconds: 5, IdleTimeoutSeconds: 10, ShutdownTimeoutSeconds: 2},
 	}
 	for index, path := range []string{cfg.EncryptionKeyPath, cfg.LookupHMACKeyPath, cfg.InternalSecretPath} {
 		if err := os.WriteFile(path, bytes.Repeat([]byte{byte(0x41 + index)}, 32), 0o600); err != nil {

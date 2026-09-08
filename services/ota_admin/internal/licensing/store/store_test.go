@@ -68,6 +68,63 @@ func TestOpenCreatesIsolatedLicenseSchemaAndConfiguresSQLite(t *testing.T) {
 	}
 }
 
+func TestAdminSchemaMigratesV1AndIdempotencyIsPersistentBoundedAndPruned(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "license-v1.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, licenseSchemaV1); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	record := model.AdminIdempotencyRecord{Fingerprint: strings.Repeat("a", 64), Status: 201, Body: []byte(`{"ok":true}`), ContentType: "application/json", ExpiresAt: now.Add(time.Hour)}
+	key := uuid.NewString()
+	if err := s.PutAdminIdempotency(ctx, key, record, now, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, found, err := s.GetAdminIdempotency(ctx, key, now)
+	if err != nil || !found || got.Status != record.Status || string(got.Body) != string(record.Body) || got.ContentType != record.ContentType {
+		t.Fatalf("persistent record=%+v found=%v err=%v", got, found, err)
+	}
+	for _, fingerprint := range []string{strings.Repeat("b", 64), strings.Repeat("c", 64)} {
+		record.Fingerprint = fingerprint
+		if err := s.PutAdminIdempotency(ctx, uuid.NewString(), record, now, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("bounded count=%d err=%v", count, err)
+	}
+	if _, _, err := s.GetAdminIdempotency(ctx, uuid.NewString(), now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("pruned count=%d err=%v", count, err)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, `SELECT version FROM license_schema_version WHERE singleton_id=1`).Scan(&version); err != nil || version != licenseSchemaVersion {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+}
+
 func TestSoftwareIdentifiersAreUUIDsImmutableAndSoftwareIsToggledNotDeleted(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

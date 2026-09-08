@@ -3,11 +3,14 @@ package service
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
@@ -21,6 +24,7 @@ var (
 	ErrAppDisabled     = errors.New("software disabled")
 	ErrMachineMismatch = errors.New("machine mismatch")
 	ErrInvalidRequest  = errors.New("invalid license request")
+	ErrConflict        = errors.New("license state conflict")
 )
 
 const validationLease = 30 * time.Minute
@@ -45,6 +49,284 @@ type Store interface {
 	RenewCard(context.Context, string, int, time.Time) error
 	UnbindCard(context.Context, string) error
 	DeleteCard(context.Context, string) error
+}
+
+type AdminStore interface {
+	ListSoftware(context.Context, int, int) ([]model.Software, int, error)
+	CreateSoftware(context.Context, string) (model.Software, error)
+	CreateSoftwareAt(context.Context, string, time.Time) (model.Software, error)
+	RenameSoftware(context.Context, string, string) error
+	SetSoftwareEnabled(context.Context, string, bool) error
+	ListPackages(context.Context, int, int) ([]model.Package, int, error)
+	CreatePackage(context.Context, string, []string) (model.Package, error)
+	CreatePackageAt(context.Context, string, []string, time.Time) (model.Package, error)
+	RenamePackage(context.Context, string, string) error
+	ReplacePackageMembers(context.Context, string, []string) error
+	PackageRemovalImpact(context.Context, string, []string, time.Time) (int, error)
+	SearchAdminCards(context.Context, model.AdminCardFilter, time.Time, int, int) ([]model.AdminCardRecord, int, error)
+	GetAdminCard(context.Context, string) (model.AdminCardRecord, error)
+	GetAdminCards(context.Context, []string) ([]model.AdminCardRecord, error)
+	SetCardNote(context.Context, string, *string) error
+	ListDevices(context.Context, int, int) ([]model.DeviceRecord, int, error)
+	GetDevice(context.Context, string) (model.DeviceRecord, error)
+}
+
+func (s *Service) ListPackages(ctx context.Context, page, pageSize int) ([]model.Package, int, error) {
+	if page < 1 || pageSize < 1 {
+		return nil, 0, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return nil, 0, errors.New("admin store unavailable")
+	}
+	items, total, err := admin.ListPackages(ctx, (page-1)*pageSize, pageSize)
+	return items, total, classifyStoreError(err)
+}
+
+func (s *Service) CreatePackage(ctx context.Context, name string, softwareIDs []string) (model.Package, error) {
+	if model.ValidatePackageName(name) != nil || !validUUIDIDs(softwareIDs, 100) {
+		return model.Package{}, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return model.Package{}, errors.New("admin store unavailable")
+	}
+	now := s.clock.Now().UTC()
+	if now.IsZero() {
+		return model.Package{}, ErrInvalidRequest
+	}
+	item, err := admin.CreatePackageAt(ctx, name, softwareIDs, now)
+	return item, classifyStoreError(err)
+}
+
+func (s *Service) RenamePackage(ctx context.Context, id, name string) error {
+	if !validUUID(id) || model.ValidatePackageName(name) != nil {
+		return ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return errors.New("admin store unavailable")
+	}
+	return classifyStoreError(admin.RenamePackage(ctx, id, name))
+}
+
+func (s *Service) ReplacePackageMembers(ctx context.Context, id string, softwareIDs []string) error {
+	if !validUUID(id) || !validUUIDIDs(softwareIDs, 100) {
+		return ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return errors.New("admin store unavailable")
+	}
+	return classifyStoreError(admin.ReplacePackageMembers(ctx, id, softwareIDs))
+}
+
+func (s *Service) PackageRemovalImpact(ctx context.Context, id string, softwareIDs []string) (int, error) {
+	if !validUUID(id) || !validUUIDIDs(softwareIDs, 100) {
+		return 0, ErrInvalidRequest
+	}
+	now := s.clock.Now().UTC()
+	if now.IsZero() {
+		return 0, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return 0, errors.New("admin store unavailable")
+	}
+	count, err := admin.PackageRemovalImpact(ctx, id, softwareIDs, now)
+	return count, classifyStoreError(err)
+}
+
+func (s *Service) SearchAdminCards(ctx context.Context, completeCard string, filter model.AdminCardFilter, page, pageSize int) ([]model.AdminCardSummary, int, error) {
+	if page < 1 || pageSize < 1 || !validAdminCardFilter(filter) {
+		return nil, 0, ErrInvalidRequest
+	}
+	if completeCard != "" {
+		if !validRawCardInput(completeCard) {
+			return nil, 0, ErrInvalidRequest
+		}
+		_, compact, err := normalizeCard(completeCard)
+		if err != nil {
+			return nil, 0, ErrInvalidRequest
+		}
+		filter.FullDigest = s.protector.digestCompact(compact)
+	}
+	now := s.clock.Now().UTC()
+	if now.IsZero() {
+		return nil, 0, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return nil, 0, errors.New("admin store unavailable")
+	}
+	records, total, err := admin.SearchAdminCards(ctx, filter, now, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, classifyStoreError(err)
+	}
+	items := make([]model.AdminCardSummary, len(records))
+	for i := range records {
+		items[i] = adminCardSummary(records[i], now)
+	}
+	return items, total, nil
+}
+
+func (s *Service) CopyCard(ctx context.Context, id string) (model.AdminExportCard, error) {
+	if !validUUID(id) {
+		return model.AdminExportCard{}, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return model.AdminExportCard{}, errors.New("admin store unavailable")
+	}
+	record, err := admin.GetAdminCard(ctx, id)
+	if err != nil {
+		return model.AdminExportCard{}, classifyStoreError(err)
+	}
+	plaintext, err := s.protector.open(record.ID, record.Ciphertext, record.FullDigest)
+	if err != nil {
+		return model.AdminExportCard{}, errors.New("open protected card")
+	}
+	return model.AdminExportCard{Summary: adminCardSummary(record, s.clock.Now().UTC()), Plaintext: plaintext}, nil
+}
+
+func (s *Service) ExportCards(ctx context.Context, ids []string, maximum int) ([]model.AdminExportCard, error) {
+	if len(ids) < 1 || len(ids) > maximum || maximum < 1 {
+		return nil, ErrInvalidRequest
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if !validUUID(id) {
+			return nil, ErrInvalidRequest
+		}
+		if _, exists := seen[id]; exists {
+			return nil, ErrInvalidRequest
+		}
+		seen[id] = struct{}{}
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return nil, errors.New("admin store unavailable")
+	}
+	records, err := admin.GetAdminCards(ctx, ids)
+	if err != nil {
+		return nil, classifyStoreError(err)
+	}
+	now := s.clock.Now().UTC()
+	result := make([]model.AdminExportCard, len(records))
+	for i, record := range records {
+		plaintext, err := s.protector.open(record.ID, record.Ciphertext, record.FullDigest)
+		if err != nil {
+			return nil, errors.New("open protected card")
+		}
+		result[i] = model.AdminExportCard{Summary: adminCardSummary(record, now), Plaintext: plaintext}
+	}
+	return result, nil
+}
+
+func (s *Service) RemarkCard(ctx context.Context, id string, note *string) error {
+	if !validUUID(id) || !validNote(note) {
+		return ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return errors.New("admin store unavailable")
+	}
+	return classifyStoreError(admin.SetCardNote(ctx, id, cloneString(note)))
+}
+
+func (s *Service) ListDevices(ctx context.Context, page, pageSize int) ([]model.DeviceSummary, int, error) {
+	if page < 1 || pageSize < 1 {
+		return nil, 0, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return nil, 0, errors.New("admin store unavailable")
+	}
+	records, total, err := admin.ListDevices(ctx, (page-1)*pageSize, pageSize)
+	if err != nil {
+		return nil, 0, classifyStoreError(err)
+	}
+	items := make([]model.DeviceSummary, len(records))
+	for i, record := range records {
+		items[i] = deviceSummary(record)
+	}
+	return items, total, nil
+}
+
+func (s *Service) GetDevice(ctx context.Context, cardID string) (model.DeviceSummary, error) {
+	if !validUUID(cardID) {
+		return model.DeviceSummary{}, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return model.DeviceSummary{}, errors.New("admin store unavailable")
+	}
+	record, err := admin.GetDevice(ctx, cardID)
+	if err != nil {
+		return model.DeviceSummary{}, classifyStoreError(err)
+	}
+	return deviceSummary(record), nil
+}
+
+func (s *Service) UnbindDevice(ctx context.Context, cardID string) error {
+	return s.UnbindCard(ctx, cardID)
+}
+
+func (s *Service) ProtectAdminReplay(key string, plaintext []byte) ([]byte, error) {
+	if !validUUID(key) {
+		return nil, ErrInvalidRequest
+	}
+	return s.protector.sealAdminReplay(key, plaintext)
+}
+func (s *Service) OpenAdminReplay(key string, ciphertext []byte) ([]byte, error) {
+	if !validUUID(key) {
+		return nil, ErrInvalidRequest
+	}
+	return s.protector.openAdminReplay(key, ciphertext)
+}
+
+func deviceSummary(record model.DeviceRecord) model.DeviceSummary {
+	cardShort := record.CardID
+	if len(cardShort) > 8 {
+		cardShort = cardShort[:8]
+	}
+	return model.DeviceSummary{CardShortID: cardShort, MachineShortID: shortOpaque("machine:" + record.MachineHash), BoundAt: record.BoundAt, LastSuccessfulValidation: record.LastSeenAt, ExpiresAt: record.ExpiresAt}
+}
+
+func validAdminCardFilter(filter model.AdminCardFilter) bool {
+	if (filter.Prefix8 != "" && len(filter.Prefix8) != 8) || (filter.Last4 != "" && len(filter.Last4) != 4) || len(filter.NoteContains) > MaxNoteUTF8Bytes || (filter.PackageID != "" && !validUUID(filter.PackageID)) || !utf8.ValidString(filter.NoteContains) {
+		return false
+	}
+	if filter.CardType != "" && filter.CardType != "duration" {
+		return false
+	}
+	switch filter.State {
+	case "", model.CardStateUnactivated, model.CardStateEffective, model.CardStateExpired:
+	default:
+		return false
+	}
+	return true
+}
+
+func adminCardSummary(record model.AdminCardRecord, now time.Time) model.AdminCardSummary {
+	state := model.CardStateUnactivated
+	if record.ActivatedAt != nil {
+		state = model.CardStateEffective
+		if record.ExpiresAt != nil && !record.ExpiresAt.After(now) {
+			state = model.CardStateExpired
+		}
+	}
+	var binding *string
+	if record.MachineHash != nil {
+		value := shortOpaque("machine:" + *record.MachineHash)
+		binding = &value
+	}
+	return model.AdminCardSummary{ID: record.ID, PackageID: record.PackageID, PackageName: record.PackageName, Prefix8: record.Prefix8, Last4: record.Last4, CardType: "duration", DurationDays: record.BaseDays, State: state, ActivatedAt: record.ActivatedAt, ExpiresAt: record.ExpiresAt, BindingShortID: binding, Note: cloneString(record.Note), CreatedAt: record.CreatedAt}
+}
+
+func shortOpaque(value string) string {
+	sum := sha256.Sum256([]byte("license-admin-short:v1:" + value))
+	return hex.EncodeToString(sum[:6])
 }
 
 var _ Store = (*licensestore.Store)(nil)
@@ -79,7 +361,7 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 		return nil, ErrInvalidRequest
 	}
 	packageID, valid = boundedIdentifier(packageID)
-	if !valid || !allowedDuration(durationDays) || (perCardNotes != nil && len(perCardNotes) != count) || !validNote(defaultNote) {
+	if !valid || !validUUID(packageID) || !allowedDuration(durationDays) || (perCardNotes != nil && len(perCardNotes) != count) || !validNote(defaultNote) {
 		return nil, ErrInvalidRequest
 	}
 	for _, note := range perCardNotes {
@@ -202,8 +484,7 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 }
 
 func (s *Service) RenewCard(ctx context.Context, cardID string, days int) error {
-	var valid bool
-	if cardID, valid = boundedIdentifier(cardID); !valid || !allowedDuration(days) {
+	if !validUUID(cardID) || !allowedDuration(days) {
 		return ErrInvalidRequest
 	}
 	now := s.clock.Now().UTC()
@@ -214,19 +495,67 @@ func (s *Service) RenewCard(ctx context.Context, cardID string, days int) error 
 }
 
 func (s *Service) UnbindCard(ctx context.Context, cardID string) error {
-	var valid bool
-	if cardID, valid = boundedIdentifier(cardID); !valid {
+	if !validUUID(cardID) {
 		return ErrInvalidRequest
 	}
 	return classifyStoreError(s.store.UnbindCard(ctx, cardID))
 }
 
 func (s *Service) DeleteCard(ctx context.Context, cardID string) error {
-	var valid bool
-	if cardID, valid = boundedIdentifier(cardID); !valid {
+	if !validUUID(cardID) {
 		return ErrInvalidRequest
 	}
 	return classifyStoreError(s.store.DeleteCard(ctx, cardID))
+}
+
+func (s *Service) ListSoftware(ctx context.Context, page, pageSize int) ([]model.Software, int, error) {
+	if page < 1 || pageSize < 1 {
+		return nil, 0, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return nil, 0, errors.New("admin store unavailable")
+	}
+	items, total, err := admin.ListSoftware(ctx, (page-1)*pageSize, pageSize)
+	return items, total, classifyStoreError(err)
+}
+
+func (s *Service) CreateSoftware(ctx context.Context, name string) (model.Software, error) {
+	if model.ValidateAdminName(name) != nil {
+		return model.Software{}, ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return model.Software{}, errors.New("admin store unavailable")
+	}
+	now := s.clock.Now().UTC()
+	if now.IsZero() {
+		return model.Software{}, ErrInvalidRequest
+	}
+	item, err := admin.CreateSoftwareAt(ctx, name, now)
+	return item, classifyStoreError(err)
+}
+
+func (s *Service) RenameSoftware(ctx context.Context, id, name string) error {
+	if !validUUID(id) || model.ValidateAdminName(name) != nil {
+		return ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return errors.New("admin store unavailable")
+	}
+	return classifyStoreError(admin.RenameSoftware(ctx, id, name))
+}
+
+func (s *Service) SetSoftwareEnabled(ctx context.Context, id string, enabled bool) error {
+	if !validUUID(id) {
+		return ErrInvalidRequest
+	}
+	admin, ok := s.store.(AdminStore)
+	if !ok {
+		return errors.New("admin store unavailable")
+	}
+	return classifyStoreError(admin.SetSoftwareEnabled(ctx, id, enabled))
 }
 
 func (s *Service) authorizeCard(ctx context.Context, cardText, softwareID, machineHash string, allowUnactivated bool) (model.Card, time.Time, error) {
@@ -300,6 +629,8 @@ func classifyStoreError(err error) error {
 		return ErrAppDisabled
 	case errors.Is(err, licensestore.ErrLicenseExpired):
 		return ErrExpired
+	case errors.Is(err, licensestore.ErrConflict):
+		return ErrConflict
 	default:
 		return err
 	}
@@ -318,7 +649,28 @@ func validRawCardInput(value string) bool {
 }
 
 func validNote(value *string) bool {
-	return value == nil || len(*value) <= MaxNoteUTF8Bytes
+	return value == nil || (len(*value) <= MaxNoteUTF8Bytes && utf8.ValidString(*value))
+}
+
+func validUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+func validUUIDIDs(values []string, maximum int) bool {
+	if len(values) < 1 || len(values) > maximum {
+		return false
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !validUUID(value) {
+			return false
+		}
+		if _, ok := seen[value]; ok {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
 }
 
 func summarize(card model.Card) model.CardSummary {
