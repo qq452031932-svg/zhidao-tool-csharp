@@ -72,6 +72,10 @@ func (router *Router) licenseAdmin(response http.ResponseWriter, request *http.R
 			result, err = router.licenseAdminClient.ListCards(ctx, list)
 		}
 	case len(segments) == 2 && segments[0] == "cards" && segments[1] == "search" && request.Method == http.MethodPost:
+		if request.URL.RawQuery != "" || request.URL.ForceQuery {
+			writeError(response, http.StatusBadRequest, "invalid_request")
+			return
+		}
 		var search licenseadmin.CardSearch
 		search, err = router.readLicenseCardSearch(response, request)
 		if err == nil {

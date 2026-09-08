@@ -455,6 +455,10 @@ func (a *api) searchCards(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *api) searchCardsSensitive(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	if values := r.Header.Values("Content-Type"); len(values) != 1 || values[0] != "application/json" {
 		a.writeAdminError(w, http.StatusBadRequest, "invalid_request")
 		return

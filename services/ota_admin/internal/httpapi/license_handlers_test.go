@@ -186,13 +186,25 @@ func TestSensitiveCardSearchUsesCSRFProtectedBodyAndNeverAURI(t *testing.T) {
 	if strings.Contains(request.URL.RequestURI(), card) || strings.Contains(request.URL.RequestURI(), note) {
 		t.Fatal("sensitive search entered browser-facing URI")
 	}
+	queryRequest := httptest.NewRequest(http.MethodPost, "http://backend/admin/api/license/cards/search?ignored=1", strings.NewReader(searchBody))
+	queryRequest.RemoteAddr = "127.0.0.1:43210"
+	queryRequest.Header.Set("Content-Type", "application/json")
+	queryRequest.Header.Set("Origin", publicOrigin)
+	queryRequest.Header.Set("Referer", publicOrigin+"/admin/")
+	queryRequest.Header.Set("X-CSRF-Token", csrf)
+	queryRequest.AddCookie(cookie)
+	queryResponse := httptest.NewRecorder()
+	h.handler.ServeHTTP(queryResponse, queryRequest)
+	if queryResponse.Code != http.StatusBadRequest || decodeBody(t, queryResponse)["code"] != "invalid_request" {
+		t.Fatalf("query search status=%d body=%s", queryResponse.Code, queryResponse.Body.String())
+	}
 
 	get := h.request(http.MethodGet, "/admin/api/license/cards?complete_card="+url.QueryEscape(card)+"&note_contains="+url.QueryEscape(note), "", "", cookie)
 	if get.Code != http.StatusBadRequest {
 		t.Fatalf("sensitive GET status=%d body=%s", get.Code, get.Body.String())
 	}
 	if downstreamCalls.Load() != 1 {
-		t.Fatalf("sensitive GET reached downstream: %d calls", downstreamCalls.Load())
+		t.Fatalf("rejected search reached downstream: %d calls", downstreamCalls.Load())
 	}
 }
 

@@ -105,6 +105,15 @@ func TestAdminSensitiveCardSearchUsesStrictReadOnlyPostBody(t *testing.T) {
 	if strings.Contains(request.URL.RequestURI(), card) || strings.Contains(request.URL.RequestURI(), note) {
 		t.Fatal("sensitive values entered internal request URI")
 	}
+	queryRequest := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/search?ignored=1", strings.NewReader(body))
+	queryRequest.RemoteAddr = "127.0.0.1:1"
+	queryRequest.Header.Set("Authorization", adminBearer)
+	queryRequest.Header.Set("Content-Type", "application/json")
+	queryResponse := httptest.NewRecorder()
+	h.handler.ServeHTTP(queryResponse, queryRequest)
+	if queryResponse.Code != http.StatusBadRequest {
+		t.Fatalf("query search status=%d body=%s", queryResponse.Code, queryResponse.Body.String())
+	}
 
 	get := httptest.NewRequest(http.MethodGet, "/internal/v1/cards?complete_card="+url.QueryEscape(card)+"&note_contains="+url.QueryEscape(note), nil)
 	get.RemoteAddr = "127.0.0.1:1"
