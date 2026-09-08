@@ -23,4 +23,10 @@
     <ProjectReference Include="..\..\src\SuperPan.Licensing.Client\SuperPan.Licensing.Client.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="..\..\services\ota_admin\internal\licensing\model\testdata\denial_claims_v1.json"
+          Link="Fixtures\denial_claims_v1.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

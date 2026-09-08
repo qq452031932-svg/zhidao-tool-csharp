@@ -114,6 +114,35 @@ public sealed class LicenseContractTests
         Assert.Throws<ArgumentException>(() => LicenseContractValidator.Validate(envelope));
     }
 
+    [Fact]
+    public void CanonicalGoDenialFixtureUsesNullForSuccessOnlyFields()
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "Fixtures", "denial_claims_v1.json");
+        var claims = JsonSerializer.Deserialize<LicenseClaims>(File.ReadAllText(path));
+
+        Assert.NotNull(claims);
+        LicenseContractValidator.Validate(claims);
+        Assert.Null(claims.CardId);
+        Assert.Null(claims.SoftwareId);
+        Assert.Null(claims.MachineHash);
+        Assert.Null(claims.PackageName);
+        Assert.Null(claims.ExpiresAt);
+        Assert.Null(claims.LeaseUntil);
+    }
+
+    [Fact]
+    public void ClaimsMeasureIdentifierLimitInUtf8Bytes()
+    {
+        var claims = CreateValidClaims() with
+        {
+            RequestId = new string('é', LicenseProtocol.MaxIdentifierLength / 2),
+        };
+        LicenseContractValidator.Validate(claims);
+
+        claims = claims with { RequestId = claims.RequestId + "a" };
+        Assert.Throws<ArgumentException>(() => LicenseContractValidator.Validate(claims));
+    }
+
     private static LicenseClaims CreateValidClaims()
     {
         var now = new DateTimeOffset(2026, 9, 8, 12, 0, 0, TimeSpan.Zero);

@@ -58,10 +58,10 @@ type Claims struct {
 	ServerTime      time.Time  `json:"server_time"`
 	Decision        Decision   `json:"decision"`
 	Code            Code       `json:"code"`
-	CardID          string     `json:"card_id"`
-	SoftwareID      string     `json:"software_id"`
-	MachineHash     string     `json:"machine_hash"`
-	PackageName     string     `json:"package_name"`
+	CardID          *string    `json:"card_id"`
+	SoftwareID      *string    `json:"software_id"`
+	MachineHash     *string    `json:"machine_hash"`
+	PackageName     *string    `json:"package_name"`
 	ExpiresAt       *time.Time `json:"expires_at"`
 	LeaseUntil      *time.Time `json:"lease_until"`
 }
@@ -70,28 +70,27 @@ func (c Claims) Validate() error {
 	if c.ProtocolVersion != ProtocolVersion {
 		return fmt.Errorf("protocol_version must be %d", ProtocolVersion)
 	}
-	identifiers := []struct {
+	if err := validateIdentifier("request_id", c.RequestID); err != nil {
+		return err
+	}
+	optionalIdentifiers := []struct {
 		name  string
-		value string
+		value *string
 	}{
-		{name: "request_id", value: c.RequestID},
 		{name: "card_id", value: c.CardID},
 		{name: "software_id", value: c.SoftwareID},
 		{name: "machine_hash", value: c.MachineHash},
 		{name: "package_name", value: c.PackageName},
 	}
-	if err := validateIdentifier(identifiers[0].name, identifiers[0].value); err != nil {
-		return err
-	}
-	for _, identifier := range identifiers[1:] {
+	for _, identifier := range optionalIdentifiers {
 		if err := validateOptionalIdentifier(identifier.name, identifier.value); err != nil {
 			return err
 		}
 	}
 
 	if c.Decision == DecisionAllow && c.Code == CodeOK {
-		for _, identifier := range identifiers[1:] {
-			if err := validateIdentifier(identifier.name, identifier.value); err != nil {
+		for _, identifier := range optionalIdentifiers {
+			if err := validateRequiredIdentifierPointer(identifier.name, identifier.value); err != nil {
 				return err
 			}
 		}
@@ -132,9 +131,16 @@ func validateIdentifier(name, value string) error {
 	return nil
 }
 
-func validateOptionalIdentifier(name, value string) error {
-	if value == "" {
+func validateRequiredIdentifierPointer(name string, value *string) error {
+	if value == nil {
+		return fmt.Errorf("%s is required", name)
+	}
+	return validateIdentifier(name, *value)
+}
+
+func validateOptionalIdentifier(name string, value *string) error {
+	if value == nil {
 		return nil
 	}
-	return validateIdentifier(name, value)
+	return validateIdentifier(name, *value)
 }

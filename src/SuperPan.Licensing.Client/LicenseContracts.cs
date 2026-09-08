@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace SuperPan.Licensing.Client;
@@ -129,10 +130,10 @@ public static class LicenseContractValidator
     private static void ValidateIdentifier(string? value, string name)
     {
         ArgumentException.ThrowIfNullOrEmpty(value, name);
-        if (value.Length > LicenseProtocol.MaxIdentifierLength)
+        if (Encoding.UTF8.GetByteCount(value) > LicenseProtocol.MaxIdentifierLength)
         {
             throw new ArgumentException(
-                $"{name} exceeds {LicenseProtocol.MaxIdentifierLength} characters.",
+                $"{name} exceeds {LicenseProtocol.MaxIdentifierLength} UTF-8 bytes.",
                 name);
         }
     }
