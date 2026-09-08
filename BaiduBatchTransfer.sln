@@ -31,6 +31,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BaiduBatchTransfer.Core.Tes
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BaiduBatchTransfer.Infrastructure.Tests", "tests\BaiduBatchTransfer.Infrastructure.Tests\BaiduBatchTransfer.Infrastructure.Tests.csproj", "{4EB2A5B8-709F-43C7-B674-F4DB55F098AE}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SuperPan.Licensing.Client", "src\SuperPan.Licensing.Client\SuperPan.Licensing.Client.csproj", "{A175EA88-2BDD-4862-8BFC-38C30B55A552}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SuperPan.Licensing.Client.Tests", "tests\SuperPan.Licensing.Client.Tests\SuperPan.Licensing.Client.Tests.csproj", "{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -84,6 +88,14 @@ Global
 		{4EB2A5B8-709F-43C7-B674-F4DB55F098AE}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4EB2A5B8-709F-43C7-B674-F4DB55F098AE}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4EB2A5B8-709F-43C7-B674-F4DB55F098AE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A175EA88-2BDD-4862-8BFC-38C30B55A552}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A175EA88-2BDD-4862-8BFC-38C30B55A552}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A175EA88-2BDD-4862-8BFC-38C30B55A552}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A175EA88-2BDD-4862-8BFC-38C30B55A552}.Release|Any CPU.Build.0 = Release|Any CPU
+		{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{64A83A6E-E28C-43E5-9CD8-0DA951CCF51B} = {71E8555E-03D0-48A2-AE92-407D4C10ED3D}
@@ -97,5 +109,7 @@ Global
 		{DD734063-777A-44C9-8D75-009A4CE1E912} = {05AC0697-DC2D-4067-AF08-653961A6CF7E}
 		{6A4C9D65-7C96-48F5-B6ED-6899605753D8} = {05AC0697-DC2D-4067-AF08-653961A6CF7E}
 		{4EB2A5B8-709F-43C7-B674-F4DB55F098AE} = {05AC0697-DC2D-4067-AF08-653961A6CF7E}
+		{A175EA88-2BDD-4862-8BFC-38C30B55A552} = {92940A27-5EF8-4768-B622-8F062998093C}
+		{BF59D018-C6F1-4CB5-98F0-9C3A61C9E151} = {05AC0697-DC2D-4067-AF08-653961A6CF7E}
 	EndGlobalSection
 EndGlobal
