@@ -25,6 +25,12 @@ var (
 
 const validationLease = 30 * time.Minute
 
+const (
+	MaxGenerateCount     = 1000
+	MaxRawCardInputBytes = 256
+	MaxNoteUTF8Bytes     = 512
+)
+
 type Clock interface {
 	Now() time.Time
 }
@@ -67,7 +73,21 @@ func New(store Store, clock Clock, random io.Reader, encryptionKey, lookupKey []
 }
 
 func (s *Service) GenerateCards(ctx context.Context, packageID string, durationDays, count int, defaultNote *string, perCardNotes []*string) ([]GeneratedCard, error) {
-	if strings.TrimSpace(packageID) == "" || !allowedDuration(durationDays) || count <= 0 || (perCardNotes != nil && len(perCardNotes) != count) {
+	var valid bool
+	if count <= 0 || count > MaxGenerateCount {
+		return nil, ErrInvalidRequest
+	}
+	packageID, valid = boundedIdentifier(packageID)
+	if !valid || !allowedDuration(durationDays) || (perCardNotes != nil && len(perCardNotes) != count) || !validNote(defaultNote) {
+		return nil, ErrInvalidRequest
+	}
+	for _, note := range perCardNotes {
+		if !validNote(note) {
+			return nil, ErrInvalidRequest
+		}
+	}
+	createdAt := s.clock.Now().UTC()
+	if createdAt.IsZero() {
 		return nil, ErrInvalidRequest
 	}
 	sealed := make([]model.SealedCard, count)
@@ -78,14 +98,15 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 			clearStrings(plaintext)
 			return nil, errors.New("generate license card")
 		}
-		protected, err := s.protector.seal(cardText)
+		cardID := uuid.NewString()
+		protected, err := s.protector.seal(cardID, cardText)
 		if err != nil {
 			clearStrings(plaintext)
 			return nil, errors.New("protect license card")
 		}
 		_, compact, _ := normalizeCard(cardText)
 		sealed[i] = model.SealedCard{
-			ID:         uuid.NewString(),
+			ID:         cardID,
 			Ciphertext: protected.ciphertext,
 			FullDigest: protected.digest,
 			Prefix8:    compact[:8],
@@ -96,7 +117,7 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 		}
 		plaintext[i] = cardText
 	}
-	cards, err := s.store.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: strings.TrimSpace(packageID), Count: count, BaseDays: durationDays, Note: cloneString(defaultNote)}, sealed)
+	cards, err := s.store.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: packageID, Count: count, BaseDays: durationDays, Note: cloneString(defaultNote), CreatedAt: createdAt}, sealed)
 	if err != nil {
 		clearStrings(plaintext)
 		return nil, classifyStoreError(err)
@@ -113,27 +134,26 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 }
 
 func (s *Service) Activate(ctx context.Context, requestID, cardText, softwareID, machineHash string) (model.ActivationState, error) {
-	if strings.TrimSpace(requestID) == "" || strings.TrimSpace(softwareID) == "" || strings.TrimSpace(machineHash) == "" {
+	var valid bool
+	if !validRawCardInput(cardText) {
+		return model.ActivationState{}, ErrInvalidRequest
+	}
+	if requestID, valid = boundedIdentifier(requestID); !valid {
+		return model.ActivationState{}, ErrInvalidRequest
+	}
+	if softwareID, valid = boundedIdentifier(softwareID); !valid {
+		return model.ActivationState{}, ErrInvalidRequest
+	}
+	if machineHash, valid = boundedIdentifier(machineHash); !valid {
 		return model.ActivationState{}, ErrInvalidRequest
 	}
 	card, now, err := s.authorizeCard(ctx, cardText, softwareID, machineHash, true)
 	if err != nil {
 		return model.ActivationState{}, err
 	}
-	activatedAt := now
-	var expiresAt time.Time
-	if card.ActivatedAt != nil && card.ExpiresAt != nil {
-		activatedAt = *card.ActivatedAt
-		expiresAt = *card.ExpiresAt
-	} else {
-		expiresAt, err = addDays(now, card.UnactivatedTotalDays)
-		if err != nil {
-			return model.ActivationState{}, ErrInvalidRequest
-		}
-	}
 	state, err := s.store.Activate(ctx, model.ActivationMutation{
-		RequestID: strings.TrimSpace(requestID), CardID: card.ID, SoftwareID: strings.TrimSpace(softwareID), MachineHash: strings.TrimSpace(machineHash),
-		ActivatedAt: activatedAt, ExpiresAt: expiresAt, LeaseUntil: now.Add(validationLease),
+		RequestID: requestID, CardID: card.ID, SoftwareID: softwareID, MachineHash: machineHash,
+		ObservedAt: now, LeaseUntil: now.Add(validationLease),
 	})
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
@@ -142,7 +162,14 @@ func (s *Service) Activate(ctx context.Context, requestID, cardText, softwareID,
 }
 
 func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHash string) (model.ActivationState, error) {
-	if strings.TrimSpace(softwareID) == "" || strings.TrimSpace(machineHash) == "" {
+	var valid bool
+	if !validRawCardInput(cardText) {
+		return model.ActivationState{}, ErrInvalidRequest
+	}
+	if softwareID, valid = boundedIdentifier(softwareID); !valid {
+		return model.ActivationState{}, ErrInvalidRequest
+	}
+	if machineHash, valid = boundedIdentifier(machineHash); !valid {
 		return model.ActivationState{}, ErrInvalidRequest
 	}
 	card, now, err := s.authorizeCard(ctx, cardText, softwareID, machineHash, false)
@@ -156,7 +183,7 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 	if leaseUntil.After(*card.ExpiresAt) {
 		leaseUntil = *card.ExpiresAt
 	}
-	state, err := s.store.ValidateAndRecordLease(ctx, model.Lease{CardID: card.ID, SoftwareID: strings.TrimSpace(softwareID), MachineHash: strings.TrimSpace(machineHash), LastSeenAt: now, LeaseUntil: leaseUntil})
+	state, err := s.store.ValidateAndRecordLease(ctx, model.Lease{CardID: card.ID, SoftwareID: softwareID, MachineHash: machineHash, LastSeenAt: now, LeaseUntil: leaseUntil})
 	if err != nil {
 		return model.ActivationState{}, classifyStoreError(err)
 	}
@@ -164,31 +191,37 @@ func (s *Service) Validate(ctx context.Context, cardText, softwareID, machineHas
 }
 
 func (s *Service) RenewCard(ctx context.Context, cardID string, days int) error {
-	if strings.TrimSpace(cardID) == "" || !allowedDuration(days) {
+	var valid bool
+	if cardID, valid = boundedIdentifier(cardID); !valid || !allowedDuration(days) {
 		return ErrInvalidRequest
 	}
 	now := s.clock.Now().UTC()
 	if now.IsZero() {
 		return ErrInvalidRequest
 	}
-	return classifyStoreError(s.store.RenewCard(ctx, strings.TrimSpace(cardID), days, now))
+	return classifyStoreError(s.store.RenewCard(ctx, cardID, days, now))
 }
 
 func (s *Service) UnbindCard(ctx context.Context, cardID string) error {
-	if strings.TrimSpace(cardID) == "" {
+	var valid bool
+	if cardID, valid = boundedIdentifier(cardID); !valid {
 		return ErrInvalidRequest
 	}
-	return classifyStoreError(s.store.UnbindCard(ctx, strings.TrimSpace(cardID)))
+	return classifyStoreError(s.store.UnbindCard(ctx, cardID))
 }
 
 func (s *Service) DeleteCard(ctx context.Context, cardID string) error {
-	if strings.TrimSpace(cardID) == "" {
+	var valid bool
+	if cardID, valid = boundedIdentifier(cardID); !valid {
 		return ErrInvalidRequest
 	}
-	return classifyStoreError(s.store.DeleteCard(ctx, strings.TrimSpace(cardID)))
+	return classifyStoreError(s.store.DeleteCard(ctx, cardID))
 }
 
 func (s *Service) authorizeCard(ctx context.Context, cardText, softwareID, machineHash string, allowUnactivated bool) (model.Card, time.Time, error) {
+	if !validRawCardInput(cardText) {
+		return model.Card{}, time.Time{}, ErrInvalidRequest
+	}
 	_, compact, err := normalizeCard(cardText)
 	if err != nil {
 		return model.Card{}, time.Time{}, ErrInvalidRequest
@@ -201,7 +234,7 @@ func (s *Service) authorizeCard(ctx context.Context, cardText, softwareID, machi
 	if !hmac.Equal([]byte(card.FullDigest), []byte(digest)) {
 		return model.Card{}, time.Time{}, ErrNotFound
 	}
-	software, member, err := s.store.GetSoftwareAuthorization(ctx, card.PackageID, strings.TrimSpace(softwareID))
+	software, member, err := s.store.GetSoftwareAuthorization(ctx, card.PackageID, softwareID)
 	if err != nil {
 		if errors.Is(err, licensestore.ErrNotFound) {
 			return model.Card{}, time.Time{}, ErrAppNotAllowed
@@ -218,7 +251,7 @@ func (s *Service) authorizeCard(ctx context.Context, cardText, softwareID, machi
 	if now.IsZero() {
 		return model.Card{}, time.Time{}, ErrInvalidRequest
 	}
-	if card.MachineHash != nil && *card.MachineHash != strings.TrimSpace(machineHash) {
+	if card.MachineHash != nil && *card.MachineHash != machineHash {
 		return model.Card{}, time.Time{}, ErrMachineMismatch
 	}
 	if card.ExpiresAt != nil && !card.ExpiresAt.After(now) {
@@ -237,18 +270,6 @@ func allowedDuration(days int) bool {
 	default:
 		return false
 	}
-}
-
-func addDays(base time.Time, days int) (time.Time, error) {
-	if days <= 0 {
-		return time.Time{}, ErrInvalidRequest
-	}
-	const secondsPerDay = int64(24 * 60 * 60)
-	delta := int64(days) * secondsPerDay
-	if delta/secondsPerDay != int64(days) || base.Unix() > int64(^uint64(0)>>1)-delta {
-		return time.Time{}, ErrInvalidRequest
-	}
-	return time.Unix(base.Unix()+delta, 0).UTC(), nil
 }
 
 func classifyStoreError(err error) error {
@@ -271,6 +292,22 @@ func classifyStoreError(err error) error {
 	default:
 		return err
 	}
+}
+
+func boundedIdentifier(value string) (string, bool) {
+	if value == "" || len(value) > model.MaxIdentifierLength {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	return value, value != ""
+}
+
+func validRawCardInput(value string) bool {
+	return value != "" && len(value) <= MaxRawCardInputBytes
+}
+
+func validNote(value *string) bool {
+	return value == nil || len(*value) <= MaxNoteUTF8Bytes
 }
 
 func summarize(card model.Card) model.CardSummary {

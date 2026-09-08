@@ -32,6 +32,18 @@ type delayedValidationStore struct {
 	proceed chan struct{}
 }
 
+type delayedActivationStore struct {
+	*licensestore.Store
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (s *delayedActivationStore) Activate(ctx context.Context, mutation model.ActivationMutation) (model.ActivationState, error) {
+	close(s.entered)
+	<-s.proceed
+	return s.Store.Activate(ctx, mutation)
+}
+
 func (s *delayedValidationStore) ValidateAndRecordLease(ctx context.Context, lease model.Lease) (model.ActivationState, error) {
 	close(s.entered)
 	<-s.proceed
@@ -190,6 +202,50 @@ func TestFirstUseStartsAtServerClockAndReusesLifetimeOnSameMachine(t *testing.T)
 	}
 }
 
+func TestReactivationClampsLeaseAndRecordsCurrentObservationTime(t *testing.T) {
+	h := newHarness(t)
+	softwareA := h.software("Lease Clamp A")
+	softwareB := h.software("Lease Clamp B")
+	pkg := h.packageWith(softwareA, softwareB)
+	card := h.generate(pkg.ID, 30)
+	first, err := h.svc.Activate(h.ctx, "request-a", card.Plaintext, softwareA.ID, "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.clock.now = first.ExpiresAt.Add(-10 * time.Minute)
+	second, err := h.svc.Activate(h.ctx, "request-b", card.Plaintext, softwareB.ID, "machine-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.LeaseUntil.Equal(first.ExpiresAt) {
+		t.Fatalf("reactivation lease_until = %v, want authoritative expiry %v", second.LeaseUntil, first.ExpiresAt)
+	}
+	raw := h.rawDB()
+	defer raw.Close()
+	var lastSeen int64
+	if err := raw.QueryRow(`SELECT last_seen_at FROM license_leases WHERE card_id=? AND software_id=?`, card.Card.ID, softwareB.ID).Scan(&lastSeen); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeen != h.clock.now.Unix() {
+		t.Fatalf("reactivation last_seen_at = %v, want current observation %v", time.Unix(lastSeen, 0).UTC(), h.clock.now)
+	}
+}
+
+func TestGeneratedCardCreatedAtUsesInjectedClock(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Generated Time")
+	pkg := h.packageWith(software)
+	h.clock.now = time.Date(2031, 4, 5, 6, 7, 8, 987654321, time.UTC)
+	card := h.generate(pkg.ID, 30)
+	want := h.clock.now.Truncate(time.Second)
+	if !card.Card.CreatedAt.Equal(want) {
+		t.Fatalf("generated created_at = %v, want injected clock %v", card.Card.CreatedAt, want)
+	}
+	if stored := h.searchCard(card.Card.Prefix8); !stored.CreatedAt.Equal(want) {
+		t.Fatalf("stored created_at = %v, want injected clock %v", stored.CreatedAt, want)
+	}
+}
+
 func TestAnotherMachineIsRejectedWithoutSecretLeakage(t *testing.T) {
 	h := newHarness(t)
 	software := h.software("Machine Binding")
@@ -204,6 +260,103 @@ func TestAnotherMachineIsRejectedWithoutSecretLeakage(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), card.Plaintext) || strings.Contains(err.Error(), strings.ReplaceAll(card.Plaintext, "-", "")) {
 		t.Fatal("error leaked card plaintext")
+	}
+}
+
+func TestActivationRechecksMembershipAndEnabledStateInsideCommit(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*harness, model.Package, model.Software, model.Software) error
+		wantErr error
+	}{
+		{
+			name: "membership removed",
+			mutate: func(h *harness, pkg model.Package, target, other model.Software) error {
+				return h.store.ReplacePackageMembers(h.ctx, pkg.ID, []string{other.ID})
+			},
+			wantErr: ErrAppNotAllowed,
+		},
+		{
+			name: "software disabled",
+			mutate: func(h *harness, _ model.Package, target, _ model.Software) error {
+				return h.store.SetSoftwareEnabled(h.ctx, target.ID, false)
+			},
+			wantErr: ErrAppDisabled,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			target := h.software("Interleaved Target")
+			other := h.software("Interleaved Other")
+			pkg := h.packageWith(target, other)
+			card := h.generate(pkg.ID, 30)
+			delayed := &delayedActivationStore{Store: h.store, entered: make(chan struct{}), proceed: make(chan struct{})}
+			defer closeIfOpen(delayed.proceed)
+			svc := h.serviceForStore(delayed)
+			done := make(chan error, 1)
+			go func() {
+				_, err := svc.Activate(h.ctx, "interleaved-request", card.Plaintext, target.ID, "machine-a")
+				done <- err
+			}()
+			<-delayed.entered
+			if err := test.mutate(h, pkg, target, other); err != nil {
+				t.Fatal(err)
+			}
+			close(delayed.proceed)
+			if err := <-done; !errors.Is(err, test.wantErr) {
+				t.Fatalf("interleaved activation error = %v, want %v", err, test.wantErr)
+			}
+			summary := h.searchCard(card.Card.Prefix8)
+			if summary.ActivatedAt != nil || summary.ExpiresAt != nil || summary.MachineHash != nil {
+				t.Fatal("denied interleaved activation mutated card lifetime or binding")
+			}
+			raw := h.rawDB()
+			defer raw.Close()
+			for _, table := range []string{"license_activation_requests", "license_activation_bindings", "license_leases"} {
+				var count int
+				query := "SELECT count(*) FROM " + table + " WHERE card_id=?"
+				if err := raw.QueryRow(query, card.Card.ID).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != 0 {
+					t.Fatalf("denied interleaved activation persisted %d rows in %s", count, table)
+				}
+			}
+		})
+	}
+}
+
+func TestActivationUsesRenewedAuthoritativeUnusedDaysAfterPreflight(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Renew During Activation")
+	pkg := h.packageWith(software)
+	card := h.generate(pkg.ID, 30)
+	delayed := &delayedActivationStore{Store: h.store, entered: make(chan struct{}), proceed: make(chan struct{})}
+	defer closeIfOpen(delayed.proceed)
+	svc := h.serviceForStore(delayed)
+	done := make(chan struct {
+		state model.ActivationState
+		err   error
+	}, 1)
+	go func() {
+		state, err := svc.Activate(h.ctx, "renewed-request", card.Plaintext, software.ID, "machine-a")
+		done <- struct {
+			state model.ActivationState
+			err   error
+		}{state: state, err: err}
+	}()
+	<-delayed.entered
+	if err := h.svc.RenewCard(h.ctx, card.Card.ID, 90); err != nil {
+		t.Fatal(err)
+	}
+	close(delayed.proceed)
+	result := <-done
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	wantExpiry := h.clock.now.Add(120 * 24 * time.Hour)
+	if !result.state.ActivatedAt.Equal(h.clock.now) || !result.state.ExpiresAt.Equal(wantExpiry) {
+		t.Fatalf("activation after interleaved renewal = %v to %v, want expiry %v", result.state.ActivatedAt, result.state.ExpiresAt, wantExpiry)
 	}
 }
 
@@ -449,13 +602,14 @@ func TestDefaultAndPerCardNotes(t *testing.T) {
 
 func TestCardProtectionEncryptsAndUsesNormalizedKeyedDigest(t *testing.T) {
 	fixture := "ABCDEFGH-JKLMNPQR-STUVWXYZ-234567AB"
+	cardID := "11111111-1111-4111-8111-111111111111"
 	key := bytes.Repeat([]byte{0x31}, 32)
 	lookupKey := bytes.Repeat([]byte{0x42}, 32)
 	protector, err := newCardProtector(key, lookupKey, bytes.NewReader(bytes.Repeat([]byte{0x53}, 64)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := protector.seal(fixture)
+	sealed, err := protector.seal(cardID, fixture)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,12 +619,38 @@ func TestCardProtectionEncryptsAndUsesNormalizedKeyedDigest(t *testing.T) {
 	if got := protector.digest("abcdefgh jklmnpqr stuvwxyz 234567ab"); got != sealed.digest {
 		t.Fatal("normalized card forms produced different keyed digests")
 	}
-	opened, err := protector.open(sealed.ciphertext)
+	opened, err := protector.open(cardID, sealed.ciphertext, sealed.digest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if opened != fixture {
 		t.Fatal("decrypted card did not equal the canonical fixture")
+	}
+}
+
+func TestCardProtectionRejectsCiphertextTransplantTamperAndDigestMismatch(t *testing.T) {
+	fixture := "ABCDEFGH-JKLMNPQR-STUVWXYZ-234567AB"
+	cardIDA := "11111111-1111-4111-8111-111111111111"
+	cardIDB := "22222222-2222-4222-8222-222222222222"
+	protector, err := newCardProtector(bytes.Repeat([]byte{0x31}, 32), bytes.Repeat([]byte{0x42}, 32), bytes.NewReader(bytes.Repeat([]byte{0x53}, 128)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := protector.seal(cardIDA, fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protector.open(cardIDB, sealed.ciphertext, sealed.digest); err == nil {
+		t.Fatal("ciphertext transplant to another card id succeeded")
+	}
+	tampered := append([]byte(nil), sealed.ciphertext...)
+	tampered[len(tampered)-1] ^= 0x01
+	if _, err := protector.open(cardIDA, tampered, sealed.digest); err == nil {
+		t.Fatal("tampered ciphertext succeeded")
+	}
+	wrongDigest := strings.Repeat("0", len(sealed.digest))
+	if _, err := protector.open(cardIDA, sealed.ciphertext, wrongDigest); err == nil {
+		t.Fatal("decryption with mismatched keyed digest succeeded")
 	}
 }
 
@@ -498,7 +678,7 @@ func TestGenerateCardsPersistsOnlyEncryptedCardMaterial(t *testing.T) {
 	if digest == hex.EncodeToString(rawDigest[:]) {
 		t.Fatal("persisted full-card digest used an unkeyed hash")
 	}
-	opened, err := h.svc.protector.open(ciphertext)
+	opened, err := h.svc.protector.open(card.Card.ID, ciphertext, digest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,6 +745,73 @@ func TestNormalListOmitsPlaintextAndErrorsAreRedacted(t *testing.T) {
 	}
 }
 
+func TestServiceResourceLimitsRejectBeforeExpensiveWork(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Resource Limits")
+	pkg := h.packageWith(software)
+	card := h.generate(pkg.ID, 30)
+
+	maxInt := int(^uint(0) >> 1)
+	if _, err := h.svc.GenerateCards(h.ctx, pkg.ID, 30, maxInt, nil, nil); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("huge count error = %v, want ErrInvalidRequest", err)
+	}
+	exactNote := strings.Repeat("é", MaxNoteUTF8Bytes/2)
+	if len(exactNote) != MaxNoteUTF8Bytes {
+		t.Fatal("test note is not at the UTF-8 byte boundary")
+	}
+	if _, err := h.svc.GenerateCards(h.ctx, pkg.ID, 30, 1, &exactNote, nil); err != nil {
+		t.Fatalf("boundary default note error = %v", err)
+	}
+	overNote := exactNote + "x"
+	if _, err := h.svc.GenerateCards(h.ctx, pkg.ID, 30, 1, &overNote, nil); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized default note error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := h.svc.GenerateCards(h.ctx, pkg.ID, 30, 1, nil, []*string{&overNote}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized per-card note error = %v, want ErrInvalidRequest", err)
+	}
+
+	boundaryCard := card.Plaintext + strings.Repeat(" ", MaxRawCardInputBytes-len(card.Plaintext))
+	if _, err := h.svc.Validate(h.ctx, boundaryCard, software.ID, "machine-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("boundary raw-card input error = %v, want normal unactivated ErrNotFound", err)
+	}
+	overCard := boundaryCard + " "
+	if _, err := h.svc.Validate(h.ctx, overCard, software.ID, "machine-a"); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized raw-card input error = %v, want ErrInvalidRequest", err)
+	}
+
+	boundaryRequest := strings.Repeat("r", model.MaxIdentifierLength)
+	boundaryMachine := strings.Repeat("m", model.MaxIdentifierLength)
+	if _, err := h.svc.Activate(h.ctx, boundaryRequest, card.Plaintext, software.ID, boundaryMachine); err != nil {
+		t.Fatalf("boundary identifier activation error = %v", err)
+	}
+	overIdentifier := strings.Repeat("界", model.MaxIdentifierLength/3+1)
+	if len(overIdentifier) <= model.MaxIdentifierLength {
+		t.Fatal("test identifier is not over the UTF-8 byte limit")
+	}
+	if _, err := h.svc.Activate(h.ctx, overIdentifier, card.Plaintext, software.ID, boundaryMachine); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized request id error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := h.svc.Validate(h.ctx, card.Plaintext, overIdentifier, boundaryMachine); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized software id error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := h.svc.Validate(h.ctx, card.Plaintext, software.ID, overIdentifier); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized machine hash error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestGenerateCountBoundaryIsAccepted(t *testing.T) {
+	h := newHarness(t)
+	software := h.software("Count Boundary")
+	pkg := h.packageWith(software)
+	cards, err := h.svc.GenerateCards(h.ctx, pkg.ID, 30, MaxGenerateCount, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) != MaxGenerateCount {
+		t.Fatalf("generated count = %d, want %d", len(cards), MaxGenerateCount)
+	}
+}
+
 func TestNewAndServiceInputsRejectInvalidRequests(t *testing.T) {
 	key := bytes.Repeat([]byte{0x11}, 32)
 	lookupKey := bytes.Repeat([]byte{0x22}, 32)
@@ -608,4 +855,33 @@ func (h *harness) rawDB() *sql.DB {
 		h.t.Fatal(err)
 	}
 	return db
+}
+
+func (h *harness) serviceForStore(store Store) *Service {
+	h.t.Helper()
+	svc, err := New(store, h.clock, rand.Reader, bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return svc
+}
+
+func (h *harness) searchCard(prefix8 string) model.CardSummary {
+	h.t.Helper()
+	cards, err := h.store.SearchCards(h.ctx, model.CardFilter{Prefix8: prefix8})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if len(cards) != 1 {
+		h.t.Fatalf("SearchCards returned %d cards, want 1", len(cards))
+	}
+	return cards[0]
+}
+
+func closeIfOpen(channel chan struct{}) {
+	select {
+	case <-channel:
+	default:
+		close(channel)
+	}
 }

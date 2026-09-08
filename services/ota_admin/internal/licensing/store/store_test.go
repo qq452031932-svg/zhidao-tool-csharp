@@ -144,11 +144,12 @@ func TestGenerateCardsPersistsSecretIndexesDurationsAndNullableActivation(t *tes
 	ctx := context.Background()
 	pkg := mustPackage(t, s)
 	note := "September Batch"
+	createdAt := time.Date(2026, 9, 8, 9, 8, 7, 654321000, time.UTC)
 	sealed := []model.SealedCard{
 		{ID: uuid.NewString(), Ciphertext: []byte("cipher-one"), FullDigest: strings.Repeat("a", 64), Prefix8: "ABCDEFGH", Last4: "WXYZ"},
 		{ID: uuid.NewString(), Ciphertext: []byte("cipher-two"), FullDigest: strings.Repeat("b", 64), Prefix8: "12345678", Last4: "9876"},
 	}
-	cards, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 2, BaseDays: 90, Note: &note}, sealed)
+	cards, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 2, BaseDays: 90, Note: &note, CreatedAt: createdAt}, sealed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +160,9 @@ func TestGenerateCardsPersistsSecretIndexesDurationsAndNullableActivation(t *tes
 		assertUUID(t, card.ID)
 		if card.ID != sealed[i].ID || card.BaseDays != 90 || card.UnactivatedTotalDays != 90 {
 			t.Fatalf("card %d = %+v", i, card)
+		}
+		if !card.CreatedAt.Equal(createdAt.Truncate(time.Second)) {
+			t.Fatalf("card %d created_at = %v, want %v", i, card.CreatedAt, createdAt.Truncate(time.Second))
 		}
 		if card.ActivatedAt != nil || card.ExpiresAt != nil || card.MachineHash != nil {
 			t.Fatalf("new card activation fields = %+v, want nil", card)
@@ -191,10 +195,11 @@ func TestCardSearchUsesExactSecretIndexesAndCaseInsensitiveLiteralNoteContains(t
 	note1, note2 := "September VIP 100%", "october"
 	one := model.SealedCard{ID: uuid.NewString(), Ciphertext: []byte("c1"), FullDigest: strings.Repeat("1", 64), Prefix8: "PREFIX01", Last4: "0001"}
 	two := model.SealedCard{ID: uuid.NewString(), Ciphertext: []byte("c2"), FullDigest: strings.Repeat("2", 64), Prefix8: "PREFIX02", Last4: "0002"}
-	if _, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 1, BaseDays: 30, Note: &note1}, []model.SealedCard{one}); err != nil {
+	createdAt := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	if _, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 1, BaseDays: 30, Note: &note1, CreatedAt: createdAt}, []model.SealedCard{one}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 1, BaseDays: 30, Note: &note2}, []model.SealedCard{two}); err != nil {
+	if _, err := s.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: 1, BaseDays: 30, Note: &note2, CreatedAt: createdAt}, []model.SealedCard{two}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,7 +243,7 @@ func TestActivateIsIdempotentAndConcurrentCallsDoNotLeakBusyErrors(t *testing.T)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
 	mutation := model.ActivationMutation{
 		RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("a", 64),
-		ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour),
+		ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour),
 	}
 
 	const workers = 20
@@ -286,6 +291,45 @@ func TestActivateIsIdempotentAndConcurrentCallsDoNotLeakBusyErrors(t *testing.T)
 	}
 }
 
+func TestFirstActivationUsesAuthoritativeUnusedDaysAndClampsLease(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	software := mustSoftware(t, s, "Authoritative Activation")
+	pkg, err := s.CreatePackage(ctx, "Authoritative Activation Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := mustCard(t, s, pkg.ID, 30, nil)
+	observedAt := time.Date(2026, 9, 9, 10, 0, 0, 0, time.UTC)
+	if err := s.RenewCard(ctx, card.ID, 90, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.Activate(ctx, model.ActivationMutation{
+		RequestID:   uuid.NewString(),
+		CardID:      card.ID,
+		SoftwareID:  software.ID,
+		MachineHash: strings.Repeat("a", 64),
+		ObservedAt:  observedAt,
+		ActivatedAt: observedAt.Add(-24 * time.Hour),
+		ExpiresAt:   observedAt.Add(24 * time.Hour),
+		LeaseUntil:  observedAt.Add(200 * 24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExpiry := observedAt.Add(120 * 24 * time.Hour)
+	if !state.ActivatedAt.Equal(observedAt) || !state.ExpiresAt.Equal(wantExpiry) || !state.LeaseUntil.Equal(wantExpiry) {
+		t.Fatalf("authoritative first activation = %+v, want expiry/lease %v", state, wantExpiry)
+	}
+	var lastSeen int64
+	if err := s.db.QueryRowContext(ctx, `SELECT last_seen_at FROM license_leases WHERE card_id=? AND software_id=?`, card.ID, software.ID).Scan(&lastSeen); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeen != observedAt.Unix() {
+		t.Fatalf("first activation last_seen_at = %v, want %v", time.Unix(lastSeen, 0).UTC(), observedAt)
+	}
+}
+
 func TestActivateRejectsACompetingMachineAtomically(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -296,7 +340,7 @@ func TestActivateRejectsACompetingMachineAtomically(t *testing.T) {
 	}
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
-	base := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("a", 64), ActivatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
+	base := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("a", 64), ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
 	if _, err := s.Activate(ctx, base); err != nil {
 		t.Fatal(err)
 	}
@@ -318,8 +362,8 @@ func TestActivationPreservesAuthoritativeLifetimeAfterRenewalAndUnbind(t *testin
 	}
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
-	initialExpiry := now.Add(10 * 24 * time.Hour)
-	initial := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("a", 64), ActivatedAt: now, ExpiresAt: initialExpiry, LeaseUntil: now.Add(time.Hour)}
+	initialExpiry := now.Add(30 * 24 * time.Hour)
+	initial := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("a", 64), ObservedAt: now, ActivatedAt: now, ExpiresAt: initialExpiry, LeaseUntil: now.Add(time.Hour)}
 	if _, err := s.Activate(ctx, initial); err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +372,7 @@ func TestActivationPreservesAuthoritativeLifetimeAfterRenewalAndUnbind(t *testin
 	}
 	wantExpiry := initialExpiry.Add(30 * 24 * time.Hour)
 
-	stale := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareB.ID, MachineHash: initial.MachineHash, ActivatedAt: now.Add(5 * 24 * time.Hour), ExpiresAt: now.Add(6 * 24 * time.Hour), LeaseUntil: now.Add(2 * time.Hour)}
+	stale := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareB.ID, MachineHash: initial.MachineHash, ObservedAt: now.Add(5 * 24 * time.Hour), ActivatedAt: now.Add(5 * 24 * time.Hour), ExpiresAt: now.Add(6 * 24 * time.Hour), LeaseUntil: now.Add(5*24*time.Hour + 2*time.Hour)}
 	state, err := s.Activate(ctx, stale)
 	if err != nil {
 		t.Fatal(err)
@@ -357,7 +401,7 @@ func TestActivationPreservesAuthoritativeLifetimeAfterRenewalAndUnbind(t *testin
 	if err := s.UnbindCard(ctx, card.ID); err != nil {
 		t.Fatal(err)
 	}
-	rebind := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("b", 64), ActivatedAt: now.Add(7 * 24 * time.Hour), ExpiresAt: now.Add(8 * 24 * time.Hour), LeaseUntil: now.Add(3 * time.Hour)}
+	rebind := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: strings.Repeat("b", 64), ObservedAt: now.Add(7 * 24 * time.Hour), ActivatedAt: now.Add(7 * 24 * time.Hour), ExpiresAt: now.Add(8 * 24 * time.Hour), LeaseUntil: now.Add(7*24*time.Hour + 3*time.Hour)}
 	state, err = s.Activate(ctx, rebind)
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +421,7 @@ func TestActivationReturnsCanonicalPersistedTimeOnFirstCallAndReplay(t *testing.
 	}
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 123456789, time.UTC)
-	mutation := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("c", 64), ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
+	mutation := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("c", 64), ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
 	first, err := s.Activate(ctx, mutation)
 	if err != nil {
 		t.Fatal(err)
@@ -413,8 +457,8 @@ func TestRenewCardExtendsActivatedFromMaxAndAccumulatesUnactivatedDays(t *testin
 	}
 
 	active := mustCard(t, s, pkg.ID, 30, nil)
-	expired := now.Add(-24 * time.Hour)
-	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: active.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("c", 64), ActivatedAt: now.Add(-60 * 24 * time.Hour), ExpiresAt: expired, LeaseUntil: now.Add(time.Hour)}); err != nil {
+	activationObservation := now.Add(-60 * 24 * time.Hour)
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: active.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("c", 64), ObservedAt: activationObservation, ActivatedAt: activationObservation, ExpiresAt: now.Add(-24 * time.Hour), LeaseUntil: activationObservation.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RenewCard(ctx, active.ID, 30, now); err != nil {
@@ -428,7 +472,8 @@ func TestRenewCardExtendsActivatedFromMaxAndAccumulatesUnactivatedDays(t *testin
 
 	futureActive := mustCard(t, s, pkg.ID, 30, nil)
 	futureExpiry := now.Add(10 * 24 * time.Hour)
-	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: futureActive.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("d", 64), ActivatedAt: now.Add(-20 * 24 * time.Hour), ExpiresAt: futureExpiry, LeaseUntil: now.Add(time.Hour)}); err != nil {
+	futureObservation := now.Add(-20 * 24 * time.Hour)
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: futureActive.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("d", 64), ObservedAt: futureObservation, ActivatedAt: futureObservation, ExpiresAt: futureExpiry, LeaseUntil: futureObservation.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RenewCard(ctx, futureActive.ID, 90, now); err != nil {
@@ -462,8 +507,8 @@ func TestRenewCardRejectsIntegerAndDurationOverflowWithoutMutation(t *testing.T)
 	}
 
 	active := mustCard(t, s, pkg.ID, 30, nil)
-	expiry := now.Add(24 * time.Hour)
-	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: active.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("f", 64), ActivatedAt: now, ExpiresAt: expiry, LeaseUntil: now.Add(time.Hour)}); err != nil {
+	expiry := now.Add(30 * 24 * time.Hour)
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: active.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("f", 64), ObservedAt: now, ActivatedAt: now, ExpiresAt: expiry, LeaseUntil: now.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RenewCard(ctx, active.ID, maxInt, now); err == nil {
@@ -525,7 +570,7 @@ func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
 	lease := model.Lease{CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("d", 64), LastSeenAt: now, LeaseUntil: now.Add(30 * time.Minute)}
-	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: lease.MachineHash, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: lease.MachineHash, ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RecordLease(ctx, lease); err != nil {
@@ -566,7 +611,7 @@ func TestLeaseRequiresCurrentActivationBindingAndCannotReappearAfterUnbind(t *te
 	if _, err := s.RecordLease(ctx, lease); err == nil {
 		t.Fatal("lease without activation binding succeeded")
 	}
-	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: machine, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
+	if _, err := s.Activate(ctx, model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: softwareA.ID, MachineHash: machine, ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: lease.LeaseUntil}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RecordLease(ctx, lease); err != nil {
@@ -697,7 +742,7 @@ func TestUnbindClearsActivationAndDeletePermanentlyCascadesCardState(t *testing.
 	}
 	card := mustCard(t, s, pkg.ID, 30, nil)
 	now := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
-	mutation := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("e", 64), ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
+	mutation := model.ActivationMutation{RequestID: uuid.NewString(), CardID: card.ID, SoftwareID: software.ID, MachineHash: strings.Repeat("e", 64), ObservedAt: now, ActivatedAt: now, ExpiresAt: now.Add(30 * 24 * time.Hour), LeaseUntil: now.Add(time.Hour)}
 	if _, err := s.Activate(ctx, mutation); err != nil {
 		t.Fatal(err)
 	}
@@ -768,7 +813,7 @@ func mustCard(t *testing.T, s *Store, packageID string, days int, note *string) 
 	t.Helper()
 	id := uuid.NewString()
 	sealed := model.SealedCard{ID: id, Ciphertext: []byte("cipher-" + id), FullDigest: fmt.Sprintf("%064x", id[0:8]), Prefix8: strings.ToUpper(strings.ReplaceAll(id[0:8], "-", "0")), Last4: strings.ToUpper(id[len(id)-4:])}
-	cards, err := s.GenerateCards(context.Background(), model.GenerateCardsRequest{PackageID: packageID, Count: 1, BaseDays: days, Note: note}, []model.SealedCard{sealed})
+	cards, err := s.GenerateCards(context.Background(), model.GenerateCardsRequest{PackageID: packageID, Count: 1, BaseDays: days, Note: note, CreatedAt: time.Date(2026, 9, 8, 8, 0, 0, 0, time.UTC)}, []model.SealedCard{sealed})
 	if err != nil {
 		t.Fatal(err)
 	}

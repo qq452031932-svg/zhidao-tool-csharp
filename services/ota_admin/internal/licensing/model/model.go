@@ -85,10 +85,11 @@ type Package struct {
 }
 
 type GenerateCardsRequest struct {
-	PackageID string  `json:"package_id"`
-	Count     int     `json:"count"`
-	BaseDays  int     `json:"base_days"`
-	Note      *string `json:"note"`
+	PackageID string    `json:"package_id"`
+	Count     int       `json:"count"`
+	BaseDays  int       `json:"base_days"`
+	Note      *string   `json:"note"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // SealedCard contains the at-rest representation prepared by the service. The
@@ -142,10 +143,14 @@ type CardSummary struct {
 }
 
 type ActivationMutation struct {
-	RequestID   string    `json:"request_id"`
-	CardID      string    `json:"card_id"`
-	SoftwareID  string    `json:"software_id"`
-	MachineHash string    `json:"machine_hash"`
+	RequestID   string `json:"request_id"`
+	CardID      string `json:"card_id"`
+	SoftwareID  string `json:"software_id"`
+	MachineHash string `json:"machine_hash"`
+	// ObservedAt is the current server time for this request. ActivatedAt and
+	// ExpiresAt are retained for wire compatibility; the store derives the
+	// authoritative lifetime from persisted card state instead of trusting them.
+	ObservedAt  time.Time `json:"observed_at"`
 	ActivatedAt time.Time `json:"activated_at"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	LeaseUntil  time.Time `json:"lease_until"`

@@ -17,6 +17,7 @@ const (
 	cardRandomBytes = 20
 	cardGroupSize   = 8
 	cardGroupCount  = 4
+	cardAADDomain   = "ota-license-card:v1:"
 )
 
 var cardEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -65,7 +66,10 @@ func (p *cardProtector) generate() (string, error) {
 	return strings.Join(groups, "-"), nil
 }
 
-func (p *cardProtector) seal(cardText string) (protectedCard, error) {
+func (p *cardProtector) seal(cardID, cardText string) (protectedCard, error) {
+	if cardID == "" {
+		return protectedCard{}, errors.New("card id is required")
+	}
 	canonical, compact, err := normalizeCard(cardText)
 	if err != nil {
 		return protectedCard{}, err
@@ -78,21 +82,29 @@ func (p *cardProtector) seal(cardText string) (protectedCard, error) {
 	}
 	ciphertext := make([]byte, 0, len(nonce)+len(plaintext)+p.gcm.Overhead())
 	ciphertext = append(ciphertext, nonce...)
-	ciphertext = p.gcm.Seal(ciphertext, nonce, plaintext, nil)
+	ciphertext = p.gcm.Seal(ciphertext, nonce, plaintext, cardAAD(cardID))
 	return protectedCard{ciphertext: ciphertext, digest: p.digestCompact(compact)}, nil
 }
 
-func (p *cardProtector) open(ciphertext []byte) (string, error) {
-	if len(ciphertext) < p.gcm.NonceSize()+p.gcm.Overhead() {
+func (p *cardProtector) open(cardID string, ciphertext []byte, expectedDigest string) (string, error) {
+	if cardID == "" || len(ciphertext) < p.gcm.NonceSize()+p.gcm.Overhead() {
 		return "", errors.New("invalid encrypted card")
 	}
 	nonce := ciphertext[:p.gcm.NonceSize()]
-	plaintext, err := p.gcm.Open(nil, nonce, ciphertext[p.gcm.NonceSize():], nil)
+	plaintext, err := p.gcm.Open(nil, nonce, ciphertext[p.gcm.NonceSize():], cardAAD(cardID))
 	if err != nil {
 		return "", errors.New("invalid encrypted card")
 	}
 	defer zeroBytes(plaintext)
-	return string(plaintext), nil
+	canonical, compact, err := normalizeCard(string(plaintext))
+	if err != nil {
+		return "", errors.New("invalid encrypted card")
+	}
+	actualDigest := p.digestCompact(compact)
+	if !hmac.Equal([]byte(actualDigest), []byte(expectedDigest)) {
+		return "", errors.New("invalid encrypted card")
+	}
+	return canonical, nil
 }
 
 func (p *cardProtector) digest(cardText string) string {
@@ -148,4 +160,8 @@ func zeroBytes(value []byte) {
 	for i := range value {
 		value[i] = 0
 	}
+}
+
+func cardAAD(cardID string) []byte {
+	return []byte(cardAADDomain + cardID)
 }
