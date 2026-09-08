@@ -493,6 +493,27 @@ func TestReplayNonceClaimPersistsUntilExpiry(t *testing.T) {
 	}
 }
 
+func TestReplayNonceDoesNotExpireEarlyAtSubsecondBoundary(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	second := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	firstNow := second.Add(100 * time.Millisecond)
+	expiresAt := second.Add(900 * time.Millisecond)
+	claimed, err := s.ClaimReplayNonce(ctx, "subsecond-nonce", expiresAt, firstNow)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+
+	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(2*time.Second), second.Add(800*time.Millisecond))
+	if err != nil || claimed {
+		t.Fatalf("claim before precise expiry = %v, %v; want replay rejected", claimed, err)
+	}
+	claimed, err = s.ClaimReplayNonce(ctx, "subsecond-nonce", second.Add(3*time.Second), second.Add(time.Second))
+	if err != nil || !claimed {
+		t.Fatalf("claim after conservative stored expiry = %v, %v; want accepted", claimed, err)
+	}
+}
+
 func TestLeaseLastSeenIsCoalescedHourlyWhileLeaseUntilStillAdvances(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

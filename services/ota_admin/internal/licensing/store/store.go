@@ -367,7 +367,7 @@ func (s *Store) ClaimReplayNonce(ctx context.Context, nonce string, expiresAt, n
 	if nonce == "" || !expiresAt.After(now) {
 		return false, errors.New("invalid replay nonce or expiry")
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO UPDATE SET expires_at=excluded.expires_at WHERE license_replay_nonces.expires_at<=?`, nonce, unixTime(expiresAt), unixTime(now))
+	result, err := s.db.ExecContext(ctx, `INSERT INTO license_replay_nonces(nonce,expires_at) VALUES(?,?) ON CONFLICT(nonce) DO UPDATE SET expires_at=excluded.expires_at WHERE license_replay_nonces.expires_at<=?`, nonce, ceilUnixSecond(expiresAt), unixTime(now))
 	if err != nil {
 		return false, fmt.Errorf("claim replay nonce: %w", err)
 	}
@@ -518,6 +518,14 @@ func requireAffected(result sql.Result) error {
 }
 
 func unixTime(value time.Time) int64 { return value.UTC().Unix() }
+
+func ceilUnixSecond(value time.Time) int64 {
+	second := value.UTC().Unix()
+	if value.Nanosecond() != 0 && second < maximumInt64 {
+		second++
+	}
+	return second
+}
 
 const (
 	maximumInt64  = int64(^uint64(0) >> 1)
