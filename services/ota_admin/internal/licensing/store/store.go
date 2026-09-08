@@ -182,16 +182,66 @@ func (s *Store) GenerateCards(ctx context.Context, req model.GenerateCardsReques
 		if len(item.Ciphertext) == 0 || item.FullDigest == "" || len(item.Prefix8) != 8 || len(item.Last4) != 4 {
 			return nil, errors.New("sealed card is incomplete")
 		}
+		note := req.Note
+		if item.Note != nil {
+			note = item.Note
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, req.Note, unixTime(createdAt)); err != nil {
+			item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
 			return nil, fmt.Errorf("store sealed card: %w", err)
 		}
-		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(req.Note), CreatedAt: createdAt})
+		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(note), CreatedAt: createdAt})
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit generated cards: %w", err)
 	}
 	return cards, nil
+}
+
+// FindCardByDigest performs an exact lookup on the keyed full-card digest. It
+// deliberately omits ciphertext, so normal service reads cannot expose the
+// encrypted secret material.
+func (s *Store) FindCardByDigest(ctx context.Context, digest string) (model.Card, error) {
+	var card model.Card
+	var note, machine sql.NullString
+	var activatedAt, expiresAt sql.NullInt64
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,package_id,full_digest,prefix8,last4,base_days,unactivated_total_days,note,activated_at,expires_at,machine_hash,created_at FROM license_cards WHERE full_digest=?`, digest).Scan(
+		&card.ID, &card.PackageID, &card.FullDigest, &card.Prefix8, &card.Last4, &card.BaseDays, &card.UnactivatedTotalDays, &note, &activatedAt, &expiresAt, &machine, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Card{}, ErrNotFound
+	}
+	if err != nil {
+		return model.Card{}, fmt.Errorf("find card by digest: %w", err)
+	}
+	card.Note = nullableString(note)
+	card.ActivatedAt = nullableTime(activatedAt)
+	card.ExpiresAt = nullableTime(expiresAt)
+	card.MachineHash = nullableString(machine)
+	card.CreatedAt = time.Unix(createdAt, 0).UTC()
+	return card, nil
+}
+
+// GetSoftwareAuthorization returns the current software state and current
+// membership in packageID. Callers must perform this query on every online
+// authorization decision rather than cache package membership.
+func (s *Store) GetSoftwareAuthorization(ctx context.Context, packageID, softwareID string) (model.Software, bool, error) {
+	var software model.Software
+	var enabled, member int
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,enabled,created_at,EXISTS(SELECT 1 FROM license_package_members WHERE package_id=? AND software_id=license_software.id) FROM license_software WHERE id=?`, packageID, softwareID).Scan(
+		&software.ID, &software.Name, &enabled, &createdAt, &member,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Software{}, false, ErrNotFound
+	}
+	if err != nil {
+		return model.Software{}, false, fmt.Errorf("read software authorization: %w", err)
+	}
+	software.Enabled = enabled != 0
+	software.CreatedAt = time.Unix(createdAt, 0).UTC()
+	return software, member != 0, nil
 }
 
 func (s *Store) Activate(ctx context.Context, req model.ActivationMutation) (state model.ActivationState, err error) {

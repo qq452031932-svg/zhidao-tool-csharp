@@ -99,6 +99,8 @@ type SealedCard struct {
 	FullDigest string `json:"full_digest"`
 	Prefix8    string `json:"prefix8"`
 	Last4      string `json:"last4"`
+	// Note is an optional per-card override. Nil preserves the batch note.
+	Note *string `json:"-"`
 }
 
 type Card struct {
