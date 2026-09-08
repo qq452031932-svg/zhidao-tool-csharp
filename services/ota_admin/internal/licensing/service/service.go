@@ -86,6 +86,7 @@ type AdminMutationTransaction interface {
 	RenewCard(context.Context, string, int, time.Time) error
 	UnbindCard(context.Context, string) error
 	DeleteCard(context.Context, string) error
+	AssociateReplayCards([]string) error
 }
 
 type adminMutationTransactionKey struct{}
@@ -97,6 +98,14 @@ func WithAdminMutationTransaction(ctx context.Context, tx AdminMutationTransacti
 func adminMutationTransaction(ctx context.Context) (AdminMutationTransaction, bool) {
 	tx, ok := ctx.Value(adminMutationTransactionKey{}).(AdminMutationTransaction)
 	return tx, ok && !isNil(tx)
+}
+
+func AssociateAdminReplayCards(ctx context.Context, cardIDs []string) error {
+	tx, ok := adminMutationTransaction(ctx)
+	if !ok {
+		return errors.New("admin mutation transaction unavailable")
+	}
+	return tx.AssociateReplayCards(cardIDs)
 }
 
 func (s *Service) ListPackages(ctx context.Context, page, pageSize int) ([]model.Package, int, error) {
@@ -220,7 +229,7 @@ func (s *Service) CopyCard(ctx context.Context, id string) (model.AdminExportCar
 	if err != nil {
 		return model.AdminExportCard{}, classifyStoreError(err)
 	}
-	plaintext, err := s.protector.open(record.ID, record.Ciphertext, record.FullDigest)
+	plaintext, err := s.openCard(record)
 	if err != nil {
 		return model.AdminExportCard{}, errors.New("open protected card")
 	}
@@ -252,13 +261,29 @@ func (s *Service) ExportCards(ctx context.Context, ids []string, maximum int) ([
 	now := s.clock.Now().UTC()
 	result := make([]model.AdminExportCard, len(records))
 	for i, record := range records {
-		plaintext, err := s.protector.open(record.ID, record.Ciphertext, record.FullDigest)
+		plaintext, err := s.openCard(record)
 		if err != nil {
 			return nil, errors.New("open protected card")
 		}
 		result[i] = model.AdminExportCard{Summary: adminCardSummary(record, now), Plaintext: plaintext}
 	}
 	return result, nil
+}
+
+func (s *Service) openCard(record model.AdminCardRecord) (string, error) {
+	if record.EncryptionKeyID != "legacy-v2" {
+		protector, ok := s.protectors[record.EncryptionKeyID]
+		if !ok {
+			return "", errors.New("card encryption key unavailable")
+		}
+		return protector.open(record.ID, record.Ciphertext, record.FullDigest)
+	}
+	for _, protector := range s.legacyProtectors {
+		if plaintext, err := protector.open(record.ID, record.Ciphertext, record.FullDigest); err == nil {
+			return plaintext, nil
+		}
+	}
+	return "", errors.New("card encryption key unavailable")
 }
 
 func (s *Service) RemarkCard(ctx context.Context, id string, note *string) error {
@@ -313,17 +338,30 @@ func (s *Service) UnbindDevice(ctx context.Context, cardID string) error {
 	return s.UnbindCard(ctx, cardID)
 }
 
-func (s *Service) ProtectAdminReplay(key string, plaintext []byte) ([]byte, error) {
+func (s *Service) ProtectAdminReplay(key string, plaintext []byte) (string, []byte, error) {
 	if !validUUID(key) {
-		return nil, ErrInvalidRequest
+		return "", nil, ErrInvalidRequest
 	}
-	return s.protector.sealAdminReplay(key, plaintext)
+	ciphertext, err := s.protector.sealAdminReplay(key, plaintext)
+	return s.currentEncryptionKeyID, ciphertext, err
 }
-func (s *Service) OpenAdminReplay(key string, ciphertext []byte) ([]byte, error) {
+func (s *Service) OpenAdminReplay(key, encryptionKeyID string, ciphertext []byte) ([]byte, error) {
 	if !validUUID(key) {
 		return nil, ErrInvalidRequest
 	}
-	return s.protector.openAdminReplay(key, ciphertext)
+	if encryptionKeyID == "legacy-v2" {
+		for _, protector := range s.legacyProtectors {
+			if plaintext, err := protector.openAdminReplay(key, ciphertext); err == nil {
+				return plaintext, nil
+			}
+		}
+		return nil, errors.New("admin replay encryption key unavailable")
+	}
+	protector, ok := s.protectors[encryptionKeyID]
+	if !ok {
+		return nil, errors.New("admin replay encryption key unavailable")
+	}
+	return protector.openAdminReplay(key, ciphertext)
 }
 
 func deviceSummary(record model.DeviceRecord) model.DeviceSummary {
@@ -373,9 +411,12 @@ func shortOpaque(value string) string {
 var _ Store = (*licensestore.Store)(nil)
 
 type Service struct {
-	store     Store
-	clock     Clock
-	protector *cardProtector
+	store                  Store
+	clock                  Clock
+	protector              *cardProtector
+	currentEncryptionKeyID string
+	protectors             map[string]*cardProtector
+	legacyProtectors       []*cardProtector
 }
 
 // GeneratedCard is the one intentional plaintext-bearing response. Ordinary
@@ -386,14 +427,47 @@ type GeneratedCard struct {
 }
 
 func New(store Store, clock Clock, random io.Reader, encryptionKey, lookupKey []byte) (*Service, error) {
+	return NewWithPreviousEncryptionKeys(store, clock, random, encryptionKey, nil, lookupKey)
+}
+
+func NewWithPreviousEncryptionKeys(store Store, clock Clock, random io.Reader, encryptionKey []byte, previousEncryptionKeys [][]byte, lookupKey []byte) (*Service, error) {
 	if isNil(store) || isNil(clock) || random == nil {
+		return nil, ErrInvalidRequest
+	}
+	if len(previousEncryptionKeys) > 2 {
 		return nil, ErrInvalidRequest
 	}
 	protector, err := newCardProtector(encryptionKey, lookupKey, random)
 	if err != nil {
 		return nil, ErrInvalidRequest
 	}
-	return &Service{store: store, clock: clock, protector: protector}, nil
+	currentID := stableEncryptionKeyID(encryptionKey)
+	protectors := map[string]*cardProtector{currentID: protector}
+	legacy := []*cardProtector{protector}
+	seen := [][]byte{encryptionKey}
+	for _, previousKey := range previousEncryptionKeys {
+		for _, existing := range seen {
+			if hmac.Equal(existing, previousKey) {
+				return nil, ErrInvalidRequest
+			}
+		}
+		previous, err := newCardProtector(previousKey, lookupKey, random)
+		if err != nil {
+			return nil, ErrInvalidRequest
+		}
+		previousID := stableEncryptionKeyID(previousKey)
+		protectors[previousID] = previous
+		legacy = append(legacy, previous)
+		seen = append(seen, previousKey)
+	}
+	return &Service{store: store, clock: clock, protector: protector, currentEncryptionKeyID: currentID, protectors: protectors, legacyProtectors: legacy}, nil
+}
+
+func stableEncryptionKeyID(key []byte) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("ota-license-encryption-key-id:v1:"))
+	_, _ = hash.Write(key)
+	return hex.EncodeToString(hash.Sum(nil)[:16])
 }
 
 func (s *Service) GenerateCards(ctx context.Context, packageID string, durationDays, count int, defaultNote *string, perCardNotes []*string) ([]GeneratedCard, error) {
@@ -430,11 +504,12 @@ func (s *Service) GenerateCards(ctx context.Context, packageID string, durationD
 		}
 		_, compact, _ := normalizeCard(cardText)
 		sealed[i] = model.SealedCard{
-			ID:         cardID,
-			Ciphertext: protected.ciphertext,
-			FullDigest: protected.digest,
-			Prefix8:    compact[:8],
-			Last4:      compact[len(compact)-4:],
+			ID:              cardID,
+			Ciphertext:      protected.ciphertext,
+			EncryptionKeyID: s.currentEncryptionKeyID,
+			FullDigest:      protected.digest,
+			Prefix8:         compact[:8],
+			Last4:           compact[len(compact)-4:],
 		}
 		if perCardNotes != nil && perCardNotes[i] != nil {
 			sealed[i].Note = cloneString(perCardNotes[i])

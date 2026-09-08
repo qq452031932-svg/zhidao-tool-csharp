@@ -106,6 +106,8 @@ type AdminIdempotencyRecord struct {
 	Fingerprint        string
 	Status             int
 	Body               []byte
+	ReplayKeyID        string
+	CardIDs            []string
 	ContentType        string
 	ContentDisposition string
 	ExpiresAt          time.Time
@@ -131,11 +133,12 @@ type GenerateCardsRequest struct {
 // SealedCard contains the at-rest representation prepared by the service. The
 // store never receives or indexes the plaintext full card value.
 type SealedCard struct {
-	ID         string `json:"id"`
-	Ciphertext []byte `json:"ciphertext"`
-	FullDigest string `json:"full_digest"`
-	Prefix8    string `json:"prefix8"`
-	Last4      string `json:"last4"`
+	ID              string `json:"id"`
+	Ciphertext      []byte `json:"ciphertext"`
+	EncryptionKeyID string `json:"-"`
+	FullDigest      string `json:"full_digest"`
+	Prefix8         string `json:"prefix8"`
+	Last4           string `json:"last4"`
 	// Note is an optional per-card override. Nil preserves the batch note.
 	Note *string `json:"-"`
 }
@@ -186,6 +189,7 @@ type AdminCardRecord struct {
 	PackageID            string     `json:"package_id"`
 	PackageName          string     `json:"package_name"`
 	Ciphertext           []byte     `json:"-"`
+	EncryptionKeyID      string     `json:"-"`
 	FullDigest           string     `json:"-"`
 	Prefix8              string     `json:"prefix8"`
 	Last4                string     `json:"last4"`

@@ -91,6 +91,12 @@ func TestValidateRejectsRemoteRelativeAndOverlappingPaths(t *testing.T) {
 		{name: "missing admin limit", mutate: func(c *Config) { c.Limits.AdminRequests = 0 }},
 		{name: "missing replay cap", mutate: func(c *Config) { c.Limits.MaxReplayNonces = 0 }},
 		{name: "excessive replay cap", mutate: func(c *Config) { c.Limits.MaxReplayNonces = 1_000_001 }},
+		{name: "missing admin idempotency entries", mutate: func(c *Config) { c.Limits.MaxAdminIdempotencyEntries = 0 }},
+		{name: "missing admin idempotency bytes", mutate: func(c *Config) { c.Limits.MaxAdminIdempotencyBytes = 0 }},
+		{name: "too many previous encryption keys", mutate: func(c *Config) {
+			c.PreviousEncryptionKeyPaths = []string{filepath.Join(filepath.Dir(c.EncryptionKeyPath), "old1.key"), filepath.Join(filepath.Dir(c.EncryptionKeyPath), "old2.key"), filepath.Join(filepath.Dir(c.EncryptionKeyPath), "old3.key")}
+		}},
+		{name: "previous key overlaps current", mutate: func(c *Config) { c.PreviousEncryptionKeyPaths = []string{c.EncryptionKeyPath} }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,18 +157,20 @@ func validConfig(t *testing.T) Config {
 		t.Fatal(err)
 	}
 	return Config{
-		ListenAddress:         "127.0.0.1:18092",
-		LicenseDatabasePath:   filepath.Join(dir, "license.db"),
-		EncryptionKeyPath:     filepath.Join(dir, "encryption.key"),
-		LookupHMACKeyPath:     filepath.Join(dir, "lookup-hmac.key"),
-		SigningPrivateKeyPath: filepath.Join(dir, "signing.pem"),
-		InternalSecretPath:    filepath.Join(dir, "internal.key"),
-		SigningKeyID:          "local-signing-1",
-		PublicAPIBasePath:     "/license-api/v1",
+		ListenAddress:              "127.0.0.1:18092",
+		LicenseDatabasePath:        filepath.Join(dir, "license.db"),
+		EncryptionKeyPath:          filepath.Join(dir, "encryption.key"),
+		PreviousEncryptionKeyPaths: []string{filepath.Join(dir, "previous-encryption.key")},
+		LookupHMACKeyPath:          filepath.Join(dir, "lookup-hmac.key"),
+		SigningPrivateKeyPath:      filepath.Join(dir, "signing.pem"),
+		InternalSecretPath:         filepath.Join(dir, "internal.key"),
+		SigningKeyID:               "local-signing-1",
+		PublicAPIBasePath:          "/license-api/v1",
 		Limits: Limits{
 			MaxBodyBytes: 8192, MaxHeaderBytes: 16384,
 			TimestampWindowSeconds: 300, NonceLifetimeSeconds: 600,
-			MaxReplayNonces:    10_000,
+			MaxReplayNonces:            10_000,
+			MaxAdminIdempotencyEntries: 1000, MaxAdminIdempotencyBytes: 16 << 20,
 			ActivationRequests: 10, ValidationRequests: 60, AdminRequests: 30, RateWindowSeconds: 60,
 			ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 10, WriteTimeoutSeconds: 10,
 			IdleTimeoutSeconds: 30, ShutdownTimeoutSeconds: 10,

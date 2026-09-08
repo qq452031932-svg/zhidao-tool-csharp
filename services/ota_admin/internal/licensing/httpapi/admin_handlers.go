@@ -84,6 +84,10 @@ func (a *api) authorizeInternal(next http.Handler) http.Handler {
 			a.writeAdminError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if malformedInternalPath(r.URL.Path) {
+			a.writeAdminError(w, http.StatusNotFound, "not_found")
+			return
+		}
 		if !a.allowAdmin(w, r) {
 			return
 		}
@@ -92,8 +96,15 @@ func (a *api) authorizeInternal(next http.Handler) http.Handler {
 			return
 		}
 		if mux, ok := next.(*http.ServeMux); ok {
-			if _, pattern := mux.Handler(r); pattern == "" {
-				next.ServeHTTP(w, r)
+			handler, pattern := mux.Handler(r)
+			if pattern == "" {
+				probe := &bufferedAdminResponse{header: make(http.Header)}
+				handler.ServeHTTP(probe, r)
+				status := http.StatusNotFound
+				if probe.status == http.StatusMethodNotAllowed {
+					status = http.StatusMethodNotAllowed
+				}
+				a.writeAdminError(w, status, map[bool]string{true: "method_not_allowed", false: "not_found"}[status == http.StatusMethodNotAllowed])
 				return
 			}
 		}
@@ -103,6 +114,18 @@ func (a *api) authorizeInternal(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func malformedInternalPath(path string) bool {
+	if path == "" || strings.Contains(path, "//") || strings.Contains(path, `\`) {
+		return true
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "." || segment == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 type bufferedAdminResponse struct {
@@ -145,7 +168,7 @@ func (a *api) serveAdminMutation(w http.ResponseWriter, r *http.Request, next ht
 
 	now := a.options.Clock.Now().UTC()
 	expiresAt := now.Add(24 * time.Hour)
-	tx, record, outcome, err := a.options.AdminIdempotencyStore.BeginAdminMutation(r.Context(), key, fingerprint, now, expiresAt, a.options.MaxReplayNonces)
+	tx, record, outcome, err := a.options.AdminIdempotencyStore.BeginAdminMutation(r.Context(), key, fingerprint, now, expiresAt, a.options.MaxAdminIdempotencyEntries, a.options.MaxAdminIdempotencyBytes)
 	if err != nil {
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
@@ -158,7 +181,7 @@ func (a *api) serveAdminMutation(w http.ResponseWriter, r *http.Request, next ht
 		a.writeAdminError(w, http.StatusConflict, "operation_in_progress")
 		return
 	case model.AdminIdempotencyReplay:
-		replayBody, err := a.options.AdminService.OpenAdminReplay(key, record.Body)
+		replayBody, err := a.options.AdminService.OpenAdminReplay(key, record.ReplayKeyID, record.Body)
 		if err != nil {
 			a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 			return
@@ -185,12 +208,12 @@ func (a *api) serveAdminMutation(w http.ResponseWriter, r *http.Request, next ht
 	if buffered.status == 0 {
 		buffered.status = http.StatusOK
 	}
-	protected, err := a.options.AdminService.ProtectAdminReplay(key, buffered.body.Bytes())
+	replayKeyID, protected, err := a.options.AdminService.ProtectAdminReplay(key, buffered.body.Bytes())
 	if err != nil {
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
-	record = model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: buffered.status, Body: protected, ContentType: buffered.header.Get("Content-Type"), ContentDisposition: buffered.header.Get("Content-Disposition"), ExpiresAt: expiresAt}
+	record = model.AdminIdempotencyRecord{Fingerprint: fingerprint, Status: buffered.status, Body: protected, ReplayKeyID: replayKeyID, ContentType: buffered.header.Get("Content-Type"), ContentDisposition: buffered.header.Get("Content-Disposition"), ExpiresAt: expiresAt}
 	if err := tx.Complete(r.Context(), key, record); err != nil {
 		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
@@ -444,6 +467,10 @@ func (a *api) exportCards(w http.ResponseWriter, r *http.Request) {
 		a.writeAdminServiceError(w, err)
 		return
 	}
+	if err := service.AssociateAdminReplayCards(r.Context(), request.CardIDs); err != nil {
+		a.writeAdminError(w, http.StatusServiceUnavailable, "service_unavailable")
+		return
+	}
 	var output bytes.Buffer
 	output.Write([]byte{0xef, 0xbb, 0xbf})
 	writer := csv.NewWriter(&output)
@@ -582,6 +609,10 @@ func (a *api) paginationValues(r *http.Request) (int, int, bool) {
 		if err != nil || pageSize < 1 || pageSize > a.options.MaxAdminPageSize {
 			return 0, 0, false
 		}
+	}
+	maxInt := int(^uint(0) >> 1)
+	if page-1 > maxInt/pageSize {
+		return 0, 0, false
 	}
 	return page, pageSize, true
 }

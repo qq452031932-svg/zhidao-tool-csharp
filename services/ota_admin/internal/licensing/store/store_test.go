@@ -154,7 +154,7 @@ func TestAdminMutationRollsBackWhenIdempotencyCompletionFails(t *testing.T) {
 	now := time.Date(2026, 9, 9, 13, 0, 0, 0, time.UTC)
 	key := uuid.NewString()
 	fingerprint := strings.Repeat("f", 64)
-	tx, _, outcome, err := s.BeginAdminMutation(ctx, key, fingerprint, now, now.Add(time.Hour), 10)
+	tx, _, outcome, err := s.BeginAdminMutation(ctx, key, fingerprint, now, now.Add(time.Hour), 10, 1<<20)
 	if err != nil || outcome != model.AdminIdempotencyNew {
 		t.Fatalf("begin outcome=%q err=%v", outcome, err)
 	}
@@ -174,6 +174,24 @@ func TestAdminMutationRollsBackWhenIdempotencyCompletionFails(t *testing.T) {
 	}
 	if software != 0 || idempotency != 0 {
 		t.Fatalf("partial commit software=%d idempotency=%d", software, idempotency)
+	}
+}
+
+func TestAdminOrdinaryCardSearchDoesNotReturnSecretColumns(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	software := mustSoftware(t, s, "Safe Search Product")
+	pkg, err := s.CreatePackage(ctx, "Safe Search Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	card := mustCard(t, s, pkg.ID, 30, nil)
+	items, total, err := s.SearchAdminCards(ctx, model.AdminCardFilter{}, time.Now().UTC(), 0, 10)
+	if err != nil || total != 1 || len(items) != 1 {
+		t.Fatalf("search total=%d items=%d err=%v", total, len(items), err)
+	}
+	if items[0].ID != card.ID || len(items[0].Ciphertext) != 0 || items[0].FullDigest != "" {
+		t.Fatalf("ordinary search returned secret columns: %+v", items[0])
 	}
 }
 

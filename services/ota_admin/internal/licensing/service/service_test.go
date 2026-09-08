@@ -743,7 +743,7 @@ func TestGenerateCardsPersistsOnlyEncryptedCardMaterial(t *testing.T) {
 	}
 	defer rows.Close()
 	allowedColumns := map[string]bool{
-		"id": true, "package_id": true, "ciphertext": true, "full_digest": true,
+		"id": true, "package_id": true, "ciphertext": true, "encryption_key_id": true, "full_digest": true,
 		"prefix8": true, "last4": true, "base_days": true, "unactivated_total_days": true,
 		"note": true, "activated_at": true, "expires_at": true, "machine_hash": true, "created_at": true,
 	}

@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const licenseSchemaVersion = 2
+const licenseSchemaVersion = 3
 
 const licenseSchemaV1 = `
 CREATE TABLE license_schema_version (
@@ -127,6 +127,23 @@ CREATE INDEX license_admin_idempotency_expiry ON license_admin_idempotency(expir
 UPDATE license_schema_version SET version=2 WHERE singleton_id=1;
 `
 
+const licenseSchemaV3 = `
+ALTER TABLE license_admin_idempotency ADD COLUMN replay_key_id TEXT NOT NULL DEFAULT 'legacy-v2';
+ALTER TABLE license_cards ADD COLUMN encryption_key_id TEXT NOT NULL DEFAULT 'legacy-v2';
+CREATE TABLE license_admin_idempotency_cards (
+    idempotency_key TEXT NOT NULL REFERENCES license_admin_idempotency(key) ON DELETE CASCADE,
+    card_id TEXT NOT NULL,
+    PRIMARY KEY(idempotency_key,card_id)
+);
+CREATE INDEX license_admin_idempotency_cards_card ON license_admin_idempotency_cards(card_id,idempotency_key);
+CREATE TRIGGER license_card_purge_secret_replays BEFORE DELETE ON license_cards
+BEGIN
+    DELETE FROM license_admin_idempotency
+    WHERE key IN (SELECT idempotency_key FROM license_admin_idempotency_cards WHERE card_id=OLD.id);
+END;
+UPDATE license_schema_version SET version=3 WHERE singleton_id=1;
+`
+
 func migrate(ctx context.Context, db *sql.DB) error {
 	return retrySQLiteBusy(ctx, func() error { return migrateOnce(ctx, db) })
 }
@@ -167,6 +184,9 @@ func migrateOnce(ctx context.Context, db *sql.DB) error {
 		if _, err := tx.ExecContext(ctx, licenseSchemaV2); err != nil {
 			return fmt.Errorf("upgrade license schema: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, licenseSchemaV3); err != nil {
+			return fmt.Errorf("upgrade license schema: %w", err)
+		}
 	} else {
 		var version int
 		if err := tx.QueryRowContext(ctx, `SELECT version FROM license_schema_version WHERE singleton_id=1`).Scan(&version); err != nil {
@@ -180,6 +200,12 @@ func migrateOnce(ctx context.Context, db *sql.DB) error {
 				return fmt.Errorf("upgrade license schema: %w", err)
 			}
 			version = 2
+		}
+		if version == 2 {
+			if _, err := tx.ExecContext(ctx, licenseSchemaV3); err != nil {
+				return fmt.Errorf("upgrade license schema: %w", err)
+			}
+			version = 3
 		}
 		if version != licenseSchemaVersion {
 			return fmt.Errorf("unsupported license schema version %d", version)

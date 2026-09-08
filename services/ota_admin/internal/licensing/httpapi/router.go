@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/licensing/authwire"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
 	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
@@ -44,12 +45,12 @@ type AdminService interface {
 	ListDevices(context.Context, int, int) ([]model.DeviceSummary, int, error)
 	GetDevice(context.Context, string) (model.DeviceSummary, error)
 	UnbindDevice(context.Context, string) error
-	ProtectAdminReplay(string, []byte) ([]byte, error)
-	OpenAdminReplay(string, []byte) ([]byte, error)
+	ProtectAdminReplay(string, []byte) (string, []byte, error)
+	OpenAdminReplay(string, string, []byte) ([]byte, error)
 }
 
 type AdminIdempotencyStore interface {
-	BeginAdminMutation(context.Context, string, string, time.Time, time.Time, int) (*licensestore.AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error)
+	BeginAdminMutation(context.Context, string, string, time.Time, time.Time, int, int64) (*licensestore.AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error)
 }
 
 type ReplayStore interface {
@@ -61,24 +62,26 @@ type ClaimsSigner interface {
 }
 
 type Options struct {
-	Service               LicenseService
-	ReplayStore           ReplayStore
-	Signer                ClaimsSigner
-	Clock                 Clock
-	MaxBodyBytes          int64
-	MaxHeaderBytes        int
-	TimestampWindow       time.Duration
-	NonceLifetime         time.Duration
-	MaxReplayNonces       int
-	ActivationRate        RateLimit
-	ValidationRate        RateLimit
-	MaxLimiterEntries     int
-	AdminService          AdminService
-	AdminIdempotencyStore AdminIdempotencyStore
-	InternalSecret        []byte
-	AdminRate             RateLimit
-	MaxAdminPageSize      int
-	MaxExportCount        int
+	Service                    LicenseService
+	ReplayStore                ReplayStore
+	Signer                     ClaimsSigner
+	Clock                      Clock
+	MaxBodyBytes               int64
+	MaxHeaderBytes             int
+	TimestampWindow            time.Duration
+	NonceLifetime              time.Duration
+	MaxReplayNonces            int
+	ActivationRate             RateLimit
+	ValidationRate             RateLimit
+	MaxLimiterEntries          int
+	AdminService               AdminService
+	AdminIdempotencyStore      AdminIdempotencyStore
+	InternalSecret             []byte
+	AdminRate                  RateLimit
+	MaxAdminPageSize           int
+	MaxExportCount             int
+	MaxAdminIdempotencyEntries int
+	MaxAdminIdempotencyBytes   int64
 }
 
 type api struct {
@@ -99,14 +102,15 @@ func NewRouter(options Options) (http.Handler, error) {
 	a.activation = newFixedWindowLimiter(options.ActivationRate, options.MaxLimiterEntries, options.Clock)
 	a.validation = newFixedWindowLimiter(options.ValidationRate, options.MaxLimiterEntries, options.Clock)
 	mux := http.NewServeMux()
+	var internal http.Handler
 	mux.HandleFunc("POST /license-api/v1/activate", a.activate)
 	mux.HandleFunc("POST /license-api/v1/validate", a.validate)
-	adminConfigured := options.AdminService != nil || options.AdminIdempotencyStore != nil || len(options.InternalSecret) != 0 || options.AdminRate.Requests != 0 || options.MaxAdminPageSize != 0 || options.MaxExportCount != 0
+	adminConfigured := options.AdminService != nil || options.AdminIdempotencyStore != nil || len(options.InternalSecret) != 0 || options.AdminRate.Requests != 0 || options.MaxAdminPageSize != 0 || options.MaxExportCount != 0 || options.MaxAdminIdempotencyEntries != 0 || options.MaxAdminIdempotencyBytes != 0
 	if adminConfigured {
-		if options.AdminService == nil || options.AdminIdempotencyStore == nil || len(options.InternalSecret) < 16 || options.AdminRate.Requests < 1 || options.AdminRate.Window <= 0 || options.MaxAdminPageSize < 1 || options.MaxExportCount < 1 {
+		if options.AdminService == nil || options.AdminIdempotencyStore == nil || len(options.InternalSecret) != 32 || options.AdminRate.Requests < 1 || options.AdminRate.Window <= 0 || options.MaxAdminPageSize < 1 || options.MaxExportCount < 1 || options.MaxAdminIdempotencyEntries < 1 || options.MaxAdminIdempotencyBytes < 1 {
 			return nil, errors.New("internal admin API dependencies are invalid")
 		}
-		a.options.InternalSecret = append([]byte(nil), options.InternalSecret...)
+		a.options.InternalSecret = []byte(authwire.EncodeInternalToken(options.InternalSecret))
 		a.admin = newFixedWindowLimiter(options.AdminRate, options.MaxLimiterEntries, options.Clock)
 		adminMux := http.NewServeMux()
 		adminMux.HandleFunc("GET /internal/v1/software", a.listSoftware)
@@ -130,9 +134,19 @@ func NewRouter(options Options) (http.Handler, error) {
 		adminMux.HandleFunc("GET /internal/v1/devices", a.listDevices)
 		adminMux.HandleFunc("GET /internal/v1/devices/{id}", a.getDevice)
 		adminMux.HandleFunc("POST /internal/v1/devices/{id}/unbind", a.unbindDevice)
-		mux.Handle("/internal/", a.authorizeInternal(adminMux))
+		internal = a.authorizeInternal(adminMux)
 	}
-	return a.protect(mux), nil
+	root := http.Handler(mux)
+	if internal != nil {
+		root = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/internal" || strings.HasPrefix(r.URL.Path, "/internal/") {
+				internal.ServeHTTP(w, r)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	}
+	return a.protect(root), nil
 }
 
 func (a *api) protect(next http.Handler) http.Handler {

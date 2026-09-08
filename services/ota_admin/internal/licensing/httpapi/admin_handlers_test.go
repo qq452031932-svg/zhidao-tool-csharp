@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/licensing/authwire"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/signing"
 	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
@@ -24,6 +26,8 @@ import (
 )
 
 const adminSecret = "0123456789abcdef0123456789abcdef"
+
+var adminBearer = "Bearer " + authwire.EncodeInternalToken([]byte(adminSecret))
 
 type adminHarness struct {
 	t       *testing.T
@@ -49,6 +53,10 @@ func newAdminHarness(t *testing.T, limit int) *adminHarness {
 }
 
 func newAdminRouterForStore(t *testing.T, st *licensestore.Store, clock *testClock, limit int) (*service.Service, http.Handler) {
+	return newAdminRouterForStoreWithSecret(t, st, clock, limit, []byte(adminSecret))
+}
+
+func newAdminRouterForStoreWithSecret(t *testing.T, st *licensestore.Store, clock *testClock, limit int, secret []byte) (*service.Service, http.Handler) {
 	t.Helper()
 	svc, err := service.New(st, clock, rand.Reader, bytes.Repeat([]byte{0x31}, 32), bytes.Repeat([]byte{0x32}, 32))
 	if err != nil {
@@ -67,13 +75,160 @@ func newAdminRouterForStore(t *testing.T, st *licensestore.Store, clock *testClo
 		MaxBodyBytes: 8192, MaxHeaderBytes: 4096,
 		TimestampWindow: time.Minute, NonceLifetime: 2 * time.Minute, MaxReplayNonces: 100,
 		ActivationRate: AntragRate(100), ValidationRate: AntragRate(100), MaxLimiterEntries: 32,
-		AdminService: svc, AdminIdempotencyStore: st, InternalSecret: []byte(adminSecret),
+		AdminService: svc, AdminIdempotencyStore: st, InternalSecret: secret,
 		AdminRate: RateLimit{Requests: limit, Window: time.Minute}, MaxAdminPageSize: 100, MaxExportCount: 100,
+		MaxAdminIdempotencyEntries: 100, MaxAdminIdempotencyBytes: 1 << 20,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return svc, handler
+}
+
+func newAdminRouterWithEncryptionKeys(t *testing.T, st *licensestore.Store, clock *testClock, current []byte, previous [][]byte) (*service.Service, http.Handler) {
+	return newAdminRouterWithCapacity(t, st, clock, current, previous, 100, 1<<20)
+}
+
+func newAdminRouterWithCapacity(t *testing.T, st *licensestore.Store, clock *testClock, current []byte, previous [][]byte, maxEntries int, maxBytes int64) (*service.Service, http.Handler) {
+	t.Helper()
+	svc, err := service.NewWithPreviousEncryptionKeys(st, clock, rand.Reader, current, previous, bytes.Repeat([]byte{0x32}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := signing.New("admin-test", key, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewRouter(Options{
+		Service: svc, ReplayStore: st, Signer: signer, Clock: clock,
+		MaxBodyBytes: 8192, MaxHeaderBytes: 4096,
+		TimestampWindow: time.Minute, NonceLifetime: 2 * time.Minute, MaxReplayNonces: 100,
+		ActivationRate: AntragRate(100), ValidationRate: AntragRate(100), MaxLimiterEntries: 32,
+		AdminService: svc, AdminIdempotencyStore: st, InternalSecret: []byte(adminSecret),
+		AdminRate: RateLimit{Requests: 100, Window: time.Minute}, MaxAdminPageSize: 100, MaxExportCount: 100,
+		MaxAdminIdempotencyEntries: maxEntries, MaxAdminIdempotencyBytes: maxBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc, handler
+}
+
+func TestAdminIdempotencyUsesDistinctEntryAndEncryptedByteCapacity(t *testing.T) {
+	ctx := context.Background()
+	clock := &testClock{now: time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)}
+	key := bytes.Repeat([]byte{0x31}, 32)
+
+	entryStore, err := licensestore.Open(ctx, t.TempDir()+`\entries.db`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer entryStore.Close()
+	_, entryRouter := newAdminRouterWithCapacity(t, entryStore, clock, key, nil, 1, 1<<20)
+	requestCreate := func(handler http.Handler, name string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"`+name+`"}`))
+		r.RemoteAddr = "127.0.0.1:10"
+		r.Header.Set("Authorization", adminBearer)
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Idempotency-Key", uuid.NewString())
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if first := requestCreate(entryRouter, "Entry One"); first.Code != http.StatusCreated {
+		t.Fatalf("first entry=%d %s", first.Code, first.Body.String())
+	}
+	if second := requestCreate(entryRouter, "Entry Two"); second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("entry capacity=%d %s", second.Code, second.Body.String())
+	}
+	if _, total, err := entryStore.ListSoftware(ctx, 0, 10); err != nil || total != 1 {
+		t.Fatalf("entry capacity mutation total=%d err=%v", total, err)
+	}
+
+	byteStore, err := licensestore.Open(ctx, t.TempDir()+`\bytes.db`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer byteStore.Close()
+	_, byteRouter := newAdminRouterWithCapacity(t, byteStore, clock, key, nil, 100, 64)
+	if response := requestCreate(byteRouter, "Byte Budget Product"); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("byte capacity=%d %s", response.Code, response.Body.String())
+	}
+	if _, total, err := byteStore.ListSoftware(ctx, 0, 10); err != nil || total != 0 {
+		t.Fatalf("oversize response committed mutation: total=%d err=%v", total, err)
+	}
+	software, err := byteStore.CreateSoftware(ctx, "Bounded Generate Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := byteStore.CreatePackage(ctx, "Bounded Generate Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/generate", strings.NewReader(`{"package_id":"`+pkg.ID+`","duration_days":30,"count":2}`))
+	r.RemoteAddr = "127.0.0.1:10"
+	r.Header.Set("Authorization", adminBearer)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Idempotency-Key", uuid.NewString())
+	w := httptest.NewRecorder()
+	byteRouter.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("oversize generation=%d %s", w.Code, w.Body.String())
+	}
+	if _, total, err := byteStore.SearchAdminCards(ctx, model.AdminCardFilter{}, clock.Now(), 0, 10); err != nil || total != 0 {
+		t.Fatalf("oversize generation committed cards: total=%d err=%v", total, err)
+	}
+}
+
+func TestAdminExportGenerateAndPageBounds(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	if response := h.request(http.MethodGet, "/internal/v1/cards?page=1&page_size=101", "", false); response.Code != http.StatusBadRequest {
+		t.Fatalf("page bound=%d %s", response.Code, response.Body.String())
+	}
+	if response := h.request(http.MethodPost, "/internal/v1/cards/generate", `{"package_id":"`+uuid.NewString()+`","duration_days":30,"count":1001}`, true); response.Code != http.StatusBadRequest {
+		t.Fatalf("generate bound=%d %s", response.Code, response.Body.String())
+	}
+	ids := make([]string, 101)
+	for index := range ids {
+		ids[index] = uuid.NewString()
+	}
+	body, err := json.Marshal(adminExportRequest{CardIDs: ids})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := h.request(http.MethodPost, "/internal/v1/cards/export", string(body), true); response.Code != http.StatusBadRequest {
+		t.Fatalf("export bound=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminRawBinarySecretUsesCanonicalWireEncoding(t *testing.T) {
+	ctx := context.Background()
+	st, err := licensestore.Open(ctx, t.TempDir()+`\license.db`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	clock := &testClock{now: time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)}
+	secret := append([]byte{0x00, 0x0a, 0x0d, 0x7f, 0x80, 0xff}, bytes.Repeat([]byte{0x42}, 26)...)
+	_, handler := newAdminRouterForStoreWithSecret(t, st, clock, 100, secret)
+	request := func(authorization string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/internal/v1/software", nil)
+		r.RemoteAddr = "127.0.0.1:1"
+		r.Header.Set("Authorization", authorization)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if got := request("Bearer " + authwire.EncodeInternalToken(secret)); got.Code != http.StatusOK {
+		t.Fatalf("encoded secret status=%d body=%s", got.Code, got.Body.String())
+	}
+	if got := request("Bearer " + string(secret)); got.Code != http.StatusUnauthorized {
+		t.Fatalf("raw binary secret status=%d body=%s", got.Code, got.Body.String())
+	}
 }
 
 func AntragRate(requests int) RateLimit {
@@ -84,7 +239,7 @@ func (h *adminHarness) request(method, path, body string, idempotency bool) *htt
 	h.t.Helper()
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.RemoteAddr = "127.0.0.1:43000"
-	r.Header.Set("Authorization", "Bearer "+adminSecret)
+	r.Header.Set("Authorization", adminBearer)
 	if body != "" {
 		r.Header.Set("Content-Type", "application/json")
 	}
@@ -103,16 +258,16 @@ func TestAdminRequiresImmediateLoopbackAndExactCanonicalBearer(t *testing.T) {
 		headers      []string
 		want         int
 	}{
-		{name: "authorized IPv4 loopback", remote: "127.0.0.1:1", headers: []string{"Bearer " + adminSecret}, want: http.StatusOK},
-		{name: "authorized IPv6 loopback", remote: "[::1]:1", headers: []string{"Bearer " + adminSecret}, want: http.StatusOK},
-		{name: "non-loopback hidden despite forwarded loopback", remote: "198.51.100.2:1", headers: []string{"Bearer " + adminSecret}, want: http.StatusNotFound},
+		{name: "authorized IPv4 loopback", remote: "127.0.0.1:1", headers: []string{adminBearer}, want: http.StatusOK},
+		{name: "authorized IPv6 loopback", remote: "[::1]:1", headers: []string{adminBearer}, want: http.StatusOK},
+		{name: "non-loopback hidden despite forwarded loopback", remote: "198.51.100.2:1", headers: []string{adminBearer}, want: http.StatusNotFound},
 		{name: "missing", remote: "127.0.0.1:1", want: http.StatusUnauthorized},
 		{name: "wrong", remote: "127.0.0.1:1", headers: []string{"Bearer wrong"}, want: http.StatusUnauthorized},
 		{name: "alternate scheme", remote: "127.0.0.1:1", headers: []string{"bearer " + adminSecret}, want: http.StatusUnauthorized},
-		{name: "leading whitespace", remote: "127.0.0.1:1", headers: []string{" Bearer " + adminSecret}, want: http.StatusUnauthorized},
-		{name: "trailing whitespace", remote: "127.0.0.1:1", headers: []string{"Bearer " + adminSecret + " "}, want: http.StatusUnauthorized},
-		{name: "comma", remote: "127.0.0.1:1", headers: []string{"Bearer " + adminSecret + ",Bearer " + adminSecret}, want: http.StatusUnauthorized},
-		{name: "duplicate", remote: "127.0.0.1:1", headers: []string{"Bearer " + adminSecret, "Bearer " + adminSecret}, want: http.StatusUnauthorized},
+		{name: "leading whitespace", remote: "127.0.0.1:1", headers: []string{" " + adminBearer}, want: http.StatusUnauthorized},
+		{name: "trailing whitespace", remote: "127.0.0.1:1", headers: []string{adminBearer + " "}, want: http.StatusUnauthorized},
+		{name: "comma", remote: "127.0.0.1:1", headers: []string{adminBearer + "," + adminBearer}, want: http.StatusUnauthorized},
+		{name: "duplicate", remote: "127.0.0.1:1", headers: []string{adminBearer, adminBearer}, want: http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,7 +332,7 @@ func TestAdminMutationIdempotencyPersistsReplayAndRejectsKeyReuse(t *testing.T) 
 	do := func(name string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"`+name+`"}`))
 		r.RemoteAddr = "127.0.0.1:2"
-		r.Header.Set("Authorization", "Bearer "+adminSecret)
+		r.Header.Set("Authorization", adminBearer)
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Idempotency-Key", key)
 		w := httptest.NewRecorder()
@@ -216,7 +371,7 @@ func TestAdminLimiterIsSeparateResetsAndRejectsBeforeBodyRead(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", nil)
 	r.Body = body
 	r.RemoteAddr = "127.0.0.1:3"
-	r.Header.Set("Authorization", "Bearer "+adminSecret)
+	r.Header.Set("Authorization", adminBearer)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Idempotency-Key", uuid.NewString())
 	w := httptest.NewRecorder()
@@ -326,7 +481,7 @@ func TestAdminCardCopyAndCSVExportAreExplicitAndFormulaSafe(t *testing.T) {
 	doExport := func() *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/export", strings.NewReader(`{"card_ids":["`+cardID+`"]}`))
 		r.RemoteAddr = "127.0.0.1:7"
-		r.Header.Set("Authorization", "Bearer "+adminSecret)
+		r.Header.Set("Authorization", adminBearer)
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Idempotency-Key", exportKey)
 		w := httptest.NewRecorder()
@@ -381,6 +536,66 @@ func TestAdminCardActionsAreIdempotentAndDeleteIsPermanent(t *testing.T) {
 	recycle := h.request(http.MethodPost, "/internal/v1/cards/"+cardID+"/restore", `{}`, true)
 	if recycle.Code != http.StatusNotFound {
 		t.Fatalf("restore route=%d %s", recycle.Code, recycle.Body.String())
+	}
+}
+
+func TestAdminDeletePurgesGenerateAndExportPlaintextReplays(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	software, err := h.store.CreateSoftware(context.Background(), "Replay Purge Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := h.store.CreatePackage(context.Background(), "Replay Purge Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generateKey := uuid.NewString()
+	do := func(method, path, body, key string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.RemoteAddr = "127.0.0.1:8"
+		r.Header.Set("Authorization", adminBearer)
+		if body != "" {
+			r.Header.Set("Content-Type", "application/json")
+		}
+		if key != "" {
+			r.Header.Set("Idempotency-Key", key)
+		}
+		w := httptest.NewRecorder()
+		h.handler.ServeHTTP(w, r)
+		return w
+	}
+	generated := do(http.MethodPost, "/internal/v1/cards/generate", `{"package_id":"`+pkg.ID+`","duration_days":30,"count":1}`, generateKey)
+	if generated.Code != http.StatusCreated {
+		t.Fatalf("generate=%d %s", generated.Code, generated.Body.String())
+	}
+	var decoded struct {
+		Items []struct {
+			Card struct {
+				ID string `json:"id"`
+			} `json:"card"`
+			Plaintext string `json:"plaintext"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(generated.Body.Bytes(), &decoded); err != nil || len(decoded.Items) != 1 {
+		t.Fatalf("decode generated cards: %v body=%s", err, generated.Body.String())
+	}
+	cards := decoded.Items
+	exportKey := uuid.NewString()
+	exported := do(http.MethodPost, "/internal/v1/cards/export", `{"card_ids":["`+cards[0].Card.ID+`"]}`, exportKey)
+	if exported.Code != http.StatusOK || !strings.Contains(exported.Body.String(), cards[0].Plaintext) {
+		t.Fatalf("export=%d %s", exported.Code, exported.Body.String())
+	}
+	deleted := do(http.MethodDelete, "/internal/v1/cards/"+cards[0].Card.ID, `{}`, uuid.NewString())
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete=%d %s", deleted.Code, deleted.Body.String())
+	}
+	exportReplay := do(http.MethodPost, "/internal/v1/cards/export", `{"card_ids":["`+cards[0].Card.ID+`"]}`, exportKey)
+	if exportReplay.Code != http.StatusNotFound || strings.Contains(exportReplay.Body.String(), cards[0].Plaintext) {
+		t.Fatalf("export replay recovered deleted plaintext: %d %s", exportReplay.Code, exportReplay.Body.String())
+	}
+	generateReplay := do(http.MethodPost, "/internal/v1/cards/generate", `{"package_id":"`+pkg.ID+`","duration_days":30,"count":1}`, generateKey)
+	if generateReplay.Body.String() == generated.Body.String() || strings.Contains(generateReplay.Body.String(), cards[0].Plaintext) {
+		t.Fatalf("generate replay recovered deleted plaintext: %d %s", generateReplay.Code, generateReplay.Body.String())
 	}
 }
 
@@ -442,7 +657,7 @@ func TestAdminStrictHeadersJSONAndUnknownRoutes(t *testing.T) {
 			}
 			r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(body))
 			r.RemoteAddr = "127.0.0.1:4"
-			r.Header.Set("Authorization", "Bearer "+adminSecret)
+			r.Header.Set("Authorization", adminBearer)
 			r.Header.Set("Content-Type", "application/json")
 			if tt.mutate != nil {
 				tt.mutate(r)
@@ -456,12 +671,54 @@ func TestAdminStrictHeadersJSONAndUnknownRoutes(t *testing.T) {
 	}
 	r := httptest.NewRequest(http.MethodPost, "/internal/v1/cards/not-a-card/restore", strings.NewReader(`{}`))
 	r.RemoteAddr = "127.0.0.1:5"
-	r.Header.Set("Authorization", "Bearer "+adminSecret)
+	r.Header.Set("Authorization", adminBearer)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.handler.ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unknown route without idempotency=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAdminMalformedPathsAndMethodMismatchNeverRedirectOrReturnPlainText(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	tests := []struct {
+		name, method, path, authorization, remote string
+		want                                      int
+	}{
+		{name: "nonloopback traversal hidden", method: http.MethodGet, path: "/internal/v1/../software", authorization: adminBearer, remote: "198.51.100.8:1", want: http.StatusNotFound},
+		{name: "bad auth repeated slash", method: http.MethodGet, path: "/internal//v1/software", authorization: "Bearer wrong", remote: "127.0.0.1:1", want: http.StatusUnauthorized},
+		{name: "authorized traversal", method: http.MethodGet, path: "/internal/v1/../software", authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusNotFound},
+		{name: "authorized repeated slash", method: http.MethodGet, path: "/internal//v1/software", authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusNotFound},
+		{name: "method mismatch", method: http.MethodDelete, path: "/internal/v1/packages/" + uuid.NewString(), authorization: adminBearer, remote: "127.0.0.1:1", want: http.StatusMethodNotAllowed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(tt.method, tt.path, nil)
+			r.RemoteAddr = tt.remote
+			r.Header.Set("Authorization", tt.authorization)
+			w := httptest.NewRecorder()
+			h.handler.ServeHTTP(w, r)
+			if w.Code != tt.want || w.Header().Get("Location") != "" || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+				t.Fatalf("status=%d want=%d location=%q type=%q cache=%q body=%q", w.Code, tt.want, w.Header().Get("Location"), w.Header().Get("Content-Type"), w.Header().Get("Cache-Control"), w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminRejectsPaginationOverflow(t *testing.T) {
+	h := newAdminHarness(t, 100)
+	response := h.request(http.MethodGet, "/internal/v1/software?page=9223372036854775807&page_size=100", "", false)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("overflow page status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminCSVFormulaDefenseCoversEveryDangerousPrefix(t *testing.T) {
+	for _, value := range []string{"=formula", "+formula", "-formula", "@formula", "\tformula", "\rformula"} {
+		if got := safeCSVCell(value); got != "'"+value {
+			t.Fatalf("safeCSVCell(%q)=%q", value, got)
+		}
 	}
 }
 
@@ -491,7 +748,7 @@ func TestAdminConflictsAndConcurrentIdempotency(t *testing.T) {
 			defer wg.Done()
 			r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"Concurrent Admin Product"}`))
 			r.RemoteAddr = "127.0.0.1:6"
-			r.Header.Set("Authorization", "Bearer "+adminSecret)
+			r.Header.Set("Authorization", adminBearer)
 			r.Header.Set("Content-Type", "application/json")
 			r.Header.Set("Idempotency-Key", key)
 			w := httptest.NewRecorder()
@@ -556,7 +813,7 @@ func TestAdminLostResponseAfterCommitReplaysExactlyAcrossRestart(t *testing.T) {
 	request := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"Restart Replay Product"}`))
 		r.RemoteAddr = "127.0.0.1:7"
-		r.Header.Set("Authorization", "Bearer "+adminSecret)
+		r.Header.Set("Authorization", adminBearer)
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Idempotency-Key", key)
 		return r
@@ -583,6 +840,73 @@ func TestAdminLostResponseAfterCommitReplaysExactlyAcrossRestart(t *testing.T) {
 	_, total, err := secondStore.ListSoftware(ctx, 0, 10)
 	if err != nil || total != 1 {
 		t.Fatalf("lost response repeated mutation: total=%d err=%v", total, err)
+	}
+}
+
+func TestAdminReplayEncryptionKeyRotationUsesBoundedPreviousKeysAndFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	st, err := licensestore.Open(ctx, t.TempDir()+`\license.db`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	clock := &testClock{now: time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)}
+	oldKey := bytes.Repeat([]byte{0x41}, 32)
+	newKey := bytes.Repeat([]byte{0x42}, 32)
+	oldService, oldRouter := newAdminRouterWithEncryptionKeys(t, st, clock, oldKey, nil)
+	software, err := st.CreateSoftware(ctx, "Rotated Card Product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := st.CreatePackage(ctx, "Rotated Card Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := oldService.GenerateCards(ctx, pkg.ID, 30, 1, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idempotencyKey := uuid.NewString()
+	request := func(handler http.Handler) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/internal/v1/software", strings.NewReader(`{"name":"Rotated Replay Product"}`))
+		r.RemoteAddr = "127.0.0.1:9"
+		r.Header.Set("Authorization", adminBearer)
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Idempotency-Key", idempotencyKey)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	first := request(oldRouter)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("old write=%d %s", first.Code, first.Body.String())
+	}
+	_, rotatedRouter := newAdminRouterWithEncryptionKeys(t, st, clock, newKey, [][]byte{oldKey})
+	replayed := request(rotatedRouter)
+	if replayed.Code != first.Code || replayed.Body.String() != first.Body.String() {
+		t.Fatalf("rotation replay differs: first=%d %q replay=%d %q", first.Code, first.Body.String(), replayed.Code, replayed.Body.String())
+	}
+	copyRequest := func(handler http.Handler) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/internal/v1/cards/"+generated[0].Card.ID+"/copy", nil)
+		r.RemoteAddr = "127.0.0.1:9"
+		r.Header.Set("Authorization", adminBearer)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	if copied := copyRequest(rotatedRouter); copied.Code != http.StatusOK || !strings.Contains(copied.Body.String(), generated[0].Plaintext) {
+		t.Fatalf("rotated card copy=%d %s", copied.Code, copied.Body.String())
+	}
+	_, missingOldRouter := newAdminRouterWithEncryptionKeys(t, st, clock, newKey, nil)
+	closed := request(missingOldRouter)
+	if closed.Code != http.StatusServiceUnavailable || strings.Contains(closed.Body.String(), "key") {
+		t.Fatalf("missing old key did not fail closed: %d %s", closed.Code, closed.Body.String())
+	}
+	if copied := copyRequest(missingOldRouter); copied.Code != http.StatusServiceUnavailable || strings.Contains(copied.Body.String(), "key") {
+		t.Fatalf("missing old card key did not fail closed: %d %s", copied.Code, copied.Body.String())
+	}
+	if _, err := service.NewWithPreviousEncryptionKeys(st, clock, rand.Reader, newKey, [][]byte{oldKey, bytes.Repeat([]byte{0x43}, 32), bytes.Repeat([]byte{0x44}, 32)}, bytes.Repeat([]byte{0x32}, 32)); err == nil {
+		t.Fatal("service accepted more than two previous encryption keys")
 	}
 }
 
@@ -643,6 +967,16 @@ func TestAdminInvalidNotFoundAndConflictResponsesAreStable(t *testing.T) {
 	duplicate := h.request(http.MethodPost, "/internal/v1/packages", `{"name":"Duplicate Package","software_ids":["`+software.ID+`"]}`, true)
 	if duplicate.Code != http.StatusConflict {
 		t.Fatalf("duplicate package=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	var createdPackage struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &createdPackage); err != nil {
+		t.Fatal(err)
+	}
+	impactMissing := h.request(http.MethodPost, "/internal/v1/packages/"+createdPackage.ID+"/impact", `{"software_ids":["`+uuid.NewString()+`"]}`, true)
+	if impactMissing.Code != http.StatusNotFound {
+		t.Fatalf("impact missing member=%d body=%s", impactMissing.Code, impactMissing.Body.String())
 	}
 	badCopy := h.request(http.MethodGet, "/internal/v1/cards/not-a-uuid/copy", "", false)
 	if badCopy.Code != http.StatusBadRequest {

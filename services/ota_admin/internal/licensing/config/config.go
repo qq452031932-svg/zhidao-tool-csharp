@@ -22,32 +22,35 @@ const (
 )
 
 type Limits struct {
-	MaxBodyBytes             int64 `json:"max_body_bytes"`
-	MaxHeaderBytes           int   `json:"max_header_bytes"`
-	TimestampWindowSeconds   int   `json:"timestamp_window_seconds"`
-	NonceLifetimeSeconds     int   `json:"nonce_lifetime_seconds"`
-	MaxReplayNonces          int   `json:"max_replay_nonces"`
-	ActivationRequests       int   `json:"activation_requests"`
-	ValidationRequests       int   `json:"validation_requests"`
-	AdminRequests            int   `json:"admin_requests"`
-	RateWindowSeconds        int   `json:"rate_window_seconds"`
-	ReadHeaderTimeoutSeconds int   `json:"read_header_timeout_seconds"`
-	ReadTimeoutSeconds       int   `json:"read_timeout_seconds"`
-	WriteTimeoutSeconds      int   `json:"write_timeout_seconds"`
-	IdleTimeoutSeconds       int   `json:"idle_timeout_seconds"`
-	ShutdownTimeoutSeconds   int   `json:"shutdown_timeout_seconds"`
+	MaxBodyBytes               int64 `json:"max_body_bytes"`
+	MaxHeaderBytes             int   `json:"max_header_bytes"`
+	TimestampWindowSeconds     int   `json:"timestamp_window_seconds"`
+	NonceLifetimeSeconds       int   `json:"nonce_lifetime_seconds"`
+	MaxReplayNonces            int   `json:"max_replay_nonces"`
+	MaxAdminIdempotencyEntries int   `json:"max_admin_idempotency_entries"`
+	MaxAdminIdempotencyBytes   int64 `json:"max_admin_idempotency_bytes"`
+	ActivationRequests         int   `json:"activation_requests"`
+	ValidationRequests         int   `json:"validation_requests"`
+	AdminRequests              int   `json:"admin_requests"`
+	RateWindowSeconds          int   `json:"rate_window_seconds"`
+	ReadHeaderTimeoutSeconds   int   `json:"read_header_timeout_seconds"`
+	ReadTimeoutSeconds         int   `json:"read_timeout_seconds"`
+	WriteTimeoutSeconds        int   `json:"write_timeout_seconds"`
+	IdleTimeoutSeconds         int   `json:"idle_timeout_seconds"`
+	ShutdownTimeoutSeconds     int   `json:"shutdown_timeout_seconds"`
 }
 
 type Config struct {
-	ListenAddress         string `json:"listen_address"`
-	LicenseDatabasePath   string `json:"license_database_path"`
-	EncryptionKeyPath     string `json:"encryption_key_path"`
-	LookupHMACKeyPath     string `json:"lookup_hmac_key_path"`
-	SigningPrivateKeyPath string `json:"signing_private_key_path"`
-	InternalSecretPath    string `json:"internal_secret_path"`
-	SigningKeyID          string `json:"signing_key_id"`
-	PublicAPIBasePath     string `json:"public_api_base_path"`
-	Limits                Limits `json:"limits"`
+	ListenAddress              string   `json:"listen_address"`
+	LicenseDatabasePath        string   `json:"license_database_path"`
+	EncryptionKeyPath          string   `json:"encryption_key_path"`
+	PreviousEncryptionKeyPaths []string `json:"previous_encryption_key_paths"`
+	LookupHMACKeyPath          string   `json:"lookup_hmac_key_path"`
+	SigningPrivateKeyPath      string   `json:"signing_private_key_path"`
+	InternalSecretPath         string   `json:"internal_secret_path"`
+	SigningKeyID               string   `json:"signing_key_id"`
+	PublicAPIBasePath          string   `json:"public_api_base_path"`
+	Limits                     Limits   `json:"limits"`
 }
 
 func Load(path string) (Config, error) {
@@ -84,7 +87,7 @@ func Load(path string) (Config, error) {
 
 func validateConfigJSONShape(data []byte) error {
 	topFields := map[string]struct{}{
-		"listen_address": {}, "license_database_path": {}, "encryption_key_path": {}, "lookup_hmac_key_path": {},
+		"listen_address": {}, "license_database_path": {}, "encryption_key_path": {}, "previous_encryption_key_paths": {}, "lookup_hmac_key_path": {},
 		"signing_private_key_path": {}, "internal_secret_path": {}, "signing_key_id": {}, "public_api_base_path": {}, "limits": {},
 	}
 	values, err := strictJSONObject(data, topFields)
@@ -96,7 +99,7 @@ func validateConfigJSONShape(data []byte) error {
 		return errors.New("configuration limits are required")
 	}
 	limitFields := map[string]struct{}{
-		"max_body_bytes": {}, "max_header_bytes": {}, "timestamp_window_seconds": {}, "nonce_lifetime_seconds": {}, "max_replay_nonces": {},
+		"max_body_bytes": {}, "max_header_bytes": {}, "timestamp_window_seconds": {}, "nonce_lifetime_seconds": {}, "max_replay_nonces": {}, "max_admin_idempotency_entries": {}, "max_admin_idempotency_bytes": {},
 		"activation_requests": {}, "validation_requests": {}, "admin_requests": {}, "rate_window_seconds": {}, "read_header_timeout_seconds": {},
 		"read_timeout_seconds": {}, "write_timeout_seconds": {}, "idle_timeout_seconds": {}, "shutdown_timeout_seconds": {},
 	}
@@ -160,7 +163,11 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.SigningKeyID) != c.SigningKeyID || c.SigningKeyID == "" || len(c.SigningKeyID) > model.MaxIdentifierLength {
 		return errors.New("signing key ID is invalid")
 	}
+	if len(c.PreviousEncryptionKeyPaths) > 2 {
+		return errors.New("too many previous encryption keys")
+	}
 	paths := []string{c.LicenseDatabasePath, c.EncryptionKeyPath, c.LookupHMACKeyPath, c.SigningPrivateKeyPath, c.InternalSecretPath}
+	paths = append(paths, c.PreviousEncryptionKeyPaths...)
 	normalized := make([]string, 0, len(paths))
 	for _, path := range paths {
 		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -191,6 +198,12 @@ func (c Config) Validate() error {
 	}
 	if c.Limits.MaxReplayNonces < 1 || c.Limits.MaxReplayNonces > 1_000_000 {
 		return errors.New("replay nonce cap is outside the safe range")
+	}
+	if c.Limits.MaxAdminIdempotencyEntries < 1 || c.Limits.MaxAdminIdempotencyEntries > 10_000 {
+		return errors.New("admin idempotency entry cap is outside the safe range")
+	}
+	if c.Limits.MaxAdminIdempotencyBytes < 1<<20 || c.Limits.MaxAdminIdempotencyBytes > 64<<20 {
+		return errors.New("admin idempotency byte cap is outside the safe range")
 	}
 	if c.Limits.ActivationRequests < 1 || c.Limits.ActivationRequests > 10000 || c.Limits.ValidationRequests < 1 || c.Limits.ValidationRequests > 10000 || c.Limits.AdminRequests < 1 || c.Limits.AdminRequests > 10000 {
 		return errors.New("rate limits are outside the safe range")

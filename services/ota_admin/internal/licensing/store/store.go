@@ -36,15 +36,18 @@ type Store struct {
 }
 
 type AdminTransaction struct {
-	conn      *sql.Conn
-	active    bool
-	dirty     bool
-	failed    bool
-	createdAt time.Time
+	conn            *sql.Conn
+	active          bool
+	dirty           bool
+	failed          bool
+	createdAt       time.Time
+	replayCardIDs   map[string]struct{}
+	maxReplayBytes  int64
+	usedReplayBytes int64
 }
 
-func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string, now, expiresAt time.Time, maximum int) (*AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error) {
-	if !validCanonicalUUID(key) || len(fingerprint) != 64 || !expiresAt.After(now) || maximum < 1 {
+func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string, now, expiresAt time.Time, maximumEntries int, maximumBytes int64) (*AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error) {
+	if !validCanonicalUUID(key) || len(fingerprint) != 64 || !expiresAt.After(now) || maximumEntries < 1 || maximumBytes < 1 {
 		return nil, model.AdminIdempotencyRecord{}, "", errors.New("invalid admin mutation reservation")
 	}
 	conn, err := s.db.Conn(ctx)
@@ -55,7 +58,7 @@ func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string,
 		_ = conn.Close()
 		return nil, model.AdminIdempotencyRecord{}, "", err
 	}
-	tx := &AdminTransaction{conn: conn, active: true, createdAt: canonicalTime(now)}
+	tx := &AdminTransaction{conn: conn, active: true, createdAt: canonicalTime(now), replayCardIDs: make(map[string]struct{})}
 	fail := func(err error) (*AdminTransaction, model.AdminIdempotencyRecord, model.AdminIdempotencyOutcome, error) {
 		tx.Rollback()
 		return nil, model.AdminIdempotencyRecord{}, "", err
@@ -65,7 +68,7 @@ func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string,
 	}
 	var record model.AdminIdempotencyRecord
 	var storedExpires int64
-	err = conn.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ContentType, &record.ContentDisposition, &storedExpires)
+	err = conn.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,replay_key_id,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ReplayKeyID, &record.ContentType, &record.ContentDisposition, &storedExpires)
 	if err == nil {
 		record.ExpiresAt = time.Unix(storedExpires, 0).UTC()
 		outcome := model.AdminIdempotencyReplay
@@ -81,12 +84,15 @@ func (s *Store) BeginAdminMutation(ctx context.Context, key, fingerprint string,
 		return fail(err)
 	}
 	var count int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM license_admin_idempotency`).Scan(&count); err != nil {
+	var usedBytes int64
+	if err := conn.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(length(response_body)),0) FROM license_admin_idempotency`).Scan(&count, &usedBytes); err != nil {
 		return fail(err)
 	}
-	if count >= maximum {
+	if count >= maximumEntries || usedBytes >= maximumBytes {
 		return fail(ErrAdminIdempotencyCapacity)
 	}
+	tx.maxReplayBytes = maximumBytes
+	tx.usedReplayBytes = usedBytes
 	return tx, model.AdminIdempotencyRecord{}, model.AdminIdempotencyNew, nil
 }
 
@@ -109,7 +115,22 @@ func (tx *AdminTransaction) Complete(ctx context.Context, key string, record mod
 		tx.Rollback()
 		return errors.New("admin transaction mutation failed")
 	}
-	_, err := tx.conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(tx.createdAt))
+	if record.ReplayKeyID == "" {
+		tx.Rollback()
+		return errors.New("admin replay key ID is required")
+	}
+	if int64(len(record.Body)) > tx.maxReplayBytes-tx.usedReplayBytes {
+		tx.Rollback()
+		return ErrAdminIdempotencyCapacity
+	}
+	_, err := tx.conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,replay_key_id,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ReplayKeyID, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(tx.createdAt))
+	if err == nil {
+		for cardID := range tx.replayCardIDs {
+			if _, err = tx.conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency_cards(idempotency_key,card_id) VALUES(?,?)`, key, cardID); err != nil {
+				break
+			}
+		}
+	}
 	if err == nil {
 		_, err = tx.conn.ExecContext(ctx, `COMMIT`)
 	}
@@ -259,7 +280,11 @@ func (tx *AdminTransaction) GenerateCards(ctx context.Context, req model.Generat
 		if item.Note != nil {
 			note = item.Note
 		}
-		if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
+		keyID := item.EncryptionKeyID
+		if keyID == "" {
+			keyID = "legacy-v2"
+		}
+		if _, err := tx.conn.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,encryption_key_id,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, item.ID, req.PackageID, item.Ciphertext, keyID, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
 			if tx.dirty {
 				tx.failed = true
 			}
@@ -272,9 +297,23 @@ func (tx *AdminTransaction) GenerateCards(ctx context.Context, req model.Generat
 			return nil, err
 		}
 		tx.dirty = true
+		tx.replayCardIDs[item.ID] = struct{}{}
 		cards = append(cards, model.Card{ID: item.ID, PackageID: req.PackageID, FullDigest: item.FullDigest, Prefix8: item.Prefix8, Last4: item.Last4, BaseDays: req.BaseDays, UnactivatedTotalDays: req.BaseDays, Note: cloneString(note), CreatedAt: createdAt})
 	}
 	return cards, nil
+}
+
+func (tx *AdminTransaction) AssociateReplayCards(cardIDs []string) error {
+	if tx == nil || !tx.active {
+		return errors.New("admin transaction is not active")
+	}
+	for _, cardID := range cardIDs {
+		if !validCanonicalUUID(cardID) {
+			return errors.New("invalid replay card ID")
+		}
+		tx.replayCardIDs[cardID] = struct{}{}
+	}
+	return nil
 }
 
 func (tx *AdminTransaction) ensureSoftwareExists(ctx context.Context, ids []string) error {
@@ -607,6 +646,15 @@ func (s *Store) PackageRemovalImpact(ctx context.Context, id string, replacement
 	if err != nil {
 		return 0, err
 	}
+	for _, softwareID := range ids {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software WHERE id=?`, softwareID).Scan(&exists); err != nil {
+			return 0, err
+		}
+		if exists == 0 {
+			return 0, ErrNotFound
+		}
+	}
 	kept := make(map[string]struct{}, len(ids))
 	for _, value := range ids {
 		kept[value] = struct{}{}
@@ -634,7 +682,7 @@ func (s *Store) GetAdminIdempotency(ctx context.Context, key string, now time.Ti
 	}
 	var record model.AdminIdempotencyRecord
 	var expires int64
-	err := s.db.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ContentType, &record.ContentDisposition, &expires)
+	err := s.db.QueryRowContext(ctx, `SELECT fingerprint,status,response_body,replay_key_id,content_type,content_disposition,expires_at FROM license_admin_idempotency WHERE key=?`, key).Scan(&record.Fingerprint, &record.Status, &record.Body, &record.ReplayKeyID, &record.ContentType, &record.ContentDisposition, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.AdminIdempotencyRecord{}, false, nil
 	}
@@ -660,13 +708,21 @@ func (s *Store) PutAdminIdempotency(ctx context.Context, key string, record mode
 		if count >= maximum {
 			return ErrAdminIdempotencyCapacity
 		}
-		_, err := conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(now))
+		keyID := record.ReplayKeyID
+		if keyID == "" {
+			keyID = "legacy-v2"
+		}
+		_, err := conn.ExecContext(ctx, `INSERT INTO license_admin_idempotency(key,fingerprint,status,response_body,replay_key_id,content_type,content_disposition,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, key, record.Fingerprint, record.Status, record.Body, keyID, record.ContentType, record.ContentDisposition, ceilUnixSecond(record.ExpiresAt), unixTime(now))
 		return err
 	})
 }
 
 func (s *Store) CompleteAdminIdempotency(ctx context.Context, key, fingerprint string, record model.AdminIdempotencyRecord) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE license_admin_idempotency SET status=?,response_body=?,content_type=?,content_disposition=? WHERE key=? AND fingerprint=? AND status=102`, record.Status, record.Body, record.ContentType, record.ContentDisposition, key, fingerprint)
+	keyID := record.ReplayKeyID
+	if keyID == "" {
+		keyID = "legacy-v2"
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE license_admin_idempotency SET status=?,response_body=?,replay_key_id=?,content_type=?,content_disposition=? WHERE key=? AND fingerprint=? AND status=102`, record.Status, record.Body, keyID, record.ContentType, record.ContentDisposition, key, fingerprint)
 	if err != nil {
 		return fmt.Errorf("complete admin idempotency: %w", err)
 	}
@@ -762,8 +818,12 @@ func (s *Store) GenerateCards(ctx context.Context, req model.GenerateCardsReques
 		if item.Note != nil {
 			note = item.Note
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			item.ID, req.PackageID, item.Ciphertext, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
+		keyID := item.EncryptionKeyID
+		if keyID == "" {
+			keyID = "legacy-v2"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO license_cards(id,package_id,ciphertext,encryption_key_id,full_digest,prefix8,last4,base_days,unactivated_total_days,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			item.ID, req.PackageID, item.Ciphertext, keyID, item.FullDigest, item.Prefix8, item.Last4, req.BaseDays, req.BaseDays, note, unixTime(createdAt)); err != nil {
 			if isForeignKeyConstraint(err) {
 				return nil, ErrNotFound
 			}
@@ -1033,7 +1093,7 @@ func (s *Store) SearchAdminCards(ctx context.Context, filter model.AdminCardFilt
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_cards c WHERE `+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count admin cards: %w", err)
 	}
-	query := `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at
+	query := `SELECT c.id,c.package_id,p.name,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at
 FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE ` + where + ` ORDER BY c.created_at,c.id LIMIT ? OFFSET ?`
 	pageArgs := append(append([]any(nil), args...), limit, offset)
 	rows, err := s.db.QueryContext(ctx, query, pageArgs...)
@@ -1043,7 +1103,7 @@ FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE ` + wher
 	defer rows.Close()
 	items := make([]model.AdminCardRecord, 0, limit)
 	for rows.Next() {
-		item, err := scanAdminCard(rows)
+		item, err := scanAdminCardSummary(rows)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1053,6 +1113,22 @@ FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE ` + wher
 		return nil, 0, err
 	}
 	return items, total, nil
+}
+
+func scanAdminCardSummary(row rowScanner) (model.AdminCardRecord, error) {
+	var item model.AdminCardRecord
+	var note, machine sql.NullString
+	var activated, expires sql.NullInt64
+	var created int64
+	if err := row.Scan(&item.ID, &item.PackageID, &item.PackageName, &item.Prefix8, &item.Last4, &item.BaseDays, &item.UnactivatedTotalDays, &note, &activated, &expires, &machine, &created); err != nil {
+		return item, err
+	}
+	item.Note = nullableString(note)
+	item.MachineHash = nullableString(machine)
+	item.ActivatedAt = nullableTime(activated)
+	item.ExpiresAt = nullableTime(expires)
+	item.CreatedAt = time.Unix(created, 0).UTC()
+	return item, nil
 }
 
 func adminCardWhere(filter model.AdminCardFilter, now time.Time) (string, []any) {
@@ -1086,7 +1162,7 @@ func adminCardWhere(filter model.AdminCardFilter, now time.Time) (string, []any)
 }
 
 func (s *Store) GetAdminCard(ctx context.Context, id string) (model.AdminCardRecord, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id=?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.encryption_key_id,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id=?`, id)
 	item, err := scanAdminCard(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.AdminCardRecord{}, ErrNotFound
@@ -1106,7 +1182,7 @@ func (s *Store) GetAdminCards(ctx context.Context, ids []string) ([]model.AdminC
 	for i, id := range ids {
 		args[i] = id
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id IN (`+placeholders+`)`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.package_id,p.name,c.ciphertext,c.encryption_key_id,c.full_digest,c.prefix8,c.last4,c.base_days,c.unactivated_total_days,c.note,c.activated_at,c.expires_at,c.machine_hash,c.created_at FROM license_cards c JOIN license_packages p ON p.id=c.package_id WHERE c.id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get admin cards: %w", err)
 	}
@@ -1138,7 +1214,7 @@ func scanAdminCard(row rowScanner) (model.AdminCardRecord, error) {
 	var note, machine sql.NullString
 	var activated, expires sql.NullInt64
 	var created int64
-	if err := row.Scan(&item.ID, &item.PackageID, &item.PackageName, &item.Ciphertext, &item.FullDigest, &item.Prefix8, &item.Last4, &item.BaseDays, &item.UnactivatedTotalDays, &note, &activated, &expires, &machine, &created); err != nil {
+	if err := row.Scan(&item.ID, &item.PackageID, &item.PackageName, &item.Ciphertext, &item.EncryptionKeyID, &item.FullDigest, &item.Prefix8, &item.Last4, &item.BaseDays, &item.UnactivatedTotalDays, &note, &activated, &expires, &machine, &created); err != nil {
 		return item, err
 	}
 	item.Note = nullableString(note)

@@ -71,6 +71,21 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		return errors.New("load card encryption key")
 	}
 	defer clear(encryptionKey)
+	previousEncryptionKeys := make([][]byte, len(cfg.PreviousEncryptionKeyPaths))
+	for index, path := range cfg.PreviousEncryptionKeyPaths {
+		previousEncryptionKeys[index], err = licenseconfig.ReadSecret32(path)
+		if err != nil {
+			for _, key := range previousEncryptionKeys {
+				clear(key)
+			}
+			return errors.New("load previous card encryption key")
+		}
+	}
+	defer func() {
+		for _, key := range previousEncryptionKeys {
+			clear(key)
+		}
+	}()
 	lookupKey, err := licenseconfig.ReadSecret32(cfg.LookupHMACKeyPath)
 	if err != nil {
 		return errors.New("load card lookup key")
@@ -105,7 +120,7 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	}
 	defer database.Close()
 	clock := systemClock{}
-	licenses, err := service.New(database, clock, rand.Reader, encryptionKey, lookupKey)
+	licenses, err := service.NewWithPreviousEncryptionKeys(database, clock, rand.Reader, encryptionKey, previousEncryptionKeys, lookupKey)
 	clear(encryptionKey)
 	clear(lookupKey)
 	if err != nil {
@@ -122,7 +137,9 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		AdminService:    licenses, AdminIdempotencyStore: database, InternalSecret: internalSecret,
 		AdminRate:        licensehttp.RateLimit{Requests: cfg.Limits.AdminRequests, Window: time.Duration(cfg.Limits.RateWindowSeconds) * time.Second},
 		MaxAdminPageSize: maximumAdminPageSize, MaxExportCount: maximumAdminExportCount,
-		MaxLimiterEntries: maximumLimiterEntries,
+		MaxAdminIdempotencyEntries: cfg.Limits.MaxAdminIdempotencyEntries,
+		MaxAdminIdempotencyBytes:   cfg.Limits.MaxAdminIdempotencyBytes,
+		MaxLimiterEntries:          maximumLimiterEntries,
 	})
 	clear(internalSecret)
 	if err != nil {
