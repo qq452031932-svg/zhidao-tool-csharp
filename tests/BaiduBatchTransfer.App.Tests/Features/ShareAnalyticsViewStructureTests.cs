@@ -147,7 +147,9 @@ public sealed class ShareAnalyticsViewStructureTests
 
         foreach (var selectionActive in new[] { "True", "False" })
         {
-            Assert.Equal("{StaticResource TextBrush}", TriggerSetterValue(SelectionStateTrigger(rowStyle, selectionActive), "Foreground"));
+            var rowSelectionTrigger = SelectionStateTrigger(rowStyle, selectionActive);
+            Assert.Equal("{StaticResource TextBrush}", TriggerSetterValue(rowSelectionTrigger, "Foreground"));
+            Assert.Equal("{StaticResource NavSelectedBrush}", TriggerSetterValue(rowSelectionTrigger, "Background"));
 
             var cellSelectionTrigger = SelectionStateTrigger(cellStyle, selectionActive);
             Assert.Equal("{StaticResource TextBrush}", TriggerSetterValue(cellSelectionTrigger, "Foreground"));
