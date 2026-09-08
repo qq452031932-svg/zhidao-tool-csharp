@@ -130,6 +130,39 @@ public sealed class ShareAnalyticsViewStructureTests
     }
 
     [Fact]
+    public void SelectionStylesKeepTextLegibleWithoutMaskingSortedColumns()
+    {
+        var (document, grid, columns) = LoadView();
+        var rowStyle = document.Descendants(Presentation + "Style")
+            .Single(style => Attribute(style, Xaml + "Key") == "ShareAnalyticsRowStyle");
+        var cellStyle = document.Descendants(Presentation + "Style")
+            .Single(style => Attribute(style, Xaml + "Key") == "ShareAnalyticsCellStyle");
+        var sortedCellStyle = document.Descendants(Presentation + "Style")
+            .Single(style => Attribute(style, Xaml + "Key") == "ShareAnalyticsSortCellStyle");
+
+        Assert.Equal("DataGridRow", Attribute(rowStyle, "TargetType"));
+        Assert.Equal("{StaticResource ShareAnalyticsRowStyle}", Attribute(grid, "RowStyle"));
+        Assert.Equal("DataGridCell", Attribute(cellStyle, "TargetType"));
+        Assert.Equal("{StaticResource ShareAnalyticsCellStyle}", Attribute(sortedCellStyle, "BasedOn"));
+
+        foreach (var selectionActive in new[] { "True", "False" })
+        {
+            Assert.Equal("{StaticResource TextBrush}", TriggerSetterValue(SelectionStateTrigger(rowStyle, selectionActive), "Foreground"));
+
+            var cellSelectionTrigger = SelectionStateTrigger(cellStyle, selectionActive);
+            Assert.Equal("{StaticResource TextBrush}", TriggerSetterValue(cellSelectionTrigger, "Foreground"));
+            Assert.Equal("{StaticResource NavSelectedBrush}", TriggerSetterValue(cellSelectionTrigger, "Background"));
+        }
+
+        var sortedColumns = columns.Where(column => column.Descendants(Presentation + "Style")
+            .Any(style => Attribute(style, "BasedOn") == "{StaticResource ShareAnalyticsSortCellStyle}"));
+        Assert.NotEmpty(sortedColumns);
+        Assert.All(sortedColumns, column => Assert.Contains(column.Descendants(Presentation + "Setter"), setter =>
+            Attribute(setter, "Property") == "Background" &&
+            Attribute(setter, "Value") == "{StaticResource ShareAnalyticsSortedCellBrush}"));
+    }
+
+    [Fact]
     public void SelectionToolbarBindsCountsRangeAndEveryBulkCommand()
     {
         var (document, _, _) = LoadView();
@@ -206,6 +239,17 @@ public sealed class ShareAnalyticsViewStructureTests
 
     private static string SetterValue(XElement style, string property) =>
         Attribute(style.Elements(Presentation + "Setter").Single(setter => Attribute(setter, "Property") == property), "Value");
+
+    private static XElement SelectionStateTrigger(XElement style, string selectionActive) =>
+        style.Descendants(Presentation + "MultiTrigger").Single(trigger =>
+        {
+            var conditions = trigger.Element(Presentation + "MultiTrigger.Conditions")?.Elements(Presentation + "Condition") ?? [];
+            return conditions.Any(condition => Attribute(condition, "Property") == "IsSelected" && Attribute(condition, "Value") == "True") &&
+                   conditions.Any(condition => Attribute(condition, "Property") == "Selector.IsSelectionActive" && Attribute(condition, "Value") == selectionActive);
+        });
+
+    private static string TriggerSetterValue(XElement trigger, string property) =>
+        Attribute(trigger.Elements(Presentation + "Setter").Single(setter => Attribute(setter, "Property") == property), "Value");
 
     private static string Attribute(XElement element, string name) =>
         element.Attribute(name)?.Value ?? string.Empty;
