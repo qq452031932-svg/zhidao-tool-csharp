@@ -66,7 +66,7 @@ func TestAdminConsoleInRealBrowserLicenseManagement(t *testing.T) {
 	if chrome == "" {
 		t.Skip("Chrome or Edge is not installed")
 	}
-	for _, mode := range []string{"license-happy", "license-unavailable", "license-edge", "license-late-error"} {
+	for _, mode := range []string{"license-happy", "license-unavailable", "license-edge", "license-late-error", "license-race"} {
 		t.Run(mode, func(t *testing.T) {
 			server := newLicenseBrowserTestServer(t, mode)
 			defer server.Close()
@@ -106,6 +106,7 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 	csrf := "license-csrf"
 	softwareCreateRequests := 0
 	searchRequests := 0
+	searchRateLimited := false
 	copyRequests := 0
 	deviceReads := 0
 	deviceUnbindPath := ""
@@ -301,7 +302,8 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			if writeLateFailure(w, "cards") {
 				return
 			}
-			if mode == "license-edge" && searchRequests == 2 {
+			if mode == "license-edge" && !searchRateLimited && searchBody["prefix8"] == "ABCDEFGH" {
+				searchRateLimited = true
 				w.Header().Set("Retry-After", "1")
 				writeBrowserJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate_limited"})
 				return
@@ -946,6 +948,39 @@ try {
     await waitForLicense(() => !document.getElementById("software-panel").hidden && !document.getElementById("software-create-button").disabled, "写操作失败后软件页恢复");
     assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
     result.textContent = "PASS license-late-error";
+  } else if (new URL(location.href).searchParams.get("mode") === "license-race") {
+    await waitForLicense(() => document.querySelector("#cards-body tr[data-card-id]"), "竞态测试初始卡密页");
+    const originalFetch = window.fetch.bind(window);
+    const pendingCardReads = [];
+    window.fetch = (input, options = {}) => {
+      const url = typeof input === "string" ? input : input.url;
+      if (url === "/admin/api/license/cards/search") {
+        return new Promise((resolve, reject) => {
+          pendingCardReads.push({ resolve, reject });
+          if (options.signal) options.signal.addEventListener("abort", () => reject(new DOMException("请求已取消", "AbortError")), { once: true });
+        });
+      }
+      return originalFetch(input, options);
+    };
+    const cardResult = (note, last4) => new Response(JSON.stringify({
+      items: [{ id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", package_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", package_name: "全能套餐", prefix8: "ABCDEFGH", last4, card_type: "month", duration_days: 30, state: "effective", binding_short_id: "MACHINE1", note }],
+      page: 1, page_size: 100, total: 1
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+
+    const automaticLoad = loadCards();
+    await waitForLicense(() => pendingCardReads.length === 1, "自动卡密请求已进入等待");
+    document.getElementById("filter-prefix8").value = "ABCDEFGH";
+    document.getElementById("card-filter-form").requestSubmit();
+    await waitForLicense(() => pendingCardReads.length === 2, "用户搜索请求已进入等待");
+    pendingCardReads[1].resolve(cardResult("用户搜索结果", "0002"));
+    await waitForLicense(() => document.getElementById("cards-body").textContent.includes("用户搜索结果"), "用户搜索结果先返回");
+    pendingCardReads[0].resolve(cardResult("自动旧结果", "0001"));
+    await automaticLoad;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    window.fetch = originalFetch;
+    assertLicense(document.getElementById("cards-body").textContent.includes("用户搜索结果") && !document.getElementById("cards-body").textContent.includes("自动旧结果"), "较早自动加载覆盖了较新的用户搜索结果");
+    assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
+    result.textContent = "PASS license-race";
   } else if (new URL(location.href).searchParams.get("mode") === "license-edge") {
     await waitForLicense(() => document.querySelectorAll("#cards-body tr[data-card-id]").length === 100, "百张卡密第一页");
 
@@ -967,13 +1002,16 @@ try {
     await waitForLicense(() => document.activeElement === document.getElementById("tab-software") && !document.getElementById("software-panel").hidden, "方向键切换标签");
     document.getElementById("tab-software").dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
     await waitForLicense(() => document.activeElement === document.getElementById("tab-cards") && !document.getElementById("cards-panel").hidden, "Home 返回首标签");
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).search_requests >= 2, "返回卡密页自动读取已发出");
+    edge = await (await fetch("/test/license-assertions")).json();
+    const searchBeforeRateLimit = edge.search_requests;
 
     document.getElementById("filter-prefix8").value = "ABCDEFGH";
     document.getElementById("card-filter-form").requestSubmit();
     document.getElementById("card-filter-form").requestSubmit();
     await waitForLicense(() => document.getElementById("search-cards-button").disabled, "查询 429 冷却");
     edge = await (await fetch("/test/license-assertions")).json();
-    assertLicense(edge.search_requests === 2, "查询忙碌期间发生重叠请求");
+    assertLicense(edge.search_requests === searchBeforeRateLimit + 1, "查询忙碌期间发生重叠请求");
     await waitForLicense(() => !document.getElementById("search-cards-button").disabled, "查询冷却结束");
     document.getElementById("cards-page-next").click();
     await waitForLicense(() => document.getElementById("cards-page-range").textContent.includes("101–101") && document.querySelectorAll("#cards-body tr[data-card-id]").length === 1, "第 101 张卡密");
@@ -1135,6 +1173,7 @@ try {
       return body.complete_card && body.prefix8 && body.last4 && body.note_contains && body.package_id && body.card_type && body.state;
     }, "全部卡密筛选");
     let cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
+    window.__licenseClipboard = "";
     cardRow.querySelector('[data-action="card-copy"]').click();
     await waitForLicense(() => window.__licenseClipboard.includes("ABCD-EFGH"), "复制单卡");
     cardRow.querySelector('[data-action="card-renew"]').click();

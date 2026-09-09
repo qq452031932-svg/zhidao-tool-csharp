@@ -23,6 +23,8 @@ const state = {
   activeCardID: "",
   licenseEpoch: 0,
   licenseControllers: new Set(),
+  licenseRequestSlots: new Map(),
+  licenseRequestGenerations: new Map(),
   mutationKeys: new Map(),
   licensePages: {
     cards: { page: 1, pageSize: 100, total: 0 },
@@ -691,8 +693,8 @@ async function licenseMutation(path, method, body, button, statusID, request = n
   }
 }
 
-async function automaticLicenseRead(path, options, tab) {
-  const request = beginLicenseRequest();
+async function automaticLicenseRead(path, options, tab, resource) {
+  const request = beginLicenseRequest(resource);
   try {
     const result = await licenseRead(path, { ...options, signal: request.controller.signal });
     if (!licenseRequestStillCurrent(request, tab)) return null;
@@ -705,24 +707,36 @@ async function automaticLicenseRead(path, options, tab) {
   }
 }
 
-function beginLicenseRequest() {
+function beginLicenseRequest(resource = "") {
+  if (resource) {
+    const previous = state.licenseRequestSlots.get(resource);
+    if (previous) previous.controller.abort();
+  }
   const controller = new AbortController();
+  const generation = resource ? (state.licenseRequestGenerations.get(resource) || 0) + 1 : 0;
+  const request = { controller, epoch: state.licenseEpoch, resource, generation };
   state.licenseControllers.add(controller);
-  return { controller, epoch: state.licenseEpoch };
+  if (resource) {
+    state.licenseRequestGenerations.set(resource, generation);
+    state.licenseRequestSlots.set(resource, request);
+  }
+  return request;
 }
 
 function endLicenseRequest(request) {
   state.licenseControllers.delete(request.controller);
+  if (request.resource && state.licenseRequestSlots.get(request.resource) === request) state.licenseRequestSlots.delete(request.resource);
 }
 
 function licenseRequestStillCurrent(request, tab = state.activeAdminTab) {
-  return !request.controller.signal.aborted && request.epoch === state.licenseEpoch && state.activeAdminTab === tab;
+  const ownsResource = !request.resource || state.licenseRequestGenerations.get(request.resource) === request.generation;
+  return ownsResource && !request.controller.signal.aborted && request.epoch === state.licenseEpoch && state.activeAdminTab === tab;
 }
 
-async function userLicenseRead(path, options, button, statusID, tab) {
+async function userLicenseRead(path, options, button, statusID, tab, resource) {
   if (button && (button.disabled || Number(button.dataset.retryUntil || 0) > Date.now())) return null;
   if (button) button.disabled = true;
-  const request = beginLicenseRequest();
+  const request = beginLicenseRequest(resource);
   try {
     const result = await api(path, { ...options, signal: request.controller.signal });
     if (!licenseRequestStillCurrent(request, tab)) return null;
@@ -759,6 +773,8 @@ function clearLicenseTransientState(endSession = false) {
   state.licenseEpoch += 1;
   for (const controller of state.licenseControllers) controller.abort();
   state.licenseControllers.clear();
+  state.licenseRequestSlots.clear();
+  state.licenseRequestGenerations.clear();
   clearGeneratedCards();
   byId("filter-complete-card").value = "";
   byId("generate-note").value = "";
@@ -828,7 +844,7 @@ function incompleteLicenseReferences() {
 }
 
 async function fetchAllLicensePages(path, tab) {
-  const request = beginLicenseRequest();
+  const request = beginLicenseRequest(`${tab}:references:${path}`);
   const items = [];
   const seenIDs = new Set();
   let expectedTotal = null;
@@ -917,11 +933,11 @@ async function loadCards(button = null, payloadOverride = null) {
   const payload = payloadOverride || cardFilterPayload();
   let result;
   if (button) {
-    const response = await userLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, button, "card-action-status", "cards");
+    const response = await userLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, button, "card-action-status", "cards", "cards:list");
     if (!response) return false;
     result = response.result;
   } else {
-    result = await automaticLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, "cards");
+    result = await automaticLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, "cards", "cards:list");
     if (!result) return false;
   }
   state.licenseCards = Array.isArray(result.items) ? result.items : [];
@@ -1037,7 +1053,7 @@ async function copyGeneratedCards() {
 
 async function copyCard(item, button) {
   try {
-    const response = await userLicenseRead(`/admin/api/license/cards/${item.id}/copy`, { method: "GET" }, button, "card-action-status", "cards");
+    const response = await userLicenseRead(`/admin/api/license/cards/${item.id}/copy`, { method: "GET" }, button, "card-action-status", "cards", "cards:copy");
     if (!response || !licenseRequestStillCurrent(response.request, "cards")) return;
     try {
       await navigator.clipboard.writeText(response.result.plaintext || "");
@@ -1119,8 +1135,8 @@ function selectAllCards(event) { state.selectedCardIDs.clear(); for (const check
 async function loadSoftware(button = null) {
   const page = state.licensePages.software;
   const path = `/admin/api/license/software?page=${page.page}&page_size=${page.pageSize}`;
-  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "software-action-status", "software") : null;
-  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "software");
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "software-action-status", "software", "software:list") : null;
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "software", "software:list");
   if (!result) return false;
   state.licenseSoftware = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
@@ -1204,8 +1220,8 @@ function renderPackages() {
 async function loadPackages(button = null) {
   const page = state.licensePages.packages;
   const path = `/admin/api/license/packages?page=${page.page}&page_size=${page.pageSize}`;
-  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "package-action-status", "packages") : null;
-  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "packages");
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "package-action-status", "packages", "packages:list") : null;
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "packages", "packages:list");
   if (!result) return false;
   state.licensePackages = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
@@ -1241,8 +1257,8 @@ async function confirmPackageChange(event) {
 async function loadDevices(button = null) {
   const page = state.licensePages.devices;
   const path = `/admin/api/license/devices?page=${page.page}&page_size=${page.pageSize}`;
-  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "device-action-status", "devices") : null;
-  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "devices");
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "device-action-status", "devices", "devices:list") : null;
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "devices", "devices:list");
   if (!result) return false;
   const items = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
