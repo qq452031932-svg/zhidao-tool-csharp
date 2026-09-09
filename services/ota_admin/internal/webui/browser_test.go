@@ -323,6 +323,15 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsCards(), "page": 1, "page_size": 100, "total": 1})
 		case "/admin/api/license/cards/generate":
 			checkMutation(r)
+			var generateBody map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&generateBody); err != nil {
+				writeBrowserJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request"})
+				return
+			}
+			if notes, ok := generateBody["per_card_notes"].([]any); ok && len(notes) == 0 {
+				writeBrowserJSON(w, http.StatusBadRequest, map[string]any{"code": "invalid_request"})
+				return
+			}
 			key := r.Header.Get("Idempotency-Key")
 			generateKeys = append(generateKeys, key)
 			if !committedGenerateKeys[key] {

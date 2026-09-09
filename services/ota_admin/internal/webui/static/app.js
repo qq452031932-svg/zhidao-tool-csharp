@@ -1025,8 +1025,7 @@ async function generateCards(event) {
     package_id: byId("generate-package").value,
     duration_days: Number(byId("generate-card-type").value),
     count: Number(byId("generate-count").value),
-    default_note: note || null,
-    per_card_notes: []
+    default_note: note || null
   }, button, "card-action-status", request);
   endLicenseRequest(request);
   if (!result || !licenseRequestStillCurrent(request, "cards")) return;
