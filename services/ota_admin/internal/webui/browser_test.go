@@ -66,7 +66,7 @@ func TestAdminConsoleInRealBrowserLicenseManagement(t *testing.T) {
 	if chrome == "" {
 		t.Skip("Chrome or Edge is not installed")
 	}
-	for _, mode := range []string{"license-happy", "license-unavailable", "license-edge"} {
+	for _, mode := range []string{"license-happy", "license-unavailable", "license-edge", "license-late-error"} {
 		t.Run(mode, func(t *testing.T) {
 			server := newLicenseBrowserTestServer(t, mode)
 			defer server.Close()
@@ -116,6 +116,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 	committedRenewKeys := map[string]bool{}
 	committedExportKeys := map[string]bool{}
 	cardDeleted := false
+	lateTarget := ""
+	lateStatus := http.StatusInternalServerError
+	lateStarts := map[string]int{}
 	securityFailures := []string{}
 	actions := map[string]int{}
 	searchBody := map[string]any{}
@@ -126,6 +129,24 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 		if cookie, cookieErr := r.Cookie("license_browser_test"); cookieErr != nil || cookie.Value != "active" {
 			securityFailures = append(securityFailures, "cookie:"+r.URL.Path)
 		}
+	}
+	writeLateFailure := func(w http.ResponseWriter, target string) bool {
+		if mode != "license-late-error" || lateTarget != target {
+			return false
+		}
+		status := lateStatus
+		lateStarts[target]++
+		mu.Unlock()
+		time.Sleep(120 * time.Millisecond)
+		mu.Lock()
+		code := "operation_failed"
+		if status == http.StatusTooManyRequests {
+			code = "rate_limited"
+		} else if status >= 400 && status < 500 {
+			code = "invalid_request"
+		}
+		writeBrowserJSON(w, status, map[string]any{"code": code})
+		return true
 	}
 	itemsSoftware := func() []map[string]any {
 		return []map[string]any{{"id": softwareA, "name": "SuperPan", "enabled": true, "created_at": now}, {"id": softwareB, "name": "助手", "enabled": true, "created_at": now}}
@@ -190,6 +211,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				return
 			}
 			if r.Method == http.MethodPost {
+				if writeLateFailure(w, "mutation") {
+					return
+				}
 				softwareCreateRequests++
 				checkMutation(r)
 				if softwareCreateRequests == 1 {
@@ -199,6 +223,29 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				}
 				actions["software_create"]++
 				writeBrowserJSON(w, http.StatusCreated, map[string]any{"id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "name": "限流软件", "enabled": true, "created_at": now})
+				return
+			}
+			if mode == "license-late-error" && strings.HasPrefix(lateTarget, "references-") {
+				page := r.URL.Query().Get("page")
+				if page == "" || page == "1" {
+					writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": softwareA, "name": "第一页软件", "enabled": true, "created_at": now}}, "page": 1, "page_size": 1, "total": 2})
+					return
+				}
+				target := lateTarget
+				lateTarget = ""
+				itemID := softwareB
+				responsePage, responseTotal := 2, 2
+				if target == "references-page" {
+					responsePage = 3
+				} else if target == "references-duplicate" {
+					itemID = softwareA
+				} else if target == "references-total" {
+					responseTotal = 3
+				}
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": itemID, "name": "第二页软件", "enabled": true, "created_at": now}}, "page": responsePage, "page_size": 1, "total": responseTotal})
+				return
+			}
+			if writeLateFailure(w, "references") || writeLateFailure(w, "software") {
 				return
 			}
 			if mode == "license-edge" && r.URL.Query().Get("page_size") == "100" {
@@ -225,6 +272,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				writeBrowserJSON(w, http.StatusCreated, itemsPackages()[0])
 				return
 			}
+			if writeLateFailure(w, "packages") {
+				return
+			}
 			if mode == "license-edge" && r.URL.Query().Get("page_size") == "100" {
 				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsPackages(), "page": 1, "page_size": 100, "total": len(itemsPackages())})
 				return
@@ -248,6 +298,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				securityFailures = append(securityFailures, "sensitive_search")
 			}
 			_ = json.NewDecoder(r.Body).Decode(&searchBody)
+			if writeLateFailure(w, "cards") {
+				return
+			}
 			if mode == "license-edge" && searchRequests == 2 {
 				w.Header().Set("Retry-After", "1")
 				writeBrowserJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate_limited"})
@@ -300,6 +353,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			_, _ = w.Write(append([]byte{0xef, 0xbb, 0xbf}, []byte("完整卡密,套餐\r\n"+cardText+",全能套餐\r\n")...))
 		case "/admin/api/license/devices":
 			deviceReads++
+			if writeLateFailure(w, "devices") {
+				return
+			}
 			if mode == "license-edge" && deviceReads == 2 {
 				time.Sleep(150 * time.Millisecond)
 			}
@@ -316,7 +372,13 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 		case "/admin/api/candidates/current":
 			writeBrowserJSON(w, http.StatusNotFound, map[string]any{"code": "not_found"})
 		case "/test/license-assertions":
-			writeBrowserJSON(w, http.StatusOK, map[string]any{"software_create_requests": softwareCreateRequests, "security_failures": securityFailures, "actions": actions, "search_body": searchBody, "search_requests": searchRequests, "copy_requests": copyRequests, "device_reads": deviceReads, "device_unbind_path": deviceUnbindPath, "generate_keys": generateKeys, "renew_keys": renewKeys, "export_keys": exportKeys})
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"software_create_requests": softwareCreateRequests, "security_failures": securityFailures, "actions": actions, "search_body": searchBody, "search_requests": searchRequests, "copy_requests": copyRequests, "device_reads": deviceReads, "device_unbind_path": deviceUnbindPath, "generate_keys": generateKeys, "renew_keys": renewKeys, "export_keys": exportKeys, "late_starts": lateStarts})
+		case "/test/arm-late":
+			lateTarget = r.URL.Query().Get("target")
+			if value := r.URL.Query().Get("status"); value != "" {
+				_, _ = fmt.Sscanf(value, "%d", &lateStatus)
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"target": lateTarget, "status": lateStatus})
 		default:
 			path := r.URL.Path
 			if strings.HasPrefix(path, "/admin/api/license/software/") {
@@ -334,6 +396,9 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			if strings.HasPrefix(path, "/admin/api/license/packages/") {
 				checkMutation(r)
 				if strings.HasSuffix(path, "/impact") {
+					if writeLateFailure(w, "impact") {
+						return
+					}
 					actions["impact"]++
 					writeBrowserJSON(w, http.StatusOK, map[string]any{"affected_valid_cards": 3, "max_offline_lease_delay_minutes": 30})
 				} else {
@@ -796,6 +861,91 @@ try {
     assertLicense(document.getElementById("license-error").hidden, "进入 OTA 后仍显示授权服务错误");
     assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
     result.textContent = "PASS license-unavailable";
+  } else if (new URL(location.href).searchParams.get("mode") === "license-late-error") {
+    await waitForLicense(() => document.querySelector("#cards-body tr[data-card-id]"), "延迟错误测试初始卡密页");
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden, "延迟错误测试 OTA 页");
+
+    const armLate = async (target, status = 500) => {
+      await fetch("/test/arm-late?target=" + encodeURIComponent(target) + "&status=" + status);
+    };
+    const lateStartCount = async target => {
+      const snapshot = await (await fetch("/test/license-assertions")).json();
+      return Number((snapshot.late_starts || {})[target] || 0);
+    };
+    const verifyLateReadIsolation = async (tabID, target, status, ready, label) => {
+      await armLate(target, status);
+      const before = await lateStartCount(target);
+      clickTab(tabID);
+      await waitForLicense(async () => await lateStartCount(target) > before, label + "请求已发出");
+      clickTab("tab-ota");
+      await waitForLicense(() => !document.getElementById("ota-panel").hidden, label + "切回 OTA");
+      await new Promise(resolve => setTimeout(resolve, 1900));
+      assertLicense(document.getElementById("license-error").hidden, label + "的迟到错误泄漏到 OTA");
+      await armLate("");
+      clickTab(tabID);
+      await waitForLicense(ready, label + "切回后恢复");
+      assertLicense(document.getElementById("license-error").hidden, label + "恢复后状态异常");
+      clickTab("tab-ota");
+      await waitForLicense(() => !document.getElementById("ota-panel").hidden, label + "恢复后返回 OTA");
+    };
+
+    await verifyLateReadIsolation("tab-cards", "references", 500, () => document.querySelector("#cards-body tr[data-card-id]"), "基础引用读取");
+    await verifyLateReadIsolation("tab-software", "software", 429, () => document.querySelector("#software-body tr[data-software-id]"), "软件读取");
+    await verifyLateReadIsolation("tab-packages", "packages", 422, () => document.querySelector("#packages-body tr[data-package-id]"), "套餐读取");
+    await verifyLateReadIsolation("tab-cards", "cards", 500, () => document.querySelector("#cards-body tr[data-card-id]"), "卡密读取");
+    await verifyLateReadIsolation("tab-devices", "devices", 429, () => document.querySelector("#devices-body [data-action=device-unbind]"), "设备读取");
+
+    clickTab("tab-software");
+    await waitForLicense(() => document.querySelectorAll("#software-body tr[data-software-id]").length === 2, "迟到成功前软件基线");
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden, "迟到成功前 OTA");
+    await armLate("software", 200);
+    const softwareSuccessBefore = await lateStartCount("software");
+    clickTab("tab-software");
+    await waitForLicense(async () => await lateStartCount("software") > softwareSuccessBefore, "迟到成功软件请求已发出");
+    clickTab("tab-ota");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assertLicense(document.querySelectorAll("#software-body tr[data-software-id]").length === 2, "迟到成功响应覆盖了软件共享状态");
+    await armLate("");
+
+    clickTab("tab-packages");
+    await waitForLicense(() => document.querySelector("#packages-body [data-action=package-preview]"), "影响预览前套餐页");
+    await armLate("impact", 200);
+    const impactBefore = await lateStartCount("impact");
+    document.querySelector("#packages-body [data-action=package-preview]").click();
+    await waitForLicense(async () => await lateStartCount("impact") > impactBefore, "影响预览请求已发出");
+    clickTab("tab-ota");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assertLicense(!document.getElementById("package-impact-dialog").open, "迟到套餐影响响应在 OTA 弹框");
+    await armLate("");
+
+    for (const target of ["references-page", "references-duplicate", "references-total"]) {
+      clickTab("tab-ota");
+      await waitForLicense(() => !document.getElementById("ota-panel").hidden, target + "前 OTA");
+      await armLate(target, 200);
+      clickTab("tab-cards");
+      await waitForLicense(() => !document.getElementById("license-error").hidden && document.getElementById("license-error-message").textContent.includes("未完整加载"), target + "明确阻止不完整引用");
+      clickTab("tab-ota");
+      await waitForLicense(() => document.getElementById("license-error").hidden, target + "错误不残留 OTA");
+    }
+
+    clickTab("tab-software");
+    await waitForLicense(() => document.querySelector("#software-body tr[data-software-id]"), "写操作前软件页");
+    await armLate("mutation", 422);
+    const mutationBefore = await lateStartCount("mutation");
+    document.getElementById("software-name").value = "迟到失败软件";
+    document.getElementById("software-create-form").requestSubmit();
+    await waitForLicense(async () => await lateStartCount("mutation") > mutationBefore, "写请求已发出");
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden, "写操作后切回 OTA");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assertLicense(document.getElementById("license-error").hidden, "写操作的迟到业务错误泄漏到 OTA");
+    await armLate("");
+    clickTab("tab-software");
+    await waitForLicense(() => !document.getElementById("software-panel").hidden && !document.getElementById("software-create-button").disabled, "写操作失败后软件页恢复");
+    assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
+    result.textContent = "PASS license-late-error";
   } else if (new URL(location.href).searchParams.get("mode") === "license-edge") {
     await waitForLicense(() => document.querySelectorAll("#cards-body tr[data-card-id]").length === 100, "百张卡密第一页");
 

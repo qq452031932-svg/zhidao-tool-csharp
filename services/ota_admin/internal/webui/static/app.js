@@ -579,6 +579,7 @@ function clearLicenseError() {
 }
 
 function showLicenseError(error) {
+  if (state.activeAdminTab === "ota") return;
   byId("license-error-message").textContent = messageFor(error, "授权服务暂时不可用，请稍后重试。");
   byId("license-error").hidden = false;
 }
@@ -593,6 +594,7 @@ async function licenseRead(path, options = {}) {
     try {
       return await api(path, options);
     } catch (error) {
+      if (error.name === "AbortError") throw error;
       latest = error;
       const temporary = !error.status || error.status === 429 || error.status >= 500;
       if (!temporary || error.status === 401 || attempt === 2) throw error;
@@ -656,6 +658,11 @@ async function licenseMutation(path, method, body, button, statusID, request = n
   if (button) button.disabled = true;
   const signature = mutationSignature(path, method, body);
   const idempotencyKey = state.mutationKeys.get(signature) || crypto.randomUUID();
+  const operationEpoch = request ? request.epoch : state.licenseEpoch;
+  const operationTab = state.activeAdminTab;
+  const stillCurrent = () => request
+    ? licenseRequestStillCurrent(request, operationTab)
+    : operationEpoch === state.licenseEpoch && state.activeAdminTab === operationTab;
   state.mutationKeys.set(signature, idempotencyKey);
   try {
     const result = await api(path, {
@@ -665,12 +672,13 @@ async function licenseMutation(path, method, body, button, statusID, request = n
       signal: request ? request.controller.signal : undefined
     });
     state.mutationKeys.delete(signature);
+    if (!stillCurrent()) return null;
     clearLicenseError();
     return result;
   } catch (error) {
-    if (error.name === "AbortError") return null;
     const temporary = !error.status || error.status === 429 || error.status >= 500 || error.code === "operation_in_progress";
     if (!temporary) state.mutationKeys.delete(signature);
+    if (error.name === "AbortError" || !stillCurrent()) return null;
     if (error.code === "license_service_unavailable") showLicenseError(error);
     if (error.status === 429 && button) {
       coolDownAction(button, error.retryAfter, statusID);
@@ -680,6 +688,20 @@ async function licenseMutation(path, method, body, button, statusID, request = n
     return null;
   } finally {
     if (button && !button.dataset.retryUntil) button.disabled = false;
+  }
+}
+
+async function automaticLicenseRead(path, options, tab) {
+  const request = beginLicenseRequest();
+  try {
+    const result = await licenseRead(path, { ...options, signal: request.controller.signal });
+    if (!licenseRequestStillCurrent(request, tab)) return null;
+    return result;
+  } catch (error) {
+    if (error.name === "AbortError" || !licenseRequestStillCurrent(request, tab)) return null;
+    throw error;
+  } finally {
+    endLicenseRequest(request);
   }
 }
 
@@ -707,7 +729,7 @@ async function userLicenseRead(path, options, button, statusID, tab) {
     clearLicenseError();
     return { result, request };
   } catch (error) {
-    if (error.name === "AbortError") return null;
+    if (error.name === "AbortError" || !licenseRequestStillCurrent(request, tab)) return null;
     if (error.status === 429 && button) coolDownAction(button, error.retryAfter, statusID);
     else if (error.code === "license_service_unavailable") showLicenseError(error);
     else if (statusID) setActionStatus(statusID, messageFor(error, "读取失败，请稍后重试。"), "error");
@@ -799,24 +821,52 @@ function updatePagination(kind, itemCount) {
   byId(`${kind}-page-next`).disabled = page.page * page.pageSize >= page.total;
 }
 
-async function fetchAllLicensePages(path) {
+function incompleteLicenseReferences() {
+  const error = new Error(errorMessages.license_reference_incomplete);
+  error.code = "license_reference_incomplete";
+  return error;
+}
+
+async function fetchAllLicensePages(path, tab) {
+  const request = beginLicenseRequest();
   const items = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const separator = path.includes("?") ? "&" : "?";
-    const result = await licenseRead(`${path}${separator}page=${page}&page_size=100`, { method: "GET" });
-    const chunk = Array.isArray(result.items) ? result.items : [];
-    items.push(...chunk);
-    total = Number(result.total) || items.length;
-    page += 1;
-    if (!chunk.length && items.length < total) {
-      const error = new Error(errorMessages.license_reference_incomplete);
-      error.code = "license_reference_incomplete";
-      throw error;
+  const seenIDs = new Set();
+  let expectedTotal = null;
+  let expectedPageSize = null;
+  let expectedPages = null;
+  try {
+    for (let page = 1; expectedPages === null || page <= expectedPages; page += 1) {
+      const separator = path.includes("?") ? "&" : "?";
+      const result = await licenseRead(`${path}${separator}page=${page}&page_size=100`, { method: "GET", signal: request.controller.signal });
+      if (!licenseRequestStillCurrent(request, tab)) return null;
+      const responsePage = Number(result.page);
+      const responsePageSize = Number(result.page_size);
+      const responseTotal = Number(result.total);
+      if (!Number.isInteger(responsePage) || responsePage !== page || !Number.isInteger(responsePageSize) || responsePageSize < 1 || !Number.isInteger(responseTotal) || responseTotal < 0) throw incompleteLicenseReferences();
+      if (expectedTotal === null) {
+        expectedTotal = responseTotal;
+        expectedPageSize = responsePageSize;
+        expectedPages = Math.max(1, Math.ceil(expectedTotal / expectedPageSize));
+      } else if (responseTotal !== expectedTotal || responsePageSize !== expectedPageSize) {
+        throw incompleteLicenseReferences();
+      }
+      const chunk = Array.isArray(result.items) ? result.items : [];
+      if (chunk.length > expectedPageSize || (!chunk.length && page < expectedPages)) throw incompleteLicenseReferences();
+      for (const item of chunk) {
+        const id = item && String(item.id || "");
+        if (!id || seenIDs.has(id)) throw incompleteLicenseReferences();
+        seenIDs.add(id);
+        items.push(item);
+      }
     }
-  } while (items.length < total);
-  return items;
+    if (items.length !== expectedTotal) throw incompleteLicenseReferences();
+    return items;
+  } catch (error) {
+    if (error.name === "AbortError" || !licenseRequestStillCurrent(request, tab)) return null;
+    throw error;
+  } finally {
+    endLicenseRequest(request);
+  }
 }
 
 function refreshPackageSelects() {
@@ -830,14 +880,17 @@ function refreshPackageSelects() {
 }
 
 async function ensureLicenseReferences() {
+  const epoch = state.licenseEpoch;
   const [softwareItems, packageItems] = await Promise.all([
-    fetchAllLicensePages("/admin/api/license/software"),
-    fetchAllLicensePages("/admin/api/license/packages")
+    fetchAllLicensePages("/admin/api/license/software", "cards"),
+    fetchAllLicensePages("/admin/api/license/packages", "cards")
   ]);
+  if (!softwareItems || !packageItems || epoch !== state.licenseEpoch || state.activeAdminTab !== "cards") return false;
   state.licenseSoftware = softwareItems;
   state.licensePackages = packageItems;
   refreshPackageSelects();
   clearLicenseError();
+  return true;
 }
 
 function cardFilterPayload() {
@@ -856,7 +909,7 @@ function cardFilterPayload() {
 }
 
 async function loadCardsWorkspace() {
-  await ensureLicenseReferences();
+  if (!await ensureLicenseReferences()) return;
   await loadCards();
 }
 
@@ -868,16 +921,8 @@ async function loadCards(button = null, payloadOverride = null) {
     if (!response) return false;
     result = response.result;
   } else {
-    const request = beginLicenseRequest();
-    try {
-      result = await licenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload), signal: request.controller.signal });
-      if (!licenseRequestStillCurrent(request, "cards")) return false;
-    } catch (error) {
-      if (error.name !== "AbortError") throw error;
-      return false;
-    } finally {
-      endLicenseRequest(request);
-    }
+    result = await automaticLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, "cards");
+    if (!result) return false;
   }
   state.licenseCards = Array.isArray(result.items) ? result.items : [];
   const page = state.licensePages.cards;
@@ -1020,6 +1065,7 @@ async function exportSelectedCards(event) {
       const body = await readJSON(response); const error = new Error(body.message || "导出失败。"); error.code = body.code || "operation_failed"; error.status = response.status; error.retryAfter = Number(response.headers.get("Retry-After")) || 0;
       if (error.status === 401) await expiredSession();
       if (error.status !== 429 && error.status < 500 && error.code !== "operation_in_progress") state.mutationKeys.delete(signature);
+      if (!licenseRequestStillCurrent(request, "cards")) return;
       if (error.status === 429) coolDownAction(button, error.retryAfter, "card-action-status");
       else setActionStatus("card-action-status", messageFor(error, "导出失败。"), "error");
       return;
@@ -1074,7 +1120,7 @@ async function loadSoftware(button = null) {
   const page = state.licensePages.software;
   const path = `/admin/api/license/software?page=${page.page}&page_size=${page.pageSize}`;
   const response = button ? await userLicenseRead(path, { method: "GET" }, button, "software-action-status", "software") : null;
-  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "software");
   if (!result) return false;
   state.licenseSoftware = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
@@ -1134,7 +1180,10 @@ function softwareCheckList(selectedIDs, attribute) {
 }
 
 async function loadPackagesWorkspace() {
-  state.licenseSoftware = await fetchAllLicensePages("/admin/api/license/software");
+  const epoch = state.licenseEpoch;
+  const software = await fetchAllLicensePages("/admin/api/license/software", "packages");
+  if (!software || epoch !== state.licenseEpoch || state.activeAdminTab !== "packages") return;
+  state.licenseSoftware = software;
   renderPackageMembers();
   await loadPackages();
 }
@@ -1156,7 +1205,7 @@ async function loadPackages(button = null) {
   const page = state.licensePages.packages;
   const path = `/admin/api/license/packages?page=${page.page}&page_size=${page.pageSize}`;
   const response = button ? await userLicenseRead(path, { method: "GET" }, button, "package-action-status", "packages") : null;
-  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "packages");
   if (!result) return false;
   state.licensePackages = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
@@ -1173,16 +1222,18 @@ async function createPackage(event) {
 }
 
 async function previewPackageChange(item, list, button) {
+  const epoch = state.licenseEpoch;
   const ids = [...list.querySelectorAll("input:checked")].map((input) => input.value);
   const result = await licenseMutation(`/admin/api/license/packages/${item.id}/impact`, "POST", { software_ids: ids }, button, "package-action-status");
-  if (!result) return;
-  state.pendingPackageChange = { item, ids };
+  if (!result || epoch !== state.licenseEpoch || state.activeAdminTab !== "packages") return;
+  state.pendingPackageChange = { item, ids, epoch };
   byId("package-impact-summary").textContent = `将影响 ${result.affected_valid_cards || 0} 张当前有效卡密；暂时离线的客户端可能最长 ${result.max_offline_lease_delay_minutes || 30} 分钟后失效。`;
   byId("package-impact-dialog").showModal();
 }
 
 async function confirmPackageChange(event) {
   event.preventDefault(); if (!state.pendingPackageChange) return; const pending = state.pendingPackageChange;
+  if (pending.epoch !== state.licenseEpoch || state.activeAdminTab !== "packages") { state.pendingPackageChange = null; byId("package-impact-dialog").close(); return; }
   const result = await licenseMutation(`/admin/api/license/packages/${pending.item.id}/members`, "PUT", { software_ids: pending.ids }, byId("package-impact-confirm"), "package-action-status");
   if (!result) return; pending.item.software_ids = pending.ids; state.pendingPackageChange = null; byId("package-impact-dialog").close(); renderPackages();
 }
@@ -1191,7 +1242,7 @@ async function loadDevices(button = null) {
   const page = state.licensePages.devices;
   const path = `/admin/api/license/devices?page=${page.page}&page_size=${page.pageSize}`;
   const response = button ? await userLicenseRead(path, { method: "GET" }, button, "device-action-status", "devices") : null;
-  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  const result = button ? (response && response.result) : await automaticLicenseRead(path, { method: "GET" }, "devices");
   if (!result) return false;
   const items = Array.isArray(result.items) ? result.items : [];
   page.page = Number(result.page) || page.page;
