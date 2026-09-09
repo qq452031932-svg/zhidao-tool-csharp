@@ -56,6 +56,7 @@ const errorMessages = {
   confirmation_required: "请完成确认后再继续。",
   operation_failed: "操作失败，请记录操作编号并稍后重试。",
   license_service_unavailable: "授权服务暂时不可用，请稍后重试。",
+  license_reference_incomplete: "授权基础数据未完整加载，请刷新后重试。",
   rate_limited: "操作过于频繁，请按提示时间重试。",
   invalid_request: "输入内容不符合要求，请检查后重试。"
 };
@@ -133,8 +134,7 @@ async function bootstrapLogin() {
 }
 
 async function expiredSession() {
-  clearLicenseTransientState();
-  state.mutationKeys.clear();
+  clearLicenseTransientState(true);
   state.csrf = "";
   state.candidate = null;
   showView("login-view");
@@ -669,7 +669,7 @@ async function licenseMutation(path, method, body, button, statusID, request = n
     return result;
   } catch (error) {
     if (error.name === "AbortError") return null;
-    const temporary = !error.status || error.status === 429 || error.status >= 500;
+    const temporary = !error.status || error.status === 429 || error.status >= 500 || error.code === "operation_in_progress";
     if (!temporary) state.mutationKeys.delete(signature);
     if (error.code === "license_service_unavailable") showLicenseError(error);
     if (error.status === 429 && button) {
@@ -733,7 +733,7 @@ function closeLicenseDialogs() {
   }
 }
 
-function clearLicenseTransientState() {
+function clearLicenseTransientState(endSession = false) {
   state.licenseEpoch += 1;
   for (const controller of state.licenseControllers) controller.abort();
   state.licenseControllers.clear();
@@ -744,7 +744,7 @@ function clearLicenseTransientState() {
   state.activeCardID = "";
   state.selectedCardIDs.clear();
   state.pendingPackageChange = null;
-  state.mutationKeys.clear();
+  if (endSession) state.mutationKeys.clear();
   byId("delete-card-confirm-check").checked = false;
   byId("delete-card-target").textContent = "卡密 — · 套餐 —";
   closeLicenseDialogs();
@@ -761,6 +761,7 @@ async function selectAdminTab(name, force = false) {
   if (state.activeAdminTab !== name) clearLicenseTransientState();
   state.activeAdminTab = name;
   byId("empty-state").hidden = name !== "ota";
+  if (name === "ota") clearLicenseError();
   for (const tab of document.querySelectorAll("[data-admin-tab]")) {
     const active = tab.dataset.adminTab === name;
     tab.classList.toggle("active", active);
@@ -809,8 +810,12 @@ async function fetchAllLicensePages(path) {
     items.push(...chunk);
     total = Number(result.total) || items.length;
     page += 1;
-    if (!chunk.length) break;
-  } while (items.length < total && page <= 100);
+    if (!chunk.length && items.length < total) {
+      const error = new Error(errorMessages.license_reference_incomplete);
+      error.code = "license_reference_incomplete";
+      throw error;
+    }
+  } while (items.length < total);
   return items;
 }
 
@@ -1005,18 +1010,25 @@ async function exportSelectedCards(event) {
   if (!state.selectedCardIDs.size || button.disabled) return;
   button.disabled = true;
   const request = beginLicenseRequest();
+  const body = { card_ids: [...state.selectedCardIDs] };
+  const signature = mutationSignature("/admin/api/license/cards/export", "POST", body);
+  const idempotencyKey = state.mutationKeys.get(signature) || crypto.randomUUID();
+  state.mutationKeys.set(signature, idempotencyKey);
   try {
-    const response = await fetch("/admin/api/license/cards/export", { method: "POST", credentials: "same-origin", cache: "no-store", signal: request.controller.signal, headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ card_ids: [...state.selectedCardIDs] }) });
+    const response = await fetch("/admin/api/license/cards/export", { method: "POST", credentials: "same-origin", cache: "no-store", signal: request.controller.signal, headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf, "Idempotency-Key": idempotencyKey }, body: JSON.stringify(body) });
     if (!response.ok) {
       const body = await readJSON(response); const error = new Error(body.message || "导出失败。"); error.code = body.code || "operation_failed"; error.status = response.status; error.retryAfter = Number(response.headers.get("Retry-After")) || 0;
       if (error.status === 401) await expiredSession();
+      if (error.status !== 429 && error.status < 500 && error.code !== "operation_in_progress") state.mutationKeys.delete(signature);
       if (error.status === 429) coolDownAction(button, error.retryAfter, "card-action-status");
       else setActionStatus("card-action-status", messageFor(error, "导出失败。"), "error");
       return;
     }
     const blob = await response.blob();
     if (!licenseRequestStillCurrent(request, "cards")) return;
+    state.mutationKeys.delete(signature);
     const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = "license-cards.csv"; link.click(); URL.revokeObjectURL(href);
+    clearLicenseError();
     setActionStatus("card-action-status", `已导出 ${state.selectedCardIDs.size} 张卡密。`);
   } catch (error) {
     if (error.name !== "AbortError" && licenseRequestStillCurrent(request, "cards")) setActionStatus("card-action-status", "导出失败，请稍后重试。", "error");

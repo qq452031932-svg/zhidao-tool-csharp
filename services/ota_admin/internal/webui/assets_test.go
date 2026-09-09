@@ -49,7 +49,7 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	script := requestAsset(t, handler, "/admin/app.js")
 	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "Array.from(value).length", "XMLHttpRequest", "crypto.randomUUID", "showModal",
 		"/admin/api/license/software", "/admin/api/license/packages", "/admin/api/license/cards/search", "/admin/api/license/cards/generate", "/admin/api/license/cards/export", "/admin/api/license/devices", "Idempotency-Key", "Retry-After", "license_service_unavailable", "URL.createObjectURL",
-		"AbortController", "licenseEpoch", "mutationKeys", "ArrowLeft", "ArrowRight", "Home", "End", "item.id"} {
+		"AbortController", "licenseEpoch", "mutationKeys", "ArrowLeft", "ArrowRight", "Home", "End", "item.id", "授权基础数据未完整加载"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("script missing %q", required)
 		}
@@ -61,6 +61,9 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 	}
 	if strings.Contains(index, `id="generated-card-list" class="secret-list" aria-live=`) {
 		t.Error("plaintext card container must not be an aria-live region")
+	}
+	if strings.Contains(script, "page <= 100") {
+		t.Error("license reference pagination must not silently truncate after 100 pages")
 	}
 }
 
