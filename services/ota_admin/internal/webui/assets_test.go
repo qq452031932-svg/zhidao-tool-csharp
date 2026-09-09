@@ -23,6 +23,11 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 		`id="software-panel"`, `id="packages-panel"`, `id="devices-panel"`, `id="ota-panel"`,
 		`完整卡密`, `前 8 位`, `后 4 位`, `默认备注`, `月卡`, `季卡`, `半年卡`, `年卡`,
 		`永久删除`, `可能最长 30 分钟`,
+		`套餐数量`, `id="delete-card-target"`,
+		`id="cards-page-range"`, `id="cards-page-prev"`, `id="cards-page-next"`,
+		`id="software-page-range"`, `id="software-page-prev"`, `id="software-page-next"`,
+		`id="packages-page-range"`, `id="packages-page-prev"`, `id="packages-page-next"`,
+		`id="devices-page-range"`, `id="devices-page-prev"`, `id="devices-page-next"`,
 	} {
 		if !strings.Contains(index, required) {
 			t.Errorf("index missing %q", required)
@@ -43,7 +48,8 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 
 	script := requestAsset(t, handler, "/admin/app.js")
 	for _, required := range []string{"/admin/api/session/bootstrap", "/admin/api/session/login", "/admin/api/uploads", "/admin/api/candidates/current", "/admin/api/releases", "historyResult.value.read_only", "current.csrf_token", "suppressSessionExpiry", "candidatePublishBlocked", "dashboardEpoch", "restoreAuthoritativeCandidate", "renderGateEvidence", "allGatesPassed", "candidate.state === \"published\"", "Array.from(value).length", "XMLHttpRequest", "crypto.randomUUID", "showModal",
-		"/admin/api/license/software", "/admin/api/license/packages", "/admin/api/license/cards/search", "/admin/api/license/cards/generate", "/admin/api/license/cards/export", "/admin/api/license/devices", "Idempotency-Key", "Retry-After", "license_service_unavailable", "URL.createObjectURL"} {
+		"/admin/api/license/software", "/admin/api/license/packages", "/admin/api/license/cards/search", "/admin/api/license/cards/generate", "/admin/api/license/cards/export", "/admin/api/license/devices", "Idempotency-Key", "Retry-After", "license_service_unavailable", "URL.createObjectURL",
+		"AbortController", "licenseEpoch", "mutationKeys", "ArrowLeft", "ArrowRight", "Home", "End", "item.id"} {
 		if !strings.Contains(script, required) {
 			t.Errorf("script missing %q", required)
 		}
@@ -52,6 +58,9 @@ func TestEmbeddedAdminPageHasCompleteAccessibleChineseWorkflow(t *testing.T) {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("script contains forbidden construct %q", forbidden)
 		}
+	}
+	if strings.Contains(index, `id="generated-card-list" class="secret-list" aria-live=`) {
+		t.Error("plaintext card container must not be an aria-live region")
 	}
 }
 

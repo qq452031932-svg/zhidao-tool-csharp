@@ -369,7 +369,7 @@ func deviceSummary(record model.DeviceRecord) model.DeviceSummary {
 	if len(cardShort) > 8 {
 		cardShort = cardShort[:8]
 	}
-	return model.DeviceSummary{CardShortID: cardShort, MachineShortID: shortOpaque("machine:" + record.MachineHash), BoundAt: record.BoundAt, LastSuccessfulValidation: record.LastSeenAt, ExpiresAt: record.ExpiresAt}
+	return model.DeviceSummary{ID: record.CardID, CardShortID: cardShort, MachineShortID: shortOpaque("machine:" + record.MachineHash), BoundAt: record.BoundAt, LastSuccessfulValidation: record.LastSeenAt, ExpiresAt: record.ExpiresAt}
 }
 
 func validAdminCardFilter(filter model.AdminCardFilter) bool {

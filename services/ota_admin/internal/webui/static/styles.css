@@ -216,6 +216,9 @@ dialog p { color: var(--muted); line-height: 1.6; }
 .secret-list { max-height: 11rem; margin: 0; padding: .8rem; overflow: auto; border: 1px solid #ead49d; border-radius: 8px; background: #fff; white-space: pre-wrap; overflow-wrap: anywhere; }
 .button-row, .table-actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .table-actions { padding: .8rem 0 .65rem; color: var(--muted); font-size: .86rem; }
+.pagination { display: flex; justify-content: flex-end; align-items: center; gap: .45rem; padding-top: .7rem; color: var(--muted); font-size: .86rem; }
+.pagination .button { min-height: 2rem; padding: .35rem .65rem; }
+.delete-target { padding: .65rem .75rem; border-radius: 8px; background: var(--surface-soft); font-family: ui-monospace, Consolas, monospace; }
 .select-all { display: inline-flex; gap: .4rem; align-items: center; color: var(--text); }
 .license-table-scroll { max-height: 31rem; }
 .license-table { min-width: 68rem; }

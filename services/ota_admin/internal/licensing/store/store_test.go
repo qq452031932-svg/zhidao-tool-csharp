@@ -1109,6 +1109,55 @@ func TestCanceledImmediateTransactionRollsBackAndConnectionIsReusable(t *testing
 	}
 }
 
+func TestListSoftwareReportsPackageCountsWithoutBreakingPaginationTotals(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	createdAt := time.Date(2026, 9, 9, 9, 0, 0, 0, time.UTC)
+	withoutPackage, err := s.CreateSoftwareAt(ctx, "Standalone Product", createdAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withPackages, err := s.CreateSoftwareAt(ctx, "Suite Product", createdAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Suite One", "Suite Two"} {
+		if _, err := s.CreatePackage(ctx, name, []string{withPackages.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstPage, total, err := s.ListSoftware(ctx, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(firstPage) != 1 {
+		t.Fatalf("first page total=%d items=%d, want total 2 and one item", total, len(firstPage))
+	}
+	if firstPage[0].ID != withoutPackage.ID || firstPage[0].PackageCount != 0 {
+		t.Fatalf("standalone software=%+v, want id %s with zero packages", firstPage[0], withoutPackage.ID)
+	}
+
+	secondPage, total, err := s.ListSoftware(ctx, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(secondPage) != 1 {
+		t.Fatalf("second page total=%d items=%d, want total 2 and one item", total, len(secondPage))
+	}
+	if secondPage[0].ID != withPackages.ID || secondPage[0].PackageCount != 2 {
+		t.Fatalf("suite software=%+v, want id %s with two packages", secondPage[0], withPackages.ID)
+	}
+
+	emptyPage, total, err := s.ListSoftware(ctx, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(emptyPage) != 0 {
+		t.Fatalf("empty page total=%d items=%d, want total 2 and zero items", total, len(emptyPage))
+	}
+}
+
 func TestUnbindClearsActivationAndDeletePermanentlyCascadesCardState(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

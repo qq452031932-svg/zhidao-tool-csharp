@@ -483,25 +483,40 @@ func (s *Store) ListSoftware(ctx context.Context, offset, limit int) ([]model.So
 	if offset < 0 || limit < 1 {
 		return nil, 0, errors.New("invalid software page")
 	}
-	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM license_software`).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count software: %w", err)
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,enabled,created_at FROM license_software ORDER BY created_at,id LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `WITH software_counts AS (
+    SELECT s.id,s.name,s.enabled,s.created_at,count(m.package_id) AS package_count
+    FROM license_software s
+    LEFT JOIN license_package_members m ON m.software_id=s.id
+    GROUP BY s.id,s.name,s.enabled,s.created_at
+), software_page AS (
+    SELECT id,name,enabled,created_at,package_count
+    FROM software_counts
+    ORDER BY created_at,id
+    LIMIT ? OFFSET ?
+)
+SELECT p.id,p.name,p.enabled,p.created_at,p.package_count,totals.total
+FROM (SELECT count(*) AS total FROM software_counts) totals
+LEFT JOIN software_page p ON 1=1
+ORDER BY p.created_at,p.id`, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list software: %w", err)
 	}
 	defer rows.Close()
 	items := make([]model.Software, 0, limit)
+	var total int
 	for rows.Next() {
-		var item model.Software
-		var enabled int
-		var created int64
-		if err := rows.Scan(&item.ID, &item.Name, &enabled, &created); err != nil {
+		var id, name sql.NullString
+		var enabled, created, packageCount sql.NullInt64
+		if err := rows.Scan(&id, &name, &enabled, &created, &packageCount, &total); err != nil {
 			return nil, 0, fmt.Errorf("scan software: %w", err)
 		}
-		item.Enabled = enabled != 0
-		item.CreatedAt = time.Unix(created, 0).UTC()
+		if !id.Valid {
+			continue
+		}
+		if !name.Valid || !enabled.Valid || !created.Valid || !packageCount.Valid {
+			return nil, 0, errors.New("software page contains incomplete data")
+		}
+		item := model.Software{ID: id.String, Name: name.String, Enabled: enabled.Int64 != 0, PackageCount: int(packageCount.Int64), CreatedAt: time.Unix(created.Int64, 0).UTC()}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {

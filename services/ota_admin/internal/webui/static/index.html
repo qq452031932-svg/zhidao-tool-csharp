@@ -79,11 +79,11 @@
 
     <div id="console-view" hidden>
       <nav id="admin-navigation" class="admin-navigation" role="tablist" aria-label="管理功能">
-        <button id="tab-cards" class="admin-tab active" role="tab" type="button" aria-selected="true" aria-controls="cards-panel" data-admin-tab="cards">卡密管理</button>
-        <button id="tab-software" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="software-panel" data-admin-tab="software">软件管理</button>
-        <button id="tab-packages" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="packages-panel" data-admin-tab="packages">套餐管理</button>
-        <button id="tab-devices" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="devices-panel" data-admin-tab="devices">设备绑定</button>
-        <button id="tab-ota" class="admin-tab" role="tab" type="button" aria-selected="false" aria-controls="ota-panel" data-admin-tab="ota">OTA 更新</button>
+        <button id="tab-cards" class="admin-tab active" role="tab" type="button" tabindex="0" aria-selected="true" aria-controls="cards-panel" data-admin-tab="cards">卡密管理</button>
+        <button id="tab-software" class="admin-tab" role="tab" type="button" tabindex="-1" aria-selected="false" aria-controls="software-panel" data-admin-tab="software">软件管理</button>
+        <button id="tab-packages" class="admin-tab" role="tab" type="button" tabindex="-1" aria-selected="false" aria-controls="packages-panel" data-admin-tab="packages">套餐管理</button>
+        <button id="tab-devices" class="admin-tab" role="tab" type="button" tabindex="-1" aria-selected="false" aria-controls="devices-panel" data-admin-tab="devices">设备绑定</button>
+        <button id="tab-ota" class="admin-tab" role="tab" type="button" tabindex="-1" aria-selected="false" aria-controls="ota-panel" data-admin-tab="ota">OTA 更新</button>
       </nav>
 
       <section id="license-error" class="state-banner error compact-banner" role="alert" hidden>
@@ -106,7 +106,7 @@
 
         <section id="generated-card-window" class="card secret-window" aria-labelledby="generated-card-title" hidden>
           <div class="section-heading dense-heading"><div><h2 id="generated-card-title">请立即复制新卡密</h2><p>明文只在当前安全窗口临时显示，离开本页或 60 秒后清除。</p></div><div class="button-row"><button id="copy-generated-cards" class="button secondary" type="button">复制全部</button><button id="clear-generated-cards" class="button ghost" type="button">立即清除</button></div></div>
-          <pre id="generated-card-list" class="secret-list" aria-live="polite"></pre>
+          <pre id="generated-card-list" class="secret-list"></pre>
         </section>
 
         <section class="card compact-card">
@@ -125,13 +125,15 @@
             <table class="license-table"><thead><tr><th scope="col"><span class="sr-only">选择</span></th><th scope="col">卡密</th><th scope="col">套餐</th><th scope="col">天数</th><th scope="col">状态</th><th scope="col">激活时间</th><th scope="col">到期时间</th><th scope="col">绑定</th><th scope="col">备注</th><th scope="col">操作</th></tr></thead>
             <tbody id="cards-body"><tr><td colspan="10" class="table-empty">正在读取卡密…</td></tr></tbody></table>
           </div>
+          <div class="pagination" aria-label="卡密分页"><span id="cards-page-range">0–0 / 0</span><button id="cards-page-prev" class="button ghost" type="button" disabled>上一页</button><button id="cards-page-next" class="button ghost" type="button" disabled>下一页</button></div>
         </section>
       </section>
 
       <section id="software-panel" class="admin-panel" role="tabpanel" aria-labelledby="tab-software" hidden>
         <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">授权对象</span><h1>软件管理</h1></div></div>
           <form id="software-create-form" class="inline-form"><label for="software-name">软件名称</label><input id="software-name" maxlength="128" required placeholder="例如 SuperPan"><button id="software-create-button" class="button primary" type="submit">创建软件</button><span id="software-action-status" class="inline-status" aria-live="polite"></span></form>
-          <div class="table-scroll"><table class="license-table"><thead><tr><th>不可变 ID</th><th>名称</th><th>状态</th><th>操作</th></tr></thead><tbody id="software-body"><tr><td colspan="4" class="table-empty">正在读取…</td></tr></tbody></table></div>
+          <div class="table-scroll"><table class="license-table"><thead><tr><th>不可变 ID</th><th>名称</th><th>套餐数量</th><th>状态</th><th>操作</th></tr></thead><tbody id="software-body"><tr><td colspan="5" class="table-empty">正在读取…</td></tr></tbody></table></div>
+          <div class="pagination" aria-label="软件分页"><span id="software-page-range">0–0 / 0</span><button id="software-page-prev" class="button ghost" type="button" disabled>上一页</button><button id="software-page-next" class="button ghost" type="button" disabled>下一页</button></div>
         </section>
       </section>
 
@@ -139,6 +141,7 @@
         <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">多软件授权</span><h1>套餐管理</h1></div></div>
           <form id="package-create-form" class="package-form"><div class="compact-field"><label for="package-name">套餐名称</label><input id="package-name" maxlength="128" required></div><fieldset><legend>包含软件</legend><div id="package-create-members" class="check-grid"></div></fieldset><button id="package-create-button" class="button primary" type="submit">创建套餐</button><span id="package-action-status" class="inline-status" aria-live="polite"></span></form>
           <div class="table-scroll"><table class="license-table"><thead><tr><th>套餐</th><th>软件成员</th><th>操作</th></tr></thead><tbody id="packages-body"><tr><td colspan="3" class="table-empty">正在读取…</td></tr></tbody></table></div>
+          <div class="pagination" aria-label="套餐分页"><span id="packages-page-range">0–0 / 0</span><button id="packages-page-prev" class="button ghost" type="button" disabled>上一页</button><button id="packages-page-next" class="button ghost" type="button" disabled>下一页</button></div>
         </section>
       </section>
 
@@ -146,6 +149,7 @@
         <section class="card compact-card"><div class="section-heading dense-heading"><div><span class="eyebrow">机器授权</span><h1>设备绑定</h1></div><button id="refresh-devices" class="button ghost" type="button">刷新</button></div>
           <p id="device-action-status" class="inline-status" aria-live="polite"></p>
           <div class="table-scroll"><table class="license-table"><thead><tr><th>卡密短号</th><th>机器短号</th><th>绑定时间</th><th>最后验证</th><th>操作</th></tr></thead><tbody id="devices-body"><tr><td colspan="5" class="table-empty">正在读取…</td></tr></tbody></table></div>
+          <div class="pagination" aria-label="设备分页"><span id="devices-page-range">0–0 / 0</span><button id="devices-page-prev" class="button ghost" type="button" disabled>上一页</button><button id="devices-page-next" class="button ghost" type="button" disabled>下一页</button></div>
         </section>
       </section>
 
@@ -275,7 +279,7 @@
   </dialog>
 
   <dialog id="delete-card-dialog" aria-labelledby="delete-card-title" aria-describedby="delete-card-description">
-    <form id="delete-card-form"><span class="eyebrow">高风险操作</span><h2 id="delete-card-title">永久删除卡密</h2><p id="delete-card-description">将同时删除绑定和服务端租约，不可恢复。</p><label class="confirm-check"><input id="delete-card-confirm-check" type="checkbox" required> 我确认永久删除这张卡密</label><div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="delete-card-dialog">取消</button><button id="delete-card-confirm" class="button danger" type="submit">永久删除</button></div></form>
+    <form id="delete-card-form"><span class="eyebrow">高风险操作</span><h2 id="delete-card-title">永久删除卡密</h2><p id="delete-card-target" class="delete-target">卡密 — · 套餐 —</p><p id="delete-card-description">将同时删除绑定和服务端租约，不可恢复。</p><label class="confirm-check"><input id="delete-card-confirm-check" type="checkbox" required> 我确认永久删除这张卡密</label><div class="dialog-actions"><button class="button ghost" type="button" data-close-dialog="delete-card-dialog">取消</button><button id="delete-card-confirm" class="button danger" type="submit">永久删除</button></div></form>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>

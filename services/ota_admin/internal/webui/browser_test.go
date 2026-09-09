@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,7 +66,7 @@ func TestAdminConsoleInRealBrowserLicenseManagement(t *testing.T) {
 	if chrome == "" {
 		t.Skip("Chrome or Edge is not installed")
 	}
-	for _, mode := range []string{"license-happy", "license-unavailable"} {
+	for _, mode := range []string{"license-happy", "license-unavailable", "license-edge"} {
 		t.Run(mode, func(t *testing.T) {
 			server := newLicenseBrowserTestServer(t, mode)
 			defer server.Close()
@@ -104,6 +105,15 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 	loggedIn := false
 	csrf := "license-csrf"
 	softwareCreateRequests := 0
+	searchRequests := 0
+	copyRequests := 0
+	deviceReads := 0
+	deviceUnbindPath := ""
+	generateKeys := []string{}
+	renewKeys := []string{}
+	committedGenerateKeys := map[string]bool{}
+	committedRenewKeys := map[string]bool{}
+	cardDeleted := false
 	securityFailures := []string{}
 	actions := map[string]int{}
 	searchBody := map[string]any{}
@@ -123,6 +133,25 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 	}
 	itemsCards := func() []map[string]any {
 		return []map[string]any{{"id": cardID, "package_id": packageID, "package_name": "全能套餐", "prefix8": "ABCDEFGH", "last4": "6789", "card_type": "month", "duration_days": 30, "state": "effective", "activated_at": now.Add(-time.Hour), "expires_at": now.Add(29 * 24 * time.Hour), "binding_short_id": "MACHINE1", "note": "张三", "created_at": now.Add(-2 * time.Hour)}}
+	}
+	edgeCards := func(page int) []map[string]any {
+		if cardDeleted && page > 1 {
+			return nil
+		}
+		count := 100
+		if page == 2 {
+			count = 1
+		}
+		items := make([]map[string]any, 0, count)
+		for index := 0; index < count; index++ {
+			number := index + 1
+			if page == 2 {
+				number = 101
+			}
+			item := map[string]any{"id": fmt.Sprintf("%08d-0000-4000-8000-%012d", number, number), "package_id": packageID, "package_name": "全能套餐", "prefix8": "ABCDEFGH", "last4": fmt.Sprintf("%04d", number), "card_type": "month", "duration_days": 30, "state": "effective", "activated_at": now.Add(-time.Hour), "expires_at": now.Add(29 * 24 * time.Hour), "binding_short_id": "MACHINE1", "note": fmt.Sprintf("用户%d", number), "created_at": now.Add(-2 * time.Hour)}
+			items = append(items, item)
+		}
+		return items
 	}
 	web := Handler()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +199,19 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				writeBrowserJSON(w, http.StatusCreated, map[string]any{"id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "name": "限流软件", "enabled": true, "created_at": now})
 				return
 			}
-			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsSoftware(), "page": 1, "page_size": 100, "total": 2})
+			if mode == "license-edge" && r.URL.Query().Get("page") == "2" {
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "name": "第二页软件", "enabled": true, "package_count": 0, "created_at": now}}, "page": 2, "page_size": 50, "total": 51})
+				return
+			}
+			if mode == "license-edge" && r.URL.Query().Get("page") != "" && r.URL.Query().Get("page") != "1" {
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []any{}, "page": 3, "page_size": 100, "total": 51})
+				return
+			}
+			total := 2
+			if mode == "license-edge" {
+				total = 51
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsSoftware(), "page": 1, "page_size": 50, "total": total})
 		case "/admin/api/license/packages":
 			if r.Method == http.MethodPost {
 				checkMutation(r)
@@ -178,16 +219,58 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 				writeBrowserJSON(w, http.StatusCreated, itemsPackages()[0])
 				return
 			}
-			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsPackages(), "page": 1, "page_size": 100, "total": 1})
+			if mode == "license-edge" && r.URL.Query().Get("page") == "2" {
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "ffffffff-ffff-4fff-8fff-ffffffffffff", "name": "第二页套餐", "software_ids": []string{softwareA}, "created_at": now}}, "page": 2, "page_size": 50, "total": 51})
+				return
+			}
+			if mode == "license-edge" && r.URL.Query().Get("page") != "" && r.URL.Query().Get("page") != "1" {
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []any{}, "page": 3, "page_size": 100, "total": 51})
+				return
+			}
+			total := 1
+			if mode == "license-edge" {
+				total = 51
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsPackages(), "page": 1, "page_size": 50, "total": total})
 		case "/admin/api/license/cards/search":
+			searchRequests++
 			if r.URL.RawQuery != "" || r.Header.Get("Idempotency-Key") != "" || r.Header.Get("Origin") != "http://"+r.Host || r.Header.Get("X-CSRF-Token") != csrf {
 				securityFailures = append(securityFailures, "sensitive_search")
 			}
 			_ = json.NewDecoder(r.Body).Decode(&searchBody)
+			if mode == "license-edge" && searchRequests == 2 {
+				w.Header().Set("Retry-After", "1")
+				writeBrowserJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate_limited"})
+				return
+			}
+			if mode == "license-edge" {
+				page := 1
+				if value, ok := searchBody["page"].(float64); ok {
+					page = int(value)
+				}
+				total := 101
+				if cardDeleted {
+					total = 100
+				}
+				writeBrowserJSON(w, http.StatusOK, map[string]any{"items": edgeCards(page), "page": page, "page_size": 100, "total": total})
+				return
+			}
 			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": itemsCards(), "page": 1, "page_size": 100, "total": 1})
 		case "/admin/api/license/cards/generate":
 			checkMutation(r)
-			actions["generate"]++
+			key := r.Header.Get("Idempotency-Key")
+			generateKeys = append(generateKeys, key)
+			if !committedGenerateKeys[key] {
+				committedGenerateKeys[key] = true
+				actions["generate"]++
+			}
+			if mode == "license-edge" && len(generateKeys) == 1 {
+				writeBrowserJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "license_service_unavailable"})
+				return
+			}
+			if mode == "license-edge" && len(generateKeys) >= 3 {
+				time.Sleep(200 * time.Millisecond)
+			}
 			writeBrowserJSON(w, http.StatusCreated, map[string]any{"items": []map[string]any{{"card": itemsCards()[0], "plaintext": cardText}}})
 		case "/admin/api/license/cards/export":
 			checkMutation(r)
@@ -197,13 +280,24 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(append([]byte{0xef, 0xbb, 0xbf}, []byte("完整卡密,套餐\r\n"+cardText+",全能套餐\r\n")...))
 		case "/admin/api/license/devices":
-			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"card_short_id": "dddddddd", "machine_short_id": "MACHINE1", "bound_at": now.Add(-time.Hour), "last_successful_validation": now, "expires_at": now.Add(29 * 24 * time.Hour)}}, "page": 1, "page_size": 100, "total": 1})
+			deviceReads++
+			if mode == "license-edge" && deviceReads == 2 {
+				time.Sleep(150 * time.Millisecond)
+			}
+			page, total := 1, 1
+			if mode == "license-edge" {
+				total = 51
+			}
+			if mode == "license-edge" && r.URL.Query().Get("page") == "2" {
+				page = 2
+			}
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": cardID, "card_short_id": "dddddddd", "machine_short_id": "MACHINE1", "bound_at": now.Add(-time.Hour), "last_successful_validation": now, "expires_at": now.Add(29 * 24 * time.Hour)}}, "page": page, "page_size": 50, "total": total})
 		case "/admin/api/releases":
 			writeBrowserJSON(w, http.StatusOK, map[string]any{"releases": browserReleases(), "read_only": false, "client_auto_downgrade": false})
 		case "/admin/api/candidates/current":
 			writeBrowserJSON(w, http.StatusNotFound, map[string]any{"code": "not_found"})
 		case "/test/license-assertions":
-			writeBrowserJSON(w, http.StatusOK, map[string]any{"software_create_requests": softwareCreateRequests, "security_failures": securityFailures, "actions": actions, "search_body": searchBody})
+			writeBrowserJSON(w, http.StatusOK, map[string]any{"software_create_requests": softwareCreateRequests, "security_failures": securityFailures, "actions": actions, "search_body": searchBody, "search_requests": searchRequests, "copy_requests": copyRequests, "device_reads": deviceReads, "device_unbind_path": deviceUnbindPath, "generate_keys": generateKeys, "renew_keys": renewKeys})
 		default:
 			path := r.URL.Path
 			if strings.HasPrefix(path, "/admin/api/license/software/") {
@@ -231,25 +325,51 @@ func newLicenseBrowserTestServer(t *testing.T, mode string) *httptest.Server {
 			}
 			if strings.HasPrefix(path, "/admin/api/license/cards/") {
 				if r.Method == http.MethodGet {
+					copyRequests++
+					if mode == "license-edge" && copyRequests == 1 {
+						w.Header().Set("Retry-After", "1")
+						writeBrowserJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate_limited"})
+						return
+					}
+					if mode == "license-edge" && copyRequests == 3 {
+						writeBrowserJSON(w, http.StatusUnauthorized, map[string]any{"code": "authentication_failed"})
+						return
+					}
+					if mode == "license-edge" {
+						time.Sleep(200 * time.Millisecond)
+					}
 					actions["copy"]++
 					writeBrowserJSON(w, http.StatusOK, map[string]any{"card": itemsCards()[0], "plaintext": cardText})
 					return
 				}
 				checkMutation(r)
 				if strings.HasSuffix(path, "/renew") {
-					actions["renew"]++
+					key := r.Header.Get("Idempotency-Key")
+					renewKeys = append(renewKeys, key)
+					if !committedRenewKeys[key] {
+						committedRenewKeys[key] = true
+						actions["renew"]++
+					}
+					if mode == "license-edge" && len(renewKeys) == 1 {
+						writeBrowserJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "license_service_unavailable"})
+						return
+					}
 				} else if strings.HasSuffix(path, "/remark") {
 					actions["remark"]++
 				} else if strings.HasSuffix(path, "/unbind") {
 					actions["card_unbind"]++
 				} else {
 					actions["delete"]++
+					if mode == "license-edge" {
+						cardDeleted = true
+					}
 				}
 				writeBrowserJSON(w, http.StatusOK, map[string]any{"id": cardID})
 				return
 			}
 			if strings.HasPrefix(path, "/admin/api/license/devices/") && strings.HasSuffix(path, "/unbind") {
 				checkMutation(r)
+				deviceUnbindPath = path
 				actions["device_unbind"]++
 				writeBrowserJSON(w, http.StatusOK, map[string]any{"id": cardID})
 				return
@@ -621,7 +741,8 @@ try {
 const licenseBrowserBootstrapScript = `
 window.__licenseClipboard = "";
 window.__licenseDownloads = 0;
-Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async value => { window.__licenseClipboard = value; } } });
+window.__rejectLicenseClipboard = false;
+Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async value => { if (window.__rejectLicenseClipboard) throw new Error("clipboard denied"); window.__licenseClipboard = value; } } });
 URL.createObjectURL = () => { window.__licenseDownloads += 1; return "blob:license-test"; };
 URL.revokeObjectURL = () => {};
 HTMLAnchorElement.prototype.click = function() {};
@@ -655,6 +776,103 @@ try {
     await waitForLicense(() => !document.getElementById("ota-panel").hidden && document.getElementById("current-version").textContent === "v20.5.0", "授权故障时 OTA 仍可用");
     assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
     result.textContent = "PASS license-unavailable";
+  } else if (new URL(location.href).searchParams.get("mode") === "license-edge") {
+    await waitForLicense(() => document.querySelectorAll("#cards-body tr[data-card-id]").length === 100, "百张卡密第一页");
+    document.getElementById("tab-cards").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    await waitForLicense(() => document.activeElement === document.getElementById("tab-software") && !document.getElementById("software-panel").hidden, "方向键切换标签");
+    document.getElementById("tab-software").dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+    await waitForLicense(() => document.activeElement === document.getElementById("tab-cards") && !document.getElementById("cards-panel").hidden, "Home 返回首标签");
+
+    document.getElementById("filter-prefix8").value = "ABCDEFGH";
+    document.getElementById("card-filter-form").requestSubmit();
+    document.getElementById("card-filter-form").requestSubmit();
+    await waitForLicense(() => document.getElementById("search-cards-button").disabled, "查询 429 冷却");
+    let edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.search_requests === 2, "查询忙碌期间发生重叠请求");
+    await waitForLicense(() => !document.getElementById("search-cards-button").disabled, "查询冷却结束");
+    document.getElementById("cards-page-next").click();
+    await waitForLicense(() => document.getElementById("cards-page-range").textContent.includes("101–101") && document.querySelectorAll("#cards-body tr[data-card-id]").length === 1, "第 101 张卡密");
+    document.querySelector("#cards-body [data-action=card-delete]").click();
+    document.getElementById("delete-card-confirm-check").checked = true;
+    document.getElementById("delete-card-form").requestSubmit();
+    await waitForLicense(() => document.getElementById("cards-page-range").textContent.includes("1–100 / 100") && document.querySelectorAll("#cards-body tr[data-card-id]").length === 100, "删除最后一条后回退第一页");
+
+    document.getElementById("generate-package").value = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    document.getElementById("generate-count").value = "1";
+    document.getElementById("generate-note").value = "幂等备注";
+    document.getElementById("card-generate-form").requestSubmit();
+    await waitForLicense(() => !document.getElementById("generate-cards-button").disabled, "生成首响应失败后可重试");
+    document.getElementById("card-generate-form").requestSubmit();
+    await waitForLicense(() => !document.getElementById("generated-card-window").hidden, "幂等重试生成成功");
+    edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.generate_keys.length === 2 && edge.generate_keys[0] === edge.generate_keys[1] && edge.actions.generate === 1, "生成重试未复用幂等键或重复提交：" + JSON.stringify(edge));
+    window.__rejectLicenseClipboard = true;
+    document.getElementById("copy-generated-cards").click();
+    await waitForLicense(() => document.getElementById("card-action-status").textContent.includes("复制失败"), "剪贴板拒绝中文提示");
+    window.__rejectLicenseClipboard = false;
+
+    let firstCard = document.querySelector("#cards-body tr[data-card-id]");
+    firstCard.querySelector('[data-action="card-copy"]').click();
+    firstCard.querySelector('[data-action="card-copy"]').click();
+    await waitForLicense(() => firstCard.querySelector('[data-action="card-copy"]').disabled, "单卡复制 429 冷却");
+    edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.copy_requests === 1, "复制忙碌期间发生重叠请求");
+    await waitForLicense(() => !firstCard.querySelector('[data-action="card-copy"]').disabled, "复制冷却结束");
+    firstCard.querySelector('[data-action="card-copy"]').click();
+    clickTab("tab-software");
+    await waitForLicense(() => !document.getElementById("software-panel").hidden && document.getElementById("software-page-range").textContent.includes("/ 51"), "复制期间切换标签");
+    await new Promise(resolve => setTimeout(resolve, 260));
+    assertLicense(window.__licenseClipboard === "", "切页后的迟到明文写入剪贴板");
+    document.getElementById("software-page-next").click();
+    await waitForLicense(() => document.getElementById("software-page-range").textContent.includes("51–51"), "软件第二页");
+
+    clickTab("tab-packages");
+    await waitForLicense(() => !document.getElementById("packages-panel").hidden && document.getElementById("packages-page-range").textContent.includes("/ 51") && !document.getElementById("packages-page-next").disabled, "套餐分页可用");
+    document.getElementById("packages-page-next").click();
+    await waitForLicense(() => document.getElementById("packages-page-range").textContent.includes("51–51"), "套餐第二页");
+
+    clickTab("tab-devices");
+    await waitForLicense(() => document.querySelector("#devices-body [data-action=device-unbind]"), "设备列表");
+    document.getElementById("refresh-devices").click();
+    document.getElementById("refresh-devices").click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).device_reads === 2, "设备刷新完成");
+    document.getElementById("devices-page-next").click();
+    await waitForLicense(() => document.getElementById("devices-page-range").textContent.includes("51–51"), "设备第二页");
+    document.querySelector("#devices-body [data-action=device-unbind]").click();
+    await waitForLicense(async () => (await (await fetch("/test/license-assertions")).json()).actions.device_unbind === 1, "设备精确解绑");
+    edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.device_unbind_path.endsWith("/devices/dddddddd-dddd-4ddd-8ddd-dddddddddddd/unbind"), "设备解绑未使用稳定完整 ID");
+
+    clickTab("tab-cards");
+    await waitForLicense(() => document.querySelector("#cards-body tr[data-card-id]"), "返回卡密页");
+    firstCard = document.querySelector("#cards-body tr[data-card-id]");
+    firstCard.querySelector('[data-action="card-renew"]').click();
+    document.getElementById("renew-form").requestSubmit();
+    await waitForLicense(() => !document.querySelector("#renew-form button[type=submit]").disabled, "续期首响应失败后可重试");
+    document.getElementById("renew-form").requestSubmit();
+    await waitForLicense(() => !document.getElementById("renew-card-dialog").open, "续期幂等重试成功");
+    edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.renew_keys.length === 2 && edge.renew_keys[0] === edge.renew_keys[1] && edge.actions.renew === 1, "续期重试未复用幂等键或重复提交");
+
+    document.getElementById("card-generate-form").requestSubmit();
+    clickTab("tab-ota");
+    await waitForLicense(() => !document.getElementById("ota-panel").hidden, "生成期间切换 OTA");
+    await new Promise(resolve => setTimeout(resolve, 260));
+    assertLicense(document.getElementById("generated-card-window").hidden && document.getElementById("generated-card-list").textContent === "", "切页后的迟到生成明文写入 DOM");
+    edge = await (await fetch("/test/license-assertions")).json();
+    assertLicense(edge.generate_keys.length >= 3 && edge.generate_keys[2] !== edge.generate_keys[0], "成功后新生成操作未使用新幂等键");
+
+    clickTab("tab-cards");
+    await waitForLicense(() => document.querySelector("#cards-body tr[data-card-id]"), "会话失效前卡密页");
+    firstCard = document.querySelector("#cards-body tr[data-card-id]");
+    firstCard.querySelector('[data-action="card-remark"]').click();
+    document.getElementById("remark-value").value = "不得残留的备注";
+    document.getElementById("filter-complete-card").value = "不得残留的完整卡密";
+    firstCard.querySelector('[data-action="card-copy"]').click();
+    await waitForLicense(() => !document.getElementById("login-view").hidden, "真正 401 后返回登录页");
+    assertLicense(!document.getElementById("remark-card-dialog").open && document.getElementById("remark-value").value === "" && document.getElementById("filter-complete-card").value === "", "会话失效未清除卡密临时状态");
+    assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
+    result.textContent = "PASS license-edge";
   } else {
     await waitForLicense(() => document.querySelectorAll("#cards-body tr[data-card-id]").length === 1, "卡密列表");
     clickTab("tab-software");
@@ -740,6 +958,7 @@ try {
     cardRow = document.querySelector('#cards-body tr[data-card-id="dddddddd-dddd-4ddd-8ddd-dddddddddddd"]');
     cardRow.querySelector('[data-action="card-delete"]').click();
     assertLicense(document.getElementById("delete-card-dialog").open, "删除卡密未二次确认");
+    assertLicense(document.getElementById("delete-card-target").textContent.includes("ABCDEFGH…6789") && document.getElementById("delete-card-target").textContent.includes("全能套餐"), "删除确认缺少卡密短号或套餐");
     document.getElementById("delete-card-form").requestSubmit();
     assertions = await (await fetch("/test/license-assertions")).json();
     assertLicense(!assertions.actions.delete, "未勾选确认就删除");

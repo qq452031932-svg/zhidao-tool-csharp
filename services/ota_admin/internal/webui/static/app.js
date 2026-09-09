@@ -20,7 +20,16 @@ const state = {
   generatedPlaintexts: [],
   generatedClearTimer: 0,
   pendingPackageChange: null,
-  activeCardID: ""
+  activeCardID: "",
+  licenseEpoch: 0,
+  licenseControllers: new Set(),
+  mutationKeys: new Map(),
+  licensePages: {
+    cards: { page: 1, pageSize: 100, total: 0 },
+    software: { page: 1, pageSize: 50, total: 0 },
+    packages: { page: 1, pageSize: 50, total: 0 },
+    devices: { page: 1, pageSize: 50, total: 0 }
+  }
 };
 
 const gateNames = ["package", "channel", "version", "signature", "files", "references", "storage"];
@@ -124,7 +133,8 @@ async function bootstrapLogin() {
 }
 
 async function expiredSession() {
-  clearGeneratedCards();
+  clearLicenseTransientState();
+  state.mutationKeys.clear();
   state.csrf = "";
   state.candidate = null;
   showView("login-view");
@@ -226,6 +236,7 @@ async function changePassword(event) {
 }
 
 async function logout() {
+  clearLicenseTransientState();
   try {
     await api("/admin/api/session/logout", { method: "POST", body: "{}" });
   } catch (error) {
@@ -235,7 +246,7 @@ async function logout() {
       return;
     }
   }
-  clearGeneratedCards();
+  state.mutationKeys.clear();
   state.csrf = "";
   state.candidate = null;
   showView("login-view");
@@ -605,6 +616,9 @@ function coolDownAction(button, seconds, statusID) {
   const until = Date.now() + safeSeconds * 1000;
   button.dataset.retryUntil = String(until);
   button.disabled = true;
+  const status = byId(statusID);
+  const previousLive = status ? status.getAttribute("aria-live") : null;
+  if (status) status.setAttribute("aria-live", "off");
   const update = () => {
     const remaining = Math.ceil((until - Date.now()) / 1000);
     if (remaining > 0) {
@@ -614,23 +628,49 @@ function coolDownAction(button, seconds, statusID) {
     }
     delete button.dataset.retryUntil;
     button.disabled = false;
+    if (status) {
+      if (previousLive === null) status.removeAttribute("aria-live");
+      else status.setAttribute("aria-live", previousLive);
+    }
     setActionStatus(statusID, "现在可以重试。");
   };
   update();
 }
 
-async function licenseMutation(path, method, body, button, statusID) {
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const key of Object.keys(value).sort()) result[key] = canonicalValue(value[key]);
+    return result;
+  }
+  return value;
+}
+
+function mutationSignature(path, method, body) {
+  return `${method.toUpperCase()} ${path} ${JSON.stringify(canonicalValue(body))}`;
+}
+
+async function licenseMutation(path, method, body, button, statusID, request = null) {
   if (button && (button.disabled || Number(button.dataset.retryUntil || 0) > Date.now())) return null;
   if (button) button.disabled = true;
+  const signature = mutationSignature(path, method, body);
+  const idempotencyKey = state.mutationKeys.get(signature) || crypto.randomUUID();
+  state.mutationKeys.set(signature, idempotencyKey);
   try {
     const result = await api(path, {
       method,
-      headers: { "Idempotency-Key": crypto.randomUUID() },
-      body: JSON.stringify(body)
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+      signal: request ? request.controller.signal : undefined
     });
+    state.mutationKeys.delete(signature);
     clearLicenseError();
     return result;
   } catch (error) {
+    if (error.name === "AbortError") return null;
+    const temporary = !error.status || error.status === 429 || error.status >= 500;
+    if (!temporary) state.mutationKeys.delete(signature);
     if (error.code === "license_service_unavailable") showLicenseError(error);
     if (error.status === 429 && button) {
       coolDownAction(button, error.retryAfter, statusID);
@@ -643,12 +683,72 @@ async function licenseMutation(path, method, body, button, statusID) {
   }
 }
 
+function beginLicenseRequest() {
+  const controller = new AbortController();
+  state.licenseControllers.add(controller);
+  return { controller, epoch: state.licenseEpoch };
+}
+
+function endLicenseRequest(request) {
+  state.licenseControllers.delete(request.controller);
+}
+
+function licenseRequestStillCurrent(request, tab = state.activeAdminTab) {
+  return !request.controller.signal.aborted && request.epoch === state.licenseEpoch && state.activeAdminTab === tab;
+}
+
+async function userLicenseRead(path, options, button, statusID, tab) {
+  if (button && (button.disabled || Number(button.dataset.retryUntil || 0) > Date.now())) return null;
+  if (button) button.disabled = true;
+  const request = beginLicenseRequest();
+  try {
+    const result = await api(path, { ...options, signal: request.controller.signal });
+    if (!licenseRequestStillCurrent(request, tab)) return null;
+    clearLicenseError();
+    return { result, request };
+  } catch (error) {
+    if (error.name === "AbortError") return null;
+    if (error.status === 429 && button) coolDownAction(button, error.retryAfter, statusID);
+    else if (error.code === "license_service_unavailable") showLicenseError(error);
+    else if (statusID) setActionStatus(statusID, messageFor(error, "读取失败，请稍后重试。"), "error");
+    return null;
+  } finally {
+    endLicenseRequest(request);
+    if (button && !button.dataset.retryUntil) button.disabled = false;
+  }
+}
+
 function clearGeneratedCards() {
   if (state.generatedClearTimer) window.clearTimeout(state.generatedClearTimer);
   state.generatedClearTimer = 0;
   state.generatedPlaintexts = [];
   byId("generated-card-list").textContent = "";
   byId("generated-card-window").hidden = true;
+}
+
+function closeLicenseDialogs() {
+  for (const id of ["package-impact-dialog", "renew-card-dialog", "remark-card-dialog", "delete-card-dialog"]) {
+    const dialog = byId(id);
+    if (dialog && dialog.open) dialog.close();
+  }
+}
+
+function clearLicenseTransientState() {
+  state.licenseEpoch += 1;
+  for (const controller of state.licenseControllers) controller.abort();
+  state.licenseControllers.clear();
+  clearGeneratedCards();
+  byId("filter-complete-card").value = "";
+  byId("generate-note").value = "";
+  byId("remark-value").value = "";
+  state.activeCardID = "";
+  state.selectedCardIDs.clear();
+  state.pendingPackageChange = null;
+  state.mutationKeys.clear();
+  byId("delete-card-confirm-check").checked = false;
+  byId("delete-card-target").textContent = "卡密 — · 套餐 —";
+  closeLicenseDialogs();
+  updateCardSelection();
 }
 
 async function openDefaultAdminTab() {
@@ -658,12 +758,14 @@ async function openDefaultAdminTab() {
 
 async function selectAdminTab(name, force = false) {
   if (!force && state.activeAdminTab === name && !byId(`${name}-panel`).hidden) return;
-  if (state.activeAdminTab === "cards" && name !== "cards") clearGeneratedCards();
+  if (state.activeAdminTab !== name) clearLicenseTransientState();
   state.activeAdminTab = name;
+  byId("empty-state").hidden = name !== "ota";
   for (const tab of document.querySelectorAll("[data-admin-tab]")) {
     const active = tab.dataset.adminTab === name;
     tab.classList.toggle("active", active);
     tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
     byId(`${tab.dataset.adminTab}-panel`).hidden = !active;
   }
   setLoading(true);
@@ -687,6 +789,31 @@ function option(value, label) {
   return item;
 }
 
+function updatePagination(kind, itemCount) {
+  const page = state.licensePages[kind];
+  const start = page.total && itemCount ? ((page.page - 1) * page.pageSize) + 1 : 0;
+  const end = start ? start + itemCount - 1 : 0;
+  byId(`${kind}-page-range`).textContent = `${start}–${end} / ${page.total}`;
+  byId(`${kind}-page-prev`).disabled = page.page <= 1;
+  byId(`${kind}-page-next`).disabled = page.page * page.pageSize >= page.total;
+}
+
+async function fetchAllLicensePages(path) {
+  const items = [];
+  let page = 1;
+  let total = 0;
+  do {
+    const separator = path.includes("?") ? "&" : "?";
+    const result = await licenseRead(`${path}${separator}page=${page}&page_size=100`, { method: "GET" });
+    const chunk = Array.isArray(result.items) ? result.items : [];
+    items.push(...chunk);
+    total = Number(result.total) || items.length;
+    page += 1;
+    if (!chunk.length) break;
+  } while (items.length < total && page <= 100);
+  return items;
+}
+
 function refreshPackageSelects() {
   for (const [id, prompt] of [["generate-package", "选择套餐"], ["filter-package", "全部套餐"]]) {
     const select = byId(id);
@@ -698,20 +825,21 @@ function refreshPackageSelects() {
 }
 
 async function ensureLicenseReferences() {
-  const [softwareResult, packageResult] = await Promise.all([
-    licenseRead("/admin/api/license/software?page=1&page_size=100", { method: "GET" }),
-    licenseRead("/admin/api/license/packages?page=1&page_size=100", { method: "GET" })
+  const [softwareItems, packageItems] = await Promise.all([
+    fetchAllLicensePages("/admin/api/license/software"),
+    fetchAllLicensePages("/admin/api/license/packages")
   ]);
-  state.licenseSoftware = Array.isArray(softwareResult.items) ? softwareResult.items : [];
-  state.licensePackages = Array.isArray(packageResult.items) ? packageResult.items : [];
+  state.licenseSoftware = softwareItems;
+  state.licensePackages = packageItems;
   refreshPackageSelects();
   clearLicenseError();
 }
 
 function cardFilterPayload() {
+  const page = state.licensePages.cards;
   return {
-    page: 1,
-    page_size: 100,
+    page: page.page,
+    page_size: page.pageSize,
     complete_card: byId("filter-complete-card").value.trim(),
     prefix8: byId("filter-prefix8").value.trim(),
     last4: byId("filter-last4").value.trim(),
@@ -727,12 +855,38 @@ async function loadCardsWorkspace() {
   await loadCards();
 }
 
-async function loadCards() {
-  const result = await licenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(cardFilterPayload()) });
+async function loadCards(button = null, payloadOverride = null) {
+  const payload = payloadOverride || cardFilterPayload();
+  let result;
+  if (button) {
+    const response = await userLicenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload) }, button, "card-action-status", "cards");
+    if (!response) return false;
+    result = response.result;
+  } else {
+    const request = beginLicenseRequest();
+    try {
+      result = await licenseRead("/admin/api/license/cards/search", { method: "POST", body: JSON.stringify(payload), signal: request.controller.signal });
+      if (!licenseRequestStillCurrent(request, "cards")) return false;
+    } catch (error) {
+      if (error.name !== "AbortError") throw error;
+      return false;
+    } finally {
+      endLicenseRequest(request);
+    }
+  }
   state.licenseCards = Array.isArray(result.items) ? result.items : [];
+  const page = state.licensePages.cards;
+  page.page = Number(result.page) || page.page;
+  page.pageSize = Number(result.page_size) || page.pageSize;
+  page.total = Number(result.total) || 0;
+  if (!state.licenseCards.length && page.total > 0 && page.page > 1) {
+    page.page -= 1;
+    return loadCards();
+  }
   state.selectedCardIDs.clear();
-  renderCards(result.total || 0);
+  renderCards(page.total);
   clearLicenseError();
+  return true;
 }
 
 function cardStateLabel(value) {
@@ -761,6 +915,7 @@ function renderCards(total) {
     const row = document.createElement("tr");
     const empty = cell("没有符合条件的卡密"); empty.colSpan = 10; empty.className = "table-empty"; row.append(empty); body.append(row);
     updateCardSelection();
+    updatePagination("cards", 0);
     return;
   }
   for (const item of state.licenseCards) {
@@ -778,7 +933,7 @@ function renderCards(total) {
     const binding = cell(item.binding_short_id || "未绑定"); binding.className = "short-id"; row.append(binding);
     row.append(cell(item.note || "—"));
     const actions = document.createElement("td"); actions.className = "row-actions";
-    actions.append(actionButton("复制", "card-copy", () => copyCard(item)));
+    actions.append(actionButton("复制", "card-copy", (event) => copyCard(item, event.currentTarget)));
     actions.append(actionButton("续期", "card-renew", () => openCardDialog("renew-card-dialog", item)));
     actions.append(actionButton("备注", "card-remark", () => openCardDialog("remark-card-dialog", item)));
     const unbind = actionButton("解绑", "card-unbind", (event) => unbindCard(item, event.currentTarget)); unbind.disabled = !item.binding_short_id; actions.append(unbind);
@@ -786,6 +941,7 @@ function renderCards(total) {
     row.append(actions); body.append(row);
   }
   updateCardSelection();
+  updatePagination("cards", state.licenseCards.length);
 }
 
 function updateCardSelection() {
@@ -798,14 +954,16 @@ async function generateCards(event) {
   event.preventDefault();
   const button = byId("generate-cards-button");
   const note = byId("generate-note").value.trim();
+  const request = beginLicenseRequest();
   const result = await licenseMutation("/admin/api/license/cards/generate", "POST", {
     package_id: byId("generate-package").value,
     duration_days: Number(byId("generate-card-type").value),
     count: Number(byId("generate-count").value),
     default_note: note || null,
     per_card_notes: []
-  }, button, "card-action-status");
-  if (!result) return;
+  }, button, "card-action-status", request);
+  endLicenseRequest(request);
+  if (!result || !licenseRequestStillCurrent(request, "cards")) return;
   const items = Array.isArray(result.items) ? result.items : [];
   state.generatedPlaintexts = items.map((item) => item.plaintext).filter(Boolean);
   byId("generated-card-list").textContent = state.generatedPlaintexts.join("\n");
@@ -818,17 +976,27 @@ async function generateCards(event) {
 
 async function copyGeneratedCards() {
   if (!state.generatedPlaintexts.length) return;
-  await navigator.clipboard.writeText(state.generatedPlaintexts.join("\n"));
-  setActionStatus("card-action-status", "新卡密已复制。");
+  const epoch = state.licenseEpoch;
+  try {
+    await navigator.clipboard.writeText(state.generatedPlaintexts.join("\n"));
+    if (epoch === state.licenseEpoch && state.activeAdminTab === "cards") setActionStatus("card-action-status", "新卡密已复制。");
+  } catch (_) {
+    if (epoch === state.licenseEpoch) setActionStatus("card-action-status", "复制失败，请允许剪贴板权限后重试。", "error");
+  }
 }
 
-async function copyCard(item) {
+async function copyCard(item, button) {
   try {
-    const result = await licenseRead(`/admin/api/license/cards/${item.id}/copy`, { method: "GET" });
-    await navigator.clipboard.writeText(result.plaintext || "");
-    setActionStatus("card-action-status", `已复制 ${item.prefix8}…${item.last4}。`);
+    const response = await userLicenseRead(`/admin/api/license/cards/${item.id}/copy`, { method: "GET" }, button, "card-action-status", "cards");
+    if (!response || !licenseRequestStillCurrent(response.request, "cards")) return;
+    try {
+      await navigator.clipboard.writeText(response.result.plaintext || "");
+      if (licenseRequestStillCurrent(response.request, "cards")) setActionStatus("card-action-status", `已复制 ${item.prefix8}…${item.last4}。`);
+    } catch (_) {
+      if (licenseRequestStillCurrent(response.request, "cards")) setActionStatus("card-action-status", "复制失败，请允许剪贴板权限后重试。", "error");
+    }
   } catch (error) {
-    showLicenseError(error);
+    setActionStatus("card-action-status", messageFor(error, "复制失败，请稍后重试。"), "error");
   }
 }
 
@@ -836,8 +1004,9 @@ async function exportSelectedCards(event) {
   const button = event.currentTarget;
   if (!state.selectedCardIDs.size || button.disabled) return;
   button.disabled = true;
+  const request = beginLicenseRequest();
   try {
-    const response = await fetch("/admin/api/license/cards/export", { method: "POST", credentials: "same-origin", cache: "no-store", headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ card_ids: [...state.selectedCardIDs] }) });
+    const response = await fetch("/admin/api/license/cards/export", { method: "POST", credentials: "same-origin", cache: "no-store", signal: request.controller.signal, headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf, "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ card_ids: [...state.selectedCardIDs] }) });
     if (!response.ok) {
       const body = await readJSON(response); const error = new Error(body.message || "导出失败。"); error.code = body.code || "operation_failed"; error.status = response.status; error.retryAfter = Number(response.headers.get("Retry-After")) || 0;
       if (error.status === 401) await expiredSession();
@@ -846,11 +1015,13 @@ async function exportSelectedCards(event) {
       return;
     }
     const blob = await response.blob();
+    if (!licenseRequestStillCurrent(request, "cards")) return;
     const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = "license-cards.csv"; link.click(); URL.revokeObjectURL(href);
     setActionStatus("card-action-status", `已导出 ${state.selectedCardIDs.size} 张卡密。`);
-  } catch (_) {
-    setActionStatus("card-action-status", "导出失败，请稍后重试。", "error");
+  } catch (error) {
+    if (error.name !== "AbortError" && licenseRequestStillCurrent(request, "cards")) setActionStatus("card-action-status", "导出失败，请稍后重试。", "error");
   } finally {
+    endLicenseRequest(request);
     if (!button.dataset.retryUntil) button.disabled = state.selectedCardIDs.size === 0;
   }
 }
@@ -858,7 +1029,10 @@ async function exportSelectedCards(event) {
 function openCardDialog(dialogID, item) {
   state.activeCardID = item.id;
   if (dialogID === "remark-card-dialog") byId("remark-value").value = item.note || "";
-  if (dialogID === "delete-card-dialog") byId("delete-card-confirm-check").checked = false;
+  if (dialogID === "delete-card-dialog") {
+    byId("delete-card-confirm-check").checked = false;
+    byId("delete-card-target").textContent = `卡密 ${item.prefix8}…${item.last4} · 套餐 ${item.package_name || "—"}`;
+  }
   byId(dialogID).showModal();
 }
 
@@ -876,37 +1050,56 @@ async function unbindCard(item, button) { state.activeCardID = item.id; await su
 
 async function searchCards(event) {
   event.preventDefault();
-  try { await loadCards(); } catch (error) { showLicenseError(error); }
-  finally { byId("filter-complete-card").value = ""; }
+  state.licensePages.cards.page = 1;
+  const payload = cardFilterPayload();
+  byId("filter-complete-card").value = "";
+  await loadCards(byId("search-cards-button"), payload);
 }
-function resetCardFilter() { byId("card-filter-form").reset(); loadCards().catch(showLicenseError); }
+function resetCardFilter() { byId("card-filter-form").reset(); state.licensePages.cards.page = 1; loadCards(byId("reset-card-filter")).catch(showLicenseError); }
 function selectAllCards(event) { state.selectedCardIDs.clear(); for (const checkbox of document.querySelectorAll("#cards-body input[type=checkbox]")) { checkbox.checked = event.currentTarget.checked; if (checkbox.checked) state.selectedCardIDs.add(checkbox.closest("tr").dataset.cardId); } updateCardSelection(); }
 
-async function loadSoftware() {
-  const result = await licenseRead("/admin/api/license/software?page=1&page_size=100", { method: "GET" });
+async function loadSoftware(button = null) {
+  const page = state.licensePages.software;
+  const path = `/admin/api/license/software?page=${page.page}&page_size=${page.pageSize}`;
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "software-action-status", "software") : null;
+  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  if (!result) return false;
   state.licenseSoftware = Array.isArray(result.items) ? result.items : [];
+  page.page = Number(result.page) || page.page;
+  page.pageSize = Number(result.page_size) || page.pageSize;
+  page.total = Number(result.total) || 0;
+  if (!state.licenseSoftware.length && page.total > 0 && page.page > 1) { page.page -= 1; return loadSoftware(); }
   renderSoftware(); clearLicenseError();
+  return true;
 }
 
 function renderSoftware() {
   const body = byId("software-body"); body.replaceChildren();
+  if (!state.licenseSoftware.length) { const row = document.createElement("tr"); const empty = cell("暂无软件"); empty.colSpan = 5; empty.className = "table-empty"; row.append(empty); body.append(row); updatePagination("software", 0); return; }
   for (const item of state.licenseSoftware) {
     const row = document.createElement("tr"); row.dataset.softwareId = item.id;
     const id = cell(item.id); id.className = "short-id"; row.append(id);
     const nameCell = document.createElement("td"); const input = document.createElement("input"); input.value = item.name; input.maxLength = 128; input.setAttribute("aria-label", `软件名称 ${item.name}`); nameCell.append(input); row.append(nameCell);
+    row.append(cell(String(item.package_count || 0)));
     row.append(cell(item.enabled ? "已启用" : "已停用"));
     const actions = document.createElement("td"); actions.className = "row-actions";
     actions.append(actionButton("保存名称", "software-save", (event) => updateSoftwareName(item, input.value, event.currentTarget)));
     actions.append(actionButton(item.enabled ? "停用" : "启用", "software-toggle", (event) => toggleSoftware(item, event.currentTarget), item.enabled));
     row.append(actions); body.append(row);
   }
+  updatePagination("software", state.licenseSoftware.length);
 }
 
 async function createSoftware(event) {
   event.preventDefault(); const button = byId("software-create-button");
   const result = await licenseMutation("/admin/api/license/software", "POST", { name: byId("software-name").value.trim() }, button, "software-action-status");
   if (!result) return;
-  state.licenseSoftware.push(result); byId("software-name").value = ""; renderSoftware(); setActionStatus("software-action-status", "软件已创建。");
+  result.package_count = Number(result.package_count) || 0;
+  state.licensePages.software.total += 1;
+  if (state.licenseSoftware.length < state.licensePages.software.pageSize) state.licenseSoftware.push(result);
+  byId("software-name").value = "";
+  renderSoftware();
+  setActionStatus("software-action-status", "软件已创建。");
 }
 
 async function updateSoftwareName(item, name, button) {
@@ -929,24 +1122,42 @@ function softwareCheckList(selectedIDs, attribute) {
 }
 
 async function loadPackagesWorkspace() {
-  await ensureLicenseReferences(); renderPackageMembers(); renderPackages();
+  state.licenseSoftware = await fetchAllLicensePages("/admin/api/license/software");
+  renderPackageMembers();
+  await loadPackages();
 }
 
 function renderPackageMembers() { const target = byId("package-create-members"); target.replaceChildren(softwareCheckList([], "data-package-create-member")); }
 
 function renderPackages() {
   const body = byId("packages-body"); body.replaceChildren();
+  if (!state.licensePackages.length) { const row = document.createElement("tr"); const empty = cell("暂无套餐"); empty.colSpan = 3; empty.className = "table-empty"; row.append(empty); body.append(row); updatePagination("packages", 0); return; }
   for (const item of state.licensePackages) {
     const row = document.createElement("tr"); row.dataset.packageId = item.id; row.append(cell(item.name));
     const members = document.createElement("td"); const list = softwareCheckList(item.software_ids || [], "data-package-member"); members.append(list); row.append(members);
     const actions = document.createElement("td"); actions.className = "row-actions"; actions.append(actionButton("预览并更新", "package-preview", (event) => previewPackageChange(item, list, event.currentTarget))); row.append(actions); body.append(row);
   }
+  updatePagination("packages", state.licensePackages.length);
+}
+
+async function loadPackages(button = null) {
+  const page = state.licensePages.packages;
+  const path = `/admin/api/license/packages?page=${page.page}&page_size=${page.pageSize}`;
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "package-action-status", "packages") : null;
+  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  if (!result) return false;
+  state.licensePackages = Array.isArray(result.items) ? result.items : [];
+  page.page = Number(result.page) || page.page;
+  page.pageSize = Number(result.page_size) || page.pageSize;
+  page.total = Number(result.total) || 0;
+  if (!state.licensePackages.length && page.total > 0 && page.page > 1) { page.page -= 1; return loadPackages(); }
+  renderPackages(); clearLicenseError(); return true;
 }
 
 async function createPackage(event) {
   event.preventDefault(); const ids = [...document.querySelectorAll("#package-create-members input:checked")].map((item) => item.value); const button = event.submitter || byId("package-create-form").querySelector("button[type=submit]");
   const result = await licenseMutation("/admin/api/license/packages", "POST", { name: byId("package-name").value.trim(), software_ids: ids }, button, "package-action-status");
-  if (!result) return; state.licensePackages.push(result); byId("package-create-form").reset(); renderPackages(); refreshPackageSelects(); setActionStatus("package-action-status", "套餐已创建。");
+  if (!result) return; byId("package-create-form").reset(); setActionStatus("package-action-status", "套餐已创建。"); await loadPackages();
 }
 
 async function previewPackageChange(item, list, button) {
@@ -964,26 +1175,68 @@ async function confirmPackageChange(event) {
   if (!result) return; pending.item.software_ids = pending.ids; state.pendingPackageChange = null; byId("package-impact-dialog").close(); renderPackages();
 }
 
-async function loadDevices() {
-  const result = await licenseRead("/admin/api/license/devices?page=1&page_size=100", { method: "GET" }); renderDevices(Array.isArray(result.items) ? result.items : []); clearLicenseError();
+async function loadDevices(button = null) {
+  const page = state.licensePages.devices;
+  const path = `/admin/api/license/devices?page=${page.page}&page_size=${page.pageSize}`;
+  const response = button ? await userLicenseRead(path, { method: "GET" }, button, "device-action-status", "devices") : null;
+  const result = button ? (response && response.result) : await licenseRead(path, { method: "GET" });
+  if (!result) return false;
+  const items = Array.isArray(result.items) ? result.items : [];
+  page.page = Number(result.page) || page.page;
+  page.pageSize = Number(result.page_size) || page.pageSize;
+  page.total = Number(result.total) || 0;
+  if (!items.length && page.total > 0 && page.page > 1) { page.page -= 1; return loadDevices(); }
+  renderDevices(items); clearLicenseError(); return true;
 }
 
 function renderDevices(items) {
   const body = byId("devices-body"); body.replaceChildren();
-  if (!items.length) { const row = document.createElement("tr"); const empty = cell("暂无设备绑定"); empty.colSpan = 5; empty.className = "table-empty"; row.append(empty); body.append(row); return; }
+  if (!items.length) { const row = document.createElement("tr"); const empty = cell("暂无设备绑定"); empty.colSpan = 5; empty.className = "table-empty"; row.append(empty); body.append(row); updatePagination("devices", 0); return; }
   for (const item of items) {
     const row = document.createElement("tr"); const card = cell(item.card_short_id); card.className = "short-id"; row.append(card); const machine = cell(item.machine_short_id); machine.className = "short-id"; row.append(machine); row.append(cell(formatDate(item.bound_at))); row.append(cell(formatDate(item.last_successful_validation)));
     const action = document.createElement("td"); action.append(actionButton("管理员解绑", "device-unbind", (event) => unbindDevice(item, event.currentTarget), true)); row.append(action); body.append(row);
   }
+  updatePagination("devices", items.length);
 }
 
 async function unbindDevice(item, button) {
-  const card = state.licenseCards.find((candidate) => candidate.id.startsWith(item.card_short_id));
-  if (!card) { showLicenseError({ code: "invalid_request" }); return; }
-  const result = await licenseMutation(`/admin/api/license/devices/${card.id}/unbind`, "POST", {}, button, "device-action-status");
+  const result = await licenseMutation(`/admin/api/license/devices/${item.id}/unbind`, "POST", {}, button, "device-action-status");
   if (result) {
     try { await loadDevices(); } catch (error) { showLicenseError(error); }
   }
+}
+
+async function changeLicensePage(kind, delta, button) {
+  const page = state.licensePages[kind];
+  const previous = page.page;
+  const target = previous + delta;
+  if (target < 1 || (delta > 0 && previous * page.pageSize >= page.total)) return;
+  page.page = target;
+  try {
+    let loaded = false;
+    if (kind === "cards") loaded = await loadCards(button);
+    else if (kind === "software") loaded = await loadSoftware(button);
+    else if (kind === "packages") loaded = await loadPackages(button);
+    else if (kind === "devices") loaded = await loadDevices(button);
+    if (!loaded) page.page = previous;
+  } catch (error) {
+    page.page = previous;
+    if (error.status !== 401) showLicenseError(error);
+  }
+}
+
+function handleAdminTabKey(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...document.querySelectorAll("[data-admin-tab]")];
+  const current = tabs.indexOf(event.currentTarget);
+  let target = current;
+  if (event.key === "ArrowLeft") target = (current - 1 + tabs.length) % tabs.length;
+  if (event.key === "ArrowRight") target = (current + 1) % tabs.length;
+  if (event.key === "Home") target = 0;
+  if (event.key === "End") target = tabs.length - 1;
+  event.preventDefault();
+  tabs[target].focus();
+  selectAdminTab(tabs[target].dataset.adminTab).catch(showLicenseError);
 }
 
 function clearRollbackPassword() {
@@ -998,6 +1251,16 @@ function closeDialog(event) {
   }
 }
 
+function clearLicenseDialogState(event) {
+  if (event.currentTarget.id === "package-impact-dialog") state.pendingPackageChange = null;
+  if (event.currentTarget.id === "remark-card-dialog") byId("remark-value").value = "";
+  if (event.currentTarget.id === "delete-card-dialog") {
+    byId("delete-card-confirm-check").checked = false;
+    byId("delete-card-target").textContent = "卡密 — · 套餐 —";
+  }
+  state.activeCardID = "";
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   byId("login-form").addEventListener("submit", login);
   byId("password-form").addEventListener("submit", changePassword);
@@ -1010,7 +1273,11 @@ document.addEventListener("DOMContentLoaded", () => {
   byId("publish-form").addEventListener("submit", publishCandidate);
   byId("rollback-form").addEventListener("submit", rollback);
   byId("rollback-dialog").addEventListener("close", clearRollbackPassword);
-  for (const tab of document.querySelectorAll("[data-admin-tab]")) tab.addEventListener("click", () => selectAdminTab(tab.dataset.adminTab));
+  for (const id of ["package-impact-dialog", "renew-card-dialog", "remark-card-dialog", "delete-card-dialog"]) byId(id).addEventListener("close", clearLicenseDialogState);
+  for (const tab of document.querySelectorAll("[data-admin-tab]")) {
+    tab.addEventListener("click", () => selectAdminTab(tab.dataset.adminTab));
+    tab.addEventListener("keydown", handleAdminTabKey);
+  }
   byId("license-retry-button").addEventListener("click", () => selectAdminTab(state.activeAdminTab, true));
   byId("card-generate-form").addEventListener("submit", generateCards);
   byId("copy-generated-cards").addEventListener("click", copyGeneratedCards);
@@ -1025,7 +1292,11 @@ document.addEventListener("DOMContentLoaded", () => {
   byId("renew-form").addEventListener("submit", renewCard);
   byId("remark-form").addEventListener("submit", remarkCard);
   byId("delete-card-form").addEventListener("submit", deleteCard);
-  byId("refresh-devices").addEventListener("click", () => loadDevices().catch(showLicenseError));
+  byId("refresh-devices").addEventListener("click", (event) => loadDevices(event.currentTarget).catch(showLicenseError));
+  for (const kind of ["cards", "software", "packages", "devices"]) {
+    byId(`${kind}-page-prev`).addEventListener("click", (event) => changeLicensePage(kind, -1, event.currentTarget));
+    byId(`${kind}-page-next`).addEventListener("click", (event) => changeLicensePage(kind, 1, event.currentTarget));
+  }
   for (const button of document.querySelectorAll("[data-close-dialog]")) button.addEventListener("click", closeDialog);
   initialize();
 });

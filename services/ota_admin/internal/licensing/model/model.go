@@ -87,10 +87,11 @@ type Claims struct {
 // Software is an independently licensed product. Its ID never changes; Enabled
 // is used instead of deleting a product that may be referenced by licenses.
 type Software struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Enabled      bool      `json:"enabled"`
+	PackageCount int       `json:"package_count"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Package groups the products authorized by a card. Membership is deliberately
@@ -269,6 +270,7 @@ type DeviceRecord struct {
 }
 
 type DeviceSummary struct {
+	ID                       string    `json:"id"`
 	CardShortID              string    `json:"card_short_id"`
 	MachineShortID           string    `json:"machine_short_id"`
 	BoundAt                  time.Time `json:"bound_at"`

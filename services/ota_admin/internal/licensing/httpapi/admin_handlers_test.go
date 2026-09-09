@@ -366,6 +366,14 @@ func TestAdminSoftwareLifecycleUsesImmutableIDAndHasNoDelete(t *testing.T) {
 	if _, err := uuid.Parse(software.ID); err != nil || software.Name != "Product A" || !software.Enabled {
 		t.Fatalf("created=%+v err=%v", software, err)
 	}
+	if !strings.Contains(created.Body.String(), `"package_count":0`) {
+		t.Fatalf("created software is missing zero package count: %s", created.Body.String())
+	}
+	for _, name := range []string{"Product Suite One", "Product Suite Two"} {
+		if _, err := h.store.CreatePackage(context.Background(), name, []string{software.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	rename := h.request(http.MethodPatch, "/internal/v1/software/"+software.ID, `{"name":"Product B"}`, true)
 	if rename.Code != http.StatusOK {
 		t.Fatalf("rename status=%d body=%s", rename.Code, rename.Body.String())
@@ -375,7 +383,7 @@ func TestAdminSoftwareLifecycleUsesImmutableIDAndHasNoDelete(t *testing.T) {
 		t.Fatalf("disable status=%d body=%s", disable.Code, disable.Body.String())
 	}
 	list := h.request(http.MethodGet, "/internal/v1/software?page=1&page_size=10", "", false)
-	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), software.ID) || !strings.Contains(list.Body.String(), "Product B") || strings.Contains(list.Body.String(), `"enabled":true`) {
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), software.ID) || !strings.Contains(list.Body.String(), "Product B") || !strings.Contains(list.Body.String(), `"package_count":2`) || strings.Contains(list.Body.String(), `"enabled":true`) {
 		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
 	}
 	remove := h.request(http.MethodDelete, "/internal/v1/software/"+software.ID, "", true)
@@ -718,25 +726,61 @@ func TestAdminDeletePurgesGenerateAndExportPlaintextReplays(t *testing.T) {
 
 func TestAdminDeviceSummariesMaskMachineAndCanUnbind(t *testing.T) {
 	h := newAdminHarness(t, 100)
-	software, _, cardID, plaintext := adminCardFixture(t, h, "device")
-	rawMachine := "raw-machine-identifier-never-return"
-	if _, err := h.service.Activate(context.Background(), "device-activation", plaintext, software, rawMachine); err != nil {
+	ctx := context.Background()
+	software, err := h.store.CreateSoftware(ctx, "Device Product")
+	if err != nil {
 		t.Fatal(err)
 	}
+	pkg, err := h.store.CreatePackage(ctx, "Device Package", []string{software.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		firstPageCardID = "00000000-0000-4000-8000-000000000001"
+		cardIDA         = "aaaaaaaa-0000-4000-8000-000000000001"
+		cardIDB         = "aaaaaaaa-0000-4000-8000-000000000002"
+	)
+	sealed := []model.SealedCard{
+		{ID: firstPageCardID, Ciphertext: []byte("first-page"), FullDigest: strings.Repeat("1", 64), Prefix8: "FIRSTPG1", Last4: "0001"},
+		{ID: cardIDA, Ciphertext: []byte("device-a"), FullDigest: strings.Repeat("2", 64), Prefix8: "DEVICEA1", Last4: "0001"},
+		{ID: cardIDB, Ciphertext: []byte("device-b"), FullDigest: strings.Repeat("3", 64), Prefix8: "DEVICEB1", Last4: "0002"},
+	}
+	if _, err := h.store.GenerateCards(ctx, model.GenerateCardsRequest{PackageID: pkg.ID, Count: len(sealed), BaseDays: 30, CreatedAt: h.clock.Now()}, sealed); err != nil {
+		t.Fatal(err)
+	}
+	for index, fixture := range []struct {
+		cardID, machine string
+	}{
+		{cardIDA, "raw-machine-identifier-never-return-a"},
+		{cardIDB, "raw-machine-identifier-never-return-b"},
+	} {
+		observedAt := h.clock.Now().Add(time.Duration(index) * time.Second)
+		if _, err := h.store.Activate(ctx, model.ActivationMutation{
+			RequestID: uuid.NewString(), CardID: fixture.cardID, SoftwareID: software.ID,
+			MachineHash: fixture.machine, ObservedAt: observedAt, LeaseUntil: observedAt.Add(30 * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cardPage := h.request(http.MethodGet, "/internal/v1/cards?page=1&page_size=1", "", false)
+	if cardPage.Code != http.StatusOK || strings.Contains(cardPage.Body.String(), cardIDA) || strings.Contains(cardPage.Body.String(), cardIDB) {
+		t.Fatalf("first card page unexpectedly contains device cards: status=%d body=%s", cardPage.Code, cardPage.Body.String())
+	}
 	devices := h.request(http.MethodGet, "/internal/v1/devices?page=1&page_size=20", "", false)
-	if devices.Code != http.StatusOK || !strings.Contains(devices.Body.String(), cardID[:8]) || strings.Contains(devices.Body.String(), rawMachine) || strings.Contains(devices.Body.String(), `"machine_hash"`) {
+	if devices.Code != http.StatusOK || !strings.Contains(devices.Body.String(), `"id":"`+cardIDA+`"`) || !strings.Contains(devices.Body.String(), `"id":"`+cardIDB+`"`) || strings.Contains(devices.Body.String(), "raw-machine-identifier-never-return") || strings.Contains(devices.Body.String(), `"machine_hash"`) {
 		t.Fatalf("devices status=%d body=%s", devices.Code, devices.Body.String())
 	}
-	device := h.request(http.MethodGet, "/internal/v1/devices/"+cardID, "", false)
-	if device.Code != http.StatusOK || !strings.Contains(device.Body.String(), cardID[:8]) || strings.Contains(device.Body.String(), rawMachine) {
+	device := h.request(http.MethodGet, "/internal/v1/devices/"+cardIDA, "", false)
+	if device.Code != http.StatusOK || !strings.Contains(device.Body.String(), `"id":"`+cardIDA+`"`) || strings.Contains(device.Body.String(), "raw-machine-identifier-never-return") {
 		t.Fatalf("device read=%d %s", device.Code, device.Body.String())
 	}
-	unbound := h.request(http.MethodPost, "/internal/v1/devices/"+cardID+"/unbind", `{}`, true)
+	unbound := h.request(http.MethodPost, "/internal/v1/devices/"+cardIDA+"/unbind", `{}`, true)
 	if unbound.Code != http.StatusOK {
 		t.Fatalf("device unbind=%d %s", unbound.Code, unbound.Body.String())
 	}
 	after := h.request(http.MethodGet, "/internal/v1/devices?page=1&page_size=20", "", false)
-	if after.Code != http.StatusOK || strings.Contains(after.Body.String(), cardID[:8]) {
+	if after.Code != http.StatusOK || strings.Contains(after.Body.String(), `"id":"`+cardIDA+`"`) || !strings.Contains(after.Body.String(), `"id":"`+cardIDB+`"`) {
 		t.Fatalf("devices after unbind=%d %s", after.Code, after.Body.String())
 	}
 }
