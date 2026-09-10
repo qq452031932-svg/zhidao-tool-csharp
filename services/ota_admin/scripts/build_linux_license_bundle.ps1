@@ -74,6 +74,14 @@ function Save-LicenseBuildEnvironment {
     return $saved
 }
 
+function Set-LicensePreBootstrapEnvironment {
+    [System.Environment]::SetEnvironmentVariable('GOROOT', $null, [System.EnvironmentVariableTarget]::Process)
+    [System.Environment]::SetEnvironmentVariable('GOENV', 'off', [System.EnvironmentVariableTarget]::Process)
+    [System.Environment]::SetEnvironmentVariable('GOTOOLCHAIN', 'local', [System.EnvironmentVariableTarget]::Process)
+    [System.Environment]::SetEnvironmentVariable('GOEXPERIMENT', '', [System.EnvironmentVariableTarget]::Process)
+    [System.Environment]::SetEnvironmentVariable('GOFIPS140', 'off', [System.EnvironmentVariableTarget]::Process)
+}
+
 function Set-SealedLicenseBuildEnvironment {
     $pinnedGoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $GoExe))).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
     $sealed = @{
@@ -618,8 +626,12 @@ Assert-LicenseBundleSourceState -SourceCommit $SourceCommit
 
 $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
 $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
-Set-SealedLicenseBuildEnvironment
+Set-LicensePreBootstrapEnvironment
 Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit
+if (-not (Test-Path -LiteralPath $GoExe -PathType Leaf)) {
+    throw 'Pinned Go executable is missing after bootstrap.'
+}
+Set-SealedLicenseBuildEnvironment
 Assert-PinnedLicenseGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null

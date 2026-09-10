@@ -437,8 +437,10 @@ func TestLicenseBundleBootstrapsPinnedToolchainBeforeSnapshot(t *testing.T) {
 	}
 	requireSubstringsInOrder(t, entryPoint,
 		"Assert-LicenseBundleSourceState -SourceCommit $SourceCommit",
-		"Set-SealedLicenseBuildEnvironment",
+		"Set-LicensePreBootstrapEnvironment",
 		"Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit",
+		"Test-Path -LiteralPath $GoExe -PathType Leaf",
+		"Set-SealedLicenseBuildEnvironment",
 		"Assert-PinnedLicenseGoToolchain",
 		"New-LicenseBundleSourceSnapshot",
 	)
@@ -560,6 +562,144 @@ if (Test-Path -LiteralPath $SnapshotRoot) { throw 'snapshot exists after committ
 	output, runErr = exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", failureHarnessPath, buildScriptPath, fixtureRepository, bootstrapPath, failureCommit, failureMarker, snapshotRoot).CombinedOutput()
 	if runErr != nil {
 		t.Fatalf("license failure bootstrap harness failed: %v; output:\n%s", runErr, output)
+	}
+}
+
+func TestLicenseBundleFreshBootstrapDoesNotInheritFinalGOROOT(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	root := testLocalTempDir(t)
+	fixtureRepository := filepath.Join(root, "repository")
+	bootstrapPath := filepath.Join(fixtureRepository, "services", "ota_admin", "scripts", "bootstrap_go_toolchain.ps1")
+	if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
+		t.Fatalf("create fresh bootstrap fixture directory: %v", err)
+	}
+	bootstrap := `$ErrorActionPreference = 'Stop'
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
+$installRoot = Join-Path $repositoryRoot '.tools\go-1.27.1'
+$stagingRoot = Join-Path $repositoryRoot '.tools\go-1.27.1.extracting'
+if (Test-Path -LiteralPath $stagingRoot) { Remove-Item -LiteralPath $stagingRoot -Recurse -Force }
+$stagedBin = Join-Path $stagingRoot 'go\bin'
+New-Item -ItemType Directory -Path $stagedBin -Force | Out-Null
+$stagedGo = Join-Path $stagedBin 'go.cmd'
+$cmd = '@echo off' + [char]13 + [char]10 +
+  'if "%~1 %~2"=="env GOROOT" (' + [char]13 + [char]10 +
+  '  echo %GOROOT%' + [char]13 + [char]10 +
+  '  exit /b 0' + [char]13 + [char]10 + ')' + [char]13 + [char]10 +
+  'if not "%GOROOT%"=="" if not exist "%GOROOT%" exit /b 2' + [char]13 + [char]10 +
+  'if not "%GOENV%"=="off" exit /b 3' + [char]13 + [char]10 +
+  'if not "%GOTOOLCHAIN%"=="local" exit /b 4' + [char]13 + [char]10 +
+  'if not "%GOEXPERIMENT%"=="" exit /b 5' + [char]13 + [char]10 +
+  'if not "%GOFIPS140%"=="off" exit /b 6' + [char]13 + [char]10 +
+  'if "%~1"=="version" echo go version go1.27.1 windows/amd64' + [char]13 + [char]10 +
+  'exit /b 0' + [char]13 + [char]10
+[IO.File]::WriteAllText($stagedGo, $cmd, [Text.ASCIIEncoding]::new())
+& $stagedGo version
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (Test-Path -LiteralPath $installRoot) { Remove-Item -LiteralPath $installRoot -Recurse -Force }
+Move-Item -LiteralPath $stagingRoot -Destination $installRoot
+exit 0
+`
+	if err := os.WriteFile(bootstrapPath, []byte(bootstrap), 0o600); err != nil {
+		t.Fatalf("write fresh bootstrap fixture: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "compat@example.invalid"},
+		{"config", "user.name", "Compatibility Test"},
+		{"add", "services/ota_admin/scripts/bootstrap_go_toolchain.ps1"},
+		{"commit", "-m", "fresh staged toolchain"},
+	} {
+		command := exec.Command("git", append([]string{"-C", fixtureRepository}, args...)...)
+		if output, commandErr := command.CombinedOutput(); commandErr != nil {
+			t.Fatalf("git %v failed: %v; output:\n%s", args, commandErr, output)
+		}
+	}
+	commitOutput, err := exec.Command("git", "-C", fixtureRepository, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve fresh bootstrap commit: %v", err)
+	}
+	commit := strings.TrimSpace(string(commitOutput))
+
+	harnessPath := filepath.Join(root, "fresh-bootstrap-contract.ps1")
+	finalGo := filepath.Join(fixtureRepository, ".tools", "go-1.27.1", "go", "bin", "go.cmd")
+	harness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $BootstrapPath, [string] $SourceCommit, [string] $FinalGo)
+$ErrorActionPreference = 'Stop'
+$FixtureSourceCommit = $SourceCommit
+. $BuildScript -FunctionsOnly
+$RepositoryRoot = [IO.Path]::GetFullPath($FixtureRepository)
+$LicenseBootstrapScript = [IO.Path]::GetFullPath($BootstrapPath)
+$GoExe = [IO.Path]::GetFullPath($FinalGo)
+$external = @{
+  GOROOT='C:\attacker\compatible-go';
+  GOENV='C:\attacker\go.env';
+  GOTOOLCHAIN='go1.99.0';
+  GOEXPERIMENT='attacker';
+  GOFIPS140='latest'
+}
+foreach ($name in $external.Keys) { [Environment]::SetEnvironmentVariable($name, $external[$name], 'Process') }
+
+function Invoke-TestBootstrap([string] $Commit) {
+  $saved = Save-LicenseBuildEnvironment
+  try {
+    if (Get-Command Set-LicensePreBootstrapEnvironment -ErrorAction SilentlyContinue) {
+      Set-LicensePreBootstrapEnvironment
+      if ($null -ne [Environment]::GetEnvironmentVariable('GOROOT', 'Process')) { throw 'pre-bootstrap GOROOT was not removed' }
+    }
+    else {
+      Set-SealedLicenseBuildEnvironment
+    }
+    Invoke-LicenseToolchainBootstrap -SourceCommit $Commit
+    if (-not (Test-Path -LiteralPath $GoExe -PathType Leaf)) { throw 'fresh bootstrap did not install final go executable' }
+    Set-SealedLicenseBuildEnvironment
+    $expectedGoRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $GoExe))).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    Assert-LicenseGoRoot -GoExecutable $GoExe -ExpectedGoRoot $expectedGoRoot
+  }
+  finally {
+    Restore-LicenseBuildEnvironment -SavedEnvironment $saved
+  }
+  foreach ($name in $external.Keys) {
+    if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $external[$name]) { throw "caller $name was not restored" }
+  }
+}
+
+if (Test-Path -LiteralPath (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $GoExe)))) { throw 'fresh final toolchain unexpectedly exists before bootstrap' }
+Invoke-TestBootstrap -Commit $FixtureSourceCommit
+Invoke-TestBootstrap -Commit $FixtureSourceCommit
+
+$failureMarker = Join-Path $FixtureRepository 'failure.marker'
+$failureScript = '[IO.File]::WriteAllText(''' + $failureMarker.Replace("'", "''") + ''',''ran''); exit 23' + [char]10
+[IO.File]::WriteAllText($BootstrapPath, $failureScript, [Text.UTF8Encoding]::new($false))
+& git -C $FixtureRepository add services/ota_admin/scripts/bootstrap_go_toolchain.ps1
+if ($LASTEXITCODE -ne 0) { throw 'could not stage failure bootstrap' }
+& git -C $FixtureRepository commit -m 'failing bootstrap'
+if ($LASTEXITCODE -ne 0) { throw 'could not commit failure bootstrap' }
+$failureCommit = (& git -C $FixtureRepository rev-parse HEAD) -join ''
+$saved = Save-LicenseBuildEnvironment
+try {
+  Set-LicensePreBootstrapEnvironment
+  try { Invoke-LicenseToolchainBootstrap -SourceCommit $failureCommit; throw 'nonzero bootstrap unexpectedly succeeded' }
+  catch {
+    if ($_.Exception.Message -eq 'nonzero bootstrap unexpectedly succeeded') { throw }
+    if ($_.Exception.Message -notlike '*Pinned Go bootstrap failed*') { throw }
+  }
+}
+finally { Restore-LicenseBuildEnvironment -SavedEnvironment $saved }
+if (-not (Test-Path -LiteralPath $failureMarker -PathType Leaf)) { throw 'nonzero bootstrap was not executed' }
+foreach ($name in $external.Keys) {
+  if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $external[$name]) { throw "caller $name was not restored after bootstrap failure" }
+}
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write fresh bootstrap harness: %v", err)
+	}
+	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, fixtureRepository, bootstrapPath, commit, finalGo).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("fresh license toolchain bootstrap harness failed: %v; output:\n%s", runErr, output)
 	}
 }
 
