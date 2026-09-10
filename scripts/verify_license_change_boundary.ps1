@@ -117,11 +117,22 @@ try {
 
     $missingNew = New-Object Collections.Generic.List[string]
     foreach ($path in $requiredNew[$CommitGroup]) {
-        git cat-file -e ("HEAD:{0}" -f $path) 2>$null
-        if ($LASTEXITCODE -eq 0) { continue }
         $entry = @(git ls-files --stage -- $path)
         if ($LASTEXITCODE -ne 0) { throw "Unable to inspect staged entry '$path'." }
-        if ($entry.Count -eq 0 -or $stagedPaths -notcontains $path) { $missingNew.Add($path) }
+        if ($entry.Count -eq 0) {
+            $missingNew.Add($path)
+            continue
+        }
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            git cat-file -e ("HEAD:{0}" -f $path) 2>$null
+            $headContainsPath = $LASTEXITCODE -eq 0
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if (-not $headContainsPath -and $stagedPaths -notcontains $path) { $missingNew.Add($path) }
     }
     if ($missingNew.Count -gt 0) {
         throw "Required new paths are absent from the index: $($missingNew -join ', ')"
