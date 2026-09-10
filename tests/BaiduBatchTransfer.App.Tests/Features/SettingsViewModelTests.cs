@@ -1,7 +1,9 @@
 using BaiduBatchTransfer.App.Features.Settings;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using System.Collections.Concurrent;
+using System.Xml.Linq;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -11,6 +13,62 @@ public sealed class SettingsViewModelTests
         "下载完成后软件将安全关闭、安装更新并自动重启，是否继续？";
     private const string RestartConfirmation =
         "软件将安全关闭、安装已下载的更新并自动重启，是否继续？";
+
+    [Fact]
+    public void AuthorizationSummaryExposesOnlyReadOnlyDisplayValues()
+    {
+        var license = new LicenseSettingsSnapshot(
+            "专业版",
+            new DateTimeOffset(2027, 3, 4, 5, 6, 0, TimeSpan.FromHours(8)),
+            isAuthorized: true,
+            isMachineBound: true);
+        using var viewModel = Create(
+            new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)),
+            licenseSettings: license);
+
+        Assert.Equal("专业版", viewModel.LicensePackageName);
+        Assert.Equal("2027-03-04 05:06 +08:00", viewModel.LicenseExpiresAt);
+        Assert.Equal("已授权", viewModel.LicenseAuthorizationStatus);
+        Assert.Equal("已绑定当前电脑", viewModel.LicenseMachineBindingStatus);
+    }
+
+    [Fact]
+    public void MissingActivationDoesNotDisableLocalSettingsOrUpdateAccess()
+    {
+        using var viewModel = Create(new FakeUpdateService(Snapshot(ApplicationUpdateStatus.Idle)));
+
+        Assert.Equal("未激活", viewModel.LicensePackageName);
+        Assert.Equal("—", viewModel.LicenseExpiresAt);
+        Assert.Equal("未授权", viewModel.LicenseAuthorizationStatus);
+        Assert.Equal("未绑定", viewModel.LicenseMachineBindingStatus);
+        Assert.True(viewModel.CheckForUpdatesCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public void SettingsViewRendersAuthorizationSummaryAsTextOnlyWithoutCommercialPrompts()
+    {
+        var path = FindRepositoryFile(
+            "src",
+            "BaiduBatchTransfer.App",
+            "Features",
+            "Settings",
+            "SettingsView.xaml");
+        var document = XDocument.Load(path);
+        var markup = document.ToString(SaveOptions.DisableFormatting);
+
+        Assert.Contains("Text=\"套餐\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding LicensePackageName}\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"到期时间\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding LicenseExpiresAt}\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"授权状态\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding LicenseAuthorizationStatus}\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"机器绑定状态\"", markup, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding LicenseMachineBindingStatus}\"", markup, StringComparison.Ordinal);
+        Assert.DoesNotContain("续费", markup, StringComparison.Ordinal);
+        Assert.DoesNotContain("支付", markup, StringComparison.Ordinal);
+        Assert.DoesNotContain("购买", markup, StringComparison.Ordinal);
+        Assert.DoesNotContain("到期提醒", markup, StringComparison.Ordinal);
+    }
 
     [Fact]
     public void InitialSnapshotPopulatesTheUpdateCard()
@@ -484,13 +542,28 @@ public sealed class SettingsViewModelTests
         IDialogService? dialog = null,
         IApplicationCloseRequester? closeRequester = null,
         SynchronizationContext? synchronizationContext = null,
-        ApplicationBuildInfo? buildInfo = null) =>
+        ApplicationBuildInfo? buildInfo = null,
+        LicenseSettingsSnapshot? licenseSettings = null) =>
         new(
             service,
             dialog ?? new FakeDialog(true),
             closeRequester ?? new FakeCloseRequester(),
             synchronizationContext ?? new ImmediateSynchronizationContext(),
-            buildInfo ?? ApplicationBuildInfo.Current);
+            buildInfo ?? ApplicationBuildInfo.Current,
+            licenseSettings);
+
+    private static string FindRepositoryFile(params string[] segments)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine([directory.FullName, .. segments]);
+            if (File.Exists(candidate)) return candidate;
+            directory = directory.Parent;
+        }
+
+        throw new FileNotFoundException($"Could not locate {Path.Combine(segments)}.");
+    }
 
     private static ApplicationUpdateSnapshot Snapshot(
         ApplicationUpdateStatus status,

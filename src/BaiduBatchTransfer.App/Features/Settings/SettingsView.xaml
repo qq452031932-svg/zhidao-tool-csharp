@@ -11,6 +11,7 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
             <StackPanel Grid.Row="0">
@@ -27,7 +28,33 @@
                            Foreground="{StaticResource BrandBrush}" />
             </StackPanel>
 
-            <Grid Grid.Row="1" Margin="0,22,0,0">
+            <Border Grid.Row="1"
+                    Margin="0,22,0,0"
+                    Padding="14"
+                    Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="套餐" Foreground="{StaticResource MutedBrush}" />
+                    <TextBlock Grid.Row="0" Grid.Column="1" Margin="20,0,0,0" Text="{Binding LicensePackageName}" />
+                    <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,8,0,0" Text="到期时间" Foreground="{StaticResource MutedBrush}" />
+                    <TextBlock Grid.Row="1" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseExpiresAt}" />
+                    <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,8,0,0" Text="授权状态" Foreground="{StaticResource MutedBrush}" />
+                    <TextBlock Grid.Row="2" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseAuthorizationStatus}" />
+                    <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,8,0,0" Text="机器绑定状态" Foreground="{StaticResource MutedBrush}" />
+                    <TextBlock Grid.Row="3" Grid.Column="1" Margin="20,8,0,0" Text="{Binding LicenseMachineBindingStatus}" />
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="2" Margin="0,22,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
@@ -51,7 +78,7 @@
                 <TextBlock Grid.Row="2" Grid.Column="1" Margin="20,10,0,0" Text="{Binding LatestVersion, TargetNullValue=--}" />
             </Grid>
 
-            <Border Grid.Row="2"
+            <Border Grid.Row="3"
                     Margin="0,20,0,0"
                     Padding="14"
                     Background="#FFF8E1"
@@ -70,7 +97,7 @@
                 </StackPanel>
             </Border>
 
-            <StackPanel Grid.Row="3" Margin="0,18,0,0">
+            <StackPanel Grid.Row="4" Margin="0,18,0,0">
                 <ProgressBar Height="8"
                              Minimum="0"
                              Maximum="100"
@@ -83,7 +110,7 @@
                            Text="{Binding DownloadProgress, StringFormat={}{0}%}" />
             </StackPanel>
 
-            <StackPanel Grid.Row="4"
+            <StackPanel Grid.Row="5"
                         Margin="0,20,0,0"
                         HorizontalAlignment="Right"
                         Orientation="Horizontal">

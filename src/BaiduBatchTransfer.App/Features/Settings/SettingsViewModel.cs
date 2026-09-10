@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
+using BaiduBatchTransfer.App.Features.Licensing;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -52,7 +53,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         IDialogService dialogService,
         IApplicationCloseRequester closeRequester,
         SynchronizationContext synchronizationContext,
-        ApplicationBuildInfo? buildInfo = null)
+        ApplicationBuildInfo? buildInfo = null,
+        LicenseSettingsSnapshot? licenseSettings = null)
     {
         this.updateService = updateService ?? throw new ArgumentNullException(nameof(updateService));
         this.dialogService = dialogService ?? throw new ArgumentNullException(nameof(dialogService));
@@ -62,6 +64,13 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         BuildLabel = (buildInfo ?? ApplicationBuildInfo.Current).IsOtaAcceptanceBuild
             ? "OTA 本地验收版"
             : string.Empty;
+        var license = licenseSettings ?? LicenseSettingsSnapshot.NotActivated;
+        LicensePackageName = string.IsNullOrWhiteSpace(license.PackageName)
+            ? "未激活"
+            : license.PackageName;
+        LicenseExpiresAt = license.ExpiryDisplay;
+        LicenseAuthorizationStatus = license.IsAuthorized ? "已授权" : "未授权";
+        LicenseMachineBindingStatus = license.IsMachineBound ? "已绑定当前电脑" : "未绑定";
 
         CheckForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, CanCheckForUpdates);
         UpdateAndRestartCommand = new AsyncRelayCommand(UpdateAndRestartAsync, CanUpdateAndRestart);
@@ -76,6 +85,14 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public IAsyncRelayCommand UpdateAndRestartCommand { get; }
 
     public string BuildLabel { get; }
+
+    public string LicensePackageName { get; }
+
+    public string LicenseExpiresAt { get; }
+
+    public string LicenseAuthorizationStatus { get; }
+
+    public string LicenseMachineBindingStatus { get; }
 
     public string CurrentVersion
     {
