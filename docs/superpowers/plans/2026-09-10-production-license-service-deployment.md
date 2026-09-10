@@ -29,6 +29,8 @@
 
 ### Task 1: Produce clean, self-contained Task 12/13 commits
 
+> **Approved recovery path (2026-09-10):** The original hunk-extraction attempt reached the safety stop below because the reviewed Task 12 wiring depended on unrelated, uncommitted transfer-target, refresh, export, and clipboard work. The user approved preserving that dirty worktree unchanged and creating `codex/license-production-deploy` from the hardened boundary HEAD instead. In the new clean worktree, reimplement the same Task 12/13 licensing behavior test-first against the committed API surface, with only the allowlisted paths and without importing those unrelated dependencies. Run the same clean-snapshot verification and review gates before proceeding to Task 2.
+
 **Files:**
 - Create/Commit: `docs/superpowers/plans/2026-09-10-production-license-service-deployment.md`
 - Create: `scripts/verify_license_change_boundary.ps1`
