@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"sync/atomic"
 
@@ -76,6 +77,10 @@ func (c *metricsConnector) Driver() driver.Driver { return c.driver }
 type metricsConn struct {
 	driver.Conn
 	counters *metricCounters
+}
+
+func (c *metricsConn) Close() error {
+	return classifySQLiteError(c.counters, c.Conn.Close())
 }
 
 func (c *metricsConn) Prepare(query string) (driver.Stmt, error) {
@@ -168,6 +173,10 @@ type metricsStmt struct {
 	counters *metricCounters
 }
 
+func (s *metricsStmt) Close() error {
+	return classifySQLiteError(s.counters, s.Stmt.Close())
+}
+
 func (s *metricsStmt) Exec(args []driver.Value) (driver.Result, error) {
 	result, err := s.Stmt.Exec(args)
 	return metricsResult{Result: result, counters: s.counters}, classifySQLiteError(s.counters, err)
@@ -213,8 +222,61 @@ type metricsRows struct {
 	counters *metricCounters
 }
 
+func (r *metricsRows) Close() error {
+	return classifySQLiteError(r.counters, r.Rows.Close())
+}
+
 func (r *metricsRows) Next(values []driver.Value) error {
 	return classifySQLiteError(r.counters, r.Rows.Next(values))
+}
+
+func (r *metricsRows) ColumnTypeDatabaseTypeName(index int) string {
+	if rows, ok := r.Rows.(driver.RowsColumnTypeDatabaseTypeName); ok {
+		return rows.ColumnTypeDatabaseTypeName(index)
+	}
+	return ""
+}
+
+func (r *metricsRows) ColumnTypeLength(index int) (int64, bool) {
+	if rows, ok := r.Rows.(driver.RowsColumnTypeLength); ok {
+		return rows.ColumnTypeLength(index)
+	}
+	return 0, false
+}
+
+func (r *metricsRows) ColumnTypeNullable(index int) (bool, bool) {
+	if rows, ok := r.Rows.(driver.RowsColumnTypeNullable); ok {
+		return rows.ColumnTypeNullable(index)
+	}
+	return false, false
+}
+
+func (r *metricsRows) ColumnTypePrecisionScale(index int) (int64, int64, bool) {
+	if rows, ok := r.Rows.(driver.RowsColumnTypePrecisionScale); ok {
+		return rows.ColumnTypePrecisionScale(index)
+	}
+	return 0, 0, false
+}
+
+func (r *metricsRows) ColumnTypeScanType(index int) reflect.Type {
+	if rows, ok := r.Rows.(driver.RowsColumnTypeScanType); ok {
+		return rows.ColumnTypeScanType(index)
+	}
+	return reflect.TypeFor[any]()
+}
+
+func (r *metricsRows) HasNextResultSet() bool {
+	if rows, ok := r.Rows.(driver.RowsNextResultSet); ok {
+		return rows.HasNextResultSet()
+	}
+	return false
+}
+
+func (r *metricsRows) NextResultSet() error {
+	if rows, ok := r.Rows.(driver.RowsNextResultSet); ok {
+		return classifySQLiteError(r.counters, rows.NextResultSet())
+	}
+	return io.EOF
 }
 
 type metricsResult struct {

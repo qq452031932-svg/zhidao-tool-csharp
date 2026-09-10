@@ -131,7 +131,7 @@ func TestServeWiresLoadCredentialHealthAndMetricsWithoutLoggingSecrets(t *testin
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Header.Set("Authorization", "Bearer "+authwire.EncodeInternalToken(loadSecret))
+		request.Header.Set("X-SuperPan-Load-Test", authwire.EncodeInternalToken(loadSecret))
 		response, err = client.Do(request)
 		if err == nil {
 			break

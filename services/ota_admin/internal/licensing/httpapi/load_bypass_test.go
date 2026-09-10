@@ -45,31 +45,55 @@ func TestLoadCredentialBypassesOnlyPublicRateLimitFromLoopback(t *testing.T) {
 	body := func(id, nonceValue string) string {
 		return `{"protocol_version":1,"activation_request_id":"` + id + `","card":"AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA","software_id":"software","machine_hash":"machine","timestamp":"` + clock.Now().Format(time.RFC3339) + `","nonce":"` + nonceValue + `"}`
 	}
-	do := func(remote, authorization, payload string) *httptest.ResponseRecorder {
+	do := func(remote, payload string, configure func(*http.Request)) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/license-api/v1/activate", strings.NewReader(payload))
 		req.RemoteAddr = remote
 		req.Header.Set("Content-Type", "application/json")
-		if authorization != "" {
-			req.Header.Set("Authorization", authorization)
+		if configure != nil {
+			configure(req)
 		}
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		return rec
 	}
-	if got := do("127.0.0.1:1", "", body("one", nonce(201))); got.Code != http.StatusOK {
+	if got := do("127.0.0.1:1", body("one", nonce(201)), nil); got.Code != http.StatusOK {
 		t.Fatalf("first = %d %s", got.Code, got.Body.String())
 	}
-	token := "Bearer " + authwire.EncodeInternalToken(secret)
-	if got := do("127.0.0.1:2", token, body("two", nonce(202))); got.Code != http.StatusOK {
-		t.Fatalf("authorized bypass = %d %s", got.Code, got.Body.String())
+	token := authwire.EncodeInternalToken(secret)
+	if got := do("127.0.0.1:2", body("authorization", nonce(202)), func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}); got.Code != http.StatusTooManyRequests {
+		t.Fatalf("Authorization unexpectedly bypassed = %d %s", got.Code, got.Body.String())
 	}
-	if got := do("127.0.0.1:3", token+"x", body("three", nonce(203))); got.Code != http.StatusTooManyRequests {
-		t.Fatalf("wrong token = %d", got.Code)
+	if got := do("127.0.0.1:2", body("two", nonce(203)), func(r *http.Request) {
+		r.Header.Set("X-SuperPan-Load-Test", token)
+	}); got.Code != http.StatusOK {
+		t.Fatalf("custom header bypass = %d %s", got.Code, got.Body.String())
 	}
-	if got := do("203.0.113.8:4", "", body("remote-first", nonce(204))); got.Code != http.StatusOK {
+	invalidHeaders := []struct {
+		name      string
+		configure func(*http.Request)
+	}{
+		{name: "missing", configure: nil},
+		{name: "repeated", configure: func(r *http.Request) {
+			r.Header.Add("X-SuperPan-Load-Test", token)
+			r.Header.Add("X-SuperPan-Load-Test", token)
+		}},
+		{name: "comma merged", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token+","+token) }},
+		{name: "padded noncanonical", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token+"=") }},
+		{name: "whitespace noncanonical", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", " "+token) }},
+	}
+	for index, tt := range invalidHeaders {
+		if got := do("127.0.0.1:3", body("invalid-"+tt.name, nonce(204+index)), tt.configure); got.Code != http.StatusTooManyRequests {
+			t.Fatalf("%s header = %d", tt.name, got.Code)
+		}
+	}
+	if got := do("203.0.113.8:4", body("remote-first", nonce(220)), nil); got.Code != http.StatusOK {
 		t.Fatalf("first remote = %d", got.Code)
 	}
-	if got := do("203.0.113.8:4", token, body("four", nonce(205))); got.Code != http.StatusTooManyRequests {
+	if got := do("203.0.113.8:4", body("four", nonce(221)), func(r *http.Request) {
+		r.Header.Set("X-SuperPan-Load-Test", token)
+	}); got.Code != http.StatusTooManyRequests {
 		t.Fatalf("remote token = %d", got.Code)
 	}
 	if calls := service.calls.Load(); calls != 3 {
@@ -80,10 +104,10 @@ func TestLoadCredentialBypassesOnlyPublicRateLimitFromLoopback(t *testing.T) {
 func TestLoadBypassStillEnforcesBodyReplayAndSignatureControls(t *testing.T) {
 	replay := &trackingReplayStore{}
 	handler, service, clock, secret := loadTestRouter(t, replay)
-	token := "Bearer " + authwire.EncodeInternalToken(secret)
+	token := authwire.EncodeInternalToken(secret)
 	req := httptest.NewRequest(http.MethodPost, "/license-api/v1/activate", strings.NewReader(`{"protocol_version":1}`))
 	req.RemoteAddr = "127.0.0.1:1"
-	req.Header.Set("Authorization", token)
+	req.Header.Set("X-SuperPan-Load-Test", token)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -98,7 +122,7 @@ func TestLoadBypassStillEnforcesBodyReplayAndSignatureControls(t *testing.T) {
 	valid := `{"protocol_version":1,"activation_request_id":"valid","card":"AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA","software_id":"software","machine_hash":"machine","timestamp":"` + clock.Now().Format(time.RFC3339) + `","nonce":"` + nonce(210) + `"}`
 	req = httptest.NewRequest(http.MethodPost, "/license-api/v1/activate", strings.NewReader(valid))
 	req.RemoteAddr = "127.0.0.1:1"
-	req.Header.Set("Authorization", token)
+	req.Header.Set("X-SuperPan-Load-Test", token)
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

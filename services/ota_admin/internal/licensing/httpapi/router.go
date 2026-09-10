@@ -69,6 +69,8 @@ type StoreMetrics interface {
 	Metrics() licensestore.Metrics
 }
 
+const loadTestHeader = "X-SuperPan-Load-Test"
+
 type Options struct {
 	Service                    LicenseService
 	ReplayStore                ReplayStore
@@ -216,19 +218,15 @@ func (a *api) markLoadBypass(next http.Handler) http.Handler {
 }
 
 func (a *api) validLoadCredential(r *http.Request) bool {
-	values := r.Header.Values("Authorization")
+	values := r.Header.Values(loadTestHeader)
 	candidate := ""
 	if len(values) > 0 {
 		candidate = values[0]
 	}
-	expected := make([]byte, 0, len("Bearer ")+len(a.options.LoadTestSecret))
-	expected = append(expected, "Bearer "...)
-	expected = append(expected, a.options.LoadTestSecret...)
 	candidateHash := sha256.Sum256([]byte(candidate))
-	expectedHash := sha256.Sum256(expected)
+	expectedHash := sha256.Sum256(a.options.LoadTestSecret)
 	match := subtle.ConstantTimeCompare(candidateHash[:], expectedHash[:]) == 1
-	valid := len(values) == 1 && len(candidate) == len(expected) && !strings.Contains(candidate, ",") && match
-	clear(expected)
+	valid := len(values) == 1 && len(candidate) == len(a.options.LoadTestSecret) && !strings.Contains(candidate, ",") && match
 	return valid
 }
 

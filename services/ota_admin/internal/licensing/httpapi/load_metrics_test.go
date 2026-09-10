@@ -23,19 +23,29 @@ func (m fixedStoreMetrics) Metrics() licensestore.Metrics { return m.snapshot }
 func TestLoadMetricsExistOnlyInLoadModeAndRequireLoopbackCredential(t *testing.T) {
 	secret := bytes.Repeat([]byte{0x5a}, 32)
 	loadHandler := newRouterWithMetrics(t, secret, fixedStoreMetrics{snapshot: licensestore.Metrics{Busy: 7, Locked: 3}})
-	token := "Bearer " + authwire.EncodeInternalToken(secret)
+	token := authwire.EncodeInternalToken(secret)
 	for _, tt := range []struct {
-		name, remote, token string
-		want                int
+		name, remote string
+		configure    func(*http.Request)
+		want         int
 	}{
-		{"ok", "127.0.0.1:1", token, http.StatusOK},
-		{"wrong token", "127.0.0.1:1", token + "x", http.StatusUnauthorized},
-		{"forwarded loopback", "203.0.113.9:1", token, http.StatusNotFound},
+		{name: "ok", remote: "127.0.0.1:1", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token) }, want: http.StatusOK},
+		{name: "authorization ignored", remote: "127.0.0.1:1", configure: func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) }, want: http.StatusUnauthorized},
+		{name: "missing", remote: "127.0.0.1:1", want: http.StatusUnauthorized},
+		{name: "repeated", remote: "127.0.0.1:1", configure: func(r *http.Request) {
+			r.Header.Add("X-SuperPan-Load-Test", token)
+			r.Header.Add("X-SuperPan-Load-Test", token)
+		}, want: http.StatusUnauthorized},
+		{name: "comma merged", remote: "127.0.0.1:1", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token+","+token) }, want: http.StatusUnauthorized},
+		{name: "noncanonical", remote: "127.0.0.1:1", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token+"=") }, want: http.StatusUnauthorized},
+		{name: "forwarded loopback", remote: "203.0.113.9:1", configure: func(r *http.Request) { r.Header.Set("X-SuperPan-Load-Test", token) }, want: http.StatusNotFound},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/internal/load-metrics", nil)
 			req.RemoteAddr = tt.remote
-			req.Header.Set("Authorization", tt.token)
+			if tt.configure != nil {
+				tt.configure(req)
+			}
 			req.Header.Set("X-Forwarded-For", "127.0.0.1")
 			rec := httptest.NewRecorder()
 			loadHandler.ServeHTTP(rec, req)
