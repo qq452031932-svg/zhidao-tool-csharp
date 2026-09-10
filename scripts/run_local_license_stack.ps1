@@ -3,15 +3,18 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$RuntimeRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.tmp\license-local'))
+$RuntimeParent = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.tmp'))
+$RuntimeRoot = [IO.Path]::GetFullPath((Join-Path $RuntimeParent 'license-local'))
 $ExpectedRuntimeRoot = [IO.Path]::GetFullPath((Join-Path $RepositoryRoot '.tmp\license-local'))
 $ManifestPath = Join-Path $RuntimeRoot 'pid-manifest.json'
 $ReadyPath = Join-Path $RuntimeRoot 'ready.json'
 $ClientPath = Join-Path $RuntimeRoot 'client.json'
 $LicenseConfigPath = Join-Path $RuntimeRoot 'license-service.json'
 $OwnerPath = Join-Path $RuntimeRoot 'instance-token'
-$LicenseExecutablePath = Join-Path (Split-Path -Parent $RuntimeRoot) 'license-service-local.exe'
-$AdminExecutablePath = Join-Path (Split-Path -Parent $RuntimeRoot) 'license-admin-local.exe'
+$StartupEvidencePath = Join-Path $RuntimeRoot 'startup-cleanup.json'
+$CleanupJournalPath = Join-Path $RuntimeParent 'license-local-cleanup.json'
+$LicenseExecutablePath = Join-Path $RuntimeParent 'license-service-local.exe'
+$AdminExecutablePath = Join-Path $RuntimeParent 'license-admin-local.exe'
 $GoExecutable = Join-Path $RepositoryRoot '.tools\go-1.27.1\go\bin\go.exe'
 $AdminAddress = '127.0.0.1:19090'
 $LicenseAddress = '127.0.0.1:19091'
@@ -21,6 +24,8 @@ $completed = $false
 $ownsRuntime = $false
 $startupMutex = $null
 $startupMutexAcquired = $false
+$LicenseExecutableHash = $null
+$AdminExecutableHash = $null
 $tokenBytes = New-Object byte[] 16
 $tokenGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $tokenGenerator.GetBytes($tokenBytes) }
@@ -70,6 +75,51 @@ function Get-LocalFileSha256 {
     finally { $hashAlgorithm.Dispose(); $stream.Dispose() }
 }
 
+function Get-LocalFileInventory {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    return @(
+        Get-ChildItem -LiteralPath $Root -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
+            $full = [IO.Path]::GetFullPath($_.FullName)
+            if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Startup cleanup inventory escaped its private root.' }
+            [ordered]@{ relative_path = $full.Substring($rootFull.Length).Replace('\', '/'); sha256 = Get-LocalFileSha256 -LiteralPath $full }
+        }
+    )
+}
+
+function Invoke-RecoverableStartupCleanup {
+    Confirm-ExactRuntimeRoot
+    if (-not $ownsRuntime -or -not (Test-Path -LiteralPath $RuntimeRoot -PathType Container)) { throw 'Startup cleanup preserved artifacts because private runtime ownership was not established.' }
+    $ownerToken = if (Test-Path -LiteralPath $OwnerPath -PathType Leaf) { (Get-Content -LiteralPath $OwnerPath -Raw -Encoding ascii).Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($ownerToken)) {
+        Write-TextFileAtomic -LiteralPath $OwnerPath -Text ($InstanceToken + "`n")
+        $ownerToken = $InstanceToken
+    }
+    if (-not [string]::Equals($ownerToken, $InstanceToken, [StringComparison]::Ordinal)) { throw 'Startup cleanup refused a runtime with changed ownership.' }
+    if ([string]::IsNullOrWhiteSpace($LicenseExecutableHash) -or [string]::IsNullOrWhiteSpace($AdminExecutableHash) -or
+        -not (Test-Path -LiteralPath $LicenseExecutablePath -PathType Leaf) -or -not (Test-Path -LiteralPath $AdminExecutablePath -PathType Leaf) -or
+        -not [string]::Equals((Get-LocalFileSha256 -LiteralPath $LicenseExecutablePath), $LicenseExecutableHash, [StringComparison]::Ordinal) -or
+        -not [string]::Equals((Get-LocalFileSha256 -LiteralPath $AdminExecutablePath), $AdminExecutableHash, [StringComparison]::Ordinal)) { throw 'Startup cleanup preserved a missing or replaced executable.' }
+    $startupEvidence = [ordered]@{ schema_version = 1; instance_token = $InstanceToken; runtime_root = $RuntimeRoot }
+    Write-TextFileAtomic -LiteralPath $StartupEvidencePath -Text (($startupEvidence | ConvertTo-Json) + "`n")
+    $executables = @(
+        [ordered]@{ role = 'license-service'; source_path = [IO.Path]::GetFullPath($LicenseExecutablePath); staged_name = ('.cleanup-' + $InstanceToken + '-license-service.exe'); sha256 = $LicenseExecutableHash },
+        [ordered]@{ role = 'license-admin-local'; source_path = [IO.Path]::GetFullPath($AdminExecutablePath); staged_name = ('.cleanup-' + $InstanceToken + '-license-admin-local.exe'); sha256 = $AdminExecutableHash }
+    )
+    $journal = [ordered]@{
+        schema_version = 1
+        instance_token = $InstanceToken
+        runtime_root = $RuntimeRoot
+        quarantine_root = [IO.Path]::GetFullPath((Join-Path $RuntimeParent ('license-local-quarantine-' + $InstanceToken)))
+        evidence_name = 'startup-cleanup.json'
+        executables = $executables
+        runtime_files = Get-LocalFileInventory -Root $RuntimeRoot
+    }
+    Write-TextFileAtomic -LiteralPath $CleanupJournalPath -Text (($journal | ConvertTo-Json -Depth 5) + "`n")
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'stop_local_license_stack.ps1') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Recoverable startup cleanup did not complete; its journal was preserved for retry.' }
+}
+
 function Get-ExactChildIdentity {
     param([Parameter(Mandatory = $true)][Diagnostics.Process]$Process, [Parameter(Mandatory = $true)][string]$ExpectedExecutable, [Parameter(Mandatory = $true)][string[]]$RequiredCommandFragments)
     $Process.Refresh()
@@ -103,6 +153,7 @@ try {
     $startupMutex = New-Object Threading.Mutex($false, 'Local\SuperPanLicenseLocalAcceptance')
     $startupMutexAcquired = $startupMutex.WaitOne(0)
     if (-not $startupMutexAcquired) { throw 'Another local acceptance stack is starting.' }
+    if (Test-Path -LiteralPath $CleanupJournalPath) { throw 'An interrupted local cleanup must be recovered with the stop script before starting.' }
     foreach ($path in @($RuntimeRoot, $LicenseExecutablePath, $AdminExecutablePath)) {
         if (Test-Path -LiteralPath $path) { throw 'Local acceptance artifacts already exist; no data was overwritten.' }
     }
@@ -114,6 +165,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Building the license service failed.' }
         & $GoExecutable build -tags license_local_acceptance -o $AdminExecutablePath ./cmd/license-admin-local
         if ($LASTEXITCODE -ne 0) { throw 'Building the tagged local admin failed.' }
+        $LicenseExecutableHash = Get-LocalFileSha256 -LiteralPath $LicenseExecutablePath
+        $AdminExecutableHash = Get-LocalFileSha256 -LiteralPath $AdminExecutablePath
     }
     finally { Pop-Location }
 
@@ -189,9 +242,7 @@ finally {
                 catch { $cleanupFailures.Add($_.Exception.Message) }
             }
             if ($cleanupFailures.Count -eq 0) {
-                Confirm-ExactRuntimeRoot
-                if ($ownsRuntime -and (Test-Path -LiteralPath $RuntimeRoot)) { Remove-LocalArtifactWithRetry -LiteralPath $RuntimeRoot -Recurse }
-                foreach ($path in @($AdminExecutablePath, $LicenseExecutablePath)) { if (Test-Path -LiteralPath $path) { Remove-LocalArtifactWithRetry -LiteralPath $path } }
+                Invoke-RecoverableStartupCleanup
             }
             if ($cleanupFailures.Count -gt 0) { throw ('Startup cleanup failed safely: ' + ($cleanupFailures -join '; ')) }
         }

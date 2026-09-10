@@ -44,7 +44,8 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("$manifestCommandLine.IndexOf([string]$ProcessRecord.instance_token", stop, StringComparison.Ordinal);
         Assert.Contains("Stop-Process -InputObject $process", stop, StringComparison.Ordinal);
         Assert.Contains("$null = $process.Handle", stop, StringComparison.Ordinal);
-        Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $RuntimeRoot -Recurse", stop, StringComparison.Ordinal);
+        Assert.Contains("Move-LocalDirectoryAtomicallyWithRetry -Source $RuntimeRoot -Destination $quarantineRoot", stop, StringComparison.Ordinal);
+        Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $quarantineRoot -Recurse", stop, StringComparison.Ordinal);
         Assert.DoesNotContain("Stop-Process -Id", stop, StringComparison.Ordinal);
         Assert.DoesNotContain("Get-Process *", stop, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Stop-Process -Name", stop, StringComparison.OrdinalIgnoreCase);
@@ -80,6 +81,9 @@ public sealed class LicenseLocalStackScriptTests
     [InlineData(".tmp/license-local/ready.json")]
     [InlineData(".tmp/license-local/pid-manifest.json")]
     [InlineData(".tmp/license-local/instance-token")]
+    [InlineData(".tmp/license-local/startup-cleanup.json")]
+    [InlineData(".tmp/license-local-cleanup.json")]
+    [InlineData(".tmp/license-local-quarantine-00000000000000000000000000000000/card-encryption.key")]
     [InlineData(".tmp/license-admin-local.exe")]
     [InlineData(".tmp/license-service-local.exe")]
     public void GitIgnoresLocalSecretsDatabasesAndGeneratedExecutable(string repositoryRelativePath)
@@ -126,8 +130,8 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("$null = $licenseProcess.Handle", start, StringComparison.Ordinal);
         Assert.Contains("$null = $adminProcess.Handle", start, StringComparison.Ordinal);
         Assert.Contains("Write-TextFileAtomic -LiteralPath $ManifestPath", start, StringComparison.Ordinal);
-        Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $RuntimeRoot -Recurse", start, StringComparison.Ordinal);
-        Assert.Contains("$AdminExecutablePath, $LicenseExecutablePath", start, StringComparison.Ordinal);
+        Assert.Contains("startup-cleanup.json", start, StringComparison.Ordinal);
+        Assert.Contains("stop_local_license_stack.ps1", start, StringComparison.Ordinal);
         Assert.Contains("$OwnerPath = Join-Path $RuntimeRoot 'instance-token'", start, StringComparison.Ordinal);
         Assert.True(start.LastIndexOf("Get-CimInstance", StringComparison.Ordinal) <
                     start.LastIndexOf("Stop-Process -InputObject $process", StringComparison.Ordinal));
@@ -149,8 +153,29 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("license-admin-local", start, StringComparison.Ordinal);
         Assert.Contains("foreach ($processRecord in $manifest.processes)", stop, StringComparison.Ordinal);
         Assert.Contains("finally", stop, StringComparison.OrdinalIgnoreCase);
-        Assert.True(stop.LastIndexOf("finally", StringComparison.OrdinalIgnoreCase) <
-                    stop.LastIndexOf("Remove-LocalArtifactWithRetry", StringComparison.Ordinal));
+        var childStopTry = stop.IndexOf("$stopFailures =", StringComparison.Ordinal);
+        Assert.True(childStopTry >= 0);
+        Assert.True(stop.IndexOf("finally", childStopTry, StringComparison.OrdinalIgnoreCase) > childStopTry);
+    }
+
+    [Fact]
+    public void CleanupUsesSerializedRecoverableAtomicQuarantine()
+    {
+        var start = File.ReadAllText(ScriptPath("run_local_license_stack.ps1"));
+        var stop = File.ReadAllText(ScriptPath("stop_local_license_stack.ps1"));
+
+        foreach (var script in new[] { start, stop })
+        {
+            Assert.Contains("license-local-cleanup.json", script, StringComparison.Ordinal);
+            Assert.Contains("license-local-quarantine-", script, StringComparison.Ordinal);
+            Assert.Contains("[IO.File]::Move", script, StringComparison.Ordinal);
+            Assert.Contains("Get-LocalFileSha256", script, StringComparison.Ordinal);
+        }
+        Assert.Contains("SuperPanLicenseLocalAcceptanceStop", stop, StringComparison.Ordinal);
+        Assert.Contains("WaitOne", stop, StringComparison.Ordinal);
+        Assert.Contains("Invoke-TestHook", stop, StringComparison.Ordinal);
+        Assert.Contains("runtime_files", stop, StringComparison.Ordinal);
+        Assert.Contains("Assert-QuarantineInventory", stop, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -426,7 +451,230 @@ public sealed class LicenseLocalStackScriptTests
         AssertRuntimeAbsent();
     }
 
-    private static async Task<(int ExitCode, string Output, string Error)> RunScriptAsync(string name)
+    [Fact]
+    public async Task StopPreservesExecutableReplacedAfterQuarantineVerificationAndCanRetry()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        byte[]? executable = null;
+        string? stagedPath = null;
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var stopTask = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "after-executable-verify-license-admin-local"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "after-executable-verify-license-admin-local.ready"));
+            var journal = ReadCleanupJournal();
+            var entry = journal["executables"]!.AsArray().Select(x => x!.AsObject())
+                .Single(x => x["role"]!.GetValue<string>() == "license-admin-local");
+            stagedPath = Path.Combine(journal["quarantine_root"]!.GetValue<string>(), entry["staged_name"]!.GetValue<string>());
+            executable = File.ReadAllBytes(stagedPath);
+            File.WriteAllText(stagedPath, "replacement sentinel");
+            File.WriteAllText(Path.Combine(hookRoot, "after-executable-verify-license-admin-local.release"), "release");
+
+            var rejected = await stopTask;
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.Equal("replacement sentinel", File.ReadAllText(stagedPath));
+            Assert.True(File.Exists(CleanupJournalPath()));
+
+            File.WriteAllBytes(stagedPath, executable);
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1"));
+        }
+        finally
+        {
+            if (stagedPath is not null && executable is not null && File.Exists(stagedPath))
+                File.WriteAllBytes(stagedPath, executable);
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task StopPreservesChangedRuntimeArtifactAfterVerificationAndCanRetry()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        byte[]? clientSettings = null;
+        string? stagedClientPath = null;
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var stopTask = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "before-quarantine-delete"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "before-quarantine-delete.ready"));
+            var journal = ReadCleanupJournal();
+            stagedClientPath = Path.Combine(journal["quarantine_root"]!.GetValue<string>(), "client.json");
+            clientSettings = File.ReadAllBytes(stagedClientPath);
+            File.WriteAllText(stagedClientPath, "replacement sentinel");
+            File.WriteAllText(Path.Combine(hookRoot, "before-quarantine-delete.release"), "release");
+
+            var rejected = await stopTask;
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.Equal("replacement sentinel", File.ReadAllText(stagedClientPath));
+            Assert.True(File.Exists(CleanupJournalPath()));
+
+            File.WriteAllBytes(stagedClientPath, clientSettings);
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1"));
+        }
+        finally
+        {
+            if (stagedClientPath is not null && clientSettings is not null && File.Exists(stagedClientPath))
+                File.WriteAllBytes(stagedClientPath, clientSettings);
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task PartialQuarantineDeletionRetainsJournalForIdempotentRetry()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var interrupted = await RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_FAIL_DELETE_ROLE"] = "license-admin-local"
+            });
+            Assert.NotEqual(0, interrupted.ExitCode);
+            var journal = ReadCleanupJournal();
+            Assert.True(Directory.Exists(journal["quarantine_root"]!.GetValue<string>()));
+            Assert.False(Directory.Exists(RuntimeRoot()));
+
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1"));
+        }
+        finally
+        {
+            await RecoverCleanupAsync();
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task ConcurrentStopsAreSerializedAndOnlyOneOwnsCleanup()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var first = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "before-stage"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "before-stage.ready"));
+            var second = RunScriptAsync("stop_local_license_stack.ps1");
+            await Task.Delay(250);
+            Assert.False(second.IsCompleted);
+            File.WriteAllText(Path.Combine(hookRoot, "before-stage.release"), "release");
+
+            var firstResult = await first;
+            var secondResult = await second;
+            AssertScriptSucceeded(firstResult);
+            Assert.NotEqual(0, secondResult.ExitCode);
+        }
+        finally
+        {
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task StopRetriesTransientRuntimeRenameWhilePreservingTheJournal()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var stopTask = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "before-stage"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "before-stage.ready"));
+            using (var locked = new FileStream(Path.Combine(RuntimeRoot(), "client.json"), FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                File.WriteAllText(Path.Combine(hookRoot, "before-stage.release"), "release");
+                await Task.Delay(500);
+            }
+
+            AssertScriptSucceeded(await stopTask);
+        }
+        finally
+        {
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task StackStartsAndStopsThroughCheckoutPathContainingSpaces()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var junction = Path.Combine(RepositoryRoot(), ".tmp", "license local checkout link");
+        Directory.CreateDirectory(Path.GetDirectoryName(junction)!);
+        CreateJunction(junction, RepositoryRoot());
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1", checkoutRoot: junction));
+            var manifest = JsonNode.Parse(File.ReadAllText(Path.Combine(RuntimeRoot(), "pid-manifest.json")))!.AsObject();
+            Assert.Contains("license local checkout link", manifest["runtime_root"]!.GetValue<string>(), StringComparison.Ordinal);
+            Assert.Equal(2, manifest["processes"]!.AsArray().Count);
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1", checkoutRoot: junction));
+        }
+        finally
+        {
+            if (File.Exists(CleanupJournalPath()) || File.Exists(Path.Combine(RuntimeRoot(), "pid-manifest.json")))
+                AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1", checkoutRoot: junction));
+            if (Directory.Exists(junction))
+                Directory.Delete(junction);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    private static async Task<(int ExitCode, string Output, string Error)> RunScriptAsync(
+        string name,
+        IReadOnlyDictionary<string, string>? environment = null,
+        string? checkoutRoot = null)
     {
         using var process = new Process
         {
@@ -444,11 +692,14 @@ public sealed class LicenseLocalStackScriptTests
         process.StartInfo.ArgumentList.Add("-ExecutionPolicy");
         process.StartInfo.ArgumentList.Add("Bypass");
         process.StartInfo.ArgumentList.Add("-File");
-        process.StartInfo.ArgumentList.Add(ScriptPath(name));
+        process.StartInfo.ArgumentList.Add(checkoutRoot is null ? ScriptPath(name) : Path.Combine(checkoutRoot, "scripts", name));
+        if (environment is not null)
+            foreach (var entry in environment)
+                process.StartInfo.Environment[entry.Key] = entry.Value;
         Assert.True(process.Start());
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
         try
         {
             await process.WaitForExitAsync(timeout.Token);
@@ -470,11 +721,62 @@ public sealed class LicenseLocalStackScriptTests
         Assert.False(Directory.Exists(RuntimeRoot()));
         Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-admin-local.exe")));
         Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-service-local.exe")));
+        Assert.False(File.Exists(CleanupJournalPath()));
+        Assert.Empty(Directory.Exists(Path.Combine(RepositoryRoot(), ".tmp"))
+            ? Directory.GetDirectories(Path.Combine(RepositoryRoot(), ".tmp"), "license-local-quarantine-*")
+            : Array.Empty<string>());
+    }
+
+    private static JsonObject ReadCleanupJournal() =>
+        JsonNode.Parse(File.ReadAllText(CleanupJournalPath()))!.AsObject();
+
+    private static string CleanupJournalPath() => Path.Combine(RepositoryRoot(), ".tmp", "license-local-cleanup.json");
+
+    private static string TestHookRoot() => Path.Combine(RepositoryRoot(), ".tmp", "license-local-test-hooks");
+
+    private static async Task WaitForFileAsync(string path)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        while (!File.Exists(path))
+            await Task.Delay(20, timeout.Token);
+    }
+
+    private static void ReleaseAllHooks(string hookRoot)
+    {
+        if (!Directory.Exists(hookRoot))
+            return;
+        foreach (var ready in Directory.GetFiles(hookRoot, "*.ready"))
+            File.WriteAllText(Path.ChangeExtension(ready, ".release"), "release");
+    }
+
+    private static async Task RecoverCleanupAsync()
+    {
+        if (File.Exists(CleanupJournalPath()) || File.Exists(Path.Combine(RuntimeRoot(), "pid-manifest.json")))
+        {
+            var recovery = await RunScriptAsync("stop_local_license_stack.ps1");
+            AssertScriptSucceeded(recovery);
+        }
     }
 
     private static void AssertScriptSucceeded((int ExitCode, string Output, string Error) result)
     {
         Assert.True(result.ExitCode == 0, $"Script failed with exit code {result.ExitCode}. Output: {result.Output} Error: {result.Error}");
+    }
+
+    private static void CreateJunction(string junction, string target)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            ArgumentList = { "/d", "/c", "mklink", "/J", junction, target }
+        });
+        Assert.NotNull(process);
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, $"Could not create checkout-path junction: {process.StandardError.ReadToEnd()}");
     }
 
     private static string RuntimeRoot() => Path.Combine(RepositoryRoot(), ".tmp", "license-local");
