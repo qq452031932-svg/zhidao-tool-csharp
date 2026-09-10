@@ -20,8 +20,8 @@ public sealed class MachineFingerprintProviderTests
     }
 
     [Theory]
-    [InlineData("machine-guid", null)]
-    [InlineData(null, "bios-uuid")]
+    [InlineData("a0b1c2d3-e4f5-4678-9abc-def012345678", null)]
+    [InlineData(null, "00112233-4455-6677-8899-aabbccddeeff")]
     public void MachineFingerprintUsesOnlyTheAvailableStableField(string? machineGuid, string? biosUuid)
     {
         var provider = new MachineFingerprintProvider(new StubSource(machineGuid, biosUuid));
@@ -65,17 +65,27 @@ public sealed class MachineFingerprintProviderTests
     [Fact]
     public void MachineFingerprintFallsBackToMachineGuidWhenBiosUuidIsASentinel()
     {
-        var withSentinel = new MachineFingerprintProvider(new StubSource("valid-machine-guid", "00000000-0000-0000-0000-000000000000"));
-        var withoutBios = new MachineFingerprintProvider(new StubSource("valid-machine-guid", null));
+        const string validMachineGuid = "a0b1c2d3-e4f5-4678-9abc-def012345678";
+        var withSentinel = new MachineFingerprintProvider(new StubSource(validMachineGuid, "00000000-0000-0000-0000-000000000000"));
+        var withoutBios = new MachineFingerprintProvider(new StubSource(validMachineGuid, null));
 
         Assert.Equal(withoutBios.GetMachineHash(), withSentinel.GetMachineHash());
+    }
+
+    [Theory]
+    [InlineData("machine-guid-not-a-guid", null)]
+    [InlineData(null, "bios-uuid-not-a-guid")]
+    public void MachineFingerprintRejectsNonGuidSourceValues(string? machineGuid, string? biosUuid)
+    {
+        Assert.Throws<MachineFingerprintException>(() =>
+            new MachineFingerprintProvider(new StubSource(machineGuid, biosUuid)).GetMachineHash());
     }
 
     [Fact]
     public void MachineFingerprintDiagnosticsNeverExposeRawIdentifiersOrHash()
     {
-        const string machineGuid = "machine-guid-secret";
-        const string biosUuid = "bios-uuid-secret";
+        const string machineGuid = "a0b1c2d3-e4f5-4678-9abc-def012345678";
+        const string biosUuid = "00112233-4455-6677-8899-aabbccddeeff";
         var provider = new MachineFingerprintProvider(new StubSource(machineGuid, biosUuid));
         var hash = provider.GetMachineHash();
 

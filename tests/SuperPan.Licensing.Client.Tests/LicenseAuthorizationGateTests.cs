@@ -1,3 +1,7 @@
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using SuperPan.Licensing.Client;
 
 namespace SuperPan.Licensing.Client.Tests;
@@ -42,6 +46,20 @@ public sealed class LicenseAuthorizationGateTests
         Assert.True(result.IsAuthorized);
         Assert.False(result.UsedCachedLease);
         Assert.Equal("card-id", Assert.Single(Assert.Single(store.Snapshot.Credentials).Leases).CardId);
+    }
+
+    [Fact]
+    public async Task AuthorizationGateRejectsOnlineAllowWithoutOriginalSignedEnvelope()
+    {
+        var response = Authorized(includeEnvelope: false);
+        Assert.Null(response.SignedEnvelope);
+        var store = new MemoryStore([Credential()]);
+        var gate = CreateGate(new FakeService(response), store);
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.Empty(Assert.Single(store.Snapshot.Credentials).Leases);
     }
 
     [Fact]
@@ -131,7 +149,7 @@ public sealed class LicenseAuthorizationGateTests
     [Fact]
     public async Task AuthorizationGateRejectsExpiredLeaseDuringTemporaryFailure()
     {
-        var expired = Lease() with { LeaseUntil = Now };
+        var expired = Lease(leaseUntil: Now);
         var gate = CreateGate(new FakeService(new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null)), StoreWithLease(expired));
 
         var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
@@ -153,6 +171,101 @@ public sealed class LicenseAuthorizationGateTests
             Assert.False(result.IsAuthorized);
             Assert.False(result.UsedCachedLease);
         }
+    }
+
+    [Fact]
+    public async Task AuthorizationGateSkipsExpiredFirstCardAndUsesValidSecondCardLease()
+    {
+        var expired = Lease(leaseUntil: Now);
+        var store = new MemoryStore([
+            CredentialWithCard("CARD-FIRST", expired),
+            CredentialWithCard("CARD-SECOND", Lease()),
+        ]);
+        var service = new FakeService(new LicenseApiResult(
+            LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null));
+        var gate = CreateGate(service, store);
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.True(result.IsAuthorized);
+        Assert.True(result.UsedCachedLease);
+        Assert.Equal("CARD-SECOND", Assert.Single(service.Calls).Card);
+    }
+
+    [Fact]
+    public async Task AuthorizationGateContinuesAfterFirstCardNotApplicableAndAuthorizesSecondCard()
+    {
+        var store = new MemoryStore([
+            CredentialWithCard("CARD-FIRST", Lease()),
+            CredentialWithCard("CARD-SECOND"),
+        ]);
+        var service = new FakeService(Rejected(LicenseCodes.AppNotAllowed), Authorized());
+        var gate = CreateGate(service, store);
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Share, CancellationToken.None);
+
+        Assert.True(result.IsAuthorized);
+        Assert.Equal(["CARD-FIRST", "CARD-SECOND"], service.Calls.Select(call => call.Card).ToArray());
+        Assert.Empty(store.Snapshot.Credentials.Single(item => item.Card == "CARD-FIRST").Leases);
+        Assert.Single(store.Snapshot.Credentials.Single(item => item.Card == "CARD-SECOND").Leases);
+    }
+
+    [Fact]
+    public async Task AuthorizationGateRejectsDpapiRoundTripMetadataTamperingDuringOfflineFallback()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        using var service = new RealVerifierService(
+            signer,
+            new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null));
+        var directory = Path.Combine(Path.GetTempPath(), $"superpan-gate-{Guid.NewGuid():N}");
+        var path = Path.Combine(directory, "licenses.dat");
+        var protector = new RoundTripProtector();
+        var store = new DpapiLicenseStore(path, protector);
+        try
+        {
+            var credential = await store.GetOrCreateCredentialAsync("CARD-SECRET", CancellationToken.None);
+            var signedEnvelope = SignCachedEnvelope(signer, "software-a", "machine-secret");
+            await store.SaveLeaseAsync(credential.Card, credential.ActivationRequestId,
+                LeaseFromEnvelope("software-a", "machine-secret", signedEnvelope), CancellationToken.None);
+
+            var plaintext = protector.Unprotect(await File.ReadAllBytesAsync(path));
+            var serialized = Encoding.UTF8.GetString(plaintext)
+                .Replace("\"software_id\":\"software-a\"", "\"software_id\":\"software-b\"", StringComparison.Ordinal)
+                .Replace(Now.AddMinutes(20).ToString("O", CultureInfo.InvariantCulture), Now.AddDays(2).ToString("O", CultureInfo.InvariantCulture), StringComparison.Ordinal);
+            await File.WriteAllBytesAsync(path, protector.Protect(Encoding.UTF8.GetBytes(serialized)));
+
+            var gate = new LicenseAuthorizationGate(
+                "software-b", service, store, new FakeFingerprintProvider("machine-secret"), new FixedTimeProvider(Now));
+            var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+            Assert.False(result.IsAuthorized);
+            Assert.False(result.UsedCachedLease);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task AuthorizationGateRejectsTamperedSignedEnvelopeDuringOfflineFallback()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        using var service = new RealVerifierService(
+            signer,
+            new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null));
+        var validEnvelope = SignCachedEnvelope(signer, "software-a", "machine-secret");
+        var tamperedEnvelope = validEnvelope.ToArray();
+        tamperedEnvelope[^3] ^= 1;
+        var store = new MemoryStore([CredentialWithCard(
+            "CARD-SECRET", LeaseFromEnvelope("software-a", "machine-secret", tamperedEnvelope))]);
+        var gate = new LicenseAuthorizationGate(
+            "software-a", service, store, new FakeFingerprintProvider("machine-secret"), new FixedTimeProvider(Now));
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.False(result.UsedCachedLease);
     }
 
     [Fact]
@@ -201,13 +314,31 @@ public sealed class LicenseAuthorizationGateTests
     private static StoredLicenseCredential Credential(params StoredLicenseLease[] leases) =>
         new("CARD-SECRET", "11111111-1111-4111-8111-111111111111", leases);
 
-    private static StoredLicenseLease Lease(string softwareId = "software-a", string signedPayload = "serialized-lease-secret") =>
-        new("card-id", softwareId, "machine-secret", "package", Now.AddDays(1), Now.AddMinutes(20), signedPayload);
+    private static StoredLicenseCredential CredentialWithCard(string card, params StoredLicenseLease[] leases) =>
+        new(card, Guid.NewGuid().ToString("D"), leases);
 
-    private static LicenseApiResult Authorized() => new(
-        LicenseApiResultKind.Authorized,
-        LicenseCodes.Ok,
-        new LicenseClaims(LicenseProtocol.Version, "request", Now, LicenseDecisions.Allow, LicenseCodes.Ok, "card-id", "software-a", "machine-secret", "package", Now.AddDays(1), Now.AddMinutes(20)));
+    private static StoredLicenseLease Lease(
+        string softwareId = "software-a",
+        string? signedPayload = null,
+        DateTimeOffset? leaseUntil = null)
+    {
+        var effectiveLeaseUntil = leaseUntil ?? Now.AddMinutes(20);
+        var envelope = signedPayload ?? Convert.ToBase64String(CreateTestEnvelope(
+            softwareId, "machine-secret", effectiveLeaseUntil, Now.AddDays(1)));
+        return new StoredLicenseLease(
+            "card-id", softwareId, "machine-secret", "package", Now.AddDays(1), effectiveLeaseUntil, envelope);
+    }
+
+    private static LicenseApiResult Authorized(bool includeEnvelope = true)
+    {
+        var claims = new LicenseClaims(LicenseProtocol.Version, "request", Now, LicenseDecisions.Allow, LicenseCodes.Ok,
+            "card-id", "software-a", "machine-secret", "package", Now.AddDays(1), Now.AddMinutes(20));
+        return new LicenseApiResult(
+            LicenseApiResultKind.Authorized,
+            LicenseCodes.Ok,
+            claims,
+            includeEnvelope ? CreateTestEnvelope("software-a", "machine-secret", Now.AddMinutes(20), Now.AddDays(1)) : null);
+    }
 
     private static LicenseApiResult Rejected(string code) => new(
         LicenseApiResultKind.Rejected,
@@ -236,12 +367,84 @@ public sealed class LicenseAuthorizationGateTests
         public Task<LicenseApiResult> ValidateAsync(string requestId, string card, string machineHash, CancellationToken cancellationToken) =>
             Reply(false, requestId, card, machineHash);
 
+        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash)
+        {
+            var fields = Encoding.UTF8.GetString(signedEnvelope).Split('|');
+            if (fields.Length != 6 || fields[0] != "test-envelope" || fields[1] != expectedSoftwareId || fields[2] != expectedMachineHash)
+                throw new LicenseEnvelopeVerificationException("Invalid test envelope.");
+            var leaseUntil = DateTimeOffset.ParseExact(fields[3], "O", CultureInfo.InvariantCulture);
+            var expiresAt = DateTimeOffset.ParseExact(fields[4], "O", CultureInfo.InvariantCulture);
+            if (fields[5] != "allow" || leaseUntil <= Now || expiresAt <= Now)
+                throw new LicenseEnvelopeVerificationException("Invalid test lease.");
+            return new LicenseClaims(LicenseProtocol.Version, "cached-request", Now, LicenseDecisions.Allow, LicenseCodes.Ok,
+                "card-id", fields[1], fields[2], "package", expiresAt, leaseUntil);
+        }
+
         private Task<LicenseApiResult> Reply(bool activate, string requestId, string card, string machineHash)
         {
             Calls.Add((activate, requestId, card, machineHash));
             var response = responses.Count == 0 ? new LicenseApiResult(LicenseApiResultKind.InvalidResponse, null, null) : responses.Dequeue();
             return response is Exception exception ? Task.FromException<LicenseApiResult>(exception) : Task.FromResult((LicenseApiResult)response);
         }
+    }
+
+    private static byte[] CreateTestEnvelope(
+        string softwareId,
+        string machineHash,
+        DateTimeOffset leaseUntil,
+        DateTimeOffset expiresAt) =>
+        Encoding.UTF8.GetBytes(string.Join('|',
+            "test-envelope",
+            softwareId,
+            machineHash,
+            leaseUntil.ToString("O", CultureInfo.InvariantCulture),
+            expiresAt.ToString("O", CultureInfo.InvariantCulture),
+            "allow"));
+
+    private static byte[] SignCachedEnvelope(ECDsa signer, string softwareId, string machineHash)
+    {
+        var claims = SignedLicenseEnvelopeVerifierTests.CreateClaims("cached-request") with
+        {
+            ServerTime = Now.AddMinutes(-10),
+            SoftwareId = softwareId,
+            MachineHash = machineHash,
+            LeaseUntil = Now.AddMinutes(20),
+        };
+        return SignedLicenseEnvelopeVerifierTests.Sign(claims, signer);
+    }
+
+    private static StoredLicenseLease LeaseFromEnvelope(
+        string softwareId,
+        string machineHash,
+        byte[] signedEnvelope) =>
+        new("card-id", softwareId, machineHash, "package", Now.AddDays(1), Now.AddMinutes(20),
+            Convert.ToBase64String(signedEnvelope));
+
+    private sealed class RealVerifierService : ILicenseServiceClient, IDisposable
+    {
+        private readonly SignedLicenseEnvelopeVerifier verifier;
+        private readonly LicenseApiResult response;
+
+        public RealVerifierService(ECDsa signer, LicenseApiResult response)
+        {
+            verifier = new SignedLicenseEnvelopeVerifier(
+                SignedLicenseEnvelopeVerifierTests.CreateOptions(signer), new FixedTimeProvider(Now));
+            this.response = response;
+        }
+
+        public Task<LicenseApiResult> ActivateAsync(string activationRequestId, string card, string machineHash, CancellationToken cancellationToken) =>
+            Task.FromResult(response);
+        public Task<LicenseApiResult> ValidateAsync(string requestId, string card, string machineHash, CancellationToken cancellationToken) =>
+            Task.FromResult(response);
+        public LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash) =>
+            verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash);
+        public void Dispose() => verifier.Dispose();
+    }
+
+    private sealed class RoundTripProtector : ILicenseStateProtector
+    {
+        public byte[] Protect(byte[] plaintext) => plaintext.ToArray();
+        public byte[] Unprotect(byte[] ciphertext) => ciphertext.ToArray();
     }
 
     private sealed class MemoryStore(IEnumerable<StoredLicenseCredential>? credentials = null) : ILicenseStateStore

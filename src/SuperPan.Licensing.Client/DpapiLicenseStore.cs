@@ -1,11 +1,8 @@
-using System.ComponentModel;
-using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Win32.SafeHandles;
 
 namespace SuperPan.Licensing.Client;
 
@@ -81,19 +78,13 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
     };
     private readonly string path;
     private readonly ILicenseStateProtector protector;
-    private readonly string mutexName;
+    private readonly string lockPath;
 
     public DpapiLicenseStore(string? path = null, ILicenseStateProtector? protector = null)
     {
         this.path = Path.GetFullPath(path ?? GetDefaultPath());
         this.protector = protector ?? DpapiCurrentUserProtector.Instance;
-        var userScope = OperatingSystem.IsWindows()
-            ? WindowsIdentity.GetCurrent().User?.Value ?? throw new LicenseStoreException()
-            : Environment.UserName;
-        var scopeHash = Convert.ToHexString(SHA256.HashData(
-            Encoding.UTF8.GetBytes(userScope + "\n" + this.path.ToUpperInvariant()))).ToLowerInvariant();
-        mutexName = (OperatingSystem.IsWindows() ? @"Global\" : string.Empty) +
-            "SuperPan.Licensing.State.v1." + scopeHash;
+        lockPath = this.path + ".lock";
     }
 
     public static string GetDefaultPath() => Path.Combine(
@@ -190,33 +181,13 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
 
     public override string ToString() => nameof(DpapiLicenseStore);
 
-    private Task<T> ExecuteAsync<T>(Func<T> action, CancellationToken cancellationToken)
+    private async Task<T> ExecuteAsync<T>(Func<T> action, CancellationToken cancellationToken)
     {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var mutex = CreateStoreMutex();
-            var acquired = false;
-            try
-            {
-                while (!acquired)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    try
-                    {
-                        acquired = mutex.WaitOne(TimeSpan.FromMilliseconds(100));
-                    }
-                    catch (AbandonedMutexException)
-                    {
-                        acquired = true;
-                    }
-                }
-                return Task.FromResult(action());
-            }
-            finally
-            {
-                if (acquired) mutex.ReleaseMutex();
-            }
+            await using var heldLock = await AcquireFileLockAsync(cancellationToken).ConfigureAwait(false);
+            return action();
         }
         catch (OperationCanceledException)
         {
@@ -232,41 +203,34 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
         }
     }
 
-    private Mutex CreateStoreMutex()
+    private async Task<FileStream> AcquireFileLockAsync(CancellationToken cancellationToken)
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            return new Mutex(false, mutexName);
-        }
-
-        using var identity = WindowsIdentity.GetCurrent();
-        var sid = identity.User?.Value ?? throw new LicenseStoreException();
-        var securityDescriptor = IntPtr.Zero;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
-                $"D:P(A;;GA;;;{sid})", 1, out securityDescriptor, out _))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
+        var directory = Path.GetDirectoryName(path) ?? throw new LicenseStoreException();
+        Directory.CreateDirectory(directory);
+        RestrictDirectoryAcl(directory);
         try
         {
-            var attributes = new SecurityAttributes
+            using (new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite))
             {
-                Length = Marshal.SizeOf<SecurityAttributes>(),
-                SecurityDescriptor = securityDescriptor,
-            };
-            var handle = CreateMutexEx(ref attributes, mutexName, 0, 0x001F0001);
-            if (handle.IsInvalid)
-            {
-                handle.Dispose();
-                throw new Win32Exception(Marshal.GetLastWin32Error());
             }
-            var mutex = new Mutex();
-            mutex.SafeWaitHandle = handle;
-            return mutex;
+            RestrictFileAcl(lockPath);
         }
-        finally
+        catch (IOException)
         {
-            _ = LocalFree(securityDescriptor);
+            // An existing owner already created and exclusively holds the protected lock file.
+        }
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(25), cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 
@@ -439,29 +403,4 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
         }
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SecurityAttributes
-    {
-        public int Length;
-        public IntPtr SecurityDescriptor;
-        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
-    }
-
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
-        string stringSecurityDescriptor,
-        uint stringSecurityDescriptorRevision,
-        out IntPtr securityDescriptor,
-        out uint securityDescriptorSize);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeWaitHandle CreateMutexEx(
-        ref SecurityAttributes mutexAttributes,
-        string name,
-        uint flags,
-        uint desiredAccess);
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr LocalFree(IntPtr memory);
 }

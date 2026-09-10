@@ -159,6 +159,27 @@ public sealed class LicenseApiClientTests
     }
 
     [Fact]
+    public async Task LicenseApiClientReturnsExactVerifiedEnvelopeWithoutLeakingItFromDiagnostics()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        byte[]? envelope = null;
+        var handler = new DelegateHandler(async (request, _, _) =>
+        {
+            var requestId = await ReadRequestIdAsync(request);
+            envelope = SignedLicenseEnvelopeVerifierTests.Sign(
+                SignedLicenseEnvelopeVerifierTests.CreateClaims(requestId), signer);
+            return Response(HttpStatusCode.OK, envelope);
+        });
+        using var client = CreateClient(signer, handler);
+
+        var result = await client.ValidateAsync("request-1", "CARD-VALUE", "machine-1", CancellationToken.None);
+
+        Assert.Equal(envelope, result.SignedEnvelope);
+        Assert.DoesNotContain(Convert.ToBase64String(envelope!), result.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Encoding.UTF8.GetString(envelope!), result.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task LicenseApiClientActivationRetriesReuseBusinessIdButRefreshTimestampAndNonce()
     {
         using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);

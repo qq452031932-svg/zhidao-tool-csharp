@@ -25,18 +25,6 @@ public sealed class MachineFingerprintProvider : IMachineFingerprintProvider
 {
     private const string FingerprintPurpose = "SuperPan.Licensing.MachineFingerprint.v1";
     private static readonly Guid AllOnesGuid = Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff");
-    private static readonly HashSet<string> InvalidSentinels = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "none",
-        "unknown",
-        "invalid",
-        "default string",
-        "system serial number",
-        "not specified",
-        "not applicable",
-        "not available",
-        "n/a",
-    };
     private readonly IMachineIdentitySource source;
 
     public MachineFingerprintProvider(IMachineIdentitySource? source = null) =>
@@ -80,16 +68,11 @@ public sealed class MachineFingerprintProvider : IMachineFingerprintProvider
     private static string? Normalize(string? value)
     {
         value = value?.Trim().Normalize(NormalizationForm.FormKC);
-        if (string.IsNullOrWhiteSpace(value) || InvalidSentinels.Contains(value) ||
-            value.Contains("to be filled", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(value) || !Guid.TryParse(value, out var guid))
         {
             return null;
         }
-        if (Guid.TryParse(value, out var guid))
-        {
-            return guid == Guid.Empty || guid == AllOnesGuid ? null : guid.ToString("D");
-        }
-        return value.ToLowerInvariant();
+        return guid == Guid.Empty || guid == AllOnesGuid ? null : guid.ToString("D");
     }
 
     private sealed class WindowsMachineIdentitySource : IMachineIdentitySource

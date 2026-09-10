@@ -17,9 +17,32 @@ public enum LicenseApiResultKind
     InvalidResponse,
 }
 
-public sealed record LicenseApiResult(LicenseApiResultKind Kind, string? Code, LicenseClaims? Claims)
+public sealed record LicenseApiResult
 {
-    public override string ToString() => $"LicenseApiResult {{ Kind = {Kind}, Code = {Code ?? "none"} }}";
+    private readonly byte[]? signedEnvelope;
+
+    public LicenseApiResult(
+        LicenseApiResultKind kind,
+        string? code,
+        LicenseClaims? claims,
+        byte[]? signedEnvelope = null)
+    {
+        Kind = kind;
+        Code = code;
+        Claims = claims;
+        this.signedEnvelope = signedEnvelope?.ToArray();
+    }
+
+    public LicenseApiResultKind Kind { get; }
+    public string? Code { get; }
+    public LicenseClaims? Claims { get; }
+    public byte[]? SignedEnvelope => signedEnvelope?.ToArray();
+
+    public override string ToString()
+    {
+        var safeCode = LicenseCodes.All.Contains(Code ?? string.Empty) ? Code : Code is null ? "none" : "unrecognized";
+        return $"LicenseApiResult {{ Kind = {Kind}, Code = {safeCode} }}";
+    }
 }
 
 public interface ILicenseRetryDelay
@@ -33,7 +56,7 @@ public interface ILicenseClientRandomSource
     byte[] GetBytes(int count);
 }
 
-public sealed class LicenseApiClient : IDisposable
+public sealed class LicenseApiClient : IDisposable, ILicenseServiceClient
 {
     private const int MaximumAttempts = 3;
     private const int MaximumCardUtf8Bytes = 256;
@@ -107,6 +130,12 @@ public sealed class LicenseApiClient : IDisposable
         CancellationToken cancellationToken) =>
         SendAsync("validate", requestId, card, machineHash, isActivation: false, cancellationToken);
 
+    public LicenseClaims VerifyCached(
+        ReadOnlySpan<byte> signedEnvelope,
+        string expectedSoftwareId,
+        string expectedMachineHash) =>
+        verifier.VerifyCached(signedEnvelope, expectedSoftwareId, expectedMachineHash);
+
     public void Dispose()
     {
         if (disposed)
@@ -173,7 +202,7 @@ public sealed class LicenseApiClient : IDisposable
                 {
                     return InvalidResponse();
                 }
-                return MapSignedDecision(response.StatusCode, claims);
+                return MapSignedDecision(response.StatusCode, claims, body);
             }
             catch (ResponseTooLargeException)
             {
@@ -285,7 +314,7 @@ public sealed class LicenseApiClient : IDisposable
         return requested > MaximumRetryAfter ? MaximumRetryAfter : requested.Value;
     }
 
-    private static LicenseApiResult MapSignedDecision(HttpStatusCode status, LicenseClaims claims)
+    private static LicenseApiResult MapSignedDecision(HttpStatusCode status, LicenseClaims claims, byte[] signedEnvelope)
     {
         var valid = status switch
         {
@@ -305,7 +334,8 @@ public sealed class LicenseApiClient : IDisposable
         return new LicenseApiResult(
             status == HttpStatusCode.OK ? LicenseApiResultKind.Authorized : LicenseApiResultKind.Rejected,
             claims.Code,
-            claims);
+            claims,
+            signedEnvelope);
     }
 
     private static bool IsSignedDecisionStatus(HttpStatusCode status) =>

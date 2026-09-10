@@ -104,7 +104,7 @@ public sealed class DpapiLicenseStoreTests : IDisposable
     }
 
     [Fact]
-    public async Task DpapiStoreMutexSerializesSameUserWritersAndAtomicWritesLeaveNoTemporaryFiles()
+    public async Task DpapiStoreFileLockSerializesSameUserWritersAndAtomicWritesLeaveNoTemporaryFiles()
     {
         var path = Path.Combine(directory, "concurrent.dat");
         var stores = Enumerable.Range(0, 12)
@@ -116,36 +116,38 @@ public sealed class DpapiLicenseStoreTests : IDisposable
 
         var snapshot = await stores[0].ReadAsync(CancellationToken.None);
         Assert.Equal(12, snapshot.Credentials.Count);
-        Assert.Equal(["concurrent.dat"], Directory.GetFiles(directory).Select(file => Path.GetFileName(file)!).ToArray());
+        Assert.Equal(
+            ["concurrent.dat", "concurrent.dat.lock"],
+            Directory.GetFiles(directory).Select(file => Path.GetFileName(file)!).Order().ToArray());
     }
 
     [Fact]
-    public async Task DpapiStoreCreatesGlobalCurrentUserMutexAndSerializesWriters()
+    public async Task DpapiStoreCreatesPrivateAclFileLockAndCancellationStopsWaitingWriter()
     {
         if (!OperatingSystem.IsWindows())
         {
-            throw SkipException.ForSkip("Global Windows mutex integration requires Windows.");
+            throw SkipException.ForSkip("Windows file ACL integration requires Windows.");
         }
-        var path = Path.Combine(directory, "global-mutex.dat");
+        var path = Path.Combine(directory, "locked.dat");
+        var lockPath = path + ".lock";
         var blocker = new BlockingProtector();
         var firstStore = new DpapiLicenseStore(path, blocker);
         var secondStore = new DpapiLicenseStore(path, PassThroughProtector.Instance);
-        var mutexName = (string)typeof(DpapiLicenseStore)
-            .GetField("mutexName", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
-            .GetValue(firstStore)!;
 
         var firstWrite = Task.Run(() => firstStore.GetOrCreateCredentialAsync("CARD-FIRST", CancellationToken.None));
         await blocker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         try
         {
-            Assert.StartsWith(@"Global\SuperPan.Licensing.State.v1.", mutexName, StringComparison.Ordinal);
-            using var openedAsCurrentUser = Mutex.OpenExisting(mutexName);
-            var secondWrite = Task.Run(() => secondStore.GetOrCreateCredentialAsync("CARD-SECOND", CancellationToken.None));
-            await Task.Delay(50);
-            Assert.False(secondWrite.IsCompleted);
+            Assert.True(File.Exists(lockPath));
+            Assert.True(DpapiLicenseStore.HasRestrictiveAcl(lockPath));
+            Assert.Equal(0, new FileInfo(lockPath).Length);
+
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                secondStore.GetOrCreateCredentialAsync("CARD-SECOND", cancellation.Token));
 
             blocker.Release.TrySetResult();
-            await Task.WhenAll(firstWrite, secondWrite);
+            await firstWrite;
         }
         finally
         {

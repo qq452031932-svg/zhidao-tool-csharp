@@ -3,6 +3,11 @@ using System.Text.Json;
 
 namespace SuperPan.Licensing.Client;
 
+public interface ICachedLicenseEnvelopeVerifier
+{
+    LicenseClaims VerifyCached(ReadOnlySpan<byte> signedEnvelope, string expectedSoftwareId, string expectedMachineHash);
+}
+
 public sealed class LicenseEnvelopeVerificationException : Exception
 {
     public LicenseEnvelopeVerificationException(string message) : base(message)
@@ -10,7 +15,7 @@ public sealed class LicenseEnvelopeVerificationException : Exception
     }
 }
 
-public sealed class SignedLicenseEnvelopeVerifier : IDisposable
+public sealed class SignedLicenseEnvelopeVerifier : IDisposable, ICachedLicenseEnvelopeVerifier
 {
     private static readonly HashSet<string> EnvelopeFields = new(StringComparer.Ordinal)
     {
@@ -40,6 +45,23 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable
         string expectedRequestId,
         string expectedSoftwareId,
         string expectedMachineHash)
+    {
+        var claims = VerifySignatureAndParse(responseBody);
+        ValidateBindingsAndTime(claims, expectedRequestId, expectedSoftwareId, expectedMachineHash);
+        return claims;
+    }
+
+    public LicenseClaims VerifyCached(
+        ReadOnlySpan<byte> signedEnvelope,
+        string expectedSoftwareId,
+        string expectedMachineHash)
+    {
+        var claims = VerifySignatureAndParse(signedEnvelope);
+        ValidateCachedBindingsAndTime(claims, expectedSoftwareId, expectedMachineHash);
+        return claims;
+    }
+
+    private LicenseClaims VerifySignatureAndParse(ReadOnlySpan<byte> responseBody)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         if (responseBody.IsEmpty || responseBody.Length > options.MaximumResponseBytes)
@@ -123,7 +145,6 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable
             throw Invalid("The signed claims are invalid.");
         }
 
-        ValidateBindingsAndTime(claims, expectedRequestId, expectedSoftwareId, expectedMachineHash);
         return claims;
     }
 
@@ -173,6 +194,33 @@ public sealed class SignedLicenseEnvelopeVerifier : IDisposable
             leaseUntil > claims.ServerTime.AddMinutes(30) || leaseUntil > expiresAt)
         {
             throw Invalid("The response lease is invalid.");
+        }
+    }
+
+    private void ValidateCachedBindingsAndTime(
+        LicenseClaims claims,
+        string expectedSoftwareId,
+        string expectedMachineHash)
+    {
+        if (claims.Decision != LicenseDecisions.Allow || claims.Code != LicenseCodes.Ok ||
+            !string.Equals(claims.SoftwareId, expectedSoftwareId, StringComparison.Ordinal) ||
+            !string.Equals(claims.MachineHash, expectedMachineHash, StringComparison.Ordinal))
+        {
+            throw Invalid("The cached response binding is invalid.");
+        }
+
+        var now = timeProvider.GetUtcNow();
+        if (claims.ServerTime - now > options.ServerClockTolerance)
+        {
+            throw Invalid("The cached response server time is invalid.");
+        }
+
+        var expiresAt = claims.ExpiresAt!.Value;
+        var leaseUntil = claims.LeaseUntil!.Value;
+        if (expiresAt <= now || leaseUntil <= now || expiresAt < claims.ServerTime || leaseUntil <= claims.ServerTime ||
+            leaseUntil > claims.ServerTime.AddMinutes(30) || leaseUntil > expiresAt)
+        {
+            throw Invalid("The cached response lease is invalid.");
         }
     }
 

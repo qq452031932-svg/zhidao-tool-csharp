@@ -143,6 +143,47 @@ public sealed class SignedLicenseEnvelopeVerifierTests
     }
 
     [Fact]
+    public void CachedEnvelopeAllowsStaleServerTimeButReverifiesSignatureBindingAndCurrentLease()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var claims = CreateClaims() with
+        {
+            ServerTime = Now.AddMinutes(-10),
+            LeaseUntil = Now.AddMinutes(20),
+        };
+        var envelope = Sign(claims, signer);
+
+        var verified = verifier.VerifyCached(envelope, "software-1", "machine-1");
+
+        Assert.Equal(claims, verified);
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(envelope, "software-other", "machine-1"));
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(envelope, "software-1", "machine-other"));
+    }
+
+    [Fact]
+    public void CachedEnvelopeRejectsTamperingExpiryAndFutureServerTime()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var verifier = CreateVerifier(signer);
+        var valid = CreateClaims();
+        var parsed = JsonSerializer.Deserialize<SignedLicenseEnvelope>(Sign(valid, signer))!;
+        var tamperedPayload = Convert.FromBase64String(parsed.Payload);
+        tamperedPayload[^2] ^= 1;
+        var tampered = JsonSerializer.SerializeToUtf8Bytes(parsed with { Payload = Convert.ToBase64String(tamperedPayload) });
+
+        Assert.Throws<LicenseEnvelopeVerificationException>(() =>
+            verifier.VerifyCached(tampered, "software-1", "machine-1"));
+        Assert.Throws<LicenseEnvelopeVerificationException>(() => verifier.VerifyCached(
+            Sign(valid with { LeaseUntil = Now }, signer), "software-1", "machine-1"));
+        Assert.Throws<LicenseEnvelopeVerificationException>(() => verifier.VerifyCached(
+            Sign(valid with { ServerTime = Now.AddMinutes(6), LeaseUntil = Now.AddMinutes(30) }, signer),
+            "software-1", "machine-1"));
+    }
+
+    [Fact]
     public void LicenseApiClientOptionsRequireHttpsExactlyTwoDistinctLowercasePinsAndP256Key()
     {
         using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
