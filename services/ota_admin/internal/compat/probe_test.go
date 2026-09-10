@@ -594,6 +594,7 @@ $cmd = '@echo off' + [char]13 + [char]10 +
   'if not "%GOTOOLCHAIN%"=="local" exit /b 4' + [char]13 + [char]10 +
   'if not "%GOEXPERIMENT%"=="" exit /b 5' + [char]13 + [char]10 +
   'if not "%GOFIPS140%"=="off" exit /b 6' + [char]13 + [char]10 +
+  'if defined GOFLAGS exit /b 7' + [char]13 + [char]10 +
   'if "%~1"=="version" echo go version go1.27.1 windows/amd64' + [char]13 + [char]10 +
   'exit /b 0' + [char]13 + [char]10
 [IO.File]::WriteAllText($stagedGo, $cmd, [Text.ASCIIEncoding]::new())
@@ -638,7 +639,8 @@ $external = @{
   GOENV='C:\attacker\go.env';
   GOTOOLCHAIN='go1.99.0';
   GOEXPERIMENT='attacker';
-  GOFIPS140='latest'
+  GOFIPS140='latest';
+  GOFLAGS='"'
 }
 foreach ($name in $external.Keys) { [Environment]::SetEnvironmentVariable($name, $external[$name], 'Process') }
 

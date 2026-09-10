@@ -77,6 +77,7 @@ function Save-LicenseBuildEnvironment {
 function Set-LicensePreBootstrapEnvironment {
     [System.Environment]::SetEnvironmentVariable('GOROOT', $null, [System.EnvironmentVariableTarget]::Process)
     [System.Environment]::SetEnvironmentVariable('GOENV', 'off', [System.EnvironmentVariableTarget]::Process)
+    [System.Environment]::SetEnvironmentVariable('GOFLAGS', '', [System.EnvironmentVariableTarget]::Process)
     [System.Environment]::SetEnvironmentVariable('GOTOOLCHAIN', 'local', [System.EnvironmentVariableTarget]::Process)
     [System.Environment]::SetEnvironmentVariable('GOEXPERIMENT', '', [System.EnvironmentVariableTarget]::Process)
     [System.Environment]::SetEnvironmentVariable('GOFIPS140', 'off', [System.EnvironmentVariableTarget]::Process)
