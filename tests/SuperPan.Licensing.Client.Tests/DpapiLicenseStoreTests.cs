@@ -120,6 +120,40 @@ public sealed class DpapiLicenseStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task DpapiStoreCreatesGlobalCurrentUserMutexAndSerializesWriters()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            throw SkipException.ForSkip("Global Windows mutex integration requires Windows.");
+        }
+        var path = Path.Combine(directory, "global-mutex.dat");
+        var blocker = new BlockingProtector();
+        var firstStore = new DpapiLicenseStore(path, blocker);
+        var secondStore = new DpapiLicenseStore(path, PassThroughProtector.Instance);
+        var mutexName = (string)typeof(DpapiLicenseStore)
+            .GetField("mutexName", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(firstStore)!;
+
+        var firstWrite = Task.Run(() => firstStore.GetOrCreateCredentialAsync("CARD-FIRST", CancellationToken.None));
+        await blocker.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            Assert.StartsWith(@"Global\SuperPan.Licensing.State.v1.", mutexName, StringComparison.Ordinal);
+            using var openedAsCurrentUser = Mutex.OpenExisting(mutexName);
+            var secondWrite = Task.Run(() => secondStore.GetOrCreateCredentialAsync("CARD-SECOND", CancellationToken.None));
+            await Task.Delay(50);
+            Assert.False(secondWrite.IsCompleted);
+
+            blocker.Release.TrySetResult();
+            await Task.WhenAll(firstWrite, secondWrite);
+        }
+        finally
+        {
+            blocker.Release.TrySetResult();
+        }
+    }
+
+    [Fact]
     public async Task DpapiCurrentUserEncryptionDoesNotWriteCardInPlaintextAndAppliesRestrictedAcl()
     {
         if (!OperatingSystem.IsWindows())
@@ -170,6 +204,21 @@ public sealed class DpapiLicenseStoreTests : IDisposable
     {
         public static readonly PassThroughProtector Instance = new();
         public byte[] Protect(byte[] plaintext) => plaintext.ToArray();
+        public byte[] Unprotect(byte[] ciphertext) => ciphertext.ToArray();
+    }
+
+    private sealed class BlockingProtector : ILicenseStateProtector
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public byte[] Protect(byte[] plaintext)
+        {
+            Entered.TrySetResult();
+            Release.Task.GetAwaiter().GetResult();
+            return plaintext.ToArray();
+        }
+
         public byte[] Unprotect(byte[] ciphertext) => ciphertext.ToArray();
     }
 }

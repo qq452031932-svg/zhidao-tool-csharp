@@ -47,6 +47,30 @@ public sealed class MachineFingerprintProviderTests
         Assert.Equal(2, source.BiosUuidReads);
     }
 
+    [Theory]
+    [InlineData("00000000-0000-0000-0000-000000000000")]
+    [InlineData("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF")]
+    [InlineData("Default string")]
+    [InlineData("System Serial Number")]
+    [InlineData("Not Specified")]
+    [InlineData("INVALID")]
+    public void MachineFingerprintTreatsCommonFirmwareUuidSentinelsAsMissing(string sentinel)
+    {
+        var exception = Assert.Throws<MachineFingerprintException>(() =>
+            new MachineFingerprintProvider(new StubSource(null, sentinel)).GetMachineHash());
+
+        Assert.DoesNotContain(sentinel, exception.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void MachineFingerprintFallsBackToMachineGuidWhenBiosUuidIsASentinel()
+    {
+        var withSentinel = new MachineFingerprintProvider(new StubSource("valid-machine-guid", "00000000-0000-0000-0000-000000000000"));
+        var withoutBios = new MachineFingerprintProvider(new StubSource("valid-machine-guid", null));
+
+        Assert.Equal(withoutBios.GetMachineHash(), withSentinel.GetMachineHash());
+    }
+
     [Fact]
     public void MachineFingerprintDiagnosticsNeverExposeRawIdentifiersOrHash()
     {

@@ -1,8 +1,11 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 namespace SuperPan.Licensing.Client;
 
@@ -84,8 +87,13 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
     {
         this.path = Path.GetFullPath(path ?? GetDefaultPath());
         this.protector = protector ?? DpapiCurrentUserProtector.Instance;
-        mutexName = @"Local\SuperPan.Licensing.State.v1." +
-            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(this.path.ToUpperInvariant()))).ToLowerInvariant();
+        var userScope = OperatingSystem.IsWindows()
+            ? WindowsIdentity.GetCurrent().User?.Value ?? throw new LicenseStoreException()
+            : Environment.UserName;
+        var scopeHash = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(userScope + "\n" + this.path.ToUpperInvariant()))).ToLowerInvariant();
+        mutexName = (OperatingSystem.IsWindows() ? @"Global\" : string.Empty) +
+            "SuperPan.Licensing.State.v1." + scopeHash;
     }
 
     public static string GetDefaultPath() => Path.Combine(
@@ -187,7 +195,7 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            using var mutex = new Mutex(false, mutexName);
+            using var mutex = CreateStoreMutex();
             var acquired = false;
             try
             {
@@ -221,6 +229,44 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
         catch
         {
             throw new LicenseStoreException();
+        }
+    }
+
+    private Mutex CreateStoreMutex()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return new Mutex(false, mutexName);
+        }
+
+        using var identity = WindowsIdentity.GetCurrent();
+        var sid = identity.User?.Value ?? throw new LicenseStoreException();
+        var securityDescriptor = IntPtr.Zero;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                $"D:P(A;;GA;;;{sid})", 1, out securityDescriptor, out _))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        try
+        {
+            var attributes = new SecurityAttributes
+            {
+                Length = Marshal.SizeOf<SecurityAttributes>(),
+                SecurityDescriptor = securityDescriptor,
+            };
+            var handle = CreateMutexEx(ref attributes, mutexName, 0, 0x001F0001);
+            if (handle.IsInvalid)
+            {
+                handle.Dispose();
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            var mutex = new Mutex();
+            mutex.SafeWaitHandle = handle;
+            return mutex;
+        }
+        finally
+        {
+            _ = LocalFree(securityDescriptor);
         }
     }
 
@@ -392,4 +438,30 @@ public sealed class DpapiLicenseStore : ILicenseStateStore
             return ProtectedData.Unprotect(ciphertext, Entropy, DataProtectionScope.CurrentUser);
         }
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SecurityAttributes
+    {
+        public int Length;
+        public IntPtr SecurityDescriptor;
+        [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+    }
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+        string stringSecurityDescriptor,
+        uint stringSecurityDescriptorRevision,
+        out IntPtr securityDescriptor,
+        out uint securityDescriptorSize);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeWaitHandle CreateMutexEx(
+        ref SecurityAttributes mutexAttributes,
+        string name,
+        uint flags,
+        uint desiredAccess);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
 }

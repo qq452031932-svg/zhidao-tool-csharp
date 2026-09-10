@@ -91,6 +91,44 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
+    public async Task AuthorizationGateUsesUnexpiredLeaseWhenTransportThrows()
+    {
+        Exception[] failures =
+        [
+            new HttpRequestException("offline"),
+            new IOException("connection reset"),
+            new TaskCanceledException("transport timeout"),
+        ];
+
+        foreach (var failure in failures)
+        {
+            var gate = CreateGate(new FakeService(failure), StoreWithLease(Lease()));
+
+            var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+            Assert.True(result.IsAuthorized);
+            Assert.True(result.UsedCachedLease);
+            Assert.Equal(LicenseCodes.ServiceUnavailable, result.Code);
+        }
+    }
+
+    [Fact]
+    public async Task AuthorizationGateStillPropagatesCallerCancellationAndRejectsInternalExceptions()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var cancelledGate = CreateGate(new FakeService(), StoreWithLease(Lease()));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            cancelledGate.AuthorizeAsync(LicenseOperationKind.Transfer, cancellation.Token));
+
+        var internalFailure = CreateGate(new FakeService(new InvalidOperationException("internal")), StoreWithLease(Lease()));
+        var result = await internalFailure.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.False(result.UsedCachedLease);
+    }
+
+    [Fact]
     public async Task AuthorizationGateRejectsExpiredLeaseDuringTemporaryFailure()
     {
         var expired = Lease() with { LeaseUntil = Now };
@@ -136,6 +174,19 @@ public sealed class LicenseAuthorizationGateTests
         {
             Assert.DoesNotContain(secret, diagnostics, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public void AuthorizationGateDiagnosticsRedactUnknownCodeInjectedThroughPublicResultConstructor()
+    {
+        const string rawCode = "raw-service-error:CARD-SECRET:MACHINE-HASH:SIGNED-PAYLOAD";
+        var result = new LicenseGateResult(LicenseOperationKind.Transfer, false, false, rawCode);
+        var status = new LicenseGateStatusEventArgs(result);
+
+        Assert.Equal(rawCode, result.Code);
+        Assert.DoesNotContain(rawCode, result.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(rawCode, status.ToString(), StringComparison.Ordinal);
+        Assert.Contains("unrecognized", result.ToString(), StringComparison.Ordinal);
     }
 
     private static LicenseAuthorizationGate CreateGate(

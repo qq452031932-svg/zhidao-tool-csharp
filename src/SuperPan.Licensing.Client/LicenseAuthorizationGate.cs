@@ -28,7 +28,12 @@ public sealed record LicenseGateResult(
     string Code)
 {
     public override string ToString() =>
-        $"LicenseGateResult {{ Operation = {Operation}, Authorized = {IsAuthorized}, Cached = {UsedCachedLease}, Code = {Code} }}";
+        $"LicenseGateResult {{ Operation = {Operation}, Authorized = {IsAuthorized}, Cached = {UsedCachedLease}, Code = {DiagnosticCode()} }}";
+
+    private string DiagnosticCode() =>
+        LicenseCodes.All.Contains(Code) || Code is "activation_required" or "authorization_unavailable"
+            ? Code
+            : "unrecognized";
 }
 
 public sealed class LicenseGateStatusEventArgs(LicenseGateResult result) : EventArgs
@@ -95,8 +100,20 @@ public sealed class LicenseAuthorizationGate : ILicenseAuthorizationGate
                 return Publish(new LicenseGateResult(operation, false, false, ActivationRequired));
             }
 
-            var response = await service.ValidateAsync(
-                Guid.NewGuid().ToString("D"), credential.Card, machineHash, cancellationToken).ConfigureAwait(false);
+            LicenseApiResult response;
+            try
+            {
+                response = await service.ValidateAsync(
+                    Guid.NewGuid().ToString("D"), credential.Card, machineHash, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                response = new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or IOException)
+            {
+                response = new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null);
+            }
             return await ApplyResponseAsync(operation, credential, machineHash, response, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
