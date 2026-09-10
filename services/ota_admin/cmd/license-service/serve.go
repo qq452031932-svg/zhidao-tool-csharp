@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -97,6 +99,13 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 			return errors.New("load load-test secret")
 		}
 		defer clear(loadTestSecret)
+		symmetricSecrets := make([][]byte, 0, 3+len(previousEncryptionKeys))
+		symmetricSecrets = append(symmetricSecrets, encryptionKey)
+		symmetricSecrets = append(symmetricSecrets, previousEncryptionKeys...)
+		symmetricSecrets = append(symmetricSecrets, lookupKey, internalSecret)
+		if !loadSecretIsIndependent(loadTestSecret, symmetricSecrets) {
+			return errors.New("load-test secret must be independent")
+		}
 	}
 	privateKey, err := signing.LoadPrivateKey(cfg.SigningPrivateKeyPath)
 	if err != nil {
@@ -187,6 +196,18 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		return errors.New("license HTTP server stopped")
 	}
 	return nil
+}
+
+func loadSecretIsIndependent(loadSecret []byte, symmetricSecrets [][]byte) bool {
+	loadDigest := sha256.Sum256(loadSecret)
+	duplicate := 0
+	for _, candidate := range symmetricSecrets {
+		candidateDigest := sha256.Sum256(candidate)
+		sameContent := subtle.ConstantTimeCompare(loadDigest[:], candidateDigest[:])
+		sameLength := subtle.ConstantTimeEq(int32(len(loadSecret)), int32(len(candidate)))
+		duplicate |= sameContent & sameLength
+	}
+	return duplicate == 0
 }
 
 func clearPreviousEncryptionKeys(keys [][]byte) {

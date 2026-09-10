@@ -177,6 +177,67 @@ func TestServeWiresLoadCredentialHealthAndMetricsWithoutLoggingSecrets(t *testin
 	}
 }
 
+func TestServeRejectsLoadSecretContentReuseBeforeListenerAndDatabase(t *testing.T) {
+	const wantError = "load-test secret must be independent"
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *licenseconfig.Config, []byte)
+	}{
+		{name: "current encryption", mutate: func(t *testing.T, cfg *licenseconfig.Config, secret []byte) {
+			if err := os.WriteFile(cfg.EncryptionKeyPath, secret, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "previous encryption", mutate: func(t *testing.T, cfg *licenseconfig.Config, secret []byte) {
+			path := filepath.Join(filepath.Dir(cfg.EncryptionKeyPath), "previous-encryption.key")
+			if err := os.WriteFile(path, secret, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg.PreviousEncryptionKeyPaths = []string{path}
+		}},
+		{name: "lookup hmac", mutate: func(t *testing.T, cfg *licenseconfig.Config, secret []byte) {
+			if err := os.WriteFile(cfg.LookupHMACKeyPath, secret, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "admin shared", mutate: func(t *testing.T, cfg *licenseconfig.Config, secret []byte) {
+			if err := os.WriteFile(cfg.InternalSecretPath, secret, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := writeRuntimeConfig(t)
+			cfg.LoadTestEnabled = true
+			cfg.LoadTestSecretPath = filepath.Join(filepath.Dir(cfg.EncryptionKeyPath), "load-test.key")
+			loadSecret := bytes.Repeat([]byte{0x6d}, 32)
+			if err := os.WriteFile(cfg.LoadTestSecretPath, loadSecret, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(t, &cfg, loadSecret)
+
+			blocker, err := net.Listen("tcp", cfg.ListenAddress)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Close()
+			var stdout, stderr bytes.Buffer
+			err = serve(context.Background(), cfg, &stdout, &stderr)
+			if err == nil || err.Error() != wantError {
+				t.Fatalf("serve error = %v, want %q", err, wantError)
+			}
+			if _, statErr := os.Stat(cfg.LicenseDatabasePath); !os.IsNotExist(statErr) {
+				t.Fatalf("database was opened before independence rejection: %v", statErr)
+			}
+			output := stdout.String() + stderr.String() + err.Error()
+			if strings.Contains(output, string(loadSecret)) || strings.Contains(output, authwire.EncodeInternalToken(loadSecret)) || strings.Contains(output, cfg.LoadTestSecretPath) {
+				t.Fatalf("independence rejection leaked load secret: %s", output)
+			}
+		})
+	}
+}
+
 func TestClearPreviousEncryptionKeysZeroesEveryOriginalByte(t *testing.T) {
 	keys := [][]byte{bytes.Repeat([]byte{0x51}, 32), bytes.Repeat([]byte{0xa7}, 32)}
 	clearPreviousEncryptionKeys(keys)
