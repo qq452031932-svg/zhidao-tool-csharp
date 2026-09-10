@@ -4,6 +4,7 @@ param(
     [switch] $FunctionsOnly
 )
 
+$LicensePreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -30,15 +31,182 @@ $LicenseBundleNames = @(
     'superpan-license'
     'superpan-license.sha256'
 )
+$LicenseBuildEnvironmentNames = @(
+    'GOENV'
+    'GOFLAGS'
+    'GOWORK'
+    'GOEXPERIMENT'
+    'GOAMD64'
+    'GOTOOLCHAIN'
+    'GOPRIVATE'
+    'GONOPROXY'
+    'GONOSUMDB'
+    'GOINSECURE'
+    'GOAUTH'
+    'GOPROXY'
+    'GOSUMDB'
+    'GOVCS'
+    'CC'
+    'CXX'
+    'PKG_CONFIG'
+    'TEMP'
+    'TMP'
+    'GOTMPDIR'
+    'GOCACHE'
+    'GOMODCACHE'
+    'CGO_ENABLED'
+    'GOOS'
+    'GOARCH'
+    'SOURCE_DATE_EPOCH'
+)
+
+function Save-LicenseBuildEnvironment {
+    $saved = @{}
+    foreach ($name in $LicenseBuildEnvironmentNames) {
+        $saved[$name] = [System.Environment]::GetEnvironmentVariable($name, [System.EnvironmentVariableTarget]::Process)
+    }
+    return $saved
+}
+
+function Set-SealedLicenseBuildEnvironment {
+    $sealed = @{
+        GOENV = 'off'
+        GOFLAGS = ''
+        GOWORK = 'off'
+        GOEXPERIMENT = ''
+        GOAMD64 = 'v1'
+        GOTOOLCHAIN = 'local'
+        GOPRIVATE = ''
+        GONOPROXY = ''
+        GONOSUMDB = ''
+        GOINSECURE = ''
+        GOAUTH = 'off'
+        GOPROXY = 'https://proxy.golang.org,direct'
+        GOSUMDB = 'sum.golang.org'
+        GOVCS = 'public:git|hg,private:off'
+        CC = ''
+        CXX = ''
+        PKG_CONFIG = ''
+    }
+    foreach ($name in $sealed.Keys) {
+        [System.Environment]::SetEnvironmentVariable($name, [string] $sealed[$name], [System.EnvironmentVariableTarget]::Process)
+    }
+}
+
+function Restore-LicenseBuildEnvironment {
+    param([Parameter(Mandatory)][hashtable] $SavedEnvironment)
+
+    foreach ($name in $LicenseBuildEnvironmentNames) {
+        [System.Environment]::SetEnvironmentVariable($name, $SavedEnvironment[$name], [System.EnvironmentVariableTarget]::Process)
+    }
+}
+
+function Get-LicenseGitBlobObjectId {
+    param(
+        [Parameter(Mandatory)][byte[]] $Bytes,
+        [Parameter(Mandatory)][ValidateSet('sha1', 'sha256')][string] $ObjectFormat
+    )
+
+    $header = [System.Text.Encoding]::ASCII.GetBytes("blob $($Bytes.Length)`0")
+    [byte[]] $objectBytes = New-Object byte[] ($header.Length + $Bytes.Length)
+    [System.Buffer]::BlockCopy($header, 0, $objectBytes, 0, $header.Length)
+    [System.Buffer]::BlockCopy($Bytes, 0, $objectBytes, $header.Length, $Bytes.Length)
+    $algorithm = if ($ObjectFormat -ceq 'sha1') {
+        [System.Security.Cryptography.SHA1]::Create()
+    }
+    else {
+        [System.Security.Cryptography.SHA256]::Create()
+    }
+    try {
+        return ([System.BitConverter]::ToString($algorithm.ComputeHash($objectBytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function ConvertTo-LicenseCanonicalGitBytes {
+    param([Parameter(Mandatory)][byte[]] $WorkingTreeBytes)
+
+    $canonical = New-Object System.IO.MemoryStream
+    try {
+        for ($index = 0; $index -lt $WorkingTreeBytes.Length; $index++) {
+            $value = $WorkingTreeBytes[$index]
+            if ($value -eq 13) {
+                if ($index + 1 -ge $WorkingTreeBytes.Length -or $WorkingTreeBytes[$index + 1] -ne 10) {
+                    throw 'Pinned Go bootstrap contains a non-canonical carriage return.'
+                }
+                continue
+            }
+            $canonical.WriteByte($value)
+        }
+        return $canonical.ToArray()
+    }
+    finally {
+        $canonical.Dispose()
+    }
+}
 
 function Invoke-LicenseToolchainBootstrap {
-    param([string[]] $Arguments = @())
+    param(
+        [Parameter(Mandatory)][string] $SourceCommit,
+        [string[]] $Arguments = @()
+    )
 
     if (-not (Test-Path -LiteralPath $LicenseBootstrapScript -PathType Leaf)) {
         throw "Pinned Go bootstrap script is missing: $LicenseBootstrapScript"
     }
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript @Arguments
-    if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
+    $bootstrapItem = Get-Item -LiteralPath $LicenseBootstrapScript -Force
+    if (($bootstrapItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Pinned Go bootstrap script must not be a reparse point.'
+    }
+    $expectedBootstrapPath = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot 'services\ota_admin\scripts\bootstrap_go_toolchain.ps1'))
+    if (-not ([System.IO.Path]::GetFullPath($LicenseBootstrapScript)).Equals($expectedBootstrapPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Pinned Go bootstrap script path is outside the expected repository location.'
+    }
+
+    [string[]] $objectFormatLines = @(& git -C $RepositoryRoot rev-parse --show-object-format)
+    if ($LASTEXITCODE -ne 0 -or $objectFormatLines.Count -ne 1 -or $objectFormatLines[0] -cnotmatch '^(sha1|sha256)$') {
+        throw 'Unable to resolve the repository Git object format.'
+    }
+    $objectFormat = $objectFormatLines[0]
+    $bootstrapObjectSpec = "${SourceCommit}:services/ota_admin/scripts/bootstrap_go_toolchain.ps1"
+    [string[]] $expectedObjectLines = @(& git -C $RepositoryRoot rev-parse --verify $bootstrapObjectSpec)
+    $expectedObjectLength = if ($objectFormat -ceq 'sha1') { 40 } else { 64 }
+    if ($LASTEXITCODE -ne 0 -or $expectedObjectLines.Count -ne 1 -or
+        $expectedObjectLines[0] -cnotmatch "^[0-9a-f]{$expectedObjectLength}$") {
+        throw 'Unable to resolve the committed pinned Go bootstrap blob.'
+    }
+
+    $bootstrapStream = [System.IO.File]::Open(
+        $LicenseBootstrapScript,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        if ($bootstrapStream.Length -le 0 -or $bootstrapStream.Length -gt 1048576) {
+            throw 'Pinned Go bootstrap script has an invalid length.'
+        }
+        [byte[]] $workingTreeBytes = New-Object byte[] ([int] $bootstrapStream.Length)
+        $offset = 0
+        while ($offset -lt $workingTreeBytes.Length) {
+            $read = $bootstrapStream.Read($workingTreeBytes, $offset, $workingTreeBytes.Length - $offset)
+            if ($read -le 0) { throw 'Pinned Go bootstrap script could not be read completely.' }
+            $offset += $read
+        }
+        [byte[]] $bootstrapBytes = ConvertTo-LicenseCanonicalGitBytes -WorkingTreeBytes $workingTreeBytes
+        $actualObjectId = Get-LicenseGitBlobObjectId -Bytes $bootstrapBytes -ObjectFormat $objectFormat
+        if ($actualObjectId -cne $expectedObjectLines[0]) {
+            throw 'Pinned Go bootstrap script does not match its committed Git blob.'
+        }
+
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript @Arguments
+        if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
+    }
+    finally {
+        $bootstrapStream.Dispose()
+    }
 }
 
 function Assert-LicenseBundleSourceState {
@@ -159,7 +327,9 @@ function Write-DeterministicSourceManifest {
     })
     [System.Array]::Sort($lines, [System.StringComparer]::Ordinal)
     if ($lines.Count -eq 0) { throw 'Cannot write an empty source manifest.' }
-    [System.IO.File]::WriteAllText($ManifestPath, ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+    [byte[]] $manifestBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($lines -join "`n") + "`n")
+    [System.IO.File]::WriteAllBytes($ManifestPath, $manifestBytes)
+    return [System.Convert]::ToBase64String($manifestBytes)
 }
 
 function Get-LicenseFileSha256 {
@@ -176,58 +346,110 @@ function Get-LicenseFileSha256 {
     }
 }
 
+function Get-LicenseBytesSha256 {
+    param([Parameter(Mandatory)][byte[]] $Bytes)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
 function Write-LicenseSha256CheckFile {
     param(
         [Parameter(Mandatory)][string] $PayloadPath,
-        [Parameter(Mandatory)][string] $CheckFilePath
+        [Parameter(Mandatory)][string] $CheckFilePath,
+        [string] $ExpectedSha256
     )
 
-    $hash = Get-LicenseFileSha256 -Path $PayloadPath
+    $hash = if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        Get-LicenseFileSha256 -Path $PayloadPath
+    }
+    else {
+        if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Expected SHA-256 must be lowercase hexadecimal.' }
+        $ExpectedSha256
+    }
     [System.IO.File]::WriteAllText($CheckFilePath, "$hash  $([System.IO.Path]::GetFileName($PayloadPath))`n", [System.Text.UTF8Encoding]::new($false))
     return $hash
 }
 
-function Assert-LicenseBundleCheckFile {
+function New-LicenseBundleExpectedState {
     param(
-        [Parameter(Mandatory)][string] $Directory,
-        [Parameter(Mandatory)][string] $PayloadName,
-        [Parameter(Mandatory)][string] $CheckName
+        [Parameter(Mandatory)][string] $OtaAdminSha256,
+        [Parameter(Mandatory)][string] $LicenseServiceSha256,
+        [Parameter(Mandatory)][string] $SourceManifestBase64,
+        [Parameter(Mandatory)][string] $SourceManifestSha256,
+        [Parameter(Mandatory)][string] $SourceCommit
     )
 
-    $payloadPath = Join-Path $Directory $PayloadName
-    $checkPath = Join-Path $Directory $CheckName
-    $actualHash = Get-LicenseFileSha256 -Path $payloadPath
-    $checkText = [System.IO.File]::ReadAllText($checkPath, [System.Text.UTF8Encoding]::new($false, $true))
-    $expectedText = "$actualHash  $PayloadName`n"
-    if ($checkText -cne $expectedText) {
-        throw "$CheckName is not the canonical lowercase SHA-256 authentication record for $PayloadName."
+    foreach ($hash in @($OtaAdminSha256, $LicenseServiceSha256, $SourceManifestSha256)) {
+        if ($hash -cnotmatch '^[0-9a-f]{64}$') { throw 'Expected artifact SHA-256 values must be lowercase hexadecimal.' }
+    }
+    if ($SourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Expected source commit must be lowercase hexadecimal.' }
+    try { [byte[]] $manifestBytes = [System.Convert]::FromBase64String($SourceManifestBase64) }
+    catch { throw 'Expected source manifest bytes are not valid base64.' }
+    if ((Get-LicenseBytesSha256 -Bytes $manifestBytes) -cne $SourceManifestSha256) {
+        throw 'Expected source manifest bytes do not match their captured SHA-256.'
+    }
+
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    $expectedText = @{
+        'ota-admin.sha256' = "$OtaAdminSha256  ota-admin`n"
+        'superpan-license.sha256' = "$LicenseServiceSha256  superpan-license`n"
+        'source-manifest.sha256.sha256' = "$SourceManifestSha256  source-manifest.sha256`n"
+        'source-commit.txt' = "$SourceCommit`n"
+    }
+    $contentSha256 = @{
+        'ota-admin' = $OtaAdminSha256
+        'superpan-license' = $LicenseServiceSha256
+        'source-manifest.sha256' = $SourceManifestSha256
+    }
+    foreach ($name in $expectedText.Keys) {
+        $contentSha256[$name] = Get-LicenseBytesSha256 -Bytes ($utf8.GetBytes($expectedText[$name]))
+    }
+    return [pscustomobject]@{
+        Names = [string[]] @($LicenseBundleNames)
+        ContentSha256 = $contentSha256
+        SourceManifestBase64 = $SourceManifestBase64
+        SourceCommitText = $expectedText['source-commit.txt']
     }
 }
 
 function Assert-LicenseBundleArtifacts {
     param(
         [Parameter(Mandatory)][string] $Directory,
-        [Parameter(Mandatory)][string] $SourceCommit
+        [Parameter(Mandatory)][psobject] $ExpectedState
     )
 
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { throw 'License bundle staging directory is missing.' }
     if (@(Get-ChildItem -LiteralPath $Directory -Directory -Force).Count -ne 0) { throw 'License bundle must not contain directories.' }
     [string[]] $actualNames = @(Get-ChildItem -LiteralPath $Directory -File -Force | ForEach-Object Name)
     [System.Array]::Sort($actualNames, [System.StringComparer]::Ordinal)
-    [string[]] $expectedNames = @($LicenseBundleNames)
+    [string[]] $expectedNames = @($ExpectedState.Names)
     [System.Array]::Sort($expectedNames, [System.StringComparer]::Ordinal)
     if ([string]::Join("`n", $actualNames) -cne [string]::Join("`n", $expectedNames)) {
         throw 'License bundle is incomplete or contains unexpected files.'
     }
 
-    Assert-LicenseBundleCheckFile -Directory $Directory -PayloadName 'ota-admin' -CheckName 'ota-admin.sha256'
-    Assert-LicenseBundleCheckFile -Directory $Directory -PayloadName 'superpan-license' -CheckName 'superpan-license.sha256'
-    Assert-LicenseBundleCheckFile -Directory $Directory -PayloadName 'source-manifest.sha256' -CheckName 'source-manifest.sha256.sha256'
+    foreach ($name in $expectedNames) {
+        $actualHash = Get-LicenseFileSha256 -Path (Join-Path $Directory $name)
+        $expectedHash = [string] $ExpectedState.ContentSha256[$name]
+        if ($expectedHash -cnotmatch '^[0-9a-f]{64}$' -or $actualHash -cne $expectedHash) {
+            throw "License bundle artifact differs from captured expected bytes: $name"
+        }
+    }
 
     $commitText = [System.IO.File]::ReadAllText((Join-Path $Directory 'source-commit.txt'), [System.Text.UTF8Encoding]::new($false, $true))
-    if ($commitText -cne "$SourceCommit`n") { throw 'source-commit.txt does not contain the exact canonical source commit.' }
+    if ($commitText -cne $ExpectedState.SourceCommitText) { throw 'source-commit.txt does not contain the captured canonical source commit.' }
 
-    $manifestText = [System.IO.File]::ReadAllText((Join-Path $Directory 'source-manifest.sha256'), [System.Text.UTF8Encoding]::new($false, $true))
+    [byte[]] $manifestBytes = [System.IO.File]::ReadAllBytes((Join-Path $Directory 'source-manifest.sha256'))
+    if ([System.Convert]::ToBase64String($manifestBytes) -cne $ExpectedState.SourceManifestBase64) {
+        throw 'Source manifest differs from the captured canonical bytes.'
+    }
+    $manifestText = [System.Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes)
     if ($manifestText.Contains("`r") -or -not $manifestText.EndsWith("`n") -or $manifestText.Length -eq 1) {
         throw 'Source manifest is not canonical UTF-8 with LF line endings.'
     }
@@ -264,9 +486,12 @@ function Publish-LicenseBundle {
 }
 
 if ($FunctionsOnly) {
+    $ErrorActionPreference = $LicensePreviousErrorActionPreference
     return
 }
 
+$savedLicenseBuildEnvironment = Save-LicenseBuildEnvironment
+try {
 if ([string]::IsNullOrWhiteSpace($SourceCommit)) {
     throw 'SourceCommit is required for a production license bundle build.'
 }
@@ -275,7 +500,8 @@ Assert-LicenseBundleSourceState -SourceCommit $SourceCommit
 
 $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
 $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
-Invoke-LicenseToolchainBootstrap
+Set-SealedLicenseBuildEnvironment
+Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit
 Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
@@ -327,20 +553,35 @@ try {
         throw 'The immutable license source snapshot changed during the build.'
     }
 
-    Write-LicenseSha256CheckFile -PayloadPath $otaAdminPath -CheckFilePath (Join-Path $StagedPublishDirectory 'ota-admin.sha256') | Out-Null
-    Write-LicenseSha256CheckFile -PayloadPath $licenseServicePath -CheckFilePath (Join-Path $StagedPublishDirectory 'superpan-license.sha256') | Out-Null
+    $otaAdminHash = Get-LicenseFileSha256 -Path $otaAdminPath
+    $licenseServiceHash = Get-LicenseFileSha256 -Path $licenseServicePath
     $sourceManifestPath = Join-Path $StagedPublishDirectory 'source-manifest.sha256'
-    Write-DeterministicSourceManifest -SnapshotRoot $SnapshotDirectory -ManifestPath $sourceManifestPath
-    Write-LicenseSha256CheckFile -PayloadPath $sourceManifestPath -CheckFilePath (Join-Path $StagedPublishDirectory 'source-manifest.sha256.sha256') | Out-Null
+    $sourceManifestBase64 = Write-DeterministicSourceManifest -SnapshotRoot $SnapshotDirectory -ManifestPath $sourceManifestPath
+    if ((Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory) -cne $snapshotFingerprint) {
+        throw 'The immutable license source snapshot changed during manifest capture.'
+    }
+    [byte[]] $sourceManifestBytes = [System.Convert]::FromBase64String($sourceManifestBase64)
+    $sourceManifestHash = Get-LicenseBytesSha256 -Bytes $sourceManifestBytes
+    $expectedBundleState = New-LicenseBundleExpectedState -OtaAdminSha256 $otaAdminHash -LicenseServiceSha256 $licenseServiceHash -SourceManifestBase64 $sourceManifestBase64 -SourceManifestSha256 $sourceManifestHash -SourceCommit $SourceCommit
+
+    Write-LicenseSha256CheckFile -PayloadPath $otaAdminPath -CheckFilePath (Join-Path $StagedPublishDirectory 'ota-admin.sha256') -ExpectedSha256 $otaAdminHash | Out-Null
+    Write-LicenseSha256CheckFile -PayloadPath $licenseServicePath -CheckFilePath (Join-Path $StagedPublishDirectory 'superpan-license.sha256') -ExpectedSha256 $licenseServiceHash | Out-Null
+    Write-LicenseSha256CheckFile -PayloadPath $sourceManifestPath -CheckFilePath (Join-Path $StagedPublishDirectory 'source-manifest.sha256.sha256') -ExpectedSha256 $sourceManifestHash | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $StagedPublishDirectory 'source-commit.txt'), "$SourceCommit`n", [System.Text.UTF8Encoding]::new($false))
 
-    Assert-LicenseBundleArtifacts -Directory $StagedPublishDirectory -SourceCommit $SourceCommit
+    Assert-LicenseBundleArtifacts -Directory $StagedPublishDirectory -ExpectedState $expectedBundleState
     Publish-LicenseBundle -StagedPath $StagedPublishDirectory -PublishedPath $OutputDirectory -PreviousPath $BackupDirectory
+    Assert-LicenseBundleArtifacts -Directory $OutputDirectory -ExpectedState $expectedBundleState
 }
 finally {
     if (Test-Path -LiteralPath $StagingDirectory) {
         Remove-SafeStagingDirectory -Path $StagingDirectory
     }
+}
+}
+finally {
+    Restore-LicenseBuildEnvironment -SavedEnvironment $savedLicenseBuildEnvironment
+    $ErrorActionPreference = $LicensePreviousErrorActionPreference
 }
 
 Write-Output "Built immutable production license bundle $OutputDirectory"

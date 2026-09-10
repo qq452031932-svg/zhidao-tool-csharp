@@ -377,7 +377,7 @@ func TestLicenseBundleBuilderDeclaresImmutableProductionContract(t *testing.T) {
 		"build -buildvcs=false -trimpath -ldflags '-s -w'", "./cmd/ota-admin", "./cmd/license-service",
 		"ota-admin", "ota-admin.sha256", "superpan-license", "superpan-license.sha256",
 		"source-manifest.sha256", "source-manifest.sha256.sha256", "source-commit.txt",
-		"Write-DeterministicSourceManifest", "Write-LicenseSha256CheckFile", "Assert-LicenseBundleArtifacts", "Publish-LicenseBundle",
+		"Write-DeterministicSourceManifest", "Write-LicenseSha256CheckFile", "New-LicenseBundleExpectedState", "Assert-LicenseBundleArtifacts", "Publish-LicenseBundle",
 	} {
 		if !strings.Contains(buildScript, required) {
 			t.Errorf("license bundle builder does not contain %q", required)
@@ -419,9 +419,26 @@ func TestLicenseBundleBootstrapsPinnedToolchainBeforeSnapshot(t *testing.T) {
 		t.Fatal("license bundle builder does not define a FunctionsOnly entry boundary")
 	}
 	entryPoint := buildScript[entryOffset:]
+	for _, required := range []string{
+		"function Invoke-LicenseToolchainBootstrap",
+		"scripts\\bootstrap_go_toolchain.ps1",
+		"rev-parse --show-object-format",
+		"blob $($Bytes.Length)",
+		"[System.IO.FileShare]::Read",
+		"bootstrapStream.Dispose()",
+		"does not match its committed Git blob",
+		"& powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript",
+		"$LASTEXITCODE",
+		"Pinned Go bootstrap failed",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("license bundle bootstrap contract does not contain %q", required)
+		}
+	}
 	requireSubstringsInOrder(t, entryPoint,
 		"Assert-LicenseBundleSourceState -SourceCommit $SourceCommit",
-		"Invoke-LicenseToolchainBootstrap",
+		"Set-SealedLicenseBuildEnvironment",
+		"Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit",
 		"Assert-PinnedGoToolchain",
 		"New-LicenseBundleSourceSnapshot",
 	)
@@ -432,42 +449,101 @@ func TestLicenseBundleBootstrapsPinnedToolchainBeforeSnapshot(t *testing.T) {
 	if strings.Contains(entryPoint[snapshotOffset:], "Invoke-LicenseToolchainBootstrap") {
 		t.Fatal("license bundle entry point reads the mutable bootstrap script after snapshot creation")
 	}
-	for _, required := range []string{
-		"function Invoke-LicenseToolchainBootstrap",
-		"scripts\\bootstrap_go_toolchain.ps1",
-		"& powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript",
-		"$LASTEXITCODE",
-		"Pinned Go bootstrap failed",
-	} {
-		if !strings.Contains(buildScript, required) {
-			t.Errorf("license bundle bootstrap contract does not contain %q", required)
-		}
+	manifestOffset := strings.LastIndex(entryPoint, "Write-DeterministicSourceManifest -SnapshotRoot $SnapshotDirectory")
+	if manifestOffset < 0 {
+		t.Fatal("license bundle entry point does not generate a deterministic source manifest")
 	}
-
+	requireSubstringsInOrder(t, entryPoint[manifestOffset:],
+		"Write-DeterministicSourceManifest -SnapshotRoot $SnapshotDirectory",
+		"Get-SnapshotFingerprint -SnapshotRoot $SnapshotDirectory",
+		"New-LicenseBundleExpectedState",
+	)
 	root := testLocalTempDir(t)
-	successScript := filepath.Join(root, "bootstrap-success.ps1")
-	failureScript := filepath.Join(root, "bootstrap-failure.ps1")
+	fixtureRepository := filepath.Join(root, "repository")
+	bootstrapPath := filepath.Join(fixtureRepository, "services", "ota_admin", "scripts", "bootstrap_go_toolchain.ps1")
+	if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
+		t.Fatalf("create bootstrap fixture directory: %v", err)
+	}
 	successMarker := filepath.Join(root, "success.marker")
 	failureMarker := filepath.Join(root, "failure.marker")
+	replacementMarker := filepath.Join(root, "replacement.marker")
 	snapshotRoot := filepath.Join(root, "snapshot-must-not-exist")
-	if err := os.WriteFile(successScript, []byte("param([string] $Marker)\n[IO.File]::WriteAllText($Marker, 'success')\nexit 0\n"), 0o600); err != nil {
+	if err := os.WriteFile(bootstrapPath, []byte("param([string] $Marker)\n[IO.File]::WriteAllText($Marker, 'success')\nexit 0\n"), 0o600); err != nil {
 		t.Fatalf("write success bootstrap fixture: %v", err)
 	}
-	if err := os.WriteFile(failureScript, []byte("param([string] $Marker)\n[IO.File]::WriteAllText($Marker, 'failure')\nexit 23\n"), 0o600); err != nil {
-		t.Fatalf("write failure bootstrap fixture: %v", err)
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "compat@example.invalid"},
+		{"config", "user.name", "Compatibility Test"},
+		{"add", "services/ota_admin/scripts/bootstrap_go_toolchain.ps1"},
+		{"commit", "-m", "bootstrap success"},
+	} {
+		command := exec.Command("git", append([]string{"-C", fixtureRepository}, args...)...)
+		if output, commandErr := command.CombinedOutput(); commandErr != nil {
+			t.Fatalf("git %v failed: %v; output:\n%s", args, commandErr, output)
+		}
 	}
+	commitOutput, err := exec.Command("git", "-C", fixtureRepository, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve success bootstrap commit: %v", err)
+	}
+	successCommit := strings.TrimSpace(string(commitOutput))
 	harnessPath := filepath.Join(root, "bootstrap-contract.ps1")
-	harness := `param([string] $BuildScript, [string] $SuccessScript, [string] $FailureScript, [string] $SuccessMarker, [string] $FailureMarker, [string] $SnapshotRoot)
+	harness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $BootstrapPath, [string] $SourceCommit, [string] $SuccessMarker, [string] $ReplacementMarker, [string] $SnapshotRoot)
 $ErrorActionPreference = 'Stop'
+$FixtureSourceCommit = $SourceCommit
 . $BuildScript -FunctionsOnly
+$RepositoryRoot = [IO.Path]::GetFullPath($FixtureRepository)
+$LicenseBootstrapScript = [IO.Path]::GetFullPath($BootstrapPath)
 
-$LicenseBootstrapScript = $SuccessScript
-Invoke-LicenseToolchainBootstrap -Arguments @('-Marker', $SuccessMarker)
+Invoke-LicenseToolchainBootstrap -SourceCommit $FixtureSourceCommit -Arguments @('-Marker', $SuccessMarker)
 if (-not (Test-Path -LiteralPath $SuccessMarker -PathType Leaf)) { throw 'success bootstrap was not invoked' }
 
-$LicenseBootstrapScript = $FailureScript
+[IO.File]::WriteAllText($BootstrapPath, ('param([string] $Marker)' + [char]10 + '[IO.File]::WriteAllText($Marker, ''replacement'')' + [char]10 + 'exit 23' + [char]10), [Text.UTF8Encoding]::new($false))
 try {
-  Invoke-LicenseToolchainBootstrap -Arguments @('-Marker', $FailureMarker)
+  Invoke-LicenseToolchainBootstrap -SourceCommit $FixtureSourceCommit -Arguments @('-Marker', $ReplacementMarker)
+  New-LicenseBundleSourceSnapshot -SourcePaths @('services/ota_admin/go.mod') -DestinationRoot $SnapshotRoot -SourceCommit ('0' * 40)
+  throw 'replaced bootstrap unexpectedly executed or continued to snapshot creation'
+}
+catch {
+  if ($_.Exception.Message -eq 'replaced bootstrap unexpectedly executed or continued to snapshot creation') { throw }
+  if ($_.Exception.Message -notlike '*does not match its committed Git blob*') { throw }
+}
+if (Test-Path -LiteralPath $ReplacementMarker) { throw 'uncommitted replacement bootstrap executed' }
+if (Test-Path -LiteralPath $SnapshotRoot) { throw 'snapshot exists after bootstrap failure' }
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write bootstrap harness: %v", err)
+	}
+	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, fixtureRepository, bootstrapPath, successCommit, successMarker, replacementMarker, snapshotRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("license bootstrap harness failed: %v; output:\n%s", runErr, output)
+	}
+
+	for _, args := range [][]string{
+		{"add", "services/ota_admin/scripts/bootstrap_go_toolchain.ps1"},
+		{"commit", "-m", "bootstrap failure"},
+	} {
+		command := exec.Command("git", append([]string{"-C", fixtureRepository}, args...)...)
+		if output, commandErr := command.CombinedOutput(); commandErr != nil {
+			t.Fatalf("git %v failed: %v; output:\n%s", args, commandErr, output)
+		}
+	}
+	failureCommitOutput, err := exec.Command("git", "-C", fixtureRepository, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve failure bootstrap commit: %v", err)
+	}
+	failureCommit := strings.TrimSpace(string(failureCommitOutput))
+	failureHarnessPath := filepath.Join(root, "bootstrap-failure-contract.ps1")
+	failureHarness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $BootstrapPath, [string] $SourceCommit, [string] $FailureMarker, [string] $SnapshotRoot)
+$ErrorActionPreference = 'Stop'
+$FixtureSourceCommit = $SourceCommit
+. $BuildScript -FunctionsOnly
+$RepositoryRoot = [IO.Path]::GetFullPath($FixtureRepository)
+$LicenseBootstrapScript = [IO.Path]::GetFullPath($BootstrapPath)
+try {
+  Invoke-LicenseToolchainBootstrap -SourceCommit $FixtureSourceCommit -Arguments @('-Marker', $FailureMarker)
   New-LicenseBundleSourceSnapshot -SourcePaths @('services/ota_admin/go.mod') -DestinationRoot $SnapshotRoot -SourceCommit ('0' * 40)
   throw 'failed bootstrap unexpectedly continued to snapshot creation'
 }
@@ -475,16 +551,82 @@ catch {
   if ($_.Exception.Message -eq 'failed bootstrap unexpectedly continued to snapshot creation') { throw }
   if ($_.Exception.Message -notlike '*Pinned Go bootstrap failed*') { throw }
 }
-if (-not (Test-Path -LiteralPath $FailureMarker -PathType Leaf)) { throw 'failure bootstrap was not invoked' }
-if (Test-Path -LiteralPath $SnapshotRoot) { throw 'snapshot exists after bootstrap failure' }
+if (-not (Test-Path -LiteralPath $FailureMarker -PathType Leaf)) { throw 'committed failure bootstrap was not invoked' }
+if (Test-Path -LiteralPath $SnapshotRoot) { throw 'snapshot exists after committed bootstrap failure' }
+`
+	if err := os.WriteFile(failureHarnessPath, []byte(failureHarness), 0o600); err != nil {
+		t.Fatalf("write failure bootstrap harness: %v", err)
+	}
+	output, runErr = exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", failureHarnessPath, buildScriptPath, fixtureRepository, bootstrapPath, failureCommit, failureMarker, snapshotRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("license failure bootstrap harness failed: %v; output:\n%s", runErr, output)
+	}
+}
+
+func TestLicenseBundleSealsAndRestoresGoEnvironment(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_license_bundle.ps1"), "\r\n", "\n")
+	for _, required := range []string{
+		"GOENV", "off", "GOFLAGS", "GOWORK", "GOEXPERIMENT", "GOAMD64", "v1", "GOTOOLCHAIN", "local",
+		"GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GOAUTH", "GOPROXY", "GOSUMDB", "GOVCS",
+		"CC", "CXX", "PKG_CONFIG", "Save-LicenseBuildEnvironment", "Set-SealedLicenseBuildEnvironment", "Restore-LicenseBuildEnvironment",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("license bundle environment contract does not contain %q", required)
+		}
+	}
+
+	root := testLocalTempDir(t)
+	harnessPath := filepath.Join(root, "environment-contract.ps1")
+	harness := `param([string] $BuildScript)
+$ErrorActionPreference = 'Continue'
+$names = @('GOENV','GOFLAGS','GOWORK','GOEXPERIMENT','GOAMD64','GOTOOLCHAIN','GOPRIVATE','GONOPROXY','GONOSUMDB','GOINSECURE','GOAUTH','GOPROXY','GOSUMDB','GOVCS','CC','CXX','PKG_CONFIG')
+$before = @{}
+foreach ($name in $names) {
+  $value = 'sentinel-' + $name
+  if ($name -eq 'GOFLAGS') { $value = '-overlay=attacker.json -toolexec=attacker.exe' }
+  if ($name -eq 'GOWORK') { $value = 'C:\attacker\go.work' }
+  if ($name -eq 'GOENV') { $value = 'C:\attacker\go.env' }
+  [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+  $before[$name] = $value
+}
+. $BuildScript -FunctionsOnly
+if ($ErrorActionPreference -ne 'Continue') { throw 'FunctionsOnly changed ErrorActionPreference' }
+foreach ($name in $names) {
+  if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $before[$name]) { throw "FunctionsOnly polluted $name" }
+}
+$saved = Save-LicenseBuildEnvironment
+try {
+  Set-SealedLicenseBuildEnvironment
+  $expected = @{
+    GOENV='off'; GOFLAGS=''; GOWORK='off'; GOEXPERIMENT=''; GOAMD64='v1'; GOTOOLCHAIN='local';
+    GOPRIVATE=''; GONOPROXY=''; GONOSUMDB=''; GOINSECURE=''; GOAUTH='off';
+    GOPROXY='https://proxy.golang.org,direct'; GOSUMDB='sum.golang.org'; GOVCS='public:git|hg,private:off';
+    CC=''; CXX=''; PKG_CONFIG=''
+  }
+  foreach ($name in $names) {
+    $actual = [string][Environment]::GetEnvironmentVariable($name, 'Process')
+    if ($actual -cne $expected[$name]) { throw "$name was not sealed: '$actual'" }
+  }
+}
+finally {
+  Restore-LicenseBuildEnvironment -SavedEnvironment $saved
+}
+foreach ($name in $names) {
+  if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $before[$name]) { throw "$name was not restored" }
+}
 `
 	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
-		t.Fatalf("write bootstrap harness: %v", err)
+		t.Fatalf("write environment harness: %v", err)
 	}
 	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
-	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, successScript, failureScript, successMarker, failureMarker, snapshotRoot).CombinedOutput()
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath).CombinedOutput()
 	if runErr != nil {
-		t.Fatalf("license bootstrap harness failed: %v; output:\n%s", runErr, output)
+		t.Fatalf("license environment harness failed: %v; output:\n%s", runErr, output)
 	}
 }
 
@@ -582,20 +724,36 @@ try {
   New-Item -ItemType Directory -Path $staged | Out-Null
   [System.IO.File]::WriteAllText((Join-Path $staged 'ota-admin'), ('ota' + [char]10), [System.Text.UTF8Encoding]::new($false))
   [System.IO.File]::WriteAllText((Join-Path $staged 'superpan-license'), ('license' + [char]10), [System.Text.UTF8Encoding]::new($false))
-  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256') | Out-Null
-  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'superpan-license') -CheckFilePath (Join-Path $staged 'superpan-license.sha256') | Out-Null
+  $otaHash = Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256')
+  $licenseHash = Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'superpan-license') -CheckFilePath (Join-Path $staged 'superpan-license.sha256')
   Write-DeterministicSourceManifest -SnapshotRoot $SnapshotRoot -ManifestPath (Join-Path $staged 'source-manifest.sha256')
-  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256') | Out-Null
+  $manifestBytes = [IO.File]::ReadAllBytes((Join-Path $staged 'source-manifest.sha256'))
+  $manifestHash = Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256')
   [System.IO.File]::WriteAllText((Join-Path $staged 'source-commit.txt'), ($Commit + [char]10), [System.Text.UTF8Encoding]::new($false))
-  Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit
-  Add-Content -LiteralPath (Join-Path $staged 'ota-admin') -Value tampered
-  try { Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit; throw 'tampered artifact unexpectedly accepted' }
-  catch { if ($_.Exception.Message -eq 'tampered artifact unexpectedly accepted') { throw } }
+  $expectedState = New-LicenseBundleExpectedState -OtaAdminSha256 $otaHash -LicenseServiceSha256 $licenseHash -SourceManifestBase64 ([Convert]::ToBase64String($manifestBytes)) -SourceManifestSha256 $manifestHash -SourceCommit $Commit
+  Assert-LicenseBundleArtifacts -Directory $staged -ExpectedState $expectedState
+
+  [System.IO.File]::WriteAllText((Join-Path $staged 'ota-admin'), ('coordinated-tamper' + [char]10), [System.Text.UTF8Encoding]::new($false))
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256') | Out-Null
+  try { Assert-LicenseBundleArtifacts -Directory $staged -ExpectedState $expectedState; throw 'coordinated payload tamper unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'coordinated payload tamper unexpectedly accepted') { throw } }
   [System.IO.File]::WriteAllText((Join-Path $staged 'ota-admin'), ('ota' + [char]10), [System.Text.UTF8Encoding]::new($false))
   Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256') | Out-Null
-  Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit
+
+  [System.IO.File]::WriteAllText((Join-Path $staged 'source-manifest.sha256'), ('0' * 64 + '  injected.go' + [char]10), [System.Text.UTF8Encoding]::new($false))
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256') | Out-Null
+  try { Assert-LicenseBundleArtifacts -Directory $staged -ExpectedState $expectedState; throw 'coordinated manifest tamper unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'coordinated manifest tamper unexpectedly accepted') { throw } }
+  [IO.File]::WriteAllBytes((Join-Path $staged 'source-manifest.sha256'), $manifestBytes)
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256') | Out-Null
+
+  Assert-LicenseBundleArtifacts -Directory $staged -ExpectedState $expectedState
   Publish-LicenseBundle -StagedPath $staged -PublishedPath $published -PreviousPath $backup
   if (-not (Test-Path -LiteralPath (Join-Path $published 'superpan-license') -PathType Leaf)) { throw 'atomic publication omitted license binary' }
+  Assert-LicenseBundleArtifacts -Directory $published -ExpectedState $expectedState
+  [IO.File]::WriteAllBytes((Join-Path $published 'superpan-license'), [byte[]]@(1,2,3))
+  try { Assert-LicenseBundleArtifacts -Directory $published -ExpectedState $expectedState; throw 'published truncation unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'published truncation unexpectedly accepted') { throw } }
 }
 finally {
   if (Test-Path -LiteralPath $StagingDirectory) { Remove-SafeStagingDirectory -Path $StagingDirectory }
