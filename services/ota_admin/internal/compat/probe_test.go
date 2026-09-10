@@ -407,6 +407,87 @@ func TestLicenseBundleBuilderDeclaresImmutableProductionContract(t *testing.T) {
 	}
 }
 
+func TestLicenseBundleBootstrapsPinnedToolchainBeforeSnapshot(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_license_bundle.ps1"), "\r\n", "\n")
+	entryOffset := strings.LastIndex(buildScript, "if ($FunctionsOnly)")
+	if entryOffset < 0 {
+		t.Fatal("license bundle builder does not define a FunctionsOnly entry boundary")
+	}
+	entryPoint := buildScript[entryOffset:]
+	requireSubstringsInOrder(t, entryPoint,
+		"Assert-LicenseBundleSourceState -SourceCommit $SourceCommit",
+		"Invoke-LicenseToolchainBootstrap",
+		"Assert-PinnedGoToolchain",
+		"New-LicenseBundleSourceSnapshot",
+	)
+	snapshotOffset := strings.Index(entryPoint, "New-LicenseBundleSourceSnapshot")
+	if snapshotOffset < 0 {
+		t.Fatal("license bundle entry point does not create a source snapshot")
+	}
+	if strings.Contains(entryPoint[snapshotOffset:], "Invoke-LicenseToolchainBootstrap") {
+		t.Fatal("license bundle entry point reads the mutable bootstrap script after snapshot creation")
+	}
+	for _, required := range []string{
+		"function Invoke-LicenseToolchainBootstrap",
+		"scripts\\bootstrap_go_toolchain.ps1",
+		"& powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript",
+		"$LASTEXITCODE",
+		"Pinned Go bootstrap failed",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("license bundle bootstrap contract does not contain %q", required)
+		}
+	}
+
+	root := testLocalTempDir(t)
+	successScript := filepath.Join(root, "bootstrap-success.ps1")
+	failureScript := filepath.Join(root, "bootstrap-failure.ps1")
+	successMarker := filepath.Join(root, "success.marker")
+	failureMarker := filepath.Join(root, "failure.marker")
+	snapshotRoot := filepath.Join(root, "snapshot-must-not-exist")
+	if err := os.WriteFile(successScript, []byte("param([string] $Marker)\n[IO.File]::WriteAllText($Marker, 'success')\nexit 0\n"), 0o600); err != nil {
+		t.Fatalf("write success bootstrap fixture: %v", err)
+	}
+	if err := os.WriteFile(failureScript, []byte("param([string] $Marker)\n[IO.File]::WriteAllText($Marker, 'failure')\nexit 23\n"), 0o600); err != nil {
+		t.Fatalf("write failure bootstrap fixture: %v", err)
+	}
+	harnessPath := filepath.Join(root, "bootstrap-contract.ps1")
+	harness := `param([string] $BuildScript, [string] $SuccessScript, [string] $FailureScript, [string] $SuccessMarker, [string] $FailureMarker, [string] $SnapshotRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+
+$LicenseBootstrapScript = $SuccessScript
+Invoke-LicenseToolchainBootstrap -Arguments @('-Marker', $SuccessMarker)
+if (-not (Test-Path -LiteralPath $SuccessMarker -PathType Leaf)) { throw 'success bootstrap was not invoked' }
+
+$LicenseBootstrapScript = $FailureScript
+try {
+  Invoke-LicenseToolchainBootstrap -Arguments @('-Marker', $FailureMarker)
+  New-LicenseBundleSourceSnapshot -SourcePaths @('services/ota_admin/go.mod') -DestinationRoot $SnapshotRoot -SourceCommit ('0' * 40)
+  throw 'failed bootstrap unexpectedly continued to snapshot creation'
+}
+catch {
+  if ($_.Exception.Message -eq 'failed bootstrap unexpectedly continued to snapshot creation') { throw }
+  if ($_.Exception.Message -notlike '*Pinned Go bootstrap failed*') { throw }
+}
+if (-not (Test-Path -LiteralPath $FailureMarker -PathType Leaf)) { throw 'failure bootstrap was not invoked' }
+if (Test-Path -LiteralPath $SnapshotRoot) { throw 'snapshot exists after bootstrap failure' }
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write bootstrap harness: %v", err)
+	}
+	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, successScript, failureScript, successMarker, failureMarker, snapshotRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("license bootstrap harness failed: %v; output:\n%s", runErr, output)
+	}
+}
+
 func TestLicenseBundleFunctionsEnforceSourceAndArtifactContracts(t *testing.T) {
 	powerShell, err := exec.LookPath("powershell")
 	if err != nil {

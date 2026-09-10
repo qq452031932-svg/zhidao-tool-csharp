@@ -11,6 +11,7 @@ $LicenseFunctionsOnly = [bool] $FunctionsOnly
 $BaseBuilderScript = Join-Path $PSScriptRoot 'build_linux_amd64.ps1'
 . $BaseBuilderScript -FunctionsOnly
 $FunctionsOnly = $LicenseFunctionsOnly
+$LicenseBootstrapScript = Join-Path $ModuleRoot 'scripts\bootstrap_go_toolchain.ps1'
 
 $LicenseOutputDirectory = [System.IO.Path]::GetFullPath((Join-Path $ArtifactsRoot 'license-production'))
 $licenseInvocationId = [guid]::NewGuid().ToString('N')
@@ -29,6 +30,16 @@ $LicenseBundleNames = @(
     'superpan-license'
     'superpan-license.sha256'
 )
+
+function Invoke-LicenseToolchainBootstrap {
+    param([string[]] $Arguments = @())
+
+    if (-not (Test-Path -LiteralPath $LicenseBootstrapScript -PathType Leaf)) {
+        throw "Pinned Go bootstrap script is missing: $LicenseBootstrapScript"
+    }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $LicenseBootstrapScript @Arguments
+    if ($LASTEXITCODE -ne 0) { throw 'Pinned Go bootstrap failed.' }
+}
 
 function Assert-LicenseBundleSourceState {
     param([Parameter(Mandatory)][string] $SourceCommit)
@@ -264,6 +275,7 @@ Assert-LicenseBundleSourceState -SourceCommit $SourceCommit
 
 $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4caabd2edd95d'
 $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
+Invoke-LicenseToolchainBootstrap
 Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
