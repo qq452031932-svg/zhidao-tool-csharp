@@ -377,7 +377,7 @@ func TestLicenseBundleBuilderDeclaresImmutableProductionContract(t *testing.T) {
 		"build -buildvcs=false -trimpath -ldflags '-s -w'", "./cmd/ota-admin", "./cmd/license-service",
 		"ota-admin", "ota-admin.sha256", "superpan-license", "superpan-license.sha256",
 		"source-manifest.sha256", "source-manifest.sha256.sha256", "source-commit.txt",
-		"Write-DeterministicSourceManifest", "Write-LicenseSha256CheckFile", "New-LicenseBundleExpectedState", "Assert-LicenseBundleArtifacts", "Publish-LicenseBundle",
+		"Write-DeterministicSourceManifest", "Write-LicenseSha256CheckFile", "New-LicenseBundleExpectedState", "Assert-LicenseBundleArtifacts", "Publish-VerifiedLicenseBundle",
 	} {
 		if !strings.Contains(buildScript, required) {
 			t.Errorf("license bundle builder does not contain %q", required)
@@ -393,7 +393,7 @@ func TestLicenseBundleBuilderDeclaresImmutableProductionContract(t *testing.T) {
 		"./cmd/license-service",
 		"Write-DeterministicSourceManifest",
 		"Assert-LicenseBundleArtifacts",
-		"Publish-LicenseBundle",
+		"Publish-VerifiedLicenseBundle",
 	)
 	snapshotOffset := strings.Index(buildScript, "New-LicenseBundleSourceSnapshot")
 	if snapshotOffset < 0 {
@@ -439,7 +439,7 @@ func TestLicenseBundleBootstrapsPinnedToolchainBeforeSnapshot(t *testing.T) {
 		"Assert-LicenseBundleSourceState -SourceCommit $SourceCommit",
 		"Set-SealedLicenseBuildEnvironment",
 		"Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit",
-		"Assert-PinnedGoToolchain",
+		"Assert-PinnedLicenseGoToolchain",
 		"New-LicenseBundleSourceSnapshot",
 	)
 	snapshotOffset := strings.Index(entryPoint, "New-LicenseBundleSourceSnapshot")
@@ -572,8 +572,10 @@ func TestLicenseBundleSealsAndRestoresGoEnvironment(t *testing.T) {
 	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_license_bundle.ps1"), "\r\n", "\n")
 	for _, required := range []string{
 		"GOENV", "off", "GOFLAGS", "GOWORK", "GOEXPERIMENT", "GOAMD64", "v1", "GOTOOLCHAIN", "local",
+		"GOROOT", "GOFIPS140", "GODEBUG", "GO111MODULE", "GOCACHEPROG", "GO_EXTLINK_ENABLED",
 		"GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GOAUTH", "GOPROXY", "GOSUMDB", "GOVCS",
 		"CC", "CXX", "PKG_CONFIG", "Save-LicenseBuildEnvironment", "Set-SealedLicenseBuildEnvironment", "Restore-LicenseBuildEnvironment",
+		"Assert-LicenseGoRoot", "env GOROOT", "Assert-PinnedLicenseGoToolchain",
 	} {
 		if !strings.Contains(buildScript, required) {
 			t.Errorf("license bundle environment contract does not contain %q", required)
@@ -581,10 +583,18 @@ func TestLicenseBundleSealsAndRestoresGoEnvironment(t *testing.T) {
 	}
 
 	root := testLocalTempDir(t)
+	fakeGoRoot := filepath.Join(root, "pinned-go")
+	fakeGo := filepath.Join(fakeGoRoot, "bin", "go.cmd")
+	if err := os.MkdirAll(filepath.Dir(fakeGo), 0o700); err != nil {
+		t.Fatalf("create fake pinned Go bin directory: %v", err)
+	}
+	if err := os.WriteFile(fakeGo, []byte("@echo off\r\nif \"%~1 %~2\"==\"env GOROOT\" (\r\n  echo %GOROOT%\r\n  exit /b 0\r\n)\r\nexit /b 23\r\n"), 0o600); err != nil {
+		t.Fatalf("write fake pinned Go executable: %v", err)
+	}
 	harnessPath := filepath.Join(root, "environment-contract.ps1")
-	harness := `param([string] $BuildScript)
+	harness := `param([string] $BuildScript, [string] $FakeGo)
 $ErrorActionPreference = 'Continue'
-$names = @('GOENV','GOFLAGS','GOWORK','GOEXPERIMENT','GOAMD64','GOTOOLCHAIN','GOPRIVATE','GONOPROXY','GONOSUMDB','GOINSECURE','GOAUTH','GOPROXY','GOSUMDB','GOVCS','CC','CXX','PKG_CONFIG')
+$names = @('GOENV','GOFLAGS','GOWORK','GOEXPERIMENT','GOAMD64','GOTOOLCHAIN','GOROOT','GOFIPS140','GODEBUG','GO111MODULE','GOCACHEPROG','GO_EXTLINK_ENABLED','GOPRIVATE','GONOPROXY','GONOSUMDB','GOINSECURE','GOAUTH','GOPROXY','GOSUMDB','GOVCS','CC','CXX','PKG_CONFIG')
 $before = @{}
 foreach ($name in $names) {
   $value = 'sentinel-' + $name
@@ -595,6 +605,7 @@ foreach ($name in $names) {
   $before[$name] = $value
 }
 . $BuildScript -FunctionsOnly
+$GoExe = [IO.Path]::GetFullPath($FakeGo)
 if ($ErrorActionPreference -ne 'Continue') { throw 'FunctionsOnly changed ErrorActionPreference' }
 foreach ($name in $names) {
   if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $before[$name]) { throw "FunctionsOnly polluted $name" }
@@ -602,8 +613,10 @@ foreach ($name in $names) {
 $saved = Save-LicenseBuildEnvironment
 try {
   Set-SealedLicenseBuildEnvironment
+  $expectedGoRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $GoExe))).TrimEnd([IO.Path]::DirectorySeparatorChar)
   $expected = @{
     GOENV='off'; GOFLAGS=''; GOWORK='off'; GOEXPERIMENT=''; GOAMD64='v1'; GOTOOLCHAIN='local';
+    GOROOT=$expectedGoRoot; GOFIPS140='off'; GODEBUG=''; GO111MODULE='on'; GOCACHEPROG=''; GO_EXTLINK_ENABLED='0';
     GOPRIVATE=''; GONOPROXY=''; GONOSUMDB=''; GOINSECURE=''; GOAUTH='off';
     GOPROXY='https://proxy.golang.org,direct'; GOSUMDB='sum.golang.org'; GOVCS='public:git|hg,private:off';
     CC=''; CXX=''; PKG_CONFIG=''
@@ -612,6 +625,11 @@ try {
     $actual = [string][Environment]::GetEnvironmentVariable($name, 'Process')
     if ($actual -cne $expected[$name]) { throw "$name was not sealed: '$actual'" }
   }
+  Assert-LicenseGoRoot -GoExecutable $GoExe -ExpectedGoRoot $expectedGoRoot
+  [Environment]::SetEnvironmentVariable('GOROOT', 'C:\attacker\compatible-go', 'Process')
+  try { Assert-LicenseGoRoot -GoExecutable $GoExe -ExpectedGoRoot $expectedGoRoot; throw 'malicious GOROOT unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'malicious GOROOT unexpectedly accepted') { throw } }
+  [Environment]::SetEnvironmentVariable('GOROOT', $expectedGoRoot, 'Process')
 }
 finally {
   Restore-LicenseBuildEnvironment -SavedEnvironment $saved
@@ -624,9 +642,142 @@ foreach ($name in $names) {
 		t.Fatalf("write environment harness: %v", err)
 	}
 	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
-	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath).CombinedOutput()
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, fakeGo).CombinedOutput()
 	if runErr != nil {
 		t.Fatalf("license environment harness failed: %v; output:\n%s", runErr, output)
+	}
+}
+
+func TestLicenseBundlePublishVerificationIsTransactional(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_license_bundle.ps1"), "\r\n", "\n")
+	for _, required := range []string{
+		"function Publish-VerifiedLicenseBundle",
+		"Assert-LicenseBundleArtifacts -Directory $PublishedPath -ExpectedState $ExpectedState",
+		"Move-Item -LiteralPath $PreviousPath -Destination $PublishedPath",
+		"Remove-SafeArtifactDirectory -Path $PublishedPath",
+		"Remove-SafeArtifactDirectory -Path $PreviousPath",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("verified license publication contract does not contain %q", required)
+		}
+	}
+	start := strings.Index(buildScript, "function Publish-VerifiedLicenseBundle")
+	if start < 0 {
+		t.Fatal("license bundle builder does not define transactional verified publication")
+	}
+	end := strings.Index(buildScript[start:], "\n}\n\nif ($FunctionsOnly)")
+	if end < 0 {
+		t.Fatal("could not isolate transactional verified publication function")
+	}
+	publishFunction := buildScript[start : start+end]
+	if strings.Contains(publishFunction, "Publish-StagedArtifacts") {
+		t.Fatal("verified publication delegates to the base helper that removes backup before verification")
+	}
+	requireSubstringsInOrder(t, publishFunction,
+		"Move-Item -LiteralPath $StagedPath -Destination $PublishedPath",
+		"Assert-LicenseBundleArtifacts -Directory $PublishedPath -ExpectedState $ExpectedState",
+		"Remove-SafeArtifactDirectory -Path $PreviousPath",
+	)
+
+	root := testLocalTempDir(t)
+	harnessPath := filepath.Join(root, "verified-publish-contract.ps1")
+	artifactRoot := filepath.Join(root, "artifacts")
+	harness := `param([string] $BuildScript, [string] $TestArtifactRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+$ArtifactsRoot = [IO.Path]::GetFullPath($TestArtifactRoot)
+New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
+
+function New-TestPublishCase([string] $Name) {
+  $script:StagingDirectory = Join-Path ([IO.Path]::GetTempPath()) ('spota-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+  $script:StagedPublishDirectory = Join-Path $script:StagingDirectory 'p'
+  New-SafeStagingDirectory -Path $script:StagingDirectory
+  New-Item -ItemType Directory -Path $script:StagedPublishDirectory | Out-Null
+  [IO.File]::WriteAllText((Join-Path $script:StagedPublishDirectory 'ota-admin'), ("ota-$Name" + [char]10), [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText((Join-Path $script:StagedPublishDirectory 'superpan-license'), ("license-$Name" + [char]10), [Text.UTF8Encoding]::new($false))
+  $otaHash = Get-LicenseFileSha256 -Path (Join-Path $script:StagedPublishDirectory 'ota-admin')
+  $licenseHash = Get-LicenseFileSha256 -Path (Join-Path $script:StagedPublishDirectory 'superpan-license')
+  $manifestText = (('0' * 64) + '  go.mod' + [char]10)
+  [IO.File]::WriteAllText((Join-Path $script:StagedPublishDirectory 'source-manifest.sha256'), $manifestText, [Text.UTF8Encoding]::new($false))
+  $manifestBytes = [Text.UTF8Encoding]::new($false).GetBytes($manifestText)
+  $manifestHash = Get-LicenseBytesSha256 -Bytes $manifestBytes
+  $commit = 'a' * 40
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $script:StagedPublishDirectory 'ota-admin') -CheckFilePath (Join-Path $script:StagedPublishDirectory 'ota-admin.sha256') -ExpectedSha256 $otaHash | Out-Null
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $script:StagedPublishDirectory 'superpan-license') -CheckFilePath (Join-Path $script:StagedPublishDirectory 'superpan-license.sha256') -ExpectedSha256 $licenseHash | Out-Null
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $script:StagedPublishDirectory 'source-manifest.sha256') -CheckFilePath (Join-Path $script:StagedPublishDirectory 'source-manifest.sha256.sha256') -ExpectedSha256 $manifestHash | Out-Null
+  [IO.File]::WriteAllText((Join-Path $script:StagedPublishDirectory 'source-commit.txt'), ($commit + [char]10), [Text.UTF8Encoding]::new($false))
+  $expectedState = New-LicenseBundleExpectedState -OtaAdminSha256 $otaHash -LicenseServiceSha256 $licenseHash -SourceManifestBase64 ([Convert]::ToBase64String($manifestBytes)) -SourceManifestSha256 $manifestHash -SourceCommit $commit
+  Assert-LicenseBundleArtifacts -Directory $script:StagedPublishDirectory -ExpectedState $expectedState
+  return [pscustomobject]@{
+    Staging = $script:StagingDirectory
+    Staged = $script:StagedPublishDirectory
+    Published = Join-Path $ArtifactsRoot ("published-$Name")
+    Backup = Join-Path $ArtifactsRoot ("backup-$Name")
+    Expected = $expectedState
+  }
+}
+
+$success = New-TestPublishCase -Name 'success'
+New-Item -ItemType Directory -Path $success.Published | Out-Null
+[IO.File]::WriteAllText((Join-Path $success.Published 'old.marker'), 'old-success', [Text.UTF8Encoding]::new($false))
+try {
+  Publish-VerifiedLicenseBundle -StagedPath $success.Staged -PublishedPath $success.Published -PreviousPath $success.Backup -ExpectedState $success.Expected
+  Assert-LicenseBundleArtifacts -Directory $success.Published -ExpectedState $success.Expected
+  if (Test-Path -LiteralPath $success.Backup) { throw 'successful publication retained old backup' }
+}
+finally { if (Test-Path -LiteralPath $success.Staging) { Remove-SafeStagingDirectory -Path $success.Staging } }
+
+$originalAssert = ${function:Assert-LicenseBundleArtifacts}
+$script:originalLicenseAssert = $originalAssert
+$script:tamperPublished = $false
+$script:tamperDirectory = $null
+function Assert-LicenseBundleArtifacts {
+  param([Parameter(Mandatory)][string] $Directory, [Parameter(Mandatory)][psobject] $ExpectedState)
+  if ($script:tamperPublished -and [IO.Path]::GetFullPath($Directory).Equals([IO.Path]::GetFullPath($script:tamperDirectory), [StringComparison]::OrdinalIgnoreCase)) {
+    $script:tamperPublished = $false
+    [IO.File]::WriteAllBytes((Join-Path $Directory 'superpan-license'), [byte[]]@(1,2,3))
+  }
+  & $script:originalLicenseAssert -Directory $Directory -ExpectedState $ExpectedState
+}
+
+$withOld = New-TestPublishCase -Name 'with-old'
+New-Item -ItemType Directory -Path $withOld.Published | Out-Null
+[IO.File]::WriteAllText((Join-Path $withOld.Published 'old.marker'), 'exact-old-bundle', [Text.UTF8Encoding]::new($false))
+$script:tamperDirectory = $withOld.Published
+$script:tamperPublished = $true
+try {
+  try { Publish-VerifiedLicenseBundle -StagedPath $withOld.Staged -PublishedPath $withOld.Published -PreviousPath $withOld.Backup -ExpectedState $withOld.Expected; throw 'tampered publication with old bundle unexpectedly succeeded' }
+  catch { if ($_.Exception.Message -eq 'tampered publication with old bundle unexpectedly succeeded') { throw } }
+  $oldNames = @(Get-ChildItem -LiteralPath $withOld.Published -Force | ForEach-Object Name)
+  if ($oldNames.Count -ne 1 -or $oldNames[0] -cne 'old.marker') { throw 'old bundle file set was not restored exactly' }
+  if ([IO.File]::ReadAllText((Join-Path $withOld.Published 'old.marker')) -cne 'exact-old-bundle') { throw 'old bundle bytes were not restored exactly' }
+  if (Test-Path -LiteralPath $withOld.Backup) { throw 'restored old bundle was also left in backup path' }
+}
+finally { if (Test-Path -LiteralPath $withOld.Staging) { Remove-SafeStagingDirectory -Path $withOld.Staging } }
+
+$withoutOld = New-TestPublishCase -Name 'without-old'
+$script:tamperDirectory = $withoutOld.Published
+$script:tamperPublished = $true
+try {
+  try { Publish-VerifiedLicenseBundle -StagedPath $withoutOld.Staged -PublishedPath $withoutOld.Published -PreviousPath $withoutOld.Backup -ExpectedState $withoutOld.Expected; throw 'tampered publication without old bundle unexpectedly succeeded' }
+  catch { if ($_.Exception.Message -eq 'tampered publication without old bundle unexpectedly succeeded') { throw } }
+  if (Test-Path -LiteralPath $withoutOld.Published) { throw 'invalid published bundle was left at live path' }
+  if (Test-Path -LiteralPath $withoutOld.Backup) { throw 'invalid published bundle was unexpectedly retained as backup' }
+}
+finally { if (Test-Path -LiteralPath $withoutOld.Staging) { Remove-SafeStagingDirectory -Path $withoutOld.Staging } }
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write verified publication harness: %v", err)
+	}
+	buildScriptPath := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScriptPath, artifactRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("verified license publication harness failed: %v; output:\n%s", runErr, output)
 	}
 }
 
@@ -748,7 +899,7 @@ try {
   Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256') | Out-Null
 
   Assert-LicenseBundleArtifacts -Directory $staged -ExpectedState $expectedState
-  Publish-LicenseBundle -StagedPath $staged -PublishedPath $published -PreviousPath $backup
+  Publish-VerifiedLicenseBundle -StagedPath $staged -PublishedPath $published -PreviousPath $backup -ExpectedState $expectedState
   if (-not (Test-Path -LiteralPath (Join-Path $published 'superpan-license') -PathType Leaf)) { throw 'atomic publication omitted license binary' }
   Assert-LicenseBundleArtifacts -Directory $published -ExpectedState $expectedState
   [IO.File]::WriteAllBytes((Join-Path $published 'superpan-license'), [byte[]]@(1,2,3))

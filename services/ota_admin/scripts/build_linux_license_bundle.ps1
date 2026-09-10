@@ -38,6 +38,12 @@ $LicenseBuildEnvironmentNames = @(
     'GOEXPERIMENT'
     'GOAMD64'
     'GOTOOLCHAIN'
+    'GOROOT'
+    'GOFIPS140'
+    'GODEBUG'
+    'GO111MODULE'
+    'GOCACHEPROG'
+    'GO_EXTLINK_ENABLED'
     'GOPRIVATE'
     'GONOPROXY'
     'GONOSUMDB'
@@ -69,6 +75,7 @@ function Save-LicenseBuildEnvironment {
 }
 
 function Set-SealedLicenseBuildEnvironment {
+    $pinnedGoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $GoExe))).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
     $sealed = @{
         GOENV = 'off'
         GOFLAGS = ''
@@ -76,6 +83,12 @@ function Set-SealedLicenseBuildEnvironment {
         GOEXPERIMENT = ''
         GOAMD64 = 'v1'
         GOTOOLCHAIN = 'local'
+        GOROOT = $pinnedGoRoot
+        GOFIPS140 = 'off'
+        GODEBUG = ''
+        GO111MODULE = 'on'
+        GOCACHEPROG = ''
+        GO_EXTLINK_ENABLED = '0'
         GOPRIVATE = ''
         GONOPROXY = ''
         GONOSUMDB = ''
@@ -91,6 +104,44 @@ function Set-SealedLicenseBuildEnvironment {
     foreach ($name in $sealed.Keys) {
         [System.Environment]::SetEnvironmentVariable($name, [string] $sealed[$name], [System.EnvironmentVariableTarget]::Process)
     }
+}
+
+function Assert-LicenseGoRoot {
+    param(
+        [Parameter(Mandatory)][string] $GoExecutable,
+        [Parameter(Mandatory)][string] $ExpectedGoRoot
+    )
+
+    $expectedCanonical = [System.IO.Path]::GetFullPath($ExpectedGoRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    $sealedGoRoot = [System.Environment]::GetEnvironmentVariable('GOROOT', [System.EnvironmentVariableTarget]::Process)
+    if ([string]::IsNullOrWhiteSpace($sealedGoRoot)) { throw 'Sealed GOROOT is missing.' }
+    $sealedCanonical = [System.IO.Path]::GetFullPath($sealedGoRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $sealedCanonical.Equals($expectedCanonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Sealed GOROOT does not match the pinned Go executable root.'
+    }
+    if (-not (Test-Path -LiteralPath $expectedCanonical -PathType Container)) {
+        throw 'Pinned GOROOT directory is missing after bootstrap.'
+    }
+
+    [string[]] $goRootLines = @(& $GoExecutable env GOROOT)
+    if ($LASTEXITCODE -ne 0 -or $goRootLines.Count -ne 1 -or [string]::IsNullOrWhiteSpace($goRootLines[0])) {
+        throw 'Pinned Go executable could not report GOROOT.'
+    }
+    $reportedCanonical = [System.IO.Path]::GetFullPath($goRootLines[0]).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $reportedCanonical.Equals($expectedCanonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Pinned Go executable reported an unexpected GOROOT.'
+    }
+}
+
+function Assert-PinnedLicenseGoToolchain {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSha256,
+        [Parameter(Mandatory)][string] $ExpectedIdentity
+    )
+
+    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedSha256 -ExpectedIdentity $ExpectedIdentity
+    $expectedGoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $GoExe))).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    Assert-LicenseGoRoot -GoExecutable $GoExe -ExpectedGoRoot $expectedGoRoot
 }
 
 function Restore-LicenseBuildEnvironment {
@@ -475,14 +526,81 @@ function Assert-LicenseBundleArtifacts {
     }
 }
 
-function Publish-LicenseBundle {
+function Publish-VerifiedLicenseBundle {
     param(
         [Parameter(Mandatory)][string] $StagedPath,
         [Parameter(Mandatory)][string] $PublishedPath,
-        [Parameter(Mandatory)][string] $PreviousPath
+        [Parameter(Mandatory)][string] $PreviousPath,
+        [Parameter(Mandatory)][psobject] $ExpectedState
     )
 
-    Publish-StagedArtifacts -StagedPath $StagedPath -PublishedPath $PublishedPath -PreviousPath $PreviousPath
+    Assert-SafeStagedPublishDirectory -Path $StagedPath
+    Assert-SafeArtifactDirectory -Path $PublishedPath
+    Assert-SafeArtifactDirectory -Path $PreviousPath
+    Assert-SameVolumeArtifactPublish -StagedPath $StagedPath -PublishedPath $PublishedPath
+    if (Test-Path -LiteralPath $PreviousPath) { throw 'License bundle backup path unexpectedly exists.' }
+
+    $movedPrevious = $false
+    if (Test-Path -LiteralPath $PublishedPath) {
+        $publishedItem = Get-Item -LiteralPath $PublishedPath -Force
+        if (($publishedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $publishedItem.PSIsContainer) {
+            throw 'Published license bundle path is not a regular directory.'
+        }
+        Move-Item -LiteralPath $PublishedPath -Destination $PreviousPath
+        $movedPrevious = $true
+    }
+
+    try {
+        Move-Item -LiteralPath $StagedPath -Destination $PublishedPath
+    }
+    catch {
+        $publishError = $_
+        if ($movedPrevious) {
+            if (Test-Path -LiteralPath $PublishedPath) {
+                throw "License bundle publication failed with an unexpected live path; backup preserved at $PreviousPath. Publish error: $publishError"
+            }
+            try { Move-Item -LiteralPath $PreviousPath -Destination $PublishedPath }
+            catch { throw "License bundle publication and rollback failed; backup preserved at $PreviousPath. Publish error: $publishError Rollback error: $_" }
+        }
+        throw $publishError
+    }
+
+    try {
+        Assert-LicenseBundleArtifacts -Directory $PublishedPath -ExpectedState $ExpectedState
+    }
+    catch {
+        $verificationError = $_
+        $invalidRemovalError = $null
+        if (Test-Path -LiteralPath $PublishedPath) {
+            try { Remove-SafeArtifactDirectory -Path $PublishedPath }
+            catch { $invalidRemovalError = $_ }
+        }
+
+        if ($null -ne $invalidRemovalError) {
+            if (-not $movedPrevious) {
+                try {
+                    Move-Item -LiteralPath $PublishedPath -Destination $PreviousPath
+                    throw "Published license bundle verification failed; invalid output quarantined at $PreviousPath. Verification error: $verificationError"
+                }
+                catch {
+                    if (Test-Path -LiteralPath $PreviousPath) { throw }
+                    throw "Published license bundle verification failed and invalid output could not be removed or quarantined. Verification error: $verificationError Removal error: $invalidRemovalError Quarantine error: $_"
+                }
+            }
+            throw "Published license bundle verification failed and invalid live output could not be removed; old backup preserved at $PreviousPath. Verification error: $verificationError Removal error: $invalidRemovalError"
+        }
+
+        if ($movedPrevious) {
+            try { Move-Item -LiteralPath $PreviousPath -Destination $PublishedPath }
+            catch { throw "Published license bundle verification failed and rollback failed; old backup preserved at $PreviousPath. Verification error: $verificationError Rollback error: $_" }
+        }
+        throw $verificationError
+    }
+
+    if ($movedPrevious) {
+        try { Remove-SafeArtifactDirectory -Path $PreviousPath }
+        catch { throw "Verified license bundle is live, but the old backup could not be removed; backup preserved at $PreviousPath. Error: $_" }
+    }
 }
 
 if ($FunctionsOnly) {
@@ -502,7 +620,7 @@ $ExpectedArchiveSha256 = 'a3911b5e0e1b1053f25ed0675f4c1c6aad1e2bfcf253df2b9be4ca
 $ExpectedGoIdentity = 'go version go1.27.1 windows/amd64'
 Set-SealedLicenseBuildEnvironment
 Invoke-LicenseToolchainBootstrap -SourceCommit $SourceCommit
-Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+Assert-PinnedLicenseGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
 
 New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
 $OutputDirectory = $LicenseOutputDirectory
@@ -533,16 +651,16 @@ try {
     $env:GOARCH = 'amd64'
     $env:SOURCE_DATE_EPOCH = '0'
 
-    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    Assert-PinnedLicenseGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
     & $GoExe -C $SnapshotDirectory mod verify
     if ($LASTEXITCODE -ne 0) { throw 'go mod verify failed for the immutable license snapshot.' }
 
     $otaAdminPath = Join-Path $StagedPublishDirectory 'ota-admin'
     $licenseServicePath = Join-Path $StagedPublishDirectory 'superpan-license'
-    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    Assert-PinnedLicenseGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
     & $GoExe -C $SnapshotDirectory build -buildvcs=false -trimpath -ldflags '-s -w' -o $otaAdminPath ./cmd/ota-admin
     if ($LASTEXITCODE -ne 0) { throw 'ota-admin static linux/amd64 build failed.' }
-    Assert-PinnedGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
+    Assert-PinnedLicenseGoToolchain -ExpectedSha256 $ExpectedArchiveSha256 -ExpectedIdentity $ExpectedGoIdentity
     & $GoExe -C $SnapshotDirectory build -buildvcs=false -trimpath -ldflags '-s -w' -o $licenseServicePath ./cmd/license-service
     if ($LASTEXITCODE -ne 0) { throw 'superpan-license static linux/amd64 build failed.' }
     if (-not (Test-Path -LiteralPath $otaAdminPath -PathType Leaf) -or
@@ -570,8 +688,7 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $StagedPublishDirectory 'source-commit.txt'), "$SourceCommit`n", [System.Text.UTF8Encoding]::new($false))
 
     Assert-LicenseBundleArtifacts -Directory $StagedPublishDirectory -ExpectedState $expectedBundleState
-    Publish-LicenseBundle -StagedPath $StagedPublishDirectory -PublishedPath $OutputDirectory -PreviousPath $BackupDirectory
-    Assert-LicenseBundleArtifacts -Directory $OutputDirectory -ExpectedState $expectedBundleState
+    Publish-VerifiedLicenseBundle -StagedPath $StagedPublishDirectory -PublishedPath $OutputDirectory -PreviousPath $BackupDirectory -ExpectedState $expectedBundleState
 }
 finally {
     if (Test-Path -LiteralPath $StagingDirectory) {
