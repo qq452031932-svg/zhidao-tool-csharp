@@ -278,8 +278,7 @@ func TestLocalStackSupportsBrowserStyleHTTPLoginOnLoopback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := serveLocalStack(ctx, runtime, adminAddress, licenseAddress, strings.Repeat("a", 32), io.Discard, io.Discard)
-		done <- err
+		done <- serveLocalAdmin(ctx, runtime, adminAddress, "http://"+licenseAddress, strings.Repeat("a", 32), io.Discard, io.Discard)
 	}()
 	defer func() {
 		cancel()
@@ -294,9 +293,12 @@ func TestLocalStackSupportsBrowserStyleHTTPLoginOnLoopback(t *testing.T) {
 	}()
 
 	passwordPath := filepath.Join(root, "admin-password.txt")
+	readyPath := filepath.Join(root, "ready.json")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, err := os.Stat(passwordPath); err == nil {
+		_, passwordErr := os.Stat(passwordPath)
+		_, readyErr := os.Stat(readyPath)
+		if passwordErr == nil && readyErr == nil {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -307,6 +309,10 @@ func TestLocalStackSupportsBrowserStyleHTTPLoginOnLoopback(t *testing.T) {
 	passwordBytes, err := os.ReadFile(passwordPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if connection, err := net.DialTimeout("tcp", licenseAddress, 100*time.Millisecond); err == nil {
+		connection.Close()
+		t.Fatal("the tagged admin host unexpectedly owned the license-service listener")
 	}
 
 	jar, err := cookiejar.New(nil)

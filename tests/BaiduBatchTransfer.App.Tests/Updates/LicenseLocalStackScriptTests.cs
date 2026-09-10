@@ -41,7 +41,7 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("instance_token", stop, StringComparison.Ordinal);
         Assert.Contains("executable_sha256", stop, StringComparison.Ordinal);
         Assert.Contains("SHA256]::Create()", stop, StringComparison.Ordinal);
-        Assert.Contains("$manifestCommandLine.IndexOf($manifestToken", stop, StringComparison.Ordinal);
+        Assert.Contains("$manifestCommandLine.IndexOf([string]$ProcessRecord.instance_token", stop, StringComparison.Ordinal);
         Assert.Contains("Stop-Process -InputObject $process", stop, StringComparison.Ordinal);
         Assert.Contains("$null = $process.Handle", stop, StringComparison.Ordinal);
         Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $RuntimeRoot -Recurse", stop, StringComparison.Ordinal);
@@ -57,19 +57,31 @@ public sealed class LicenseLocalStackScriptTests
 
         Assert.StartsWith("//go:build license_local_acceptance && windows", host, StringComparison.Ordinal);
         Assert.Contains("validateLoopbackAddress(*adminAddress)", host, StringComparison.Ordinal);
-        Assert.Contains("validateLoopbackAddress(*licenseAddress)", host, StringComparison.Ordinal);
+        Assert.Contains("validateLoopbackAddress(licenseAddress)", host, StringComparison.Ordinal);
         Assert.Contains("host != \"127.0.0.1\"", host, StringComparison.Ordinal);
+        Assert.DoesNotContain("licensehttp", host, StringComparison.Ordinal);
+        Assert.DoesNotContain("licenseServer", host, StringComparison.Ordinal);
         Assert.Contains(".tmp/", ignore, StringComparison.Ordinal);
         Assert.Contains("license-local", ignore, StringComparison.Ordinal);
     }
 
     [Theory]
     [InlineData(".tmp/license-local/admin-password.txt")]
+    [InlineData(".tmp/license-local/card-encryption.key")]
+    [InlineData(".tmp/license-local/card-lookup.key")]
+    [InlineData(".tmp/license-local/session-source.key")]
     [InlineData(".tmp/license-local/license.db")]
     [InlineData(".tmp/license-local/admin.db")]
     [InlineData(".tmp/license-local/signing-private.pem")]
+    [InlineData(".tmp/license-local/signing-public.pem")]
     [InlineData(".tmp/license-local/internal-admin.key")]
+    [InlineData(".tmp/license-local/license-service.json")]
+    [InlineData(".tmp/license-local/client.json")]
+    [InlineData(".tmp/license-local/ready.json")]
+    [InlineData(".tmp/license-local/pid-manifest.json")]
+    [InlineData(".tmp/license-local/instance-token")]
     [InlineData(".tmp/license-admin-local.exe")]
+    [InlineData(".tmp/license-service-local.exe")]
     public void GitIgnoresLocalSecretsDatabasesAndGeneratedExecutable(string repositoryRelativePath)
     {
         using var process = Process.Start(new ProcessStartInfo
@@ -95,7 +107,6 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("license_local_acceptance", start, StringComparison.Ordinal);
         Assert.Contains("license-admin-local", start, StringComparison.Ordinal);
         Assert.Contains("client.json", start, StringComparison.Ordinal);
-        Assert.Contains("Get-Process -Id", start, StringComparison.Ordinal);
         Assert.Contains("Get-CimInstance", start, StringComparison.Ordinal);
         Assert.Contains(".Path", start, StringComparison.Ordinal);
         Assert.Contains("StartTime", start, StringComparison.Ordinal);
@@ -109,18 +120,37 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("-WindowStyle Hidden", start, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("[IO.FileMode]::CreateNew", start, StringComparison.Ordinal);
         Assert.Contains("[IO.FileShare]::None", start, StringComparison.Ordinal);
-        Assert.Contains("$QuotedRuntimeRoot", start, StringComparison.Ordinal);
-        Assert.Contains("$failureCommandLine.IndexOf($InstanceToken", start, StringComparison.Ordinal);
-        Assert.Contains("$failureStartTicks", start, StringComparison.Ordinal);
-        Assert.Contains("$null = $startedProcess.Handle", start, StringComparison.Ordinal);
+        Assert.Contains("$quotedRoot", start, StringComparison.Ordinal);
+        Assert.Contains("$InstanceToken", start, StringComparison.Ordinal);
+        Assert.Contains("Get-ExactChildIdentity", start, StringComparison.Ordinal);
+        Assert.Contains("$null = $licenseProcess.Handle", start, StringComparison.Ordinal);
+        Assert.Contains("$null = $adminProcess.Handle", start, StringComparison.Ordinal);
         Assert.Contains("Write-TextFileAtomic -LiteralPath $ManifestPath", start, StringComparison.Ordinal);
-        Assert.Contains("$null = $startedProcess.Handle", start, StringComparison.Ordinal);
         Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $RuntimeRoot -Recurse", start, StringComparison.Ordinal);
-        Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $ExecutablePath", start, StringComparison.Ordinal);
+        Assert.Contains("$AdminExecutablePath, $LicenseExecutablePath", start, StringComparison.Ordinal);
         Assert.Contains("$OwnerPath = Join-Path $RuntimeRoot 'instance-token'", start, StringComparison.Ordinal);
         Assert.True(start.LastIndexOf("Get-CimInstance", StringComparison.Ordinal) <
-                    start.LastIndexOf("Stop-Process -InputObject $startedProcess", StringComparison.Ordinal));
+                    start.LastIndexOf("Stop-Process -InputObject $process", StringComparison.Ordinal));
         Assert.DoesNotContain("explorer.exe", start, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void StartAndStopScriptsModelTwoIndependentExactChildren()
+    {
+        var start = File.ReadAllText(ScriptPath("run_local_license_stack.ps1"));
+        var stop = File.ReadAllText(ScriptPath("stop_local_license_stack.ps1"));
+
+        Assert.Contains("$LicenseExecutablePath", start, StringComparison.Ordinal);
+        Assert.Contains("$AdminExecutablePath", start, StringComparison.Ordinal);
+        Assert.Contains("./cmd/license-service", start, StringComparison.Ordinal);
+        Assert.Equal(2, CountOccurrences(start, "Start-Process -FilePath"));
+        Assert.Contains("processes = @(", start, StringComparison.Ordinal);
+        Assert.Contains("license-service", start, StringComparison.Ordinal);
+        Assert.Contains("license-admin-local", start, StringComparison.Ordinal);
+        Assert.Contains("foreach ($processRecord in $manifest.processes)", stop, StringComparison.Ordinal);
+        Assert.Contains("finally", stop, StringComparison.OrdinalIgnoreCase);
+        Assert.True(stop.LastIndexOf("finally", StringComparison.OrdinalIgnoreCase) <
+                    stop.LastIndexOf("Remove-LocalArtifactWithRetry", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -139,6 +169,7 @@ public sealed class LicenseLocalStackScriptTests
             Assert.NotEqual(0, rejected.ExitCode);
             Assert.Equal("keep", File.ReadAllText(sentinel));
             Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-admin-local.exe")));
+            Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-service-local.exe")));
         }
         finally
         {
@@ -175,6 +206,45 @@ public sealed class LicenseLocalStackScriptTests
 
             var loginResponse = await client.SendAsync(request);
             Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+            var login = JsonNode.Parse(await loginResponse.Content.ReadAsStringAsync())!.AsObject();
+            Assert.True(login["must_change_password"]!.GetValue<bool>());
+            var replacementPassword = "Local-Acceptance-Password-2026!";
+            var passwordRequest = JsonRequest(HttpMethod.Post, "/admin/api/session/password",
+                new JsonObject { ["current_password"] = password, ["new_password"] = replacementPassword },
+                login["csrf_token"]!.GetValue<string>());
+            var passwordResponse = await client.SendAsync(passwordRequest);
+            Assert.Equal(HttpStatusCode.OK, passwordResponse.StatusCode);
+            var passwordResult = JsonNode.Parse(await passwordResponse.Content.ReadAsStringAsync())!.AsObject();
+            var csrf = passwordResult["csrf_token"]!.GetValue<string>();
+
+            async Task<JsonObject> Mutate(string path, JsonObject body)
+            {
+                var mutation = JsonRequest(HttpMethod.Post, path, body, csrf);
+                mutation.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
+                var response = await client.SendAsync(mutation);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+                return JsonNode.Parse(await response.Content.ReadAsStringAsync())!.AsObject();
+            }
+
+            var software = await Mutate("/admin/api/license/software", new JsonObject { ["name"] = "Local acceptance product" });
+            var softwareId = software["id"]!.GetValue<string>();
+            var package = await Mutate("/admin/api/license/packages", new JsonObject
+            {
+                ["name"] = "Local acceptance package",
+                ["software_ids"] = new JsonArray(softwareId)
+            });
+            var packageId = package["id"]!.GetValue<string>();
+            var generated = await Mutate("/admin/api/license/cards/generate", new JsonObject
+            {
+                ["package_id"] = packageId,
+                ["duration_days"] = 30,
+                ["count"] = 1
+            });
+            var cards = generated["items"]!.AsArray();
+            Assert.Single(cards);
+            Assert.Equal(30, cards[0]!["card"]!["base_days"]!.GetValue<int>());
+            Assert.False(string.IsNullOrWhiteSpace(cards[0]!["plaintext"]!.GetValue<string>()));
+
             var currentResponse = await client.GetAsync("http://127.0.0.1:19090/admin/api/session/current");
             Assert.Equal(HttpStatusCode.OK, currentResponse.StatusCode);
         }
@@ -201,7 +271,7 @@ public sealed class LicenseLocalStackScriptTests
             var started = await RunScriptAsync("run_local_license_stack.ps1");
             AssertScriptSucceeded(started);
             var manifest = JsonNode.Parse(File.ReadAllText(Path.Combine(RuntimeRoot(), "pid-manifest.json")))!.AsObject();
-            using var process = Process.GetProcessById(manifest["process"]!["pid"]!.GetValue<int>());
+            using var process = Process.GetProcessById(ManifestProcess(manifest, "license-service")["pid"]!.GetValue<int>());
             process.Kill(entireProcessTree: false);
             Assert.True(process.WaitForExit(10_000));
 
@@ -228,7 +298,8 @@ public sealed class LicenseLocalStackScriptTests
         var ownerPath = Path.Combine(RuntimeRoot(), "instance-token");
         string? manifestText = null;
         string? readyText = null;
-        Process? process = null;
+        Process? licenseProcess = null;
+        Process? adminProcess = null;
 
         try
         {
@@ -237,34 +308,41 @@ public sealed class LicenseLocalStackScriptTests
             manifestText = File.ReadAllText(manifestPath);
             readyText = File.ReadAllText(readyPath);
             var manifest = JsonNode.Parse(manifestText)!.AsObject();
-            var pid = manifest["process"]!["pid"]!.GetValue<int>();
-            process = Process.GetProcessById(pid);
+            licenseProcess = Process.GetProcessById(ManifestProcess(manifest, "license-service")["pid"]!.GetValue<int>());
+            adminProcess = Process.GetProcessById(ManifestProcess(manifest, "license-admin-local")["pid"]!.GetValue<int>());
+            Assert.NotEqual(licenseProcess.Id, adminProcess.Id);
 
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
             Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("http://127.0.0.1:19090/admin/health")).StatusCode);
-            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("http://127.0.0.1:19091/health")).StatusCode);
+            using (var licenseSocket = new TcpClient())
+                await licenseSocket.ConnectAsync(IPAddress.Loopback, 19091);
 
             var secondStart = await RunScriptAsync("run_local_license_stack.ps1");
             Assert.NotEqual(0, secondStart.ExitCode);
-            Assert.False(process.HasExited);
+            Assert.False(licenseProcess.HasExited);
+            Assert.False(adminProcess.HasExited);
 
             var tamperedReady = JsonNode.Parse(readyText)!.AsObject();
             tamperedReady["instance_token"] = new string('0', 32);
             File.WriteAllText(readyPath, tamperedReady.ToJsonString());
             var readyRejected = await RunScriptAsync("stop_local_license_stack.ps1");
             Assert.NotEqual(0, readyRejected.ExitCode);
-            Assert.False(process.HasExited);
+            Assert.False(licenseProcess.HasExited);
+            Assert.False(adminProcess.HasExited);
             File.WriteAllText(readyPath, readyText);
 
             var tamperedManifest = JsonNode.Parse(manifestText)!.AsObject();
-            tamperedManifest["process"]!["command_line"] = manifest["process"]!["command_line"]!.GetValue<string>() + " tampered";
+            var tamperedLicense = ManifestProcess(tamperedManifest, "license-service");
+            tamperedLicense["command_line"] = tamperedLicense["command_line"]!.GetValue<string>() + " tampered";
             File.WriteAllText(manifestPath, tamperedManifest.ToJsonString());
             var manifestRejected = await RunScriptAsync("stop_local_license_stack.ps1");
             Assert.NotEqual(0, manifestRejected.ExitCode);
-            Assert.False(process.HasExited);
+            Assert.False(licenseProcess.HasExited);
+            adminProcess.WaitForExit(10_000);
+            Assert.True(adminProcess.HasExited);
             File.WriteAllText(manifestPath, manifestText);
 
-            Assert.Equal(File.ReadAllText(ownerPath).Trim(), manifest["process"]!["instance_token"]!.GetValue<string>());
+            Assert.Equal(File.ReadAllText(ownerPath).Trim(), manifest["instance_token"]!.GetValue<string>());
         }
         finally
         {
@@ -279,10 +357,12 @@ public sealed class LicenseLocalStackScriptTests
             }
         }
 
-        Assert.NotNull(process);
-        process!.WaitForExit(10_000);
-        Assert.True(process.HasExited);
-        process.Dispose();
+        Assert.NotNull(licenseProcess);
+        Assert.NotNull(adminProcess);
+        licenseProcess!.WaitForExit(10_000);
+        Assert.True(licenseProcess.HasExited);
+        licenseProcess.Dispose();
+        adminProcess!.Dispose();
         AssertRuntimeAbsent();
     }
 
@@ -294,15 +374,17 @@ public sealed class LicenseLocalStackScriptTests
 
         AssertRuntimeAbsent();
         var executablePath = Path.Combine(RepositoryRoot(), ".tmp", "license-admin-local.exe");
+        byte[]? originalExecutable = null;
         try
         {
             var started = await RunScriptAsync("run_local_license_stack.ps1");
             AssertScriptSucceeded(started);
             var manifest = JsonNode.Parse(File.ReadAllText(Path.Combine(RuntimeRoot(), "pid-manifest.json")))!.AsObject();
-            using var process = Process.GetProcessById(manifest["process"]!["pid"]!.GetValue<int>());
+            using var process = Process.GetProcessById(ManifestProcess(manifest, "license-admin-local")["pid"]!.GetValue<int>());
             process.Kill(entireProcessTree: false);
             Assert.True(process.WaitForExit(10_000));
 
+            originalExecutable = File.ReadAllBytes(executablePath);
             File.WriteAllText(executablePath, "replacement sentinel");
             var rejected = await RunScriptAsync("stop_local_license_stack.ps1");
 
@@ -312,10 +394,13 @@ public sealed class LicenseLocalStackScriptTests
         }
         finally
         {
-            if (File.Exists(executablePath))
-                File.Delete(executablePath);
-            if (Directory.Exists(RuntimeRoot()))
-                Directory.Delete(RuntimeRoot(), recursive: true);
+            if (originalExecutable is not null)
+                File.WriteAllBytes(executablePath, originalExecutable);
+            if (File.Exists(Path.Combine(RuntimeRoot(), "pid-manifest.json")))
+            {
+                var stopped = await RunScriptAsync("stop_local_license_stack.ps1");
+                AssertScriptSucceeded(stopped);
+            }
         }
         AssertRuntimeAbsent();
     }
@@ -384,6 +469,7 @@ public sealed class LicenseLocalStackScriptTests
     {
         Assert.False(Directory.Exists(RuntimeRoot()));
         Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-admin-local.exe")));
+        Assert.False(File.Exists(Path.Combine(RepositoryRoot(), ".tmp", "license-service-local.exe")));
     }
 
     private static void AssertScriptSucceeded((int ExitCode, string Output, string Error) result)
@@ -392,6 +478,24 @@ public sealed class LicenseLocalStackScriptTests
     }
 
     private static string RuntimeRoot() => Path.Combine(RepositoryRoot(), ".tmp", "license-local");
+
+    private static int CountOccurrences(string text, string value) =>
+        (text.Length - text.Replace(value, string.Empty, StringComparison.Ordinal).Length) / value.Length;
+
+    private static JsonObject ManifestProcess(JsonObject manifest, string role) =>
+        manifest["processes"]!.AsArray().Select(item => item!.AsObject()).Single(item => item["role"]!.GetValue<string>() == role);
+
+    private static HttpRequestMessage JsonRequest(HttpMethod method, string path, JsonObject body, string csrf)
+    {
+        var request = new HttpRequestMessage(method, "http://127.0.0.1:19090" + path)
+        {
+            Content = new StringContent(body.ToJsonString())
+        };
+        request.Content.Headers.ContentType = new("application/json");
+        request.Headers.Add("Origin", "http://127.0.0.1:19090");
+        request.Headers.Add("X-CSRF-Token", csrf);
+        return request;
+    }
 
     private static string ScriptPath(string name) => Path.Combine(RepositoryRoot(), "scripts", name);
 
