@@ -364,6 +364,184 @@ func TestBuildCreatesAndExportsPrivateTemporaryDirectoryBeforeBootstrap(t *testi
 	)
 }
 
+func TestLicenseBundleBuilderDeclaresImmutableProductionContract(t *testing.T) {
+	t.Parallel()
+
+	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_license_bundle.ps1"), "\r\n", "\n")
+	for _, required := range []string{
+		"param(", "[string] $SourceCommit", "[switch] $FunctionsOnly",
+		"$LicenseFunctionsOnly = [bool] $FunctionsOnly", "$FunctionsOnly = $LicenseFunctionsOnly",
+		"Assert-LicenseBundleSourceState", "Get-LicenseBundleSourcePaths", "New-LicenseBundleSourceSnapshot",
+		"Assert-PinnedGoToolchain", "go version go1.27.1 windows/amd64", "GOTOOLCHAIN", "local",
+		"CGO_ENABLED", "GOOS", "linux", "GOARCH", "amd64",
+		"build -buildvcs=false -trimpath -ldflags '-s -w'", "./cmd/ota-admin", "./cmd/license-service",
+		"ota-admin", "ota-admin.sha256", "superpan-license", "superpan-license.sha256",
+		"source-manifest.sha256", "source-manifest.sha256.sha256", "source-commit.txt",
+		"Write-DeterministicSourceManifest", "Write-LicenseSha256CheckFile", "Assert-LicenseBundleArtifacts", "Publish-LicenseBundle",
+	} {
+		if !strings.Contains(buildScript, required) {
+			t.Errorf("license bundle builder does not contain %q", required)
+		}
+	}
+	requireSubstringsInOrder(t, buildScript,
+		"Assert-LicenseBundleSourceState -SourceCommit $SourceCommit",
+		"New-LicenseBundleSourceSnapshot",
+		"mod verify",
+		"build -buildvcs=false -trimpath -ldflags '-s -w'",
+		"./cmd/ota-admin",
+		"build -buildvcs=false -trimpath -ldflags '-s -w'",
+		"./cmd/license-service",
+		"Write-DeterministicSourceManifest",
+		"Assert-LicenseBundleArtifacts",
+		"Publish-LicenseBundle",
+	)
+	snapshotOffset := strings.Index(buildScript, "New-LicenseBundleSourceSnapshot")
+	if snapshotOffset < 0 {
+		t.Fatal("license bundle builder does not create a Git-object snapshot")
+	}
+	afterSnapshot := buildScript[snapshotOffset:]
+	for _, prohibited := range []string{"Copy-Item -LiteralPath $RepositoryRoot", "Get-Content -LiteralPath $RepositoryRoot"} {
+		if strings.Contains(afterSnapshot, prohibited) {
+			t.Errorf("license bundle builder reads mutable source after snapshot: %q", prohibited)
+		}
+	}
+}
+
+func TestLicenseBundleFunctionsEnforceSourceAndArtifactContracts(t *testing.T) {
+	powerShell, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skip("PowerShell is unavailable on this compatibility-test host")
+	}
+
+	root := testLocalTempDir(t)
+	repositoryRoot := filepath.Join(root, "repository")
+	moduleRoot := filepath.Join(repositoryRoot, "services", "ota_admin")
+	tracked := map[string]string{
+		"go.mod": "module example.test/license\n",
+		"go.sum": "",
+		filepath.Join("cmd", "ota-admin", "main.go"):               "package main\n",
+		filepath.Join("cmd", "license-service", "main.go"):         "package main\n",
+		filepath.Join("internal", "shared", "shared.go"):           "package shared\n",
+		filepath.Join("internal", "webui", "static", "index.html"): "<main>committed</main>\n",
+		filepath.Join("cmd", "ota-admin-acceptance", "main.go"):    "package main\n",
+		filepath.Join("cmd", "license-load-generator", "main.go"):  "package main\n",
+		"production.json": "{}\n",
+		"private.key":     "not-a-real-key\n",
+		"state.db":        "not-a-real-database\n",
+	}
+	for relativePath, contents := range tracked {
+		path := filepath.Join(moduleRoot, relativePath)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("create fixture parent: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatalf("write fixture %q: %v", relativePath, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "compat@example.invalid"},
+		{"config", "user.name", "Compatibility Test"},
+		{"add", "services/ota_admin"},
+		{"commit", "-m", "fixture"},
+	} {
+		command := exec.Command("git", append([]string{"-C", repositoryRoot}, args...)...)
+		if output, commandErr := command.CombinedOutput(); commandErr != nil {
+			t.Fatalf("git %v failed: %v; output:\n%s", args, commandErr, output)
+		}
+	}
+	commitOutput, err := exec.Command("git", "-C", repositoryRoot, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("resolve fixture commit: %v", err)
+	}
+	commit := strings.TrimSpace(string(commitOutput))
+	untrackedPath := filepath.Join(moduleRoot, "untracked.go")
+	if err := os.WriteFile(untrackedPath, []byte("package excluded\n"), 0o600); err != nil {
+		t.Fatalf("write untracked fixture: %v", err)
+	}
+
+	buildScript := filepath.Join(testModuleRoot(t), "scripts", "build_linux_license_bundle.ps1")
+	harnessPath := filepath.Join(root, "license-bundle-functions.ps1")
+	snapshotRoot := filepath.Join(root, "snapshot")
+	artifactRoot := filepath.Join(root, "artifacts")
+	harness := `param([string] $BuildScript, [string] $FixtureRepository, [string] $Commit, [string] $SnapshotRoot, [string] $TestArtifactRoot)
+$ErrorActionPreference = 'Stop'
+. $BuildScript -FunctionsOnly
+$RepositoryRoot = [System.IO.Path]::GetFullPath($FixtureRepository)
+
+try { Assert-LicenseBundleSourceState -SourceCommit ('0' * 40); throw 'wrong commit unexpectedly accepted' }
+catch { if ($_.Exception.Message -eq 'wrong commit unexpectedly accepted') { throw } }
+try { Assert-LicenseBundleSourceState -SourceCommit $Commit; throw 'dirty tree unexpectedly accepted' }
+catch { if ($_.Exception.Message -eq 'dirty tree unexpectedly accepted') { throw } }
+Remove-Item -LiteralPath (Join-Path $FixtureRepository 'services\ota_admin\untracked.go') -Force
+Assert-LicenseBundleSourceState -SourceCommit $Commit
+
+[string[]] $paths = @(Get-LicenseBundleSourcePaths -SourceCommit $Commit)
+[string[]] $expected = @(
+  'services/ota_admin/cmd/license-service/main.go',
+  'services/ota_admin/cmd/ota-admin/main.go',
+  'services/ota_admin/go.mod',
+  'services/ota_admin/go.sum',
+  'services/ota_admin/internal/shared/shared.go',
+  'services/ota_admin/internal/webui/static/index.html'
+)
+if ([string]::Join([char]10, $paths) -cne [string]::Join([char]10, $expected)) { throw ('unexpected source allowlist:' + [char]10 + ($paths -join [char]10)) }
+New-LicenseBundleSourceSnapshot -SourcePaths $paths -DestinationRoot $SnapshotRoot -SourceCommit $Commit
+if ((Get-Content -Raw -LiteralPath (Join-Path $SnapshotRoot 'internal\webui\static\index.html')) -notlike '*committed*') { throw 'snapshot did not contain committed bytes' }
+
+$ArtifactsRoot = [System.IO.Path]::GetFullPath($TestArtifactRoot)
+New-Item -ItemType Directory -Path $ArtifactsRoot -Force | Out-Null
+$StagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('spota-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+$StagedPublishDirectory = Join-Path $StagingDirectory 'p'
+$staged = $StagedPublishDirectory
+$published = Join-Path $ArtifactsRoot 'license-production'
+$backup = Join-Path $ArtifactsRoot 'backup'
+New-SafeStagingDirectory -Path $StagingDirectory
+try {
+  New-Item -ItemType Directory -Path $staged | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $staged 'ota-admin'), ('ota' + [char]10), [System.Text.UTF8Encoding]::new($false))
+  [System.IO.File]::WriteAllText((Join-Path $staged 'superpan-license'), ('license' + [char]10), [System.Text.UTF8Encoding]::new($false))
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256') | Out-Null
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'superpan-license') -CheckFilePath (Join-Path $staged 'superpan-license.sha256') | Out-Null
+  Write-DeterministicSourceManifest -SnapshotRoot $SnapshotRoot -ManifestPath (Join-Path $staged 'source-manifest.sha256')
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'source-manifest.sha256') -CheckFilePath (Join-Path $staged 'source-manifest.sha256.sha256') | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $staged 'source-commit.txt'), ($Commit + [char]10), [System.Text.UTF8Encoding]::new($false))
+  Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit
+  Add-Content -LiteralPath (Join-Path $staged 'ota-admin') -Value tampered
+  try { Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit; throw 'tampered artifact unexpectedly accepted' }
+  catch { if ($_.Exception.Message -eq 'tampered artifact unexpectedly accepted') { throw } }
+  [System.IO.File]::WriteAllText((Join-Path $staged 'ota-admin'), ('ota' + [char]10), [System.Text.UTF8Encoding]::new($false))
+  Write-LicenseSha256CheckFile -PayloadPath (Join-Path $staged 'ota-admin') -CheckFilePath (Join-Path $staged 'ota-admin.sha256') | Out-Null
+  Assert-LicenseBundleArtifacts -Directory $staged -SourceCommit $Commit
+  Publish-LicenseBundle -StagedPath $staged -PublishedPath $published -PreviousPath $backup
+  if (-not (Test-Path -LiteralPath (Join-Path $published 'superpan-license') -PathType Leaf)) { throw 'atomic publication omitted license binary' }
+}
+finally {
+  if (Test-Path -LiteralPath $StagingDirectory) { Remove-SafeStagingDirectory -Path $StagingDirectory }
+}
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o600); err != nil {
+		t.Fatalf("write license bundle harness: %v", err)
+	}
+	output, runErr := exec.Command(powerShell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", harnessPath, buildScript, repositoryRoot, commit, snapshotRoot, artifactRoot).CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("license bundle function harness failed: %v; output:\n%s", runErr, output)
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(artifactRoot, "license-production", "source-manifest.sha256"))
+	if err != nil {
+		t.Fatalf("read published source manifest: %v", err)
+	}
+	manifestText := string(manifest)
+	if strings.Contains(manifestText, "\\") || !strings.HasSuffix(manifestText, "\n") || strings.Contains(manifestText, "\r") {
+		t.Fatalf("source manifest is not canonical LF with slash paths: %q", manifestText)
+	}
+	lines := strings.Split(strings.TrimSuffix(manifestText, "\n"), "\n")
+	if !slices.IsSorted(lines) {
+		t.Fatalf("source manifest lines are not ordinally sorted: %q", lines)
+	}
+}
+
 func TestLinuxStateVerificationDoesNotOpenSQLiteTargetsAfterConnection(t *testing.T) {
 	t.Parallel()
 
@@ -464,7 +642,7 @@ if (Test-Path -LiteralPath $valid) { throw 'validated staging root was not remov
 func TestBuildPublishesOnlyFromValidatedStagingOutput(t *testing.T) {
 	t.Parallel()
 
-	buildScript := readRepositoryFile(t, "scripts", "build_linux_amd64.ps1")
+	buildScript := strings.ReplaceAll(readRepositoryFile(t, "scripts", "build_linux_amd64.ps1"), "\r\n", "\n")
 	for _, required := range []string{
 		"function Assert-SafeStagedPublishDirectory",
 		"function Assert-SameVolumeArtifactPublish",
