@@ -5,3 +5,5 @@
 **/artifacts/
 **/.artifacts/
 **/__pycache__/
+.tmp/
+**/license-local/
