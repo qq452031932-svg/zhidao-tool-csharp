@@ -37,10 +37,10 @@ function Confirm-ExactRuntimeRoot {
 }
 
 function Remove-LocalArtifactWithRetry {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath, [switch]$Recurse)
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
         try {
-            if (Test-Path -LiteralPath $LiteralPath) { Remove-Item -LiteralPath $LiteralPath -Force -Recurse:$Recurse -ErrorAction Stop }
+            if (Test-Path -LiteralPath $LiteralPath) { Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop }
             return
         }
         catch [IO.IOException] { if ($attempt -eq 49) { throw }; Start-Sleep -Milliseconds 100 }
@@ -75,16 +75,27 @@ function Get-LocalFileSha256 {
     finally { $hashAlgorithm.Dispose(); $stream.Dispose() }
 }
 
-function Get-LocalFileInventory {
+function Get-LocalArtifactInventory {
     param([Parameter(Mandatory = $true)][string]$Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    return @(
-        Get-ChildItem -LiteralPath $Root -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
-            $full = [IO.Path]::GetFullPath($_.FullName)
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Startup cleanup inventory root is not a bound ordinary directory.' }
+    $pending = New-Object Collections.Generic.Stack[string]
+    $inventory = New-Object Collections.Generic.List[object]
+    $pending.Push([IO.Path]::GetFullPath($Root))
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $current -Force | Sort-Object FullName)) {
+            $full = [IO.Path]::GetFullPath($item.FullName)
             if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Startup cleanup inventory escaped its private root.' }
-            [ordered]@{ relative_path = $full.Substring($rootFull.Length).Replace('\', '/'); sha256 = Get-LocalFileSha256 -LiteralPath $full }
+            $entryType = if ($item.PSIsContainer) { 'directory' } else { 'file' }
+            $isReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            $sha256 = if ($entryType -eq 'file' -and -not $isReparsePoint) { Get-LocalFileSha256 -LiteralPath $full } else { $null }
+            $inventory.Add([ordered]@{ relative_path = $full.Substring($rootFull.Length).Replace('\', '/'); entry_type = $entryType; is_reparse_point = [bool]$isReparsePoint; sha256 = $sha256 })
+            if ($entryType -eq 'directory' -and -not $isReparsePoint) { $pending.Push($full) }
         }
-    )
+    }
+    return @($inventory | Sort-Object { [string]$_.relative_path })
 }
 
 function Invoke-RecoverableStartupCleanup {
@@ -107,13 +118,13 @@ function Invoke-RecoverableStartupCleanup {
         [ordered]@{ role = 'license-admin-local'; source_path = [IO.Path]::GetFullPath($AdminExecutablePath); staged_name = ('.cleanup-' + $InstanceToken + '-license-admin-local.exe'); sha256 = $AdminExecutableHash }
     )
     $journal = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         instance_token = $InstanceToken
         runtime_root = $RuntimeRoot
         quarantine_root = [IO.Path]::GetFullPath((Join-Path $RuntimeParent ('license-local-quarantine-' + $InstanceToken)))
         evidence_name = 'startup-cleanup.json'
         executables = $executables
-        runtime_files = Get-LocalFileInventory -Root $RuntimeRoot
+        runtime_files = Get-LocalArtifactInventory -Root $RuntimeRoot
     }
     Write-TextFileAtomic -LiteralPath $CleanupJournalPath -Text (($journal | ConvertTo-Json -Depth 5) + "`n")
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'stop_local_license_stack.ps1') | Out-Null

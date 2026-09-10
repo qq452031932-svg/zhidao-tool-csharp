@@ -45,7 +45,8 @@ public sealed class LicenseLocalStackScriptTests
         Assert.Contains("Stop-Process -InputObject $process", stop, StringComparison.Ordinal);
         Assert.Contains("$null = $process.Handle", stop, StringComparison.Ordinal);
         Assert.Contains("Move-LocalDirectoryAtomicallyWithRetry -Source $RuntimeRoot -Destination $quarantineRoot", stop, StringComparison.Ordinal);
-        Assert.Contains("Remove-LocalArtifactWithRetry -LiteralPath $quarantineRoot -Recurse", stop, StringComparison.Ordinal);
+        Assert.Contains("Remove-VerifiedQuarantineTree -Journal $Journal -QuarantineRoot $quarantineRoot", stop, StringComparison.Ordinal);
+        Assert.DoesNotContain("Remove-LocalArtifactWithRetry -LiteralPath $quarantineRoot -Recurse", stop, StringComparison.Ordinal);
         Assert.DoesNotContain("Stop-Process -Id", stop, StringComparison.Ordinal);
         Assert.DoesNotContain("Get-Process *", stop, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Stop-Process -Name", stop, StringComparison.OrdinalIgnoreCase);
@@ -537,6 +538,104 @@ public sealed class LicenseLocalStackScriptTests
                 File.WriteAllBytes(stagedClientPath, clientSettings);
             ReleaseAllHooks(hookRoot);
             await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task StopPreservesUnownedEmptyDirectoryAddedAfterInventoryAndCanRetry()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        string? insertedDirectory = null;
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            var stopTask = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "before-quarantine-delete"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "before-quarantine-delete.ready"));
+            var journal = ReadCleanupJournal();
+            insertedDirectory = Path.Combine(journal["quarantine_root"]!.GetValue<string>(), "unowned-empty");
+            Directory.CreateDirectory(insertedDirectory);
+            File.WriteAllText(Path.Combine(hookRoot, "before-quarantine-delete.release"), "release");
+
+            var rejected = await stopTask;
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.True(Directory.Exists(insertedDirectory));
+            Assert.True(File.Exists(CleanupJournalPath()));
+
+            Directory.Delete(insertedDirectory);
+            insertedDirectory = null;
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1"));
+        }
+        finally
+        {
+            if (insertedDirectory is not null && Directory.Exists(insertedDirectory))
+                Directory.Delete(insertedDirectory);
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(hookRoot))
+                Directory.Delete(hookRoot, recursive: true);
+        }
+        AssertRuntimeAbsent();
+    }
+
+    [Fact]
+    public async Task StopPreservesEmptyDirectoryReplacedByReparsePointAndCanRetry()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        AssertRuntimeAbsent();
+        var hookRoot = TestHookRoot();
+        var replacementTarget = Path.Combine(RepositoryRoot(), ".tmp", "license-local-directory-replacement-target");
+        string? stagedDirectory = null;
+        try
+        {
+            AssertScriptSucceeded(await RunScriptAsync("run_local_license_stack.ps1"));
+            Directory.CreateDirectory(Path.Combine(RuntimeRoot(), "owned-empty"));
+            Directory.CreateDirectory(replacementTarget);
+            File.WriteAllText(Path.Combine(replacementTarget, "sentinel.txt"), "outside replacement");
+
+            var stopTask = RunScriptAsync("stop_local_license_stack.ps1", new Dictionary<string, string>
+            {
+                ["LICENSE_LOCAL_TEST_HOOK_ROOT"] = hookRoot,
+                ["LICENSE_LOCAL_TEST_HOOK_NAME"] = "before-quarantine-delete"
+            });
+            await WaitForFileAsync(Path.Combine(hookRoot, "before-quarantine-delete.ready"));
+            var journal = ReadCleanupJournal();
+            stagedDirectory = Path.Combine(journal["quarantine_root"]!.GetValue<string>(), "owned-empty");
+            Directory.Delete(stagedDirectory);
+            CreateJunction(stagedDirectory, replacementTarget);
+            File.WriteAllText(Path.Combine(hookRoot, "before-quarantine-delete.release"), "release");
+
+            var rejected = await stopTask;
+            Assert.NotEqual(0, rejected.ExitCode);
+            Assert.True(Directory.Exists(stagedDirectory));
+            Assert.Equal("outside replacement", File.ReadAllText(Path.Combine(replacementTarget, "sentinel.txt")));
+            Assert.True(File.Exists(CleanupJournalPath()));
+
+            Directory.Delete(stagedDirectory);
+            Directory.CreateDirectory(stagedDirectory);
+            AssertScriptSucceeded(await RunScriptAsync("stop_local_license_stack.ps1"));
+            stagedDirectory = null;
+        }
+        finally
+        {
+            if (stagedDirectory is not null && Directory.Exists(stagedDirectory))
+                Directory.Delete(stagedDirectory);
+            ReleaseAllHooks(hookRoot);
+            await RecoverCleanupAsync();
+            if (Directory.Exists(replacementTarget))
+                Directory.Delete(replacementTarget, recursive: true);
             if (Directory.Exists(hookRoot))
                 Directory.Delete(hookRoot, recursive: true);
         }

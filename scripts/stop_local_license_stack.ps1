@@ -16,10 +16,10 @@ $stopMutex = $null
 $stopMutexAcquired = $false
 
 function Remove-LocalArtifactWithRetry {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath, [switch]$Recurse)
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
         try {
-            if (Test-Path -LiteralPath $LiteralPath) { Remove-Item -LiteralPath $LiteralPath -Force -Recurse:$Recurse -ErrorAction Stop }
+            if (Test-Path -LiteralPath $LiteralPath) { Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop }
             return
         }
         catch [IO.IOException] { if ($attempt -eq 49) { throw }; Start-Sleep -Milliseconds 100 }
@@ -74,16 +74,27 @@ function Get-LocalFileSha256 {
     finally { $hashAlgorithm.Dispose(); $stream.Dispose() }
 }
 
-function Get-LocalFileInventory {
+function Get-LocalArtifactInventory {
     param([Parameter(Mandatory = $true)][string]$Root)
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    return @(
-        Get-ChildItem -LiteralPath $Root -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
-            $full = [IO.Path]::GetFullPath($_.FullName)
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Runtime inventory root is not a bound ordinary directory.' }
+    $pending = New-Object Collections.Generic.Stack[string]
+    $inventory = New-Object Collections.Generic.List[object]
+    $pending.Push([IO.Path]::GetFullPath($Root))
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $current -Force | Sort-Object FullName)) {
+            $full = [IO.Path]::GetFullPath($item.FullName)
             if (-not $full.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) { throw 'Runtime inventory escaped its private root.' }
-            [ordered]@{ relative_path = $full.Substring($rootFull.Length).Replace('\', '/'); sha256 = Get-LocalFileSha256 -LiteralPath $full }
+            $entryType = if ($item.PSIsContainer) { 'directory' } else { 'file' }
+            $isReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            $sha256 = if ($entryType -eq 'file' -and -not $isReparsePoint) { Get-LocalFileSha256 -LiteralPath $full } else { $null }
+            $inventory.Add([ordered]@{ relative_path = $full.Substring($rootFull.Length).Replace('\', '/'); entry_type = $entryType; is_reparse_point = [bool]$isReparsePoint; sha256 = $sha256 })
+            if ($entryType -eq 'directory' -and -not $isReparsePoint) { $pending.Push($full) }
         }
-    )
+    }
+    return @($inventory | Sort-Object { [string]$_.relative_path })
 }
 
 function Get-ExpectedExecutable {
@@ -145,7 +156,7 @@ function Assert-CleanupJournal {
     param([Parameter(Mandatory = $true)]$Journal)
     $token = [string]$Journal.instance_token
     $expectedQuarantine = [IO.Path]::GetFullPath((Join-Path $RuntimeParent ("license-local-quarantine-" + $token)))
-    if ([int]$Journal.schema_version -ne 1 -or $token -notmatch '^[0-9a-f]{32}$' -or
+    if ([int]$Journal.schema_version -ne 2 -or $token -notmatch '^[0-9a-f]{32}$' -or
         -not [string]::Equals([IO.Path]::GetFullPath([string]$Journal.runtime_root), $RuntimeRoot, [StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals([IO.Path]::GetFullPath([string]$Journal.quarantine_root), $expectedQuarantine, [StringComparison]::OrdinalIgnoreCase) -or
         [string]$Journal.evidence_name -notin @('pid-manifest.json', 'startup-cleanup.json') -or @($Journal.executables).Count -ne 2 -or @($Journal.runtime_files).Count -lt 1) { throw 'Cleanup journal identity rejected.' }
@@ -162,25 +173,58 @@ function Assert-CleanupJournal {
 
 function Assert-QuarantineInventory {
     param([Parameter(Mandatory = $true)]$Journal, [Parameter(Mandatory = $true)][string]$QuarantineRoot)
+    $rootItem = Get-Item -LiteralPath $QuarantineRoot -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cleanup root is not a bound ordinary directory and was preserved.' }
     $rootPrefix = [IO.Path]::GetFullPath($QuarantineRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     $expected = @{}
     foreach ($entry in $Journal.runtime_files) {
-        $relative = [string]$entry.relative_path
-        if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|/|\\)\.\.($|/|\\)' -or [string]$entry.sha256 -notmatch '^[0-9a-f]{64}$' -or $expected.ContainsKey($relative)) { throw 'Cleanup journal runtime inventory rejected.' }
+        $relative = ([string]$entry.relative_path).Replace('\', '/')
+        $entryType = [string]$entry.entry_type
+        $isReparsePoint = [bool]$entry.is_reparse_point
+        $sha256 = [string]$entry.sha256
+        if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|/)\.\.($|/)' -or
+            $entryType -notin @('file', 'directory') -or $isReparsePoint -or
+            ($entryType -eq 'file' -and $sha256 -notmatch '^[0-9a-f]{64}$') -or
+            ($entryType -eq 'directory' -and -not [string]::IsNullOrEmpty($sha256)) -or $expected.ContainsKey($relative)) { throw 'Cleanup journal runtime inventory rejected.' }
         $candidate = [IO.Path]::GetFullPath((Join-Path $QuarantineRoot $relative))
         if (-not $candidate.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Cleanup journal runtime path escaped quarantine.' }
-        $expected[$relative.Replace('\', '/')] = [string]$entry.sha256
+        $expected[$relative] = [ordered]@{ entry_type = $entryType; is_reparse_point = $isReparsePoint; sha256 = $sha256 }
     }
-    foreach ($entry in $Journal.executables) { $expected[[string]$entry.staged_name] = [string]$entry.sha256 }
+    foreach ($entry in $Journal.executables) { $expected[[string]$entry.staged_name] = [ordered]@{ entry_type = 'file'; is_reparse_point = $false; sha256 = [string]$entry.sha256 } }
     $actual = @{}
-    foreach ($entry in (Get-LocalFileInventory -Root $QuarantineRoot)) { $actual[[string]$entry.relative_path] = [string]$entry.sha256 }
+    foreach ($entry in (Get-LocalArtifactInventory -Root $QuarantineRoot)) { $actual[[string]$entry.relative_path] = $entry }
     foreach ($relative in $actual.Keys) {
-        if (-not $expected.ContainsKey($relative) -or -not [string]::Equals([string]$actual[$relative], [string]$expected[$relative], [StringComparison]::Ordinal)) { throw 'Quarantine contains a changed or unowned artifact and was preserved.' }
+        if (-not $expected.ContainsKey($relative)) { throw 'Quarantine contains a changed or unowned artifact and was preserved.' }
+        $actualEntry = $actual[$relative]
+        $expectedEntry = $expected[$relative]
+        if (-not [string]::Equals([string]$actualEntry.entry_type, [string]$expectedEntry.entry_type, [StringComparison]::Ordinal) -or
+            [bool]$actualEntry.is_reparse_point -ne [bool]$expectedEntry.is_reparse_point -or
+            ([string]$actualEntry.entry_type -eq 'file' -and -not [string]::Equals([string]$actualEntry.sha256, [string]$expectedEntry.sha256, [StringComparison]::Ordinal))) { throw 'Quarantine contains a changed or unowned artifact and was preserved.' }
     }
-    foreach ($entry in $Journal.runtime_files) {
+}
+
+function Remove-VerifiedQuarantineTree {
+    param([Parameter(Mandatory = $true)]$Journal, [Parameter(Mandatory = $true)][string]$QuarantineRoot)
+    $rootPrefix = [IO.Path]::GetFullPath($QuarantineRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $files = @($Journal.runtime_files | Where-Object { [string]$_.entry_type -eq 'file' } | Sort-Object { ([string]$_.relative_path).Length } -Descending)
+    $directories = @($Journal.runtime_files | Where-Object { [string]$_.entry_type -eq 'directory' } | Sort-Object { ([string]$_.relative_path).Length } -Descending)
+    foreach ($entry in @($files + $directories)) {
         $relative = ([string]$entry.relative_path).Replace('\', '/')
-        if (-not $actual.ContainsKey($relative)) { throw 'Quarantine ownership evidence is incomplete and was preserved.' }
+        $candidate = [IO.Path]::GetFullPath((Join-Path $QuarantineRoot $relative))
+        if (-not $candidate.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Cleanup journal runtime path escaped quarantine.' }
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        $expectedType = [string]$entry.entry_type
+        $actualType = if ($item.PSIsContainer) { 'directory' } else { 'file' }
+        $isReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if (-not [string]::Equals($actualType, $expectedType, [StringComparison]::Ordinal) -or $isReparsePoint) { throw 'A runtime directory identity changed before deletion and was preserved.' }
+        if ($actualType -eq 'file' -and -not [string]::Equals((Get-LocalFileSha256 -LiteralPath $candidate), [string]$entry.sha256, [StringComparison]::Ordinal)) { throw 'A runtime file changed before deletion and was preserved.' }
+        if ($actualType -eq 'directory' -and @(Get-ChildItem -LiteralPath $candidate -Force).Count -ne 0) { throw 'A runtime directory was not empty at deletion and was preserved.' }
+        Remove-LocalArtifactWithRetry -LiteralPath $candidate
     }
+    $rootItem = Get-Item -LiteralPath $QuarantineRoot -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or @(Get-ChildItem -LiteralPath $QuarantineRoot -Force).Count -ne 0) { throw 'Cleanup root identity changed before deletion and was preserved.' }
+    Remove-LocalArtifactWithRetry -LiteralPath $QuarantineRoot
 }
 
 function Resume-QuarantineCleanup {
@@ -203,8 +247,9 @@ function Resume-QuarantineCleanup {
     if (-not (Test-Path -LiteralPath $quarantineRoot -PathType Container)) { throw 'Cleanup quarantine is missing.' }
     $owner = Join-Path $quarantineRoot 'instance-token'
     $manifest = Join-Path $quarantineRoot ([string]$Journal.evidence_name)
-    if (-not (Test-Path -LiteralPath $owner -PathType Leaf) -or -not (Test-Path -LiteralPath $manifest -PathType Leaf) -or
-        -not [string]::Equals((Get-Content -LiteralPath $owner -Raw -Encoding ascii).Trim(), [string]$Journal.instance_token, [StringComparison]::Ordinal)) { throw 'Quarantine ownership evidence rejected.' }
+    if ((Test-Path -LiteralPath $owner) -and (-not (Test-Path -LiteralPath $owner -PathType Leaf) -or
+        -not [string]::Equals((Get-Content -LiteralPath $owner -Raw -Encoding ascii).Trim(), [string]$Journal.instance_token, [StringComparison]::Ordinal))) { throw 'Quarantine ownership evidence rejected.' }
+    if ((Test-Path -LiteralPath $manifest) -and -not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Quarantine ownership evidence rejected.' }
     Assert-QuarantineInventory -Journal $Journal -QuarantineRoot $quarantineRoot
     foreach ($entry in $Journal.executables) {
         $staged = Join-Path $quarantineRoot ([string]$entry.staged_name)
@@ -217,9 +262,9 @@ function Resume-QuarantineCleanup {
         }
     }
     Invoke-TestHook -Name 'before-quarantine-delete'
-    if (-not [string]::Equals((Get-Content -LiteralPath $owner -Raw -Encoding ascii).Trim(), [string]$Journal.instance_token, [StringComparison]::Ordinal)) { throw 'Quarantine ownership changed before deletion.' }
+    if ((Test-Path -LiteralPath $owner) -and -not [string]::Equals((Get-Content -LiteralPath $owner -Raw -Encoding ascii).Trim(), [string]$Journal.instance_token, [StringComparison]::Ordinal)) { throw 'Quarantine ownership changed before deletion.' }
     Assert-QuarantineInventory -Journal $Journal -QuarantineRoot $quarantineRoot
-    Remove-LocalArtifactWithRetry -LiteralPath $quarantineRoot -Recurse
+    Remove-VerifiedQuarantineTree -Journal $Journal -QuarantineRoot $quarantineRoot
     Remove-LocalArtifactWithRetry -LiteralPath $CleanupJournalPath
 }
 
@@ -261,8 +306,8 @@ try {
     finally {
         if ($stopFailures.Count -eq 0) {
             $executables = @($manifest.processes | ForEach-Object { [ordered]@{ role = [string]$_.role; source_path = [IO.Path]::GetFullPath([string]$_.executable_path); staged_name = ('.cleanup-' + $manifestToken + '-' + [string]$_.role + '.exe'); sha256 = [string]$_.executable_sha256 } })
-            $runtimeFiles = Get-LocalFileInventory -Root $RuntimeRoot
-            $journal = [ordered]@{ schema_version = 1; instance_token = $manifestToken; runtime_root = $RuntimeRoot; quarantine_root = [IO.Path]::GetFullPath((Join-Path $RuntimeParent ("license-local-quarantine-" + $manifestToken))); evidence_name = 'pid-manifest.json'; executables = $executables; runtime_files = $runtimeFiles }
+            $runtimeFiles = Get-LocalArtifactInventory -Root $RuntimeRoot
+            $journal = [ordered]@{ schema_version = 2; instance_token = $manifestToken; runtime_root = $RuntimeRoot; quarantine_root = [IO.Path]::GetFullPath((Join-Path $RuntimeParent ("license-local-quarantine-" + $manifestToken))); evidence_name = 'pid-manifest.json'; executables = $executables; runtime_files = $runtimeFiles }
             Write-TextFileAtomic -LiteralPath $CleanupJournalPath -Text (($journal | ConvertTo-Json -Depth 5) + "`n")
             Resume-QuarantineCleanup -Journal $journal
         }
