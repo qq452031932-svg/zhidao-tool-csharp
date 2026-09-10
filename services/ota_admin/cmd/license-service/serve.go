@@ -85,11 +85,19 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		return errors.New("load card lookup key")
 	}
 	defer clear(lookupKey)
-	internalSecret, err := licenseconfig.ReadSecret32(cfg.InternalSecretPath)
+	internalSecret, err := licenseconfig.ReadSharedSecret32(cfg.InternalSecretPath)
 	if err != nil {
 		return errors.New("load internal API secret")
 	}
 	defer clear(internalSecret)
+	var loadTestSecret []byte
+	if cfg.LoadTestEnabled {
+		loadTestSecret, err = licenseconfig.ReadSecret32(cfg.LoadTestSecretPath)
+		if err != nil {
+			return errors.New("load load-test secret")
+		}
+		defer clear(loadTestSecret)
+	}
 	privateKey, err := signing.LoadPrivateKey(cfg.SigningPrivateKeyPath)
 	if err != nil {
 		return errors.New("load signing private key")
@@ -121,6 +129,10 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 	if err != nil {
 		return errors.New("initialize license service")
 	}
+	var storeMetrics licensehttp.StoreMetrics
+	if cfg.LoadTestEnabled {
+		storeMetrics = database
+	}
 	handler, err := licensehttp.NewRouter(licensehttp.Options{
 		Service: licenses, ReplayStore: database, Signer: signer, Clock: clock,
 		MaxBodyBytes: cfg.Limits.MaxBodyBytes, MaxHeaderBytes: cfg.Limits.MaxHeaderBytes,
@@ -135,8 +147,11 @@ func serve(ctx context.Context, cfg licenseconfig.Config, stdout, stderr io.Writ
 		MaxAdminIdempotencyEntries: cfg.Limits.MaxAdminIdempotencyEntries,
 		MaxAdminIdempotencyBytes:   cfg.Limits.MaxAdminIdempotencyBytes,
 		MaxLimiterEntries:          maximumLimiterEntries,
+		LoadTestSecret:             loadTestSecret,
+		StoreMetrics:               storeMetrics,
 	})
 	clear(internalSecret)
+	clear(loadTestSecret)
 	if err != nil {
 		return errors.New("initialize license API")
 	}

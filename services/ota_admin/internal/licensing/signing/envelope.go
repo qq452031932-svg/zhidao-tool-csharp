@@ -10,10 +10,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
-	"os"
-	"runtime"
 	"strings"
 
+	licenseconfig "fanfh.cn/superpan/ota-admin/internal/licensing/config"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 )
 
@@ -62,14 +61,7 @@ func (s *Signer) Sign(claims model.Claims) (model.SignedEnvelope, error) {
 }
 
 func LoadPrivateKey(path string) (*ecdsa.PrivateKey, error) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maximumPrivateKeyBytes {
-		return nil, errors.New("signing private key file is invalid")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 && info.Mode().Perm() != 0o640 {
-		return nil, errors.New("signing private key permissions are too broad")
-	}
-	data, err := os.ReadFile(path)
+	data, err := licenseconfig.ReadLicenseFile(path, maximumPrivateKeyBytes)
 	if err != nil {
 		return nil, errors.New("read signing private key")
 	}

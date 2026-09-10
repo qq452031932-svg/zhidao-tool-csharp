@@ -21,8 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"fanfh.cn/superpan/ota-admin/internal/licensing/authwire"
 	licenseconfig "fanfh.cn/superpan/ota-admin/internal/licensing/config"
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
 )
 
 func TestRunRequiresExplicitStrictConfigWithoutLeakingPath(t *testing.T) {
@@ -104,6 +106,74 @@ func TestServeRejectsNonLoopbackBeforeOpeningState(t *testing.T) {
 	}
 	if _, err := os.Stat(cfg.LicenseDatabasePath); !os.IsNotExist(err) {
 		t.Fatalf("database was opened before config rejection: %v", err)
+	}
+}
+
+func TestServeWiresLoadCredentialHealthAndMetricsWithoutLoggingSecrets(t *testing.T) {
+	cfg := writeRuntimeConfig(t)
+	cfg.LoadTestEnabled = true
+	cfg.LoadTestSecretPath = filepath.Join(filepath.Dir(cfg.EncryptionKeyPath), "load-test.key")
+	loadSecret := bytes.Repeat([]byte{0x79}, 32)
+	if err := os.WriteFile(cfg.LoadTestSecretPath, loadSecret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr lockedBuffer
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, cfg, &stdout, &stderr) }()
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	baseURL := "http://" + cfg.ListenAddress
+	var response *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		request, err := http.NewRequest(http.MethodGet, baseURL+"/internal/load-metrics", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+authwire.EncodeInternalToken(loadSecret))
+		response, err = client.Do(request)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if response == nil {
+		cancel()
+		t.Fatalf("server did not start; stderr=%s", stderr.String())
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status = %d", response.StatusCode)
+	}
+	var metrics licensestore.Metrics
+	if err := json.NewDecoder(response.Body).Decode(&metrics); err != nil {
+		t.Fatal(err)
+	}
+	if metrics != (licensestore.Metrics{}) {
+		t.Fatalf("initial metrics = %+v", metrics)
+	}
+
+	health, err := client.Get(baseURL + "/internal/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d", health.StatusCode)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not stop")
+	}
+	output := stdout.String() + stderr.String()
+	if strings.Contains(output, cfg.LoadTestSecretPath) || strings.Contains(output, string(loadSecret)) || strings.Contains(output, authwire.EncodeInternalToken(loadSecret)) {
+		t.Fatalf("load secret leaked: %s", output)
 	}
 }
 

@@ -48,6 +48,8 @@ type Config struct {
 	LookupHMACKeyPath          string   `json:"lookup_hmac_key_path"`
 	SigningPrivateKeyPath      string   `json:"signing_private_key_path"`
 	InternalSecretPath         string   `json:"internal_secret_path"`
+	LoadTestEnabled            bool     `json:"load_test_enabled"`
+	LoadTestSecretPath         string   `json:"load_test_secret_path"`
 	SigningKeyID               string   `json:"signing_key_id"`
 	PublicAPIBasePath          string   `json:"public_api_base_path"`
 	Limits                     Limits   `json:"limits"`
@@ -57,15 +59,11 @@ func Load(path string) (Config, error) {
 	if strings.TrimSpace(path) == "" {
 		return Config{}, errors.New("configuration path is required")
 	}
-	file, err := os.Open(path)
+	data, err := readConfigFile(path, maximumConfigBytes)
 	if err != nil {
-		return Config{}, errors.New("open license service configuration")
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maximumConfigBytes+1))
-	if err != nil || len(data) > maximumConfigBytes {
 		return Config{}, errors.New("read license service configuration")
 	}
+	defer clear(data)
 	if err := validateConfigJSONShape(data); err != nil {
 		return Config{}, err
 	}
@@ -88,7 +86,7 @@ func Load(path string) (Config, error) {
 func validateConfigJSONShape(data []byte) error {
 	topFields := map[string]struct{}{
 		"listen_address": {}, "license_database_path": {}, "encryption_key_path": {}, "previous_encryption_key_paths": {}, "lookup_hmac_key_path": {},
-		"signing_private_key_path": {}, "internal_secret_path": {}, "signing_key_id": {}, "public_api_base_path": {}, "limits": {},
+		"signing_private_key_path": {}, "internal_secret_path": {}, "load_test_enabled": {}, "load_test_secret_path": {}, "signing_key_id": {}, "public_api_base_path": {}, "limits": {},
 	}
 	values, err := strictJSONObject(data, topFields)
 	if err != nil {
@@ -166,8 +164,14 @@ func (c Config) Validate() error {
 	if len(c.PreviousEncryptionKeyPaths) > 2 {
 		return errors.New("too many previous encryption keys")
 	}
+	if c.LoadTestEnabled != (c.LoadTestSecretPath != "") {
+		return errors.New("load-test mode requires exactly one explicit secret path")
+	}
 	paths := []string{c.LicenseDatabasePath, c.EncryptionKeyPath, c.LookupHMACKeyPath, c.SigningPrivateKeyPath, c.InternalSecretPath}
 	paths = append(paths, c.PreviousEncryptionKeyPaths...)
+	if c.LoadTestEnabled {
+		paths = append(paths, c.LoadTestSecretPath)
+	}
 	normalized := make([]string, 0, len(paths))
 	for _, path := range paths {
 		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -237,17 +241,43 @@ func pathsOverlap(first, second string) bool {
 }
 
 func ReadSecret32(path string) ([]byte, error) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != 32 {
-		return nil, errors.New("secret file must contain exactly 32 raw bytes")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 && info.Mode().Perm() != 0o640 {
-		return nil, errors.New("secret file permissions are too broad")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) != 32 {
+	data, err := readLicenseFile(path, 32, 32)
+	if err != nil {
 		clear(data)
 		return nil, errors.New("read 32-byte secret file")
 	}
 	return data, nil
+}
+
+// ReadSharedSecret32 reads the one credential shared with the OTA admin. On
+// Linux it is restricted to the process's single supplementary group rather
+// than the license service's primary group.
+func ReadSharedSecret32(path string) ([]byte, error) {
+	data, err := readSharedFile(path, 32, 32)
+	if err != nil {
+		clear(data)
+		return nil, errors.New("read shared 32-byte secret file")
+	}
+	return data, nil
+}
+
+// ReadLicenseFile applies the same runtime trust boundary used by the service
+// configuration and license-only keys.
+func ReadLicenseFile(path string, maximum int64) ([]byte, error) {
+	if maximum < 1 {
+		return nil, errors.New("trusted file size limit must be positive")
+	}
+	return readLicenseFile(path, 0, maximum)
+}
+
+func sharedFilePolicy(groups []int, exactSize, maximumSize int64) (trustedFilePolicy, error) {
+	if len(groups) != 1 || groups[0] < 0 {
+		return trustedFilePolicy{}, errors.New("exactly one supplementary group is required")
+	}
+	return trustedFilePolicy{
+		allowedGIDs:  map[uint32]struct{}{uint32(groups[0]): {}},
+		exactSize:    exactSize,
+		maximumSize:  maximumSize,
+		allowedModes: map[os.FileMode]struct{}{0o600: {}, 0o640: {}},
+	}, nil
 }

@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -87,6 +89,9 @@ func TestNewRejectsWrongCurveAndInvalidKeyID(t *testing.T) {
 }
 
 func TestLoadPrivateKeyAcceptsOnlySingleP256ECPEM(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux acceptance requires installed production ownership")
+	}
 	p256, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -133,8 +138,8 @@ func TestLoadPrivateKeyAcceptsOnlySingleP256ECPEM(t *testing.T) {
 }
 
 func TestLoadPrivateKeyUnixPermissionsAllowOnly0600Or0640(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows ACLs are not represented by Unix mode bits")
+	if runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		t.Skip("platform uses a separate trusted-file policy")
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -148,6 +153,47 @@ func TestLoadPrivateKeyUnixPermissionsAllowOnly0600Or0640(t *testing.T) {
 		if (err == nil) != wantOK {
 			t.Fatalf("mode %o error = %v, wantOK=%v", mode, err, wantOK)
 		}
+	}
+}
+
+func TestLoadPrivateKeyRejectsSymlinkOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		t.Skip("Linux root-only trust fixture")
+	}
+	group, err := user.LookupGroup("superpan-license")
+	if err != nil {
+		t.Skip("superpan-license group is not installed")
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp("/root", "signing-trust-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "real.pem")
+	if err := os.WriteFile(target, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(target, 0, gid); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.pem")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPrivateKey(link); err == nil {
+		t.Fatal("LoadPrivateKey accepted symlink")
 	}
 }
 

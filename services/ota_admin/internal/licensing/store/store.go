@@ -14,7 +14,6 @@ import (
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
 )
 
 var (
@@ -32,7 +31,8 @@ var (
 const busyTimeoutMilliseconds = 10_000
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	metrics *metricCounters
 }
 
 type AdminTransaction struct {
@@ -422,10 +422,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMilliseconds))
 	u.RawQuery = query.Encode()
-	db, err := sql.Open("sqlite", u.String())
-	if err != nil {
-		return nil, fmt.Errorf("open license sqlite: %w", err)
-	}
+	metrics := &metricCounters{}
+	db := sql.OpenDB(newMetricsConnector(u.String(), metrics))
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
 	closeOnError := func(err error) (*Store, error) {
@@ -450,7 +448,14 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if !strings.EqualFold(mode, "wal") {
 		return closeOnError(fmt.Errorf("license sqlite journal mode is %q, want WAL", mode))
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, metrics: metrics}, nil
+}
+
+func (s *Store) Metrics() Metrics {
+	if s == nil {
+		return Metrics{}
+	}
+	return s.metrics.snapshot()
 }
 
 func (s *Store) Close() error {

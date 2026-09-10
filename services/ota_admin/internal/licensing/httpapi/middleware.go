@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const loadBypassClientKey = "\x00load-test-rate-bypass"
+
 type RateLimit struct {
 	Requests int
 	Window   time.Duration
@@ -29,6 +31,9 @@ func newFixedWindowLimiter(limit RateLimit, maxEntries int, clock Clock) *fixedW
 }
 
 func (l *fixedWindowLimiter) allow(key string) (bool, int) {
+	if key == loadBypassClientKey {
+		return true, 0
+	}
 	now := l.clock.Now().UTC()
 	l.mu.Lock()
 	defer l.mu.Unlock()

@@ -2,7 +2,11 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -61,6 +65,10 @@ type ClaimsSigner interface {
 	Sign(model.Claims) (model.SignedEnvelope, error)
 }
 
+type StoreMetrics interface {
+	Metrics() licensestore.Metrics
+}
+
 type Options struct {
 	Service                    LicenseService
 	ReplayStore                ReplayStore
@@ -82,6 +90,8 @@ type Options struct {
 	MaxExportCount             int
 	MaxAdminIdempotencyEntries int
 	MaxAdminIdempotencyBytes   int64
+	LoadTestSecret             []byte
+	StoreMetrics               StoreMetrics
 }
 
 type api struct {
@@ -103,8 +113,17 @@ func NewRouter(options Options) (http.Handler, error) {
 	a.validation = newFixedWindowLimiter(options.ValidationRate, options.MaxLimiterEntries, options.Clock)
 	mux := http.NewServeMux()
 	var internal http.Handler
-	mux.HandleFunc("POST /license-api/v1/activate", a.activate)
-	mux.HandleFunc("POST /license-api/v1/validate", a.validate)
+	mux.Handle("POST /license-api/v1/activate", a.markLoadBypass(http.HandlerFunc(a.activate)))
+	mux.Handle("POST /license-api/v1/validate", a.markLoadBypass(http.HandlerFunc(a.validate)))
+	mux.HandleFunc("GET /internal/health", a.health)
+	loadConfigured := len(options.LoadTestSecret) != 0 || options.StoreMetrics != nil
+	if loadConfigured {
+		if len(options.LoadTestSecret) != 32 || options.StoreMetrics == nil {
+			return nil, errors.New("load-test dependencies are invalid")
+		}
+		a.options.LoadTestSecret = []byte(authwire.EncodeInternalToken(options.LoadTestSecret))
+		mux.HandleFunc("GET /internal/load-metrics", a.loadMetrics)
+	}
 	adminConfigured := options.AdminService != nil || options.AdminIdempotencyStore != nil || len(options.InternalSecret) != 0 || options.AdminRate.Requests != 0 || options.MaxAdminPageSize != 0 || options.MaxExportCount != 0 || options.MaxAdminIdempotencyEntries != 0 || options.MaxAdminIdempotencyBytes != 0
 	if adminConfigured {
 		if options.AdminService == nil || options.AdminIdempotencyStore == nil || len(options.InternalSecret) != 32 || options.AdminRate.Requests < 1 || options.AdminRate.Window <= 0 || options.MaxAdminPageSize < 1 || options.MaxExportCount < 1 || options.MaxAdminIdempotencyEntries < 1 || options.MaxAdminIdempotencyBytes < 1 {
@@ -137,18 +156,88 @@ func NewRouter(options Options) (http.Handler, error) {
 		adminMux.HandleFunc("POST /internal/v1/devices/{id}/unbind", a.unbindDevice)
 		internal = a.authorizeInternal(adminMux)
 	}
-	root := http.Handler(mux)
-	if internal != nil {
-		root = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/internal" || strings.HasPrefix(r.URL.Path, "/internal/") {
-				internal.ServeHTTP(w, r)
-				return
-			}
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/internal/health" {
 			mux.ServeHTTP(w, r)
-		})
-	}
+			return
+		}
+		if r.URL.Path == "/internal/load-metrics" {
+			if loadConfigured {
+				mux.ServeHTTP(w, r)
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		}
+		if internal != nil && (r.URL.Path == "/internal" || strings.HasPrefix(r.URL.Path, "/internal/")) {
+			internal.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 	return a.protect(root), nil
 }
+
+func (a *api) health(w http.ResponseWriter, r *http.Request) {
+	if !loopbackPeer(r) {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "{\"status\":\"ok\"}\n")
+}
+
+func (a *api) loadMetrics(w http.ResponseWriter, r *http.Request) {
+	if !loopbackPeer(r) {
+		http.NotFound(w, r)
+		return
+	}
+	if !a.validLoadCredential(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, "{\"code\":\"unauthorized\"}\n")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(a.options.StoreMetrics.Metrics())
+}
+
+func (a *api) markLoadBypass(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(a.options.LoadTestSecret) != 0 && loopbackPeer(r) && a.validLoadCredential(r) {
+			r = r.WithContext(context.WithValue(r.Context(), loadBypassContextKey{}, true))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *api) validLoadCredential(r *http.Request) bool {
+	values := r.Header.Values("Authorization")
+	candidate := ""
+	if len(values) > 0 {
+		candidate = values[0]
+	}
+	expected := make([]byte, 0, len("Bearer ")+len(a.options.LoadTestSecret))
+	expected = append(expected, "Bearer "...)
+	expected = append(expected, a.options.LoadTestSecret...)
+	candidateHash := sha256.Sum256([]byte(candidate))
+	expectedHash := sha256.Sum256(expected)
+	match := subtle.ConstantTimeCompare(candidateHash[:], expectedHash[:]) == 1
+	valid := len(values) == 1 && len(candidate) == len(expected) && !strings.Contains(candidate, ",") && match
+	clear(expected)
+	return valid
+}
+
+func loopbackPeer(r *http.Request) bool {
+	peer := canonicalRemoteIP(r.RemoteAddr)
+	return peer.IsValid() && peer.IsLoopback()
+}
+
+type loadBypassContextKey struct{}
 
 func (a *api) protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +262,9 @@ func headerBytes(headers http.Header) int {
 }
 
 func clientKey(request *http.Request) string {
+	if bypass, _ := request.Context().Value(loadBypassContextKey{}).(bool); bypass {
+		return loadBypassClientKey
+	}
 	peer := canonicalRemoteIP(request.RemoteAddr)
 	if peer.IsValid() && peer.IsLoopback() {
 		values := request.Header.Values("X-Real-IP")
