@@ -178,6 +178,8 @@ try {
 
     $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in $groups[$CommitGroup]) { [void]$allowed.Add($path) }
+    $requiredNewSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in $requiredNew[$CommitGroup]) { [void]$requiredNewSet.Add($path) }
     $stagedSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in $stagedPaths) { [void]$stagedSet.Add($path) }
     $outside = @($stagedPaths | Where-Object { -not $allowed.Contains($_) })
@@ -210,8 +212,11 @@ try {
             throw "Staged path mode is forbidden: $($entries[0].Mode) $($change.Path)"
         }
         $headContainsPath = Test-HeadContainsPath $change.Path
-        if (($headContainsPath -and $change.Status -ne 'M') -or
-            (-not $headContainsPath -and $change.Status -ne 'A')) {
+        if (-not $headContainsPath -and -not $requiredNewSet.Contains($change.Path)) {
+            throw "Staged add is not declared as a required new path: $($change.Path)"
+        }
+        $expectedStatus = if ($headContainsPath) { 'M' } else { 'A' }
+        if ($change.Status -ne $expectedStatus) {
             throw "Staged status '$($change.Status)' does not match HEAD state: $($change.Path)"
         }
     }
