@@ -40,7 +40,6 @@ $groups = @{
         'tests/BaiduBatchTransfer.App.Tests/Features/LicenseOperationBoundaryTests.cs'
         'tests/BaiduBatchTransfer.App.Tests/Features/ShareAnalyticsViewModelTests.cs'
         'tests/BaiduBatchTransfer.App.Tests/Features/ShareWorkspaceViewModelTests.cs'
-        'tests/BaiduBatchTransfer.App.Tests/Features/TransferRecoveryAuthorizationSourceTests.cs'
         'tests/BaiduBatchTransfer.App.Tests/Features/TransferWorkspaceViewModelTests.cs'
         'tests/BaiduBatchTransfer.App.Tests/Features/WorkspaceRunPanelViewModelTests.cs'
         'tests/BaiduBatchTransfer.App.Tests/Services/StandaloneShareCoordinatorHostedServiceTests.cs'
@@ -97,6 +96,7 @@ $mixedTask12 = @(
     'tests/BaiduBatchTransfer.App.Tests/Features/TransferWorkspaceViewModelTests.cs'
     'tests/BaiduBatchTransfer.App.Tests/Features/WorkspaceRunPanelViewModelTests.cs'
     'tests/BaiduBatchTransfer.App.Tests/Services/TransferCoordinatorHostedServiceTests.cs'
+    'tests/BaiduBatchTransfer.App.Tests/Updates/OtaBuildConfigurationTests.cs'
 )
 
 Push-Location $repositoryRoot
@@ -117,6 +117,8 @@ try {
 
     $missingNew = New-Object Collections.Generic.List[string]
     foreach ($path in $requiredNew[$CommitGroup]) {
+        git cat-file -e ("HEAD:{0}" -f $path) 2>$null
+        if ($LASTEXITCODE -eq 0) { continue }
         $entry = @(git ls-files --stage -- $path)
         if ($LASTEXITCODE -ne 0) { throw "Unable to inspect staged entry '$path'." }
         if ($entry.Count -eq 0 -or $stagedPaths -notcontains $path) { $missingNew.Add($path) }
@@ -146,7 +148,7 @@ try {
 
         $changedLines = @(git diff --cached --unified=0 -- @($groups.task12) |
             Where-Object { $_ -match '^[+-](?![+-])' })
-        $forbiddenHunkPattern = 'ManagedBrowserHelperPackageDirectory|HelperSourceDirectory|ITransferTargetDirectory|transferTargetDirectoryPicker|TargetDirectoryPicker|ShareAnalyticsPreference|startup-error\.txt|DirectBackground|PendingRowRuntimeStatus|WorkspaceLog|LocalResultExport|ReplacementWorkbook|ManagedChromium'
+        $forbiddenHunkPattern = 'ManagedBrowserHelperPackageDirectory|HelperSourceDirectory|ITransferTargetDirectory|transferTargetDirectoryPicker|TargetDirectoryPicker|ShareAnalyticsPreference|startup-error\.txt|DirectBackground|PendingRowRuntimeStatus|WorkspaceLog|LocalResultExport|ReplacementWorkbook|ManagedChromium|OtaAcceptanceBuild|OtaAcceptanceFeedPath|AcceptanceBuildDerivesDedicatedPackageId'
         $unrelated = @($changedLines | Where-Object { $_ -match $forbiddenHunkPattern })
         if ($unrelated.Count -gt 0) {
             throw "A staged Task 12 hunk matches an unrelated-work marker: $($unrelated[0])"
