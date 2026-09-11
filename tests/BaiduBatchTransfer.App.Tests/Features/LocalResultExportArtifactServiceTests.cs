@@ -15,6 +15,17 @@ public sealed class LocalResultExportArtifactServiceTests : IDisposable
         Path.GetTempPath(), $"bbt-result-inspection-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task PublishCreatesPreviouslyAuthorizedMissingDirectory()
+    {
+        const string target = "result.xlsx";
+
+        var receipt = await CreateService().PublishAsync(Owner(expectedRows: 1), target);
+
+        Assert.Equal(target, receipt.FinalFileName);
+        Assert.True(File.Exists(Path.Combine(root, target)));
+    }
+
+    [Fact]
     public async Task ValidButWrongWorkbookIsRejectedForRecoveredBatch()
     {
         Directory.CreateDirectory(root);

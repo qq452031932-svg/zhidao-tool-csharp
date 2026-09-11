@@ -211,9 +211,6 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
         foreach (var action in new[]
         {
-            BaiduAutomationAction.SetExtractionCode,
-            BaiduAutomationAction.SubmitExtraction,
-            BaiduAutomationAction.SelectExactItems,
             BaiduAutomationAction.OpenDestinationPicker,
             BaiduAutomationAction.EnterDirectory,
             BaiduAutomationAction.ClickConfirmTransfer,
@@ -237,6 +234,164 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
             await formal.TryCreateBindingAsync(recovery));
         Assert.Null(await formal.TryAcquireTransferMutationPermitAsync(
             Mutation(recovery, recoveryBinding, read, BaiduAutomationAction.CreateDirectory)));
+    }
+
+    [Fact]
+    public async Task SubmissionStagePickerSelectionAllowsOnlyOpenEnterAndFinalConfirm()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+        Assert.True(await coordinator.TryValidateBindingAsync(
+            ensure with { Action = AdapterWriteAction.PrepareTransfer }, binding));
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        var read = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.DestinationPicker,
+            "uid-1", ["item-1"], "parent-1", new RemotePath("/目标"));
+
+        foreach (var action in new[]
+        {
+            BaiduAutomationAction.OpenDestinationPicker,
+            BaiduAutomationAction.EnterDirectory,
+            BaiduAutomationAction.ClickConfirmTransfer,
+        })
+        {
+            var permit = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+                await coordinator.TryAcquireTransferMutationPermitAsync(Mutation(submit, binding, read, action)));
+            await permit.DisposeAsync();
+        }
+
+        foreach (var forbidden in new[]
+        {
+            BaiduAutomationAction.SetExtractionCode,
+            BaiduAutomationAction.SubmitExtraction,
+            BaiduAutomationAction.SelectExactItems,
+            BaiduAutomationAction.CreateDirectory,
+            BaiduAutomationAction.ConfirmDirectoryCreation,
+            BaiduAutomationAction.CancelDestinationPicker,
+        })
+            Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, forbidden)));
+    }
+
+    [Fact]
+    public async Task OneLeaseAllowsOnlyOneGlobalMutationPermitAndDuplicateDisposeCannotReleaseAnother()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+        Assert.True(await coordinator.TryValidateBindingAsync(
+            ensure with { Action = AdapterWriteAction.PrepareTransfer }, binding));
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        var read = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.DestinationPicker,
+            "uid-1", ["item-1"], "parent-1", new RemotePath("/目标"));
+
+        var held = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, BaiduAutomationAction.OpenDestinationPicker)));
+        Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+            Mutation(submit, binding, read, BaiduAutomationAction.EnterDirectory)));
+        Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+            Mutation(submit, binding, read, BaiduAutomationAction.ClickConfirmTransfer)));
+        Assert.Null(await coordinator.TryAcquireMutationPermitAsync(new BaiduCandidateDomRequest(
+            submit, binding, BaiduAutomationAction.ClickSave,
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.OwnDrive, ["item-1"])));
+
+        await held.DisposeAsync();
+        var entered = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, BaiduAutomationAction.EnterDirectory)));
+        await held.DisposeAsync();
+        Assert.Null(await coordinator.TryAcquireTransferMutationPermitAsync(
+            Mutation(submit, binding, read, BaiduAutomationAction.ClickConfirmTransfer)));
+        await entered.DisposeAsync();
+        var confirmed = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, BaiduAutomationAction.ClickConfirmTransfer)));
+        await confirmed.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ActiveTransferPermitAttestationRequiresExactOwnerBindingActionAndLiveToken()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var ensure = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        Assert.True(coordinator.TryCreateLease(ensure, Confirmed()));
+        var binding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(ensure));
+        Assert.True(await coordinator.TryValidateBindingAsync(
+            ensure with { Action = AdapterWriteAction.PrepareTransfer }, binding));
+        var submit = ensure with { Action = AdapterWriteAction.SubmitTransfer };
+        Assert.True(await coordinator.TryValidateBindingAsync(submit, binding));
+        var read = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.DestinationPicker,
+            "uid-1", ["item-1"], "parent-1", new RemotePath("/目标"));
+        var permit = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit, binding, read, BaiduAutomationAction.ClickConfirmTransfer)));
+
+        Assert.True(coordinator.HasExactActiveTransferMutationPermit(
+            permit, submit, binding, BaiduAutomationAction.ClickConfirmTransfer));
+        Assert.False(coordinator.HasExactActiveTransferMutationPermit(
+            permit, submit, binding, BaiduAutomationAction.OpenDestinationPicker));
+        Assert.False(coordinator.HasExactActiveTransferMutationPermit(
+            permit, submit, binding with { BatchId = Guid.NewGuid() },
+            BaiduAutomationAction.ClickConfirmTransfer));
+        var foreign = Coordinator(true, ["--webview-acceptance"]);
+        Assert.False(foreign.HasExactActiveTransferMutationPermit(
+            permit, submit, binding, BaiduAutomationAction.ClickConfirmTransfer));
+
+        await permit.DisposeAsync();
+        var wrongOwnerPermit = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(submit with { Action = AdapterWriteAction.PrepareTransfer }, binding,
+                    read, BaiduAutomationAction.ClickConfirmTransfer)));
+        Assert.False(coordinator.HasExactActiveTransferMutationPermit(
+            wrongOwnerPermit, submit, binding, BaiduAutomationAction.ClickConfirmTransfer));
+
+        var revoking = coordinator.ReleaseBindingAsync(binding).AsTask();
+        Assert.False(coordinator.HasExactActiveTransferMutationPermit(
+            wrongOwnerPermit, submit, binding, BaiduAutomationAction.ClickConfirmTransfer));
+        Assert.False(revoking.IsCompleted);
+        await wrongOwnerPermit.DisposeAsync();
+        await wrongOwnerPermit.DisposeAsync();
+        await revoking;
+        Assert.False(coordinator.HasExactActiveTransferMutationPermit(
+            wrongOwnerPermit, submit, binding, BaiduAutomationAction.ClickConfirmTransfer));
+    }
+
+    [Fact]
+    public async Task DifferentTransferLeasesRetainIndependentMutationPermitOwnership()
+    {
+        var coordinator = Coordinator(true, ["--webview-acceptance"]);
+        var first = Request() with { Action = AdapterWriteAction.EnsureDirectory };
+        var second = first with { OperationId = Guid.NewGuid() };
+        Assert.True(coordinator.TryCreateLease(first, Confirmed()));
+        Assert.True(coordinator.TryCreateLease(second, Confirmed()));
+        var firstBinding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(first));
+        var secondBinding = Assert.IsType<AdapterWriteAuthorizationBinding>(
+            await coordinator.TryCreateBindingAsync(second));
+        var read = new BaiduCandidateDomReadRequest(
+            new Uri("https://pan.baidu.com/disk/main"), BaiduCandidatePageState.DestinationPicker,
+            "uid-1", ["item-1"], "parent-1", new RemotePath("/目标"));
+
+        var firstPermit = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(first, firstBinding, read, BaiduAutomationAction.OpenDestinationPicker)));
+        var secondPermit = Assert.IsAssignableFrom<IBaiduCandidateMutationPermit>(
+            await coordinator.TryAcquireTransferMutationPermitAsync(
+                Mutation(second, secondBinding, read, BaiduAutomationAction.OpenDestinationPicker)));
+
+        await firstPermit.DisposeAsync();
+        await secondPermit.DisposeAsync();
     }
 
     [Fact]
@@ -425,6 +580,38 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
     }
 
     [Fact]
+    public async Task AcceptanceOnlyIgnoresFormalRecordsAndCannotAcceptAVersion()
+    {
+        var store = new MemoryCapabilityStore();
+        var presenter = new RecordingPresenter();
+        var request = Request();
+        store.Records.Add(new(
+            request.Capability.AdapterKind,
+            request.Capability.ProtocolVersion,
+            request.Capability.SelectorVersion,
+            request.Capability.BuildVersion,
+            Now,
+            Hash));
+        var coordinator = Coordinator(
+            true,
+            [AcceptanceWriteLeaseOptions.Switch],
+            store: store,
+            presenter: presenter,
+            mode: RemoteWriteExecutionMode.AcceptanceOnly);
+
+        Assert.False(await coordinator.TryAuthorizeAsync(request));
+        Assert.True(coordinator.TryCreateLease(request, Confirmed()));
+        Assert.True(await coordinator.TryAuthorizeAsync(request));
+        await coordinator.RecordRemoteResultAsync(request, Hash);
+        await coordinator.RecordRecoveryAsync(request with { IsRecovery = true }, Hash);
+        await coordinator.OnLocalResultExportCompletedAsync(ExportEvidence(request));
+
+        Assert.Equal(0, presenter.EnableCount);
+        Assert.False(await coordinator.AcceptVersionAsync(request, userConfirmed: true));
+        Assert.Single(store.Records);
+    }
+
+    [Fact]
     public async Task MismatchedOrNonRecoveryEvidenceCannotEnableFormalAcceptance()
     {
         var presenter = new RecordingPresenter();
@@ -588,11 +775,13 @@ public sealed class AcceptanceWriteLeaseCoordinatorTests
         IReadOnlyList<string> args,
         TimeProvider? clock = null,
         MemoryCapabilityStore? store = null,
-        IAcceptanceWriteLeasePresenter? presenter = null) => new(
+        IAcceptanceWriteLeasePresenter? presenter = null,
+        RemoteWriteExecutionMode mode = RemoteWriteExecutionMode.Full) => new(
             new AcceptanceWriteLeaseOptions(debug, args),
             store ?? new MemoryCapabilityStore(),
             clock ?? new MutableTimeProvider(Now),
-            presenter);
+            presenter,
+            mode);
 
     private static AdapterWriteAuthorizationRequest Request() => new(
         new AdapterCapabilityVersion("BaiduTransfer", "protocol-v1", "selector-v1", "build-1"),

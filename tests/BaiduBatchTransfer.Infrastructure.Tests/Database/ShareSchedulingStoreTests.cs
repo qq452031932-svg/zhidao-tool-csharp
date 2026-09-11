@@ -25,6 +25,28 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task LoadMarksOnlyTheExactTransferLinkedAcceptanceShareAsEligible()
+    {
+        var graph = await CreateGraphAsync(
+            includeShareSettings: true, managedShare: true, acceptanceOnly: true);
+        var store = new SqliteShareSchedulingStore(graph.Factory);
+
+        var exact = Assert.IsType<ShareExecutionContext>(await store.LoadAsync(graph.ShareOperationId));
+        Assert.True(exact.AcceptanceOnly);
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE TransferOperations SET RemoteItemIdsJson='[\"different-exact-id\"]' WHERE Id=$id;";
+            command.Parameters.AddWithValue("$id", graph.TransferId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var drifted = Assert.IsType<ShareExecutionContext>(await store.LoadAsync(graph.ShareOperationId));
+        Assert.False(drifted.AcceptanceOnly);
+    }
+
+    [Fact]
     public async Task FreshShareSchemaOmitsUnusedResourceOperationIndexes()
     {
         var graph=await CreateGraphAsync(includeShareSettings:true);
@@ -1834,7 +1856,8 @@ public sealed class ShareSchedulingStoreTests : IDisposable
     private async Task<Graph> CreateGraphAsync(
         bool includeShareSettings,
         string batchStatus = "Active",
-        bool managedShare = false)
+        bool managedShare = false,
+        bool acceptanceOnly = false)
     {
         Directory.CreateDirectory(root);
         var factory = new SqliteConnectionFactory(Path.Combine(root, $"{Guid.NewGuid():N}.db"));
@@ -1844,18 +1867,17 @@ public sealed class ShareSchedulingStoreTests : IDisposable
         var secondAccount = AccountRecord.Create(Guid.Parse("00000000-0000-0000-0000-000000000002"), $"user-{Guid.NewGuid():N}", "Second Account");
         var batch = new BatchJobRecord(Guid.NewGuid(), "Batch", "Excel", "Distribution", "TaskCount", "ProportionalReduction",
             1, 1, "/", "None", "Skip", "Immediate", batchStatus, now,
-            batchStatus == "Active" ? now : null, null, null, 1, 4);
+            batchStatus == "Active" ? now : null, null, null, 1,
+            ShareOperationCount: acceptanceOnly ? 1 : 4, AcceptanceOnly: acceptanceOnly);
         var resource = new ResourceItemRecord(Guid.NewGuid(), batch.Id, null, 1, "source-url", "source-id", null, null,
             null, null, null, "None", "Valid", null, "Expanded", null, null, now, now, "Resolved title");
-        var transfer = new TransferOperationRecord(Guid.NewGuid(), resource.Id, batch.Id, 1, 1, "/", "/", "", account.Id,
-            "Rule", "Succeeded", "NewTransfer", 1, "transfer", "{}", "request", "[\"remote-a\",\"remote-b\"]",
-            "ResultReceived", "Fulfilled", now, now, now, null, null, null, now, now);
         var shareId = Guid.NewGuid();
         var settingsFingerprint = ShareSettingsFingerprint.Compute(
             true, true, ShareExtractionCodeBehavior.Random, null);
-        var itemSetFingerprint = new RemoteItemIdentitySet([
-            new("remote-a", "A"),
-            new("remote-b", "B")]).Fingerprint;
+        var exactGraphItems = acceptanceOnly
+            ? new RemoteItemIdentitySet([new("remote-a", "A")])
+            : new RemoteItemIdentitySet([new("remote-a", "A"), new("remote-b", "B")]);
+        var itemSetFingerprint = exactGraphItems.Fingerprint;
         ExecutionProfileSnapshot? managedExecutionProfile = null;
         if (managedShare)
         {
@@ -1870,17 +1892,31 @@ public sealed class ShareSchedulingStoreTests : IDisposable
             var installation = new BrowserInstallationIdentity(
                 Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
                 "Google LLC", "Google Chrome", $"managed-share-file-{Guid.NewGuid():N}");
-            await state.CreateInstallationAsync(installation, default);
+            var storedInstallation = await state.CreateInstallationAsync(installation, default);
+            Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+                (await state.TryReplaceActiveInstallationAsync(
+                    new ManagedBrowserInstallationActivationRequest(null, storedInstallation), default)).Status);
             var session = new ManagedBrowserSessionReference(
                 Guid.NewGuid(), installation.InstallationId, account.Id, account.BaiduUserId,
                 BrowserFamily.Chrome, $"managed-share-profile-{Guid.NewGuid():N}",
                 $"managed-share-ownership-{Guid.NewGuid():N}");
-            await state.CreateSessionAsync(session, default);
+            var storedSession = await state.CreateSessionAsync(session, default);
+            Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+                (await state.TryReplaceActiveSessionAsync(
+                    new ManagedBrowserSessionActivationRequest(null, storedSession), default)).Status);
             managedExecutionProfile = ExecutionProfileSnapshot.Managed(
                 BrowserFamily.Chrome, session.ProfileId, installation.InstallationId, session.SessionId);
         }
+        if (acceptanceOnly && managedExecutionProfile is null)
+            throw new InvalidOperationException("AcceptanceOnly test graphs require a managed snapshot.");
+        var transfer = new TransferOperationRecord(Guid.NewGuid(), resource.Id, batch.Id, 1, 1, "/", "/", "", account.Id,
+            "Rule", "Succeeded", "NewTransfer", 1, "transfer", "{}", "request",
+            acceptanceOnly ? "[\"remote-a\"]" : "[\"remote-a\",\"remote-b\"]",
+            "ResultReceived", "Fulfilled", now, now, now, null, null, null, now, now,
+            managedExecutionProfile, acceptanceOnly);
         var share = new ShareOperationRecord(shareId, transfer.Id, resource.Id, batch.Id, account.Id, 1,
-            "WaitingShare", itemSetFingerprint, settingsFingerprint, 1, null, null, "Unknown", 0, null, null, null, null, null,
+            acceptanceOnly ? "WaitingTransfer" : "WaitingShare", itemSetFingerprint, settingsFingerprint,
+            1, null, null, "Unknown", 0, null, null, null, null, null,
             now, now, 0, managedExecutionProfile);
 
         await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
@@ -1902,11 +1938,98 @@ public sealed class ShareSchedulingStoreTests : IDisposable
                 new(batch.Id, secondAccount.Id, 2, "Second Account", 1, 1, true)]);
             if (includeShareSettings)
             {
-                await unit.Jobs.AddShareOperationsAsync([share], [
-                    new(shareId, 1, "remote-b", "B"),
-                    new(shareId, 0, "remote-a", "A")]);
+                if (!acceptanceOnly)
+                    await unit.Jobs.AddShareOperationsAsync([share], [
+                        new(shareId, 1, "remote-b", "B"),
+                        new(shareId, 0, "remote-a", "A")]);
             }
             await unit.CommitAsync();
+        }
+        if (acceptanceOnly)
+        {
+            var acceptanceProfile = managedExecutionProfile!;
+            await using var connection = await factory.OpenConnectionAsync();
+            await using var transaction = connection.BeginTransaction();
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO ShareOperations(
+                      Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
+                      ExactItemSetFingerprint,SettingsFingerprint,Generation,SubmissionAcceptance,AttemptCount,
+                      CreatedAt,UpdatedAt,LeaseGeneration,ExecutionEngineVersion,BrowserFamily,ProfileId,
+                      InstallationId,SessionId)
+                    VALUES($id,$transfer,$resource,$batch,$account,1,'WaitingTransfer',NULL,$settings,1,
+                      'Unknown',0,$now,$now,0,$engine,$family,$profile,$installation,$session);
+                    """;
+                insert.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                insert.Parameters.AddWithValue("$transfer", transfer.Id.ToString("D"));
+                insert.Parameters.AddWithValue("$resource", resource.Id.ToString("D"));
+                insert.Parameters.AddWithValue("$batch", batch.Id.ToString("D"));
+                insert.Parameters.AddWithValue("$account", account.Id.ToString("D"));
+                insert.Parameters.AddWithValue("$settings", settingsFingerprint);
+                insert.Parameters.AddWithValue("$now", now.ToString("O"));
+                insert.Parameters.AddWithValue("$engine", "ManagedChromium-v1");
+                insert.Parameters.AddWithValue("$family", acceptanceProfile.BrowserFamily.ToString());
+                insert.Parameters.AddWithValue("$profile", acceptanceProfile.ProfileId);
+                insert.Parameters.AddWithValue("$installation", acceptanceProfile.InstallationId!.Value.ToString("D"));
+                insert.Parameters.AddWithValue("$session", acceptanceProfile.SessionId!.Value.ToString("D"));
+                Assert.Equal(1, await insert.ExecuteNonQueryAsync());
+            }
+            await using (var handoff = connection.CreateCommand())
+            {
+                handoff.Transaction = transaction;
+                handoff.CommandText = "UPDATE ShareOperations SET Status='WaitingShare',ExactItemSetFingerprint=$items WHERE Id=$id AND Status='WaitingTransfer';";
+                handoff.Parameters.AddWithValue("$items", itemSetFingerprint);
+                handoff.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                Assert.Equal(1, await handoff.ExecuteNonQueryAsync());
+            }
+            await using (var generation = connection.CreateCommand())
+            {
+                generation.Transaction = transaction;
+                generation.CommandText = """
+                    INSERT INTO ShareOperationGenerations(
+                      ShareOperationId,Generation,BatchJobId,ResourceItemId,AccountId,
+                      ExactItemSetFingerprint,SettingsFingerprint,ExactItemCount)
+                    VALUES($id,1,$batch,$resource,$account,$items,$settings,NULL);
+                    """;
+                generation.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                generation.Parameters.AddWithValue("$batch", batch.Id.ToString("D"));
+                generation.Parameters.AddWithValue("$resource", resource.Id.ToString("D"));
+                generation.Parameters.AddWithValue("$account", account.Id.ToString("D"));
+                generation.Parameters.AddWithValue("$items", itemSetFingerprint);
+                generation.Parameters.AddWithValue("$settings", settingsFingerprint);
+                Assert.Equal(1, await generation.ExecuteNonQueryAsync());
+            }
+            var acceptanceItems = new[] { (0, "remote-a", "A") };
+            foreach (var (ordinal, remote, name) in acceptanceItems)
+            {
+                await using var item = connection.CreateCommand();
+                item.Transaction = transaction;
+                item.CommandText = "INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($id,$ordinal,$remote,$sort,$name);";
+                item.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                item.Parameters.AddWithValue("$ordinal", ordinal);
+                item.Parameters.AddWithValue("$remote", remote);
+                item.Parameters.AddWithValue("$sort", RemoteItemIdentitySet.GetCanonicalSortKey(remote));
+                item.Parameters.AddWithValue("$name", name);
+                Assert.Equal(1, await item.ExecuteNonQueryAsync());
+            }
+            await using (var seal = connection.CreateCommand())
+            {
+                seal.Transaction = transaction;
+                seal.CommandText = "UPDATE ShareOperationGenerations SET ExactItemCount=1 WHERE ShareOperationId=$id AND Generation=1;";
+                seal.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                Assert.Equal(1, await seal.ExecuteNonQueryAsync());
+            }
+            await using (var reserve = connection.CreateCommand())
+            {
+                reserve.Transaction = transaction;
+                reserve.CommandText = "UPDATE ShareOperations SET Status='Reserved',LeaseGeneration=1,LeaseExpiresAt=$lease WHERE Id=$id;";
+                reserve.Parameters.AddWithValue("$lease", now.AddMinutes(2).ToString("O"));
+                reserve.Parameters.AddWithValue("$id", shareId.ToString("D"));
+                Assert.Equal(1, await reserve.ExecuteNonQueryAsync());
+            }
+            await transaction.CommitAsync();
         }
         if (!includeShareSettings)
             await SeedOrphanShareOperationAsync(factory, share);

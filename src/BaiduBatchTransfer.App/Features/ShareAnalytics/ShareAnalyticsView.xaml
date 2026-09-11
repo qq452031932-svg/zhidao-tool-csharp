@@ -121,110 +121,111 @@
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <Border Style="{StaticResource BorderedPanelStyle}" Padding="14" Margin="0,0,0,10">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <StackPanel>
-                    <TextBlock Text="分享数据" FontSize="18" FontWeight="SemiBold" />
-                    <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
-                        <TextBlock Text="当前账号：" Foreground="{StaticResource MutedBrush}" />
-                        <TextBlock Text="{Binding CurrentAccountName}" FontWeight="SemiBold" />
-                        <TextBlock Text="　" />
-                        <TextBlock Text="{Binding CacheStatusText}" Foreground="{StaticResource MutedBrush}" />
-                    </StackPanel>
-                </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="{Binding StatusMessage}" Foreground="{StaticResource MutedBrush}"
-                               VerticalAlignment="Center" Margin="0,0,12,0" />
-                    <Button Content="刷新数据" Command="{Binding RefreshCommand}"
-                            Style="{StaticResource PrimaryButton}" Margin="0" Padding="18,7" />
-                </StackPanel>
-            </Grid>
-        </Border>
-
-        <Border Grid.Row="1" Style="{StaticResource BorderedPanelStyle}" Padding="12" Margin="0,0,0,10">
+        <Border x:Name="ShareAnalyticsToolbar" Style="{StaticResource BorderedPanelStyle}"
+                Padding="10,6" Margin="0,0,0,6" TextElement.FontSize="12">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
-                <Grid>
+                <Grid x:Name="ShareSummaryToolbar">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="28" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Text="{Binding TotalCount, StringFormat=全部 {0:N0}}" FontWeight="SemiBold" />
-                    <TextBlock Grid.Column="1" Text="{Binding ValidCount, StringFormat=有效 {0:N0}}" Foreground="#1E8E5A" Margin="18,0,0,0" />
-                    <TextBlock Grid.Column="2" Text="{Binding InvalidCount, StringFormat=失效 {0:N0}}" Foreground="#E5484D" Margin="18,0,0,0" />
-                    <Button Grid.Column="4" Content="转存" Command="{Binding SelectMetricCommand}"
-                            CommandParameter="{x:Static domain:AccountShareMetric.Transfer}" Padding="14,4" Margin="0">
-                        <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsTransferSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
-                    </Button>
-                    <Button Grid.Column="5" Content="浏览" Command="{Binding SelectMetricCommand}"
-                            CommandParameter="{x:Static domain:AccountShareMetric.View}" Padding="14,4" Margin="6,0,0,0">
-                        <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsViewSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
-                    </Button>
-                    <Button Grid.Column="6" Content="下载" Command="{Binding SelectMetricCommand}"
-                            CommandParameter="{x:Static domain:AccountShareMetric.Download}" Padding="14,4" Margin="6,0,0,0">
-                        <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsDownloadSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
-                    </Button>
-                </Grid>
-                <Grid Grid.Row="1" Margin="0,10,0,0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="260" />
-                        <ColumnDefinition Width="150" />
                         <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" Padding="8,5"
-                             ToolTip="按标题搜索" />
-                    <ComboBox Grid.Column="1" Margin="10,0,0,0" ItemsSource="{Binding StatusFilterOptions}"
-                              SelectedItem="{Binding SelectedStatusOption}" DisplayMemberPath="Label" />
-                    <TextBlock Grid.Column="2" Text="点击表头切换升序/降序；缺失数据始终排在最后"
-                               HorizontalAlignment="Right" VerticalAlignment="Center"
-                               Foreground="{StaticResource MutedBrush}" FontSize="11" />
+                    <Grid Margin="0,0,10,0" VerticalAlignment="Center" ToolTip="{Binding StatusMessage}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" MaxWidth="90" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding CurrentAccountName}" FontWeight="SemiBold"
+                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding CurrentAccountName}" />
+                        <TextBlock Grid.Column="1" Text="{Binding LastSuccessfulSyncText, StringFormat=缓存 {0}}" Margin="8,0,0,0"
+                                   Foreground="{StaticResource MutedBrush}" TextTrimming="CharacterEllipsis">
+                            <TextBlock.ToolTip>
+                                <TextBlock Text="{Binding CacheStatusText}" />
+                            </TextBlock.ToolTip>
+                        </TextBlock>
+                    </Grid>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button Content="转存" Command="{Binding SelectMetricCommand}"
+                                CommandParameter="{x:Static domain:AccountShareMetric.Transfer}" Padding="8,4" Margin="0">
+                            <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsTransferSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
+                        </Button>
+                        <Button Content="浏览" Command="{Binding SelectMetricCommand}"
+                                CommandParameter="{x:Static domain:AccountShareMetric.View}" Padding="8,4" Margin="4,0,0,0">
+                            <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsViewSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
+                        </Button>
+                        <Button Content="下载" Command="{Binding SelectMetricCommand}"
+                                CommandParameter="{x:Static domain:AccountShareMetric.Download}" Padding="8,4" Margin="4,0,0,0">
+                            <Button.Style><Style TargetType="Button" BasedOn="{StaticResource SecondaryButtonStyle}"><Style.Triggers><DataTrigger Binding="{Binding IsDownloadSelected}" Value="True"><Setter Property="Background" Value="{StaticResource NavSelectedBrush}" /><Setter Property="Foreground" Value="{StaticResource BrandBrush}" /></DataTrigger></Style.Triggers></Style></Button.Style>
+                        </Button>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="12,0" VerticalAlignment="Center">
+                        <TextBlock Text="{Binding TotalCount, StringFormat=全部 {0:N0}}" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding ValidCount, StringFormat=有效 {0:N0}}" Foreground="#1E8E5A" Margin="8,0,0,0" />
+                        <TextBlock Text="{Binding InvalidCount, StringFormat=失效 {0:N0}}" Foreground="#E5484D" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <Button Grid.Column="3" Content="刷新数据" Command="{Binding RefreshCommand}"
+                            ToolTip="{Binding StatusMessage}" AutomationProperties.HelpText="{Binding StatusMessage}"
+                            Style="{StaticResource PrimaryButton}" Margin="0" Padding="10,4" />
                 </Grid>
-                <StackPanel x:Name="SelectionToolbar" Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0"
-                            VerticalAlignment="Center">
-                    <TextBlock Text="{Binding SelectedCount, StringFormat=已选 {0:N0} 条}" VerticalAlignment="Center" />
-                    <TextBlock Text=" / 共 " Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
-                    <TextBlock Text="{Binding CurrentResultCount, StringFormat={}{0:N0} 条}" VerticalAlignment="Center" />
-                    <TextBlock Text="　｜　从" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
-                    <TextBox Width="54" AutomationProperties.Name="选取起始序号"
-                             Text="{Binding RangeStartText, UpdateSourceTrigger=PropertyChanged}"
-                             TextAlignment="Center" Padding="5,3" />
-                    <TextBlock Text="到" Margin="6,0" VerticalAlignment="Center" />
-                    <TextBox Width="54" AutomationProperties.Name="选取结束序号"
-                             Text="{Binding RangeEndText, UpdateSourceTrigger=PropertyChanged}"
-                             TextAlignment="Center" Padding="5,3" />
-                    <TextBlock Text="　｜　" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
-                    <Button Content="选取" Command="{Binding SelectRangeCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="0" />
-                    <Button Content="全选" Command="{Binding SelectAllCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
-                    <Button Content="反选" Command="{Binding InvertSelectionCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
-                    <Button Content="清空选择" Command="{Binding ClearSelectionCommand}"
-                            Style="{StaticResource SecondaryButtonStyle}" Padding="12,4" Margin="6,0,0,0" />
-                    <Button Content="导出表格" Command="{Binding ExportCommand}"
-                            Style="{StaticResource PrimaryButton}" Padding="14,4" Margin="12,0,0,0" />
-                </StackPanel>
+                <Grid x:Name="SelectionToolbar" Grid.Row="1" Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="96" />
+                        <ColumnDefinition Width="90" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="TitleSearchInput" MinWidth="90"
+                             Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged, Delay=300}" Padding="8,5"
+                             AutomationProperties.Name="标题搜索" ToolTip="按标题搜索，回车立即筛选" />
+                    <ComboBox Grid.Column="1" Margin="6,0,0,0" ItemsSource="{Binding StatusFilterOptions}"
+                              SelectedItem="{Binding SelectedStatusOption}" DisplayMemberPath="Label" />
+                    <TextBlock Grid.Column="2" Margin="8,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis">
+                        <TextBlock.Text>
+                            <MultiBinding StringFormat="已选 {0:N0} / {1:N0}">
+                                <Binding Path="SelectedCount" />
+                                <Binding Path="CurrentResultCount" />
+                            </MultiBinding>
+                        </TextBlock.Text>
+                        <TextBlock.ToolTip>
+                            <MultiBinding StringFormat="已选 {0:N0} 条 / 当前结果 {1:N0} 条">
+                                <Binding Path="SelectedCount" />
+                                <Binding Path="CurrentResultCount" />
+                            </MultiBinding>
+                        </TextBlock.ToolTip>
+                    </TextBlock>
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="序号" Margin="0,0,4,0" Foreground="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBox Width="36" AutomationProperties.Name="选取起始序号"
+                                 Text="{Binding RangeStartText, UpdateSourceTrigger=PropertyChanged}"
+                                 TextAlignment="Center" Padding="5,3" />
+                        <TextBlock Text="至" Margin="4,0" VerticalAlignment="Center" />
+                        <TextBox Width="36" AutomationProperties.Name="选取结束序号"
+                                 Text="{Binding RangeEndText, UpdateSourceTrigger=PropertyChanged}"
+                                 TextAlignment="Center" Padding="5,3" />
+                        <Button Content="选取" Command="{Binding SelectRangeCommand}"
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="6,4" Margin="6,0,0,0" />
+                        <Button Content="全选" Command="{Binding SelectAllCommand}"
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="6,4" Margin="4,0,0,0" />
+                        <Button Content="反选" Command="{Binding InvertSelectionCommand}"
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="6,4" Margin="4,0,0,0" />
+                        <Button Content="清空选择" Command="{Binding ClearSelectionCommand}"
+                                Style="{StaticResource SecondaryButtonStyle}" Padding="6,4" Margin="4,0,0,0" />
+                        <Button Content="导出表格" Command="{Binding ExportCommand}"
+                                Style="{StaticResource PrimaryButton}" Padding="8,4" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Grid>
             </Grid>
         </Border>
 
-        <Border Grid.Row="2" Style="{StaticResource BorderedPanelStyle}" Padding="8">
+        <Border Grid.Row="1" Style="{StaticResource BorderedPanelStyle}" Padding="8">
             <DataGrid ItemsSource="{Binding VisibleItems}" AutoGenerateColumns="False" IsReadOnly="True"
                       CanUserAddRows="False" CanUserDeleteRows="False" HeadersVisibility="Column"
                       ColumnHeaderStyle="{StaticResource ShareAnalyticsColumnHeaderStyle}"

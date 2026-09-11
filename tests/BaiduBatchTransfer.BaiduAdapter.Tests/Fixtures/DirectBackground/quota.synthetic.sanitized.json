@@ -1,0 +1,12 @@
+{
+  "routeId": "quota",
+  "method": "GET",
+  "statusCode": 200,
+  "jsonShape": [
+    "$:object",
+    "$.errno:number",
+    "$.total:number",
+    "$.used:number"
+  ],
+  "values": "[REDACTED]"
+}

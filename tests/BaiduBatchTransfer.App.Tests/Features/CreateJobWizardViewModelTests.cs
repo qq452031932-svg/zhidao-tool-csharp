@@ -133,6 +133,92 @@ public sealed class CreateJobWizardViewModelTests
     }
 
     [Fact]
+    public async Task PreviewValidationFailurePreservesConcreteMessage()
+    {
+        const string message = "The import draft does not exist.";
+        var gateway = new FakeBatchGateway
+        {
+            PreviewException = new BatchDraftValidationException(message),
+        };
+        var vm = Create(Accounts(1), ready: 1, gateway: gateway);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].TargetItemCount = 1;
+
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Null(vm.ConfirmationToken);
+        Assert.Equal(message, vm.ValidationMessage);
+        Assert.NotEqual("转存配置或导入数据已变化，请返回检查并重新预览。", vm.ValidationMessage);
+    }
+
+    [Fact]
+    public async Task ConfirmationValidationFailurePreservesConcreteMessage()
+    {
+        const string message = "Direct-background activation graph is incomplete.";
+        var gateway = new FakeBatchGateway
+        {
+            ConfirmException = new BatchDraftValidationException(message),
+        };
+        var vm = Create(Accounts(1), ready: 1, gateway: gateway);
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].TargetItemCount = 1;
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Null(await vm.ConfirmPreparedFromUserIntentAsync());
+
+        Assert.Equal(message, vm.ValidationMessage);
+        Assert.NotEqual("任务创建失败，未写入执行队列，请重试。", vm.ValidationMessage);
+    }
+
+    [Fact]
+    public async Task ConfirmationDeclineFlagResetsBeforeLaterConfirmationFailure()
+    {
+        var gateway = new FakeBatchGateway();
+        var dialog = new FakeDialogService { ConfirmationResult = false };
+        var vm = new CreateJobWizardViewModel(
+            Accounts(1), new FakePageSource([], 1, null), gateway, dialog);
+        vm.Initialize(new(Guid.NewGuid(), "测试任务", 1, false, 0, 0, 0, "/我的资源"));
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].TargetItemCount = 1;
+        await vm.PrepareConfirmationAsync();
+
+        Assert.Null(await vm.ConfirmPreparedFromUserIntentAsync());
+        Assert.True(vm.LastConfirmationWasDeclined);
+
+        dialog.ConfirmationResult = true;
+        gateway.ConfirmException = new BatchConfirmationException("stale");
+        Assert.Null(await vm.ConfirmPreparedFromUserIntentAsync());
+        Assert.False(vm.LastConfirmationWasDeclined);
+        Assert.NotEmpty(vm.ValidationMessage);
+    }
+
+    [Fact]
+    public async Task AcceptanceDraftCarriesImmutableManagedProfileAndResultDirectory()
+    {
+        var profile = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "acceptance-profile", Guid.NewGuid(), Guid.NewGuid());
+        var gateway = new FakeBatchGateway();
+        var option = Account("Managed") with
+        {
+            ExecutionProfile = profile,
+            ShareEnabled = true,
+        };
+        var vm = Create([option], ready: 1, gateway: gateway);
+        vm.AcceptanceOnly = true;
+        vm.AcceptanceResultDirectory = Path.GetTempPath();
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.Accounts[0].TargetItemCount = 1;
+
+        await vm.PrepareConfirmationAsync();
+
+        var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        Assert.True(draft.AcceptanceOnly);
+        Assert.Equal(Path.GetTempPath(), draft.ResultDirectory);
+        Assert.Equal(profile, Assert.Single(draft.Accounts).ExecutionProfile);
+        Assert.Equal(profile, Assert.Single(vm.Accounts).ExecutionProfile);
+    }
+
+    [Fact]
     public void WorkloadContractsRedactIdsPathsCodesNamesAndConfirmationTokens()
     {
         var accountId = Guid.NewGuid();
@@ -735,6 +821,119 @@ public sealed class CreateJobWizardViewModelTests
         });
     }
 
+    [Fact]
+    public async Task DirectBackgroundSettingsAreIncludedInTheConfirmedDraft()
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(1), ready: 2, gateway: gateway);
+        vm.DirectBackground = true;
+        vm.MaxConcurrency = 2;
+        vm.DuplicatePolicy = DuplicatePolicy.Rename;
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.ExistingSharePolicy = "Regenerate";
+        vm.ExtractionCodeBehavior = ShareExtractionCodeBehavior.Random;
+        vm.ResultDirectory = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "direct-results"));
+        vm.Accounts[0].ShareEnabled = true;
+
+        await vm.PrepareConfirmationAsync();
+
+        var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        Assert.True(draft.DirectBackground);
+        Assert.Equal(2, draft.MaxConcurrency);
+        Assert.Equal(DuplicatePolicy.Rename, draft.DuplicatePolicy);
+        Assert.Equal("Regenerate", draft.ExistingSharePolicy);
+        Assert.Equal(vm.ResultDirectory, draft.ResultDirectory);
+    }
+
+    [Theory]
+    [InlineData(TransferMode.Replication)]
+    [InlineData(TransferMode.Distribution)]
+    public async Task DirectBackgroundAllowsMultipleSelectedAccountsInBothTaskCountModes(TransferMode mode)
+    {
+        var gateway = new FakeBatchGateway();
+        var vm = Create(Accounts(2), ready: 2, gateway: gateway);
+        vm.SelectMode(mode);
+        vm.DirectBackground = true;
+        vm.QuotaBasis = mode == TransferMode.Replication
+            ? QuotaBasis.SuccessTarget
+            : QuotaBasis.TaskCount;
+        vm.DuplicatePolicy = DuplicatePolicy.Rename;
+        vm.ExistingSharePolicy = "Regenerate";
+        vm.ExtractionCodeBehavior = ShareExtractionCodeBehavior.Random;
+        vm.ResultDirectory = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "direct-multi-results"));
+        foreach (var account in vm.Accounts)
+        {
+            account.IsSelected = true;
+            account.ShareEnabled = true;
+            account.TargetItemCount = mode == TransferMode.Distribution ? 1 : 2;
+        }
+
+        Assert.True(vm.CanContinue);
+        await vm.PrepareConfirmationAsync();
+
+        var draft = Assert.IsType<WizardBatchDraft>(gateway.LastPreviewDraft);
+        Assert.Equal(mode, draft.TransferMode);
+        Assert.Equal(2, draft.Accounts.Count(account => account.IsSelected));
+        Assert.All(draft.Accounts.Where(account => account.IsSelected), account => Assert.True(account.ShareEnabled));
+        Assert.Equal(QuotaBasis.TaskCount, draft.QuotaBasis);
+        Assert.NotNull(vm.ConfirmationToken);
+    }
+
+    [Theory]
+    [InlineData("no-account")]
+    [InlineData("success-target")]
+    [InlineData("skip")]
+    [InlineData("reuse")]
+    [InlineData("fixed-code")]
+    [InlineData("share-disabled")]
+    [InlineData("relative-result")]
+    public void DirectBackgroundRejectsAnyNonExactMultiAccountWizardShape(string scenario)
+    {
+        var vm = Create(Accounts(2), ready: 2);
+        vm.SelectMode(TransferMode.Distribution);
+        vm.DirectBackground = true;
+        vm.QuotaBasis = QuotaBasis.TaskCount;
+        vm.DuplicatePolicy = DuplicatePolicy.Rename;
+        vm.ExistingSharePolicy = "Regenerate";
+        vm.ExtractionCodeBehavior = ShareExtractionCodeBehavior.Random;
+        vm.ResultDirectory = Path.GetTempPath();
+        foreach (var account in vm.Accounts)
+        {
+            account.IsSelected = true;
+            account.ShareEnabled = true;
+            account.TargetItemCount = 1;
+        }
+
+        switch (scenario)
+        {
+            case "no-account":
+                foreach (var account in vm.Accounts) account.IsSelected = false;
+                break;
+            case "success-target": vm.QuotaBasis = QuotaBasis.SuccessTarget; break;
+            case "skip": vm.DuplicatePolicy = DuplicatePolicy.Skip; break;
+            case "reuse": vm.ExistingSharePolicy = "Reuse"; break;
+            case "fixed-code": vm.ExtractionCodeBehavior = ShareExtractionCodeBehavior.Fixed; break;
+            case "share-disabled": vm.Accounts[1].ShareEnabled = false; break;
+            case "relative-result": vm.ResultDirectory = "relative"; break;
+            default: throw new InvalidOperationException(scenario);
+        }
+
+        Assert.False(vm.CanContinue);
+    }
+
+    [Fact]
+    public void DirectBackgroundConcurrencyAcceptsOneThroughThreeOnly()
+    {
+        var vm = Create(Accounts(1), ready: 1);
+
+        vm.MaxConcurrency = 1;
+        Assert.Equal(1, vm.MaxConcurrency);
+        vm.MaxConcurrency = 3;
+        Assert.Equal(3, vm.MaxConcurrency);
+        Assert.Throws<ArgumentOutOfRangeException>(() => vm.MaxConcurrency = 0);
+        Assert.Throws<ArgumentOutOfRangeException>(() => vm.MaxConcurrency = 4);
+    }
+
     [Theory]
     [InlineData("missing")]
     [InlineData("duplicate")]
@@ -1161,6 +1360,8 @@ public sealed class CreateJobWizardViewModelTests
         public int PreviewCalls { get; private set; }
         public string? ConfirmedToken { get; private set; }
         public bool ThrowDiskShortage { get; set; }
+        public Exception? PreviewException { get; init; }
+        public Exception? ConfirmException { get; set; }
         public WizardConfirmationSummary? Summary { get; init; }
         public WizardBatchDraft? LastPreviewDraft { get; private set; }
 
@@ -1169,6 +1370,7 @@ public sealed class CreateJobWizardViewModelTests
             PreviewCalls++;
             LastPreviewDraft = draft;
             if (ThrowDiskShortage) throw new StorageCapacityException(10, 1);
+            if (PreviewException is not null) throw PreviewException;
             if (Summary is not null) return Task.FromResult(Summary);
             var selected = draft.Accounts.Where(account => account.IsSelected).ToArray();
             var transferCounts = selected.Select((account, index) =>
@@ -1197,6 +1399,7 @@ public sealed class CreateJobWizardViewModelTests
 
         public Task<Guid> ConfirmAsync(WizardBatchDraft draft, string confirmationToken, CancellationToken cancellationToken)
         {
+            if (ConfirmException is not null) throw ConfirmException;
             ConfirmedToken = confirmationToken;
             return Task.FromResult(draft.BatchJobId);
         }
@@ -1226,8 +1429,9 @@ public sealed class CreateJobWizardViewModelTests
 
     private sealed class FakeDialogService : IDialogService
     {
+        public bool ConfirmationResult { get; set; } = true;
         public Task<bool> ConfirmAsync(string title, string message, CancellationToken cancellationToken = default) =>
-            Task.FromResult(true);
+            Task.FromResult(ConfirmationResult);
 
         public Task ShowMessageAsync(string title, string message, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;

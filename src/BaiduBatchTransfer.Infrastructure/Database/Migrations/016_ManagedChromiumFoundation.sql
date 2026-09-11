@@ -143,6 +143,29 @@ WHERE (attempt.OwnerKind='Transfer' AND NOT EXISTS(
            AND selection.AccountId=attempt.AccountId
            AND selection.Generation=attempt.Generation));
 
+-- A v15 transfer could leave older Preparing rows behind after a later retry
+-- advanced AttemptCount.  Preparing is before the submit boundary; only
+-- strictly older generations with the same exact transfer/account owner are
+-- classified as definitely not submitted.  The validation below still aborts
+-- the migration if any such row carries baseline, acceptance, submission, or
+-- remote-item evidence.
+UPDATE WebAutomationAttempts AS attempt
+SET State='DefinitelyNotSubmitted'
+WHERE attempt.OwnerKind='Transfer'
+  AND attempt.State='Preparing'
+  AND EXISTS(
+        SELECT 1
+        FROM V16OwnerlessWebAutomationAttempts orphan
+        WHERE orphan.OperationId=attempt.OperationId
+          AND orphan.AccountId=attempt.AccountId
+          AND orphan.Generation=attempt.Generation)
+  AND EXISTS(
+        SELECT 1
+        FROM TransferOperations operation
+        WHERE operation.Id=attempt.OperationId
+          AND operation.AssignedAccountId=attempt.AccountId
+          AND operation.AttemptCount>attempt.Generation);
+
 CREATE TEMP TABLE V16OwnerlessWebAutomationAttemptValidation(
     Value INTEGER NOT NULL CHECK(Value=1)
 );

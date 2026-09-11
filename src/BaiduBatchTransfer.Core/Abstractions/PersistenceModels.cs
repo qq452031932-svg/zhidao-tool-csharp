@@ -110,7 +110,10 @@ public sealed record OperationResultRecord(
       int? ShareGeneration = null,
       DateTimeOffset? ShareUpdatedAt = null,
       int TransferAttemptCount = 0,
-      bool CanSafelyRetryTransfer = false)
+      bool CanSafelyRetryTransfer = false,
+      string? GeneratedShareUrl = null,
+      string? GeneratedExtractionCode = null,
+      Guid? StagedImportRowId = null)
 {
     public override string ToString() =>
         $"OperationResultRecord {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, UserContent = [REDACTED] }}";
@@ -124,7 +127,9 @@ public sealed record AccountBatchStatisticsRecord(
     long ExistingCount,
     long FailedCount,
     long PendingCount,
-    long PausedCount)
+    long PausedCount,
+    long CompleteSuccessCount = 0,
+    long TerminalProblemCount = 0)
 {
     public override string ToString() =>
         $"AccountBatchStatisticsRecord {{ AccountId = {AccountId}, PriorityOrder = {PriorityOrder}, NewCount = {NewCount}, ExistingCount = {ExistingCount}, FailedCount = {FailedCount}, PendingCount = {PendingCount}, PausedCount = {PausedCount}, DisplayName = [REDACTED] }}";
@@ -212,7 +217,12 @@ public sealed record BatchJobRecord(
     int ResourceCount, int OperationCount, string DefaultTargetPath, string FolderCreationMode,
     string DuplicatePolicy, string ValidationMode, string Status, DateTimeOffset CreatedAt,
     DateTimeOffset? StartedAt, DateTimeOffset? CompletedAt, Guid? ImportSessionId, long QueueOrder,
-    int ShareOperationCount = 0)
+    int ShareOperationCount = 0,
+    bool AcceptanceOnly = false,
+    bool DirectBackground = false,
+    int MaxConcurrency = 1,
+    string DirectActivationState = "Inert",
+    string? DirectPauseReason = null)
 {
     public override string ToString() =>
         $"BatchJobRecord {{ Status = {Status}, ResourceCount = {ResourceCount}, OperationCount = {OperationCount}, ShareOperationCount = {ShareOperationCount}, UserContent = [REDACTED] }}";
@@ -238,7 +248,9 @@ public sealed record TransferOperationRecord(
     string TargetSlotState, DateTimeOffset? TargetSlotReservedAt, DateTimeOffset? DailyCountedAt,
     DateTimeOffset? SubmitStartedAt, string? LastErrorCode, string? LastErrorMessage,
     DateTimeOffset? LeaseExpiresAt, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt,
-    ExecutionProfileSnapshot? PersistedExecutionProfile = null)
+    ExecutionProfileSnapshot? PersistedExecutionProfile = null,
+    bool AcceptanceOnly = false,
+    int UnknownResubmissionCount = 0)
 {
     public ExecutionProfileSnapshot ExecutionProfile =>
         PersistedExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(AssignedAccountId);
@@ -335,7 +347,8 @@ public sealed record PendingShareOperationRecord(
     Guid AccountId,
     int OutputOrdinal,
     string SettingsFingerprint,
-    DateTimeOffset CreatedAt)
+    DateTimeOffset CreatedAt,
+    string? DirectExtractionCode = null)
 {
     public override string ToString() =>
         $"PendingShareOperationRecord {{ Identity = [REDACTED], OutputOrdinal = {OutputOrdinal}, Status = WaitingTransfer }}";
@@ -377,7 +390,8 @@ public sealed record ShareOperationRemoteItemRecord(
     Guid ShareOperationId,
     int ItemOrdinal,
     string RemoteItemId,
-    string DisplayName)
+    string DisplayName,
+    int? ResponseOrdinal = null)
 {
     public override string ToString() =>
         $"ShareOperationRemoteItemRecord {{ Identity = [REDACTED], ItemOrdinal = {ItemOrdinal}, RemoteItem = [REDACTED] }}";

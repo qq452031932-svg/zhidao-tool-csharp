@@ -28,6 +28,63 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
     }
 
     [Fact]
+    public async Task LoginAttemptUsesAttemptTokenAsItsIsolatedOwnedProfileKey()
+    {
+        var attemptToken = Guid.NewGuid();
+        var policy = new FileSystemAccountProfilePathPolicy(root);
+        var store = new RecordingStore();
+        var bootstrapper = new LoginProfileBootstrapper(policy, store);
+
+        var lease = await bootstrapper.PrepareAttemptAsync(attemptToken, CancellationToken.None);
+
+        Assert.Equal(attemptToken, lease.ProfileId);
+        Assert.Equal(attemptToken, lease.OwnershipToken);
+        Assert.Equal(policy.GetAccountProfilePath(attemptToken), lease.Path);
+        Assert.Equal((attemptToken, lease.Path, attemptToken), store.Registration);
+    }
+
+    [Fact]
+    public async Task LoginAttemptCleanupClosesThenDeletesOnlyItsOwnedProfile()
+    {
+        var attemptToken = Guid.NewGuid();
+        var policy = new FileSystemAccountProfilePathPolicy(root);
+        var store = new RecordingStore();
+        var bootstrapper = new LoginProfileBootstrapper(policy, store);
+        var lease = await bootstrapper.PrepareAttemptAsync(attemptToken, CancellationToken.None);
+
+        var result = await bootstrapper.CleanupAttemptAsync(lease, CancellationToken.None);
+
+        Assert.Equal(OwnedProfileDeletionStatus.Completed, result);
+        Assert.Equal(new[] { "close", "delete" }, store.Events);
+        Assert.Equal((attemptToken, lease.Path, attemptToken), store.Deletion);
+    }
+
+    [Fact]
+    public async Task CleanupAfterBrowserExitRetriesTransientProfileLocks()
+    {
+        var attemptToken = Guid.NewGuid();
+        var policy = new FileSystemAccountProfilePathPolicy(root);
+        var store = new RecordingStore { RemainingTransientDeleteFailures = 1 };
+        var bootstrapper = new LoginProfileBootstrapper(policy, store);
+        var lease = await bootstrapper.PrepareAttemptAsync(attemptToken, CancellationToken.None);
+        var delays = new List<TimeSpan>();
+
+        var result = await bootstrapper.CleanupAttemptAfterBrowserExitAsync(
+            lease,
+            (delay, _) =>
+            {
+                delays.Add(delay);
+                return Task.CompletedTask;
+            },
+            CancellationToken.None);
+
+        Assert.Equal(OwnedProfileDeletionStatus.Completed, result);
+        Assert.Single(delays);
+        Assert.Equal(2, store.DeleteAttempts);
+        Assert.Equal(new[] { "close", "delete", "close", "delete" }, store.Events);
+    }
+
+    [Fact]
     public async Task RegisteredBrowserProfileIsClosedAtMostOnce()
     {
         var closer = new WebView2ProfileCloser();
@@ -197,14 +254,31 @@ public sealed class LoginProfileBootstrapperTests : IDisposable
     private sealed class RecordingStore : IWebViewProfileStore
     {
         public (Guid, string, Guid)? Registration { get; private set; }
+        public (Guid, string, Guid)? Deletion { get; private set; }
+        public List<string> Events { get; } = [];
+        public int RemainingTransientDeleteFailures { get; set; }
+        public int DeleteAttempts { get; private set; }
         public Task RegisterOwnershipAsync(Guid accountId, string exactProfilePath, Guid ownershipToken, CancellationToken cancellationToken)
         {
             Registration = (accountId, exactProfilePath, ownershipToken);
             return Task.CompletedTask;
         }
-        public Task CloseAsync(Guid accountId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task CloseAsync(Guid accountId, CancellationToken cancellationToken)
+        {
+            Events.Add("close");
+            return Task.CompletedTask;
+        }
         public Task DeleteAsync(Guid accountId, string exactProfilePath, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task<bool> CommitOwnedAsync(Guid accountId, string exactProfilePath, Guid ownershipToken, Func<CancellationToken, Task> commitAction, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<OwnedProfileDeletionStatus> DeleteOwnedAsync(Guid accountId, string exactProfilePath, Guid ownershipToken, Func<CancellationToken, Task<bool>> confirmNoActiveAccount, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public async Task<OwnedProfileDeletionStatus> DeleteOwnedAsync(Guid accountId, string exactProfilePath, Guid ownershipToken, Func<CancellationToken, Task<bool>> confirmNoActiveAccount, CancellationToken cancellationToken)
+        {
+            Assert.True(await confirmNoActiveAccount(cancellationToken));
+            Events.Add("delete");
+            DeleteAttempts++;
+            if (RemainingTransientDeleteFailures-- > 0)
+                throw new IOException("synthetic transient WebView2 lock");
+            Deletion = (accountId, exactProfilePath, ownershipToken);
+            return OwnedProfileDeletionStatus.Completed;
+        }
     }
 }

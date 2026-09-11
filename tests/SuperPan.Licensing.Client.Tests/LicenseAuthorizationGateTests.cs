@@ -159,6 +159,60 @@ public sealed class LicenseAuthorizationGateTests
     }
 
     [Fact]
+    public async Task AuthorizationGateRejectsDeletedCardEvenWhenItsCachedLeaseWasUnexpired()
+    {
+        var store = StoreWithLease(Lease());
+        var gate = CreateGate(new FakeService(Rejected(LicenseCodes.LicenseNotFound)), store);
+
+        var result = await gate.AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.False(result.IsAuthorized);
+        Assert.False(result.UsedCachedLease);
+        Assert.Equal(LicenseCodes.LicenseNotFound, result.Code);
+        Assert.Empty(Assert.Single(store.Snapshot.Credentials).Leases);
+    }
+
+    [Fact]
+    public async Task AuthorizationGateUsesSignedLeaseOnlyBeforeInjectedVerifierExpiryWithoutSleeping()
+    {
+        using var signer = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var claims = SignedLicenseEnvelopeVerifierTests.CreateClaims("cached-boundary") with
+        {
+            ServerTime = Now,
+            SoftwareId = "software-a",
+            MachineHash = "machine-secret",
+            ExpiresAt = Now.AddDays(1),
+            LeaseUntil = Now.AddMinutes(30),
+        };
+        var envelope = SignedLicenseEnvelopeVerifierTests.Sign(claims, signer);
+        var boundaryLease = new StoredLicenseLease(
+            "card-id", "software-a", "machine-secret", "package", Now.AddDays(1), Now.AddMinutes(30),
+            Convert.ToBase64String(envelope));
+        var beforeStore = StoreWithLease(boundaryLease);
+        var afterStore = StoreWithLease(boundaryLease);
+        using var beforeService = new RealVerifierService(
+            signer,
+            new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null),
+            new FixedTimeProvider(Now.AddMinutes(29)));
+        using var afterService = new RealVerifierService(
+            signer,
+            new LicenseApiResult(LicenseApiResultKind.TemporaryFailure, LicenseCodes.ServiceUnavailable, null),
+            new FixedTimeProvider(Now.AddMinutes(31)));
+
+        var before = await new LicenseAuthorizationGate(
+            "software-a", beforeService, beforeStore, new FakeFingerprintProvider("machine-secret"),
+            new FixedTimeProvider(Now.AddMinutes(29))).AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+        var after = await new LicenseAuthorizationGate(
+            "software-a", afterService, afterStore, new FakeFingerprintProvider("machine-secret"),
+            new FixedTimeProvider(Now.AddMinutes(31))).AuthorizeAsync(LicenseOperationKind.Transfer, CancellationToken.None);
+
+        Assert.True(before.IsAuthorized, before.ToString());
+        Assert.True(before.UsedCachedLease);
+        Assert.False(after.IsAuthorized);
+        Assert.False(after.UsedCachedLease);
+    }
+
+    [Fact]
     public async Task AuthorizationGateNeverUsesLeaseForInvalidOrDefinitiveResponses()
     {
         foreach (var response in new[]
@@ -425,10 +479,10 @@ public sealed class LicenseAuthorizationGateTests
         private readonly SignedLicenseEnvelopeVerifier verifier;
         private readonly LicenseApiResult response;
 
-        public RealVerifierService(ECDsa signer, LicenseApiResult response)
+        public RealVerifierService(ECDsa signer, LicenseApiResult response, TimeProvider? timeProvider = null)
         {
             verifier = new SignedLicenseEnvelopeVerifier(
-                SignedLicenseEnvelopeVerifierTests.CreateOptions(signer), new FixedTimeProvider(Now));
+                SignedLicenseEnvelopeVerifierTests.CreateOptions(signer), timeProvider ?? new FixedTimeProvider(Now));
             this.response = response;
         }
 

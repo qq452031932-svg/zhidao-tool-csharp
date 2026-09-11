@@ -27,6 +27,7 @@ public sealed class ManagedBrowserLoginLifecycleTests
         Assert.Null(account.WebView2ProfileDirectory);
         Assert.Equal("123", account.BaiduUserId);
         Assert.Equal(id, (await f.Store.LoadActiveSessionAsync(id, BrowserFamily.Chrome, default))!.Identity.AccountId);
+        Assert.Equal(id, (await f.Lifecycle.LoadActiveSessionAsync(id, default))!.AccountId);
         Assert.Equal([ManagedBrowserAction.Health, ManagedBrowserAction.ObserveAccountIdentity], f.Helper.Requests.Select(x => x.Action));
         var request = f.Helper.Requests[1];
         var payload = Assert.IsType<ManagedBrowserObserveAccountIdentityRequest>(request.Payload);
@@ -378,7 +379,11 @@ public sealed class ManagedBrowserLoginLifecycleTests
     {
         await using var f = await Fixture.CreateAsync();
         var id = Guid.NewGuid();
-        await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+        var login = await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+        Assert.Equal(ManagedBrowserLoginStatus.Bound, login.Status);
+        var account = await f.ReadAccountAsync(id);
+        Assert.NotNull(account);
+        Assert.Equal("ManagedChromium", account.LoginMethod);
         var eligible = await new BaiduBatchTransfer.App.WizardAccountProvider(new SqliteUnitOfWorkFactory(f.Factory)).LoadEligibleAsync();
         Assert.Empty(eligible);
     }
@@ -445,6 +450,19 @@ public sealed class ManagedBrowserLoginLifecycleTests
         f.Helper.OnObserve = () => { f.Processes.Process.Alive = false; return Task.CompletedTask; };
         Assert.Equal(ManagedBrowserLoginStatus.BrowserUnavailable, (await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome)).Status);
         Assert.Null(await f.ReadAccountAsync(id));
+    }
+
+    [Fact]
+    public async Task SafeFailureStageIdentifiesReconnectAfterSuccessfulIdentityObservation()
+    {
+        await using var f = await Fixture.CreateAsync();
+        var id = Guid.NewGuid();
+        f.Helper.OnObserve = () => { f.Processes.Process.Alive = false; return Task.CompletedTask; };
+
+        var result = await f.Launcher.LaunchAsync(ManagedBrowserLoginRequest.AddNew(id), BrowserFamily.Chrome);
+
+        Assert.Equal(ManagedBrowserLoginStatus.BrowserUnavailable, result.Status);
+        Assert.Equal(ManagedBrowserLoginStage.IdentityObserved, result.Stage);
     }
 
     [Fact]

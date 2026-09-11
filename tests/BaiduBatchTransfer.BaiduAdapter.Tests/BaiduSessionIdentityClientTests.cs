@@ -11,7 +11,7 @@ public sealed class BaiduSessionIdentityClientTests
     public async Task StableIdentityIsReadFromBoundedOfficialSameOriginResponse()
     {
         var handler = new RecordingHandler(HttpStatusCode.OK,
-            """{"errno":0,"result":{"uk":123456789,"username":"测试账号"}}""");
+            """{"errno":0,"result":{"uk":123456789,"username":"测试账号","avatar_url":"https://himg.bdimg.com/sys/portrait/item/test.jpg"}}""");
         using var client = new BaiduSessionIdentityClient(handler);
 
         var result = await client.ValidateAsync(Session(), CancellationToken.None);
@@ -19,9 +19,11 @@ public sealed class BaiduSessionIdentityClientTests
         Assert.True(result.IsSuccess);
         Assert.Equal("123456789", result.Value!.UserId);
         Assert.Equal("测试账号", result.Value.DisplayName);
+        Assert.Equal(new Uri("https://himg.bdimg.com/sys/portrait/item/test.jpg"), result.Value.AvatarUri);
         Assert.Equal("https", handler.RequestUri!.Scheme);
         Assert.Equal("pan.baidu.com", handler.RequestUri.IdnHost);
         Assert.Equal("/api/gettemplatevariable", handler.RequestUri.AbsolutePath);
+        Assert.Contains("avatar_url", Uri.UnescapeDataString(handler.RequestUri.Query), StringComparison.Ordinal);
         Assert.Contains("BDUSS=secret-a", handler.CookieHeader, StringComparison.Ordinal);
         Assert.DoesNotContain("STOKEN=secret-b", handler.CookieHeader, StringComparison.Ordinal);
     }
@@ -39,6 +41,36 @@ public sealed class BaiduSessionIdentityClientTests
         Assert.True(result.IsSuccess);
         Assert.Equal("42", result.Value!.UserId);
         Assert.Equal("账号甲", result.Value.DisplayName);
+    }
+
+    [Fact]
+    public async Task UnsafeAvatarUrlIsIgnoredWithoutRejectingTheBoundIdentity()
+    {
+        using var client = new BaiduSessionIdentityClient(new RecordingHandler(
+            HttpStatusCode.OK,
+            """{"errno":0,"result":{"uk":"42","username":"账号甲","avatar_url":"http://example.com/avatar.jpg"}}"""));
+
+        var result = await client.ValidateAsync(Session(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Value!.AvatarUri);
+    }
+
+    [Fact]
+    public async Task MissingTemplateAvatarFallsBackToOfficialUserInfoForTheSameAccount()
+    {
+        var handler = new SequenceHandler(
+            (HttpStatusCode.OK, """{"errno":0,"result":{"uk":"42","username":"账号甲"}}"""),
+            (HttpStatusCode.OK, """{"errno":0,"uk":"42","avatar_url":"https://himg.bdimg.com/sys/portrait/item/test.jpg"}"""));
+        using var client = new BaiduSessionIdentityClient(handler);
+
+        var result = await client.ValidateAsync(Session(), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(new Uri("https://himg.bdimg.com/sys/portrait/item/test.jpg"), result.Value!.AvatarUri);
+        Assert.Equal(2, handler.RequestUris.Count);
+        Assert.Equal("/rest/2.0/xpan/nas", handler.RequestUris[1].AbsolutePath);
+        Assert.Contains("method=uinfo", handler.RequestUris[1].Query, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -187,6 +219,24 @@ public sealed class BaiduSessionIdentityClientTests
             return Task.FromResult(new HttpResponseMessage(status)
             {
                 Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            });
+        }
+    }
+
+    private sealed class SequenceHandler(params (HttpStatusCode Status, string Body)[] responses) : HttpMessageHandler
+    {
+        private int _responseIndex;
+
+        public List<Uri> RequestUris { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RequestUris.Add(request.RequestUri!);
+            var response = responses[Math.Min(_responseIndex++, responses.Length - 1)];
+            return Task.FromResult(new HttpResponseMessage(response.Status)
+            {
+                Content = new StringContent(response.Body, Encoding.UTF8, "application/json"),
             });
         }
     }

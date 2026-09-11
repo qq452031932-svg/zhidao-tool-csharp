@@ -88,6 +88,22 @@ public sealed class TransferDirectoryPreparationFlowTests
     }
 
     [Fact]
+    public async Task FolderCandidatesTreatTheCompleteListingAsEligibleFoldersOnly()
+    {
+        var request = Request("/甲");
+        var store = new MemoryEvidenceStore(Attempt(request));
+        var session = new FixtureSession(store,
+            Listing("root", "/", [Folder("jia", "甲")], [], TransferDirectoryListingScope.FolderCandidates),
+            Listing("jia", "/甲", [], ["jia"], TransferDirectoryListingScope.FolderCandidates));
+
+        var outcome = await new TransferDirectoryPreparationFlow(new FixedTimeProvider(Now))
+            .ExecuteAsync(session, store, request);
+
+        Assert.Equal(TransferDirectoryPreparationStatus.Prepared, outcome.Status);
+        Assert.Equal(0, session.CreateCount);
+    }
+
+    [Fact]
     public async Task LostCreateResponseLeavesOutcomeUnknownAndReportsOnlyConfirmedPartialPath()
     {
         var request = Request("/不确定");
@@ -192,10 +208,11 @@ public sealed class TransferDirectoryPreparationFlowTests
         Listing("root", "/", items, []);
 
     private static TransferDirectoryListing Listing(
-        string id, string path, IReadOnlyList<TransferRemoteItem> items, IReadOnlyList<string> ancestors) =>
+        string id, string path, IReadOnlyList<TransferRemoteItem> items, IReadOnlyList<string> ancestors,
+        TransferDirectoryListingScope scope = TransferDirectoryListingScope.AllItems) =>
         TransferDirectoryListing.Exact(
             new RemoteDirectory(id, new RemotePath(path)), ancestors, items, items.Count,
-            reachedEnd: true, isStable: true, "generation-0", "uid-1", Fingerprint);
+            reachedEnd: true, isStable: true, "generation-0", "uid-1", Fingerprint, scope);
 
     private sealed class FixtureSession(
         MemoryEvidenceStore store,

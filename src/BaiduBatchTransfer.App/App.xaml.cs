@@ -3,6 +3,7 @@ using System.IO;
 using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Updates;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -17,6 +18,7 @@ public partial class App : System.Windows.Application
     private readonly IApplicationUpdateRuntime updateRuntime;
     private IHost? host;
     private ApplicationShutdownCoordinator? shutdownCoordinator;
+    private ApplicationStoppingShutdownCoordinator? applicationStoppingShutdownCoordinator;
     private UpdateAwareShutdownOrchestrator? updateShutdownOrchestrator;
     private int shutdownRequested;
     private bool allowShutdown;
@@ -29,6 +31,15 @@ public partial class App : System.Windows.Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (LicenseAcceptanceSmokeRunner.IsRequested(e.Args))
+        {
+            var smoke = await LicenseAcceptanceSmokeRunner
+                .RunAsync(e.Args, LicenseRuntimeBuildInfo.Current)
+                .ConfigureAwait(true);
+            Environment.ExitCode = smoke.ExitCode;
+            Shutdown(smoke.ExitCode);
+            return;
+        }
         var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var dataRoot = StartupDataRootSelector.Resolve(
             e.Args,
@@ -51,6 +62,13 @@ public partial class App : System.Windows.Application
                 _ => configuredHost.StopAsync(TimeSpan.FromSeconds(5)),
                 configuredHost,
                 configuredHost.Services.GetRequiredService<ManagedChromiumProcessManager>());
+            applicationStoppingShutdownCoordinator = new ApplicationStoppingShutdownCoordinator(
+                configuredHost.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping,
+                () => Interlocked.Exchange(ref shutdownRequested, 1) == 0,
+                operation => Dispatcher.InvokeAsync(operation).Task.Unwrap(),
+                () => ShutdownSafelyAsync(CancellationToken.None),
+                CompleteApplicationExit,
+                FailClosedApplicationStop);
             updateShutdownOrchestrator = new UpdateAwareShutdownOrchestrator(
                 ShutdownSafelyAsync,
                 updateRuntime.LaunchPreparedUpdateAndRestart,
@@ -59,6 +77,11 @@ public partial class App : System.Windows.Application
                 CompleteApplicationExit);
             MainWindow.Closing += OnMainWindowClosing;
             MainWindow.Show();
+            if (!startup.LicenseAuthorized)
+            {
+                await host.Services.GetRequiredService<ILicenseActivationPresenter>()
+                    .PresentAsync().ConfigureAwait(true);
+            }
 #if DEBUG
             var probeOptions = BaiduAcceptanceProbeLaunchOptions.FromStartup(e.Args);
             if (probeOptions.IsEnabled)
@@ -72,8 +95,20 @@ public partial class App : System.Windows.Application
             }
 #endif
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            try
+            {
+                var logDirectory = Path.Combine(dataRoot, "logs");
+                Directory.CreateDirectory(logDirectory);
+                File.WriteAllText(
+                    Path.Combine(logDirectory, "startup-error.txt"),
+                    exception.ToString());
+            }
+            catch
+            {
+                // Startup diagnostics must never hide the original failure prompt.
+            }
             MessageBox.Show(
                 "应用启动失败，本机数据没有被删除。请关闭后重试；如果问题持续，请导出诊断信息。",
                 "百度批量转存",
@@ -105,6 +140,22 @@ public partial class App : System.Windows.Application
 
         try
         {
+            if (MainWindow?.DataContext is MainWindowViewModel mainViewModel)
+            {
+                var preferenceFlushed = await mainViewModel
+                    .SealAndFlushShareAnalyticsPreferenceAsync(TimeSpan.FromSeconds(2))
+                    .ConfigureAwait(true);
+                if (!preferenceFlushed)
+                {
+                    MessageBox.Show(
+                        "账号查看偏好尚未保存，请稍候后重试关闭。",
+                        "百度批量转存",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return false;
+                }
+            }
+
             var completed = await coordinator
                 .ShutdownAsync(TimeSpan.FromSeconds(15), cancellationToken)
                 .ConfigureAwait(true);
@@ -134,6 +185,8 @@ public partial class App : System.Windows.Application
 
     private void ResumeAfterFailedShutdown()
     {
+        if (MainWindow?.DataContext is MainWindowViewModel mainViewModel)
+            mainViewModel.ResumeShareAnalyticsPreferenceAfterFailedShutdown();
         if (MainWindow is not null) MainWindow.IsEnabled = true;
     }
 
@@ -150,10 +203,24 @@ public partial class App : System.Windows.Application
         Shutdown();
     }
 
+    private void FailClosedApplicationStop()
+    {
+        Environment.ExitCode = -1;
+        allowShutdown = true;
+        if (MainWindow is not null)
+        {
+            MainWindow.Closing -= OnMainWindowClosing;
+            MainWindow.IsEnabled = false;
+        }
+        Shutdown(-1);
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
         try
         {
+            applicationStoppingShutdownCoordinator?.Dispose();
+            applicationStoppingShutdownCoordinator = null;
             if (host is not null)
             {
                 host.Dispose();

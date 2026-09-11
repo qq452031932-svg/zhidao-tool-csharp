@@ -4,7 +4,7 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Tests.Scheduling;
 
-public sealed class ShareReconciliationTests
+public sealed partial class ShareReconciliationTests
 {
     private static readonly DateTimeOffset Now = new(2026, 8, 21, 1, 0, 0, TimeSpan.Zero);
 
@@ -17,11 +17,15 @@ public sealed class ShareReconciliationTests
 
         Assert.Equal(ShareReconciliationDisposition.Accepted, result.Disposition);
         Assert.NotNull(harness.Store.Accepted);
+        Assert.Equal("https://pan.baidu.com/s/new-share?pwd=r4nd", harness.Store.Accepted.ShareUrl);
+        Assert.Equal("r4nd", harness.Store.Accepted.ExtractionCode);
         Assert.Equal("分享成功", result.StableStatus);
     }
 
-    [Fact]
-    public async Task OperationBoundRecoveryUsesExactConfirmAndNeverFallsBackToLegacyListing()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OperationBoundRecoveryUsesExactConfirmAndKeepsConflictingCodePending(bool conflictingCode)
     {
         var exact = new RemoteItemIdentitySet([new("remote-1", "display")]);
         var operation = new ShareOperationRecord(
@@ -34,7 +38,9 @@ public sealed class ShareReconciliationTests
             operation.BatchJobId, true, true, "Random", null, "Regenerate", Now,
             operation.SettingsFingerprint);
         var store = new RecordingStore(new(operation, settings, true, true, exact, ExistingShareDecision.Regenerate));
-        var adapter = new BoundReconciliationAdapter();
+        var adapter = new BoundReconciliationAdapter(shareUrl: conflictingCode
+            ? "https://pan.baidu.com/s/new-share?pwd=x9Y8"
+            : "https://pan.baidu.com/s/new-share");
         var service = new ShareOperationReconciliationService(
             adapter, new MemorySessionStore(operation.AccountId), store, new RecordingDelay(),
             new ShareReconciliationOptions(1, 10, TimeSpan.Zero, TimeSpan.FromMinutes(1)),
@@ -42,9 +48,42 @@ public sealed class ShareReconciliationTests
 
         var result = await service.ReconcileAsync(operation.Id);
 
-        Assert.Equal(ShareReconciliationDisposition.Accepted, result.Disposition);
+        Assert.Equal(conflictingCode ? ShareReconciliationDisposition.ResultPending : ShareReconciliationDisposition.Accepted,
+            result.Disposition);
+        if (conflictingCode)
+        {
+            Assert.Equal("ResultPending", store.Status);
+            Assert.NotEqual("Submitting", store.Status);
+            Assert.Equal(ShareReconciliationIssue.ListingUnavailable, store.PendingIssue);
+            Assert.Null(store.Accepted);
+            Assert.DoesNotContain("x9Y8", result.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain("r4nd", result.ToString(), StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal("https://pan.baidu.com/s/new-share?pwd=r4nd", store.Accepted?.ShareUrl);
+            Assert.Equal("r4nd", store.Accepted?.ExtractionCode);
+        }
         Assert.Equal(1, adapter.ConfirmCalls);
         Assert.Equal(0, adapter.ListCalls);
+    }
+
+    [Fact]
+    public async Task CompatibleCandidateWithConflictingCodeRemainsPendingWithoutPersistingResult()
+    {
+        var candidate = new BaiduShareRecord("new-share", new([new RemoteItemIdentity("remote-1", "display")]),
+            "https://pan.baidu.com/s/new-share?pwd=x9Y8", "r4nd", true, true);
+        var harness = Harness([Page(candidate)]);
+
+        var result = await harness.Service.ReconcileAsync(harness.Operation.Id);
+
+        Assert.Equal(ShareReconciliationDisposition.ResultPending, result.Disposition);
+        Assert.Equal("ResultPending", harness.Store.Status);
+        Assert.NotEqual("Submitting", harness.Store.Status);
+        Assert.Equal(ShareReconciliationIssue.ListingUnavailable, harness.Store.PendingIssue);
+        Assert.Null(harness.Store.Accepted);
+        Assert.DoesNotContain("x9Y8", result.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("r4nd", result.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -233,6 +272,7 @@ public sealed class ShareReconciliationTests
 
     private sealed class RecordingStore(ShareExecutionContext context) : IShareReconciliationStore
     {
+        public string Status { get; private set; } = context.Operation.Status;
         public List<ShareDiscoveryBaselineRecord> Baseline { get; } = [];
         public BaiduShareResultRecord? Accepted { get; private set; }
         public ShareReconciliationIssue? PendingIssue { get; private set; }
@@ -254,12 +294,14 @@ public sealed class ShareReconciliationTests
         public Task<bool> TryAcceptAsync(Guid operationId, int generation, long leaseGeneration, ShareReconciliationWriteSnapshot expected, BaiduShareResultRecord result, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {
             Accepted = result;
+            Status = "Succeeded";
             return Task.FromResult(true);
         }
 
         public Task<bool> TryKeepPendingAsync(Guid operationId, int generation, long leaseGeneration, ShareReconciliationWriteSnapshot expected, ShareReconciliationIssue issue, DateTimeOffset? observedSessionCapturedAtUtc, DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {
             PendingIssue = issue;
+            Status = "ResultPending";
             return Task.FromResult(true);
         }
 
@@ -294,7 +336,8 @@ public sealed class ShareReconciliationTests
     }
 
     private sealed class BoundReconciliationAdapter(
-        SubmissionAcceptance acceptance = SubmissionAcceptance.Unknown) : IOperationBoundBaiduShareAdapter
+        SubmissionAcceptance acceptance = SubmissionAcceptance.Unknown,
+        string shareUrl = "https://pan.baidu.com/s/new-share") : IOperationBoundBaiduShareAdapter
     {
         public int ConfirmCalls { get; private set; }
         public int ListCalls { get; private set; }
@@ -311,7 +354,7 @@ public sealed class ShareReconciliationTests
                     BaiduErrorKind.UnknownResponse, adapterDiagnostic: null,
                     submissionAcceptance: acceptance));
             return Task.FromResult(BaiduAdapterResult<ShareCreationReceipt>.Success(new(
-                Now, "adapter", request, "new-share", "https://pan.baidu.com/s/new-share",
+                Now, "adapter", request, "new-share", shareUrl,
                 new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Random, "r4nd"))));
         }
     }

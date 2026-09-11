@@ -34,7 +34,7 @@ public sealed class ReplacementWorkbookExportTests
                     "https://pan.baidu.com/s/original")],
                 [
                     new(resource, accountA, 1, "Succeeded", ShareOperationStatus.Succeeded,
-                        "https://pan.baidu.com/s/replacement", "a1b2", null),
+                        "https://pan.baidu.com/s/replacement?pwd=a1b2", "a1b2", null),
                     new(resource, accountB, 2, "Succeeded", null, null, null, null),
                 ],
                 NextCandidateSequence: null));
@@ -67,9 +67,11 @@ public sealed class ReplacementWorkbookExportTests
         {
             "用户标题", "含链接的原始文案", "教程",
             "用户标题", "https://pan.baidu.com/s/original",
-            "账号A", "转存成功", "https://pan.baidu.com/s/replacement", "a1b2", "分享成功",
+            "账号A", "转存成功", "https://pan.baidu.com/s/replacement?pwd=a1b2", "a1b2", "分享成功",
             "账号B", "转存成功", "", "", "",
         }, row.TextCells.ToArray());
+        Assert.Equal("?pwd=" + row.TextCells[8], new Uri(row.TextCells[7]).Query);
+        Assert.Matches("^[A-Za-z0-9]{4}$", row.TextCells[8]);
         Assert.Equal([(0L, 100)], repository.ProjectionPageRequests);
     }
 

@@ -45,7 +45,8 @@ public sealed record ShareExecutionContext(
     bool ShareEnabled,
     RemoteItemIdentitySet ExactRemoteItems,
     ExistingShareDecision? ExistingShareDecision,
-    BaiduShareRecord? ConfirmedExistingShare = null)
+    BaiduShareRecord? ConfirmedExistingShare = null,
+    bool AcceptanceOnly = false)
 {
     public override string ToString() =>
         $"ShareExecutionContext {{ Selected = {Selected}, ShareEnabled = {ShareEnabled}, Decision = {ExistingShareDecision}, Identity = [REDACTED], UserContent = [REDACTED] }}";

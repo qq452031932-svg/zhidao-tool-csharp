@@ -39,10 +39,15 @@ internal sealed record ManagedBrowserHelperIntegrityLimits(
 
 public sealed class ManagedBrowserHelperIntegrityException : Exception
 {
-    public ManagedBrowserHelperIntegrityException(ManagedBrowserHelperIntegrityError error)
-        : base($"Managed browser helper integrity failure: {error}.") => Error = error;
+    public ManagedBrowserHelperIntegrityException(ManagedBrowserHelperIntegrityError error, string? phase = null)
+        : base($"Managed browser helper integrity failure: {error}.")
+    {
+        Error = error;
+        Phase = phase;
+    }
 
     public ManagedBrowserHelperIntegrityError Error { get; }
+    public string? Phase { get; }
 
     public override string ToString() =>
         $"ManagedBrowserHelperIntegrityException {{ Error = {Error}, Details = [REDACTED] }}";
@@ -277,6 +282,8 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         string helperRoot,
         CancellationToken cancellationToken)
     {
+        var phase = "Manifest";
+        var captureEntry = ".";
         Manifest manifest;
         try
         {
@@ -296,18 +303,25 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
+            phase = "RecoverOrphans";
             VerifiedHelperSnapshotLease.RecoverExpiredOrphans(
                 snapshotParent, limits, timeProvider.GetUtcNow(), orphanMinimumAge, cancellationToken);
-            sourceTree = PinnedHelperTree.Capture(helperRoot, limits, cancellationToken);
+            phase = "CaptureSource";
+            sourceTree = CaptureSourceWithTransientRetry(helperRoot,
+                relative => captureEntry = relative, cancellationToken);
+            phase = "VerifySource";
             VerifyPinnedTree(sourceTree, manifest, cancellationToken);
 
+            phase = "CreateSnapshot";
             snapshot = VerifiedHelperSnapshotLease.Create(
                 snapshotParent, sourceTree, manifest.BuildIdentity, limits, timeProvider.GetUtcNow(),
                 cancellationToken, snapshotCreationObserver, snapshotFileCopiedObserver,
                 cleanupAttemptObserver, snapshotCleanupObserver, snapshotCopyHandoffObserver);
             sourceTree.Dispose();
             sourceTree = null;
+            phase = "VerifySnapshot";
             VerifyPinnedTree(snapshot.Tree, manifest, cancellationToken);
+            phase = "SealSnapshot";
             snapshot.EnsureReadOnlyAcl();
 
             var executable = snapshot.Tree.Files[ExecutableFileName].FullPath;
@@ -336,12 +350,43 @@ public sealed class ManagedBrowserHelperIntegrityVerifier
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or Win32Exception or OverflowException)
         {
-            throw Failure(ManagedBrowserHelperIntegrityError.VerificationIoFailure);
+            var nativeCode = exception is Win32Exception native
+                ? native.NativeErrorCode
+                : exception.HResult & 0xffff;
+            throw new ManagedBrowserHelperIntegrityException(
+                ManagedBrowserHelperIntegrityError.VerificationIoFailure,
+                $"{phase}-{nativeCode}-{captureEntry}");
         }
         finally
         {
             sourceTree?.Dispose();
             snapshot?.Dispose();
+        }
+    }
+
+    private PinnedHelperTree CaptureSourceWithTransientRetry(
+        string helperRoot, Action<string> openingEntry, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try { return PinnedHelperTree.Capture(helperRoot, limits, cancellationToken,
+                openingEntry: openingEntry); }
+            catch (Win32Exception error) when (
+                attempt < 2 && error.NativeErrorCode is 2 or 3)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Thread.Yield();
+            }
+            catch (DirectoryNotFoundException) when (attempt < 2)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Thread.Yield();
+            }
+            catch (FileNotFoundException) when (attempt < 2)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Thread.Yield();
+            }
         }
     }
 
@@ -598,7 +643,8 @@ internal sealed class PinnedHelperTree : IDisposable
         bool deleteCapable = false,
         FileShare? shareMode = null,
         bool writeDac = false,
-        Action? beforeRootOpen = null)
+        Action? beforeRootOpen = null,
+        Action<string>? openingEntry = null)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("Managed browser helper verification requires Windows.");
@@ -609,6 +655,7 @@ internal sealed class PinnedHelperTree : IDisposable
         try
         {
             beforeRootOpen?.Invoke();
+            openingEntry?.Invoke(".");
             var rootEntry = PinnedHelperEntry.Open(
                 canonical, deleteCapable, writeDac, shareMode);
             tree.entries.Add(rootEntry);
@@ -643,6 +690,7 @@ internal sealed class PinnedHelperTree : IDisposable
                     var depth = relative.Count(character => character == '/') + 1;
                     if (entryCount > limits.MaximumTreeEntries || depth > limits.MaximumTreeDepth)
                         throw new HelperResourceLimitException();
+                    openingEntry?.Invoke(relative);
                     var entry = PinnedHelperEntry.Open(
                         candidate, deleteCapable, writeDac, shareMode);
                     tree.entries.Add(entry);
@@ -1684,8 +1732,14 @@ internal sealed class PinnedHelperEntry : IDisposable
         bool writeDac = false,
         FileShare? shareMode = null)
     {
+        var canonical = Path.GetFullPath(path);
+        var nativePath = canonical.StartsWith(@"\\?\", StringComparison.Ordinal)
+            ? canonical
+            : canonical.StartsWith(@"\\", StringComparison.Ordinal)
+                ? @"\\?\UNC\" + canonical[2..]
+                : @"\\?\" + canonical;
         var handle = CreateFileW(
-            path,
+            nativePath,
             GenericRead | (deleteCapable ? DeleteAccess : 0) | (writeDac ? WriteDac : 0),
             shareMode ?? FileShare.Read,
             IntPtr.Zero,
@@ -1704,7 +1758,6 @@ internal sealed class PinnedHelperEntry : IDisposable
             var actualDirectory = (info.FileAttributes & FileAttributeDirectory) != 0;
             if ((info.FileAttributes & FileAttributeReparsePoint) != 0)
                 throw new UnsafeHelperFilesystemException();
-            var canonical = Path.GetFullPath(path);
             var finalPath = ReadFinalPath(handle);
             if (!string.Equals(canonical.TrimEnd(Path.DirectorySeparatorChar),
                     finalPath.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))

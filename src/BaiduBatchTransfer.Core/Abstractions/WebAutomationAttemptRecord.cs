@@ -99,7 +99,9 @@ public sealed record WebAutomationAttemptRecord
         TransferSubmissionEvidence? submissionEvidence = null,
         string? officialRequestId = null,
         TransferIdentityMapping? transferIdentityMapping = null,
-        ExecutionProfileSnapshot? executionProfile = null)
+        ExecutionProfileSnapshot? executionProfile = null,
+        string? officialObservationFingerprint = null,
+        TransferTargetConfirmationEvidence? targetConfirmationEvidence = null)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation is required.", nameof(operationId));
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
@@ -111,6 +113,7 @@ public sealed record WebAutomationAttemptRecord
         if (revision < 0) throw new ArgumentOutOfRangeException(nameof(revision));
         if (updatedAt < createdAt) throw new ArgumentOutOfRangeException(nameof(updatedAt));
         ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
+        ValidateFingerprint(officialObservationFingerprint, nameof(officialObservationFingerprint));
         if (state == WebAutomationAttemptState.UserHandoff)
         {
             if (resumeStage is null || !CanResumeStage(resumeStage.Value) || !isWaitingForUser)
@@ -155,6 +158,24 @@ public sealed record WebAutomationAttemptRecord
             if (acceptedRemoteItems is null || mappedDestinations != acceptedRemoteItems)
                 throw new ArgumentException("Accepted remote items must match the transfer mapping.", nameof(acceptedRemoteItems));
         }
+        if (targetConfirmationEvidence is not null)
+        {
+            if (state != WebAutomationAttemptState.Succeeded || submissionEvidence is null ||
+                targetPreparationEvidence is null || transferIdentityMapping is null ||
+                string.IsNullOrWhiteSpace(officialRequestId) || !submissionEvidence.IsLocallyBound ||
+                targetConfirmationEvidence.SubmissionId != submissionEvidence.SubmissionId ||
+                !string.Equals(targetConfirmationEvidence.ReadinessFingerprint,
+                    submissionEvidence.ReadinessFingerprint, StringComparison.Ordinal) ||
+                !string.Equals(targetConfirmationEvidence.OfficialRequestId,
+                    officialRequestId, StringComparison.Ordinal) ||
+                !string.Equals(targetConfirmationEvidence.OfficialMappingFingerprint,
+                    transferIdentityMapping.Fingerprint, StringComparison.Ordinal) ||
+                !string.Equals(targetConfirmationEvidence.TargetObservationFingerprint,
+                    observationFingerprint, StringComparison.Ordinal))
+                throw new ArgumentException(
+                    "Target confirmation evidence must bind the succeeded official transfer.",
+                    nameof(targetConfirmationEvidence));
+        }
 
         OperationId = operationId;
         AccountId = accountId;
@@ -175,6 +196,8 @@ public sealed record WebAutomationAttemptRecord
         OfficialRequestId = officialRequestId;
         TransferIdentityMapping = transferIdentityMapping;
         ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(accountId);
+        OfficialObservationFingerprint = officialObservationFingerprint;
+        TargetConfirmationEvidence = targetConfirmationEvidence;
     }
 
     public Guid OperationId { get; }
@@ -197,6 +220,8 @@ public sealed record WebAutomationAttemptRecord
     public string? OfficialRequestId { get; }
     public TransferIdentityMapping? TransferIdentityMapping { get; }
     public ExecutionProfileSnapshot ExecutionProfile { get; }
+    public string? OfficialObservationFingerprint { get; }
+    public TransferTargetConfirmationEvidence? TargetConfirmationEvidence { get; }
 
     public static WebAutomationAttemptRecord Create(
         Guid operationId,

@@ -5,16 +5,19 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Scheduling;
 
-public sealed class ShareOperationExecutor
+public sealed class ShareOperationExecutor : IShareOperationExecutor
 {
     private static readonly TimeSpan ReconciliationDelay = TimeSpan.FromMinutes(1);
-    private readonly IBaiduShareAdapter adapter;
-    private readonly IBaiduSessionStore sessionStore;
+    private readonly IBaiduShareAdapter? adapter;
+    private readonly IBaiduSessionStore? sessionStore;
+    private readonly ExecutionBoundShareAdapter? boundAdapter;
+    private readonly IBaiduExecutionContextResolver? contextResolver;
     private readonly IShareExecutionStore store;
     private readonly RetryPolicy retryPolicy;
     private readonly IAsyncDelay delay;
     private readonly TimeProvider timeProvider;
     private readonly ShareSubmissionEngine submissionEngine;
+    private readonly bool allowLegacySessionForAnyProfile;
 
     public ShareOperationExecutor(
         IBaiduShareAdapter adapter,
@@ -23,10 +26,34 @@ public sealed class ShareOperationExecutor
         RetryPolicy retryPolicy,
         IAsyncDelay delay,
         TimeProvider? timeProvider = null,
-        ShareSubmissionEngine? submissionEngine = null)
+        ShareSubmissionEngine? submissionEngine = null,
+        bool allowLegacySessionForAnyProfile = false)
     {
         this.adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         this.sessionStore = sessionStore ?? throw new ArgumentNullException(nameof(sessionStore));
+        this.store = store ?? throw new ArgumentNullException(nameof(store));
+        this.retryPolicy = retryPolicy ?? throw new ArgumentNullException(nameof(retryPolicy));
+        this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.submissionEngine = submissionEngine ?? new ShareSubmissionEngine();
+        this.allowLegacySessionForAnyProfile = allowLegacySessionForAnyProfile;
+    }
+
+    /// <summary>
+    /// Executes only the exact transfer-linked AcceptanceOnly share through its persisted execution snapshot.
+    /// Managed execution never loads or constructs a cookie session.
+    /// </summary>
+    public ShareOperationExecutor(
+        ExecutionBoundShareAdapter adapter,
+        IBaiduExecutionContextResolver contextResolver,
+        IShareExecutionStore store,
+        RetryPolicy retryPolicy,
+        IAsyncDelay delay,
+        TimeProvider? timeProvider = null,
+        ShareSubmissionEngine? submissionEngine = null)
+    {
+        boundAdapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+        this.contextResolver = contextResolver ?? throw new ArgumentNullException(nameof(contextResolver));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.retryPolicy = retryPolicy ?? throw new ArgumentNullException(nameof(retryPolicy));
         this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
@@ -48,21 +75,59 @@ public sealed class ShareOperationExecutor
         if (!context.Selected || !context.ShareEnabled)
             return ShareExecutionResult.NotEnabled;
 
-        ValidateContext(context);
+        ValidateContext(context, requireAcceptanceOnly: boundAdapter is not null);
         var operation = context.Operation;
         var request = BuildRequest(context);
-        var session = await sessionStore.LoadAsync(operation.AccountId.ToString("D"), cancellationToken)
-            .ConfigureAwait(false);
-        if (session is null)
-            return await PauseAsync(operation, SharePauseReason.AccountSessionUnavailable, cancellationToken).ConfigureAwait(false);
+        BaiduExecutionContext execution;
+        if (boundAdapter is not null)
+        {
+            var resolution = await contextResolver!.ResolveAsync(
+                    operation.AccountId, operation.ExecutionProfile, cancellationToken)
+                .ConfigureAwait(false);
+            if (resolution.Status != BaiduExecutionResolutionStatus.Ready)
+                return await PauseAsync(operation,
+                    resolution.Status == BaiduExecutionResolutionStatus.LoginRequired
+                        ? SharePauseReason.AccountSessionUnavailable
+                        : SharePauseReason.AccountVerificationRequired,
+                    cancellationToken).ConfigureAwait(false);
+            execution = resolution.Context!;
+        }
+        else
+        {
+            if (!allowLegacySessionForAnyProfile &&
+                operation.ExecutionProfile.Engine != BaiduExecutionEngine.WebView2V1)
+                return await PauseAsync(operation, SharePauseReason.AccountVerificationRequired, cancellationToken)
+                    .ConfigureAwait(false);
+            var session = await sessionStore!.LoadAsync(
+                    operation.AccountId.ToString("D"), cancellationToken)
+                .ConfigureAwait(false);
+            if (session is null)
+                return await PauseAsync(operation, SharePauseReason.AccountSessionUnavailable, cancellationToken)
+                    .ConfigureAwait(false);
+            if (allowLegacySessionForAnyProfile && session.LocalAccountId != operation.AccountId)
+                return await PauseAsync(operation, SharePauseReason.AccountVerificationRequired, cancellationToken)
+                    .ConfigureAwait(false);
+            execution = BaiduExecutionContext.Legacy(session);
+        }
+
+        var automationContext = new ShareOperationAutomationContext(
+            operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
+            WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems,
+            PersistedExecutionProfile: operation.ExecutionProfile).Validate();
 
         if (!await store.TryMarkPreparingAsync(
                 operation.Id, operation.Generation, operation.LeaseGeneration,
                 timeProvider.GetUtcNow(), cancellationToken).ConfigureAwait(false))
             return Stale();
 
-        var discovery = await submissionEngine.DiscoverAsync(
-            adapter, session, request, retryPolicy, delay, cancellationToken).ConfigureAwait(false);
+        var discovery = boundAdapter is null
+            ? await submissionEngine.DiscoverAsync(
+                adapter!, execution.LegacySession!, request, retryPolicy, delay, cancellationToken)
+                .ConfigureAwait(false)
+            : await boundAdapter.DiscoverPermanentSharesForOperationAsync(
+                automationContext, execution, request, retryPolicy, delay, cancellationToken)
+                .ConfigureAwait(false);
+        discovery = submissionEngine.ValidateDiscoverySnapshot(request, discovery);
         if (!discovery.IsSuccess)
         {
             if (IsAccountPausingFailure(discovery.ErrorKind!.Value))
@@ -105,17 +170,15 @@ public sealed class ShareOperationExecutor
                 throw new InvalidOperationException("The persisted existing-share decision is invalid.");
         }
 
-        ShareOperationAutomationContext? automationContext = null;
-        if (adapter is IOperationBoundBaiduShareAdapter operationBound)
-            automationContext = new ShareOperationAutomationContext(
-                operation.Id, operation.BatchJobId, operation.AccountId, operation.Generation,
-                WebAutomationOwnerKind.TransferShare, context.ExactRemoteItems,
-                PersistedExecutionProfile: operation.ExecutionProfile).Validate();
         var submission = await submissionEngine.ExecuteSubmissionAsync(
             request,
             new ShareSubmissionPorts(
-                token => adapter is IOperationBoundBaiduShareAdapter bound
-                    ? bound.PreparePermanentShareForOperationAsync(automationContext!, session, request, token)
+                token => boundAdapter is not null
+                    ? boundAdapter.PreparePermanentShareForOperationAsync(
+                        automationContext, execution, request, token)
+                    : adapter is IOperationBoundBaiduShareAdapter bound
+                        ? bound.PreparePermanentShareForOperationAsync(
+                            automationContext, execution.LegacySession!, request, token)
                     : Task.FromResult(BaiduAdapterResult<SharePreparationReceipt>.Success(
                         SharePreparationReceipt.Ready, SubmissionAcceptance.DefinitelyNotAccepted)),
                 token =>
@@ -129,9 +192,13 @@ public sealed class ShareOperationExecutor
                 (completedRetries, token) => store.TryBeginSubmissionAttemptAsync(
                     operation.Id, operation.Generation, operation.LeaseGeneration,
                     checked(operation.AttemptCount + completedRetries), timeProvider.GetUtcNow(), token),
-                token => adapter is IOperationBoundBaiduShareAdapter bound
-                    ? bound.SubmitPermanentShareForOperationAsync(automationContext!, session, request, token)
-                    : adapter.CreatePermanentShareAsync(session, request, token),
+                token => boundAdapter is not null
+                    ? boundAdapter.SubmitPermanentShareForOperationAsync(
+                        automationContext, execution, request, token)
+                    : adapter is IOperationBoundBaiduShareAdapter bound
+                        ? bound.SubmitPermanentShareForOperationAsync(
+                            automationContext, execution.LegacySession!, request, token)
+                        : adapter!.CreatePermanentShareAsync(execution.LegacySession!, request, token),
                 (completedAttempts, token) => store.TryRecordDefinitelyNotAcceptedRetryAsync(
                     operation.Id, operation.Generation, operation.LeaseGeneration,
                     checked(operation.AttemptCount + completedAttempts), timeProvider.GetUtcNow(), token),
@@ -185,10 +252,20 @@ public sealed class ShareOperationExecutor
         if (!submissionEngine.IsExactAcceptedReceipt(request, receipt))
             return await MarkPendingAsync(operation, cancellationToken).ConfigureAwait(false);
 
+        string shareUrl;
+        try
+        {
+            shareUrl = BaiduShareLink.Normalize(receipt.ShareUrl, receipt.ExtractionCode!);
+        }
+        catch (ArgumentException)
+        {
+            return await MarkPendingAsync(operation, cancellationToken).ConfigureAwait(false);
+        }
+
         var now = timeProvider.GetUtcNow();
         var accepted = await store.AcceptResultAsync(
             operation.Id, ShareOperationStatus.Submitting, operation.LeaseGeneration,
-            Result(context, receipt.ShareId, receipt.ShareUrl, receipt.ExtractionCode!, receipt.SubmittedAtUtc, now),
+            Result(context, receipt.ShareId, shareUrl, receipt.ExtractionCode!, receipt.SubmittedAtUtc, now),
             now, cancellationToken).ConfigureAwait(false);
         return accepted
             ? new(ShareExecutionDisposition.Succeeded, "分享成功")
@@ -201,10 +278,20 @@ public sealed class ShareOperationExecutor
         CancellationToken cancellationToken)
     {
         var operation = context.Operation;
+        string shareUrl;
+        try
+        {
+            shareUrl = BaiduShareLink.Normalize(existing.ShareUrl, existing.ExtractionCode);
+        }
+        catch (ArgumentException)
+        {
+            return await FailAsync(operation, "InvalidShareLink", "The existing share link is invalid.", cancellationToken)
+                .ConfigureAwait(false);
+        }
         var now = timeProvider.GetUtcNow();
         var accepted = await store.ReuseExistingResultAsync(
             operation.Id, operation.LeaseGeneration,
-            Result(context, existing.ShareId, existing.ShareUrl, existing.ExtractionCode, now, now),
+            Result(context, existing.ShareId, shareUrl, existing.ExtractionCode, now, now),
             now, cancellationToken).ConfigureAwait(false);
         return accepted
             ? new(ShareExecutionDisposition.ReusedExisting, "复用已有分享")
@@ -297,7 +384,7 @@ public sealed class ShareOperationExecutor
             ? new(context.ExactRemoteItems)
             : new(context.ExactRemoteItems, context.Settings.FixedExtractionCode);
 
-    private static void ValidateContext(ShareExecutionContext context)
+    private static void ValidateContext(ShareExecutionContext context, bool requireAcceptanceOnly)
     {
         var operation = context.Operation;
         var settings = context.Settings;
@@ -306,7 +393,9 @@ public sealed class ShareOperationExecutor
             operation.BatchJobId != settings.BatchJobId ||
             !string.Equals(operation.ExactItemSetFingerprint, context.ExactRemoteItems.Fingerprint, StringComparison.Ordinal) ||
             !settings.IsPermanent || !settings.IsAccessUnlimited ||
-            !string.Equals(operation.SettingsFingerprint, settings.SettingsFingerprint, StringComparison.Ordinal))
+            !string.Equals(operation.SettingsFingerprint, settings.SettingsFingerprint, StringComparison.Ordinal) ||
+            requireAcceptanceOnly && (!context.AcceptanceOnly ||
+                operation.ExecutionProfile.Engine != BaiduExecutionEngine.ManagedChromiumV1))
             throw new InvalidOperationException("The confirmed share execution boundary is invalid.");
 
         ShareExtractionCodeBehavior behavior;

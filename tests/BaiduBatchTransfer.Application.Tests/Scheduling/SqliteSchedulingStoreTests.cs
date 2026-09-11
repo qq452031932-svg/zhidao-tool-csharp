@@ -15,6 +15,47 @@ public sealed class SqliteSchedulingStoreTests
     private static readonly DateTimeOffset Now = new(2026, 8, 19, 1, 0, 0, TimeSpan.Zero);
 
     [Fact]
+    public async Task DirectBatchPolicyUsesPersistedConcurrencyAndSharePriority()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        await db.SeedAsync([], job: Job(batch, "TaskCount", "Active", 1, 1) with
+        {
+            DirectBackground = true,
+            MaxConcurrency = 3,
+            DirectActivationState = "Active",
+        });
+        var source = Assert.IsAssignableFrom<IBatchSchedulingPolicySource>(
+            new SqliteTransferSchedulingStore(db.ConnectionFactory));
+
+        var policy = await source.GetPolicyAsync(batch);
+
+        Assert.Equal(3, policy.MaxConcurrency);
+        Assert.True(policy.PreferReadyShares);
+    }
+
+    [Fact]
+    public async Task InertDirectBatchCannotActivateUntilItsWriteBoundaryIsActivated()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        await db.SeedAsync([], job: Job(batch, "TaskCount", "Queued", 1, 1) with
+        {
+            DirectBackground = true,
+            MaxConcurrency = 2,
+            DirectActivationState = "Inert",
+        });
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        Assert.Null(await store.TryActivateNextBatchAsync(Now));
+        await ExecuteAsync(db,
+            "UPDATE BatchJobs SET DirectActivationState='Active' WHERE Id=$id;",
+            ("$id", batch.ToString("D")));
+
+        Assert.Equal(batch, await store.TryActivateNextBatchAsync(Now));
+    }
+
+    [Fact]
     public async Task ExecutionLoadReturnsThePersistedManagedSnapshot()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -27,11 +68,17 @@ public sealed class SqliteSchedulingStoreTests
         var installation = new BrowserInstallationIdentity(
             Guid.NewGuid(), BrowserFamily.Edge, directory, Path.Combine(directory, "msedge.exe"),
             "Microsoft Corporation", "Microsoft Edge", $"managed-scheduling-file-{Guid.NewGuid():N}");
-        await state.CreateInstallationAsync(installation, default);
+        var storedInstallation = await state.CreateInstallationAsync(installation, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await state.TryReplaceActiveInstallationAsync(
+                new ManagedBrowserInstallationActivationRequest(null, storedInstallation), default)).Status);
         var session = new ManagedBrowserSessionReference(
             Guid.NewGuid(), installation.InstallationId, account, $"baidu-{account:N}",
             BrowserFamily.Edge, $"managed-scheduling-{account:N}", $"owner-{account:N}");
-        await state.CreateSessionAsync(session, default);
+        var storedSession = await state.CreateSessionAsync(session, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await state.TryReplaceActiveSessionAsync(
+                new ManagedBrowserSessionActivationRequest(null, storedSession), default)).Status);
         var operation = Operation(resource, account, 1) with
         {
             PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
@@ -810,6 +857,44 @@ public sealed class SqliteSchedulingStoreTests
     }
 
     [Fact]
+    public async Task DirectPendingReconciliationSourceReturnsOnlyActiveDirectResultPendingOperation()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var directBatch = Guid.NewGuid();
+        var ordinaryBatch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var directResource = Resource(directBatch, 1, null, "Reserved") with
+        {
+            ReservedAccountId = account,
+        };
+        var ordinaryResource = Resource(ordinaryBatch, 2, null, "Reserved") with
+        {
+            ReservedAccountId = account,
+        };
+        var directOperation = Operation(
+            directResource, account, 1, "ResultPending", "PendingConfirmation", "Reserved", "{}");
+        var ordinaryOperation = Operation(
+            ordinaryResource, account, 2, "ResultPending", "PendingConfirmation", "Reserved", "{}");
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(directBatch, "TaskCount", "Active", 1, 1) with
+            {
+                DirectBackground = true,
+                DirectActivationState = "Active",
+            },
+            resources: [directResource], operations: [directOperation],
+            allocations: [Allocation(directBatch, account, 1, 1, reserved: 1)]);
+        await db.SeedAsync([], job: Job(ordinaryBatch, "TaskCount", "Active", 1, 1),
+            resources: [ordinaryResource], operations: [ordinaryOperation],
+            allocations: [Allocation(ordinaryBatch, account, 1, 1, reserved: 1)]);
+        var source = Assert.IsAssignableFrom<IPendingTransferReconciliationSource>(
+            new SqliteTransferSchedulingStore(db.ConnectionFactory));
+
+        var selected = await source.TryGetPendingDirectOperationAsync();
+
+        Assert.Equal(directOperation.Id, selected);
+    }
+
+    [Fact]
     public async Task ExpiredPreSubmissionLeaseReturnsSameOperationToWaitingWithoutLosingCandidate()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -924,6 +1009,43 @@ public sealed class SqliteSchedulingStoreTests
         Assert.Equal(1L, await ScalarLongAsync(db, "SELECT ReservedSlotCount FROM AccountAllocations"));
         Assert.Equal(0L, await ScalarLongAsync(db, "SELECT FailedItemCount FROM AccountAllocations"));
         Assert.Equal("Active", await ScalarStringAsync(db, "SELECT Status FROM Accounts"));
+    }
+
+    [Fact]
+    public async Task ManagedPreparationOutcomeUnknownRetainsSlotAndCannotReturnToWaiting()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1, null, "Expanded");
+        var operation = Operation(resource, account, 1, "Preparing", "PreparingToSubmit", "Reserved") with
+        {
+            AttemptCount = 1,
+            LeaseExpiresAt = Now.AddMinutes(5),
+        };
+        await db.SeedAsync([Account(account, 0)],
+            job: Job(batch, "TaskCount", "Active", 1, 1),
+            resources: [resource], operations: [operation],
+            allocations: [Allocation(batch, account, 1, 1, reserved: 1)]);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+
+        await store.MarkPreparationOutcomeUnknownAsync(operation.Id, "PreparationOutcomeUnknown",
+            "The managed directory preparation outcome is unknown.", SubmissionAcceptance.Unknown,
+            Now.AddSeconds(1), expectedAttemptCount: 1);
+
+        Assert.Equal("ResultPending", await ScalarStringAsync(db,
+            "SELECT Status FROM TransferOperations"));
+        Assert.Equal("PreparingToSubmit", await ScalarStringAsync(db,
+            "SELECT SubmitState FROM TransferOperations"));
+        Assert.Equal("PreparationOutcomeUnknown", await ScalarStringAsync(db,
+            "SELECT LastErrorCode FROM TransferOperations"));
+        Assert.Equal("Reserved", await ScalarStringAsync(db,
+            "SELECT TargetSlotState FROM TransferOperations"));
+        Assert.Equal(1L, await ScalarLongAsync(db,
+            "SELECT ReservedSlotCount FROM AccountAllocations"));
+        Assert.Equal(0, (await store.RecoverInterruptedOperationsAsync(Now.AddHours(1))).RetryableOperationCount);
+        Assert.Equal("ResultPending", await ScalarStringAsync(db,
+            "SELECT Status FROM TransferOperations"));
     }
 
     [Theory]
@@ -1137,12 +1259,18 @@ public sealed class SqliteSchedulingStoreTests
         var installation = new BrowserInstallationIdentity(
             Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
             "Google LLC", "Google Chrome", $"managed-reassignment-file-{Guid.NewGuid():N}");
-        await browserStore.CreateInstallationAsync(installation, default);
+        var storedInstallation = await browserStore.CreateInstallationAsync(installation, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await browserStore.TryReplaceActiveInstallationAsync(
+                new ManagedBrowserInstallationActivationRequest(null, storedInstallation), default)).Status);
         var session = new ManagedBrowserSessionReference(
             Guid.NewGuid(), installation.InstallationId, oldAccount, $"baidu-{oldAccount:N}",
             BrowserFamily.Chrome, $"managed-reassignment-profile-{Guid.NewGuid():N}",
             $"managed-reassignment-owner-{Guid.NewGuid():N}");
-        await browserStore.CreateSessionAsync(session, default);
+        var storedSession = await browserStore.CreateSessionAsync(session, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await browserStore.TryReplaceActiveSessionAsync(
+                new ManagedBrowserSessionActivationRequest(null, storedSession), default)).Status);
         var resource = Resource(batch, 1, null, "Expanded");
         var operation = Operation(resource, oldAccount, 1) with
         {

@@ -1,0 +1,23 @@
+{
+  "routeId": "quota",
+  "method": "GET",
+  "statusCode": 200,
+  "jsonShape": [
+    "$:object",
+    "$.errmsg:string",
+    "$.errno:number",
+    "$.expire:boolean",
+    "$.free:number",
+    "$.is_show_window:number",
+    "$.newno:string",
+    "$.recmd_vip:string",
+    "$.recyclestatus:number",
+    "$.request_id:number",
+    "$.sbox_total:number",
+    "$.sbox_used:number",
+    "$.server_time:number",
+    "$.total:number",
+    "$.used:number"
+  ],
+  "values": "[REDACTED]"
+}

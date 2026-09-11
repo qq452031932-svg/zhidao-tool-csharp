@@ -18,10 +18,11 @@ public sealed record AccountCapacityRefreshResult(
     Guid AccountId,
     AccountCapacityRefreshDisposition Disposition,
     AccountCapacity? Capacity,
-    string SafeMessage)
+    string SafeMessage,
+    Uri? AvatarUri = null)
 {
     public override string ToString() =>
-        $"AccountCapacityRefreshResult {{ Disposition = {Disposition}, Capacity = [REDACTED], Identity = [REDACTED] }}";
+        $"AccountCapacityRefreshResult {{ Disposition = {Disposition}, Capacity = [REDACTED], AvatarUri = [REDACTED], Identity = [REDACTED] }}";
 }
 
 public sealed class AccountCapacityRefreshService(
@@ -60,6 +61,24 @@ public sealed class AccountCapacityRefreshService(
                 return Result(accountId, Map(observed.ErrorKind));
 
             var capacity = observed.Value!;
+            Uri? avatarUri = null;
+            try
+            {
+                var identity = await adapter
+                    .ValidateSessionAsync(session, cancellationToken)
+                    .ConfigureAwait(false);
+                if (identity.IsSuccess)
+                {
+                    if (!string.Equals(identity.Value!.UserId, session.BaiduUserId, StringComparison.Ordinal))
+                        return Result(accountId, AccountCapacityRefreshDisposition.AccountChanged);
+                    avatarUri = identity.Value.AvatarUri;
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch
+            {
+                // Avatar is presentation-only. A profile read failure must not discard a valid quota refresh.
+            }
             var persisted = await capacityStore.TryUpdateAsync(
                 accountId,
                 session.BaiduUserId,
@@ -67,7 +86,7 @@ public sealed class AccountCapacityRefreshService(
                 timeProvider.GetUtcNow(),
                 cancellationToken).ConfigureAwait(false);
             return persisted
-                ? new(accountId, AccountCapacityRefreshDisposition.Updated, capacity, "账号容量已更新。")
+                ? new(accountId, AccountCapacityRefreshDisposition.Updated, capacity, "账号容量已更新。", avatarUri)
                 : Result(accountId, AccountCapacityRefreshDisposition.AccountChanged);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }

@@ -20,11 +20,11 @@
                     <TextBlock Text="暂停：" Foreground="{StaticResource MutedBrush}" />
                     <TextBlock Text="{Binding PausedCount, StringFormat={}{0:N0}}" FontWeight="SemiBold" />
                 </WrapPanel>
-                <TextBlock Text="{Binding TransferCapabilityMessage}" Foreground="#8A5A00" Margin="0,8,0,0" />
-                <TextBlock Text="{Binding ShareCapabilityMessage}" Foreground="#8A5A00" />
             </StackPanel>
         </Border>
-        <DataGrid Grid.Row="1" ItemsSource="{Binding Items}" SelectedItem="{Binding SelectedItem}"
+        <DataGrid x:Name="ResultsGrid" Grid.Row="1" ItemsSource="{Binding Items}"
+                  SelectedItem="{Binding SelectedItem, Mode=TwoWay}"
+                  Style="{StaticResource DenseDataGridStyle}" RowHeight="34" ColumnHeaderHeight="38"
                   AutoGenerateColumns="False" IsReadOnly="True"
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
@@ -33,11 +33,13 @@
                 <DataGridTextColumn Header="序号" Binding="{Binding CandidateSequence}" Width="80" />
                 <DataGridTextColumn Header="标题" Binding="{Binding ResolvedTitle}" Width="2*" />
                 <DataGridTextColumn Header="账号" Binding="{Binding AccountDisplayName}" Width="*" />
+                <DataGridTextColumn Header="原链接" Binding="{Binding OriginalShareUrl}" Width="2*" />
+                <DataGridTextColumn Header="百度保存目录" Binding="{Binding TargetPath}" Width="*" />
                 <DataGridTextColumn Header="转存状态" Binding="{Binding TransferStatusText}" Width="120" />
                 <DataGridTextColumn Header="转存提示" Binding="{Binding TransferDetailMessage}" Width="2*" />
                 <DataGridTextColumn Header="分享状态" Binding="{Binding ShareStatusText}" Width="120" />
-                <DataGridTextColumn Header="转存错误码" Binding="{Binding TransferErrorCode}" Width="120" />
-                <DataGridTextColumn Header="分享错误码" Binding="{Binding ShareErrorCode}" Width="120" />
+                <DataGridTextColumn Header="新分享链接" Binding="{Binding GeneratedShareUrl}" Width="2*" />
+                <DataGridTextColumn Header="新提取码" Binding="{Binding GeneratedExtractionCode}" Width="120" />
             </DataGrid.Columns>
         </DataGrid>
         <Grid Grid.Row="2" Margin="0,12,0,0">
@@ -45,14 +47,22 @@
             <WrapPanel KeyboardNavigation.TabNavigation="Local">
                 <Button Content="下一页" Command="{Binding LoadNextPageCommand}" />
                 <Button Content="刷新结果" Command="{Binding RefreshCommand}" Margin="8,0,0,0" />
-                <Button Content="仅重试分享" Command="{Binding RetryShareOnlyCommand}" Margin="8,0,0,0" />
-                <Button Content="确认转存结果" Command="{Binding ReconcileTransferCommand}" Margin="8,0,0,0" />
-                <Button Content="确认分享结果" Command="{Binding ReconcileShareCommand}" Margin="8,0,0,0" />
-                <Button Content="恢复转存" Command="{Binding ResumeTransferCommand}" Margin="8,0,0,0" />
-                <Button Content="恢复分享" Command="{Binding ResumeShareCommand}" Margin="8,0,0,0" />
-                <Button Content="处理已有分享" Command="{Binding ResolveExistingSharesCommand}" Margin="8,0,0,0" />
+                <Button Content="复制链接和提取码" Command="{Binding CopyGeneratedShareCommand}"
+                        CommandParameter="{Binding SelectedItem, ElementName=ResultsGrid}" Margin="8,0,0,0" />
                 <Button Content="另存结果表格" Command="{Binding SaveAsCommand}" Margin="8,0,0,0" />
-                <Button Content="取消另存" Command="{Binding CancelSaveCommand}" Margin="8,0,0,0" />
+                <Menu VerticalAlignment="Center" Background="Transparent">
+                    <MenuItem Header="更多">
+                        <MenuItem Header="重试分享" Command="{Binding RetryShareOnlyCommand}" />
+                        <MenuItem Header="继续转存" Command="{Binding ResumeTransferCommand}" />
+                        <MenuItem Header="继续分享" Command="{Binding ResumeShareCommand}" />
+                        <Separator />
+                        <MenuItem Header="检查转存结果" Command="{Binding ReconcileTransferCommand}" />
+                        <MenuItem Header="检查分享结果" Command="{Binding ReconcileShareCommand}" />
+                        <MenuItem Header="处理已有分享" Command="{Binding ResolveExistingSharesCommand}" />
+                        <Separator />
+                        <MenuItem Header="取消另存" Command="{Binding CancelSaveCommand}" />
+                    </MenuItem>
+                </Menu>
             </WrapPanel>
             <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,8,0,0">
                 <TextBlock Text="{Binding StatusMessage}" AutomationProperties.LiveSetting="Polite"

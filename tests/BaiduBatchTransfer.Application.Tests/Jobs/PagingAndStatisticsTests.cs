@@ -17,6 +17,52 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
     private readonly ITestOutputHelper output = output;
 
     [Fact]
+    public async Task PendingRowQueryPreservesImportIdentityAndRawShareStatus()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var session = ImportSessionRecord.Create(Guid.NewGuid(), "Text", "projection");
+        var row = StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 1, "url", "Ready");
+        await using (var unit = await db.UnitOfWorkFactory.BeginAsync())
+        {
+            await unit.Imports.AddSessionAsync(session);
+            await unit.Imports.AddRowsAsync([row]);
+            await unit.CommitAsync();
+        }
+        var resource = Resource(batch, 1) with { StagedImportRowId = row.Id };
+        var transfer = Operation(batch, resource, account, 1, "Succeeded", "NewTransfer");
+        await db.SeedAsync([BatchTestData.Account(account, "pending-projection")], job: Job(batch),
+            resources: [resource], operations: [transfer], allocations: [Allocation(batch, account, 1)]);
+        await SeedShareAsync(db, batch, account, transfer, resource, "ReusedExisting", null);
+        var result = Assert.Single((await new JobPageQuery(db.UnitOfWorkFactory)
+            .GetOperationsAsync(new(batch, null, null, null, null, 10))).Items);
+        Assert.Equal("ReusedExisting", result.ShareStatus);
+        Assert.Equal(row.Id, result.StagedImportRowId);
+        Assert.True(result.ShareEnabled);
+    }
+
+    [Theory]
+    [InlineData("Failed", 0L, 1L)]
+    [InlineData("ReusedExisting", 1L, 0L)]
+    public async Task TerminalStatisticsQueryPreservesCompleteShareCounts(string status, long successes, long problems)
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1);
+        var transfer = Operation(batch, resource, account, 1, "Succeeded", "NewTransfer");
+        await db.SeedAsync([BatchTestData.Account(account, "terminal-stats")], job: Job(batch),
+            resources: [resource], operations: [transfer], allocations: [Allocation(batch, account, 1)]);
+        await SeedShareAsync(db, batch, account, transfer, resource, status, null);
+        var statistics = await new BatchStatisticsQuery(db.UnitOfWorkFactory).ExecuteAsync(batch);
+        var result = Assert.Single(statistics.Accounts);
+        Assert.Equal(0, result.FailedCount);
+        Assert.Equal(successes, result.CompleteSuccessCount);
+        Assert.Equal(problems, result.TerminalProblemCount);
+    }
+
+    [Fact]
     public async Task OperationQueryProjectsStableChineseStatusLabels()
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -283,6 +329,61 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
         Assert.False((bool)projected.CanReconcileShare);
         Assert.True((bool)((dynamic)second.Items[0]).CanReconcileTransfer);
         Assert.Equal("等待生成分享", (string)((dynamic)second.Items[0]).ShareStatusText);
+    }
+
+    [Fact]
+    public async Task OperationQueryProjectsOnlyAcceptedCurrentGeneratedShareResult()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var resource = Resource(batch, 1);
+        var transfer = Operation(batch, resource, account, 1, "Succeeded", "NewTransfer") with
+        {
+            SubmitState = "ResultReceived",
+            ConfirmationDescriptorJson = "{}",
+            RemoteItemIdsJson = "[\"remote-1\"]",
+            TargetSlotState = "Fulfilled",
+        };
+        await db.SeedAsync(
+            [BatchTestData.Account(account, "replacement-link")],
+            job: Job(batch) with { Status = "Active", ResourceCount = 1, OperationCount = 1 },
+            resources: [resource],
+            operations: [transfer],
+            allocations: [Allocation(batch, account, 1)]);
+        var share = await SeedShareAsync(db, batch, account, transfer, resource, "Succeeded", null);
+
+        await using (var connection = await db.ConnectionFactory.OpenConnectionAsync())
+        {
+            await ExecuteAsync(connection, """
+                INSERT INTO BaiduShareResults(
+                  Id,ShareOperationId,BatchJobId,ResourceItemId,AccountId,CandidateSequence,OutputOrdinal,
+                  ExactItemSetFingerprint,SettingsFingerprint,Generation,ShareId,ShareUrl,ExtractionCode,
+                  IsAccepted,IsCurrent,SharedAt,UpdatedAt)
+                VALUES
+                  ($rejected,$share,$batch,$resource,$account,1,1,'exact-fp','settings-fp',1,
+                   'rejected-share','https://pan.baidu.com/s/rejected','reject',0,1,$time,$time),
+                  ($superseded,$share,$batch,$resource,$account,1,1,'exact-fp','settings-fp',1,
+                   'superseded-share','https://pan.baidu.com/s/superseded','oldcode',1,0,$time,$time),
+                  ($accepted,$share,$batch,$resource,$account,1,1,'exact-fp','settings-fp',1,
+                   'accepted-share','https://pan.baidu.com/s/accepted','newcode',1,1,$time,$time);
+                """,
+                ("$rejected", Guid.NewGuid().ToString("D")),
+                ("$superseded", Guid.NewGuid().ToString("D")),
+                ("$accepted", Guid.NewGuid().ToString("D")),
+                ("$share", share.ToString("D")),
+                ("$batch", batch.ToString("D")),
+                ("$resource", resource.Id.ToString("D")),
+                ("$account", account.ToString("D")),
+                ("$time", BatchTestData.Now.ToString("O")));
+        }
+
+        var item = Assert.Single((await new JobPageQuery(db.UnitOfWorkFactory).GetOperationsAsync(
+            new(batch, account, null, null, null, 10))).Items);
+
+        Assert.Equal(resource.ShareUrl, item.ShareUrl);
+        Assert.Equal("https://pan.baidu.com/s/accepted", ReadGeneratedShareValue(item, "GeneratedShareUrl"));
+        Assert.Equal("newcode", ReadGeneratedShareValue(item, "GeneratedExtractionCode"));
     }
 
     [Fact]
@@ -1085,6 +1186,9 @@ public sealed class PagingAndStatisticsTests(ITestOutputHelper output)
             $"Managed memory grew by {peakManagedBytes - baseline:N0} bytes.");
         Assert.True(timer.Elapsed < TimeSpan.FromSeconds(30), $"Scale query/export took {timer.Elapsed}.");
     }
+
+    private static string? ReadGeneratedShareValue(OperationPageItem item, string propertyName) =>
+        item.GetType().GetProperty(propertyName)?.GetValue(item) as string;
 
     private static BatchJobRecord Job(Guid id) => new(
         id, "batch", "Excel", "Replication", "TaskCount", "ProportionalReduction", 3, 5,

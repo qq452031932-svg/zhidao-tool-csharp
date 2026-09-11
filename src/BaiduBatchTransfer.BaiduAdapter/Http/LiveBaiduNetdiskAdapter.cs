@@ -4,15 +4,25 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.BaiduAdapter.Http;
 
-public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityClient) : IBaiduNetdiskAdapter
+public sealed class LiveBaiduNetdiskAdapter :
+    IBaiduNetdiskAdapter,
+    ISourceAwareBaiduTransferConfirmationAdapter
 {
     public static AdapterCapability Capability { get; } = new(
         transferValidated: false,
         shareValidated: false,
         "百度转存和分享能力尚未通过现场验收。");
 
-    private readonly BaiduSessionIdentityClient identityClient =
-        identityClient ?? throw new ArgumentNullException(nameof(identityClient));
+    private readonly BaiduSessionIdentityClient identityClient;
+    private readonly BaiduWebApiClient? webApiClient;
+
+    public LiveBaiduNetdiskAdapter(
+        BaiduSessionIdentityClient identityClient,
+        BaiduWebApiClient? webApiClient = null)
+    {
+        this.identityClient = identityClient ?? throw new ArgumentNullException(nameof(identityClient));
+        this.webApiClient = webApiClient;
+    }
 
     public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(
         AccountSession session,
@@ -29,7 +39,9 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return NotValidated<ImmutableArray<RemoteDirectory>>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<ImmutableArray<RemoteDirectory>>(session, cancellationToken)
+            : webApiClient.ListDirectoriesAsync(session, path, cancellationToken);
     }
 
     public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(
@@ -38,7 +50,9 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return NotValidated<RemoteDirectory>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<RemoteDirectory>(session, cancellationToken)
+            : webApiClient.EnsureDirectoryAsync(session, path, cancellationToken);
     }
 
     public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(
@@ -47,7 +61,9 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(share);
-        return NotValidated<ShareMetadata>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<ShareMetadata>(session, cancellationToken)
+            : webApiClient.InspectShareAsync(session, share, cancellationToken);
     }
 
     public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(
@@ -59,7 +75,10 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
     {
         ArgumentNullException.ThrowIfNull(share);
         ArgumentNullException.ThrowIfNull(destination);
-        return NotValidated<TransferReceipt>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<TransferReceipt>(session, cancellationToken)
+            : webApiClient.SaveWholeShareAsync(
+                session, share, destination, duplicatePolicy, cancellationToken);
     }
 
     public Task<BaiduAdapterResult<TransferConfirmation>> ConfirmTransferAsync(
@@ -78,6 +97,19 @@ public sealed class LiveBaiduNetdiskAdapter(BaiduSessionIdentityClient identityC
     {
         ArgumentNullException.ThrowIfNull(query);
         return NotValidated<TransferConfirmationResult>(session, cancellationToken);
+    }
+
+    public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferAsync(
+        AccountSession session,
+        ShareReference sourceShare,
+        TransferConfirmationQuery query,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(sourceShare);
+        ArgumentNullException.ThrowIfNull(query);
+        return webApiClient is null
+            ? NotValidated<TransferConfirmationResult>(session, cancellationToken)
+            : webApiClient.ConfirmExactTransferAsync(session, sourceShare, query, cancellationToken);
     }
 
     private static Task<BaiduAdapterResult<T>> NotValidated<T>(

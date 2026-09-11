@@ -69,6 +69,21 @@ public sealed class BaiduLoginPolicyTests
     }
 
     [Fact]
+    public void SettlingGateResetRequiresANewContinuousAuthenticatedDelay()
+    {
+        var gate = new BaiduLoginSettlingGate(TimeSpan.FromSeconds(3));
+        var authenticated = new BaiduLoginAuthenticationState(true, true);
+        var start = DateTimeOffset.Parse("2026-09-01T01:00:00Z");
+        Assert.False(gate.IsReady(authenticated, start));
+        Assert.True(gate.IsReady(authenticated, start.AddSeconds(3)));
+
+        gate.Reset();
+
+        Assert.False(gate.IsReady(authenticated, start.AddSeconds(4)));
+        Assert.True(gate.IsReady(authenticated, start.AddSeconds(7)));
+    }
+
+    [Fact]
     public void CookieSnapshotRejectsForeignProfileCookiesBeforeApplyingTheSafetyLimit()
     {
         var cookies = Enumerable.Range(0, 512)

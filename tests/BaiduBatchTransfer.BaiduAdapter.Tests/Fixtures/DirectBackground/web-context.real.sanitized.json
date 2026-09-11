@@ -1,0 +1,13 @@
+{
+  "routeId": "web-context",
+  "method": "GET",
+  "statusCode": 200,
+  "jsonShape": [
+    "$:object",
+    "$.errno:number",
+    "$.result:object",
+    "$.result.bdstoken:string",
+    "$.request_id:number"
+  ],
+  "values": "[REDACTED]"
+}

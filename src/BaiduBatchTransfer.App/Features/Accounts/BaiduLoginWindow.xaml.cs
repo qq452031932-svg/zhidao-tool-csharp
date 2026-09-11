@@ -13,8 +13,9 @@ public partial class BaiduLoginWindow : Window
 {
     private readonly Guid accountId;
     private readonly Guid ownershipToken;
+    private readonly BaiduLoginWindowPurpose purpose;
     private readonly LoginProfileBootstrapper profileBootstrapper;
-    private readonly AddAccountService addAccountService;
+    private readonly BaiduLoginSessionRegistrar sessionRegistrar;
     private readonly WebView2ProfileCloser profileCloser;
     private LoginWindowCloseGate? closeGate;
     private readonly WebViewCookieSessionBridge cookieBridge;
@@ -27,18 +28,19 @@ public partial class BaiduLoginWindow : Window
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly DispatcherTimer pollTimer = new() { Interval = TimeSpan.FromMilliseconds(700) };
     private IDisposable? profileRegistration;
+    private LoginProfileLease? profileLease;
     private AccountProfileOwnership? ownership;
     private bool profilePrepared;
     private bool pollInProgress;
-    private bool registrationCompleted;
     private bool cleanupInProgress;
     private bool allowClose;
 
     public BaiduLoginWindow(
         Guid accountId,
         Guid ownershipToken,
+        BaiduLoginWindowPurpose purpose,
         LoginProfileBootstrapper profileBootstrapper,
-        AddAccountService addAccountService,
+        BaiduLoginSessionRegistrar sessionRegistrar,
         WebView2ProfileCloser profileCloser,
         WebViewCookieSessionBridge cookieBridge)
     {
@@ -46,8 +48,9 @@ public partial class BaiduLoginWindow : Window
         if (ownershipToken == Guid.Empty) throw new ArgumentException("An ownership token is required.", nameof(ownershipToken));
         this.accountId = accountId;
         this.ownershipToken = ownershipToken;
+        this.purpose = purpose;
         this.profileBootstrapper = profileBootstrapper ?? throw new ArgumentNullException(nameof(profileBootstrapper));
-        this.addAccountService = addAccountService ?? throw new ArgumentNullException(nameof(addAccountService));
+        this.sessionRegistrar = sessionRegistrar ?? throw new ArgumentNullException(nameof(sessionRegistrar));
         this.profileCloser = profileCloser ?? throw new ArgumentNullException(nameof(profileCloser));
         this.cookieBridge = cookieBridge ?? throw new ArgumentNullException(nameof(cookieBridge));
         ownership = AccountProfileOwnership.NewLoginProfile(ownershipToken);
@@ -64,7 +67,7 @@ public partial class BaiduLoginWindow : Window
     {
         try
         {
-            try { profileRegistration = profileCloser.Register(accountId, CloseBrowserAsync); }
+            try { profileRegistration = profileCloser.Register(ownershipToken, CloseBrowserAsync); }
             catch
             {
                 profilePreparationStopped.TrySetResult();
@@ -72,14 +75,15 @@ public partial class BaiduLoginWindow : Window
             }
             closeGate = new LoginWindowCloseGate(
                 profilePreparationStopped.Task,
-                cancellationToken => profileCloser.CloseAsync(accountId, cancellationToken));
+                cancellationToken => profileCloser.CloseAsync(ownershipToken, cancellationToken));
 
             string profilePath;
             try
             {
-                profilePath = await profileBootstrapper
-                    .PrepareAsync(accountId, ownershipToken, lifetime.Token)
+                profileLease = await profileBootstrapper
+                    .PrepareAttemptAsync(ownershipToken, lifetime.Token)
                     .ConfigureAwait(true);
+                profilePath = profileLease.Path;
             }
             finally { profilePreparationStopped.TrySetResult(); }
             profilePrepared = true;
@@ -105,8 +109,8 @@ public partial class BaiduLoginWindow : Window
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
-            if (!cleanupInProgress)
-                await CleanupAfterCanceledInitializationAsync().ConfigureAwait(true);
+            // The owned attempt profile is cleaned only after the window has actually closed,
+            // so WebView2 has released its remaining file handles.
         }
         catch (Exception)
         {
@@ -178,12 +182,18 @@ public partial class BaiduLoginWindow : Window
         {
             var session = cookieBridge.CreateUnboundSession(
                 Guid.NewGuid(), capturedCookies, capturedAt, cancellationToken);
-            var result = await addAccountService.AddAsync(
-                new AddAccountRequest(accountId, session, capturedAt, ownership!),
-                cancellationToken).ConfigureAwait(true);
-            if (viewModel.ReportRegistrationResult(result))
+            var result = await sessionRegistrar.RegisterAsync(
+                purpose, accountId, ownership!, session, capturedAt, cancellationToken).ConfigureAwait(true);
+            var succeeded = result.AddResult is not null
+                ? viewModel.ReportRegistrationResult(result.AddResult)
+                : result.Succeeded;
+            if (!succeeded && result.AddResult is null)
             {
-                registrationCompleted = true;
+                viewModel.ReportFailure(result.FailureMessage ?? BaiduLoginUiText.CaptureFailed);
+                await ResetForAnotherScanAsync().ConfigureAwait(true);
+            }
+            if (succeeded)
+            {
                 captureCoordinator.CompleteRegistration();
             }
         }
@@ -240,6 +250,11 @@ public partial class BaiduLoginWindow : Window
         await Dispatcher.InvokeAsync(() =>
         {
             pollTimer.Stop();
+            if (Browser.CoreWebView2 is not null)
+            {
+                Browser.CoreWebView2.Stop();
+                Browser.CoreWebView2.CookieManager.DeleteAllCookies();
+            }
             Browser.Dispose();
         });
         await profilePreparationStopped.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -268,14 +283,6 @@ public partial class BaiduLoginWindow : Window
                 await closeGate.WaitForSafeCloseAsync(CancellationToken.None).ConfigureAwait(true);
             else
                 await profilePreparationStopped.Task.ConfigureAwait(true);
-            if (!registrationCompleted && profilePrepared && ownership is not null)
-            {
-                var cleanup = await addAccountService
-                    .RetryProfileCleanupAsync(accountId, ownership, CancellationToken.None)
-                    .ConfigureAwait(true);
-                if (cleanup == ProfileCleanupStatus.Pending)
-                    viewModel.ReportFailure(BaiduLoginUiText.CleanupPending);
-            }
             allowClose = true;
             Close();
         }
@@ -286,20 +293,38 @@ public partial class BaiduLoginWindow : Window
         }
     }
 
-    private async Task CleanupAfterCanceledInitializationAsync()
+    private Task ResetForAnotherScanAsync()
     {
-        if (!profilePrepared || ownership is null) return;
-        await addAccountService
-            .RetryProfileCleanupAsync(accountId, ownership, CancellationToken.None)
-            .ConfigureAwait(true);
+        if (Browser.CoreWebView2 is null) return Task.CompletedTask;
+        Browser.CoreWebView2.Stop();
+        Browser.CoreWebView2.CookieManager.DeleteAllCookies();
+        captureCoordinator.ResetAfterFailure();
+        settlingGate.Reset();
+        domAutomation.Reset();
+        Browser.CoreWebView2.Navigate(BaiduLoginFlowPolicy.InitialLoginUri.AbsoluteUri);
+        viewModel.ReportWaiting();
+        pollTimer.Start();
+        return Task.CompletedTask;
     }
 
-    private void OnClosed(object? sender, EventArgs e)
+    private async void OnClosed(object? sender, EventArgs e)
     {
         pollTimer.Stop();
         lifetime.Cancel();
         profileRegistration?.Dispose();
         try { Browser.Dispose(); }
         catch (Exception) { /* The profile closer may already have disposed the browser. */ }
+        if (!profilePrepared || profileLease is null) return;
+        try
+        {
+            await profileBootstrapper
+                .CleanupAttemptAfterBrowserExitAsync(profileLease, CancellationToken.None)
+                .ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            // The owned/quarantined profile remains recoverable; account registration has
+            // already completed independently and the login window must stay closed.
+        }
     }
 }

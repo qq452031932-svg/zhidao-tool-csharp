@@ -58,7 +58,10 @@ public sealed class ManagedBrowserLifecycleCoordinator(IManagedBrowserStateStore
 
     public async Task<ManagedBrowserLifecycleSession?> LoadActiveSessionAsync(Guid accountId, CancellationToken token)
     {
-        if (pending.ContainsKey(accountId) || unboundProfiles.Values.Any(x => x.Profile.AccountId == accountId))
+        // A successfully bound browser remains tracked in `pending` while the owned process is alive.
+        // Only an unbound profile is unsafe to expose; a bound pending process is the exact handle
+        // required by ManagedChromium execution in the same app lifetime.
+        if (unboundProfiles.Values.Any(x => x.Profile.AccountId == accountId))
             throw new InvalidOperationException("Pending browser ownership must be stopped before removal.");
         return await LoadPersistedAsync(accountId, token).ConfigureAwait(false);
     }

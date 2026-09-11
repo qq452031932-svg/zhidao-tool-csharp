@@ -55,6 +55,24 @@ public sealed class AccountLifecycleTests : IDisposable
     }
 
     [Fact]
+    public async Task CookieOnlyAddPersistsEncryptedSessionWithoutReusableBrowserProfile()
+    {
+        var repository = new FakeAccountRepository();
+        var events = new List<string>();
+        var profiles = new FakeProfileStore(events);
+        var service = CreateAddService(repository, new FakeProtector(), profiles);
+        var request = CreateAddRequest() with { PersistBrowserProfile = false };
+
+        var result = await service.AddAsync(request, CancellationToken.None);
+
+        Assert.Equal(AddAccountStatus.Added, result.Status);
+        var account = Assert.Single(repository.Records);
+        Assert.Equal(new byte[] { 9, 8, 7 }, account.EncryptedSession);
+        Assert.Null(account.WebView2ProfileDirectory);
+        Assert.Empty(events);
+    }
+
+    [Fact]
     public async Task AddCommitFailureRollsBackAccount()
     {
         var repository = new FakeAccountRepository();

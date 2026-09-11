@@ -14,6 +14,7 @@ if HELPER_ROOT not in sys.path:
 
 import protocol
 import main
+import session_operations
 
 
 CORRELATION_ID = "11111111-1111-1111-1111-111111111111"
@@ -67,6 +68,111 @@ class FragmentedReader:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_session_operation_dispatcher_denies_unavailable_writes_before_executor(self):
+        calls = []
+        dispatcher = session_operations.SessionOperationDispatcher(
+            enabled_mutations=(), executor=lambda value: calls.append(value) or {"kind": "Succeeded"})
+        binding = {
+            "browserId": "11111111-1111-1111-1111-111111111111",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 30000,
+            "baiduUserId": "123456789",
+        }
+        for action, arguments in (
+                ("EnsureDirectory", {"targetCanonicalPath": "/测试"}),
+                ("SubmitTransfer", {"sourceUri": "https://pan.baidu.com/s/1safe",
+                                    "targetCanonicalPath": "/测试", "duplicatePolicy": "Rename"}),
+                ("SubmitShare", {"exactItemIds": ["item-1"], "fixedCode": "a1b2"})):
+            result = dispatcher.dispatch({"operation": action, "operationId": OPERATION_ID,
+                                          "attemptOrdinal": 1, "binding": binding,
+                                          "arguments": arguments})
+            self.assertEqual("ContractUnavailable", result["kind"])
+        self.assertEqual([], calls)
+
+    def test_named_session_operation_protocol_allows_only_fixed_actions(self):
+        binding = {
+            "browserId": "11111111-1111-1111-1111-111111111111",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 30000,
+            "baiduUserId": "123456789",
+        }
+        arguments = {
+            "InspectSource": {"sourceUri": "https://pan.baidu.com/s/1safe"},
+            "EnsureDirectory": {"targetCanonicalPath": "/测试"},
+            "SubmitTransfer": {
+                "sourceUri": "https://pan.baidu.com/s/1safe",
+                "targetCanonicalPath": "/测试",
+                "duplicatePolicy": "Rename",
+            },
+            "ObserveTransfer": {"adapterRequestId": "request-1"},
+            "SubmitShare": {"exactItemIds": ["item-1", "item-2"], "fixedCode": "a1b2"},
+            "ObserveShare": {"adapterRequestId": "request-2"},
+        }
+        for action in protocol.SESSION_OPERATION_ACTIONS:
+            with self.subTest(action=action):
+                value = {
+                    "operation": action,
+                    "operationId": OPERATION_ID,
+                    "attemptOrdinal": 1,
+                    "binding": binding,
+                    "arguments": arguments[action],
+                }
+                self.assertEqual(action, protocol.validate_session_operation_request(value)["operation"])
+
+        for action in ("ExecuteScript", "Navigate", "RawHttp"):
+            with self.subTest(action=action), self.assertRaisesRegex(protocol.ProtocolError, "UnknownAction"):
+                protocol.validate_session_operation_request({
+                    "operation": action,
+                    "operationId": OPERATION_ID,
+                    "attemptOrdinal": 1,
+                    "binding": binding,
+                    "arguments": {},
+                })
+
+    def test_named_session_operation_rejects_transport_secret_and_unknown_fields(self):
+        base = {
+            "operation": "InspectSource",
+            "operationId": OPERATION_ID,
+            "attemptOrdinal": 1,
+            "binding": {
+                "browserId": "11111111-1111-1111-1111-111111111111",
+                "targetId": "target-1",
+                "devToolsEndpoint": "http://127.0.0.1:43127/",
+                "timeoutMilliseconds": 30000,
+                "baiduUserId": "123456789",
+            },
+            "arguments": {"sourceUri": "https://pan.baidu.com/s/1safe"},
+        }
+        for field in ("script", "selector", "cookie", "authorization", "token",
+                      "origin", "referer", "url", "verb"):
+            value = json.loads(json.dumps(base))
+            value["arguments"][field] = "sensitive-value"
+            with self.subTest(field=field), self.assertRaisesRegex(protocol.ProtocolError, "ForbiddenField"):
+                protocol.validate_session_operation_request(value)
+
+        value = json.loads(json.dumps(base))
+        value["arguments"]["unexpected"] = True
+        with self.assertRaisesRegex(protocol.ProtocolError, "UnknownField"):
+            protocol.validate_session_operation_request(value)
+
+    def test_atomic_v3_constants_and_complete_fixed_capabilities(self):
+        self.assertEqual(3, protocol.PROTOCOL_VERSION)
+        self.assertEqual("ManagedChromium-v3", protocol.EXECUTION_ENGINE_VERSION)
+        self.assertEqual(1_048_576, protocol.MAX_FRAME_BYTES)
+        self.assertEqual(("Health", "Shutdown", "ObserveAccountIdentity", "OpenTransferSource",
+                          "ReadTransferSource", "ReadTransferDirectory", "OpenTransferPicker",
+                          "OpenTransferDirectoryRoot", "EnterTransferDirectory",
+                          "BeginCreateTransferDirectory", "ConfirmCreateTransferDirectory",
+                          "CancelTransferPicker", "ObserveTransferPickerClosed",
+                          "OpenTransferTargetRoot", "EnterTransferTargetDirectory",
+                          "ReadTransferTargetDirectory", "OpenTransferSourceAfterTargetRead",
+                          "ObserveTransferSubmissionReady", "SubmitTransferOnce",
+                          "ObserveTransferSubmissionOutcome", "ReadShareOfficialListing",
+                          "SubmitShareOnce", "ObserveShareSubmissionOutcome", "SubmitExtractionCode"),
+                         protocol.REQUIRED_CAPABILITIES)
+
     def test_entrypoint_disables_bytecode_writes_before_runtime_imports(self):
         self.assertTrue(sys.dont_write_bytecode)
 
@@ -97,6 +203,26 @@ class ProtocolTests(unittest.TestCase):
                 with self.assertRaisesRegex(protocol.ProtocolError, "FrameSizeInvalid"):
                     protocol.read_message(io.BytesIO(struct.pack(">I", length)))
 
+    def test_maximum_legal_frame_is_read_and_over_limit_stops_before_payload(self):
+        legal = b"{" + (b" " * (protocol.MAX_FRAME_BYTES - 1))
+        with self.assertRaisesRegex(protocol.ProtocolError, "MalformedJson"):
+            protocol.read_message(io.BytesIO(struct.pack(">I", len(legal)) + legal))
+
+        class HeaderOnly:
+            def __init__(self):
+                self.header = io.BytesIO(struct.pack(">I", protocol.MAX_FRAME_BYTES + 1))
+                self.reads = 0
+            def read(self, size):
+                self.reads += 1
+                if self.reads > 1:
+                    raise AssertionError("payload read must not be attempted")
+                return self.header.read(size)
+
+        reader = HeaderOnly()
+        with self.assertRaisesRegex(protocol.ProtocolError, "FrameSizeInvalid"):
+            protocol.read_message(reader)
+        self.assertEqual(1, reader.reads)
+
     def test_malformed_utf8_json_duplicate_and_non_finite_numbers_are_rejected(self):
         cases = (
             (b"\xff", "MalformedUtf8"),
@@ -125,6 +251,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_unknown_version_engine_action_and_fields_are_typed_failures(self):
         variants = (
+            ({"protocolVersion": 1}, "ProtocolVersionMismatch"),
             ({"protocolVersion": 2}, "ProtocolVersionMismatch"),
             ({"protocolVersion": True}, "ProtocolVersionMismatch"),
             ({"protocolVersion": 1.0}, "ProtocolVersionMismatch"),
@@ -305,21 +432,214 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual("Rejected", main.classify_route(value))
 
-    def test_identity_html_mapping_returns_only_typed_result(self):
-        logged_out = '<html><body data-baidu-login-state="logged-out"></body></html>'
-        logged_in = '<html><body><i data-baidu-stable-uid="uid-123"></i></body></html>'
-        missing = '<html><body data-baidu-login-state="logged-in"></body></html>'
-        changed = '<html><body><i data-baidu-stable-uid="uid-other"></i></body></html>'
+    def test_fake_dom_attributes_cannot_confer_identity_and_real_query_is_used(self):
+        calls = []
 
-        self.assertEqual({"kind": "LoginRequired"}, main.map_identity_fixture(logged_out))
-        self.assertEqual(
-            {"kind": "Observed", "stableBaiduUserId": "uid-123"},
-            main.map_identity_fixture(logged_in))
-        self.assertEqual({"kind": "BrowserUnavailable"}, main.map_identity_fixture(missing))
-        self.assertEqual(
-            {"kind": "Observed", "stableBaiduUserId": "uid-other"},
-            main.map_identity_fixture(changed))
-        self.assertNotIn("html", json.dumps(main.map_identity_fixture(logged_in)).lower())
+        class FakeIdentityElement:
+            def attr(self, _name):
+                return "42"
+
+        class Tab:
+            tab_id = "target-1"
+
+            def ele(self, selector, **_kwargs):
+                return False if "logged-out" in selector else FakeIdentityElement()
+
+            def run_js(self, script, *args, **kwargs):
+                calls.append((script, args, kwargs))
+                return {"kind": "QueryResponse", "status": 200, "body": "{}"}
+
+        self.assertEqual({"kind": "BrowserUnavailable"}, main._DrissionTarget(Tab()).observe_identity(1.0))
+        self.assertEqual(1, len(calls))
+        self.assertFalse(hasattr(main, "map_identity_fixture"))
+        self.assertFalse(hasattr(main, "_IdentityFixtureParser"))
+        self.assertFalse(hasattr(main, "_fixed_dom_identity"))
+
+    def test_query_result_is_discarded_when_navigation_or_binding_changes_during_read(self):
+        for mutation in ("browser", "target-id", "replacement", "disconnect", "passport", "pan-main", "foreign"):
+            with self.subTest(mutation=mutation):
+                payload = request("ObserveAccountIdentity", {
+                    "browserId": "44444444-4444-4444-4444-444444444444",
+                    "targetId": "target-1", "devToolsEndpoint": "http://127.0.0.1:43127/",
+                    "timeoutMilliseconds": 5000,
+                })["payload"]
+                target = FakeTarget("target-1", [main.PAN_ROOT], {"kind": "Observed", "stableBaiduUserId": "42"})
+                connector = FakeConnector(payload["browserId"], target)
+
+                def observe(_remaining):
+                    if mutation == "browser":
+                        connector.browser_id = "55555555-5555-5555-5555-555555555555"
+                    elif mutation == "target-id":
+                        target.target_id = "target-2"
+                    elif mutation == "replacement":
+                        connector._target = FakeTarget("target-1", [main.PAN_ROOT], {})
+                    elif mutation == "disconnect":
+                        connector._target = None
+                    else:
+                        target._routes[0] = {"passport": main.PASSPORT_ROOT,
+                            "pan-main": "https://pan.baidu.com/disk/main#/index?category=all",
+                            "foreign": "https://evil.test/"}[mutation]
+                    return {"kind": "Observed", "stableBaiduUserId": "42"}
+
+                target.observe_identity = observe
+                self.assertEqual({"kind": "BrowserUnavailable"}, main.observe_bound_target(payload, connector))
+
+    def test_login_required_query_poll_has_two_second_minimum_and_remaining_bound(self):
+        for timeout_ms, expected_sleep in ((5000, 2.0), (500, 0.5)):
+            with self.subTest(timeout_ms=timeout_ms):
+                payload = request("ObserveAccountIdentity", {
+                    "browserId": "44444444-4444-4444-4444-444444444444",
+                    "targetId": "target-1", "devToolsEndpoint": "http://127.0.0.1:43127/",
+                    "timeoutMilliseconds": timeout_ms,
+                })["payload"]
+                target = FakeTarget("target-1", [main.PAN_ROOT],
+                                    [{"kind": "LoginRequired"}, {"kind": "BrowserUnavailable"}])
+                sleeps = []
+                result = main.observe_bound_target(payload, FakeConnector(payload["browserId"], target),
+                                                   monotonic=lambda: 0.0, sleeper=sleeps.append)
+                self.assertEqual({"kind": "BrowserUnavailable"}, result)
+                self.assertEqual([expected_sleep], sleeps)
+
+    def test_initial_passport_waits_without_query_or_navigation(self):
+        payload = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1", "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 5000,
+        })["payload"]
+        target = FakeTarget("target-1", [main.PASSPORT_ROOT, main.PAN_ROOT], {"kind": "BrowserUnavailable"})
+        waits = []
+
+        def wait(seconds):
+            self.assertEqual(0, target.identity_reads)
+            waits.append(seconds)
+            target.advance()
+
+        self.assertEqual({"kind": "BrowserUnavailable"}, main.observe_bound_target(
+            payload, FakeConnector(payload["browserId"], target), sleeper=wait))
+        self.assertEqual([], target.navigations)
+        self.assertEqual(1, len(waits))
+        self.assertEqual(1, target.identity_reads)
+
+    def test_drission_binding_properties_reflect_current_driver_ids(self):
+        browser = FakeChromium("44444444-4444-4444-4444-444444444444")
+        connector = main._DrissionConnector(browser)
+        browser.id = "55555555-5555-5555-5555-555555555555"
+        self.assertEqual(browser.id, connector.browser_id)
+        tab = FakeDrissionTab()
+        target = main._DrissionTarget(tab)
+        tab.tab_id = "target-2"
+        self.assertEqual("target-2", target.target_id)
+
+    def test_deadline_and_cancel_are_rechecked_after_final_post_query_route_read(self):
+        for condition in ("deadline", "cancel"):
+            with self.subTest(condition=condition):
+                payload = request("ObserveAccountIdentity", {
+                    "browserId": "44444444-4444-4444-4444-444444444444",
+                    "targetId": "target-1", "devToolsEndpoint": "http://127.0.0.1:43127/",
+                    "timeoutMilliseconds": 5000,
+                })["payload"]
+                state = {"time": 0.0, "cancelled": False, "reads": 0}
+                target = FakeTarget("target-1", [main.PAN_ROOT], {"kind": "Observed", "stableBaiduUserId": "42"})
+
+                def url(_remaining):
+                    state["reads"] += 1
+                    if state["reads"] == 3:
+                        if condition == "deadline":
+                            state["time"] = 6.0
+                        else:
+                            state["cancelled"] = True
+                    return main.PAN_ROOT
+
+                target.current_url = url
+                self.assertEqual({"kind": "TimedOut" if condition == "deadline" else "Cancelled"},
+                    main.observe_bound_target(payload, FakeConnector(payload["browserId"], target),
+                        monotonic=lambda: state["time"], is_cancelled=lambda: state["cancelled"]))
+
+    def test_private_query_body_and_username_never_reach_helper_ipc_or_events(self):
+        class Tab:
+            tab_id = "target-1"
+
+            def run_js(self, *_args, **_kwargs):
+                return {"kind": "QueryResponse", "status": 200,
+                    "body": '{"errno":0,"result":{"uk":9007199254740993,"username":"private-name-marker"}}'}
+
+        observe = {**request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1", "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 5000,
+        }), "correlationId": str(uuid.uuid4())}
+        output, events = io.BytesIO(), io.StringIO()
+        result = main.run(io.BytesIO(protocol.encode_message(request()) + protocol.encode_message(observe)),
+            output, events, helper_pid=9876, parent_pid=1234,
+            observer=lambda _payload: main._DrissionTarget(Tab()).observe_identity(1.0))
+        self.assertEqual(0, result)
+        self.assertEqual("", events.getvalue())
+        self.assertNotIn(b"private-name-marker", output.getvalue())
+        self.assertNotIn(b"QueryResponse", output.getvalue())
+        self.assertNotIn(b"errno", output.getvalue())
+        output.seek(0)
+        protocol.read_message(output, response=True)
+        self.assertEqual({"kind": "Observed", "stableBaiduUserId": "9007199254740993"},
+                         protocol.read_message(output, response=True)["result"])
+
+    def test_screenshot_confirmed_pan_main_route_is_recognized_separately_from_login(self):
+        self.assertEqual("PanMain", main.classify_route(
+            "https://pan.baidu.com/disk/main#/index?category=all"))
+
+    def test_baidu_home_flow_redirect_is_recognized_as_exact_pan_main(self):
+        self.assertEqual("PanMain", main.classify_route(
+            "https://pan.baidu.com/disk/main?from=homeFlow#/index?category=all"))
+
+    def test_pan_main_route_does_not_allow_other_hosts_paths_or_fragment_parameters(self):
+        for value in (
+            "http://pan.baidu.com/disk/main#/index?category=all",
+            "https://user@pan.baidu.com/disk/main#/index?category=all",
+            "https://pan.baidu.com:444/disk/main#/index?category=all",
+            "https://pan.baidu.com.evil.test/disk/main#/index?category=all",
+            "https://passport.baidu.com/disk/main#/index?category=all",
+            "https://pan.baidu.com/disk/main/extra#/index?category=all",
+            "https://pan.baidu.com/disk/main?redirect=1#/index?category=all",
+            "https://pan.baidu.com/disk/main#/index?category=all&redirect=1",
+            "https://pan.baidu.com/disk/main#/index?category=all&category=other",
+            "https://pan.baidu.com/disk/main#/share?category=all",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual("Rejected", main.classify_route(value))
+
+    def test_existing_pan_main_is_not_reloaded_and_missing_identity_is_not_login_success(self):
+        payload = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 30000,
+        })["payload"]
+        target = FakeTarget("target-1",
+            ["https://pan.baidu.com/disk/main#/index?category=all"],
+            {"kind": "BrowserUnavailable"})
+
+        result = main.observe_bound_target(payload, FakeConnector(payload["browserId"], target))
+
+        self.assertEqual([], target.navigations)
+        self.assertEqual(1, target.identity_reads)
+        self.assertEqual({"kind": "BrowserUnavailable"}, result)
+
+    def test_manual_login_transition_to_pan_main_reaches_identity_observation(self):
+        payload = request("ObserveAccountIdentity", {
+            "browserId": "44444444-4444-4444-4444-444444444444",
+            "targetId": "target-1",
+            "devToolsEndpoint": "http://127.0.0.1:43127/",
+            "timeoutMilliseconds": 30000,
+        })["payload"]
+        target = FakeTarget("target-1",
+            ["https://pan.baidu.com/", "https://pan.baidu.com/disk/main#/index?category=all"],
+            [{"kind": "LoginRequired"}, {"kind": "BrowserUnavailable"}])
+
+        result = main.observe_bound_target(payload, FakeConnector(payload["browserId"], target),
+            sleeper=lambda _: target.advance())
+
+        self.assertEqual([], target.navigations)
+        self.assertEqual(2, target.identity_reads)
+        self.assertEqual({"kind": "BrowserUnavailable"}, result)
 
     def test_bound_observer_navigates_only_to_pan_root_and_observes_only_there(self):
         payload = request("ObserveAccountIdentity", {

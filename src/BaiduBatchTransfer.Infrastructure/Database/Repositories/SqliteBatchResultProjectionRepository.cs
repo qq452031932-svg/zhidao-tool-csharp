@@ -19,16 +19,19 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
         await using var connection = await connectionFactory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: true);
 
+        string sourceType;
         string sourceName;
         await using (var command = Command(connection, transaction,
-            "SELECT i.SourceName FROM BatchJobs b LEFT JOIN ImportSessions i ON i.Id=b.ImportSessionId WHERE b.Id=$batch;"))
+            "SELECT i.SourceType,i.SourceName FROM BatchJobs b LEFT JOIN ImportSessions i ON i.Id=b.ImportSessionId WHERE b.Id=$batch;"))
         {
             Add(command, "$batch", batchJobId);
-            var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-            if (value is null) return null;
-            if (value is DBNull || string.IsNullOrWhiteSpace(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture)))
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+            if (reader.IsDBNull(0) || string.IsNullOrWhiteSpace(reader.GetString(0)) ||
+                reader.IsDBNull(1) || string.IsNullOrWhiteSpace(reader.GetString(1)))
                 throw InvalidProjection("The batch source name is unavailable.");
-            sourceName = (string)value;
+            sourceType = reader.GetString(0);
+            sourceName = reader.GetString(1);
         }
 
         var columns = new List<BatchResultOriginalColumn>();
@@ -40,7 +43,7 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 columns.Add(new(reader.GetInt32(0), reader.IsDBNull(1) ? string.Empty : reader.GetString(1)));
         }
-        ValidateColumnOrdinals(columns.Select(value => value.ColumnOrdinal).ToArray());
+        ValidateColumnOrdinals(columns.Select(value => value.ColumnOrdinal).ToArray(), sourceType);
 
         var accounts = new List<BatchResultProjectionAccount>();
         await using (var command = Command(connection, transaction,
@@ -70,7 +73,9 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
         await using var transaction = connection.BeginTransaction(deferred: true);
         var columnOrdinals = await ReadColumnOrdinalsAsync(
             connection, transaction, batchJobId, cancellationToken).ConfigureAwait(false);
-        ValidateColumnOrdinals(columnOrdinals);
+        var sourceType = await ReadSourceTypeAsync(
+            connection, transaction, batchJobId, cancellationToken).ConfigureAwait(false);
+        ValidateColumnOrdinals(columnOrdinals, sourceType);
 
         var items = new List<BatchResultResourceProjection>(pageSize + 1);
         await using (var command = Command(connection, transaction, """
@@ -253,10 +258,32 @@ public sealed class SqliteBatchResultProjectionRepository(SqliteConnectionFactor
         return values;
     }
 
-    private static void ValidateColumnOrdinals(IReadOnlyList<int> ordinals)
+    private static async Task<string> ReadSourceTypeAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        Guid batchJobId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = Command(connection, transaction, """
+            SELECT i.SourceType
+            FROM BatchJobs b
+            JOIN ImportSessions i ON i.Id=b.ImportSessionId
+            WHERE b.Id=$batch;
+            """);
+        Add(command, "$batch", batchJobId);
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return value is string sourceType && !string.IsNullOrWhiteSpace(sourceType)
+            ? sourceType
+            : throw InvalidProjection("The batch source type is unavailable.");
+    }
+
+    private static void ValidateColumnOrdinals(IReadOnlyList<int> ordinals, string sourceType)
     {
         if (ordinals.Count == 0)
+        {
+            if (string.Equals(sourceType, "Text", StringComparison.Ordinal)) return;
             throw InvalidProjection("The confirmed batch has no source-column snapshot.");
+        }
         var previous = -1;
         foreach (var ordinal in ordinals)
         {

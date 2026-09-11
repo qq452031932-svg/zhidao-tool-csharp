@@ -4,15 +4,18 @@ param(
     [string]$ManifestSource,
 
     [Parameter(Mandatory = $true)]
-    [string]$PackageDirectory
+    [string]$PackageDirectory,
+
+    [Parameter(Mandatory = $true)]
+    [string]$HelperSourceDirectory
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $manifestVersion = 1
-$protocolVersion = 1
-$executionEngineVersion = 'ManagedChromium-v1'
+$protocolVersion = 3
+$executionEngineVersion = 'ManagedChromium-v3'
 $pythonVersion = '3.14.0'
 $distributionMode = 'PersonalNonCommercial'
 $maximumEntries = 32768
@@ -20,8 +23,97 @@ $maximumDepth = 64
 $maximumFileBytes = 1024L * 1024 * 1024
 $maximumTotalBytes = 4L * 1024 * 1024 * 1024
 $manifestName = 'helper-manifest.json'
+$helperSourceNames = @(
+    'main.py',
+    'protocol.py',
+    'identity_query.py',
+    'transfer_source.py',
+    'transfer_source_listing.py',
+    'transfer_directory_listing.py',
+    'transfer_directory_mutation.py',
+    'transfer_picker.py',
+    'transfer_target_baseline.py',
+    'transfer_submission.py',
+    'share_submission.py',
+    'session_operations.py',
+    'requirements.lock',
+    'THIRD_PARTY_NOTICES.txt'
+)
 
 function Fail([string]$Reason) { throw "Managed browser helper Release gate failed: $Reason" }
+
+function Assert-ExactProperties(
+    [object]$Value,
+    [string[]]$ExpectedNames,
+    [string]$Reason) {
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { Fail $Reason }
+    $actualProperties = @($Value.PSObject.Properties)
+    if ($actualProperties.Count -ne $ExpectedNames.Count) { Fail $Reason }
+    for ($index = 0; $index -lt $ExpectedNames.Count; $index++) {
+        if (-not [string]::Equals(
+                [string]$actualProperties[$index].Name,
+                [string]$ExpectedNames[$index],
+                [StringComparison]::Ordinal)) {
+            Fail $Reason
+        }
+    }
+}
+
+function Test-JsonInteger([object]$Value) {
+    return $Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+}
+
+function Assert-NoDuplicateJsonProperties([string]$JsonText) {
+    $containers = New-Object 'Collections.Generic.Stack[object]'
+    for ($index = 0; $index -lt $JsonText.Length; $index++) {
+        $character = $JsonText[$index]
+        if ($character -eq '{') {
+            $containers.Push([pscustomobject]@{
+                Kind = 'Object'
+                Names = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+            })
+            continue
+        }
+        if ($character -eq '[') {
+            $containers.Push([pscustomobject]@{ Kind = 'Array'; Names = $null })
+            continue
+        }
+        if ($character -eq '}' -or $character -eq ']') {
+            if ($containers.Count -gt 0) { [void]$containers.Pop() }
+            continue
+        }
+        if ($character -ne '"') { continue }
+
+        $start = $index
+        $escaped = $false
+        do {
+            $index++
+            if ($index -ge $JsonText.Length) { Fail 'manifest JSON is malformed' }
+            $character = $JsonText[$index]
+            if ($escaped) {
+                $escaped = $false
+            }
+            elseif ($character -eq '\') {
+                $escaped = $true
+            }
+        } while ($character -ne '"' -or $escaped)
+
+        $next = $index + 1
+        while ($next -lt $JsonText.Length -and [char]::IsWhiteSpace($JsonText[$next])) { $next++ }
+        if ($next -ge $JsonText.Length -or $JsonText[$next] -ne ':') { continue }
+        if ($containers.Count -eq 0 -or $containers.Peek().Kind -cne 'Object') {
+            Fail 'manifest JSON is malformed'
+        }
+        $encodedName = $JsonText.Substring($start, $index - $start + 1)
+        $name = [string]($encodedName | ConvertFrom-Json)
+        if (-not $containers.Peek().Names.Add($name)) {
+            Fail 'duplicate manifest property'
+        }
+    }
+}
 
 function Get-LowerSha256([string]$Path) {
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -63,11 +155,18 @@ function Test-SafeRelativePath([string]$RelativePath) {
 
 $sourcePath = [IO.Path]::GetFullPath($ManifestSource)
 $packagePath = [IO.Path]::GetFullPath($PackageDirectory)
+$helperSourcePath = [IO.Path]::GetFullPath($HelperSourceDirectory)
 $externalManifestPath = Join-Path $packagePath $manifestName
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { Fail 'fixed manifest source is missing' }
 if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) { Fail 'package is missing' }
+if (-not (Test-Path -LiteralPath $helperSourcePath -PathType Container)) {
+    Fail 'helper source directory is missing'
+}
 if (([IO.File]::GetAttributes($packagePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     Fail 'package root is a reparse point'
+}
+if (([IO.File]::GetAttributes($helperSourcePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    Fail 'helper source root is a reparse point'
 }
 if (-not (Test-Path -LiteralPath $externalManifestPath -PathType Leaf)) { Fail 'manifest is missing' }
 $sourceBytes = [IO.File]::ReadAllBytes($sourcePath)
@@ -81,7 +180,21 @@ if ($sourceBytes[$sourceBytes.Length - 1] -ne 10 -or $sourceBytes -contains 13 -
         $sourceBytes[1] -eq 187 -and $sourceBytes[2] -eq 191)) {
     Fail 'manifest encoding is not canonical UTF-8/LF'
 }
-$manifest = [Text.Encoding]::UTF8.GetString($sourceBytes) | ConvertFrom-Json
+$manifestText = [Text.Encoding]::UTF8.GetString($sourceBytes)
+Assert-NoDuplicateJsonProperties $manifestText
+$manifest = $manifestText | ConvertFrom-Json
+Assert-ExactProperties $manifest @('manifestVersion', 'protocolVersion',
+    'executionEngineVersion', 'pythonVersion', 'distributionMode', 'buildIdentity', 'files') `
+    'manifest schema is invalid'
+if (-not (Test-JsonInteger $manifest.manifestVersion) -or
+    -not (Test-JsonInteger $manifest.protocolVersion) -or
+    $manifest.executionEngineVersion -isnot [string] -or
+    $manifest.pythonVersion -isnot [string] -or
+    $manifest.distributionMode -isnot [string] -or
+    $manifest.buildIdentity -isnot [string] -or
+    $manifest.files -isnot [System.Array]) {
+    Fail 'manifest schema is invalid'
+}
 if ($manifest.manifestVersion -ne $manifestVersion -or
     $manifest.protocolVersion -ne $protocolVersion -or
     $manifest.executionEngineVersion -cne $executionEngineVersion -or
@@ -99,6 +212,12 @@ $previous = $null
 $identityText = "manifestVersion=$manifestVersion`nprotocolVersion=$protocolVersion`nexecutionEngineVersion=$executionEngineVersion`npythonVersion=$pythonVersion`ndistributionMode=$distributionMode`n"
 $expectedTotal = 0L
 foreach ($file in $manifestFiles) {
+    Assert-ExactProperties $file @('path', 'length', 'sha256') `
+        'manifest file schema is invalid'
+    if ($file.path -isnot [string] -or -not (Test-JsonInteger $file.length) -or
+        $file.sha256 -isnot [string]) {
+        Fail 'manifest file schema is invalid'
+    }
     $path = [string]$file.path
     $length = [long]$file.length
     $hash = [string]$file.sha256
@@ -120,7 +239,7 @@ if ((Get-LowerSha256Bytes $utf8NoBom.GetBytes($identityText)) -cne [string]$mani
     Fail 'manifest build identity is invalid'
 }
 foreach ($required in @('python.exe', 'python314.dll', 'main.py', 'protocol.py',
-        'requirements.lock', 'THIRD_PARTY_NOTICES.txt')) {
+        'transfer_submission.py', 'share_submission.py', 'session_operations.py', 'requirements.lock', 'THIRD_PARTY_NOTICES.txt')) {
     if (-not $expected.ContainsKey($required)) { Fail "required payload is absent: $required" }
 }
 
@@ -172,6 +291,28 @@ foreach ($path in $expected.Keys) {
 if ($directories.Count -ne $requiredDirectories.Count) { Fail 'actual directory inventory differs from the manifest' }
 foreach ($directory in $directories) {
     if (-not $requiredDirectories.Contains($directory)) { Fail 'actual directory is unlisted' }
+}
+foreach ($name in $helperSourceNames) {
+    $helperSourceFile = Join-Path $helperSourcePath $name
+    if (-not (Test-Path -LiteralPath $helperSourceFile -PathType Leaf) -or
+        ([IO.File]::GetAttributes($helperSourceFile) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "required helper source is missing or unsafe: $name"
+    }
+    if (-not $expected.ContainsKey($name) -or -not $actual.ContainsKey($name) -or
+        $name -cne [string]$expected[$name].path) {
+        Fail "required helper source is absent from the exact package: $name"
+    }
+    $helperSourceInfo = [IO.FileInfo]::new($helperSourceFile)
+    if ($helperSourceInfo.Length -ne [long]$expected[$name].length -or
+        (Get-LowerSha256 $helperSourceFile) -cne [string]$expected[$name].sha256) {
+        Fail "helper source payload differs from the manifest: $name"
+    }
+    $helperSourceBytes = [IO.File]::ReadAllBytes($helperSourceFile)
+    $packagedSourceBytes = [IO.File]::ReadAllBytes($actual[$name])
+    if (-not [Linq.Enumerable]::SequenceEqual(
+            [byte[]]$helperSourceBytes, [byte[]]$packagedSourceBytes)) {
+        Fail "helper source payload differs from the package: $name"
+    }
 }
 foreach ($path in $expected.Keys) {
     $actualInfo = [IO.FileInfo]::new($actual[$path])

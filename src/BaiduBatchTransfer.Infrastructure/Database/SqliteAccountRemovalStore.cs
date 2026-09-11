@@ -848,12 +848,15 @@ public sealed class SqliteAccountRemovalStore : IAccountRemovalStore
               attempt.SubmissionSourceFingerprint,attempt.SubmissionTargetExactId,
               attempt.SubmissionTargetBaselineFingerprint,attempt.SubmissionMarkedAt,attempt.OfficialRequestId,
               attempt.TransferMappingFingerprint,attempt.TransferMappingCount,attempt.ExecutionEngineVersion,
-              attempt.BrowserFamily,attempt.ProfileId,attempt.InstallationId,attempt.SessionId
+              attempt.BrowserFamily,attempt.ProfileId,attempt.InstallationId,attempt.SessionId,
+              attempt.SubmissionId,attempt.SubmissionReadinessFingerprint,
+              attempt.OfficialObservationFingerprint,attempt.TargetConfirmationFingerprint,
+              attempt.TargetConfirmedAt
             FROM WebAutomationAttempts attempt WHERE attempt.AccountId=$account
             ORDER BY attempt.OperationId,attempt.Generation;
             """, token,
-            ["BaselinePersistedAt", "CreatedAt", "UpdatedAt", "AcceptancePersistedAt", "SubmissionMarkedAt"],
-            ["BaiduUserId", "TargetPath", "OfficialRequestId", "ProfileId"],
+            ["BaselinePersistedAt", "CreatedAt", "UpdatedAt", "AcceptancePersistedAt", "SubmissionMarkedAt", "TargetConfirmedAt"],
+            ["BaiduUserId", "TargetPath", "OfficialRequestId", "ProfileId", "SubmissionId"],
             ("$account", (object?)Id(account.Id))).ConfigureAwait(false);
         foreach (var evidence in new[]
                  {

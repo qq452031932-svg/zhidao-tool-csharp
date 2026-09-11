@@ -1,4 +1,5 @@
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 
 namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
@@ -136,14 +137,27 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
         var attempts = new SqliteWebAutomationAttemptStore(graph.Factory);
         Assert.True(await attempts.BeginAsync(WebAutomationAttemptRecord.Create(
             graph.OperationId, graph.AccountId, 2, WebAutomationOwnerKind.Transfer, graph.Now)));
-        Assert.True(await attempts.TryPersistBaselineAsync(
-            graph.OperationId, graph.AccountId, 2, 0,
-            WebAutomationBaseline.Create(["before"]), new string('a', 64), graph.Now.AddSeconds(1)));
-        Assert.True(await attempts.TryAdvanceAsync(
-            graph.OperationId, graph.AccountId, 2,
-            WebAutomationAttemptState.BaselinePersisted, 1,
-            WebAutomationAttemptState.Submitting, new string('b', 64), false,
-            graph.Now.AddSeconds(2)));
+        var capability = new AdapterCapabilityVersion(
+            "BaiduTransfer", "protocol-1", "selectors-1", "build-1");
+        var source = new TransferSourceEvidence(
+            new RemoteItemIdentitySet([new("source", null)]), 1, true, true,
+            "source-generation", "baidu-user", capability, new string('a', 64));
+        Assert.True(await attempts.TryPersistTransferSourceEvidenceAsync(
+            graph.OperationId, graph.AccountId, 2, 0, source, graph.Now.AddSeconds(1)));
+        var baseline = WebAutomationBaseline.Create(["before"]);
+        var targetFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+            "target", new RemotePath("/target"), 1, true, true, "target-generation", "baidu-user",
+            TransferTargetInventoryScope.AllItems, baseline);
+        var target = new TransferTargetPreparationEvidence(
+            "target", new RemotePath("/target"), 1, true, true, "target-generation", "baidu-user",
+            TransferTargetInventoryScope.AllItems, baseline, targetFingerprint);
+        Assert.True(await attempts.TryPersistTransferTargetPreparationAsync(
+            graph.OperationId, graph.AccountId, 2, 1, target, graph.Now.AddSeconds(2)));
+        var submission = TransferSubmissionEvidence.CreateBound(
+            Guid.NewGuid(), new string('b', 64), source.Items.Fingerprint, target.TargetExactId,
+            target.Baseline.Fingerprint, source.BaiduUserId, capability, graph.Now.AddSeconds(3));
+        Assert.True(await attempts.TryPersistTransferSubmissionAsync(
+            graph.OperationId, graph.AccountId, 2, 2, submission, graph.Now.AddSeconds(3)));
         var handoff = await EnterHandoffAsync(
             attempts, graph, 2, WebAutomationAttemptState.Submitting);
 
@@ -157,8 +171,11 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
             graph.Factory, "SELECT Status FROM TransferOperations WHERE Id=$id;", graph.OperationId));
         Assert.Equal("request-evidence", await ScalarTextAsync(
             graph.Factory, "SELECT AdapterRequestId FROM TransferOperations WHERE Id=$id;", graph.OperationId));
-        Assert.Equal(WebAutomationAttemptState.NeedsDecision,
-            (await attempts.GetAsync(graph.OperationId, graph.AccountId, 2))!.State);
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 2);
+        Assert.Equal(WebAutomationAttemptState.NeedsDecision, restored!.State);
+        Assert.Equal(submission, restored.SubmissionEvidence);
+        Assert.True(restored.SubmissionEvidence!.IsLocallyBound);
     }
 
     [Fact]
@@ -206,9 +223,12 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
                 VALUES($batch,$account,1,'output',1,1,1,0);
                 INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,
                   Status,ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,
-                  AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,SubmitStartedAt,CreatedAt,UpdatedAt)
+                  AdapterRequestId,SubmissionAcceptance,AttemptCount,LeaseGeneration,SubmitStartedAt,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 SELECT $share,operation.Id,operation.ResourceItemId,operation.BatchJobId,operation.AssignedAccountId,1,
-                  'Submitting','exact-fp','settings-fp',1,'{}','share-request','Unknown',1,1,$now,$now,$now
+                  'Submitting','exact-fp','settings-fp',1,'{}','share-request','Unknown',1,1,$now,$now,$now,
+                  operation.ExecutionEngineVersion,operation.BrowserFamily,operation.ProfileId,
+                  operation.InstallationId,operation.SessionId
                 FROM TransferOperations operation WHERE operation.Id=$transfer;
                 """;
             command.Parameters.AddWithValue("$batch", graph.BatchId.ToString("D"));
@@ -352,15 +372,18 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
             VALUES($resource,$batch,1,'https://pan.baidu.com/s/test','test','None','Valid','Expanded',$now,$now);
             INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
               NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
-              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt)
+              OperationFingerprint,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Automatic','Preparing',$attempt,
-              'transfer-fp','NotPrepared','Reserved',$now,$now);
+              'transfer-fp','NotPrepared','Reserved',$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             """;
         command.Parameters.AddWithValue("$account", accountId.ToString("D"));
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         command.Parameters.AddWithValue("$resource", resourceId.ToString("D"));
         command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
         command.Parameters.AddWithValue("$attempt", attemptCount);
+        command.Parameters.AddWithValue("$legacyProfile", ExecutionProfileSnapshot.LegacyForAccount(accountId).ProfileId);
         command.Parameters.AddWithValue("$now", now.ToString("O"));
         await command.ExecuteNonQueryAsync();
         return new(factory, operationId, batchId, accountId, now);
@@ -387,9 +410,11 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
             VALUES($batch,'draft-fp',$directory,'Active',1,0,$now,$now);
             INSERT INTO StandaloneShareOperations(Id,BatchId,AccountId,SequenceNumber,DisplayName,ResourceKind,
               ParentPath,ExactItemSetFingerprint,Generation,Status,SubmissionState,SubmissionAcceptance,
-              LeaseGeneration,Revision,CreatedAt,UpdatedAt)
+              LeaseGeneration,Revision,CreatedAt,UpdatedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
             VALUES($operation,$batch,$account,1,'item','File','/','exact-fp',1,'Preparing',
-              'NotStarted','Unknown',1,0,$now,$now);
+              'NotStarted','Unknown',1,0,$now,$now,
+              'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
             INSERT INTO StandaloneShareRemoteItems(OperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName)
             VALUES($operation,0,'remote-id',X'01','item');
             """;
@@ -397,6 +422,7 @@ public sealed class WebAutomationBatchCancellationStoreTests : IDisposable
         command.Parameters.AddWithValue("$batch", batchId.ToString("D"));
         command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
         command.Parameters.AddWithValue("$directory", Path.Combine(root, "results"));
+        command.Parameters.AddWithValue("$legacyProfile", ExecutionProfileSnapshot.LegacyForAccount(accountId).ProfileId);
         command.Parameters.AddWithValue("$now", now.ToString("O"));
         await command.ExecuteNonQueryAsync();
         return new(factory, operationId, batchId, accountId, now);

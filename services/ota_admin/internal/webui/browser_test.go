@@ -1218,6 +1218,8 @@ try {
     assertLicense(document.getElementById("generated-card-window").hidden && !document.getElementById("generated-card-list").textContent.includes("ABCD-EFGH"), "离开卡密页后明文未清除");
     assertions = await (await fetch("/test/license-assertions")).json();
     assertLicense(assertions.security_failures.length === 0, "请求安全头缺失：" + assertions.security_failures.join(","));
+    const acceptanceActions = ["software_disable", "software_enable", "package_create", "members", "generate", "renew", "card_unbind", "delete", "device_unbind"];
+    assertLicense(acceptanceActions.every(name => assertions.actions[name] === 1), "本地许可证验收动作计数不完整：" + JSON.stringify(assertions.actions));
     assertLicense(window.__licenseRuntimeErrors.length === 0, "页面异常：" + window.__licenseRuntimeErrors.join(","));
     result.textContent = "PASS license-happy";
   }

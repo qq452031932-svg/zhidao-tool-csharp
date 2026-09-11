@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using BaiduBatchTransfer.App.Services;
@@ -64,6 +65,13 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     private string fixedExtractionCode = string.Empty;
     private string precheckStatusMessage = string.Empty;
     private WizardPrecheckResult? lastPrecheckResult;
+    private bool lastConfirmationWasDeclined;
+    private bool acceptanceOnly;
+    private string acceptanceResultDirectory = string.Empty;
+    private bool directBackground;
+    private int maxConcurrency = 2;
+    private string resultDirectory = string.Empty;
+    private string existingSharePolicy = "Ask";
 
     public event EventHandler<Guid>? JobCreated;
 
@@ -154,6 +162,27 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public IAsyncRelayCommand RunPrecheckCommand { get; }
 
     public string JobName { get => jobName; set => SetAndInvalidate(ref jobName, value ?? string.Empty); }
+    public bool AcceptanceOnly { get => acceptanceOnly; set => SetAndInvalidate(ref acceptanceOnly, value); }
+    public bool DirectBackground { get => directBackground; set => SetAndInvalidate(ref directBackground, value); }
+    public int MaxConcurrency
+    {
+        get => maxConcurrency;
+        set
+        {
+            if (value is < 1 or > 3) throw new ArgumentOutOfRangeException(nameof(value));
+            SetAndInvalidate(ref maxConcurrency, value);
+        }
+    }
+    public string ResultDirectory
+    {
+        get => resultDirectory;
+        set => SetAndInvalidate(ref resultDirectory, value?.Trim() ?? string.Empty);
+    }
+    public string AcceptanceResultDirectory
+    {
+        get => acceptanceResultDirectory;
+        set => SetAndInvalidate(ref acceptanceResultDirectory, value ?? string.Empty);
+    }
     public string DefaultTargetPath
     {
         get => defaultTargetPath;
@@ -227,6 +256,11 @@ public sealed class CreateJobWizardViewModel : ObservableObject
     public string? ConfirmationToken { get => confirmationToken; private set => SetProperty(ref confirmationToken, value); }
     public string ValidationMessage { get => validationMessage; private set => SetProperty(ref validationMessage, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
+    public bool LastConfirmationWasDeclined
+    {
+        get => lastConfirmationWasDeclined;
+        private set => SetProperty(ref lastConfirmationWasDeclined, value);
+    }
     public bool IsBusy
     {
         get => isBusy;
@@ -316,8 +350,23 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         get => fixedExtractionCode;
         set => SetAndInvalidate(ref fixedExtractionCode, value ?? string.Empty);
     }
-    public string ExistingSharePolicy => "Ask";
-    public string ExistingSharePolicyText => "询问，默认复用";
+    public string ExistingSharePolicy
+    {
+        get => existingSharePolicy;
+        set
+        {
+            if (value is not ("Ask" or "Reuse" or "Regenerate"))
+                throw new ArgumentOutOfRangeException(nameof(value));
+            if (!SetAndInvalidate(ref existingSharePolicy, value)) return;
+            OnPropertyChanged(nameof(ExistingSharePolicyText));
+        }
+    }
+    public string ExistingSharePolicyText => ExistingSharePolicy switch
+    {
+        "Regenerate" => "始终生成新分享",
+        "Reuse" => "复用已有分享",
+        _ => "询问，默认复用",
+    };
     public string ShareCapabilityStatusMessage => resultCapabilities.CanUseShareActions
         ? string.Empty
         : resultCapabilities.ShareStatusMessage;
@@ -756,20 +805,26 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 ValidationMessage = "本机磁盘空间不足，无法安全开始转存。请释放空间后重新预览。";
             }
         }
-        catch (BatchDraftValidationException)
+        catch (BatchDraftValidationException error)
         {
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "转存配置或导入数据已变化，请返回检查并重新预览。";
+                ValidationMessage = string.IsNullOrWhiteSpace(error.Message)
+                    ? "无法准备转存预览，请检查配置后重试。"
+                    : error.Message.StartsWith("预览", StringComparison.Ordinal)
+                        ? $"{error.Message} 请重新预览。"
+                        : error.Message;
             }
         }
-        catch (Exception)
+        catch (Exception error)
         {
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "任务预览失败，请检查配置后重试。";
+                ValidationMessage = AcceptanceOnly
+                    ? $"现场验收预览失败：{error.GetType().Name}：{error.Message}"
+                    : "任务预览失败，请检查配置后重试。";
             }
         }
         finally { EndBusy(busyToken); }
@@ -787,6 +842,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         bool requireFinalCheck,
         CancellationToken cancellationToken)
     {
+        LastConfirmationWasDeclined = false;
         var mayConfirm = adapterAvailability.CanStartTransfers && ConfirmationToken is not null &&
             CanContinue && !IsBusy && (!requireFinalCheck || IsFinalConfirmationChecked);
         if (!mayConfirm || ConfirmationToken is null) return null;
@@ -798,7 +854,12 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             "最终确认",
             $"将开始转存“{JobName}”，包含 {ConfirmedResourceCount:N0} 个资源、{ConfirmedOperationCount:N0} 次转存操作。确认继续吗？",
             cancellationToken);
-        if (!confirmed || !IsCurrentDraft(session, generation)) return null;
+        if (!confirmed)
+        {
+            LastConfirmationWasDeclined = true;
+            return null;
+        }
+        if (!IsCurrentDraft(session, generation)) return null;
         var busyToken = BeginBusy();
         Guid? createdBatchJobId = null;
         try
@@ -811,12 +872,22 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 StatusMessage = "任务已创建，正在等待调度。";
             }
         }
-        catch (BatchConfirmationException)
+        catch (BatchDraftValidationException error)
         {
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "导入数据或转存设置已变化，请重新预览并确认。";
+                ValidationMessage = error.Message;
+            }
+        }
+        catch (BatchConfirmationException error)
+        {
+            if (IsCurrentDraft(session, generation))
+            {
+                InvalidateConfirmation();
+                ValidationMessage = AcceptanceOnly
+                    ? $"现场验收未能创建批次：{error.Message}"
+                    : "导入数据或转存设置已变化，请重新预览并确认。";
             }
         }
         catch (StorageCapacityException)
@@ -827,12 +898,14 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 ValidationMessage = "本机磁盘空间不足，任务没有创建。";
             }
         }
-        catch (Exception)
+        catch (Exception error)
         {
             if (IsCurrentDraft(session, generation))
             {
                 InvalidateConfirmation();
-                ValidationMessage = "任务创建失败，未写入执行队列，请重试。";
+                ValidationMessage = AcceptanceOnly
+                    ? $"现场验收创建批次失败：{error.Message}"
+                    : "任务创建失败，未写入执行队列，请重试。";
             }
         }
         finally { EndBusy(busyToken); }
@@ -881,7 +954,8 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             account.TargetItemCount,
             account.TargetSuccessCount,
             account.IsSelected ? BatchAccountSelectionDecision.Selected : BatchAccountSelectionDecision.NotSelected,
-            account.ShareEnabled)).ToArray();
+            account.ShareEnabled,
+            account.ExecutionProfile)).ToArray();
         var anyShareEnabled = accountDrafts.Any(account => account.IsSelected && account.ShareEnabled);
         return new(
             batchJobId,
@@ -901,7 +975,11 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             IsShareAccessUnlimited,
             anyShareEnabled ? ExtractionCodeBehavior : ShareExtractionCodeBehavior.Random,
             anyShareEnabled && ExtractionCodeBehavior == ShareExtractionCodeBehavior.Fixed ? FixedExtractionCode.Trim() : null,
-            ExistingSharePolicy);
+            ExistingSharePolicy,
+            AcceptanceOnly,
+            AcceptanceOnly ? AcceptanceResultDirectory : DirectBackground ? ResultDirectory : null,
+            DirectBackground,
+            MaxConcurrency);
     }
 
     private static void ValidateSelectionDecisions(
@@ -924,7 +1002,33 @@ public sealed class CreateJobWizardViewModel : ObservableObject
         if (transferMode is null) return "多个账号时必须选择多账号复制或多账号分流。";
         var selected = Accounts.Where(x => x.IsSelected).ToArray();
         if (selected.Length == 0) return "请至少选择一个参与账号。";
-        if (selected.Any(account => account.ShareEnabled) && !resultCapabilities.CanUseShareActions)
+        var effectiveQuotaBasis = transferMode == Core.Domain.TransferMode.Replication
+            ? Core.Domain.QuotaBasis.TaskCount
+            : quotaBasis;
+        if (AcceptanceOnly &&
+            (readyResourceCount != 1 || Accounts.Count != 1 || selected.Length != 1 ||
+             transferMode != Core.Domain.TransferMode.Distribution || effectiveQuotaBasis != Core.Domain.QuotaBasis.TaskCount ||
+             selected[0].TargetItemCount != 1 || !selected[0].ShareEnabled ||
+             selected[0].ExecutionProfile.Engine != BaiduExecutionEngine.ManagedChromiumV1))
+            return "现场验收仅允许一个链接、一个 Managed 账号、一次转存和一次自动分享。";
+        if (AcceptanceOnly &&
+            (string.IsNullOrWhiteSpace(AcceptanceResultDirectory) ||
+             !Path.IsPathFullyQualified(AcceptanceResultDirectory)))
+            return "现场验收需要有效的本机结果目录。";
+        if (DirectBackground &&
+            (AcceptanceOnly ||
+             transferMode is not (Core.Domain.TransferMode.Distribution or Core.Domain.TransferMode.Replication) ||
+             effectiveQuotaBasis != Core.Domain.QuotaBasis.TaskCount ||
+             selected.Any(account => !account.ShareEnabled) ||
+             DuplicatePolicy != Core.Domain.DuplicatePolicy.Rename ||
+             ExistingSharePolicy != "Regenerate" ||
+             ExtractionCodeBehavior != ShareExtractionCodeBehavior.Random ||
+             MaxConcurrency is < 1 or > 3))
+            return "批量转存需要至少一个账号、任务数复制或分流、保留同名文件并为全部参与账号自动生成分享。";
+        if (DirectBackground &&
+            (string.IsNullOrWhiteSpace(ResultDirectory) || !Path.IsPathFullyQualified(ResultDirectory)))
+            return "批量转存需要有效的本机结果目录。";
+        if (!AcceptanceOnly && selected.Any(account => account.ShareEnabled) && !resultCapabilities.CanUseShareActions)
             return string.IsNullOrWhiteSpace(resultCapabilities.ShareStatusMessage)
                 ? "分享功能尚未通过现场验证；请先关闭分享或完成能力验收。"
                 : resultCapabilities.ShareStatusMessage;
@@ -954,7 +1058,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
                 return "请选中 Excel 已映射的全部账号，或统一指定参与账号。";
         }
         if (selected.Any(x => string.IsNullOrWhiteSpace(x.DefaultTargetPath))) return "每个参与账号都必须设置目标目录。";
-        if (transferMode == Core.Domain.TransferMode.Distribution && quotaBasis == Core.Domain.QuotaBasis.TaskCount)
+        if (transferMode == Core.Domain.TransferMode.Distribution && effectiveQuotaBasis == Core.Domain.QuotaBasis.TaskCount)
         {
             foreach (var account in selected)
                 if (account.LockedItemCount > account.TargetItemCount)
@@ -963,7 +1067,7 @@ public sealed class CreateJobWizardViewModel : ObservableObject
             if (assigned < readyResourceCount) return $"任务配额还差 {readyResourceCount - assigned:N0} 条。";
             if (assigned > readyResourceCount) return $"任务配额超出 {assigned - readyResourceCount:N0} 条。";
         }
-        if (transferMode == Core.Domain.TransferMode.Distribution && quotaBasis == Core.Domain.QuotaBasis.SuccessTarget)
+        if (transferMode == Core.Domain.TransferMode.Distribution && effectiveQuotaBasis == Core.Domain.QuotaBasis.SuccessTarget)
         {
             if (selected.Any(x => x.TargetSuccessCount <= 0)) return "参与成功目标调度的账号目标必须大于零。";
             var target = selected.Sum(x => (long)x.TargetSuccessCount);

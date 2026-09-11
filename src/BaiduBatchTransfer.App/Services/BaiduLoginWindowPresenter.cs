@@ -7,7 +7,7 @@ namespace BaiduBatchTransfer.App.Services;
 
 public sealed class BaiduLoginWindowPresenter(
     LoginProfileBootstrapper profileBootstrapper,
-    AddAccountService addAccountService,
+    BaiduLoginSessionRegistrar sessionRegistrar,
     WebView2ProfileCloser profileCloser,
     WebViewCookieSessionBridge cookieBridge) : IBaiduLoginWindowPresenter
 {
@@ -24,8 +24,9 @@ public sealed class BaiduLoginWindowPresenter(
             var window = new BaiduLoginWindow(
                 request.AccountId,
                 request.OwnershipToken,
+                request.Purpose,
                 profileBootstrapper,
-                addAccountService,
+                sessionRegistrar,
                 profileCloser,
                 cookieBridge)
             {

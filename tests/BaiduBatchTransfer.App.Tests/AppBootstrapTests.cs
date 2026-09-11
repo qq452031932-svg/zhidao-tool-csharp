@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App;
 using BaiduBatchTransfer.App.Features.Accounts;
+using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Imports;
@@ -9,6 +10,7 @@ using BaiduBatchTransfer.App.Features.Shares;
 using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Features.Acceptance;
 using BaiduBatchTransfer.App.Features.ShareAnalytics;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
@@ -27,13 +29,221 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests;
 
 public sealed class AppBootstrapTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "BaiduBatchTransfer-AppBootstrapTests", Guid.NewGuid().ToString("N"));
+
+    [Fact]
+    public void LicenseGateAndRuntimeStateAreSingleSharedBootstrapServices()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        var gate = host.Services.GetRequiredService<ILicenseAuthorizationGate>();
+        var state = host.Services.GetRequiredService<LicenseRuntimeAuthorizationState>();
+        var startup = host.Services.GetRequiredService<AppStartupController>();
+        var transfer = host.Services.GetServices<IHostedService>()
+            .OfType<TransferCoordinatorHostedService>().Single();
+        var share = host.Services.GetServices<IHostedService>()
+            .OfType<StandaloneShareCoordinatorHostedService>().Single();
+
+        Assert.Same(gate, PrivateField<ILicenseAuthorizationGate>(startup, "licenseGate"));
+        Assert.Same(state, PrivateField<LicenseRuntimeAuthorizationState>(startup, "authorizationState"));
+        Assert.Same(state, PrivateField<LicenseRuntimeAuthorizationState>(transfer, "authorizationState"));
+        Assert.Same(state, PrivateField<LicenseRuntimeAuthorizationState>(share, "authorizationState"));
+    }
+
+    [Fact]
+    public async Task RejectedLicensePreparesFreshAndOlderDatabasesAndCreatesLocalShellWithoutAuthorizedRecovery()
+    {
+        Assert.True(await RunStaAsync(async () =>
+        {
+            var application = new App(new RecordingUpdateRuntime(UpdateSnapshot(ApplicationUpdateStatus.Idle)));
+            application.InitializeComponent();
+            application.ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown;
+            try
+            {
+                await VerifyScenarioAsync("fresh", startFromOlderSchema: false);
+                await VerifyScenarioAsync("older", startFromOlderSchema: true);
+                return true;
+            }
+            finally
+            {
+                application.Shutdown();
+            }
+        }));
+
+        async Task VerifyScenarioAsync(string name, bool startFromOlderSchema)
+        {
+            var hostStartCalls = 0;
+            using var host = AppBootstrap.CreateHost(Path.Combine(root, name), services =>
+            {
+                services.RemoveAll<ILicenseAuthorizationGate>();
+                services.AddSingleton<ILicenseAuthorizationGate>(new RejectingStartupLicenseGate());
+                services.RemoveAll<IInterruptedOperationRecoveryStore>();
+                services.AddSingleton<IInterruptedOperationRecoveryStore>(new ForbiddenStartupRecoveryStore());
+                services.RemoveAll<IInterruptedShareOperationRecoveryStore>();
+                services.AddSingleton<IInterruptedShareOperationRecoveryStore>(new ForbiddenStartupRecoveryStore());
+                services.RemoveAll<IAllocationCounterStore>();
+                services.AddSingleton<IAllocationCounterStore>(new ForbiddenStartupRecoveryStore());
+                services.RemoveAll<IRemoteSelectionSessionStore>();
+                services.AddSingleton<IRemoteSelectionSessionStore>(new ForbiddenStartupRecoveryStore());
+                services.RemoveAll<ILocalResultExportCoordinator>();
+                services.AddSingleton<ILocalResultExportCoordinator>(new ForbiddenStartupRecoveryStore());
+            });
+            if (startFromOlderSchema)
+            {
+                var migrator = host.Services.GetRequiredService<DatabaseMigrator>();
+                var applyMigration = typeof(DatabaseMigrator).GetMethod(
+                    "ApplyMigrationAsync",
+                    BindingFlags.Instance | BindingFlags.NonPublic)!;
+                for (var version = 1; version < DatabaseMigrator.LatestVersion; version++)
+                    await (Task)applyMigration.Invoke(migrator, [version, CancellationToken.None])!;
+            }
+
+            var result = await host.Services.GetRequiredService<AppStartupController>().StartAsync(_ =>
+            {
+                hostStartCalls++;
+                return Task.CompletedTask;
+            });
+
+            Assert.False(result.LicenseAuthorized);
+            Assert.True(result.LocalUiMayOpen);
+            Assert.Equal(1, hostStartCalls);
+            var shell = await host.Services.GetRequiredService<IAppShellFactory>().CreateAsync();
+            try { Assert.NotNull(shell.DataContext); }
+            finally { shell.Close(); }
+            Assert.True((await host.Services.GetRequiredService<DatabaseIntegrityService>().CheckAsync()).IsHealthy);
+        }
+    }
+
+    [Fact]
+    public void ShellCompositionPassesTheSharedGateToEveryRemoteWorkViewModel()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "AppBootstrap.cs"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+
+        Assert.Contains("ILicenseAuthorizationGate licenseGate", source, StringComparison.Ordinal);
+        Assert.Contains("textClipboard, licenseGate", source, StringComparison.Ordinal);
+        Assert.Contains("batchHistorySource,\n            licenseGate: licenseGate", source, StringComparison.Ordinal);
+        Assert.Contains("dialogService,\n            licenseGate", source, StringComparison.Ordinal);
+        Assert.Contains("resultSaveDialog,\n            licenseGate: licenseGate", source, StringComparison.Ordinal);
+        Assert.Contains("localResultExportStore: localResultExportStore,\n            licenseGate: licenseGate", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TransferTargetDirectoryPickerServicesAreRegistered()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+
+        Assert.IsType<BaiduTransferTargetDirectorySource>(
+            host.Services.GetRequiredService<ITransferTargetDirectorySource>());
+        Assert.IsType<BaiduTransferTargetDirectoryCreator>(
+            host.Services.GetRequiredService<ITransferTargetDirectoryCreator>());
+        Assert.IsType<WpfTransferTargetDirectoryPicker>(
+            host.Services.GetRequiredService<ITransferTargetDirectoryPicker>());
+    }
+
+    [Fact]
+    public void TransferCompletionDialogUsesRegisteredDialogDependency()
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        var dialog = host.Services.GetRequiredService<IDialogService>();
+        var shell = host.Services.GetRequiredService<IAppShellFactory>();
+        var create = shell.GetType().GetMethod(nameof(IAppShellFactory.CreateAsync))!;
+        var stateMachine = create.GetCustomAttribute<AsyncStateMachineAttribute>()!.StateMachineType;
+        var moveNext = stateMachine.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var instructions = ReadCompositionInstructions(moveNext);
+        var constructorIndex = Assert.Single(Enumerable.Range(0, instructions.Count), index =>
+            instructions[index].Code == OpCodes.Newobj &&
+            instructions[index].Member is ConstructorInfo { DeclaringType: { } type } &&
+            type == typeof(TransferWorkspaceViewModel));
+        var constructor = (ConstructorInfo)instructions[constructorIndex].Member!;
+        Assert.Equal(typeof(IDialogService), constructor.GetParameters()[^2].ParameterType);
+        Assert.Equal(typeof(ILicenseAuthorizationGate), constructor.GetParameters()[^1].ParameterType);
+
+        // Verify the actual compiled composition call's final argument. Omitting the optional
+        // dialog argument emits ldnull here, even though the factory still holds a dialog field.
+        var dialogArgument = instructions.Take(constructorIndex).Last(instruction =>
+            instruction.Code == OpCodes.Ldfld &&
+            instruction.Member is FieldInfo { FieldType: { } fieldType } &&
+            fieldType == typeof(IDialogService));
+        Assert.Equal(OpCodes.Ldfld, dialogArgument.Code);
+        var dialogField = Assert.IsAssignableFrom<FieldInfo>(dialogArgument.Member);
+        Assert.Equal(shell.GetType(), dialogField.DeclaringType);
+        Assert.Equal(typeof(IDialogService), dialogField.FieldType);
+        Assert.Same(dialog, dialogField.GetValue(shell));
+    }
+
+    private static IReadOnlyList<(OpCode Code, MemberInfo? Member)> ReadCompositionInstructions(MethodInfo method)
+    {
+        var opcodes = typeof(OpCodes).GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(field => field.FieldType == typeof(OpCode))
+            .Select(field => (OpCode)field.GetValue(null)!)
+            .ToDictionary(code => unchecked((ushort)code.Value));
+        var bytes = method.GetMethodBody()!.GetILAsByteArray()!;
+        var instructions = new List<(OpCode, MemberInfo?)>();
+        for (var offset = 0; offset < bytes.Length;)
+        {
+            var first = bytes[offset++];
+            var code = opcodes[first == 0xfe ? (ushort)(0xfe00 | bytes[offset++]) : first];
+            MemberInfo? member = code.OperandType switch
+            {
+                OperandType.InlineField => method.Module.ResolveField(BitConverter.ToInt32(bytes, offset)),
+                OperandType.InlineMethod => method.Module.ResolveMethod(BitConverter.ToInt32(bytes, offset)),
+                _ => null,
+            };
+            instructions.Add((code, member));
+            offset += code.OperandType switch
+            {
+                OperandType.InlineNone => 0,
+                OperandType.ShortInlineBrTarget or OperandType.ShortInlineI or OperandType.ShortInlineVar => 1,
+                OperandType.InlineVar => 2,
+                OperandType.InlineI8 or OperandType.InlineR => 8,
+                OperandType.InlineSwitch => 4 + 4 * BitConverter.ToInt32(bytes, offset),
+                _ => 4,
+            };
+        }
+        return instructions;
+    }
+
+    [Theory]
+    [InlineData("Succeeded", 1L, 0L)]
+    [InlineData("Failed", 0L, 1L)]
+    public async Task LocalResultsSummaryMapsTerminalStatistics(string transferStatus, long successes, long problems)
+    {
+        using var host = AppBootstrap.CreateHost(root);
+        await host.Services.GetRequiredService<DatabaseMigrator>().MigrateAsync();
+        var factory = host.Services.GetRequiredService<SqliteConnectionFactory>();
+        var batch = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var operation = Guid.NewGuid();
+        await SeedTransferOwnerAsync(factory, operation, batch, account, 1, "terminal-summary", DateTimeOffset.UtcNow);
+        await using (var connection = await factory.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO BatchOutputAccounts(BatchJobId,AccountId,OutputOrdinal,OutputLabel,PlannedTransferCount,PlannedShareCount,ShareEnabled)
+                VALUES($batch,$account,1,'账号',1,0,0);
+                UPDATE TransferOperations SET Status=$status WHERE Id=$operation;
+                """;
+            command.Parameters.AddWithValue("$batch", batch.ToString("D"));
+            command.Parameters.AddWithValue("$account", account.ToString("D"));
+            command.Parameters.AddWithValue("$operation", operation.ToString("D"));
+            command.Parameters.AddWithValue("$status", transferStatus);
+            await command.ExecuteNonQueryAsync();
+        }
+        var summary = await host.Services.GetRequiredService<IJobResultsWorkflow>().LoadSummaryAsync(batch);
+        Assert.Equal(successes, summary.CompleteSuccessCount);
+        Assert.Equal(problems, summary.TerminalProblemCount);
+        Assert.Equal(problems, summary.FailedCount);
+    }
 
     [Fact]
     public void LegacyCreateHostUsesUnavailableUpdateRuntime()
@@ -1642,5 +1852,91 @@ public sealed class AppBootstrapTests : IDisposable
             throw new NotSupportedException();
 
         public bool TryPrepareRestart() => false;
+    }
+
+    private sealed class RejectingStartupLicenseGate : ILicenseAuthorizationGate
+    {
+        public Task<LicenseGateResult> AuthorizeAsync(
+            LicenseOperationKind operation,
+            CancellationToken cancellationToken) => Task.FromResult(new LicenseGateResult(
+                operation,
+                IsAuthorized: false,
+                UsedCachedLease: false,
+                Code: "activation_required"));
+    }
+
+    private static Task<T> RunStaAsync<T>(Func<Task<T>> action)
+    {
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            var dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+            SynchronizationContext.SetSynchronizationContext(
+                new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+            dispatcher.BeginInvoke(new Action(() => _ = ExecuteAsync()));
+            System.Windows.Threading.Dispatcher.Run();
+
+            async Task ExecuteAsync()
+            {
+                try { completion.TrySetResult(await action()); }
+                catch (Exception error) { completion.TrySetException(error); }
+                finally
+                {
+                    if (!dispatcher.HasShutdownStarted)
+                        dispatcher.InvokeShutdown();
+                }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "AppBootstrapTests STA shell",
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
+    }
+
+    private sealed class ForbiddenStartupRecoveryStore :
+        IInterruptedOperationRecoveryStore,
+        IInterruptedShareOperationRecoveryStore,
+        IAllocationCounterStore,
+        IRemoteSelectionSessionStore,
+        ILocalResultExportCoordinator
+    {
+        private static Exception Forbidden() =>
+            new InvalidOperationException("Authorized startup recovery must not run after license rejection.");
+
+        public Task<LeaseRecoveryResult> RecoverInterruptedOperationsAsync(DateTimeOffset recoveredAt, CancellationToken cancellationToken = default) =>
+            Task.FromException<LeaseRecoveryResult>(Forbidden());
+
+        public Task<ShareLeaseRecoveryResult> RecoverInterruptedShareOperationsAsync(DateTimeOffset recoveredAt, CancellationToken cancellationToken = default) =>
+            Task.FromException<ShareLeaseRecoveryResult>(Forbidden());
+
+        public Task<ShareLeaseRecoveryResult> RecoverExpiredShareOperationsAsync(DateTimeOffset recoveredAt, CancellationToken cancellationToken = default) =>
+            Task.FromException<ShareLeaseRecoveryResult>(Forbidden());
+
+        public Task<AllocationCounterRebuildResult> RebuildAllocationCountersAsync(CancellationToken cancellationToken = default) =>
+            Task.FromException<AllocationCounterRebuildResult>(Forbidden());
+
+        public Task<RemoteSelectionSession> CreateAsync(Guid accountId, DateTimeOffset now, CancellationToken cancellationToken = default) =>
+            Task.FromException<RemoteSelectionSession>(Forbidden());
+
+        public Task<RemoteSelectionSession?> GetAsync(Guid sessionId, Guid workspaceDraftId, Guid accountId, int generation, CancellationToken cancellationToken = default) =>
+            Task.FromException<RemoteSelectionSession?>(Forbidden());
+
+        public Task<bool> TryCompleteAsync(Guid sessionId, Guid workspaceDraftId, Guid accountId, int generation, long expectedRevision, RemoteSelectionSessionState terminalState, DateTimeOffset now, CancellationToken cancellationToken = default) =>
+            Task.FromException<bool>(Forbidden());
+
+        public Task<int> RecoverIncompleteAsync(DateTimeOffset now, CancellationToken cancellationToken = default) =>
+            Task.FromException<int>(Forbidden());
+
+        public Task<LocalResultExportOutcome> ExportStandaloneAsync(Guid batchId, CancellationToken cancellationToken = default) =>
+            Task.FromException<LocalResultExportOutcome>(Forbidden());
+
+        public Task<LocalResultExportOutcome> ExportTransferAsync(Guid batchId, CancellationToken cancellationToken = default) =>
+            Task.FromException<LocalResultExportOutcome>(Forbidden());
+
+        public Task<int> RecoverAsync(CancellationToken cancellationToken = default) =>
+            Task.FromException<int>(Forbidden());
     }
 }

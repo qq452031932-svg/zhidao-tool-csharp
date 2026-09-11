@@ -1,6 +1,9 @@
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Automation.Peers;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 
 namespace BaiduBatchTransfer.App;
@@ -14,7 +17,52 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContextChanged += OnDataContextChanged;
         Closed += OnClosed;
+        StateChanged += OnWindowStateChanged;
         DataContext = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
+    }
+
+    private void OnMinimizeClick(object sender, RoutedEventArgs e) =>
+        SystemCommands.MinimizeWindow(this);
+
+    private void OnMaximizeRestoreClick(object sender, RoutedEventArgs e) =>
+        ToggleMaximizeRestore();
+
+    private void OnCloseClick(object sender, RoutedEventArgs e) =>
+        SystemCommands.CloseWindow(this);
+
+    private void OnTitleBarMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.OriginalSource is DependencyObject source && IsInsideButton(source)) return;
+
+        if (e.ClickCount == 2)
+        {
+            ToggleMaximizeRestore();
+            e.Handled = true;
+            return;
+        }
+
+        DragMove();
+    }
+
+    private void ToggleMaximizeRestore()
+    {
+        if (WindowState == WindowState.Maximized)
+            SystemCommands.RestoreWindow(this);
+        else
+            SystemCommands.MaximizeWindow(this);
+    }
+
+    private void OnWindowStateChanged(object? sender, EventArgs e) =>
+        MaximizeRestoreButton.Content = WindowState == WindowState.Maximized ? "❐" : "□";
+
+    private static bool IsInsideButton(DependencyObject source)
+    {
+        for (var current = source; current is not null; current = VisualTreeHelper.GetParent(current))
+        {
+            if (current is Button) return true;
+        }
+
+        return false;
     }
 
     private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
@@ -42,10 +90,12 @@ public partial class MainWindow : Window
 
     private void OnClosed(object? sender, EventArgs e)
     {
+        if (DataContext is MainWindowViewModel viewModel) viewModel.Close();
         liveRegionNotifier?.Dispose();
         liveRegionNotifier = null;
         DataContextChanged -= OnDataContextChanged;
         Closed -= OnClosed;
+        StateChanged -= OnWindowStateChanged;
     }
 
     private static void RaiseLiveRegionChanged(FrameworkElement element)

@@ -21,11 +21,17 @@ public sealed class StandaloneShareStoreTests : IDisposable
         var installation = new BrowserInstallationIdentity(
             Guid.NewGuid(), BrowserFamily.Edge, directory, Path.Combine(directory, "msedge.exe"),
             "Microsoft Corporation", "Microsoft Edge", "managed-standalone-file");
-        await state.CreateInstallationAsync(installation, default);
+        var storedInstallation = await state.CreateInstallationAsync(installation, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await state.TryReplaceActiveInstallationAsync(
+                new ManagedBrowserInstallationActivationRequest(null, storedInstallation), default)).Status);
         var session = new ManagedBrowserSessionReference(
             Guid.NewGuid(), installation.InstallationId, graph.AccountId, "local-user",
             BrowserFamily.Edge, "managed-standalone-profile", "managed-standalone-owner");
-        await state.CreateSessionAsync(session, default);
+        var storedSession = await state.CreateSessionAsync(session, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await state.TryReplaceActiveSessionAsync(
+                new ManagedBrowserSessionActivationRequest(null, storedSession), default)).Status);
         var snapshot = ExecutionProfileSnapshot.Managed(
             BrowserFamily.Edge, session.ProfileId, installation.InstallationId, session.SessionId);
         var batchId = Guid.NewGuid();

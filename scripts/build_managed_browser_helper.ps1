@@ -22,8 +22,8 @@ $pythonArchiveName = 'python-3.14.0-embed-amd64.zip'
 $pythonArchiveUri = 'https://www.python.org/ftp/python/3.14.0/python-3.14.0-embed-amd64.zip'
 $pythonArchiveSha256 = '8d4d3590c10449d78aa4375f534e6d5f3027d67fdc362dd1a882279db6f90fdf'
 $manifestVersion = 1
-$protocolVersion = 1
-$executionEngineVersion = 'ManagedChromium-v1'
+$protocolVersion = 3
+$executionEngineVersion = 'ManagedChromium-v3'
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $helperSource = Join-Path $repoRoot 'tools\managed_browser_helper'
@@ -46,7 +46,15 @@ if (Test-Path -LiteralPath $outputPath) {
 }
 foreach ($requiredSource in @($requirementsPath, $noticeSourcePath,
         $mplLicenseSourcePath, (Join-Path $helperSource 'main.py'),
-        (Join-Path $helperSource 'protocol.py'))) {
+        (Join-Path $helperSource 'protocol.py'), (Join-Path $helperSource 'identity_query.py'),
+        (Join-Path $helperSource 'transfer_source.py'), (Join-Path $helperSource 'transfer_source_listing.py'),
+        (Join-Path $helperSource 'transfer_picker.py'),
+        (Join-Path $helperSource 'transfer_directory_listing.py'),
+        (Join-Path $helperSource 'transfer_directory_mutation.py'),
+        (Join-Path $helperSource 'transfer_target_baseline.py'),
+        (Join-Path $helperSource 'transfer_submission.py'),
+        (Join-Path $helperSource 'share_submission.py'),
+        (Join-Path $helperSource 'session_operations.py'))) {
     if (-not (Test-Path -LiteralPath $requiredSource -PathType Leaf)) {
         throw "Required helper input is missing: $requiredSource"
     }
@@ -307,7 +315,7 @@ try {
         finally { $wheelStream.Dispose() }
     }
 
-    foreach ($name in @('main.py', 'protocol.py', 'requirements.lock')) {
+    foreach ($name in @('main.py', 'protocol.py', 'identity_query.py', 'transfer_source.py', 'transfer_source_listing.py', 'transfer_directory_listing.py', 'transfer_directory_mutation.py', 'transfer_picker.py', 'transfer_target_baseline.py', 'transfer_submission.py', 'share_submission.py', 'session_operations.py', 'requirements.lock')) {
         [IO.File]::Copy((Join-Path $helperSource $name), (Join-Path $staging $name), $false)
     }
 
@@ -430,10 +438,20 @@ try {
     }
     $manifestJson = (($manifest | ConvertTo-Json -Depth 5).Replace("`r`n", "`n").TrimEnd() + "`n")
     [IO.File]::WriteAllText((Join-Path $staging 'helper-manifest.json'), $manifestJson, $utf8NoBom)
+    $generatedManifestBytes = $utf8NoBom.GetBytes($manifestJson)
+    $checkedInManifestBytes = [IO.File]::ReadAllBytes($embeddedManifestPath)
+    if (-not [Linq.Enumerable]::SequenceEqual(
+            [byte[]]$generatedManifestBytes, [byte[]]$checkedInManifestBytes)) {
+        throw 'The generated manifest differs from the checked-in manifest.'
+    }
+    $generatedNoticeBytes = $utf8NoBom.GetBytes($packagedNotice)
+    $checkedInNoticeBytes = [IO.File]::ReadAllBytes($noticeSourcePath)
+    if (-not [Linq.Enumerable]::SequenceEqual(
+            [byte[]]$generatedNoticeBytes, [byte[]]$checkedInNoticeBytes)) {
+        throw 'The generated notice differs from the checked-in notice.'
+    }
     [IO.Directory]::Move($staging, $outputPath)
     $staging = $null
-    [IO.File]::WriteAllText($embeddedManifestPath, $manifestJson, $utf8NoBom)
-    [IO.File]::WriteAllText($noticeSourcePath, $packagedNotice, $utf8NoBom)
     Write-Output "Managed browser helper package created. BuildIdentity=$buildIdentity"
 }
 finally {

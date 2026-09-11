@@ -959,10 +959,15 @@ public sealed class WebViewBaiduNetdiskAdapterTests
             new RemoteItemIdentitySet([new("fictional-source", "来源资源")]),
             1, true, true, "source-generation", "fictional-user", capability,
             new string('b', 64));
+        var targetFingerprint = baseline is null ? null :
+            TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+                Destination().RemoteId, Destination().Path, baseline.Items.Length,
+                true, true, "target-generation", "fictional-user",
+                TransferTargetInventoryScope.AllItems, baseline);
         var target = baseline is null ? null : new TransferTargetPreparationEvidence(
             Destination().RemoteId, Destination().Path, baseline.Items.Length,
-            true, true, "target-generation", "fictional-user", baseline,
-            new string('c', 64));
+            true, true, "target-generation", "fictional-user",
+            TransferTargetInventoryScope.AllItems, baseline, targetFingerprint!);
         var effectiveState = state == WebAutomationAttemptState.UserHandoff ? resumeStage : state;
         var submission = includeTransferSubmission &&
                          effectiveState is (WebAutomationAttemptState.ResultPending or
