@@ -26,6 +26,16 @@ export EXPECTED_CERT_SHA256 EXPECTED_HEALTH_SHA256 STABLE_PROBE_URL EXPECTED_STA
 
 ## 安装
 
+### 授权服务（本地/预演阶段）
+
+授权服务安装脚本位于 `deploy/license-service/install.sh`，只绑定
+`127.0.0.1:18092`，并使用独立的 `superpan-license` 用户、配置目录和数据目录。
+在本地验证阶段仅运行契约测试和离线夹具；不要把该脚本直接用于生产主机。生产或
+staging 执行前必须单独确认主机、快照和回滚边界，并保留安装前后的脱敏哈希证据。
+
+公共 Nginx 路由片段在授权服务安装和验收完成前不得加入；安装脚本不会自动修改
+现有 vhost，也不会执行 Nginx reload。
+
 1. 在现有 `ota.fanfh.cn` HTTPS `server {}` 内只加入一次下列 include 行。先备份该 vhost，除此之外不复制或改写其他站点配置。片段本身也对非 HTTPS 请求 fail closed，但仍必须只放在 HTTPS block。
 
    ```nginx
