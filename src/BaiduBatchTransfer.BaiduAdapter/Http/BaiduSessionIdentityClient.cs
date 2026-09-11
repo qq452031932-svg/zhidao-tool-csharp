@@ -10,7 +10,8 @@ public sealed class BaiduSessionIdentityClient : IDisposable
 {
     private const int MaximumResponseBytes = 64 * 1024;
     private static readonly Uri IdentityUri = new(
-        "https://pan.baidu.com/api/gettemplatevariable?fields=%5B%22uk%22%2C%22username%22%5D");
+        "https://pan.baidu.com/api/gettemplatevariable?fields=%5B%22uk%22%2C%22username%22%2C%22avatar_url%22%2C%22photo_url%22%5D");
+    private static readonly Uri UserInfoUri = new("https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo");
     private static readonly Uri CapacityUri = new("https://pan.baidu.com/api/quota");
     private readonly HttpMessageInvoker http;
 
@@ -72,7 +73,9 @@ public sealed class BaiduSessionIdentityClient : IDisposable
                 {
                     return Failure(BaiduErrorKind.ExpiredLogin, "Identity fields were absent.");
                 }
-                return BaiduAdapterResult<BaiduAccountIdentity>.Success(new(userId, displayName));
+                var avatarUri = TryReadAvatarUri(result) ??
+                    await TryReadUserInfoAvatarAsync(session, userId, cancellationToken).ConfigureAwait(false);
+                return BaiduAdapterResult<BaiduAccountIdentity>.Success(new(userId, displayName, avatarUri));
             }
             catch (JsonException error)
             {
@@ -226,6 +229,58 @@ public sealed class BaiduSessionIdentityClient : IDisposable
         if (!result.TryGetProperty("username", out var value) || value.ValueKind != JsonValueKind.String) return false;
         displayName = value.GetString()?.Trim() ?? string.Empty;
         return displayName.Length is > 0 and <= 256 && !displayName.Any(char.IsControl);
+    }
+
+    private static Uri? TryReadAvatarUri(JsonElement result)
+    {
+        foreach (var propertyName in new[] { "avatar_url", "photo_url" })
+        {
+            if (!result.TryGetProperty(propertyName, out var value) ||
+                value.ValueKind != JsonValueKind.String ||
+                !Uri.TryCreate(value.GetString(), UriKind.Absolute, out var uri) ||
+                !BaiduAccountIdentity.IsTrustedAvatarUri(uri))
+                continue;
+            return uri;
+        }
+        return null;
+    }
+
+    private async Task<Uri?> TryReadUserInfoAvatarAsync(
+        AccountSession session,
+        string expectedUserId,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, UserInfoUri);
+        var cookieHeader = BuildCookieHeader(session.SessionCookies, UserInfoUri, DateTimeOffset.UtcNow);
+        if (cookieHeader.Length == 0) return null;
+        request.Headers.TryAddWithoutValidation("Cookie", cookieHeader);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (HttpRequestException) { return null; }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode) return null;
+            try
+            {
+                var payload = await ReadBoundedAsync(response.Content, cancellationToken).ConfigureAwait(false);
+                using var document = JsonDocument.Parse(payload);
+                var root = document.RootElement;
+                if (!IsSuccess(root) ||
+                    !TryReadUserId(root, out var userId) ||
+                    !string.Equals(userId, expectedUserId, StringComparison.Ordinal))
+                    return null;
+                return TryReadAvatarUri(root);
+            }
+            catch (InvalidDataException) { return null; }
+            catch (JsonException) { return null; }
+        }
     }
 
     private static bool TryReadNonNegativeInt64(JsonElement root, string propertyName, out long value)

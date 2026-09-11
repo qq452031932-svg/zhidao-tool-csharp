@@ -178,23 +178,113 @@ public sealed class ManagedBrowserHelperClient : IAsyncDisposable, IManagedBrows
         ArgumentNullException.ThrowIfNull(request);
         if (request.Action is ManagedBrowserAction.Handshake or ManagedBrowserAction.Shutdown)
             return Task.FromException<ManagedBrowserResponse>(Failure(ManagedBrowserHelperClientError.InvalidAction));
-        var timeout = request.Payload is ManagedBrowserObserveAccountIdentityRequest observation
-            ? TimeSpan.FromMilliseconds(observation.TimeoutMilliseconds) : options.CommandTimeout;
+        if (request.Action == ManagedBrowserAction.SubmitTransferOnce)
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(SubmitTerminalResponse(request,
+                    ManagedBrowserTransferSubmitDispatchState.KnownNotDispatched,
+                    ManagedBrowserHelperClientError.Cancelled))
+                : ExchangeMutationAsync(request, cancellationToken);
+        if (request.Action == ManagedBrowserAction.SubmitShareOnce)
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(ShareSubmitTerminalResponse(request,
+                    ManagedBrowserShareSubmitDispatchState.KnownNotDispatched,
+                    ManagedBrowserHelperClientError.Cancelled))
+                : ExchangeMutationAsync(request, cancellationToken);
+        if (request.Action == ManagedBrowserAction.SubmitExtractionCode)
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(ExtractionTerminalResponse(request,
+                    ManagedBrowserExtractionDispatchState.KnownNotDispatched,
+                    ManagedBrowserHelperClientError.Cancelled))
+                : ExchangeMutationAsync(request, cancellationToken);
+        if (IsTargetNavigation(request.Action))
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(TargetNavigationTerminalResponse(request, ManagedBrowserTargetNavigationState.KnownNotDispatched,
+                    ManagedBrowserHelperClientError.Cancelled))
+                : ExchangeMutationAsync(request, cancellationToken);
+        if (IsDirectoryMutation(request.Action))
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(ManagedBrowserResponse.For(request,
+                    new ManagedBrowserDirectoryMutationResult(ManagedBrowserDirectoryMutationResultKind.Cancelled)))
+                : ExchangeMutationAsync(request, cancellationToken);
+        if (request.Action == ManagedBrowserAction.OpenTransferPicker)
+            return cancellationToken.IsCancellationRequested
+                ? Task.FromResult(ManagedBrowserResponse.For(request,
+                    new ManagedBrowserTransferPickerResult(ManagedBrowserTransferPickerResultKind.Cancelled)))
+                : ExchangeMutationAsync(request, cancellationToken);
+        var timeout = request.Payload switch
+        {
+            ManagedBrowserObserveAccountIdentityRequest observation => TimeSpan.FromMilliseconds(observation.TimeoutMilliseconds),
+            ManagedBrowserOpenTransferSourceRequest source => TimeSpan.FromMilliseconds(source.TimeoutMilliseconds),
+            ManagedBrowserReadTransferSourceRequest listing => TimeSpan.FromMilliseconds(listing.Binding.TimeoutMilliseconds),
+            ManagedBrowserReadTransferDirectoryRequest directory => TimeSpan.FromMilliseconds(directory.Binding.TimeoutMilliseconds),
+            ManagedBrowserObserveTransferPickerClosedRequest closed => TimeSpan.FromMilliseconds(closed.Binding.TimeoutMilliseconds),
+            ManagedBrowserReadTransferTargetDirectoryRequest target => TimeSpan.FromMilliseconds(target.Binding.TimeoutMilliseconds),
+            ManagedBrowserObserveTransferSubmissionReadyRequest readiness =>
+                TimeSpan.FromMilliseconds(readiness.Context.TimeoutMilliseconds),
+            ManagedBrowserObserveTransferSubmissionOutcomeRequest outcome =>
+                TimeSpan.FromMilliseconds(outcome.Context.TimeoutMilliseconds),
+            ManagedBrowserReadShareOfficialListingRequest shareListing =>
+                TimeSpan.FromMilliseconds(shareListing.Context.TimeoutMilliseconds),
+            ManagedBrowserObserveShareSubmissionOutcomeRequest shareOutcome =>
+                TimeSpan.FromMilliseconds(shareOutcome.Context.TimeoutMilliseconds),
+            _ => options.CommandTimeout,
+        };
         return ExchangeAsync(request, timeout, cancellationToken, handshake: false);
+    }
+
+    private async Task<ManagedBrowserResponse> ExchangeMutationAsync(ManagedBrowserRequest request, CancellationToken cancellationToken)
+    {
+        // Once dispatched, cancellation cannot imply that the browser did not click. The fixed
+        // helper action has its own budget; cancellation/deadline terminates the helper as usual
+        // but retains the exchange until all local writes and transport teardown have drained.
+        // Teardown drains local I/O only, NOT browser JS: uncertain outcomes require quarantine.
+        try
+        {
+            var timeout = request.Payload switch
+            {
+                ManagedBrowserDirectoryMutationRequest mutation => mutation.Binding.TimeoutMilliseconds,
+                ManagedBrowserOpenTransferPickerRequest picker => picker.Binding.TimeoutMilliseconds,
+                ManagedBrowserOpenTransferTargetRootRequest targetRoot => targetRoot.Binding.TimeoutMilliseconds,
+                ManagedBrowserEnterTransferTargetDirectoryRequest targetEnter => targetEnter.Binding.TimeoutMilliseconds,
+                ManagedBrowserOpenTransferSourceAfterTargetReadRequest restore => restore.Binding.TimeoutMilliseconds,
+                ManagedBrowserSubmitTransferOnceRequest submit => submit.Context.TimeoutMilliseconds,
+                ManagedBrowserSubmitShareOnceRequest shareSubmit => shareSubmit.Context.TimeoutMilliseconds,
+                ManagedBrowserSubmitExtractionCodeRequest extraction => extraction.Binding.TimeoutMilliseconds,
+                _ => throw Failure(ManagedBrowserHelperClientError.InvalidAction),
+            };
+            var response = await ExchangeAsync(request, TimeSpan.FromMilliseconds(timeout), cancellationToken,
+                handshake: false).ConfigureAwait(false);
+            bool interrupted;
+            lock (sync) interrupted = failure is not null || disposing;
+            if (interrupted) await cleanup.ConfigureAwait(false);
+            return response;
+        }
+        catch
+        {
+            bool interrupted;
+            lock (sync) interrupted = failure is not null || disposing;
+            if (interrupted) await cleanup.ConfigureAwait(false);
+            throw;
+        }
     }
 
     private async Task<ManagedBrowserResponse> ExchangeAsync(ManagedBrowserRequest request,
         TimeSpan timeout, CancellationToken cancellationToken, bool handshake)
     {
+        var started = Stopwatch.GetTimestamp();
         Pending current;
         Task writing;
+        TimeSpan remainingTimeout;
         lock (sync)
         {
             if (disposing) throw Failure(ManagedBrowserHelperClientError.Disposed);
             if (failure is { } error) throw Failure(error);
             if (!handshake && !ready) throw Failure(ManagedBrowserHelperClientError.Unavailable);
             if (cancellationToken.IsCancellationRequested)
-                return TerminalResponse(request, ManagedBrowserHelperClientError.Cancelled);
+                return PreDispatchTerminalResponse(request, ManagedBrowserHelperClientError.Cancelled);
+            remainingTimeout = timeout - Stopwatch.GetElapsedTime(started);
+            if (remainingTimeout <= TimeSpan.Zero)
+                return PreDispatchTerminalResponse(request, ManagedBrowserHelperClientError.TimedOut);
             if (seen.Contains(request.CorrelationId)) throw Failure(ManagedBrowserHelperClientError.DuplicateCorrelationId);
             if (pending is not null) throw Failure(ManagedBrowserHelperClientError.Busy);
             if (seen.Count >= ManagedBrowserProtocol.MaximumRequestsPerSession - 1)
@@ -208,7 +298,7 @@ public sealed class ManagedBrowserHelperClient : IAsyncDisposable, IManagedBrows
         {
             // WaitAsync supplies the hard deadline even when a stream ignores its cancellation token.
             var response = await AwaitExchangeAsync(writing, current)
-                .WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+                .WaitAsync(remainingTimeout, cancellationToken).ConfigureAwait(false);
             return response ?? TerminalResponse(request, await current.Interrupted.Task.ConfigureAwait(false));
         }
         catch (TimeoutException)
@@ -418,6 +508,83 @@ public sealed class ManagedBrowserHelperClient : IAsyncDisposable, IManagedBrows
 
     private static ManagedBrowserResponse TerminalResponse(ManagedBrowserRequest request, ManagedBrowserHelperClientError error)
     {
+        if (IsDirectoryMutation(request.Action))
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserDirectoryMutationResult(ManagedBrowserDirectoryMutationResultKind.OutcomeUnknown));
+        if (request.Action == ManagedBrowserAction.OpenTransferPicker)
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserTransferPickerResult(ManagedBrowserTransferPickerResultKind.OutcomeUnknown));
+        if (request.Action == ManagedBrowserAction.SubmitTransferOnce)
+            return SubmitTerminalResponse(request,
+                ManagedBrowserTransferSubmitDispatchState.DispatchOutcomeUnknown, error);
+        if (request.Action == ManagedBrowserAction.SubmitShareOnce)
+            return ShareSubmitTerminalResponse(request,
+                ManagedBrowserShareSubmitDispatchState.DispatchOutcomeUnknown, error);
+        if (request.Action == ManagedBrowserAction.SubmitExtractionCode)
+            return ExtractionTerminalResponse(request,
+                ManagedBrowserExtractionDispatchState.ClickOutcomeUnknown, error);
+        if (IsTargetNavigation(request.Action))
+            return TargetNavigationTerminalResponse(request, ManagedBrowserTargetNavigationState.RouteOutcomeUnknown, error);
+        if (request.Action == ManagedBrowserAction.ReadTransferTargetDirectory &&
+            error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
+            return ManagedBrowserResponse.For(request, new ManagedBrowserReadTransferTargetDirectoryResult(
+                error == ManagedBrowserHelperClientError.Cancelled
+                    ? ManagedBrowserReadTransferTargetDirectoryResultKind.Cancelled
+                    : ManagedBrowserReadTransferTargetDirectoryResultKind.TimedOut));
+        if (request.Action == ManagedBrowserAction.ObserveTransferSubmissionReady)
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserTransferSubmissionReadinessResult(error switch
+                {
+                    ManagedBrowserHelperClientError.Cancelled =>
+                        ManagedBrowserTransferSubmissionReadinessResultKind.Cancelled,
+                    ManagedBrowserHelperClientError.TimedOut =>
+                        ManagedBrowserTransferSubmissionReadinessResultKind.TimedOut,
+                    _ => ManagedBrowserTransferSubmissionReadinessResultKind.BrowserUnavailable,
+                }));
+        if (request.Action == ManagedBrowserAction.ObserveTransferSubmissionOutcome)
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserTransferSubmissionOutcomeResult(error switch
+                {
+                    ManagedBrowserHelperClientError.Cancelled => ManagedBrowserTransferOutcomeKind.Cancelled,
+                    ManagedBrowserHelperClientError.TimedOut => ManagedBrowserTransferOutcomeKind.TimedOut,
+                    _ => ManagedBrowserTransferOutcomeKind.BrowserUnavailable,
+                }));
+        if (request.Action == ManagedBrowserAction.ReadShareOfficialListing)
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserReadShareOfficialListingResult(error switch
+                {
+                    ManagedBrowserHelperClientError.Cancelled => ManagedBrowserShareListingResultKind.Cancelled,
+                    ManagedBrowserHelperClientError.TimedOut => ManagedBrowserShareListingResultKind.TimedOut,
+                    _ => ManagedBrowserShareListingResultKind.BrowserUnavailable,
+                }));
+        if (request.Action == ManagedBrowserAction.ObserveShareSubmissionOutcome)
+            return ManagedBrowserResponse.For(request,
+                new ManagedBrowserShareSubmissionOutcomeResult(error switch
+                {
+                    ManagedBrowserHelperClientError.Cancelled => ManagedBrowserShareOutcomeKind.Cancelled,
+                    ManagedBrowserHelperClientError.TimedOut => ManagedBrowserShareOutcomeKind.TimedOut,
+                    _ => ManagedBrowserShareOutcomeKind.BrowserUnavailable,
+                }));
+        if (request.Action == ManagedBrowserAction.ReadTransferDirectory &&
+            error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
+            return ManagedBrowserResponse.For(request, new ManagedBrowserDirectoryListingResult(
+                error == ManagedBrowserHelperClientError.Cancelled
+                    ? ManagedBrowserDirectoryListingResultKind.Cancelled : ManagedBrowserDirectoryListingResultKind.TimedOut));
+        if (request.Action == ManagedBrowserAction.ObserveTransferPickerClosed &&
+            error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
+            return ManagedBrowserResponse.For(request, new ManagedBrowserTransferPickerClosedResult(
+                error == ManagedBrowserHelperClientError.Cancelled
+                    ? ManagedBrowserTransferPickerClosedResultKind.Cancelled : ManagedBrowserTransferPickerClosedResultKind.TimedOut));
+        if (request.Action == ManagedBrowserAction.ReadTransferSource &&
+            error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
+            return ManagedBrowserResponse.For(request, new ManagedBrowserSourceListingResult(
+                error == ManagedBrowserHelperClientError.Cancelled
+                    ? ManagedBrowserSourceListingResultKind.Cancelled : ManagedBrowserSourceListingResultKind.TimedOut));
+        if (request.Action == ManagedBrowserAction.OpenTransferSource &&
+            error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
+            return ManagedBrowserResponse.For(request, new ManagedBrowserTransferSourceResult(
+                error == ManagedBrowserHelperClientError.Cancelled
+                    ? ManagedBrowserTransferSourceResultKind.Cancelled : ManagedBrowserTransferSourceResultKind.TimedOut));
         if (request.Action == ManagedBrowserAction.ObserveAccountIdentity &&
             error is ManagedBrowserHelperClientError.Cancelled or ManagedBrowserHelperClientError.TimedOut)
             return ManagedBrowserResponse.For(request, new ManagedBrowserIdentityResult(
@@ -426,10 +593,108 @@ public sealed class ManagedBrowserHelperClient : IAsyncDisposable, IManagedBrows
         throw Failure(error);
     }
 
+    private static ManagedBrowserResponse PreDispatchTerminalResponse(
+        ManagedBrowserRequest request, ManagedBrowserHelperClientError error) =>
+        request.Action == ManagedBrowserAction.SubmitTransferOnce
+            ? SubmitTerminalResponse(request,
+                ManagedBrowserTransferSubmitDispatchState.KnownNotDispatched, error)
+            : request.Action == ManagedBrowserAction.SubmitShareOnce
+            ? ShareSubmitTerminalResponse(request,
+                ManagedBrowserShareSubmitDispatchState.KnownNotDispatched, error)
+            : IsTargetNavigation(request.Action)
+            ? TargetNavigationTerminalResponse(
+                request, ManagedBrowserTargetNavigationState.KnownNotDispatched, error)
+            : request.Action == ManagedBrowserAction.SubmitExtractionCode
+            ? ExtractionTerminalResponse(
+                request, ManagedBrowserExtractionDispatchState.KnownNotDispatched, error)
+            : TerminalResponse(request, error);
+
     private static ManagedBrowserRequest ControlRequest(ManagedBrowserAction action, ManagedBrowserRequestPayload payload) =>
         new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1, action, payload);
 
     private static ManagedBrowserHelperClientException Failure(ManagedBrowserHelperClientError error) => new(error);
+
+    private static ManagedBrowserResponse TargetNavigationTerminalResponse(ManagedBrowserRequest request,
+        ManagedBrowserTargetNavigationState state, ManagedBrowserHelperClientError error)
+    {
+        return request.Action switch
+        {
+            ManagedBrowserAction.OpenTransferTargetRoot => ManagedBrowserResponse.For(request,
+                new ManagedBrowserOpenTransferTargetRootResult(
+                    error switch
+                    {
+                        ManagedBrowserHelperClientError.Cancelled => ManagedBrowserOpenTransferTargetRootResultKind.Cancelled,
+                        ManagedBrowserHelperClientError.TimedOut => ManagedBrowserOpenTransferTargetRootResultKind.TimedOut,
+                        _ => ManagedBrowserOpenTransferTargetRootResultKind.BrowserUnavailable,
+                    },
+                    state)),
+            ManagedBrowserAction.EnterTransferTargetDirectory => ManagedBrowserResponse.For(request,
+                new ManagedBrowserEnterTransferTargetDirectoryResult(
+                    error switch
+                    {
+                        ManagedBrowserHelperClientError.Cancelled => ManagedBrowserEnterTransferTargetDirectoryResultKind.Cancelled,
+                        ManagedBrowserHelperClientError.TimedOut => ManagedBrowserEnterTransferTargetDirectoryResultKind.TimedOut,
+                        _ => ManagedBrowserEnterTransferTargetDirectoryResultKind.BrowserUnavailable,
+                    },
+                    state)),
+            ManagedBrowserAction.OpenTransferSourceAfterTargetRead => ManagedBrowserResponse.For(request,
+                new ManagedBrowserOpenTransferSourceAfterTargetReadResult(
+                    error switch
+                    {
+                        ManagedBrowserHelperClientError.Cancelled => ManagedBrowserOpenTransferSourceAfterTargetReadResultKind.Cancelled,
+                        ManagedBrowserHelperClientError.TimedOut => ManagedBrowserOpenTransferSourceAfterTargetReadResultKind.TimedOut,
+                        _ => ManagedBrowserOpenTransferSourceAfterTargetReadResultKind.BrowserUnavailable,
+                    },
+                    state)),
+            _ => throw Failure(ManagedBrowserHelperClientError.InvalidAction),
+        };
+    }
+
+    private static ManagedBrowserResponse SubmitTerminalResponse(
+        ManagedBrowserRequest request, ManagedBrowserTransferSubmitDispatchState dispatchState,
+        ManagedBrowserHelperClientError error) =>
+        ManagedBrowserResponse.For(request, new ManagedBrowserSubmitTransferOnceResult(
+            error switch
+            {
+                ManagedBrowserHelperClientError.Cancelled => ManagedBrowserTransferSubmitResultKind.Cancelled,
+                ManagedBrowserHelperClientError.TimedOut => ManagedBrowserTransferSubmitResultKind.TimedOut,
+                _ => ManagedBrowserTransferSubmitResultKind.BrowserUnavailable,
+            }, dispatchState));
+
+    private static ManagedBrowserResponse ShareSubmitTerminalResponse(
+        ManagedBrowserRequest request, ManagedBrowserShareSubmitDispatchState dispatchState,
+        ManagedBrowserHelperClientError error) =>
+        ManagedBrowserResponse.For(request, new ManagedBrowserSubmitShareOnceResult(
+            error switch
+            {
+                ManagedBrowserHelperClientError.Cancelled => ManagedBrowserShareSubmitResultKind.Cancelled,
+                ManagedBrowserHelperClientError.TimedOut => ManagedBrowserShareSubmitResultKind.TimedOut,
+                _ => ManagedBrowserShareSubmitResultKind.BrowserUnavailable,
+            }, dispatchState));
+
+    private static ManagedBrowserResponse ExtractionTerminalResponse(
+        ManagedBrowserRequest request,
+        ManagedBrowserExtractionDispatchState dispatchState,
+        ManagedBrowserHelperClientError error) =>
+        ManagedBrowserResponse.For(request, new ManagedBrowserSubmitExtractionCodeResult(
+            dispatchState == ManagedBrowserExtractionDispatchState.ClickOutcomeUnknown
+                ? ManagedBrowserExtractionCodeResultKind.OutcomeUnknown
+                : error switch
+                {
+                    ManagedBrowserHelperClientError.Cancelled => ManagedBrowserExtractionCodeResultKind.Cancelled,
+                    ManagedBrowserHelperClientError.TimedOut => ManagedBrowserExtractionCodeResultKind.TimedOut,
+                    _ => ManagedBrowserExtractionCodeResultKind.BrowserUnavailable,
+                },
+            dispatchState));
+
+    private static bool IsDirectoryMutation(ManagedBrowserAction action) => action is
+        ManagedBrowserAction.OpenTransferDirectoryRoot or ManagedBrowserAction.EnterTransferDirectory or
+        ManagedBrowserAction.BeginCreateTransferDirectory or ManagedBrowserAction.ConfirmCreateTransferDirectory or
+        ManagedBrowserAction.CancelTransferPicker;
+
+    private static bool IsTargetNavigation(ManagedBrowserAction action) => action is
+        ManagedBrowserAction.OpenTransferTargetRoot or ManagedBrowserAction.EnterTransferTargetDirectory or
+        ManagedBrowserAction.OpenTransferSourceAfterTargetRead;
 
     private sealed class Pending(ManagedBrowserRequest request)
     {

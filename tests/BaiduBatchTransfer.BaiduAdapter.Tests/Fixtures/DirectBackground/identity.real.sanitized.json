@@ -1,0 +1,14 @@
+{
+  "routeId": "identity",
+  "method": "GET",
+  "statusCode": 200,
+  "jsonShape": [
+    "$:object",
+    "$.errno:number",
+    "$.result:object",
+    "$.result.uk:number",
+    "$.result.username:string",
+    "$.request_id:number"
+  ],
+  "values": "[REDACTED]"
+}

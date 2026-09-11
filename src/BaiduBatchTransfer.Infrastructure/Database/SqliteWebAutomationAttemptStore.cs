@@ -348,6 +348,7 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         ValidateIdentity(operationId, accountId, generation);
         if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
         ArgumentNullException.ThrowIfNull(evidence);
+        if (!evidence.IsLocallyBound) return false;
         var markedAt = evidence.MarkedSubmittingAtUtc.ToUniversalTime();
         if (updatedAt.ToUniversalTime() != markedAt) return false;
 
@@ -357,7 +358,8 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             UPDATE WebAutomationAttempts SET
               State='Submitting',SubmissionSourceFingerprint=$source,
               SubmissionTargetExactId=$target,SubmissionTargetBaselineFingerprint=$baseline,
-              SubmissionMarkedAt=$marked,ObservationFingerprint=TargetObservationFingerprint,
+              SubmissionMarkedAt=$marked,SubmissionId=$submission,
+              SubmissionReadinessFingerprint=$readiness,ObservationFingerprint=TargetObservationFingerprint,
               Revision=Revision+1,UpdatedAt=$updated
             WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
               AND OwnerKind='Transfer' AND State='BaselinePersisted' AND Revision=$revision
@@ -371,13 +373,73 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.Parameters.AddWithValue("$target", evidence.TargetExactId);
         command.Parameters.AddWithValue("$baseline", evidence.TargetBaselineFingerprint);
         command.Parameters.AddWithValue("$marked", markedAt.ToString("O"));
+        command.Parameters.AddWithValue("$submission", evidence.SubmissionId!.Value.ToString("D"));
+        command.Parameters.AddWithValue("$readiness", evidence.ReadinessFingerprint!);
         AddCapability(command, evidence.BaiduUserId, evidence.Capability);
         command.Parameters.AddWithValue("$revision", expectedRevision);
         command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
     }
 
-    public async Task<bool> TryPersistTransferAcceptanceAsync(
+    public async Task<bool> TryResolveTransferKnownNotDispatchedAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        Guid submissionId,
+        string readinessFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateIdentity(operationId, accountId, generation);
+        if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        if (submissionId == Guid.Empty) throw new ArgumentException("A submission is required.", nameof(submissionId));
+        WebAutomationAttemptRecord.ValidateFingerprint(readinessFingerprint, nameof(readinessFingerprint));
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var current = await LoadAsync(connection, transaction, operationId, accountId, generation, cancellationToken)
+            .ConfigureAwait(false);
+        var submission = current?.SubmissionEvidence;
+        if (current?.OwnerKind != WebAutomationOwnerKind.Transfer ||
+            current.State != WebAutomationAttemptState.Submitting || current.Revision != expectedRevision ||
+            submission is null || !submission.IsLocallyBound ||
+            submission.SubmissionId != submissionId ||
+            !string.Equals(submission.ReadinessFingerprint, readinessFingerprint, StringComparison.Ordinal) ||
+            updatedAt < current.UpdatedAt)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE WebAutomationAttempts SET
+              State='DefinitelyNotSubmitted',IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$updated
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+              AND OwnerKind='Transfer' AND State='Submitting' AND Revision=$revision
+              AND SubmissionId=$submission AND SubmissionReadinessFingerprint=$readiness
+              AND SubmissionSourceFingerprint=SourceFingerprint
+              AND SubmissionTargetExactId=TargetExactId
+              AND SubmissionTargetBaselineFingerprint=BaselineFingerprint
+              AND BaiduUserId=$uid AND CapabilityAdapterKind=$adapter
+              AND CapabilityProtocolVersion=$protocol AND CapabilitySelectorVersion=$selector
+              AND CapabilityBuildVersion=$build AND UpdatedAt<=$updated;
+            """;
+        AddIdentity(command, operationId, accountId, generation);
+        command.Parameters.AddWithValue("$revision", expectedRevision);
+        command.Parameters.AddWithValue("$submission", submissionId.ToString("D"));
+        command.Parameters.AddWithValue("$readiness", readinessFingerprint);
+        AddCapability(command, submission.BaiduUserId, submission.Capability);
+        command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
+        var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+        if (changed) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        else await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return changed;
+    }
+
+    public Task<bool> TryPersistTransferAcceptanceAsync(
         Guid operationId,
         Guid accountId,
         int generation,
@@ -386,10 +448,57 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         TransferIdentityMapping mapping,
         string observationFingerprint,
         DateTimeOffset updatedAt,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        TryPersistTransferAcceptanceCoreAsync(
+            operationId, accountId, generation, expectedRevision,
+            lateSubmissionId: null, lateReadinessFingerprint: null,
+            lateTargetBaselineFingerprint: null, officialRequestId, mapping,
+            observationFingerprint, updatedAt, cancellationToken);
+
+    public Task<bool> TryPersistTransferLateAcceptanceAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        Guid submissionId,
+        string readinessFingerprint,
+        string targetBaselineFingerprint,
+        string officialRequestId,
+        TransferIdentityMapping mapping,
+        string observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        TryPersistTransferAcceptanceCoreAsync(
+            operationId, accountId, generation, expectedRevision,
+            submissionId, readinessFingerprint, targetBaselineFingerprint,
+            officialRequestId, mapping, observationFingerprint, updatedAt,
+            cancellationToken);
+
+    private async Task<bool> TryPersistTransferAcceptanceCoreAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        Guid? lateSubmissionId,
+        string? lateReadinessFingerprint,
+        string? lateTargetBaselineFingerprint,
+        string officialRequestId,
+        TransferIdentityMapping mapping,
+        string observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken)
     {
         ValidateIdentity(operationId, accountId, generation);
         if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        if (lateSubmissionId == Guid.Empty)
+            throw new ArgumentOutOfRangeException(nameof(lateSubmissionId));
+        if (lateSubmissionId is not null)
+        {
+            WebAutomationAttemptRecord.ValidateFingerprint(
+                lateReadinessFingerprint!, nameof(lateReadinessFingerprint));
+            WebAutomationAttemptRecord.ValidateFingerprint(
+                lateTargetBaselineFingerprint!, nameof(lateTargetBaselineFingerprint));
+        }
         ValidateBoundedText(officialRequestId, nameof(officialRequestId));
         ArgumentNullException.ThrowIfNull(mapping);
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
@@ -398,9 +507,36 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         await using var transaction = connection.BeginTransaction(deferred: false);
         var current = await LoadAsync(connection, transaction, operationId, accountId, generation, cancellationToken)
             .ConfigureAwait(false);
+        var initialChildCounts = await CountTransferAcceptanceChildrenAsync(
+            connection, transaction, operationId, accountId, generation, cancellationToken)
+            .ConfigureAwait(false);
+        if (initialChildCounts.MappingCount != 0 || initialChildCounts.AcceptedCount != 0)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+        var isLate = lateSubmissionId is not null;
+        var isExactEmptyOfficialPending = current is
+        {
+            State: WebAutomationAttemptState.ResultPending,
+            SubmissionEvidence.IsLocallyBound: true,
+            OfficialRequestId: null,
+            TransferIdentityMapping: null,
+            AcceptedRemoteItems: null,
+            OfficialObservationFingerprint: null,
+            TargetConfirmationEvidence: null,
+        } && current.SubmissionEvidence.SubmissionId == lateSubmissionId &&
+            string.Equals(current.SubmissionEvidence.ReadinessFingerprint,
+                lateReadinessFingerprint, StringComparison.Ordinal) &&
+            string.Equals(current.SubmissionEvidence.TargetBaselineFingerprint,
+                lateTargetBaselineFingerprint, StringComparison.Ordinal) &&
+            string.Equals(current.TargetPreparationEvidence?.Baseline.Fingerprint,
+                lateTargetBaselineFingerprint, StringComparison.Ordinal);
         if (current?.SourceEvidence is null || current.SubmissionEvidence is null ||
             current.OwnerKind != WebAutomationOwnerKind.Transfer ||
-            current.State != WebAutomationAttemptState.Submitting || current.Revision != expectedRevision ||
+            (isLate ? !isExactEmptyOfficialPending :
+                current.State != WebAutomationAttemptState.Submitting) ||
+            current.Revision != expectedRevision ||
             !mapping.Covers(current.SourceEvidence.Items) || updatedAt < current.UpdatedAt)
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -442,18 +578,88 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             await insertAccepted.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var writtenChildCounts = await CountTransferAcceptanceChildrenAsync(
+            connection, transaction, operationId, accountId, generation, cancellationToken)
+            .ConfigureAwait(false);
+        if (writtenChildCounts.MappingCount != mapping.Entries.Length ||
+            writtenChildCounts.AcceptedCount != mapping.Entries.Length)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
         await using var update = connection.CreateCommand();
         update.Transaction = transaction;
-        update.CommandText = """
+        update.CommandText = isLate ? """
             UPDATE WebAutomationAttempts SET
               State='ResultPending',OfficialRequestId=$request,
               TransferMappingFingerprint=$mapping,TransferMappingCount=$count,
               AcceptanceFingerprint=$acceptance,AcceptedItemCount=$count,
-              AcceptancePersistedAt=$updated,ObservationFingerprint=$observation,
+              AcceptancePersistedAt=$updated,OfficialObservationFingerprint=$observation,
+              ObservationFingerprint=$observation,
               Revision=Revision+1,UpdatedAt=$updated
             WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
-              AND OwnerKind='Transfer' AND State='Submitting' AND Revision=$revision
-              AND SubmissionSourceFingerprint=SourceFingerprint;
+              AND OwnerKind='Transfer' AND State='ResultPending' AND Revision=$revision
+              AND SubmissionId=$submission AND SubmissionReadinessFingerprint=$readiness
+              AND SubmissionTargetBaselineFingerprint=$targetBaseline
+              AND SubmissionSourceFingerprint=SourceFingerprint
+              AND OfficialRequestId IS NULL
+              AND TransferMappingFingerprint IS NULL AND TransferMappingCount=0
+              AND AcceptanceFingerprint IS NULL AND AcceptedItemCount=0
+              AND AcceptancePersistedAt IS NULL AND OfficialObservationFingerprint IS NULL
+              AND TargetConfirmationFingerprint IS NULL AND TargetConfirmedAt IS NULL
+              AND (SELECT COUNT(*) FROM WebAutomationTransferMappings m
+                   WHERE m.OperationId=WebAutomationAttempts.OperationId
+                     AND m.AccountId=WebAutomationAttempts.AccountId
+                     AND m.Generation=WebAutomationAttempts.Generation)=$count
+              AND (SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems a
+                   WHERE a.OperationId=WebAutomationAttempts.OperationId
+                     AND a.AccountId=WebAutomationAttempts.AccountId
+                     AND a.Generation=WebAutomationAttempts.Generation)=$count
+              AND NOT EXISTS(
+                   SELECT 1 FROM WebAutomationTransferMappings m
+                   WHERE m.OperationId=WebAutomationAttempts.OperationId
+                     AND m.AccountId=WebAutomationAttempts.AccountId
+                     AND m.Generation=WebAutomationAttempts.Generation
+                     AND (m.ItemOrdinal<0 OR m.ItemOrdinal>=$count))
+              AND NOT EXISTS(
+                   SELECT 1 FROM WebAutomationAttemptAcceptedRemoteItems a
+                   WHERE a.OperationId=WebAutomationAttempts.OperationId
+                     AND a.AccountId=WebAutomationAttempts.AccountId
+                     AND a.Generation=WebAutomationAttempts.Generation
+                     AND (a.ItemOrdinal<0 OR a.ItemOrdinal>=$count));
+            """ : """
+            UPDATE WebAutomationAttempts SET
+              State='ResultPending',OfficialRequestId=$request,
+              TransferMappingFingerprint=$mapping,TransferMappingCount=$count,
+              AcceptanceFingerprint=$acceptance,AcceptedItemCount=$count,
+              AcceptancePersistedAt=$updated,OfficialObservationFingerprint=$observation,
+              ObservationFingerprint=$observation,
+              Revision=Revision+1,UpdatedAt=$updated
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+              AND OwnerKind='Transfer' AND State='Submitting'
+              AND Revision=$revision
+              AND SubmissionSourceFingerprint=SourceFingerprint
+              AND (SELECT COUNT(*) FROM WebAutomationTransferMappings m
+                   WHERE m.OperationId=WebAutomationAttempts.OperationId
+                     AND m.AccountId=WebAutomationAttempts.AccountId
+                     AND m.Generation=WebAutomationAttempts.Generation)=$count
+              AND (SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems a
+                   WHERE a.OperationId=WebAutomationAttempts.OperationId
+                     AND a.AccountId=WebAutomationAttempts.AccountId
+                     AND a.Generation=WebAutomationAttempts.Generation)=$count
+              AND NOT EXISTS(
+                   SELECT 1 FROM WebAutomationTransferMappings m
+                   WHERE m.OperationId=WebAutomationAttempts.OperationId
+                     AND m.AccountId=WebAutomationAttempts.AccountId
+                     AND m.Generation=WebAutomationAttempts.Generation
+                     AND (m.ItemOrdinal<0 OR m.ItemOrdinal>=$count))
+              AND NOT EXISTS(
+                   SELECT 1 FROM WebAutomationAttemptAcceptedRemoteItems a
+                   WHERE a.OperationId=WebAutomationAttempts.OperationId
+                     AND a.AccountId=WebAutomationAttempts.AccountId
+                     AND a.Generation=WebAutomationAttempts.Generation
+                     AND (a.ItemOrdinal<0 OR a.ItemOrdinal>=$count));
             """;
         AddIdentity(update, operationId, accountId, generation);
         update.Parameters.AddWithValue("$request", officialRequestId.Trim());
@@ -463,7 +669,126 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         update.Parameters.AddWithValue("$observation", observationFingerprint);
         update.Parameters.AddWithValue("$revision", expectedRevision);
         update.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
+        if (isLate)
+        {
+            update.Parameters.AddWithValue("$submission", lateSubmissionId!.Value.ToString("D"));
+            update.Parameters.AddWithValue("$readiness", lateReadinessFingerprint!);
+            update.Parameters.AddWithValue("$targetBaseline", lateTargetBaselineFingerprint!);
+        }
         var changed = await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+        if (changed)
+        {
+            var finalChildCounts = await CountTransferAcceptanceChildrenAsync(
+                connection, transaction, operationId, accountId, generation, cancellationToken)
+                .ConfigureAwait(false);
+            changed = finalChildCounts.MappingCount == mapping.Entries.Length &&
+                finalChildCounts.AcceptedCount == mapping.Entries.Length;
+        }
+        if (changed) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        else await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return changed;
+    }
+
+    private static async Task<(long MappingCount, long AcceptedCount)>
+        CountTransferAcceptanceChildrenAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            Guid operationId,
+            Guid accountId,
+            int generation,
+            CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT
+              (SELECT COUNT(*) FROM WebAutomationTransferMappings
+               WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation),
+              (SELECT COUNT(*) FROM WebAutomationAttemptAcceptedRemoteItems
+               WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation);
+            """;
+        AddIdentity(command, operationId, accountId, generation);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("WEB_TRANSFER_ACCEPTANCE_CHILD_COUNT_UNAVAILABLE");
+        return (reader.GetInt64(0), reader.GetInt64(1));
+    }
+
+    public async Task<bool> TryPersistTransferTargetConfirmationAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        TransferTargetConfirmationEvidence evidence,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateIdentity(operationId, accountId, generation);
+        if (expectedRevision < 0) throw new ArgumentOutOfRangeException(nameof(expectedRevision));
+        ArgumentNullException.ThrowIfNull(evidence);
+
+        await using var connection = await factory.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: false);
+        var current = await LoadAsync(connection, transaction, operationId, accountId, generation, cancellationToken)
+            .ConfigureAwait(false);
+        if (current?.OwnerKind != WebAutomationOwnerKind.Transfer ||
+            current.State != WebAutomationAttemptState.ResultPending || current.Revision != expectedRevision ||
+            current.SubmissionEvidence is null || !current.SubmissionEvidence.IsLocallyBound ||
+            current.TargetPreparationEvidence is null || current.TransferIdentityMapping is null ||
+            current.AcceptedRemoteItems is null || string.IsNullOrWhiteSpace(current.OfficialRequestId) ||
+            current.TargetConfirmationEvidence is not null || evidence.ConfirmedAtUtc < current.UpdatedAt)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
+        TransferTargetConfirmationEvidence expected;
+        try
+        {
+            var currentInventory = WebAutomationBaseline.Create(
+                current.TargetPreparationEvidence.Baseline.Items.Select(item => item.ExactId)
+                    .Concat(current.TransferIdentityMapping.Entries.Select(entry => entry.DestinationExactId)));
+            expected = TransferTargetConfirmationEvidence.Create(
+                current.SubmissionEvidence, current.OfficialRequestId, current.TransferIdentityMapping,
+                current.TargetPreparationEvidence, currentInventory,
+                evidence.TargetObservationFingerprint, evidence.ConfirmedAtUtc);
+        }
+        catch (ArgumentException)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+        if (expected != evidence)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE WebAutomationAttempts SET
+              State='Succeeded',TargetConfirmationFingerprint=$fingerprint,
+              TargetConfirmedAt=$confirmed,ObservationFingerprint=$fingerprint,
+              IsWaitingForUser=0,Revision=Revision+1,UpdatedAt=$confirmed
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation
+              AND OwnerKind='Transfer' AND State='ResultPending' AND Revision=$revision
+              AND SubmissionId=$submission AND SubmissionReadinessFingerprint=$readiness
+              AND OfficialRequestId=$request AND TransferMappingFingerprint=$mapping
+              AND OfficialObservationFingerprint IS NOT NULL
+              AND AcceptanceFingerprint IS NOT NULL AND AcceptedItemCount=1
+              AND TargetConfirmationFingerprint IS NULL AND TargetConfirmedAt IS NULL
+              AND UpdatedAt<=$confirmed;
+            """;
+        AddIdentity(command, operationId, accountId, generation);
+        command.Parameters.AddWithValue("$revision", expectedRevision);
+        command.Parameters.AddWithValue("$submission", evidence.SubmissionId.ToString("D"));
+        command.Parameters.AddWithValue("$readiness", evidence.ReadinessFingerprint);
+        command.Parameters.AddWithValue("$request", evidence.OfficialRequestId);
+        command.Parameters.AddWithValue("$mapping", evidence.OfficialMappingFingerprint);
+        command.Parameters.AddWithValue("$fingerprint", evidence.TargetObservationFingerprint);
+        command.Parameters.AddWithValue("$confirmed", evidence.ConfirmedAtUtc.ToUniversalTime().ToString("O"));
+        var changed = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
         if (changed) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         else await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
         return changed;
@@ -507,7 +832,9 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
               AND State=$expected AND Revision=$revision AND UpdatedAt<=$updated
               AND ($requiresBaseline=0 OR BaselinePersistedAt IS NOT NULL)
               AND ($requiresAcceptance=0 OR OwnerKind NOT IN ('Transfer','TransferShare','StandaloneShare') OR
-                   (AcceptanceFingerprint IS NOT NULL AND AcceptancePersistedAt IS NOT NULL AND AcceptedItemCount>0));
+                   (AcceptanceFingerprint IS NOT NULL AND AcceptancePersistedAt IS NOT NULL AND AcceptedItemCount>0))
+              AND ($managedTransferSuccess=0 OR OwnerKind<>'Transfer' OR
+                   (SubmissionId IS NULL AND SubmissionReadinessFingerprint IS NULL));
             """;
         AddIdentity(command, operationId, accountId, generation);
         command.Parameters.AddWithValue("$next", nextState.ToString());
@@ -518,6 +845,9 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         command.Parameters.AddWithValue("$updated", updatedAt.ToUniversalTime().ToString("O"));
         command.Parameters.AddWithValue("$requiresBaseline", RequiresBaseline(nextState) ? 1 : 0);
         command.Parameters.AddWithValue("$requiresAcceptance",
+            expectedState == WebAutomationAttemptState.ResultPending &&
+            nextState == WebAutomationAttemptState.Succeeded ? 1 : 0);
+        command.Parameters.AddWithValue("$managedTransferSuccess",
             expectedState == WebAutomationAttemptState.ResultPending &&
             nextState == WebAutomationAttemptState.Succeeded ? 1 : 0);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
@@ -903,6 +1233,11 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
         string? officialRequestId;
         string? transferMappingFingerprint;
         int transferMappingCount;
+        string? submissionId;
+        string? submissionReadinessFingerprint;
+        string? officialObservationFingerprint;
+        string? targetConfirmationFingerprint;
+        DateTimeOffset? targetConfirmedAt;
         ExecutionProfileSnapshot executionProfile;
         bool waiting;
         long revision;
@@ -921,7 +1256,9 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                        TargetGenerationToken,TargetObservationFingerprint,
                        SubmissionSourceFingerprint,SubmissionTargetExactId,SubmissionTargetBaselineFingerprint,
                        SubmissionMarkedAt,OfficialRequestId,TransferMappingFingerprint,TransferMappingCount,
-                       ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+                       ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId,
+                       SubmissionId,SubmissionReadinessFingerprint,OfficialObservationFingerprint,
+                       TargetConfirmationFingerprint,TargetConfirmedAt
                 FROM WebAutomationAttempts
                 WHERE OperationId=$operation AND AccountId=$account AND Generation=$generation;
                 """;
@@ -967,6 +1304,12 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             transferMappingFingerprint = reader.IsDBNull(35) ? null : reader.GetString(35);
             transferMappingCount = reader.GetInt32(36);
             executionProfile = SqliteExecutionProfileSnapshotCodec.Read(reader, 37);
+            submissionId = reader.IsDBNull(42) ? null : reader.GetString(42);
+            submissionReadinessFingerprint = reader.IsDBNull(43) ? null : reader.GetString(43);
+            officialObservationFingerprint = reader.IsDBNull(44) ? null : reader.GetString(44);
+            targetConfirmationFingerprint = reader.IsDBNull(45) ? null : reader.GetString(45);
+            targetConfirmedAt = reader.IsDBNull(46) ? null : DateTimeOffset.Parse(
+                reader.GetString(46), null, System.Globalization.DateTimeStyles.RoundtripKind);
         }
 
         TransferSourceEvidence? sourceEvidence = null;
@@ -1110,24 +1453,43 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
                 targetTotalCount is null || targetReachedEnd is null || targetIsStable is null ||
                 targetGenerationToken is null || targetObservationFingerprint is null || baiduUserId is null)
                 throw new InvalidDataException("WEB_TARGET_METADATA_MISMATCH");
-            targetPreparationEvidence = new TransferTargetPreparationEvidence(
-                targetExactId, new RemotePath(targetPath), targetTotalCount.Value,
-                targetReachedEnd.Value, targetIsStable.Value, targetGenerationToken, baiduUserId,
-                baseline, targetObservationFingerprint);
+            targetPreparationEvidence = LoadTargetPreparationEvidence(
+                targetExactId, targetPath, targetTotalCount.Value,
+                targetReachedEnd.Value, targetIsStable.Value, targetGenerationToken,
+                baiduUserId, baseline, targetObservationFingerprint);
         }
 
         TransferSubmissionEvidence? submissionEvidence = null;
         var hasAnySubmissionMetadata = submissionSourceFingerprint is not null ||
             submissionTargetExactId is not null || submissionTargetBaselineFingerprint is not null ||
-            submissionMarkedAt is not null;
+            submissionMarkedAt is not null || submissionId is not null || submissionReadinessFingerprint is not null;
         if (hasAnySubmissionMetadata)
         {
             if (sourceEvidence is null || submissionSourceFingerprint is null || submissionTargetExactId is null ||
                 submissionTargetBaselineFingerprint is null || submissionMarkedAt is null || baiduUserId is null)
                 throw new InvalidDataException("WEB_SUBMISSION_METADATA_MISMATCH");
-            submissionEvidence = new TransferSubmissionEvidence(
-                submissionSourceFingerprint, submissionTargetExactId, submissionTargetBaselineFingerprint,
-                baiduUserId, sourceEvidence.Capability, submissionMarkedAt.Value);
+            if ((submissionId is null) != (submissionReadinessFingerprint is null))
+                throw new InvalidDataException("WEB_SUBMISSION_BINDING_MISMATCH");
+            try
+            {
+                submissionEvidence = submissionId is null
+                    ? new TransferSubmissionEvidence(
+                        submissionSourceFingerprint, submissionTargetExactId,
+                        submissionTargetBaselineFingerprint, baiduUserId, sourceEvidence.Capability,
+                        submissionMarkedAt.Value)
+                    : TransferSubmissionEvidence.CreateBound(
+                        Guid.Parse(submissionId), submissionReadinessFingerprint!, submissionSourceFingerprint,
+                        submissionTargetExactId, submissionTargetBaselineFingerprint, baiduUserId,
+                        sourceEvidence.Capability, submissionMarkedAt.Value);
+            }
+            catch (ArgumentException exception)
+            {
+                throw new InvalidDataException("WEB_SUBMISSION_BINDING_INVALID", exception);
+            }
+            catch (FormatException exception)
+            {
+                throw new InvalidDataException("WEB_SUBMISSION_BINDING_INVALID", exception);
+            }
         }
 
         TransferIdentityMapping? transferIdentityMapping = null;
@@ -1171,16 +1533,107 @@ public sealed class SqliteWebAutomationAttemptStore : IWebAutomationAttemptStore
             throw new InvalidDataException("WEB_TRANSFER_MAPPING_METADATA_MISMATCH");
         }
 
+        try
+        {
+            WebAutomationAttemptRecord.ValidateFingerprint(
+                officialObservationFingerprint, nameof(officialObservationFingerprint));
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException("WEB_OFFICIAL_OBSERVATION_INVALID", exception);
+        }
+
+        TransferTargetConfirmationEvidence? targetConfirmationEvidence = null;
+        if ((targetConfirmationFingerprint is null) != (targetConfirmedAt is null))
+            throw new InvalidDataException("WEB_TARGET_CONFIRMATION_METADATA_MISMATCH");
+        if (targetConfirmationFingerprint is not null)
+        {
+            if (submissionEvidence is null || targetPreparationEvidence is null ||
+                transferIdentityMapping is null || officialRequestId is null)
+                throw new InvalidDataException("WEB_TARGET_CONFIRMATION_METADATA_MISMATCH");
+            try
+            {
+                var currentInventory = WebAutomationBaseline.Create(
+                    targetPreparationEvidence.Baseline.Items.Select(item => item.ExactId)
+                        .Concat(transferIdentityMapping.Entries.Select(entry => entry.DestinationExactId)));
+                targetConfirmationEvidence = TransferTargetConfirmationEvidence.Create(
+                    submissionEvidence, officialRequestId, transferIdentityMapping,
+                    targetPreparationEvidence, currentInventory, targetConfirmationFingerprint,
+                    targetConfirmedAt!.Value);
+            }
+            catch (ArgumentException exception)
+            {
+                throw new InvalidDataException("WEB_TARGET_CONFIRMATION_INVALID", exception);
+            }
+        }
+
         var attempt = new WebAutomationAttemptRecord(operationId, accountId, generation,
             Enum.Parse<WebAutomationOwnerKind>(owner), Enum.Parse<WebAutomationAttemptState>(state),
             resumeStage is null ? null : Enum.Parse<WebAutomationAttemptState>(resumeStage),
             baseline, observation, waiting, revision, created, updated, acceptedRemoteItems,
             sourceEvidence, targetPreparationEvidence, submissionEvidence, officialRequestId,
-            transferIdentityMapping, executionProfile);
+            transferIdentityMapping, executionProfile, officialObservationFingerprint,
+            targetConfirmationEvidence);
         if (!await OwnerSnapshotMatchesAsync(
                 connection, transaction, attempt, cancellationToken).ConfigureAwait(false))
             throw new InvalidDataException("WEB_ATTEMPT_OWNER_SNAPSHOT_MISMATCH");
         return attempt;
+    }
+
+    private static TransferTargetPreparationEvidence LoadTargetPreparationEvidence(
+        string rawTargetExactId,
+        string rawTargetPath,
+        int totalCount,
+        bool reachedEnd,
+        bool isStable,
+        string rawTargetGenerationToken,
+        string rawBaiduUserId,
+        WebAutomationBaseline baseline,
+        string observationFingerprint)
+    {
+        if (totalCount != baseline.Items.Length)
+            throw new InvalidDataException("WEB_TARGET_COUNT_MISMATCH");
+        try
+        {
+            var canonicalPath = new RemotePath(rawTargetPath);
+            var durableFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+                rawTargetExactId, canonicalPath, totalCount, reachedEnd, isStable,
+                rawTargetGenerationToken, rawBaiduUserId,
+                TransferTargetInventoryScope.AllItems, baseline);
+            if (!string.Equals(durableFingerprint, observationFingerprint, StringComparison.Ordinal))
+                throw new InvalidDataException("WEB_TARGET_OBSERVATION_FINGERPRINT_MISMATCH");
+            var evidence = new TransferTargetPreparationEvidence(
+                rawTargetExactId, canonicalPath, totalCount, reachedEnd, isStable,
+                rawTargetGenerationToken, rawBaiduUserId,
+                TransferTargetInventoryScope.AllItems, baseline, observationFingerprint);
+            RequireCanonicalPersistedText(
+                rawTargetExactId, evidence.TargetExactId, "WEB_TARGET_EXACT_ID_NOT_CANONICAL");
+            RequireCanonicalPersistedText(
+                rawTargetPath, evidence.TargetPath.Value, "WEB_TARGET_PATH_NOT_CANONICAL");
+            RequireCanonicalPersistedText(
+                rawTargetGenerationToken, evidence.TargetGenerationToken,
+                "WEB_TARGET_GENERATION_NOT_CANONICAL");
+            RequireCanonicalPersistedText(
+                rawBaiduUserId, evidence.BaiduUserId, "WEB_TARGET_UID_NOT_CANONICAL");
+            return evidence;
+        }
+        catch (InvalidDataException)
+        {
+            throw;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException("WEB_TARGET_METADATA_INVALID", exception);
+        }
+    }
+
+    private static void RequireCanonicalPersistedText(
+        string rawValue,
+        string canonicalValue,
+        string errorCode)
+    {
+        if (!string.Equals(rawValue, canonicalValue, StringComparison.Ordinal))
+            throw new InvalidDataException(errorCode);
     }
 
     private static async Task<bool> OwnerSnapshotMatchesAsync(

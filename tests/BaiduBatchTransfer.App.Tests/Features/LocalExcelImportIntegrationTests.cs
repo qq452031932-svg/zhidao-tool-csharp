@@ -208,7 +208,7 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
     }
 
     [Fact]
-    public async Task RealWorkbookImportsThroughTheMigratedHostWhileTransfersStayUnavailable()
+    public async Task RealWorkbookImportsThroughTheMigratedDirectBackgroundHost()
     {
         Directory.CreateDirectory(root);
         var workbookPath = Path.Combine(root, "private-user-workbook.xlsx");
@@ -239,7 +239,7 @@ public sealed class LocalExcelImportIntegrationTests : IDisposable
 
         await vm.SelectAndImportExcelCommand.ExecuteAsync(null);
 
-        Assert.False(availability.CanStartTransfers);
+        Assert.True(availability.CanStartTransfers);
         var completed = Assert.IsType<ImportDraftReady>(draft);
         Assert.Equal(2, completed.Statistics.Total);
         Assert.Equal(2, completed.Statistics.Ready);

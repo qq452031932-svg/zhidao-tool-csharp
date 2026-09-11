@@ -23,7 +23,8 @@ public sealed class ManagedBrowserProtocolTests
         var bytes = stream.ToArray();
         Assert.Equal(bytes.Length - 4, BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(0, 4)));
         var json = new UTF8Encoding(false, true).GetString(bytes.AsSpan(4));
-        Assert.Contains("\"protocolVersion\":1", json, StringComparison.Ordinal);
+        Assert.Contains("\"protocolVersion\":3", json, StringComparison.Ordinal);
+        Assert.Contains("\"executionEngineVersion\":\"ManagedChromium-v3\"", json, StringComparison.Ordinal);
         Assert.DoesNotContain("\uFEFF", json, StringComparison.Ordinal);
     }
 
@@ -75,7 +76,7 @@ public sealed class ManagedBrowserProtocolTests
 
     [Theory]
     [InlineData(0)]
-    [InlineData(65537)]
+    [InlineData(1048577)]
     public async Task InvalidFrameLengthIsRejectedBeforeReadingPayload(int length)
     {
         var header = new byte[4];
@@ -98,8 +99,10 @@ public sealed class ManagedBrowserProtocolTests
     }
 
     [Theory]
+    [InlineData("protocolVersion", "1", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
     [InlineData("protocolVersion", "2", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
-    [InlineData("executionEngineVersion", "\"WebView2-v1\"", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
+    [InlineData("executionEngineVersion", "\"ManagedChromium-v1\"", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
+    [InlineData("executionEngineVersion", "\"ManagedChromium-v2\"", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
     [InlineData("action", "\"RunScript\"", ManagedBrowserProtocolError.UnknownAction)]
     public void VersionEngineAndActionMismatchesAreRejected(
         string property,
@@ -109,8 +112,8 @@ public sealed class ManagedBrowserProtocolTests
         var json = HandshakeJson().Replace(
             property switch
             {
-                "protocolVersion" => "\"protocolVersion\":1",
-                "executionEngineVersion" => "\"executionEngineVersion\":\"ManagedChromium-v1\"",
+                "protocolVersion" => "\"protocolVersion\":3",
+                "executionEngineVersion" => "\"executionEngineVersion\":\"ManagedChromium-v3\"",
                 _ => "\"action\":\"Handshake\"",
             }, $"\"{property}\":{replacement}", StringComparison.Ordinal);
 
@@ -120,9 +123,9 @@ public sealed class ManagedBrowserProtocolTests
     }
 
     [Theory]
-    [InlineData("\"protocolVersion\":1", "\"protocolVersion\":\"1\"", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
-    [InlineData("\"protocolVersion\":1", "\"protocolVersion\":1.0", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
-    [InlineData("\"executionEngineVersion\":\"ManagedChromium-v1\"", "\"executionEngineVersion\":1", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
+    [InlineData("\"protocolVersion\":3", "\"protocolVersion\":\"3\"", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
+    [InlineData("\"protocolVersion\":3", "\"protocolVersion\":3.0", ManagedBrowserProtocolError.ProtocolVersionMismatch)]
+    [InlineData("\"executionEngineVersion\":\"ManagedChromium-v3\"", "\"executionEngineVersion\":1", ManagedBrowserProtocolError.ExecutionEngineVersionMismatch)]
     [InlineData("\"action\":\"Handshake\"", "\"action\":1", ManagedBrowserProtocolError.UnknownAction)]
     public void MismatchedDiscriminatorTypesUseTheSameTypedErrorsAsPython(
         string original,
@@ -176,6 +179,7 @@ public sealed class ManagedBrowserProtocolTests
             ("request capabilities item type", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Health\",1,\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.InvalidPayload),
             ("request capabilities set", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
             ("request capabilities order", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Shutdown\",\"Health\",\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("request capabilities duplicate", false, WithBodyValue(requestHandshake, "payload", "requiredCapabilities", "[\"Health\",\"Health\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
             ("request invalid schema precedes capability mismatch", false, WithBodyValue(WithBodyValue(requestHandshake, "payload", "nonce", "\"short\""), "payload", "requiredCapabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.InvalidPayload),
             ("request browser id type", false, WithBodyValue(requestObserve, "payload", "browserId", "1"), ManagedBrowserProtocolError.InvalidPayload),
             ("request browser id format", false, WithBodyValue(requestObserve, "payload", "browserId", "\"not-a-guid\""), ManagedBrowserProtocolError.InvalidPayload),
@@ -198,6 +202,7 @@ public sealed class ManagedBrowserProtocolTests
             ("response capabilities item type", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Health\",1,\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.InvalidPayload),
             ("response capabilities set", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
             ("response capabilities order", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Shutdown\",\"Health\",\"ObserveAccountIdentity\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
+            ("response capabilities duplicate", true, WithBodyValue(responseHandshake, "result", "capabilities", "[\"Health\",\"Health\"]"), ManagedBrowserProtocolError.CapabilityMismatch),
             ("response invalid schema precedes capability mismatch", true, WithBodyValue(WithBodyValue(responseHandshake, "result", "nonce", "\"short\""), "result", "capabilities", "[\"Health\",\"Shutdown\"]"), ManagedBrowserProtocolError.InvalidPayload),
             ("response health kind type", true, WithBodyValue(responseHealth, "result", "kind", "1"), ManagedBrowserProtocolError.InvalidPayload),
             ("response health kind format", true, WithBodyValue(responseHealth, "result", "kind", "\"ShuttingDown\""), ManagedBrowserProtocolError.InvalidPayload),
@@ -260,6 +265,20 @@ public sealed class ManagedBrowserProtocolTests
         var payload = Assert.IsType<ManagedBrowserHandshakeRequest>(request.Payload);
 
         Assert.Equal(ManagedBrowserProtocol.RequiredCapabilities, payload.RequiredCapabilities);
+        Assert.Equal(new[]
+        {
+            "Health", "Shutdown", "ObserveAccountIdentity", "OpenTransferSource",
+            "ReadTransferSource", "ReadTransferDirectory", "OpenTransferPicker",
+            "OpenTransferDirectoryRoot", "EnterTransferDirectory",
+            "BeginCreateTransferDirectory", "ConfirmCreateTransferDirectory",
+            "CancelTransferPicker", "ObserveTransferPickerClosed",
+            "OpenTransferTargetRoot", "EnterTransferTargetDirectory",
+            "ReadTransferTargetDirectory", "OpenTransferSourceAfterTargetRead",
+            "ObserveTransferSubmissionReady", "SubmitTransferOnce",
+            "ObserveTransferSubmissionOutcome", "ReadShareOfficialListing",
+            "SubmitShareOnce", "ObserveShareSubmissionOutcome", "SubmitExtractionCode",
+        }, payload.RequiredCapabilities);
+        Assert.Equal(24, payload.RequiredCapabilities.Count);
         Assert.DoesNotContain(Nonce, request.ToString(), StringComparison.Ordinal);
 
         var altered = HandshakeJson().Replace(
@@ -268,6 +287,25 @@ public sealed class ManagedBrowserProtocolTests
         var error = Assert.Throws<ManagedBrowserProtocolException>(() =>
             ManagedBrowserProtocol.DecodeRequest(Encoding.UTF8.GetBytes(altered)));
         Assert.Equal(ManagedBrowserProtocolError.CapabilityMismatch, error.Error);
+    }
+
+    [Fact]
+    public async Task MaximumLegalFrameIsAcceptedAndOneByteOverIsRejectedBeforePayloadRead()
+    {
+        Assert.Equal(1_048_576, ManagedBrowserProtocol.MaximumFrameBytes);
+        var legal = new byte[ManagedBrowserProtocol.MaximumFrameBytes];
+        legal[0] = (byte)'{';
+        var malformed = await Assert.ThrowsAsync<ManagedBrowserProtocolException>(() =>
+            ManagedBrowserProtocol.ReadRequestAsync(Frame(legal), CancellationToken.None));
+        Assert.Equal(ManagedBrowserProtocolError.MalformedJson, malformed.Error);
+
+        var header = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(header, ManagedBrowserProtocol.MaximumFrameBytes + 1);
+        await using var unreadable = new HeaderOnlyStream(header);
+        var tooLarge = await Assert.ThrowsAsync<ManagedBrowserProtocolException>(() =>
+            ManagedBrowserProtocol.ReadRequestAsync(unreadable, CancellationToken.None));
+        Assert.Equal(ManagedBrowserProtocolError.FrameSizeInvalid, tooLarge.Error);
+        Assert.Equal(4, unreadable.BytesRead);
     }
 
     [Fact]
@@ -375,6 +413,50 @@ public sealed class ManagedBrowserProtocolTests
     [InlineData("https://pan.baidu.com/disk/home")]
     [InlineData("https://pan.baidu.com/?query=1")]
     public void LookalikeOrNonRootRoutesAreRejected(string value)
+    {
+        Assert.Equal(ManagedBrowserRoute.Rejected, ManagedBrowserRoutePolicy.Classify(new Uri(value)));
+    }
+
+    [Fact]
+    public void ScreenshotConfirmedPanMainCanBeObservedWithoutBeingLoginProof()
+    {
+        var route = ManagedBrowserRoutePolicy.Classify(new Uri("https://pan.baidu.com/disk/main#/index?category=all"));
+
+        Assert.NotEqual(ManagedBrowserRoute.Rejected, route);
+        Assert.NotEqual(ManagedBrowserRoute.PanRoot, route);
+        Assert.True(ManagedBrowserRoutePolicy.CanObserveIdentity(route));
+        Assert.True(ManagedBrowserRoutePolicy.CanTransition(ManagedBrowserRoute.PanRoot, route));
+        Assert.True(ManagedBrowserRoutePolicy.CanTransition(ManagedBrowserRoute.PassportRoot, route));
+        Assert.True(ManagedBrowserRoutePolicy.CanTransition(route, route));
+        Assert.True(ManagedBrowserRoutePolicy.CanTransition(route, ManagedBrowserRoute.PanRoot));
+        Assert.True(ManagedBrowserRoutePolicy.CanTransition(route, ManagedBrowserRoute.PassportRoot));
+        Assert.False(ManagedBrowserRoutePolicy.CanTransition(route, ManagedBrowserRoute.Rejected));
+        Assert.False(ManagedBrowserRoutePolicy.CanTransition(ManagedBrowserRoute.Rejected, route));
+        Assert.False(ManagedBrowserRoutePolicy.CanObserveIdentity(ManagedBrowserRoute.PassportRoot));
+    }
+
+    [Fact]
+    public void BaiduHomeFlowRedirectStillClassifiesAsExactPanMain()
+    {
+        var route = ManagedBrowserRoutePolicy.Classify(
+            new Uri("https://pan.baidu.com/disk/main?from=homeFlow#/index?category=all"));
+
+        Assert.Equal(ManagedBrowserRoute.PanMain, route);
+        Assert.True(ManagedBrowserRoutePolicy.CanObserveIdentity(route));
+    }
+
+    [Theory]
+    [InlineData("http://pan.baidu.com/disk/main#/index?category=all")]
+    [InlineData("https://user@pan.baidu.com/disk/main#/index?category=all")]
+    [InlineData("https://pan.baidu.com:444/disk/main#/index?category=all")]
+    [InlineData("https://pan.baidu.com.evil.test/disk/main#/index?category=all")]
+    [InlineData("https://passport.baidu.com/disk/main#/index?category=all")]
+    [InlineData("https://pan.baidu.com/disk/main/extra#/index?category=all")]
+    [InlineData("https://pan.baidu.com/disk/main?redirect=1#/index?category=all")]
+    [InlineData("https://pan.baidu.com/disk/main#/index?category=all&redirect=1")]
+    [InlineData("https://pan.baidu.com/disk/main#/index?category=all&category=other")]
+    [InlineData("https://pan.baidu.com/disk/main#/share?category=all")]
+    public void PanMainLookalikesRemainRejected(string value)
     {
         Assert.Equal(ManagedBrowserRoute.Rejected, ManagedBrowserRoutePolicy.Classify(new Uri(value)));
     }
@@ -489,6 +571,32 @@ public sealed class ManagedBrowserProtocolTests
         public override long Length => bytes.Length;
         public override long Position { get => offset; set => throw new NotSupportedException(); }
         public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class HeaderOnlyStream(byte[] header) : Stream
+    {
+        private int offset;
+        public int BytesRead { get; private set; }
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (offset >= header.Length) throw new InvalidOperationException("Payload read must not be attempted.");
+            var count = Math.Min(buffer.Length, header.Length - offset);
+            header.AsMemory(offset, count).CopyTo(buffer);
+            offset += count;
+            BytesRead += count;
+            return ValueTask.FromResult(count);
+        }
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => throw new NotSupportedException();
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();

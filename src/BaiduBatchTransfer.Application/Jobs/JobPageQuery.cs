@@ -61,7 +61,11 @@ public sealed record OperationPageItem(
     bool CanResumeTransfer,
     bool CanResumeShare,
     int TransferAttemptCount,
-    bool CanSafelyRetryTransfer = false)
+    bool CanSafelyRetryTransfer = false,
+    string? GeneratedShareUrl = null,
+    string? GeneratedExtractionCode = null,
+    Guid? StagedImportRowId = null,
+    bool ShareEnabled = false)
 {
     public string StatusText => TransferStatusText;
 
@@ -112,9 +116,13 @@ public sealed record OperationPageItem(
             record.ShareStatus == ShareOperationStatus.ResultPending.ToString(),
             record.Status == OperationStatus.Paused.ToString(),
             record.ShareStatus == ShareOperationStatus.Paused.ToString() && shareActionGate &&
-                record.ShareLastErrorCode is not ("AwaitingExistingShareDecision" or "CancelledByUser" or "IncompatibleExistingShare"),
+            record.ShareLastErrorCode is not ("AwaitingExistingShareDecision" or "CancelledByUser" or "IncompatibleExistingShare"),
             record.TransferAttemptCount,
-            record.CanSafelyRetryTransfer);
+            record.CanSafelyRetryTransfer,
+            record.GeneratedShareUrl,
+            record.GeneratedExtractionCode,
+            record.StagedImportRowId,
+            record.ShareEnabled);
     }
 
     public override string ToString() =>

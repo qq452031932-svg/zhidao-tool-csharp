@@ -81,3 +81,70 @@ public sealed class ApplicationShutdownCoordinator
         return true;
     }
 }
+
+public sealed class ApplicationStoppingShutdownCoordinator : IDisposable
+{
+    private readonly Func<bool> tryBeginShutdown;
+    private readonly Func<Func<Task>, Task> dispatchAsync;
+    private readonly Func<Task<bool>> shutdownAsync;
+    private readonly Action completeExit;
+    private readonly Action failClosed;
+    private readonly CancellationTokenRegistration registration;
+
+    public ApplicationStoppingShutdownCoordinator(
+        CancellationToken applicationStopping,
+        Func<bool> tryBeginShutdown,
+        Func<Func<Task>, Task> dispatchAsync,
+        Func<Task<bool>> shutdownAsync,
+        Action completeExit,
+        Action failClosed)
+    {
+        this.tryBeginShutdown = tryBeginShutdown ?? throw new ArgumentNullException(nameof(tryBeginShutdown));
+        this.dispatchAsync = dispatchAsync ?? throw new ArgumentNullException(nameof(dispatchAsync));
+        this.shutdownAsync = shutdownAsync ?? throw new ArgumentNullException(nameof(shutdownAsync));
+        this.completeExit = completeExit ?? throw new ArgumentNullException(nameof(completeExit));
+        this.failClosed = failClosed ?? throw new ArgumentNullException(nameof(failClosed));
+        registration = applicationStopping.Register(OnApplicationStopping);
+    }
+
+    public void Dispose() => registration.Dispose();
+
+    private void OnApplicationStopping()
+    {
+        if (!tryBeginShutdown()) return;
+        _ = ObserveShutdownAsync();
+    }
+
+    private async Task ObserveShutdownAsync()
+    {
+        try
+        {
+            await dispatchAsync(ShutdownOnDispatcherAsync).ConfigureAwait(false);
+        }
+        catch
+        {
+            TryFailClosed();
+        }
+    }
+
+    private async Task ShutdownOnDispatcherAsync()
+    {
+        try
+        {
+            if (await shutdownAsync().ConfigureAwait(true))
+                completeExit();
+            else
+                TryFailClosed();
+        }
+        catch
+        {
+            TryFailClosed();
+        }
+    }
+
+    private void TryFailClosed()
+    {
+        try { failClosed(); }
+        catch { }
+    }
+}

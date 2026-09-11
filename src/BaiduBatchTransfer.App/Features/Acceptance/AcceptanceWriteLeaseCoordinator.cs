@@ -21,6 +21,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
     private readonly IAdapterCapabilityStore store;
     private readonly TimeProvider timeProvider;
     private readonly IAcceptanceWriteLeasePresenter? presenter;
+    private readonly RemoteWriteExecutionMode remoteWriteMode;
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, AcceptanceWriteLease> leases = [];
     private readonly HashSet<AcceptanceWriteLeaseIdentity> createdLeaseIdentities = [];
     private readonly Dictionary<AcceptanceWriteLeaseIdentity, HashSet<AdapterWriteAction>> consumedLeaseOperations = [];
@@ -35,12 +36,15 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         AcceptanceWriteLeaseOptions options,
         IAdapterCapabilityStore store,
         TimeProvider timeProvider,
-        IAcceptanceWriteLeasePresenter? presenter = null)
+        IAcceptanceWriteLeasePresenter? presenter = null,
+        RemoteWriteExecutionMode remoteWriteMode = RemoteWriteExecutionMode.Full)
     {
         this.options = options ?? throw new ArgumentNullException(nameof(options));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         this.presenter = presenter;
+        this.remoteWriteMode = remoteWriteMode;
+        if (!Enum.IsDefined(remoteWriteMode)) throw new ArgumentOutOfRangeException(nameof(remoteWriteMode));
     }
 
     public bool TryCreateLease(
@@ -75,29 +79,32 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         ArgumentNullException.ThrowIfNull(request.Capability);
         cancellationToken.ThrowIfCancellationRequested();
         var now = timeProvider.GetUtcNow();
-        try
+        if (remoteWriteMode == RemoteWriteExecutionMode.Full)
         {
-            var accepted = await store.GetAsync(
-                request.Capability.AdapterKind,
-                request.Capability.ProtocolVersion,
-                request.Capability.SelectorVersion,
-                request.Capability.BuildVersion,
-                cancellationToken).ConfigureAwait(false);
-            if (accepted is not null &&
-                accepted.AcceptedAt <= now &&
-                now - accepted.AcceptedAt <= FormalEvidenceLifetime)
+            try
             {
-                RegisterNavigationScope(request, accepted.AcceptedAt + FormalEvidenceLifetime);
-                return true;
+                var accepted = await store.GetAsync(
+                    request.Capability.AdapterKind,
+                    request.Capability.ProtocolVersion,
+                    request.Capability.SelectorVersion,
+                    request.Capability.BuildVersion,
+                    cancellationToken).ConfigureAwait(false);
+                if (accepted is not null &&
+                    accepted.AcceptedAt <= now &&
+                    now - accepted.AcceptedAt <= FormalEvidenceLifetime)
+                {
+                    RegisterNavigationScope(request, accepted.AcceptedAt + FormalEvidenceLifetime);
+                    return true;
+                }
             }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            return false;
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         if (!options.IsEnabled || !HasExactOperationIdentity(request) || request.IsRecovery) return false;
@@ -299,6 +306,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        if (remoteWriteMode != RemoteWriteExecutionMode.Full) return null;
         try
         {
             var accepted = await store.GetAsync(
@@ -406,7 +414,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                     !consumedLeaseOperations.TryGetValue(key, out var actions) ||
                     !actions.Contains(BootstrapAction(authorization.Capability.AdapterKind)!.Value))
                     return null;
-                return TryAcquireMutationPermitLocked(binding, request.Action);
+                return TryAcquireMutationPermitLocked(authorization, binding, request.Action);
             }
         }
 
@@ -425,7 +433,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         lock (sync)
         {
             if (binding.ExpiresAtUtc <= timeProvider.GetUtcNow()) return null;
-            return TryAcquireMutationPermitLocked(binding, request.Action);
+            return TryAcquireMutationPermitLocked(authorization, binding, request.Action);
         }
     }
 
@@ -457,7 +465,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                     !consumedLeaseOperations.TryGetValue(key, out var actions) ||
                     !actions.Contains(AdapterWriteAction.EnsureDirectory))
                     return null;
-                return TryAcquireTransferMutationPermitLocked(binding, request.Action);
+                return TryAcquireTransferMutationPermitLocked(
+                    authorization, binding, request.Action);
             }
         }
 
@@ -473,40 +482,84 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         lock (sync)
         {
             if (binding.ExpiresAtUtc <= timeProvider.GetUtcNow()) return null;
-            return TryAcquireTransferMutationPermitLocked(binding, request.Action);
+            return TryAcquireTransferMutationPermitLocked(
+                authorization, binding, request.Action);
         }
     }
 
     private IBaiduCandidateMutationPermit? TryAcquireTransferMutationPermitLocked(
+        AdapterWriteAuthorizationRequest owner,
         AdapterWriteAuthorizationBinding binding,
         BaiduAutomationAction action)
     {
         if (!bindingStates.TryGetValue(binding, out var state) || state.IsRevoking ||
+            state.ActiveMutationPermits != 0 ||
             !IsTransferV2ActionAllowedForStage(state.Stage, action))
             return null;
-        state.ActiveMutationPermits++;
-        return new MutationPermit(this, binding);
+        var token = new object();
+        state.ActiveMutationPermits = 1;
+        state.ActiveMutationPermitToken = token;
+        state.ActiveMutationAction = action;
+        return new MutationPermit(this, owner, binding, action, token);
     }
 
     private IBaiduCandidateMutationPermit? TryAcquireMutationPermitLocked(
+        AdapterWriteAuthorizationRequest owner,
         AdapterWriteAuthorizationBinding binding,
         BaiduAutomationAction action)
     {
         if (!bindingStates.TryGetValue(binding, out var state) || state.IsRevoking ||
+            state.ActiveMutationPermits != 0 ||
             !IsCandidateActionAllowedForStage(state.Stage, action))
             return null;
-        state.ActiveMutationPermits++;
-        return new MutationPermit(this, binding);
+        var token = new object();
+        state.ActiveMutationPermits = 1;
+        state.ActiveMutationPermitToken = token;
+        state.ActiveMutationAction = action;
+        return new MutationPermit(this, owner, binding, action, token);
     }
 
-    private void ReleaseMutationPermit(AdapterWriteAuthorizationBinding binding)
+    internal bool HasExactActiveTransferMutationPermit(
+        IBaiduCandidateMutationPermit permit,
+        AdapterWriteAuthorizationRequest owner,
+        AdapterWriteAuthorizationBinding binding,
+        BaiduAutomationAction expectedAction)
+    {
+        ArgumentNullException.ThrowIfNull(permit);
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(binding);
+        if (permit is not MutationPermit issued ||
+            !ReferenceEquals(issued.Owner, this) || issued.IsDisposed ||
+            issued.Authorization != owner ||
+            !Equals(issued.Binding, binding) || issued.Action != expectedAction ||
+            owner.Action != AdapterWriteAction.SubmitTransfer ||
+            owner.Capability.AdapterKind != "BaiduTransfer" ||
+            !BindingMatches(owner, binding))
+            return false;
+        lock (sync)
+        {
+            return bindingStates.TryGetValue(binding, out var state) &&
+                !state.IsRevoking && state.Stage == AdapterWriteAction.SubmitTransfer &&
+                state.ActiveMutationPermits == 1 &&
+                ReferenceEquals(state.ActiveMutationPermitToken, issued.Token) &&
+                state.ActiveMutationAction == expectedAction &&
+                IsTransferV2ActionAllowedForStage(state.Stage, expectedAction);
+        }
+    }
+
+    private void ReleaseMutationPermit(
+        AdapterWriteAuthorizationBinding binding, object token)
     {
         TaskCompletionSource? drained = null;
         lock (sync)
         {
-            if (!bindingStates.TryGetValue(binding, out var state) || state.ActiveMutationPermits < 1)
+            if (!bindingStates.TryGetValue(binding, out var state) ||
+                state.ActiveMutationPermits != 1 ||
+                !ReferenceEquals(state.ActiveMutationPermitToken, token))
                 return;
-            state.ActiveMutationPermits--;
+            state.ActiveMutationPermits = 0;
+            state.ActiveMutationPermitToken = null;
+            state.ActiveMutationAction = null;
             if (state.ActiveMutationPermits == 0 && state.IsRevoking)
             {
                 bindingStates.Remove(binding);
@@ -550,9 +603,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                 BaiduAutomationAction.ConfirmDirectoryCreation or
                 BaiduAutomationAction.CancelDestinationPicker,
             AdapterWriteAction.PrepareTransfer => false,
-            AdapterWriteAction.SubmitTransfer => action is BaiduAutomationAction.SetExtractionCode or
-                BaiduAutomationAction.SubmitExtraction or BaiduAutomationAction.SelectExactItems or
-                BaiduAutomationAction.OpenDestinationPicker or BaiduAutomationAction.EnterDirectory or
+            AdapterWriteAction.SubmitTransfer => action is BaiduAutomationAction.OpenDestinationPicker or
+                BaiduAutomationAction.EnterDirectory or
                 BaiduAutomationAction.ClickConfirmTransfer,
             _ => false,
         };
@@ -652,7 +704,7 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        if (!options.IsEnabled || !userConfirmed) return false;
+        if (remoteWriteMode != RemoteWriteExecutionMode.Full || !options.IsEnabled || !userConfirmed) return false;
         string evidenceHash;
         var key = AcceptanceWriteLeaseIdentity.From(request);
         lock (sync)
@@ -785,7 +837,8 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
                 completedEvidence[key] = finalHash;
             }
         }
-        if (finalHash is not null && presenter is not null)
+        if (finalHash is not null && presenter is not null &&
+            remoteWriteMode == RemoteWriteExecutionMode.Full)
         {
             try
             {
@@ -829,19 +882,38 @@ public sealed class AcceptanceWriteLeaseCoordinator : IAdapterWriteAuthorization
         public AdapterWriteAction Stage { get; set; } = stage;
         public bool IsRevoking { get; set; }
         public int ActiveMutationPermits { get; set; }
+        public object? ActiveMutationPermitToken { get; set; }
+        public BaiduAutomationAction? ActiveMutationAction { get; set; }
         public TaskCompletionSource? Drained { get; set; }
     }
 
-    private sealed class MutationPermit(
-        AcceptanceWriteLeaseCoordinator owner,
-        AdapterWriteAuthorizationBinding binding) : IBaiduCandidateMutationPermit
+    private sealed class MutationPermit : IBaiduCandidateMutationPermit
     {
         private int disposed;
+        internal MutationPermit(
+            AcceptanceWriteLeaseCoordinator owner,
+            AdapterWriteAuthorizationRequest authorization,
+            AdapterWriteAuthorizationBinding binding,
+            BaiduAutomationAction action,
+            object token)
+        {
+            Owner = owner;
+            Authorization = authorization;
+            Binding = binding;
+            Action = action;
+            Token = token;
+        }
+        internal AcceptanceWriteLeaseCoordinator Owner { get; }
+        internal AdapterWriteAuthorizationRequest Authorization { get; }
+        internal AdapterWriteAuthorizationBinding Binding { get; }
+        internal BaiduAutomationAction Action { get; }
+        internal object Token { get; }
+        internal bool IsDisposed => Volatile.Read(ref disposed) != 0;
 
         public ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref disposed, 1) == 0)
-                owner.ReleaseMutationPermit(binding);
+                Owner.ReleaseMutationPermit(Binding, Token);
             return ValueTask.CompletedTask;
         }
     }

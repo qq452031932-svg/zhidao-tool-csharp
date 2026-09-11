@@ -9,8 +9,14 @@ using System.Text.Json;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
+[CollectionDefinition(ManagedBrowserHelperIntegrityVerifierTests.CollectionName,
+    DisableParallelization = true)]
+public sealed class ManagedBrowserHelperIntegrityVerifierTestCollection;
+
+[Collection(CollectionName)]
 public sealed class ManagedBrowserHelperIntegrityVerifierTests
 {
+    public const string CollectionName = "Managed browser helper integrity isolation";
     private const string HelperIntegrationDirectoryVariable =
         "BAIDU_BATCH_TRANSFER_TEST_HELPER_DIRECTORY";
 
@@ -153,6 +159,7 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     [InlineData(0, "ManagedChromium-v1", "3.14.0")]
     [InlineData(1, "ManagedChromium-v0", "3.14.0")]
     [InlineData(1, "ManagedChromium-v1", "3.13.9")]
+    [InlineData(2, "ManagedChromium-v2", "3.14.0")]
     public async Task OldProtocolEngineOrRuntimeIsRejected(
         int protocolVersion,
         string engineVersion,
@@ -595,8 +602,6 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
     {
         var root = Path.Combine(Path.GetTempPath(), $"managed-helper-type-owner-{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
-        using var process = Process.GetCurrentProcess();
-        var handlesBefore = process.HandleCount;
         Assert.Throws<UnsafeHelperFilesystemException>(() => PinnedHelperTree.Capture(
             root, ManagedBrowserHelperIntegrityLimits.Default, CancellationToken.None,
             beforeRootOpen: () =>
@@ -604,12 +609,35 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
                 Directory.Delete(root);
                 File.WriteAllText(root, "replacement");
             }));
-        process.Refresh();
-        var handleDelta = process.HandleCount - handlesBefore;
+        // Capture opens the replacement for read without write/delete sharing. Any retained
+        // handle therefore makes this immediate exclusive, write-capable reopen fail.
+        using (var exclusive = new FileStream(
+                   root, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.Equal("replacement", new StreamReader(exclusive, leaveOpen: true).ReadToEnd());
+        }
         var deletion = Record.Exception(() => File.Delete(root));
 
         Assert.Null(deletion);
-        Assert.InRange(handleDelta, -2, 2);
+    }
+
+    [Fact]
+    public void CapturePinsManifestFilesBeyondLegacyMaxPath()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"managed-helper-long-{Guid.NewGuid():N}");
+        var nested = root;
+        while (Path.Combine(nested, "payload.txt").Length <= 270)
+            nested = Path.Combine(nested, "long-segment-1234567890");
+        Directory.CreateDirectory(nested);
+        var file = Path.Combine(nested, "payload.txt");
+        File.WriteAllText(file, "payload");
+
+        using var tree = PinnedHelperTree.Capture(
+            root, ManagedBrowserHelperIntegrityLimits.Default, CancellationToken.None);
+
+        Assert.Single(tree.Files);
+        tree.Dispose();
+        Directory.Delete(root, recursive: true);
     }
 
     private static SafeFileHandle OpenDirectoryWriter(string path) => CreateFileW(
@@ -1466,6 +1494,23 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
             unchecked((int)0xC0000022)));
     }
 
+    [Fact]
+    public void CheckedInEmbeddedManifestIsAtomicV3AndListsTransferSubmissionExactlyOnce()
+    {
+        using var stream = typeof(ManagedBrowserHelperIntegrityVerifier).Assembly
+            .GetManifestResourceStream(ManagedBrowserHelperIntegrityVerifier.EmbeddedManifestResourceName)
+            ?? throw new InvalidOperationException("The embedded helper manifest is missing.");
+        using var document = JsonDocument.Parse(stream);
+        var root = document.RootElement;
+
+        Assert.Equal(3, root.GetProperty("protocolVersion").GetInt32());
+        Assert.Equal("ManagedChromium-v3",
+            root.GetProperty("executionEngineVersion").GetString());
+        Assert.Single(root.GetProperty("files").EnumerateArray(), entry =>
+            string.Equals(entry.GetProperty("path").GetString(), "transfer_submission.py",
+                StringComparison.Ordinal));
+    }
+
     [SelectedManagedHelperPackageFact(HelperIntegrationDirectoryVariable)]
     public async Task PackagedReleaseBundleMatchesTheEmbeddedManifestAndEveryPayloadHash()
     {
@@ -1473,11 +1518,30 @@ public sealed class ManagedBrowserHelperIntegrityVerifierTests
         if (string.IsNullOrWhiteSpace(root))
             throw new InvalidOperationException("Required managed helper package directory is missing.");
 
-        using var verified = await new ManagedBrowserHelperIntegrityVerifier()
-            .VerifyAsync(root, CancellationToken.None);
+        using var manifest = typeof(ManagedBrowserHelperIntegrityVerifier).Assembly
+            .GetManifestResourceStream(ManagedBrowserHelperIntegrityVerifier.EmbeddedManifestResourceName)
+            ?? throw new InvalidOperationException("The embedded helper manifest is missing.");
+        using var manifestBytes = new MemoryStream();
+        await manifest.CopyToAsync(manifestBytes);
+        var phases = new List<ManagedBrowserHelperSnapshotPhase>();
+        var verifier = new ManagedBrowserHelperIntegrityVerifier(
+            manifestBytes.ToArray(), snapshotCreationObserver: phases.Add);
 
-        Assert.False(verified.IsDisposed);
-        Assert.Matches("^[0-9a-f]{64}$", verified.BuildIdentity);
+        VerifiedManagedBrowserHelperBundle verified;
+        try
+        {
+            verified = await verifier.VerifyAsync(root, CancellationToken.None);
+        }
+        catch (ManagedBrowserHelperIntegrityException exception)
+        {
+            throw new InvalidOperationException(
+                $"Packaged helper failed after phases: {string.Join(",", phases)}.", exception);
+        }
+        using (verified)
+        {
+            Assert.False(verified.IsDisposed);
+            Assert.Matches("^[0-9a-f]{64}$", verified.BuildIdentity);
+        }
     }
 
     [SelectedManagedHelperPackageFact(HelperIntegrationDirectoryVariable)]

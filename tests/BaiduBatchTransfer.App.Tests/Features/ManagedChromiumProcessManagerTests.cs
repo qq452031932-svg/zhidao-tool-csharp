@@ -10,7 +10,7 @@ using System.Diagnostics;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
-public sealed class ManagedChromiumProcessManagerTests
+public sealed partial class ManagedChromiumProcessManagerTests
 {
     [Fact]
     public async Task FailedTerminationRetainsPinsAndStopRetriesTheOwnedProcess()
@@ -434,6 +434,40 @@ public sealed class ManagedChromiumProcessManagerTests
         Assert.Equal(0, fixture.Processes.Process.Terminations);
         Assert.DoesNotContain(typeof(ManagedChromiumProcessManager).GetMethods(), method =>
             method.GetParameters().Any(parameter => parameter.ParameterType == typeof(Uri) || parameter.Name == "port"));
+    }
+
+    [Fact]
+    public async Task OwnedTargetCanReconnectAfterManualLoginReachesExactPanMain()
+    {
+        var fixture = await Fixture.CreateAsync();
+        await using var manager = fixture.Manager;
+        var first = (await manager.LaunchAsync(fixture.Installation, fixture.Profile)).Session!;
+        fixture.Targets.Page = new Uri("https://pan.baidu.com/disk/main#/index?category=all");
+
+        var reconnected = await manager.ReconnectAsync(first);
+
+        Assert.Equal(ManagedChromiumLaunchStatus.Ready, reconnected.Status);
+        Assert.Same(first, reconnected.Session);
+        Assert.Equal(1, fixture.Processes.LaunchCount);
+        Assert.Equal(0, fixture.Processes.Process.Terminations);
+        fixture.Targets.TargetId = "unrelated-tab";
+        Assert.Null((await manager.ReconnectAsync(first)).Session);
+    }
+
+    [Fact]
+    public async Task OwnedInitialPanMainIsReadyButUnknownFragmentStillWaits()
+    {
+        var fixture = await Fixture.CreateAsync();
+        await using var manager = fixture.Manager;
+        fixture.Targets.Page = new Uri("https://pan.baidu.com/disk/main#/index?category=all");
+
+        var initial = await manager.LaunchAsync(fixture.Installation, fixture.Profile);
+
+        Assert.Equal(ManagedChromiumLaunchStatus.Ready, initial.Status);
+        Assert.NotNull(initial.Session);
+        fixture.Targets.Page = new Uri("https://pan.baidu.com/disk/main#/index?category=all&extra=1");
+        Assert.Null((await manager.ReconnectAsync(initial.Session!)).Session);
+        Assert.Equal(0, fixture.Processes.Process.Terminations);
     }
 
     [Fact]

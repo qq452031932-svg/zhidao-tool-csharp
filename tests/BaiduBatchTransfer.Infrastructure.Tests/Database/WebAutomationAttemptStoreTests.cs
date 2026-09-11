@@ -65,14 +65,19 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
 
         Assert.True(await graph.Store.TryPersistTransferSourceEvidenceAsync(
             graph.OperationId, graph.AccountId, 1, 0, source, graph.Now.AddSeconds(1)));
+        var baseline = ExactBaseline("before");
+        var targetFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+            "target-directory", new RemotePath("/自动转存/游戏"), 1, true, true,
+            "target-generation", "baidu-user", TransferTargetInventoryScope.AllItems, baseline);
         var target = new TransferTargetPreparationEvidence(
             "target-directory", new RemotePath("/自动转存/游戏"), 1, true, true,
-            "target-generation", "baidu-user", ExactBaseline("before"), Fingerprint('2'));
+            "target-generation", "baidu-user", TransferTargetInventoryScope.AllItems,
+            baseline, targetFingerprint);
         Assert.True(await graph.Store.TryPersistTransferTargetPreparationAsync(
             graph.OperationId, graph.AccountId, 1, 1, target, graph.Now.AddSeconds(2)));
-        var submission = new TransferSubmissionEvidence(
-            source.Items.Fingerprint, target.TargetExactId, target.Baseline.Fingerprint,
-            "baidu-user", capability, graph.Now.AddSeconds(3));
+        var submission = TransferSubmissionEvidence.CreateBound(
+            Guid.NewGuid(), Fingerprint('2'), source.Items.Fingerprint, target.TargetExactId,
+            target.Baseline.Fingerprint, "baidu-user", capability, graph.Now.AddSeconds(3));
         Assert.True(await graph.Store.TryPersistTransferSubmissionAsync(
             graph.OperationId, graph.AccountId, 1, 2, submission, graph.Now.AddSeconds(3)));
         var mapping = new TransferIdentityMapping([
@@ -92,13 +97,483 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         Assert.Equal(target.TargetPath, restored.TargetPreparationEvidence.TargetPath);
         Assert.Equal(target.Baseline.Fingerprint, restored.TargetPreparationEvidence.Baseline.Fingerprint);
         Assert.Equal(target.TargetGenerationToken, restored.TargetPreparationEvidence.TargetGenerationToken);
+        Assert.Equal(TransferTargetInventoryScope.AllItems, restored.TargetPreparationEvidence.Scope);
+        Assert.Equal(targetFingerprint, restored.TargetPreparationEvidence.ObservationFingerprint);
         Assert.Equal(submission, restored.SubmissionEvidence);
         Assert.Equal("official-request", restored.OfficialRequestId);
         Assert.Equal(mapping.Fingerprint, restored.TransferIdentityMapping!.Fingerprint);
+        Assert.Equal(Fingerprint('3'), restored.OfficialObservationFingerprint);
         Assert.Equal(mapping.Entries.ToArray(), restored.TransferIdentityMapping.Entries.ToArray());
         Assert.Equal(["destination-1", "destination-2"],
             restored.AcceptedRemoteItems!.Items.Select(item => item.ExactId));
         Assert.Equal(4, restored.Revision);
+    }
+
+    [Fact]
+    public async Task EmptyOfficialResultPendingCanBindExactAcceptanceAfterSqliteReopenOnlyOnce()
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        var submitting = (await graph.Store.GetAsync(
+            graph.OperationId, graph.AccountId, 1))!;
+        Assert.True(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, 1,
+            WebAutomationAttemptState.Submitting, submitting.Revision,
+            WebAutomationAttemptState.ResultPending, observationFingerprint: null,
+            isWaitingForUser: false, graph.Now.AddSeconds(4)));
+
+        var reopened = new SqliteWebAutomationAttemptStore(graph.Factory);
+        var emptyPending = (await reopened.GetAsync(
+            graph.OperationId, graph.AccountId, 1))!;
+        Assert.Equal(WebAutomationAttemptState.ResultPending, emptyPending.State);
+        Assert.NotNull(emptyPending.SubmissionEvidence);
+        Assert.Null(emptyPending.OfficialRequestId);
+        Assert.Null(emptyPending.TransferIdentityMapping);
+        Assert.Null(emptyPending.AcceptedRemoteItems);
+        Assert.Null(emptyPending.OfficialObservationFingerprint);
+
+        var mapping = new TransferIdentityMapping([new("source", "destination")]);
+        Assert.False(await reopened.TryPersistTransferAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            Guid.NewGuid(), emptyPending.SubmissionEvidence!.ReadinessFingerprint!,
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            emptyPending.SubmissionEvidence.SubmissionId!.Value, Fingerprint('7'),
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            emptyPending.SubmissionEvidence.SubmissionId!.Value,
+            emptyPending.SubmissionEvidence.ReadinessFingerprint!, Fingerprint('6'),
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision - 1,
+            emptyPending.SubmissionEvidence.SubmissionId!.Value,
+            emptyPending.SubmissionEvidence.ReadinessFingerprint!,
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            emptyPending.SubmissionEvidence.SubmissionId!.Value,
+            emptyPending.SubmissionEvidence.ReadinessFingerprint!,
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(3)));
+        Assert.True(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, emptyPending.Revision,
+            emptyPending.SubmissionEvidence!.SubmissionId!.Value,
+            emptyPending.SubmissionEvidence.ReadinessFingerprint!,
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "late-official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+
+        var verified = (await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        Assert.Equal(WebAutomationAttemptState.ResultPending, verified.State);
+        Assert.Equal(emptyPending.Revision + 1, verified.Revision);
+        Assert.Equal("late-official-request", verified.OfficialRequestId);
+        Assert.Equal(mapping.Fingerprint, verified.TransferIdentityMapping!.Fingerprint);
+        Assert.Equal(mapping.Entries.ToArray(),
+            verified.TransferIdentityMapping.Entries.ToArray());
+        Assert.Equal(Fingerprint('9'), verified.OfficialObservationFingerprint);
+        Assert.False(await reopened.TryPersistTransferLateAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, verified.Revision,
+            emptyPending.SubmissionEvidence.SubmissionId!.Value,
+            emptyPending.SubmissionEvidence.ReadinessFingerprint!,
+            emptyPending.SubmissionEvidence.TargetBaselineFingerprint,
+            "replacement-request", mapping, Fingerprint('8'), graph.Now.AddSeconds(6)));
+    }
+
+    [Theory]
+    [InlineData(false, true, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
+    public async Task TransferAcceptanceRejectsUncountedChildEvidenceWithoutChangingParentOrChildren(
+        bool late, bool orphanMapping, bool orphanAccepted)
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        var before = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        if (late)
+        {
+            Assert.True(await graph.Store.TryAdvanceAsync(
+                graph.OperationId, graph.AccountId, 1,
+                WebAutomationAttemptState.Submitting, before.Revision,
+                WebAutomationAttemptState.ResultPending, null, false,
+                graph.Now.AddSeconds(4)));
+            before = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        }
+        await InsertUncountedAcceptanceEvidenceAsync(
+            graph, orphanMapping, orphanAccepted, ordinal: 100);
+        var mappingCount = await CountAcceptanceChildAsync(
+            graph, "WebAutomationTransferMappings");
+        var acceptedCount = await CountAcceptanceChildAsync(
+            graph, "WebAutomationAttemptAcceptedRemoteItems");
+        var mapping = new TransferIdentityMapping([new("source", "destination")]);
+
+        var changed = late
+            ? await graph.Store.TryPersistTransferLateAcceptanceAsync(
+                graph.OperationId, graph.AccountId, 1, before.Revision,
+                before.SubmissionEvidence!.SubmissionId!.Value,
+                before.SubmissionEvidence.ReadinessFingerprint!,
+                before.SubmissionEvidence.TargetBaselineFingerprint,
+                "official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5))
+            : await graph.Store.TryPersistTransferAcceptanceAsync(
+                graph.OperationId, graph.AccountId, 1, before.Revision,
+                "official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5));
+
+        Assert.False(changed);
+        Assert.Equal(mappingCount, await CountAcceptanceChildAsync(
+            graph, "WebAutomationTransferMappings"));
+        Assert.Equal(acceptedCount, await CountAcceptanceChildAsync(
+            graph, "WebAutomationAttemptAcceptedRemoteItems"));
+        var parent = (await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        Assert.Equal(before.State, parent.State);
+        Assert.Equal(before.Revision, parent.Revision);
+        Assert.Null(parent.OfficialRequestId);
+        Assert.Null(parent.TransferIdentityMapping);
+        Assert.Null(parent.AcceptedRemoteItems);
+        Assert.Null(parent.OfficialObservationFingerprint);
+
+        await DeleteAcceptanceChildrenAsync(graph);
+        var cleaned = (await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        Assert.Equal(before.State, cleaned.State);
+        Assert.Equal(before.Revision, cleaned.Revision);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TransferAcceptanceSecondChildInsertFailureRollsBackParentAndFirstInsert(
+        bool late)
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        var before = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        if (late)
+        {
+            Assert.True(await graph.Store.TryAdvanceAsync(
+                graph.OperationId, graph.AccountId, 1,
+                WebAutomationAttemptState.Submitting, before.Revision,
+                WebAutomationAttemptState.ResultPending, null, false,
+                graph.Now.AddSeconds(4)));
+            before = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        }
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var trigger = connection.CreateCommand())
+        {
+            trigger.CommandText = """
+                CREATE TRIGGER RejectAcceptedEvidenceInsert
+                BEFORE INSERT ON WebAutomationAttemptAcceptedRemoteItems
+                WHEN NEW.ItemOrdinal=0
+                BEGIN SELECT RAISE(ABORT,'synthetic transfer acceptance failure'); END;
+                """;
+            await trigger.ExecuteNonQueryAsync();
+        }
+        var mapping = new TransferIdentityMapping([new("source", "destination")]);
+
+        if (late)
+        {
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                graph.Store.TryPersistTransferLateAcceptanceAsync(
+                    graph.OperationId, graph.AccountId, 1, before.Revision,
+                    before.SubmissionEvidence!.SubmissionId!.Value,
+                    before.SubmissionEvidence.ReadinessFingerprint!,
+                    before.SubmissionEvidence.TargetBaselineFingerprint,
+                    "official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        }
+        else
+        {
+            await Assert.ThrowsAnyAsync<Exception>(() =>
+                graph.Store.TryPersistTransferAcceptanceAsync(
+                    graph.OperationId, graph.AccountId, 1, before.Revision,
+                    "official-request", mapping, Fingerprint('9'), graph.Now.AddSeconds(5)));
+        }
+
+        Assert.Equal(0, await CountAcceptanceChildAsync(
+            graph, "WebAutomationTransferMappings"));
+        Assert.Equal(0, await CountAcceptanceChildAsync(
+            graph, "WebAutomationAttemptAcceptedRemoteItems"));
+        var parent = (await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        Assert.Equal(before.State, parent.State);
+        Assert.Equal(before.Revision, parent.Revision);
+        Assert.Null(parent.OfficialRequestId);
+        Assert.Null(parent.TransferIdentityMapping);
+        Assert.Null(parent.AcceptedRemoteItems);
+        Assert.Null(parent.OfficialObservationFingerprint);
+    }
+
+    [Fact]
+    public async Task TransferSubmissionRequiresLocalBindingAndRoundTripsTheExactPair()
+    {
+        var graph = await CreateTargetPreparedAttemptAsync();
+        var prepared = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        var source = prepared.SourceEvidence!;
+        var target = prepared.TargetPreparationEvidence!;
+        var unbound = new TransferSubmissionEvidence(
+            source.Items.Fingerprint, target.TargetExactId, target.Baseline.Fingerprint,
+            source.BaiduUserId, source.Capability, graph.Now.AddSeconds(3));
+
+        Assert.False(await graph.Store.TryPersistTransferSubmissionAsync(
+            graph.OperationId, graph.AccountId, 1, prepared.Revision, unbound, graph.Now.AddSeconds(3)));
+
+        var submissionId = Guid.NewGuid();
+        var bound = TransferSubmissionEvidence.CreateBound(
+            submissionId, Fingerprint('8'), source.Items.Fingerprint, target.TargetExactId,
+            target.Baseline.Fingerprint, source.BaiduUserId, source.Capability, graph.Now.AddSeconds(3));
+        Assert.True(await graph.Store.TryPersistTransferSubmissionAsync(
+            graph.OperationId, graph.AccountId, 1, prepared.Revision, bound, graph.Now.AddSeconds(3)));
+
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(submissionId, restored!.SubmissionEvidence!.SubmissionId);
+        Assert.Equal(Fingerprint('8'), restored.SubmissionEvidence.ReadinessFingerprint);
+        Assert.True(restored.SubmissionEvidence.IsLocallyBound);
+    }
+
+    [Fact]
+    public async Task OneSidedSubmissionBindingCannotBeLoadedButLegacyUnboundRowsRemainReadable()
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE WebAutomationAttempts SET SubmissionReadinessFingerprint=NULL
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        var reopened = new SqliteWebAutomationAttemptStore(graph.Factory);
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            reopened.GetAsync(graph.OperationId, graph.AccountId, 1));
+        Assert.Equal("WEB_SUBMISSION_BINDING_MISMATCH", error.Message);
+
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE WebAutomationAttempts SET SubmissionId=NULL
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        var legacy = await reopened.GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.NotNull(legacy);
+        Assert.False(legacy.SubmissionEvidence!.IsLocallyBound);
+    }
+
+    [Theory]
+    [InlineData("SubmissionId")]
+    [InlineData("SubmissionReadinessFingerprint")]
+    public async Task GenericSuccessRejectsEveryHalfBoundManagedTransferRow(string clearedColumn)
+    {
+        var (graph, pending, _) = await CreateOfficiallyAcceptedAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"""
+                UPDATE WebAutomationAttempts SET {clearedColumn}=NULL
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        Assert.False(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, 1, WebAutomationAttemptState.ResultPending,
+            pending.Revision, WebAutomationAttemptState.Succeeded, Fingerprint('f'), false,
+            graph.Now.AddSeconds(5)));
+
+        await using var reopened = await graph.Factory.OpenConnectionAsync();
+        await using var verify = reopened.CreateCommand();
+        verify.CommandText = """
+            SELECT COUNT(*) FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1
+              AND State='ResultPending' AND Revision=$revision;
+            """;
+        verify.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+        verify.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+        verify.Parameters.AddWithValue("$revision", pending.Revision);
+        Assert.Equal(1L, Convert.ToInt64(await verify.ExecuteScalarAsync()));
+    }
+
+    [Fact]
+    public async Task KnownNotDispatchedResolutionRequiresExactDurableSubmissionCasAndIsIdempotent()
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        var current = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        var submission = current.SubmissionEvidence!;
+
+        Assert.False(await graph.Store.TryResolveTransferKnownNotDispatchedAsync(
+            graph.OperationId, graph.AccountId, 1, current.Revision,
+            Guid.NewGuid(), submission.ReadinessFingerprint!, graph.Now.AddSeconds(4)));
+        Assert.False(await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .TryResolveTransferKnownNotDispatchedAsync(
+                graph.OperationId, graph.AccountId, 1, current.Revision,
+                submission.SubmissionId!.Value, Fingerprint('9'), graph.Now.AddSeconds(4)));
+        var rejected = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.Submitting, rejected!.State);
+        Assert.Equal(current.Revision, rejected.Revision);
+
+        Assert.True(await graph.Store.TryResolveTransferKnownNotDispatchedAsync(
+            graph.OperationId, graph.AccountId, 1, current.Revision,
+            submission.SubmissionId.Value, submission.ReadinessFingerprint!, graph.Now.AddSeconds(4)));
+        Assert.False(await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .TryResolveTransferKnownNotDispatchedAsync(
+                graph.OperationId, graph.AccountId, 1, current.Revision,
+                submission.SubmissionId.Value, submission.ReadinessFingerprint!, graph.Now.AddSeconds(4)));
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.DefinitelyNotSubmitted, restored!.State);
+        Assert.Equal(current.Revision + 1, restored.Revision);
+        Assert.Equal(submission, restored.SubmissionEvidence);
+    }
+
+    [Fact]
+    public async Task TargetConfirmationAloneFinalizesOfficiallyBoundTransferAndSeparatesObservations()
+    {
+        var (graph, pending, mapping) = await CreateOfficiallyAcceptedAttemptAsync();
+        Assert.False(await graph.Store.TryAdvanceAsync(
+            graph.OperationId, graph.AccountId, 1, WebAutomationAttemptState.ResultPending,
+            pending.Revision, WebAutomationAttemptState.Succeeded, Fingerprint('f'), false,
+            graph.Now.AddSeconds(5)));
+        var confirmation = TransferTargetConfirmationEvidence.Create(
+            pending.SubmissionEvidence!, pending.OfficialRequestId!, mapping,
+            pending.TargetPreparationEvidence!, ExactBaseline("before", "destination"),
+            Fingerprint('4'), graph.Now.AddSeconds(5));
+
+        Assert.True(await graph.Store.TryPersistTransferTargetConfirmationAsync(
+            graph.OperationId, graph.AccountId, 1, pending.Revision, confirmation));
+        Assert.False(await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .TryPersistTransferTargetConfirmationAsync(
+                graph.OperationId, graph.AccountId, 1, pending.Revision, confirmation));
+
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, restored!.State);
+        Assert.Equal(Fingerprint('3'), restored.OfficialObservationFingerprint);
+        Assert.Equal(Fingerprint('4'), restored.ObservationFingerprint);
+        Assert.Equal(confirmation, restored.TargetConfirmationEvidence);
+        Assert.Equal(pending.Revision + 1, restored.Revision);
+    }
+
+    [Fact]
+    public async Task TargetConfirmationCannotReplaceOfficialEvidenceOrUseAnotherSubmissionBinding()
+    {
+        var (graph, pending, mapping) = await CreateOfficiallyAcceptedAttemptAsync();
+        var differentSubmission = TransferSubmissionEvidence.CreateBound(
+            pending.SubmissionEvidence!.SubmissionId!.Value, Fingerprint('9'),
+            pending.SubmissionEvidence.SourceFingerprint, pending.SubmissionEvidence.TargetExactId,
+            pending.SubmissionEvidence.TargetBaselineFingerprint, pending.SubmissionEvidence.BaiduUserId,
+            pending.SubmissionEvidence.Capability, pending.SubmissionEvidence.MarkedSubmittingAtUtc);
+        var rejected = TransferTargetConfirmationEvidence.Create(
+            differentSubmission, pending.OfficialRequestId!, mapping, pending.TargetPreparationEvidence!,
+            ExactBaseline("before", "destination"), Fingerprint('4'), graph.Now.AddSeconds(5));
+
+        Assert.False(await graph.Store.TryPersistTransferTargetConfirmationAsync(
+            graph.OperationId, graph.AccountId, 1, pending.Revision, rejected));
+
+        var restored = await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1);
+        Assert.Equal(WebAutomationAttemptState.ResultPending, restored!.State);
+        Assert.Equal("official-request", restored.OfficialRequestId);
+        Assert.Equal(mapping.Fingerprint, restored.TransferIdentityMapping!.Fingerprint);
+        Assert.Equal(Fingerprint('3'), restored.OfficialObservationFingerprint);
+        Assert.Null(restored.TargetConfirmationEvidence);
+    }
+
+    [Fact]
+    public async Task LegacyTargetFingerprintCannotBeLoadedAsAnAllItemsBaseline()
+    {
+        var graph = await CreateTargetPreparedAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE WebAutomationAttempts
+                SET TargetObservationFingerprint=$legacy,ObservationFingerprint=$legacy
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$legacy", Fingerprint('2'));
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new SqliteWebAutomationAttemptStore(graph.Factory).GetAsync(
+                graph.OperationId, graph.AccountId, 1));
+
+        Assert.Equal("WEB_TARGET_OBSERVATION_FINGERPRINT_MISMATCH", error.Message);
+    }
+
+    [Fact]
+    public async Task TargetCountMismatchCannotBeLoadedAsACompleteBaseline()
+    {
+        var graph = await CreateTargetPreparedAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE WebAutomationAttempts SET TargetTotalCount=2
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new SqliteWebAutomationAttemptStore(graph.Factory).GetAsync(
+                graph.OperationId, graph.AccountId, 1));
+
+        Assert.Equal("WEB_TARGET_COUNT_MISMATCH", error.Message);
+    }
+
+    [Theory]
+    [InlineData("TargetExactId", " target-directory ", "WEB_TARGET_EXACT_ID_NOT_CANONICAL")]
+    [InlineData("TargetPath", "/自动转存//游戏", "WEB_TARGET_PATH_NOT_CANONICAL")]
+    [InlineData("TargetPath", "\\\\自动转存\\\\游戏", "WEB_TARGET_PATH_NOT_CANONICAL")]
+    [InlineData("TargetGenerationToken", " target-generation ", "WEB_TARGET_GENERATION_NOT_CANONICAL")]
+    [InlineData("BaiduUserId", " baidu-user ", "WEB_TARGET_UID_NOT_CANONICAL")]
+    public async Task NonCanonicalRawTargetFieldsCannotReuseTheCanonicalFingerprint(
+        string columnName,
+        string mutatedValue,
+        string expectedError)
+    {
+        var graph = await CreateTargetPreparedAttemptAsync();
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"""
+                UPDATE WebAutomationAttempts SET {columnName}=$mutated
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$mutated", mutatedValue);
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new SqliteWebAutomationAttemptStore(graph.Factory).GetAsync(
+                graph.OperationId, graph.AccountId, 1));
+
+        Assert.Equal(expectedError, error.Message);
+        Assert.DoesNotContain(mutatedValue, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -728,6 +1203,57 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         return graph;
     }
 
+    private async Task<Graph> CreateTargetPreparedAttemptAsync()
+    {
+        var graph = await CreateAsync();
+        await SetTransferGenerationAsync(graph, 1);
+        Assert.True(await graph.Store.BeginAsync(WebAutomationAttemptRecord.Create(
+            graph.OperationId, graph.AccountId, 1, WebAutomationOwnerKind.Transfer, graph.Now)));
+        var capability = Capability();
+        Assert.True(await graph.Store.TryPersistTransferSourceEvidenceAsync(
+            graph.OperationId, graph.AccountId, 1, 0,
+            SourceEvidence(capability, '1'), graph.Now.AddSeconds(1)));
+        var baseline = ExactBaseline("before");
+        var fingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+            "target-directory", new RemotePath("/自动转存/游戏"), 1, true, true,
+            "target-generation", "baidu-user", TransferTargetInventoryScope.AllItems, baseline);
+        var target = new TransferTargetPreparationEvidence(
+            "target-directory", new RemotePath("/自动转存/游戏"), 1, true, true,
+            "target-generation", "baidu-user", TransferTargetInventoryScope.AllItems,
+            baseline, fingerprint);
+        Assert.True(await graph.Store.TryPersistTransferTargetPreparationAsync(
+            graph.OperationId, graph.AccountId, 1, 1, target, graph.Now.AddSeconds(2)));
+        return graph;
+    }
+
+    private async Task<Graph> CreateBoundSubmittingAttemptAsync()
+    {
+        var graph = await CreateTargetPreparedAttemptAsync();
+        var prepared = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        var source = prepared.SourceEvidence!;
+        var target = prepared.TargetPreparationEvidence!;
+        var submission = TransferSubmissionEvidence.CreateBound(
+            Guid.NewGuid(), Fingerprint('8'), source.Items.Fingerprint, target.TargetExactId,
+            target.Baseline.Fingerprint, source.BaiduUserId, source.Capability, graph.Now.AddSeconds(3));
+        Assert.True(await graph.Store.TryPersistTransferSubmissionAsync(
+            graph.OperationId, graph.AccountId, 1, prepared.Revision, submission, graph.Now.AddSeconds(3)));
+        return graph;
+    }
+
+    private async Task<(Graph Graph, WebAutomationAttemptRecord Pending, TransferIdentityMapping Mapping)>
+        CreateOfficiallyAcceptedAttemptAsync()
+    {
+        var graph = await CreateBoundSubmittingAttemptAsync();
+        var submitting = (await graph.Store.GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        var mapping = new TransferIdentityMapping([new("source", "destination")]);
+        Assert.True(await graph.Store.TryPersistTransferAcceptanceAsync(
+            graph.OperationId, graph.AccountId, 1, submitting.Revision,
+            "official-request", mapping, Fingerprint('3'), graph.Now.AddSeconds(4)));
+        var pending = (await new SqliteWebAutomationAttemptStore(graph.Factory)
+            .GetAsync(graph.OperationId, graph.AccountId, 1))!;
+        return (graph, pending, mapping);
+    }
+
     private async Task<Graph> CreateAsync(
         int maximumBaselineItemCount = 100_000,
         int baselineReadPageSize = 1_000,
@@ -785,13 +1311,13 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
               InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,ProductName,
               FileIdentity,State,Revision,CreatedAt,UpdatedAt)
             SELECT $installation,$family,$browserDirectory,$executable,'Google LLC','Google Chrome',$fileIdentity,
-                   'Retired',0,$now,$now
+                   'Active',1,$now,$now
             WHERE $managed=1;
             INSERT INTO ManagedBrowserSessions(
               SessionId,AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,ProfileOwnershipId,
               State,Revision,CreatedAt,UpdatedAt)
             SELECT $session,$account,'owner',$installation,$family,$transferProfile,$ownership,
-                   'Retired',0,$now,$now
+                   'Active',1,$now,$now
             WHERE $managed=1;
             INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,
               OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,QueueOrder)
@@ -862,6 +1388,86 @@ public sealed class WebAutomationAttemptStoreTests : IDisposable
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task InsertUncountedAcceptanceEvidenceAsync(
+        Graph graph, bool mapping, bool accepted, int ordinal)
+    {
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        if (mapping)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO WebAutomationTransferMappings(
+                  OperationId,AccountId,Generation,ItemOrdinal,SourceRemoteItemId,
+                  SourceCanonicalSortKey,DestinationRemoteItemId,DestinationCanonicalSortKey)
+                VALUES($operation,$account,1,$ordinal,$source,$sourceSort,$destination,$destinationSort);
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$ordinal", ordinal);
+            command.Parameters.AddWithValue("$source", "orphan-source");
+            command.Parameters.AddWithValue("$sourceSort",
+                RemoteItemIdentitySet.GetCanonicalSortKey("orphan-source"));
+            command.Parameters.AddWithValue("$destination", "orphan-destination");
+            command.Parameters.AddWithValue("$destinationSort",
+                RemoteItemIdentitySet.GetCanonicalSortKey("orphan-destination"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+        if (accepted)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,$ordinal,$item,$sort);
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$ordinal", ordinal);
+            command.Parameters.AddWithValue("$item", "orphan-accepted");
+            command.Parameters.AddWithValue("$sort",
+                RemoteItemIdentitySet.GetCanonicalSortKey("orphan-accepted"));
+            Assert.Equal(1, await command.ExecuteNonQueryAsync());
+        }
+    }
+
+    private static async Task<long> CountAcceptanceChildAsync(Graph graph, string table)
+    {
+        Assert.True(table is "WebAutomationTransferMappings" or
+            "WebAutomationAttemptAcceptedRemoteItems");
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT COUNT(*) FROM {table}
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """;
+        command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task DeleteAcceptanceChildrenAsync(Graph graph)
+    {
+        await using var connection = await graph.Factory.OpenConnectionAsync();
+        await using var transaction = connection.BeginTransaction();
+        foreach (var table in new[]
+        {
+            "WebAutomationTransferMappings",
+            "WebAutomationAttemptAcceptedRemoteItems",
+        })
+        {
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"""
+                DELETE FROM {table}
+                WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+                """;
+            command.Parameters.AddWithValue("$operation", graph.OperationId.ToString("D"));
+            command.Parameters.AddWithValue("$account", graph.AccountId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+        await transaction.CommitAsync();
     }
 
     public void Dispose()

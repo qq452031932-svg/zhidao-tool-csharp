@@ -1,6 +1,15 @@
 namespace BaiduBatchTransfer.App.Services;
 
-public sealed record BaiduLoginWindowRequest(Guid AccountId, Guid OwnershipToken)
+public enum BaiduLoginWindowPurpose
+{
+    AddAccount,
+    RefreshAccountSession,
+}
+
+public sealed record BaiduLoginWindowRequest(
+    Guid AccountId,
+    Guid OwnershipToken,
+    BaiduLoginWindowPurpose Purpose = BaiduLoginWindowPurpose.AddAccount)
 {
     public override string ToString() =>
         "BaiduLoginWindowRequest { AccountId = [REDACTED], OwnershipToken = [REDACTED] }";

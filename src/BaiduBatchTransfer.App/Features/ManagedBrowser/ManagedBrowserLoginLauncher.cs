@@ -13,7 +13,18 @@ public enum ManagedBrowserLoginStatus
     BrowserFamilyChoiceRequired, SetupUnavailable
 }
 
-public sealed record ManagedBrowserLoginResult(ManagedBrowserLoginStatus Status)
+public enum ManagedBrowserLoginStage
+{
+    None, AccountRead, SetupReady, LifecyclePrepared, ManagerEntered,
+    ManagerProfilePinned, ManagerExecutablePinned, ManagerProcessLaunched,
+    ManagerRootVerified, ManagerPortRead, ManagerTargetBound, BrowserLaunched,
+    HelperStarted, HelperHealthy, IdentityReceived, IdentityObserved,
+    BrowserReconnected, AccountBound
+}
+
+public sealed record ManagedBrowserLoginResult(ManagedBrowserLoginStatus Status,
+    ManagedBrowserLoginStage Stage = ManagedBrowserLoginStage.None,
+    string? DiagnosticCode = null)
 {
     public string SafeMessage => Status switch
     {
@@ -29,6 +40,7 @@ public sealed record ManagedBrowserLoginResult(ManagedBrowserLoginStatus Status)
         ManagedBrowserLoginStatus.BrowserFamilyChoiceRequired => "请选择 Chrome 或 Edge。",
         ManagedBrowserLoginStatus.SetupUnavailable => "浏览器目录尚未就绪，请重新选择。",
         ManagedBrowserLoginStatus.Conflict => "账号或浏览器状态已变化，请重试。",
+        ManagedBrowserLoginStatus.BrowserUnavailable => $"专用浏览器暂不可用（诊断：{Stage}/{DiagnosticCode ?? "None"}），请检查后重试。",
         _ => "专用浏览器暂不可用，请检查后重试。"
     };
 }
@@ -82,13 +94,14 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         ArgumentNullException.ThrowIfNull(request);
         if (family is not (null or BrowserFamily.Chrome or BrowserFamily.Edge))
             throw new ArgumentOutOfRangeException(nameof(family));
+        var progress = new LoginProgress();
         try
         {
             using var lease = await lifecycle.AcquireAccountLeaseAsync(request.AccountId, cancellationToken).ConfigureAwait(false);
-            return await LaunchCoreAsync(request, family, reselect, cancellationToken).ConfigureAwait(false);
+            return await LaunchCoreAsync(request, family, reselect, progress, cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { return Result(ManagedBrowserLoginStatus.Cancelled); }
-        catch (TimeoutException) { return Result(ManagedBrowserLoginStatus.TimedOut); }
+        catch (OperationCanceledException) { return Result(ManagedBrowserLoginStatus.Cancelled, progress.Stage); }
+        catch (TimeoutException) { return Result(ManagedBrowserLoginStatus.TimedOut, progress.Stage); }
         catch (ManagedBrowserHelperClientException error)
         {
             return Result(error.Error switch
@@ -96,19 +109,24 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
                 ManagedBrowserHelperClientError.Cancelled => ManagedBrowserLoginStatus.Cancelled,
                 ManagedBrowserHelperClientError.TimedOut => ManagedBrowserLoginStatus.TimedOut,
                 _ => ManagedBrowserLoginStatus.BrowserUnavailable
-            });
+            }, progress.Stage, error.Error.ToString());
         }
-        catch (Exception)
+        catch (ManagedBrowserHelperIntegrityException error)
+        { return Result(ManagedBrowserLoginStatus.BrowserUnavailable, progress.Stage,
+            error.Phase is null ? error.Error.ToString() : $"{error.Error}@{error.Phase}"); }
+        catch (Exception error)
         {
             // Never surface arbitrary browser/helper/SQLite details (UIDs, paths, URLs or page data).
-            return Result(ManagedBrowserLoginStatus.BrowserUnavailable);
+            var code = error is IOException ? $"IOException-{error.HResult & 0xffff}" : error.GetType().Name;
+            return Result(ManagedBrowserLoginStatus.BrowserUnavailable, progress.Stage, code);
         }
     }
 
     private async Task<ManagedBrowserLoginResult> LaunchCoreAsync(ManagedBrowserLoginRequest request,
-        BrowserFamily? family, bool reselect, CancellationToken token)
+        BrowserFamily? family, bool reselect, LoginProgress progress, CancellationToken token)
     {
         var account = await ReadAccountAsync(request.AccountId, token).ConfigureAwait(false);
+        progress.Stage = ManagedBrowserLoginStage.AccountRead;
         if (request.Kind == ManagedBrowserLoginRequestKind.AddNew ? account is not null : !IsActive(account))
             return Result(request.Kind == ManagedBrowserLoginRequestKind.AddNew ? ManagedBrowserLoginStatus.Conflict : ManagedBrowserLoginStatus.AccountUnavailable);
         var selected = reselect ? await setup.ReselectAsync(token).ConfigureAwait(false) : await setup.EnsureSelectedAsync(token).ConfigureAwait(false);
@@ -118,6 +136,7 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         if (family is null && selected.Candidates.Count != 1) return Result(ManagedBrowserLoginStatus.BrowserFamilyChoiceRequired);
         var candidate = family is null ? selected.Candidates.Single() : selected.Candidates.SingleOrDefault(x => x.BrowserFamily == family);
         if (candidate is null) return Result(ManagedBrowserLoginStatus.SetupUnavailable);
+        progress.Stage = ManagedBrowserLoginStage.SetupReady;
 
         var installation = candidate.Identity;
         var known = await store.LoadInstallationByFileIdentityAsync(installation.FileIdentity, token).ConfigureAwait(false);
@@ -160,11 +179,23 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
             pending = new(installation, profile, !switching && current is not null ? current.SessionId : Guid.NewGuid());
             lifecycle.Track(pending, alreadyBound: current is not null && !switching); // Before launch: never lose pending ownership.
         }
-        var launched = await manager.LaunchAsync(installation, profile, token).ConfigureAwait(false);
+        progress.Stage = ManagedBrowserLoginStage.LifecyclePrepared;
+        var launched = await manager.LaunchAsync(installation, profile, token,
+            stage => progress.Stage = stage switch
+            {
+                ManagedChromiumLaunchStage.Entered => ManagedBrowserLoginStage.ManagerEntered,
+                ManagedChromiumLaunchStage.ProfilePinned => ManagedBrowserLoginStage.ManagerProfilePinned,
+                ManagedChromiumLaunchStage.ExecutablePinned => ManagedBrowserLoginStage.ManagerExecutablePinned,
+                ManagedChromiumLaunchStage.ProcessLaunched => ManagedBrowserLoginStage.ManagerProcessLaunched,
+                ManagedChromiumLaunchStage.RootVerified => ManagedBrowserLoginStage.ManagerRootVerified,
+                ManagedChromiumLaunchStage.PortRead => ManagedBrowserLoginStage.ManagerPortRead,
+                _ => ManagedBrowserLoginStage.ManagerTargetBound,
+            }).ConfigureAwait(false);
         if (launched.Status != ManagedChromiumLaunchStatus.Ready || launched.Session is null)
             return Result(ManagedBrowserLoginStatus.Pending);
         var handle = launched.Session;
-        var identity = await ObserveAsync(handle, token).ConfigureAwait(false);
+        progress.Stage = ManagedBrowserLoginStage.BrowserLaunched;
+        var identity = await ObserveAsync(handle, progress, token).ConfigureAwait(false);
         if (identity.Kind != ManagedBrowserIdentityResultKind.Observed)
             return Result(identity.Kind switch
             {
@@ -173,6 +204,7 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
                 ManagedBrowserIdentityResultKind.Cancelled => ManagedBrowserLoginStatus.Cancelled,
                 _ => ManagedBrowserLoginStatus.BrowserUnavailable
             });
+        progress.Stage = ManagedBrowserLoginStage.IdentityObserved;
         token.ThrowIfCancellationRequested();
         if (request.Kind == ManagedBrowserLoginRequestKind.ReloginExisting)
         {
@@ -183,6 +215,7 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         // Re-prove the still-owned browser after observation before binding any durable identity.
         if ((await manager.ReconnectAsync(handle, token).ConfigureAwait(false)).Session is null)
             return Result(ManagedBrowserLoginStatus.Pending);
+        progress.Stage = ManagedBrowserLoginStage.BrowserReconnected;
         var session = !switching && current is not null ? current.Session : new ManagedBrowserSessionReference(pending.SessionId,
             installation.InstallationId, request.AccountId, identity.StableBaiduUserId!, installation.BrowserFamily,
             profile.ProfileId.ToString("N"), profile.OwnershipId.ToString("N"));
@@ -200,6 +233,7 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         }
         var expected = current is null ? null : new StoredManagedBrowserSession(current.Session, ManagedBrowserSessionLifecycleState.Active, current.SessionRevision);
         var bound = await accounts.BindAsync(request, installation, session, expected, token).ConfigureAwait(false);
+        progress.Stage = ManagedBrowserLoginStage.AccountBound;
         if (bound == ManagedBrowserBindingStatus.Bound) lifecycle.Bound(profile);
         return Result(bound switch
         {
@@ -212,19 +246,23 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         });
     }
 
-    private async Task<ManagedBrowserIdentityResult> ObserveAsync(ManagedChromiumSessionHandle handle, CancellationToken token)
+    private async Task<ManagedBrowserIdentityResult> ObserveAsync(ManagedChromiumSessionHandle handle,
+        LoginProgress progress, CancellationToken token)
     {
         // Complete helper cleanup before the durable commit. A cleanup failure cannot disguise a saved binding.
         await using var helper = await startHelper(token).ConfigureAwait(false);
+        progress.Stage = ManagedBrowserLoginStage.HelperStarted;
         var operationId = Guid.NewGuid();
         ManagedBrowserRequest BoundRequest(ManagedBrowserAction action, ManagedBrowserRequestPayload payload) =>
             new(Guid.NewGuid(), operationId, handle.Profile.AccountId, 1, action, payload);
         var health = BoundRequest(ManagedBrowserAction.Health, ManagedBrowserRequestPayload.Empty);
         ManagedBrowserProtocol.ValidateResponseFor(health, await helper.SendAsync(health, token).ConfigureAwait(false));
+        progress.Stage = ManagedBrowserLoginStage.HelperHealthy;
         var observe = BoundRequest(ManagedBrowserAction.ObserveAccountIdentity,
             new ManagedBrowserObserveAccountIdentityRequest(handle.BrowserId, handle.TargetId, handle.Endpoint, 5000));
         var response = await helper.SendAsync(observe, token).ConfigureAwait(false);
         ManagedBrowserProtocol.ValidateResponseFor(observe, response);
+        progress.Stage = ManagedBrowserLoginStage.IdentityReceived;
         return (ManagedBrowserIdentityResult)response.Result;
     }
 
@@ -238,5 +276,11 @@ public sealed class ManagedBrowserLoginLauncher : IManagedBrowserLoginOperations
         x.BrowserFamily == y.BrowserFamily && x.FileIdentity == y.FileIdentity && x.Publisher == y.Publisher && x.ProductName == y.ProductName &&
         string.Equals(x.ExecutablePath, y.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
         string.Equals(x.InstallationDirectory, y.InstallationDirectory, StringComparison.OrdinalIgnoreCase);
-    private static ManagedBrowserLoginResult Result(ManagedBrowserLoginStatus status) => new(status);
+    private sealed class LoginProgress
+    {
+        public ManagedBrowserLoginStage Stage { get; set; }
+    }
+    private static ManagedBrowserLoginResult Result(ManagedBrowserLoginStatus status,
+        ManagedBrowserLoginStage stage = ManagedBrowserLoginStage.None,
+        string? diagnosticCode = null) => new(status, stage, diagnosticCode);
 }

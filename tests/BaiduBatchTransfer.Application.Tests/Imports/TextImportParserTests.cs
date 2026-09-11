@@ -5,6 +5,39 @@ namespace BaiduBatchTransfer.Application.Tests.Imports;
 
 public sealed class TextImportParserTests
 {
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task OnePasteOfMultilineTitledSharesReturnsOneRowPerLink(int count)
+    {
+        var text = string.Join("\r\n", Enumerable.Range(1, count)
+            .Select(index => $"课程资料{index}\r\nhttps://pan.baidu.com/s/course-{index} 提取码：a1B{index}"));
+
+        var rows = await ReadAllAsync(new TextImportParser().ParseAsync(new StringReader(text)));
+
+        Assert.Equal(count, rows.Count);
+        for (var index = 1; index <= count; index++)
+        {
+            Assert.Equal($"课程资料{index}", rows[index - 1].SourceTitle);
+            Assert.Equal($"https://pan.baidu.com/s/course-{index}", rows[index - 1].ShareUrl);
+            Assert.Equal($"a1B{index}", rows[index - 1].ExtractionCode);
+            Assert.Null(rows[index - 1].ValidationError);
+        }
+    }
+
+    [Fact]
+    public async Task PlainTitleLineIsAppliedToTheFollowingShareLinkWithoutCreatingAnInvalidRow()
+    {
+        const string text = "[安卓]太空队生存v1.0.02免费购物\nhttps://pan.baidu.com/s/1rf-nQSX7pDPwTOe8WCi_7g?pwd=1111";
+
+        var rows = await ReadAllAsync(new TextImportParser().ParseAsync(new StringReader(text)));
+
+        var row = Assert.Single(rows);
+        Assert.Equal("https://pan.baidu.com/s/1rf-nQSX7pDPwTOe8WCi_7g?pwd=1111", row.ShareUrl);
+        Assert.Equal("[安卓]太空队生存v1.0.02免费购物", row.SourceTitle);
+        Assert.Null(row.ValidationError);
+    }
+
     [Fact]
     public async Task MixedChineseProseProducesOneRowPerLinkAndAssociatesOnlyAdjacentCode()
     {

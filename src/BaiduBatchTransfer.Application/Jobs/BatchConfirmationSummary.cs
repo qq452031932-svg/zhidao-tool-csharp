@@ -19,7 +19,8 @@ public sealed class BatchAccountDraft
         int targetItemCount,
         int targetSuccessCount,
         BatchAccountSelectionDecision selectionDecision,
-        bool shareEnabled = true)
+        bool shareEnabled = true,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(priorityOrder);
         ArgumentOutOfRangeException.ThrowIfNegative(targetItemCount);
@@ -35,6 +36,7 @@ public sealed class BatchAccountDraft
             throw new ArgumentOutOfRangeException(nameof(selectionDecision));
         SelectionDecision = selectionDecision;
         ShareEnabled = shareEnabled;
+        ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(accountId);
     }
 
     public Guid AccountId { get; }
@@ -45,6 +47,7 @@ public sealed class BatchAccountDraft
     public BatchAccountSelectionDecision SelectionDecision { get; }
     public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
     public bool ShareEnabled { get; }
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
 
     public override string ToString() =>
         $"BatchAccountDraft {{ AccountId = [REDACTED], PriorityOrder = {PriorityOrder}, DefaultTargetPath = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, SelectionDecision = {SelectionDecision}, ShareEnabled = {ShareEnabled} }}";
@@ -70,7 +73,11 @@ public sealed class BatchDraft
         bool isShareAccessUnlimited = true,
         ShareExtractionCodeBehavior extractionCodeBehavior = ShareExtractionCodeBehavior.Random,
         string? fixedExtractionCode = null,
-        string existingSharePolicy = "Ask")
+        string existingSharePolicy = "Ask",
+        bool acceptanceOnly = false,
+        string? resultDirectory = null,
+        bool directBackground = false,
+        int maxConcurrency = 1)
     {
         BatchJobId = batchJobId == Guid.Empty ? throw new ArgumentException("A batch identifier is required.", nameof(batchJobId)) : batchJobId;
         ImportSessionId = importSessionId == Guid.Empty ? throw new ArgumentException("An import identifier is required.", nameof(importSessionId)) : importSessionId;
@@ -90,6 +97,12 @@ public sealed class BatchDraft
             throw new ArgumentException("Only permanent shares with unlimited access are supported.");
         if (existingSharePolicy is not ("Ask" or "Reuse" or "Regenerate" or "Cancel"))
             throw new ArgumentOutOfRangeException(nameof(existingSharePolicy));
+        if (acceptanceOnly && directBackground)
+            throw new ArgumentException("A batch cannot use both acceptance-only and direct-background execution.");
+        if (maxConcurrency is < 1 or > 3)
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+        if (!directBackground && maxConcurrency != 1)
+            throw new ArgumentException("Only direct-background batches can use configurable concurrency.", nameof(maxConcurrency));
         IsSharePermanent = isSharePermanent;
         IsShareAccessUnlimited = isShareAccessUnlimited;
         ExtractionCodeBehavior = extractionCodeBehavior;
@@ -105,6 +118,10 @@ public sealed class BatchDraft
                 ? null
                 : throw new ArgumentException("Random extraction-code mode cannot contain a fixed code.", nameof(fixedExtractionCode));
         ExistingSharePolicy = existingSharePolicy;
+        AcceptanceOnly = acceptanceOnly;
+        ResultDirectory = resultDirectory;
+        DirectBackground = directBackground;
+        MaxConcurrency = maxConcurrency;
         ShareSettingsFingerprint = BaiduBatchTransfer.Core.Domain.ShareSettingsFingerprint.Compute(
             IsSharePermanent, IsShareAccessUnlimited, ExtractionCodeBehavior, FixedExtractionCode);
     }
@@ -128,6 +145,10 @@ public sealed class BatchDraft
     public string? FixedExtractionCode { get; }
     public string ExistingSharePolicy { get; }
     public string ShareSettingsFingerprint { get; }
+    public bool AcceptanceOnly { get; }
+    public string? ResultDirectory { get; }
+    public bool DirectBackground { get; }
+    public int MaxConcurrency { get; }
 
     public override string ToString() =>
         $"BatchDraft {{ BatchJobId = {BatchJobId}, ImportSessionId = {ImportSessionId}, Name = [REDACTED], TransferMode = {TransferMode}, QuotaBasis = {QuotaBasis}, Accounts = {Accounts.Length}, PathsAndUserContent = [REDACTED] }}";
@@ -175,7 +196,8 @@ public sealed class BatchAccountConfirmation
         long plannedShareCount = -1,
         bool shareEnabled = true,
         int outputOrdinal = 0,
-        string? outputLabel = null)
+        string? outputLabel = null,
+        ExecutionProfileSnapshot? executionProfile = null)
     {
         if (accountId == Guid.Empty) throw new ArgumentException("An account is required.", nameof(accountId));
         ArgumentOutOfRangeException.ThrowIfNegative(priorityOrder);
@@ -216,6 +238,7 @@ public sealed class BatchAccountConfirmation
         ShareEnabled = shareEnabled;
         OutputOrdinal = outputOrdinal;
         OutputLabel = outputLabel;
+        ExecutionProfile = executionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(accountId);
         if (EffectiveTargetSuccessCount > TargetSuccessCount || ReachableTargetSuccessCount > TargetSuccessCount)
             throw new ArgumentOutOfRangeException(nameof(effectiveTargetSuccessCount), "Effective and reachable targets cannot exceed the original target.");
     }
@@ -239,6 +262,7 @@ public sealed class BatchAccountConfirmation
     public bool ShareEnabled { get; }
     public int OutputOrdinal { get; }
     public string? OutputLabel { get; }
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
 
     public override string ToString() =>
         $"BatchAccountConfirmation {{ AccountId = [REDACTED], PriorityOrder = {PriorityOrder}, Path = [REDACTED], TargetItemCount = {TargetItemCount}, TargetSuccessCount = {TargetSuccessCount}, EffectiveTargetSuccessCount = {EffectiveTargetSuccessCount}, FulfilledCount = {FulfilledCount}, ReservedSlotCount = {ReservedSlotCount}, LockedItemCount = {LockedItemCount}, ExclusiveCandidateCount = {ExclusiveCandidateCount}, UnusedCandidateCount = {UnusedCandidateCount}, NewExclusiveCandidateCount = {NewExclusiveCandidateCount}, ReachableTargetSuccessCount = {ReachableTargetSuccessCount}, PlannedTransferCount = {PlannedTransferCount}, PlannedShareCount = {PlannedShareCount}, ShareEnabled = {ShareEnabled}, OutputOrdinal = {OutputOrdinal}, OutputLabel = [REDACTED] }}";
@@ -254,7 +278,10 @@ public sealed class BatchConfirmationSummary
         IReadOnlyList<BatchAccountConfirmation> accounts,
         StorageGrowthEstimate storageEstimate,
         string confirmationToken,
-        ResultColumnLayout? resultColumnLayout = null)
+        ResultColumnLayout? resultColumnLayout = null,
+        bool acceptanceOnly = false,
+        bool directBackground = false,
+        int maxConcurrency = 1)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(resourceCount);
         ArgumentOutOfRangeException.ThrowIfNegative(operationCount);
@@ -268,6 +295,9 @@ public sealed class BatchConfirmationSummary
             ? throw new ArgumentException("A confirmation token is required.", nameof(confirmationToken))
             : confirmationToken;
         ResultColumnLayout = resultColumnLayout;
+        AcceptanceOnly = acceptanceOnly;
+        DirectBackground = directBackground;
+        MaxConcurrency = maxConcurrency;
         checked
         {
             TransferCount = Accounts.Sum(account => account.PlannedTransferCount);
@@ -287,6 +317,9 @@ public sealed class BatchConfirmationSummary
     public long TotalActionCount => checked(TransferCount + ShareCount);
     public ResultColumnLayout? ResultColumnLayout { get; }
     public int ResultColumnCount => ResultColumnLayout?.ColumnCount ?? 0;
+    public bool AcceptanceOnly { get; }
+    public bool DirectBackground { get; }
+    public int MaxConcurrency { get; }
 
     public override string ToString() =>
         $"BatchConfirmationSummary {{ ImportSessionId = {ImportSessionId}, ResourceCount = {ResourceCount}, OperationCount = {OperationCount}, TransferCount = {TransferCount}, ShareCount = {ShareCount}, Accounts = {Accounts.Length}, ResultColumnCount = {ResultColumnCount}, ConfirmationToken = [REDACTED] }}";

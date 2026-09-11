@@ -13,15 +13,18 @@ public sealed class CreateBatchService
     private readonly IUnitOfWorkFactory unitOfWorkFactory;
     private readonly BatchDraftValidator validator;
     private readonly ReplicationPreflightEstimator preflightEstimator;
+    private readonly SecureExtractionCodeGenerator extractionCodeGenerator;
 
     public CreateBatchService(
         IUnitOfWorkFactory unitOfWorkFactory,
         BatchDraftValidator validator,
-        ReplicationPreflightEstimator preflightEstimator)
+        ReplicationPreflightEstimator preflightEstimator,
+        SecureExtractionCodeGenerator? extractionCodeGenerator = null)
     {
         this.unitOfWorkFactory = unitOfWorkFactory ?? throw new ArgumentNullException(nameof(unitOfWorkFactory));
         this.validator = validator ?? throw new ArgumentNullException(nameof(validator));
         this.preflightEstimator = preflightEstimator ?? throw new ArgumentNullException(nameof(preflightEstimator));
+        this.extractionCodeGenerator = extractionCodeGenerator ?? new SecureExtractionCodeGenerator();
     }
 
     public async Task<BatchConfirmationSummary> PreviewAsync(
@@ -105,7 +108,11 @@ public sealed class CreateBatchService
                 draft.QueueOrder,
                 checked((int)(draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.TaskCount
                     ? validated.ShareOperationCount
-                    : 0)));
+                    : 0)),
+                draft.AcceptanceOnly,
+                draft.DirectBackground,
+                draft.MaxConcurrency,
+                "Inert");
 
             await unit.Jobs.AddAsync(job, cancellationToken).ConfigureAwait(false);
             await unit.Jobs.SetShareSettingsAsync(new(
@@ -147,10 +154,28 @@ public sealed class CreateBatchService
                             operation.AssignedAccountId,
                             outputByAccount[operation.AssignedAccountId].OutputOrdinal,
                             draft.ShareSettingsFingerprint,
-                            now)),
+                            now,
+                            draft.DirectBackground ? extractionCodeGenerator.Generate() : null)),
                     cancellationToken).ConfigureAwait(false);
             }
             await unit.Jobs.AddAllocationsAsync(allocations, cancellationToken).ConfigureAwait(false);
+            if (draft.DirectBackground)
+            {
+                await unit.Jobs.SetResultDestinationAsync(
+                    LocalResultDestinationRecord.Create(draft.BatchJobId, draft.ResultDirectory!, now),
+                    cancellationToken).ConfigureAwait(false);
+                if (!await unit.Jobs.HasExactDirectBackgroundGraphAsync(
+                        draft.BatchJobId, cancellationToken).ConfigureAwait(false))
+                    throw new BatchDraftValidationException(
+                        "The direct-background transfer/share graph is incomplete or inconsistent.");
+                await unit.Jobs.ActivateDirectBackgroundAsync(
+                    draft.BatchJobId, cancellationToken).ConfigureAwait(false);
+            }
+            if (draft.AcceptanceOnly &&
+                (unit.Jobs is not IAcceptanceExecutionProfileStore acceptanceStore ||
+                 !await acceptanceStore.HasExactAcceptanceGraphAsync(
+                     draft.BatchJobId, cancellationToken).ConfigureAwait(false)))
+                throw new BatchDraftValidationException("The AcceptanceOnly operation graph is incomplete or inconsistent.");
             await unit.Jobs.WriteAuditAsync(
                 new AuditEventRecord(Guid.NewGuid(), draft.BatchJobId, null, null, null,
                     AuditEventKind.BatchCreated, now), cancellationToken).ConfigureAwait(false);
@@ -215,7 +240,8 @@ public sealed class CreateBatchService
         StorageGrowthEstimate estimate) =>
         new(validated.Session.Id, validated.Session.UpdatedAt, validated.Rows.Length,
             validated.OperationCount, validated.Accounts, estimate, validated.ConfirmationToken,
-            validated.ResultColumnLayout);
+            validated.ResultColumnLayout, validated.AcceptanceOnly,
+            validated.DirectBackground, validated.MaxConcurrency);
 
     private static List<ResourceItemRecord> CreateResources(
         BatchDraft draft,
@@ -271,7 +297,7 @@ public sealed class CreateBatchService
                 foreach (var account in validated.Accounts)
                 {
                     ordinal = checked(ordinal + 1);
-                    yield return Operation(resource, staged, account, ordinal, "Replication", now);
+                    yield return Operation(resource, staged, account, ordinal, "Replication", now, draft.AcceptanceOnly);
                 }
             }
             yield break;
@@ -295,7 +321,7 @@ public sealed class CreateBatchService
             var staged = validated.Rows[checked((int)resource.CandidateSequence - 1)];
             ordinal = checked(ordinal + 1);
             yield return Operation(resource, staged, account, ordinal,
-                assignment.IsLocked ? "Locked" : "Weighted", now);
+                assignment.IsLocked ? "Locked" : "Weighted", now, draft.AcceptanceOnly);
         }
     }
 
@@ -305,7 +331,8 @@ public sealed class CreateBatchService
         BatchAccountConfirmation account,
         long ordinal,
         string source,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        bool acceptanceOnly)
     {
         var target = staged.Row.TargetPath ?? account.DefaultTargetPath;
         var normalizedTarget = staged.NormalizedTargetPath ?? account.NormalizedDefaultTargetPath;
@@ -315,7 +342,8 @@ public sealed class CreateBatchService
             target, normalizedTarget, folder, account.AccountId, source, "Waiting", null, 0,
             BatchFingerprint.Create(resource.NormalizedShareId, account.AccountId, normalizedTarget, folder),
             null, null, null, "NotPrepared", "Unoccupied", null, null, null, null, null, null, now, now,
-            ExecutionProfileSnapshot.LegacyForAccount(account.AccountId));
+            account.ExecutionProfile,
+            acceptanceOnly);
     }
 
     private static List<AccountAllocationRecord> CreateAllocations(
@@ -364,7 +392,10 @@ internal sealed record BatchConfirmationSummarySnapshot(
     long OperationCount,
     BatchAccountConfirmationSnapshot[] Accounts,
     StorageGrowthEstimate StorageEstimate,
-    ResultColumnLayoutSnapshot? ResultColumnLayout)
+    ResultColumnLayoutSnapshot? ResultColumnLayout,
+    bool AcceptanceOnly = false,
+    bool DirectBackground = false,
+    int MaxConcurrency = 1)
 {
     public static BatchConfirmationSummarySnapshot From(BatchConfirmationSummary value) => new(
         1,
@@ -374,7 +405,10 @@ internal sealed record BatchConfirmationSummarySnapshot(
         value.OperationCount,
         value.Accounts.Select(BatchAccountConfirmationSnapshot.From).ToArray(),
         value.StorageEstimate,
-        value.ResultColumnLayout is null ? null : ResultColumnLayoutSnapshot.From(value.ResultColumnLayout));
+        value.ResultColumnLayout is null ? null : ResultColumnLayoutSnapshot.From(value.ResultColumnLayout),
+        value.AcceptanceOnly,
+        value.DirectBackground,
+        value.MaxConcurrency);
 
     public BatchConfirmationSummary ToSummary(string confirmationToken) => new(
         ImportSessionId,
@@ -384,7 +418,10 @@ internal sealed record BatchConfirmationSummarySnapshot(
         Accounts.Select(account => account.ToConfirmation()).ToArray(),
         StorageEstimate,
         confirmationToken,
-        ResultColumnLayout?.ToLayout());
+        ResultColumnLayout?.ToLayout(),
+        AcceptanceOnly,
+        DirectBackground,
+        MaxConcurrency);
 }
 
 internal sealed record BatchAccountConfirmationSnapshot(
@@ -406,7 +443,8 @@ internal sealed record BatchAccountConfirmationSnapshot(
     long PlannedShareCount,
     bool ShareEnabled,
     int OutputOrdinal,
-    string? OutputLabel)
+    string? OutputLabel,
+    ExecutionProfileSnapshot? ExecutionProfile = null)
 {
     public static BatchAccountConfirmationSnapshot From(BatchAccountConfirmation value) => new(
         value.AccountId, value.PriorityOrder, value.DefaultTargetPath, value.NormalizedDefaultTargetPath,
@@ -414,14 +452,14 @@ internal sealed record BatchAccountConfirmationSnapshot(
         value.EffectiveTargetSuccessCount, value.FulfilledCount, value.ReservedSlotCount,
         value.UnusedCandidateCount, value.NewExclusiveCandidateCount, value.ReachableTargetSuccessCount,
         value.PlannedTransferCount, value.PlannedShareCount, value.ShareEnabled, value.OutputOrdinal,
-        value.OutputLabel);
+        value.OutputLabel, value.ExecutionProfile);
 
     public BatchAccountConfirmation ToConfirmation() => new(
         AccountId, PriorityOrder, DefaultTargetPath, NormalizedDefaultTargetPath,
         TargetItemCount, TargetSuccessCount, LockedItemCount, ExclusiveCandidateCount,
         EffectiveTargetSuccessCount, FulfilledCount, ReservedSlotCount, UnusedCandidateCount,
         NewExclusiveCandidateCount, ReachableTargetSuccessCount, PlannedTransferCount,
-        PlannedShareCount, ShareEnabled, OutputOrdinal, OutputLabel);
+        PlannedShareCount, ShareEnabled, OutputOrdinal, OutputLabel, ExecutionProfile);
 }
 
 internal sealed record ResultColumnLayoutSnapshot(

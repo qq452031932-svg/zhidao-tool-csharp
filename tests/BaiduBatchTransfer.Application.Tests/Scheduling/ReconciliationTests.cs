@@ -202,6 +202,75 @@ public sealed class ReconciliationTests
     }
 
     [Fact]
+    public async Task ManagedReconciliationUsesPersistedManagedBindingWithoutReadingCookies()
+    {
+        var initial = PendingOperation();
+        var session = new ManagedBrowserSessionReference(Guid.NewGuid(), Guid.NewGuid(),
+            initial.AccountId, "uid-1", BrowserFamily.Chrome, "profile-1", "ownership-1");
+        var operation = initial with
+        {
+            BatchId = Guid.NewGuid(),
+            SourceShare = new ShareReference("share", "https://pan.baidu.com/s/reconcile", "a1b2"),
+            RequiresExactShareEvidence = true,
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                session.BrowserFamily, session.ProfileId, session.InstallationId, session.SessionId),
+        };
+        var exact = new RemoteItemIdentitySet([new("exact-apk-id", "item.apk")]);
+        var managed = new ManagedConfirmationAdapter
+        {
+            Result = BaiduAdapterResult<TransferConfirmationResult>.Success(
+                TransferConfirmationResult.ExactPresent(exact)),
+        };
+        var store = new RecordingReconciliationStore(operation);
+        var service = new OperationReconciliationService(
+            new ExecutionBoundTransferAdapter(new OperationBoundConfirmationAdapter(), managed),
+            new FixedResolver(BaiduExecutionResolution.Ready(BaiduExecutionContext.Managed(session))),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.ConfirmedPresent, result);
+        Assert.Same(exact, store.ExactRemoteItems);
+        Assert.Same(session, managed.Session);
+        Assert.True(managed.Context!.IsRecovery);
+    }
+
+    [Fact]
+    public async Task MissingManagedRuntimeDoesNotConsumeTheAutomaticResultRetry()
+    {
+        var initial = PendingOperation();
+        var session = new ManagedBrowserSessionReference(Guid.NewGuid(), Guid.NewGuid(),
+            initial.AccountId, "uid-1", BrowserFamily.Chrome, "profile-1", "ownership-1");
+        var operation = initial with
+        {
+            BatchId = Guid.NewGuid(),
+            SourceShare = new ShareReference("share", "https://pan.baidu.com/s/reconcile", "a1b2"),
+            PersistedExecutionProfile = ExecutionProfileSnapshot.Managed(
+                session.BrowserFamily, session.ProfileId, session.InstallationId, session.SessionId),
+            AllowsOneAutomaticRetry = true,
+        };
+        var store = new RecordingReconciliationStore(operation);
+        var managed = new ManagedConfirmationAdapter
+        {
+            Result = BaiduAdapterResult<TransferConfirmationResult>.Failure(
+                BaiduErrorKind.NotValidated,
+                adapterDiagnostic: null,
+                submissionAcceptance: SubmissionAcceptance.DefinitelyNotAccepted),
+        };
+        var service = new OperationReconciliationService(
+            new ExecutionBoundTransferAdapter(new OperationBoundConfirmationAdapter(), managed),
+            new FixedResolver(BaiduExecutionResolution.Ready(BaiduExecutionContext.Managed(session))),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(operation.OperationId);
+
+        Assert.Equal(TransferConfirmation.Ambiguous, result);
+        Assert.False(store.AmbiguousResolved);
+    }
+
+    [Fact]
     public async Task MultipleApproximateMatchesRemainAmbiguousAndNeverUseLegacyPresentSignal()
     {
         var operation = PendingOperation() with { RequiresExactShareEvidence = true };
@@ -341,10 +410,32 @@ public sealed class ReconciliationTests
         Assert.Equal(expectedTitle, await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
     }
 
+    [Fact]
+    public async Task DirectPreplannedExactCompletionAcceptsAlreadyExpandedResource()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingShareAsync(db, "预解析标题");
+        await ExecuteAsync(db,
+            "UPDATE ResourceItems SET CandidateStatus='Expanded',ReservedAccountId=NULL,ReservationExpiresAt=NULL;");
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var pending = await store.LoadPendingAsync(data.OperationId);
+        var exact = new RemoteItemIdentitySet([
+            new RemoteItemIdentity("remote-1", "已转存文件")
+        ]);
+
+        await store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now);
+
+        Assert.Equal("Succeeded", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("WaitingShare", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Equal("Expanded", await ScalarAsync(db, "ResourceItems", "CandidateStatus"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("   ")]
-    public async Task ShareEnabledExactCompletionRejectsBlankPersistedTitleAndRollsBackEntireHandoff(
+    public async Task ShareEnabledExactCompletionDerivesBlankTitleAndReleasesLinkedShare(
         string? persistedTitle)
     {
         await using var db = await BatchTestDatabase.CreateAsync();
@@ -355,21 +446,23 @@ public sealed class ReconciliationTests
             new RemoteItemIdentity("remote-2", "第二项"),
             new RemoteItemIdentity("remote-1", "第一项"),
         ]);
+        var expectedTitle = ResolvedOutputTitleBuilder.Resolve(
+            persistedTitle,
+            exact.Items.Select(item => (string?)item.DisplayedTopLevelName).ToArray());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now));
+        await store.MarkConfirmedPresentWithEvidenceAsync(pending!, exact, Now);
 
-        Assert.Equal("ResultPending", await ScalarAsync(db, "TransferOperations", "Status"));
-        Assert.Equal("Reserved", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
-        Assert.Null(await ScalarNullableAsync(db, "TransferOperations", "OutcomeKind"));
-        Assert.Null(await ScalarNullableAsync(db, "TransferOperations", "RemoteItemIdsJson"));
-        Assert.Equal("WaitingTransfer", await ScalarAsync(db, "ShareOperations", "Status"));
-        Assert.Null(await ScalarNullableAsync(db, "ShareOperations", "ExactItemSetFingerprint"));
-        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ItemCount FROM ShareOperationRemoteItems)", "ItemCount"));
-        Assert.Equal(0, await ScalarIntAsync(db, "(SELECT COUNT(*) AS GenerationCount FROM ShareOperationGenerations)", "GenerationCount"));
-        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
-        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
-        Assert.Equal(persistedTitle, await ScalarNullableAsync(db, "ResourceItems", "ResolvedOutputTitle"));
+        Assert.Equal("Succeeded", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Fulfilled", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal("NewTransfer", await ScalarAsync(db, "TransferOperations", "OutcomeKind"));
+        Assert.Equal("WaitingShare", await ScalarAsync(db, "ShareOperations", "Status"));
+        Assert.Equal(exact.Fingerprint, await ScalarAsync(db, "ShareOperations", "ExactItemSetFingerprint"));
+        Assert.Equal(2, await ScalarIntAsync(db, "(SELECT COUNT(*) AS ItemCount FROM ShareOperationRemoteItems)", "ItemCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "(SELECT COUNT(*) AS GenerationCount FROM ShareOperationGenerations)", "GenerationCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+        Assert.Equal("第一项 等 2 项", expectedTitle);
+        Assert.Equal(expectedTitle, await ScalarAsync(db, "ResourceItems", "ResolvedOutputTitle"));
     }
 
     [Fact]
@@ -535,6 +628,69 @@ public sealed class ReconciliationTests
         Assert.Equal(expectedSlot, await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
         Assert.Equal(expectedReserved, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
         Assert.Equal(expectedFulfilled, await ScalarIntAsync(db, "AccountAllocations", "FulfilledCount"));
+    }
+
+    [Fact]
+    public async Task DirectBatchAutomaticallyRetriesItsFirstAmbiguousTransferResult()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingAsync(db, directBackground: true);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new OperationReconciliationService(
+            new ConfirmationAdapter(), new SessionStore(data.AccountId), store, new FixedTimeProvider(Now));
+
+        await service.ReconcileAsync(data.OperationId);
+
+        Assert.Equal("Waiting", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Released", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal(1, await ScalarIntAsync(db, "TransferOperations", "UnknownResubmissionCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+    }
+
+    [Fact]
+    public async Task ManagedDirectBatchAutomaticallyRetriesWhenRecoveryContextIsUnavailable()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingAsync(db, directBackground: true);
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new OperationReconciliationService(
+            new ExecutionBoundTransferAdapter(
+                new OperationBoundConfirmationAdapter(),
+                new ManagedConfirmationAdapter()),
+            new FixedResolver(BaiduExecutionResolution.Unavailable(
+                BaiduExecutionResolutionStatus.BrowserUnavailable)),
+            store,
+            new FixedTimeProvider(Now));
+
+        var result = await service.ReconcileAsync(data.OperationId);
+
+        Assert.Equal(TransferConfirmation.Ambiguous, result);
+        Assert.Equal("Waiting", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Released", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal(1, await ScalarIntAsync(db, "TransferOperations", "UnknownResubmissionCount"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+    }
+
+    [Fact]
+    public async Task DirectBatchFailsWhenTheRetriedTransferResultIsStillAmbiguous()
+    {
+        await using var db = await BatchTestDatabase.CreateAsync();
+        var data = await SeedPendingAsync(db, directBackground: true);
+        await ExecuteAsync(db,
+            "UPDATE TransferOperations SET UnknownResubmissionCount=1 WHERE Id=$operation;",
+            ("$operation", data.OperationId.ToString("D")));
+        var store = new SqliteTransferSchedulingStore(db.ConnectionFactory);
+        var service = new OperationReconciliationService(
+            new ConfirmationAdapter(), new SessionStore(data.AccountId), store, new FixedTimeProvider(Now));
+
+        await service.ReconcileAsync(data.OperationId);
+
+        Assert.Equal("Failed", await ScalarAsync(db, "TransferOperations", "Status"));
+        Assert.Equal("Failed", await ScalarAsync(db, "TransferOperations", "OutcomeKind"));
+        Assert.Equal("RetryExhausted", await ScalarAsync(db, "TransferOperations", "LastErrorCode"));
+        Assert.Equal("Released", await ScalarAsync(db, "TransferOperations", "TargetSlotState"));
+        Assert.Equal(0, await ScalarIntAsync(db, "AccountAllocations", "ReservedSlotCount"));
+        Assert.Equal(1, await ScalarIntAsync(db, "AccountAllocations", "FailedItemCount"));
     }
 
     [Fact]
@@ -735,7 +891,8 @@ public sealed class ReconciliationTests
         string status = "ResultPending",
         string submitState = "PendingConfirmation",
         bool hasDescriptor = true,
-        bool dailyCounted = true)
+        bool dailyCounted = true,
+        bool directBackground = false)
     {
         var batchId = Guid.NewGuid();
         var accountId = Guid.NewGuid();
@@ -749,7 +906,11 @@ public sealed class ReconciliationTests
         };
         var job = new BatchJobRecord(batchId, "Batch", "Text", "Distribution", "SuccessTarget",
             "ProportionalReduction", 1, 1, "/base", "OptionalOuter", "Skip", "Immediate", "Active",
-            Now.AddHours(-1), Now.AddHours(-1), null, null, 1);
+            Now.AddHours(-1), Now.AddHours(-1), null, null, 1) with
+        {
+            DirectBackground = directBackground,
+            DirectActivationState = directBackground ? "Active" : "Inert",
+        };
         var resource = new ResourceItemRecord(resourceId, batchId, null, 1,
             "https://pan.baidu.com/s/reconcile", "share", "a1b2", null, null, null, null,
             "OptionalOuter", "Unknown", null, "Reserved", accountId, Now.AddMinutes(5),
@@ -887,6 +1048,7 @@ public sealed class ReconciliationTests
         public bool Present { get; private set; }
         public bool Absent { get; private set; }
         public bool ResetForRetry { get; private set; }
+        public bool AmbiguousResolved { get; private set; }
         public Guid? ResetOperationId { get; private set; }
         public RemoteItemIdentitySet? ExactRemoteItems { get; private set; }
 
@@ -933,6 +1095,15 @@ public sealed class ReconciliationTests
         {
             ResetForRetry = true;
             ResetOperationId = operationId;
+            return Task.CompletedTask;
+        }
+
+        public Task ResolveAmbiguousResultAsync(
+            PendingReconciliationOperation expected,
+            DateTimeOffset resolvedAt,
+            CancellationToken cancellationToken = default)
+        {
+            AmbiguousResolved = true;
             return Task.CompletedTask;
         }
     }
@@ -1001,6 +1172,13 @@ public sealed class ReconciliationTests
         public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareAsync(AccountSession session, ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy, CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
+    private sealed class FixedResolver(BaiduExecutionResolution resolution) : IBaiduExecutionContextResolver
+    {
+        public Task<BaiduExecutionResolution> ResolveAsync(Guid accountId,
+            ExecutionProfileSnapshot profile, CancellationToken cancellationToken) =>
+            Task.FromResult(resolution);
+    }
+
     private sealed class OperationBoundConfirmationAdapter : ConfirmationAdapter, IOperationBoundBaiduNetdiskAdapter
     {
         public TransferOperationAutomationContext? Context { get; private set; }
@@ -1031,6 +1209,35 @@ public sealed class ReconciliationTests
             Context = context;
             return ConfirmExactTransferAsync(session, query, cancellationToken);
         }
+    }
+
+    private sealed class ManagedConfirmationAdapter : IManagedChromiumTransferAdapter
+    {
+        public BaiduAdapterResult<TransferConfirmationResult> Result { get; init; } =
+            BaiduAdapterResult<TransferConfirmationResult>.Success(TransferConfirmationResult.Ambiguous);
+        public TransferOperationAutomationContext? Context { get; private set; }
+        public ManagedBrowserSessionReference? Session { get; private set; }
+
+        public Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferForOperationAsync(
+            TransferOperationAutomationContext context, ManagedBrowserSessionReference session,
+            TransferConfirmationQuery query, CancellationToken cancellationToken)
+        {
+            Context = context;
+            Session = session;
+            return Task.FromResult(Result);
+        }
+
+        public Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureDirectoryForOperationAsync(
+            TransferOperationAutomationContext context, ManagedBrowserSessionReference session,
+            RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<TransferPreparationReceipt>> PrepareWholeShareForOperationAsync(
+            TransferOperationAutomationContext context, ManagedBrowserSessionReference session,
+            ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<TransferReceipt>> SaveWholeShareForOperationAsync(
+            TransferOperationAutomationContext context, ManagedBrowserSessionReference session,
+            ShareReference share, RemoteDirectory destination, DuplicatePolicy duplicatePolicy,
+            CancellationToken cancellationToken) => throw new NotSupportedException();
     }
 
     private sealed class LegacyOnlyConfirmationAdapter(BaiduAdapterResult<TransferConfirmation> result)

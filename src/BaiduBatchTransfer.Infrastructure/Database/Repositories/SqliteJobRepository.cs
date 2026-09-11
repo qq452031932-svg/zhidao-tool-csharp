@@ -1,34 +1,35 @@
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using BaiduBatchTransfer.Application.Jobs;
 using Microsoft.Data.Sqlite;
 using System.Text.Json;
 
 namespace BaiduBatchTransfer.Infrastructure.Database.Repositories;
 
-public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
+public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository, IAcceptanceExecutionProfileStore
 {
     internal SqliteJobRepository(SqliteConnection connection, SqliteTransaction transaction) : base(connection, transaction) { }
 
     public async Task AddAsync(BatchJobRecord j, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount) VALUES($id,$name,$source,$mode,$quota,$shortage,$resources,$operations,$target,$folder,$duplicate,$validation,$status,$created,$started,$completed,$import,$queue,$shares);");
-        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$created",Time(j.CreatedAt)); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder); Add(c,"$shares",j.ShareOperationCount);
+        await using var c = Command("INSERT INTO BatchJobs(Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount,AcceptanceOnly,DirectBackground,MaxConcurrency,DirectActivationState,DirectPauseReason) VALUES($id,$name,$source,$mode,$quota,$shortage,$resources,$operations,$target,$folder,$duplicate,$validation,$status,$created,$started,$completed,$import,$queue,$shares,$acceptance,$direct,$concurrency,$activation,$pause);");
+        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$created",Time(j.CreatedAt)); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder); Add(c,"$shares",j.ShareOperationCount); Add(c,"$acceptance",j.AcceptanceOnly ? 1 : 0); Add(c,"$direct",j.DirectBackground ? 1 : 0); Add(c,"$concurrency",j.MaxConcurrency); Add(c,"$activation",j.DirectActivationState); Add(c,"$pause",j.DirectPauseReason);
         await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task UpdateAsync(BatchJobRecord j, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("UPDATE BatchJobs SET Name=$name,SourceType=$source,TransferMode=$mode,QuotaBasis=$quota,ShortagePolicy=$shortage,ResourceCount=$resources,OperationCount=$operations,ShareOperationCount=$shares,DefaultTargetPath=$target,FolderCreationMode=$folder,DuplicatePolicy=$duplicate,ValidationMode=$validation,Status=$status,StartedAt=$started,CompletedAt=$completed,ImportSessionId=$import,QueueOrder=$queue WHERE Id=$id;");
-        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$shares",j.ShareOperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder);
+        await using var c = Command("UPDATE BatchJobs SET Name=$name,SourceType=$source,TransferMode=$mode,QuotaBasis=$quota,ShortagePolicy=$shortage,ResourceCount=$resources,OperationCount=$operations,ShareOperationCount=$shares,DefaultTargetPath=$target,FolderCreationMode=$folder,DuplicatePolicy=$duplicate,ValidationMode=$validation,Status=$status,StartedAt=$started,CompletedAt=$completed,ImportSessionId=$import,QueueOrder=$queue,AcceptanceOnly=$acceptance,DirectBackground=$direct,MaxConcurrency=$concurrency,DirectActivationState=$activation,DirectPauseReason=$pause WHERE Id=$id;");
+        Add(c,"$id",Id(j.Id)); Add(c,"$name",j.Name); Add(c,"$source",j.SourceType); Add(c,"$mode",j.TransferMode); Add(c,"$quota",j.QuotaBasis); Add(c,"$shortage",j.ShortagePolicy); Add(c,"$resources",j.ResourceCount); Add(c,"$operations",j.OperationCount); Add(c,"$shares",j.ShareOperationCount); Add(c,"$target",j.DefaultTargetPath); Add(c,"$folder",j.FolderCreationMode); Add(c,"$duplicate",j.DuplicatePolicy); Add(c,"$validation",j.ValidationMode); Add(c,"$status",j.Status); Add(c,"$started",NullableTime(j.StartedAt)); Add(c,"$completed",NullableTime(j.CompletedAt)); Add(c,"$import",NullableId(j.ImportSessionId)); Add(c,"$queue",j.QueueOrder); Add(c,"$acceptance",j.AcceptanceOnly ? 1 : 0); Add(c,"$direct",j.DirectBackground ? 1 : 0); Add(c,"$concurrency",j.MaxConcurrency); Add(c,"$activation",j.DirectActivationState); Add(c,"$pause",j.DirectPauseReason);
         if (await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             throw new InvalidOperationException("The batch no longer exists.");
     }
 
     public async Task<BatchJobRecord?> GetAsync(Guid id, CancellationToken cancellationToken = default)
     {
-        await using var c = Command("SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount FROM BatchJobs WHERE Id=$id;"); Add(c,"$id",Id(id));
+        await using var c = Command("SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount,AcceptanceOnly,DirectBackground,MaxConcurrency,DirectActivationState,DirectPauseReason FROM BatchJobs WHERE Id=$id;"); Add(c,"$id",Id(id));
         await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetString(4),r.GetString(5),r.GetInt32(6),r.GetInt32(7),r.GetString(8),r.GetString(9),r.GetString(10),r.GetString(11),r.GetString(12),ReadTime(r,13),ReadNullableTime(r,14),ReadNullableTime(r,15),ReadNullableId(r,16),r.GetInt64(17),r.GetInt32(18)) : null;
+        return await r.ReadAsync(cancellationToken).ConfigureAwait(false) ? new(Guid.Parse(r.GetString(0)),r.GetString(1),r.GetString(2),r.GetString(3),r.GetString(4),r.GetString(5),r.GetInt32(6),r.GetInt32(7),r.GetString(8),r.GetString(9),r.GetString(10),r.GetString(11),r.GetString(12),ReadTime(r,13),ReadNullableTime(r,14),ReadNullableTime(r,15),ReadNullableId(r,16),r.GetInt64(17),r.GetInt32(18),r.GetInt32(19)!=0,r.GetInt32(20)!=0,r.GetInt32(21),r.GetString(22),r.IsDBNull(23)?null:r.GetString(23)) : null;
     }
 
     public async Task AddResourcesAsync(IEnumerable<ResourceItemRecord> resources, CancellationToken cancellationToken = default)
@@ -86,7 +87,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     public async Task AddOperationsAsync(IEnumerable<TransferOperationRecord> operations, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(operations);
-        await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated,$engine,$browserFamily,$profile,$installation,$session);");
+        await using var c = Command("INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId,AcceptanceOnly,UnknownResubmissionCount) VALUES($id,$resource,$job,$sequence,$ordinal,$target,$normalized,$folder,$account,$source,$status,$outcome,$attempt,$fingerprint,$confirmation,$request,$remote,$submit,$slot,$reserved,$counted,$started,$errorCode,$errorMessage,$lease,$created,$updated,$engine,$browserFamily,$profile,$installation,$session,$acceptance,$unknownResubmission);");
         var id = c.Parameters.Add("$id", SqliteType.Text);
         var resource = c.Parameters.Add("$resource", SqliteType.Text);
         var job = c.Parameters.Add("$job", SqliteType.Text);
@@ -119,6 +120,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var profile = c.Parameters.Add("$profile", SqliteType.Text);
         var installation = c.Parameters.Add("$installation", SqliteType.Text);
         var managedSession = c.Parameters.Add("$session", SqliteType.Text);
+        var acceptance = c.Parameters.Add("$acceptance", SqliteType.Integer);
+        var unknownResubmission = c.Parameters.Add("$unknownResubmission", SqliteType.Integer);
         c.Prepare();
         foreach (var x in operations)
         {
@@ -139,6 +142,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             profile.Value = x.ExecutionProfile.ProfileId;
             installation.Value = NullableId(x.ExecutionProfile.InstallationId);
             managedSession.Value = NullableId(x.ExecutionProfile.SessionId);
+            acceptance.Value = x.AcceptanceOnly ? 1 : 0;
+            unknownResubmission.Value = x.UnknownResubmissionCount;
             await c.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
@@ -147,9 +152,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
     {
         query.Validate(); cancellationToken.ThrowIfCancellationRequested();
         var total = await CountAsync("TransferOperations",batchJobId,cancellationToken).ConfigureAwait(false);
-        await using var c = Command("SELECT Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId FROM TransferOperations WHERE BatchJobId=$job ORDER BY SequenceNumber,AllocationOrdinal,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
+        await using var c = Command("SELECT Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,OutcomeKind,AttemptCount,OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,RemoteItemIdsJson,SubmitState,TargetSlotState,TargetSlotReservedAt,DailyCountedAt,SubmitStartedAt,LastErrorCode,LastErrorMessage,LeaseExpiresAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId,AcceptanceOnly,UnknownResubmissionCount FROM TransferOperations WHERE BatchJobId=$job ORDER BY SequenceNumber,AllocationOrdinal,Id LIMIT $limit OFFSET $offset;"); AddPage(c,batchJobId,query);
         var items = new List<TransferOperationRecord>(); await using var r = await c.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),Guid.Parse(r.GetString(2)),r.GetInt64(3),r.GetInt64(4),r.GetString(5),r.GetString(6),r.GetString(7),Guid.Parse(r.GetString(8)),r.GetString(9),r.GetString(10),r.IsDBNull(11)?null:r.GetString(11),r.GetInt32(12),r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetString(16),r.GetString(17),r.GetString(18),ReadNullableTime(r,19),ReadNullableTime(r,20),ReadNullableTime(r,21),r.IsDBNull(22)?null:r.GetString(22),r.IsDBNull(23)?null:r.GetString(23),ReadNullableTime(r,24),ReadTime(r,25),ReadTime(r,26),SqliteExecutionProfileSnapshotCodec.Read(r,27)));
+        while (await r.ReadAsync(cancellationToken).ConfigureAwait(false)) items.Add(new(Guid.Parse(r.GetString(0)),Guid.Parse(r.GetString(1)),Guid.Parse(r.GetString(2)),r.GetInt64(3),r.GetInt64(4),r.GetString(5),r.GetString(6),r.GetString(7),Guid.Parse(r.GetString(8)),r.GetString(9),r.GetString(10),r.IsDBNull(11)?null:r.GetString(11),r.GetInt32(12),r.GetString(13),r.IsDBNull(14)?null:r.GetString(14),r.IsDBNull(15)?null:r.GetString(15),r.IsDBNull(16)?null:r.GetString(16),r.GetString(17),r.GetString(18),ReadNullableTime(r,19),ReadNullableTime(r,20),ReadNullableTime(r,21),r.IsDBNull(22)?null:r.GetString(22),r.IsDBNull(23)?null:r.GetString(23),ReadNullableTime(r,24),ReadTime(r,25),ReadTime(r,26),SqliteExecutionProfileSnapshotCodec.Read(r,27),r.GetInt32(32)!=0,r.GetInt32(33)));
         return new(items,total,query.PageNumber,query.PageSize);
     }
 
@@ -208,7 +213,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         await using var command = Command("""
             SELECT Id,Name,SourceType,TransferMode,QuotaBasis,ShortagePolicy,ResourceCount,OperationCount,
               DefaultTargetPath,FolderCreationMode,DuplicatePolicy,ValidationMode,Status,CreatedAt,StartedAt,
-              CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount
+              CompletedAt,ImportSessionId,QueueOrder,ShareOperationCount,AcceptanceOnly,
+              DirectBackground,MaxConcurrency,DirectActivationState,DirectPauseReason
             FROM BatchJobs
             ORDER BY julianday(CreatedAt) DESC,Id DESC
             LIMIT $limit;
@@ -222,7 +228,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.GetString(4), reader.GetString(5), reader.GetInt32(6), reader.GetInt32(7),
                 reader.GetString(8), reader.GetString(9), reader.GetString(10), reader.GetString(11),
                 reader.GetString(12), ReadTime(reader, 13), ReadNullableTime(reader, 14),
-                ReadNullableTime(reader, 15), ReadNullableId(reader, 16), reader.GetInt64(17), reader.GetInt32(18)));
+                ReadNullableTime(reader, 15), ReadNullableId(reader, 16), reader.GetInt64(17), reader.GetInt32(18),
+                reader.GetInt32(19) != 0, reader.GetInt32(20) != 0, reader.GetInt32(21),
+                reader.GetString(22), reader.IsDBNull(23) ? null : reader.GetString(23)));
         return items;
     }
 
@@ -380,11 +388,19 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             "COALESCE(output.ShareEnabled,0)," +
             "CASE WHEN s.Id IS NOT NULL AND (s.SubmitStartedAt IS NULL OR s.SubmissionAcceptance='DefinitelyNotAccepted') THEN 1 ELSE 0 END," +
             "s.Generation,s.UpdatedAt,o.AttemptCount," +
-            $"CASE WHEN {safeRetryPredicate} THEN 1 ELSE 0 END " +
+            $"CASE WHEN {safeRetryPredicate} THEN 1 ELSE 0 END," +
+            "current_result.ShareUrl,current_result.ExtractionCode,r.StagedImportRowId " +
             $"FROM TransferOperations o INDEXED BY {pageIndex} JOIN ResourceItems r ON r.Id=o.ResourceItemId " +
             "JOIN Accounts a ON a.Id=o.AssignedAccountId JOIN BatchJobs b ON b.Id=o.BatchJobId " +
             "JOIN AccountAllocations allocation ON allocation.BatchJobId=o.BatchJobId AND allocation.AccountId=o.AssignedAccountId " +
             "LEFT JOIN ShareOperations s ON s.TransferOperationId=o.Id " +
+            "LEFT JOIN BaiduShareResults current_result ON current_result.Id=(" +
+            "SELECT candidate.Id FROM BaiduShareResults candidate " +
+            "WHERE candidate.AccountId=s.AccountId " +
+            "AND candidate.ExactItemSetFingerprint=s.ExactItemSetFingerprint " +
+            "AND candidate.SettingsFingerprint=s.SettingsFingerprint " +
+            "AND candidate.IsAccepted=1 AND candidate.IsCurrent=1 " +
+            "ORDER BY candidate.Generation DESC,candidate.UpdatedAt DESC,candidate.Id DESC LIMIT 1) " +
             "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
             "LEFT JOIN BatchShareSettings settings ON settings.BatchJobId=o.BatchJobId " +
             "WHERE o.BatchJobId=$job" + filter +
@@ -412,7 +428,9 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 reader.IsDBNull(25) ? null : reader.GetInt32(25),
                 reader.IsDBNull(26) ? null : ReadTime(reader, 26),
                 reader.GetInt32(27),
-                reader.GetInt64(28) != 0));
+                reader.GetInt64(28) != 0,
+                reader.IsDBNull(29) ? null : reader.GetString(29),
+                reader.IsDBNull(30) ? null : reader.GetString(30), ReadNullableId(reader, 31)));
         }
         if (items.Zip(items.Skip(1), static (left, right) => left.AllocationOrdinal == right.AllocationOrdinal).Any(equal => equal))
             throw new InvalidDataException("The operation result keyset contains duplicate allocation ordinals.");
@@ -434,9 +452,13 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             "COALESCE(SUM(CASE WHEN o.Status='Succeeded' AND o.OutcomeKind='AlreadySatisfied' THEN 1 ELSE 0 END),0)," +
             "COALESCE(SUM(CASE WHEN o.Status IN ('Failed','Cancelled') OR o.OutcomeKind IN ('Failed','GloballyInvalid','Cancelled') THEN 1 ELSE 0 END),0)," +
             "COALESCE(SUM(CASE WHEN o.Status IN ('Waiting','Reserved','Preparing','Submitting','ResultPending') THEN 1 ELSE 0 END),0)," +
-            "COALESCE(SUM(CASE WHEN o.Status='Paused' THEN 1 ELSE 0 END),0) " +
+            "COALESCE(SUM(CASE WHEN o.Status='Paused' THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status='Succeeded' AND (COALESCE(output.ShareEnabled,0)=0 OR s.Status IN ('Succeeded','ReusedExisting')) THEN 1 ELSE 0 END),0)," +
+            "COALESCE(SUM(CASE WHEN o.Status IN ('Failed','Cancelled') OR (output.ShareEnabled=1 AND s.Status IN ('Failed','Cancelled')) THEN 1 ELSE 0 END),0) " +
             "FROM AccountAllocations al JOIN Accounts a ON a.Id=al.AccountId " +
             "LEFT JOIN TransferOperations o ON o.BatchJobId=al.BatchJobId AND o.AssignedAccountId=al.AccountId " +
+            "LEFT JOIN BatchOutputAccounts output ON output.BatchJobId=o.BatchJobId AND output.AccountId=o.AssignedAccountId " +
+            "LEFT JOIN ShareOperations s ON s.TransferOperationId=o.Id " +
             "WHERE al.BatchJobId=$job GROUP BY al.AccountId,a.DisplayName,al.PriorityOrder " +
             "ORDER BY al.PriorityOrder,al.AccountId;");
         Add(command, "$job", Id(batchJobId));
@@ -446,7 +468,8 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         {
             accounts.Add(new(
                 Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt32(2),
-                reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7)));
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7),
+                reader.GetInt64(8), reader.GetInt64(9)));
         }
         return new(batchJobId, resourceCount, operationCount, accounts);
     }
@@ -627,16 +650,18 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         var snapshot = TakeBounded(operations, 500, nameof(operations));
         if (snapshot.Any(value => value.Id == Guid.Empty || value.TransferOperationId == Guid.Empty ||
             value.ResourceItemId == Guid.Empty || value.BatchJobId == Guid.Empty || value.AccountId == Guid.Empty ||
-            value.OutputOrdinal <= 0 || string.IsNullOrWhiteSpace(value.SettingsFingerprint)))
+            value.OutputOrdinal <= 0 || string.IsNullOrWhiteSpace(value.SettingsFingerprint) ||
+            (value.DirectExtractionCode is not null && !PermanentShareRequest.IsValidFixedExtractionCode(
+                value.DirectExtractionCode))))
             throw new ArgumentException("The pending share operation is invalid.", nameof(operations));
         await ValidatePendingShareOutputsAsync(snapshot, cancellationToken).ConfigureAwait(false);
         await using var command = Command("""
             INSERT INTO ShareOperations(Id,TransferOperationId,ResourceItemId,BatchJobId,AccountId,OutputOrdinal,Status,
               ExactItemSetFingerprint,SettingsFingerprint,Generation,RequestDescriptorJson,AdapterRequestId,SubmissionAcceptance,
               AttemptCount,LeaseGeneration,LeaseExpiresAt,SubmitStartedAt,NextReconcileAt,LastErrorCode,LastErrorMessage,CreatedAt,UpdatedAt,
-              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId,DirectExtractionCode)
             SELECT $id,$transfer,$resource,$batch,$account,$ordinal,'WaitingTransfer',NULL,$settings,1,NULL,NULL,'Unknown',0,0,NULL,NULL,NULL,NULL,NULL,$created,$created,
-              transfer.ExecutionEngineVersion,transfer.BrowserFamily,transfer.ProfileId,transfer.InstallationId,transfer.SessionId
+              transfer.ExecutionEngineVersion,transfer.BrowserFamily,transfer.ProfileId,transfer.InstallationId,transfer.SessionId,$directCode
             FROM TransferOperations transfer
             WHERE transfer.Id=$transfer AND transfer.ResourceItemId=$resource
               AND transfer.BatchJobId=$batch AND transfer.AssignedAccountId=$account;
@@ -649,6 +674,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
             Bind(command,"$resource",Id(value.ResourceItemId),!prepared); Bind(command,"$batch",Id(value.BatchJobId),!prepared);
             Bind(command,"$account",Id(value.AccountId),!prepared); Bind(command,"$ordinal",value.OutputOrdinal,!prepared);
             Bind(command,"$settings",value.SettingsFingerprint,!prepared); Bind(command,"$created",Time(value.CreatedAt),!prepared);
+            Bind(command,"$directCode",value.DirectExtractionCode,!prepared);
             if (!prepared) { command.Prepare(); prepared = true; }
             if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new InvalidOperationException("The pending share operation source is unavailable.");
@@ -710,7 +736,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                 }
             }
 
-            await using (var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName) VALUES($operation,$ordinal,$remote,$sortKey,$name);"))
+            await using (var item = Command("INSERT INTO ShareOperationRemoteItems(ShareOperationId,ItemOrdinal,RemoteItemId,CanonicalSortKey,DisplayName,ResponseOrdinal) VALUES($operation,$ordinal,$remote,$sortKey,$name,$responseOrdinal);"))
             {
                 var itemPrepared = false;
                 foreach (var value in remoteItems)
@@ -723,6 +749,7 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
                     Bind(item, "$remote", value.RemoteItemId, !itemPrepared);
                     Bind(item, "$sortKey", RemoteItemIdentitySet.GetCanonicalSortKey(value.RemoteItemId), !itemPrepared);
                     Bind(item, "$name", value.DisplayName, !itemPrepared);
+                    Bind(item, "$responseOrdinal", value.ResponseOrdinal, !itemPrepared);
                     if (!itemPrepared)
                     {
                         item.Prepare();
@@ -867,6 +894,217 @@ public sealed class SqliteJobRepository : SqliteRepositoryBase, IJobRepository
         if (snapshot.Length > maximum)
             throw new ArgumentOutOfRangeException(parameterName, $"A single write chunk cannot exceed {maximum} records.");
         return snapshot;
+    }
+
+    public async Task<bool> IsCurrentManagedProfileAsync(
+        Guid accountId,
+        ExecutionProfileSnapshot profile,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(profile);
+        if (profile.Engine != BaiduExecutionEngine.ManagedChromiumV1 ||
+            profile.InstallationId is null || profile.SessionId is null)
+            return false;
+        await using var command = Command("""
+            SELECT EXISTS(
+              SELECT 1
+              FROM Accounts account
+              JOIN ManagedBrowserSessions session
+                ON session.AccountId=account.Id AND session.BaiduUserId=account.BaiduUserId
+              JOIN BrowserInstallations installation
+                ON installation.InstallationId=session.InstallationId
+               AND installation.BrowserFamily=session.BrowserFamily
+              WHERE account.Id=$account
+                AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0
+                AND session.SessionId=$session AND session.InstallationId=$installation
+                AND session.BrowserFamily=$family AND session.ProfileId=$profile
+                AND session.State='Active' AND installation.State='Active');
+            """);
+        Add(command, "$account", Id(accountId));
+        Add(command, "$session", Id(profile.SessionId.Value));
+        Add(command, "$installation", Id(profile.InstallationId.Value));
+        Add(command, "$family", SqliteExecutionProfileSnapshotCodec.FormatFamily(profile.BrowserFamily));
+        Add(command, "$profile", profile.ProfileId);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    public async Task<bool> HasExactAcceptanceGraphAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            SELECT EXISTS(
+              SELECT 1
+              FROM BatchJobs batch
+              JOIN TransferOperations transfer ON transfer.BatchJobId=batch.Id
+              JOIN ShareOperations share ON share.TransferOperationId=transfer.Id
+              JOIN BatchOutputAccounts output
+                ON output.BatchJobId=batch.Id AND output.AccountId=transfer.AssignedAccountId
+               AND output.OutputOrdinal=share.OutputOrdinal
+              WHERE batch.Id=$batch
+                AND batch.AcceptanceOnly=1 AND transfer.AcceptanceOnly=1
+                AND batch.ResourceCount=1 AND batch.OperationCount=1 AND batch.ShareOperationCount=1
+                AND share.BatchJobId=batch.Id AND share.ResourceItemId=transfer.ResourceItemId
+                AND share.AccountId=transfer.AssignedAccountId AND share.Status='WaitingTransfer'
+                AND output.ShareEnabled=1 AND output.PlannedTransferCount=1 AND output.PlannedShareCount=1
+                AND share.ExecutionEngineVersion=transfer.ExecutionEngineVersion
+                AND share.BrowserFamily=transfer.BrowserFamily
+                AND share.ProfileId=transfer.ProfileId
+                AND share.InstallationId=transfer.InstallationId
+                AND share.SessionId=transfer.SessionId
+                AND (SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=batch.Id)=1
+                AND (SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=batch.Id)=1
+                AND (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=batch.Id)=1
+                AND (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=batch.Id)=1);
+            """);
+        Add(command, "$batch", Id(batchJobId));
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    public async Task SetResultDestinationAsync(
+        LocalResultDestinationRecord destination,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        await using var command = Command("""
+            INSERT INTO BatchResultDestinations(BatchJobId,DirectoryReference,Revision,CreatedAt,UpdatedAt)
+            VALUES($batch,$directory,$revision,$created,$updated);
+            """);
+        Add(command, "$batch", Id(destination.BatchJobId));
+        Add(command, "$directory", destination.DirectoryReference);
+        Add(command, "$revision", destination.Revision);
+        Add(command, "$created", Time(destination.CreatedAt));
+        Add(command, "$updated", Time(destination.UpdatedAt));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<bool> HasExactDirectBackgroundGraphAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            SELECT EXISTS(
+              SELECT 1 FROM BatchJobs batch
+              WHERE batch.Id=$batch
+                AND batch.DirectBackground=1
+                AND batch.DirectActivationState='Inert'
+                AND batch.MaxConcurrency BETWEEN 1 AND 3
+                AND batch.ResourceCount>0
+                AND batch.QuotaBasis='TaskCount'
+                AND batch.DuplicatePolicy='Rename'
+                AND batch.TransferMode IN ('Distribution','Replication')
+                AND batch.OperationCount=CASE batch.TransferMode
+                  WHEN 'Distribution' THEN batch.ResourceCount
+                  WHEN 'Replication' THEN batch.ResourceCount *
+                    (SELECT COUNT(*) FROM BatchOutputAccounts WHERE BatchJobId=batch.Id)
+                END
+                AND batch.ShareOperationCount=batch.OperationCount
+                AND (SELECT COUNT(*) FROM ResourceItems WHERE BatchJobId=batch.Id)=batch.ResourceCount
+                AND (SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=batch.Id)>=1
+                AND (SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=batch.Id)=
+                    (SELECT COUNT(*) FROM BatchOutputAccounts WHERE BatchJobId=batch.Id)
+                AND (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=batch.Id)=batch.OperationCount
+                AND (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=batch.Id)=batch.ShareOperationCount
+                AND (SELECT COUNT(*) FROM BatchResultDestinations WHERE BatchJobId=batch.Id)=1
+                AND (SELECT COUNT(*) FROM BatchShareSettings settings
+                     WHERE settings.BatchJobId=batch.Id
+                       AND settings.IsPermanent=1
+                       AND settings.IsAccessUnlimited=1
+                       AND settings.ExtractionCodeMode='Random'
+                       AND settings.FixedExtractionCode IS NULL
+                       AND settings.ExistingSharePolicy='Regenerate'
+                       AND settings.SettingsFingerprint=$settingsFingerprint)=1
+                AND NOT EXISTS(
+                  SELECT 1 FROM AccountAllocations allocation
+                  LEFT JOIN BatchOutputAccounts output
+                    ON output.BatchJobId=allocation.BatchJobId AND output.AccountId=allocation.AccountId
+                  WHERE allocation.BatchJobId=batch.Id AND output.AccountId IS NULL)
+                AND NOT EXISTS(
+                  SELECT 1 FROM BatchOutputAccounts output
+                  LEFT JOIN AccountAllocations allocation
+                    ON allocation.BatchJobId=output.BatchJobId AND allocation.AccountId=output.AccountId
+                  WHERE output.BatchJobId=batch.Id AND
+                    (allocation.AccountId IS NULL OR
+                     output.PlannedShareCount<>output.PlannedTransferCount OR
+                     output.ShareEnabled<>CASE WHEN output.PlannedTransferCount>0 THEN 1 ELSE 0 END OR
+                     output.PlannedTransferCount<>(SELECT COUNT(*) FROM TransferOperations transfer
+                       WHERE transfer.BatchJobId=batch.Id AND transfer.AssignedAccountId=output.AccountId) OR
+                     output.PlannedShareCount<>(SELECT COUNT(*) FROM ShareOperations share
+                       WHERE share.BatchJobId=batch.Id AND share.AccountId=output.AccountId
+                         AND share.OutputOrdinal=output.OutputOrdinal) OR
+                     output.CreatedShareOperationCount<>output.PlannedShareCount))
+                AND NOT EXISTS(
+                  SELECT 1 FROM TransferOperations transfer
+                  WHERE transfer.BatchJobId=batch.Id AND
+                    (SELECT COUNT(*) FROM ShareOperations share
+                     JOIN BatchOutputAccounts output
+                       ON output.BatchJobId=share.BatchJobId AND output.AccountId=share.AccountId
+                      AND output.OutputOrdinal=share.OutputOrdinal
+                     WHERE share.TransferOperationId=transfer.Id
+                       AND share.BatchJobId=transfer.BatchJobId
+                       AND share.ResourceItemId=transfer.ResourceItemId
+                       AND share.AccountId=transfer.AssignedAccountId
+                        AND share.ExecutionEngineVersion=transfer.ExecutionEngineVersion
+                        AND share.BrowserFamily=transfer.BrowserFamily
+                        AND share.ProfileId=transfer.ProfileId
+                        AND share.InstallationId IS transfer.InstallationId
+                        AND share.SessionId IS transfer.SessionId
+                        AND share.SettingsFingerprint=(SELECT settings.SettingsFingerprint
+                          FROM BatchShareSettings settings WHERE settings.BatchJobId=batch.Id))<>1)
+                AND NOT EXISTS(
+                  SELECT 1 FROM ShareOperations share
+                  LEFT JOIN TransferOperations transfer
+                    ON transfer.Id=share.TransferOperationId
+                   AND transfer.BatchJobId=share.BatchJobId
+                   AND transfer.ResourceItemId=share.ResourceItemId
+                   AND transfer.AssignedAccountId=share.AccountId
+                  WHERE share.BatchJobId=batch.Id
+                    AND (transfer.Id IS NULL OR share.Status<>'WaitingTransfer'
+                         OR share.DirectExtractionCode IS NULL))
+                AND NOT EXISTS(
+                  SELECT 1 FROM TransferOperations transfer
+                  LEFT JOIN AccountAllocations allocation
+                    ON allocation.BatchJobId=transfer.BatchJobId
+                   AND allocation.AccountId=transfer.AssignedAccountId
+                  LEFT JOIN BatchOutputAccounts output
+                    ON output.BatchJobId=transfer.BatchJobId
+                   AND output.AccountId=transfer.AssignedAccountId
+                  WHERE transfer.BatchJobId=batch.Id AND
+                    (allocation.AccountId IS NULL OR output.AccountId IS NULL))
+                AND (batch.TransferMode<>'Distribution' OR NOT EXISTS(
+                  SELECT 1 FROM ResourceItems resource
+                  WHERE resource.BatchJobId=batch.Id AND
+                    (SELECT COUNT(*) FROM TransferOperations transfer
+                     WHERE transfer.BatchJobId=batch.Id AND transfer.ResourceItemId=resource.Id)<>1))
+                AND (batch.TransferMode<>'Replication' OR NOT EXISTS(
+                  SELECT 1 FROM ResourceItems resource
+                  CROSS JOIN BatchOutputAccounts output
+                  WHERE resource.BatchJobId=batch.Id AND output.BatchJobId=batch.Id AND
+                    (SELECT COUNT(*) FROM TransferOperations transfer
+                     WHERE transfer.BatchJobId=batch.Id AND transfer.ResourceItemId=resource.Id
+                       AND transfer.AssignedAccountId=output.AccountId)<>1))
+                AND NOT EXISTS(
+                  SELECT 1 FROM StandaloneShareOperations standalone
+                  WHERE standalone.BatchId=batch.Id));
+            """);
+        Add(command, "$batch", Id(batchJobId));
+        Add(command, "$settingsFingerprint", ShareSettingsFingerprint.Compute(
+            true, true, ShareExtractionCodeBehavior.Random, null));
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    public async Task ActivateDirectBackgroundAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var command = Command("""
+            UPDATE BatchJobs
+            SET DirectActivationState='Active'
+            WHERE Id=$batch AND DirectBackground=1 AND DirectActivationState='Inert';
+            """);
+        Add(command, "$batch", Id(batchJobId));
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidOperationException("The direct-background batch could not be activated.");
     }
 
     private static void BindShareOperation(SqliteCommand command, ShareOperationRecord value, bool add)

@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using BaiduBatchTransfer.App.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Features.Jobs;
 
@@ -12,6 +13,9 @@ public sealed class JobResultsViewModel : ObservableObject
     private readonly IResultSaveDialog saveDialog;
     private readonly IJobResultCapabilityAvailability capabilities;
     private readonly IExistingShareDecisionInteraction? existingShareInteraction;
+    private readonly ITextClipboard? clipboard;
+    private readonly ILicenseAuthorizationGate? licenseGate;
+    private readonly SemaphoreSlim lifecycleRefreshGate = new(1, 1);
     private Guid batchJobId;
     private long? nextCursor;
     private long generation;
@@ -22,23 +26,33 @@ public sealed class JobResultsViewModel : ObservableObject
     private long operationCount;
     private long failedCount;
     private long pausedCount;
+    private long completeSuccessCount;
+    private long terminalProblemCount;
     private long exportedRows;
     private JobResultRow? selectedItem;
     private string statusMessage = "请选择一个任务查看结果。";
     private CancellationTokenSource? saveCancellation;
+    private ProgressSnapshot? lastProgressSnapshot;
+    private Guid progressBatchJobId;
+    private bool refreshFailureActive;
     private readonly HashSet<Guid> loadedOperationIds = [];
     private readonly HashSet<Guid> autoPromptedExistingShareBatches = [];
+    private readonly HashSet<Guid> finalizedLifecycleBatches = [];
 
     public JobResultsViewModel(
         IJobResultsWorkflow workflow,
         IResultSaveDialog saveDialog,
         IJobResultCapabilityAvailability capabilities,
-        IExistingShareDecisionInteraction? existingShareInteraction = null)
+        IExistingShareDecisionInteraction? existingShareInteraction = null,
+        ITextClipboard? clipboard = null,
+        ILicenseAuthorizationGate? licenseGate = null)
     {
         this.workflow = workflow ?? throw new ArgumentNullException(nameof(workflow));
         this.saveDialog = saveDialog ?? throw new ArgumentNullException(nameof(saveDialog));
         this.capabilities = capabilities ?? throw new ArgumentNullException(nameof(capabilities));
         this.existingShareInteraction = existingShareInteraction;
+        this.clipboard = clipboard;
+        this.licenseGate = licenseGate;
         LoadNextPageCommand = new AsyncRelayCommand(LoadNextPageAsync, () => CanLoadNextPage);
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => CanRefresh);
         RetryShareOnlyCommand = new AsyncRelayCommand(RetryShareOnlyAsync, () => CanRetryShareOnly);
@@ -50,6 +64,9 @@ public sealed class JobResultsViewModel : ObservableObject
             ResolveExistingSharesAsync,
             () => CanResolveExistingShares);
         SaveAsCommand = new AsyncRelayCommand(SaveAsAsync, () => CanSaveAs);
+        CopyGeneratedShareCommand = new AsyncRelayCommand<JobResultRow?>(
+            CopyGeneratedShareAsync,
+            row => CanCopyGeneratedShareRow(row ?? SelectedItem));
         CancelSaveCommand = new RelayCommand(CancelSave, () => IsSaving);
     }
 
@@ -60,6 +77,8 @@ public sealed class JobResultsViewModel : ObservableObject
     public long OperationCount { get => operationCount; private set => SetProperty(ref operationCount, value); }
     public long FailedCount { get => failedCount; private set => SetProperty(ref failedCount, value); }
     public long PausedCount { get => pausedCount; private set => SetProperty(ref pausedCount, value); }
+    public long CompleteSuccessCount { get => completeSuccessCount; private set => SetProperty(ref completeSuccessCount, value); }
+    public long TerminalProblemCount { get => terminalProblemCount; private set => SetProperty(ref terminalProblemCount, value); }
     public long ExportedRows { get => exportedRows; private set => SetProperty(ref exportedRows, value); }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
     public string TransferCapabilityMessage => capabilities.TransferStatusMessage;
@@ -103,7 +122,9 @@ public sealed class JobResultsViewModel : ObservableObject
     public bool CanResumeShare => !IsBusy && !IsSaving && capabilities.CanUseShareActions &&
         SelectedItem is { ShareOperationId: not null, CanResumeShare: true };
     public bool CanSaveAs => batchJobId != Guid.Empty && !IsBusy && !IsSaving;
-    public bool CanRefresh => batchJobId != Guid.Empty && !IsBusy && !IsSaving;
+    public bool CanCopyGeneratedShare => CanCopyGeneratedShareRow(SelectedItem);
+    public bool CanRefresh => batchJobId != Guid.Empty && !IsBusy && !IsSaving &&
+        !finalizedLifecycleBatches.Contains(batchJobId);
     public bool CanResolveExistingShares => batchJobId != Guid.Empty && !IsBusy && !IsSaving &&
         capabilities.CanUseShareActions && existingShareInteraction is not null;
     public IAsyncRelayCommand LoadNextPageCommand { get; }
@@ -115,6 +136,7 @@ public sealed class JobResultsViewModel : ObservableObject
     public IAsyncRelayCommand ResumeShareCommand { get; }
     public IAsyncRelayCommand ResolveExistingSharesCommand { get; }
     public IAsyncRelayCommand SaveAsCommand { get; }
+    public IAsyncRelayCommand CopyGeneratedShareCommand { get; }
     public IRelayCommand CancelSaveCommand { get; }
 
     public Task InitializeAsync(Guid requestedBatchJobId, CancellationToken cancellationToken = default) =>
@@ -130,6 +152,12 @@ public sealed class JobResultsViewModel : ObservableObject
     {
         if (requestedBatchJobId == Guid.Empty) throw new ArgumentException("A batch is required.", nameof(requestedBatchJobId));
         var capturedGeneration = Interlocked.Increment(ref generation);
+        if (requestedBatchJobId != progressBatchJobId)
+        {
+            progressBatchJobId = requestedBatchJobId;
+            lastProgressSnapshot = null;
+            refreshFailureActive = false;
+        }
         var previousSave = saveCancellation;
         saveCancellation = null;
         previousSave?.Cancel();
@@ -196,32 +224,52 @@ public sealed class JobResultsViewModel : ObservableObject
         }
     }
 
-    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    public Task RefreshAsync(CancellationToken cancellationToken = default) =>
+        RefreshForLifecycleAsync(cancellationToken);
+
+    public async Task<bool> RefreshForLifecycleAsync(CancellationToken cancellationToken = default)
     {
-        if (!CanRefresh) return;
-        var capturedGeneration = generation;
+        if (!CanRefresh) return false;
         var capturedBatch = batchJobId;
-        IsBusy = true;
-        StatusMessage = "正在刷新任务结果……";
+        await lifecycleRefreshGate.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
-            await ReloadSnapshotAsync(capturedBatch, capturedGeneration, cancellationToken).ConfigureAwait(true);
-            if (capturedGeneration == generation)
-                StatusMessage = $"任务结果已刷新，共 {TotalCount:N0} 条操作。";
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            if (capturedGeneration == generation) StatusMessage = "刷新任务结果已取消。";
-        }
-        catch (Exception)
-        {
-            if (capturedGeneration == generation) StatusMessage = "任务结果刷新失败，请稍后重试。";
+            if (capturedBatch != batchJobId || !CanRefresh) return false;
+            return await RefreshSnapshotCoreAsync(capturedBatch, finalize: false, cancellationToken)
+                .ConfigureAwait(true);
         }
         finally
         {
-            if (capturedGeneration == generation) IsBusy = false;
+            lifecycleRefreshGate.Release();
         }
     }
+
+    internal async Task<bool> FinalizeForTerminalAsync(
+        Guid requestedBatch,
+        Func<bool> isCurrent,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(isCurrent);
+        await lifecycleRefreshGate.WaitAsync(cancellationToken).ConfigureAwait(true);
+        try
+        {
+            if (requestedBatch == Guid.Empty || finalizedLifecycleBatches.Contains(requestedBatch) ||
+                cancellationToken.IsCancellationRequested || !isCurrent())
+                return false;
+            if (requestedBatch != batchJobId)
+                return await LoadAndFinalizeTerminalSnapshotAsync(requestedBatch, isCurrent, cancellationToken)
+                    .ConfigureAwait(true);
+            return await RefreshSnapshotCoreAsync(requestedBatch, finalize: true, cancellationToken)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            lifecycleRefreshGate.Release();
+        }
+    }
+
+    internal bool IsFinalizedForLifecycle(Guid requestedBatch) =>
+        finalizedLifecycleBatches.Contains(requestedBatch);
 
     public async Task ResolveExistingSharesAsync(CancellationToken cancellationToken = default)
     {
@@ -360,8 +408,32 @@ public sealed class JobResultsViewModel : ObservableObject
         }
     }
 
+    private async Task CopyGeneratedShareAsync(
+        JobResultRow? commandRow,
+        CancellationToken cancellationToken)
+    {
+        var selected = commandRow ?? SelectedItem;
+        if (!CanCopyGeneratedShareRow(selected) || clipboard is null || selected is null) return;
+        try
+        {
+            await clipboard.SetTextAsync(
+                $"分享链接：{selected.GeneratedShareUrl}\r\n提取码：{selected.GeneratedExtractionCode}",
+                cancellationToken).ConfigureAwait(true);
+            StatusMessage = "分享链接和提取码已复制。";
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            StatusMessage = "复制已取消。";
+        }
+        catch (Exception)
+        {
+            StatusMessage = "复制失败，请稍后重试。";
+        }
+    }
+
     private Task RetryShareOnlyAsync(CancellationToken cancellationToken) =>
-        RunRowActionAsync(
+        RunAuthorizedRowActionAsync(
+            LicenseOperationKind.Share,
             () => workflow.RetryShareOnlyAsync(SelectedItem!, cancellationToken),
             "正在重新排队分享……", cancellationToken);
 
@@ -376,14 +448,34 @@ public sealed class JobResultsViewModel : ObservableObject
             "正在确认分享结果……", cancellationToken);
 
     private Task ResumeTransferAsync(CancellationToken cancellationToken) =>
-        RunRowActionAsync(
+        RunAuthorizedRowActionAsync(
+            LicenseOperationKind.Transfer,
             () => workflow.ResumeTransferAsync(SelectedItem!, cancellationToken),
             "正在恢复转存任务……", cancellationToken);
 
     private Task ResumeShareAsync(CancellationToken cancellationToken) =>
-        RunRowActionAsync(
+        RunAuthorizedRowActionAsync(
+            LicenseOperationKind.Share,
             () => workflow.ResumeShareAsync(SelectedItem!, cancellationToken),
             "正在恢复分享任务……", cancellationToken);
+
+    private async Task RunAuthorizedRowActionAsync(
+        LicenseOperationKind operation,
+        Func<Task<JobResultActionOutcome>> action,
+        string pendingText,
+        CancellationToken cancellationToken)
+    {
+        if (licenseGate is not null)
+        {
+            var authorization = await licenseGate.AuthorizeAsync(operation, cancellationToken).ConfigureAwait(true);
+            if (!authorization.IsAuthorized)
+            {
+                StatusMessage = "软件尚未激活，联网功能暂不可用。";
+                return;
+            }
+        }
+        await RunRowActionAsync(action, pendingText, cancellationToken).ConfigureAwait(true);
+    }
 
     private async Task RunRowActionAsync(
         Func<Task<JobResultActionOutcome>> action,
@@ -425,6 +517,120 @@ public sealed class JobResultsViewModel : ObservableObject
         OperationCount = summary.OperationCount;
         FailedCount = summary.FailedCount;
         PausedCount = summary.PausedCount;
+        CompleteSuccessCount = summary.CompleteSuccessCount;
+        TerminalProblemCount = summary.TerminalProblemCount;
+    }
+
+    private void PublishProgress(Guid requestedBatch)
+    {
+        var snapshot = new ProgressSnapshot(OperationCount, CompleteSuccessCount, TerminalProblemCount);
+        var mustPublish = requestedBatch != progressBatchJobId || lastProgressSnapshot != snapshot || refreshFailureActive;
+        progressBatchJobId = requestedBatch;
+        lastProgressSnapshot = snapshot;
+        refreshFailureActive = false;
+        if (!mustPublish) return;
+
+        var processed = snapshot.Success + snapshot.Failed;
+        var remaining = Math.Max(0, snapshot.Total - processed);
+        StatusMessage = $"进度 {processed:N0}/{snapshot.Total:N0}：成功 {snapshot.Success:N0}，失败 {snapshot.Failed:N0}，剩余 {remaining:N0}。";
+    }
+
+    private async Task<bool> RefreshSnapshotCoreAsync(
+        Guid capturedBatch,
+        bool finalize,
+        CancellationToken cancellationToken)
+    {
+        var capturedGeneration = generation;
+        IsBusy = true;
+        try
+        {
+            await ReloadSnapshotAsync(capturedBatch, capturedGeneration, cancellationToken).ConfigureAwait(true);
+            if (capturedGeneration != generation || capturedBatch != batchJobId || cancellationToken.IsCancellationRequested)
+                return false;
+            PublishProgress(capturedBatch);
+            if (finalize) FinalizeLifecycle(capturedBatch);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (capturedGeneration == generation && !finalizedLifecycleBatches.Contains(capturedBatch))
+                StatusMessage = "刷新任务结果已取消。";
+        }
+        catch (Exception)
+        {
+            if (capturedGeneration == generation && capturedBatch == batchJobId)
+            {
+                if (!refreshFailureActive)
+                {
+                    refreshFailureActive = true;
+                    StatusMessage = "任务结果刷新失败，请稍后重试。";
+                }
+                if (finalize) FinalizeLifecycle(capturedBatch);
+            }
+        }
+        finally
+        {
+            if (capturedGeneration == generation) IsBusy = false;
+        }
+        return false;
+    }
+
+    private void FinalizeLifecycle(Guid requestedBatch)
+    {
+        if (!finalizedLifecycleBatches.Add(requestedBatch)) return;
+        NotifyCommandState();
+    }
+
+    private async Task<bool> LoadAndFinalizeTerminalSnapshotAsync(
+        Guid requestedBatch,
+        Func<bool> isCurrent,
+        CancellationToken cancellationToken)
+    {
+        var capturedGeneration = generation;
+        IsBusy = true;
+        try
+        {
+            var summaryTask = workflow.LoadSummaryAsync(requestedBatch, cancellationToken);
+            var pageTask = workflow.LoadPageAsync(requestedBatch, null, PageSize, cancellationToken);
+            await Task.WhenAll(summaryTask, pageTask).ConfigureAwait(true);
+            if (capturedGeneration != generation || cancellationToken.IsCancellationRequested || !isCurrent())
+                return false;
+
+            var previousSave = saveCancellation;
+            saveCancellation = null;
+            previousSave?.Cancel();
+            IsSaving = false;
+            batchJobId = requestedBatch;
+            OnPropertyChanged(nameof(BatchJobId));
+            Items.Clear();
+            loadedOperationIds.Clear();
+            nextCursor = null;
+            SelectedItem = null;
+            if (requestedBatch != progressBatchJobId)
+            {
+                progressBatchJobId = requestedBatch;
+                lastProgressSnapshot = null;
+                refreshFailureActive = false;
+            }
+            ApplySummary(await summaryTask.ConfigureAwait(true));
+            ApplyPage(await pageTask.ConfigureAwait(true), replace: true);
+            PublishProgress(requestedBatch);
+            FinalizeLifecycle(requestedBatch);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception)
+        {
+            if (capturedGeneration == generation && !cancellationToken.IsCancellationRequested && isCurrent())
+                FinalizeLifecycle(requestedBatch);
+        }
+        finally
+        {
+            if (capturedGeneration == generation) IsBusy = false;
+        }
+        return false;
     }
 
     private async Task ReloadSnapshotAsync(
@@ -435,13 +641,15 @@ public sealed class JobResultsViewModel : ObservableObject
         var summaryTask = workflow.LoadSummaryAsync(requestedBatch, cancellationToken);
         var pageTask = workflow.LoadPageAsync(requestedBatch, null, PageSize, cancellationToken);
         await Task.WhenAll(summaryTask, pageTask).ConfigureAwait(true);
-        if (expectedGeneration != generation || requestedBatch != batchJobId) return;
+        if (expectedGeneration != generation || requestedBatch != batchJobId || cancellationToken.IsCancellationRequested)
+            return;
         ApplySummary(await summaryTask.ConfigureAwait(true));
         ApplyPage(await pageTask.ConfigureAwait(true), replace: true);
     }
 
     private void ApplyPage(JobResultsPage page, bool replace)
     {
+        var selectedOperationId = SelectedItem?.TransferOperationId;
         var operationIds = page.Items.Select(item => item.TransferOperationId).ToArray();
         if (operationIds.Any(id => id == Guid.Empty) || operationIds.Distinct().Count() != operationIds.Length ||
             (!replace && operationIds.Any(loadedOperationIds.Contains)) ||
@@ -463,6 +671,10 @@ public sealed class JobResultsViewModel : ObservableObject
                 TransferDetailMessage = SafeDetail(item.TransferDetailMessage),
             });
         }
+        if (replace && Items.Count > 0)
+            SelectedItem = selectedOperationId is { } operationId
+                ? Items.FirstOrDefault(item => item.TransferOperationId == operationId) ?? Items[0]
+                : Items[0];
         TotalCount = page.TotalCount;
         nextCursor = page.NextCursor;
         NotifyCommandState();
@@ -485,6 +697,10 @@ public sealed class JobResultsViewModel : ObservableObject
 
     private void CancelSave() => saveCancellation?.Cancel();
 
+    private bool CanCopyGeneratedShareRow(JobResultRow? row) =>
+        !IsBusy && !IsSaving && clipboard is not null &&
+        row is { GeneratedShareUrl: { Length: > 0 }, GeneratedExtractionCode: { Length: > 0 } };
+
     private void NotifyCommandState()
     {
         OnPropertyChanged(nameof(CanLoadNextPage));
@@ -494,6 +710,7 @@ public sealed class JobResultsViewModel : ObservableObject
         OnPropertyChanged(nameof(CanResumeTransfer));
         OnPropertyChanged(nameof(CanResumeShare));
         OnPropertyChanged(nameof(CanSaveAs));
+        OnPropertyChanged(nameof(CanCopyGeneratedShare));
         OnPropertyChanged(nameof(CanRefresh));
         OnPropertyChanged(nameof(CanResolveExistingShares));
         LoadNextPageCommand.NotifyCanExecuteChanged();
@@ -505,6 +722,9 @@ public sealed class JobResultsViewModel : ObservableObject
         ResumeShareCommand.NotifyCanExecuteChanged();
         ResolveExistingSharesCommand.NotifyCanExecuteChanged();
         SaveAsCommand.NotifyCanExecuteChanged();
+        CopyGeneratedShareCommand.NotifyCanExecuteChanged();
         CancelSaveCommand.NotifyCanExecuteChanged();
     }
+
+    private readonly record struct ProgressSnapshot(long Total, long Success, long Failed);
 }

@@ -81,6 +81,17 @@ public interface IWebAutomationAttemptStore
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("The attempt store does not support transfer submission evidence.");
 
+    Task<bool> TryResolveTransferKnownNotDispatchedAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        Guid submissionId,
+        string readinessFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("The attempt store does not support exact negative submission resolution.");
+
     Task<bool> TryPersistTransferAcceptanceAsync(
         Guid operationId,
         Guid accountId,
@@ -92,6 +103,30 @@ public interface IWebAutomationAttemptStore
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("The attempt store does not support exact transfer acceptance.");
+
+    Task<bool> TryPersistTransferLateAcceptanceAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        Guid submissionId,
+        string readinessFingerprint,
+        string targetBaselineFingerprint,
+        string officialRequestId,
+        TransferIdentityMapping mapping,
+        string observationFingerprint,
+        DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("The attempt store does not support exact late transfer acceptance.");
+
+    Task<bool> TryPersistTransferTargetConfirmationAsync(
+        Guid operationId,
+        Guid accountId,
+        int generation,
+        long expectedRevision,
+        TransferTargetConfirmationEvidence evidence,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("The attempt store does not support exact transfer target confirmation.");
 
     Task<bool> TryBeginDirectoryMutationAsync(
         TransferDirectoryMutationRecord mutation,

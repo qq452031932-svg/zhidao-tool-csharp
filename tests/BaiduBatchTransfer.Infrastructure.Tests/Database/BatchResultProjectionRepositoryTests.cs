@@ -36,6 +36,41 @@ public sealed class BatchResultProjectionRepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task PastedTextBatchWithoutSourceColumnsProjectsItsFixedFields()
+    {
+        var graph = await CreateGraphAsync();
+        await graph.ExecuteAsync("""
+            UPDATE ImportSessions SET SourceType='Text',SourceName='[PASTED]' WHERE Id=$session;
+            UPDATE BatchJobs SET SourceType='Text' WHERE Id=$batch;
+            """);
+        var resourceId = await graph.AddResourceAsync(
+            1, "粘贴标题", "[]", "https://pan.baidu.com/s/original");
+
+        var definition = await graph.Repository.GetDefinitionAsync(graph.BatchId);
+        var page = await graph.Repository.GetProjectionPageAsync(graph.BatchId, 0, 10);
+
+        Assert.NotNull(definition);
+        Assert.Equal("[PASTED]", definition.SourceFileName);
+        Assert.Empty(definition.OriginalColumns);
+        var resource = Assert.Single(page.Resources);
+        Assert.Equal(resourceId, resource.ResourceItemId);
+        Assert.Empty(resource.OriginalValues);
+        Assert.Equal("粘贴标题", resource.ResolvedTitle);
+        Assert.Equal("https://pan.baidu.com/s/original", resource.OriginalShareUrl);
+    }
+
+    [Fact]
+    public async Task ExcelBatchWithoutSourceColumnsStillFailsClosed()
+    {
+        var graph = await CreateGraphAsync();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            graph.Repository.GetDefinitionAsync(graph.BatchId));
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            graph.Repository.GetProjectionPageAsync(graph.BatchId, 0, 10));
+    }
+
+    [Fact]
     public async Task ResourcePagesUseStrictCandidateKeysetAndPersistedPayloadValues()
     {
         var graph = await CreateGraphAsync();

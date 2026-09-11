@@ -1,5 +1,7 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Core.Domain;
+using System.Globalization;
 
 namespace BaiduBatchTransfer.App.Features.Jobs;
 
@@ -11,6 +13,9 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
     private int targetItemCount;
     private int targetSuccessCount;
     private string defaultTargetPath;
+    private long? capacityTotal;
+    private long? capacityUsed;
+    private Uri? avatarUri;
 
     public AccountAllocationRowViewModel(WizardAccountOption option, string initialTargetPath)
     {
@@ -20,19 +25,28 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         AccountId = option.AccountId;
         DisplayName = option.DisplayName;
         StatusText = option.Status == "Active" ? "可用" : "不可用";
-        CapacityTotal = option.CapacityTotal;
-        CapacityUsed = option.CapacityUsed;
+        capacityTotal = option.CapacityTotal;
+        capacityUsed = option.CapacityUsed;
         isSelected = option.IsSelected;
         shareEnabled = option.ShareEnabled;
+        ExecutionProfile = option.ExecutionProfile ?? ExecutionProfileSnapshot.LegacyForAccount(option.AccountId);
         defaultTargetPath = initialTargetPath;
     }
 
     public Guid AccountId { get; }
     public string DisplayName { get; }
     public string StatusText { get; }
-    public long? CapacityTotal { get; }
-    public long? CapacityUsed { get; }
+    public Uri? AvatarUri => avatarUri;
+    public long? CapacityTotal => capacityTotal;
+    public long? CapacityUsed => capacityUsed;
+    public ExecutionProfileSnapshot ExecutionProfile { get; }
     public long? RemainingCapacity => CapacityTotal is null || CapacityUsed is null ? null : Math.Max(0, CapacityTotal.Value - CapacityUsed.Value);
+    public string RemainingCapacityText => FormatCapacity(RemainingCapacity);
+    public string CapacityUsedText => FormatCapacity(CapacityUsed);
+    public string CapacityTotalText => FormatCapacity(CapacityTotal);
+    public string CapacitySummaryText => CapacityTotal is null || CapacityUsed is null
+        ? "容量未知"
+        : $"已用 {CapacityUsedText} / {CapacityTotalText}";
 
     // Server preview outputs are meaningful only while HasCurrentConfirmation is true.
     public bool HasCurrentConfirmation { get; private set; }
@@ -115,10 +129,43 @@ public sealed class AccountAllocationRowViewModel : ObservableObject
         OnPropertyChanged(string.Empty);
     }
 
+    public void ApplyCapacity(AccountCapacity capacity)
+    {
+        ArgumentNullException.ThrowIfNull(capacity);
+        var totalChanged = SetProperty(ref capacityTotal, capacity.TotalBytes, nameof(CapacityTotal));
+        var usedChanged = SetProperty(ref capacityUsed, capacity.UsedBytes, nameof(CapacityUsed));
+        if (!totalChanged && !usedChanged) return;
+        OnPropertyChanged(nameof(RemainingCapacity));
+        OnPropertyChanged(nameof(RemainingCapacityText));
+        OnPropertyChanged(nameof(CapacityUsedText));
+        OnPropertyChanged(nameof(CapacityTotalText));
+        OnPropertyChanged(nameof(CapacitySummaryText));
+    }
+
+    public void ApplyAvatar(Uri avatar)
+    {
+        ArgumentNullException.ThrowIfNull(avatar);
+        if (!BaiduAccountIdentity.IsTrustedAvatarUri(avatar))
+            throw new ArgumentException("Avatar URI must use a trusted Baidu HTTPS host.", nameof(avatar));
+        SetProperty(ref avatarUri, avatar, nameof(AvatarUri));
+    }
+
     private static long RequireCount(long? value, string parameterName)
     {
         if (value is null) throw new ArgumentException("账号确认结果缺少工作量。", parameterName);
         if (value < 0) throw new ArgumentOutOfRangeException(parameterName);
         return value.Value;
+    }
+
+    private static string FormatCapacity(long? bytes)
+    {
+        if (bytes is null) return "未知";
+
+        const long gibibyte = 1024L * 1024 * 1024;
+        const long tebibyte = 1024L * gibibyte;
+        var (value, unit) = bytes >= tebibyte
+            ? ((double)bytes.Value / tebibyte, "TB")
+            : ((double)bytes.Value / gibibyte, "GB");
+        return $"{value.ToString("0.##", CultureInfo.InvariantCulture)} {unit}";
     }
 }

@@ -1,0 +1,28 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.Transfers.TransferFolderNameWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="新建文件夹"
+        Width="380" Height="170" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="文件夹名称" Margin="0,0,0,6" />
+        <TextBox x:Name="FolderNameInput" Grid.Row="1" MinHeight="30"
+                 MaxLength="510" VerticalContentAlignment="Center"
+                 AutomationProperties.Name="文件夹名称" />
+
+        <StackPanel Grid.Row="2" Margin="0,16,0,0" Orientation="Horizontal"
+                    HorizontalAlignment="Right" VerticalAlignment="Bottom">
+            <Button Content="取消" IsCancel="True"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Padding="14,6" Margin="0,0,8,0" />
+            <Button Content="创建" IsDefault="True" Click="Confirm_Click"
+                    Style="{StaticResource PrimaryButton}" Padding="14,6" />
+        </StackPanel>
+    </Grid>
+</Window>

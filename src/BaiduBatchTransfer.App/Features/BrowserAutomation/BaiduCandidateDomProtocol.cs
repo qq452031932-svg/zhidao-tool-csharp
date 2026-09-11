@@ -239,7 +239,7 @@ public sealed record BaiduTransferCandidateItem
         if (!Enum.IsDefined(kind)) throw new ArgumentOutOfRangeException(nameof(kind));
         ExactId = Validate(exactId, nameof(exactId));
         Kind = kind;
-        ServerName = Validate(serverName, nameof(serverName));
+        ServerName = Validate(serverName, nameof(serverName), preserveWhitespace: true);
     }
 
     public string ExactId { get; }
@@ -249,9 +249,12 @@ public sealed record BaiduTransferCandidateItem
     public override string ToString() =>
         $"BaiduTransferCandidateItem {{ Kind = {Kind}, ExactId = [REDACTED], ServerName = [REDACTED] }}";
 
-    private static string Validate(string value, string parameterName)
+    private static string Validate(string value, string parameterName, bool preserveWhitespace = false)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
+        // Names are exact observed metadata, not identity selectors; do not normalize them.
+        // Exact IDs retain the original non-whitespace requirement.
+        if (preserveWhitespace) ArgumentException.ThrowIfNullOrEmpty(value, parameterName);
+        else ArgumentException.ThrowIfNullOrWhiteSpace(value, parameterName);
         if (value.Length > 512 || value.Any(char.IsControl))
             throw new ArgumentException("The candidate item field is invalid.", parameterName);
         return value;

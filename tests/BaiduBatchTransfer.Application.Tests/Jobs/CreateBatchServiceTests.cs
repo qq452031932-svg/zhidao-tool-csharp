@@ -9,6 +9,556 @@ namespace BaiduBatchTransfer.Application.Tests.Jobs;
 public sealed class CreateBatchServiceTests
 {
     [Fact]
+    public async Task DirectBackgroundReplicationAcrossTwoAccountsPersistsExactActiveTransferShareGraph()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var firstAccountId = Guid.NewGuid();
+        var secondAccountId = Guid.NewGuid();
+        var rows = Enumerable.Range(1, 2).Select(row => BatchTestData.ReadyRow(sessionId, row)).ToArray();
+        await database.SeedAsync(
+            [BatchTestData.Account(firstAccountId, "direct-a"), BatchTestData.Account(secondAccountId, "direct-b")],
+            BatchTestData.ReadySession(sessionId, 2, 2),
+            rows,
+            payloads: rows.Select((row, index) => new StagedImportRowPayloadRecord(
+                row.Id, $"source-{index + 1}", $"resolved-{index + 1}", row.ShareUrl, "[]")));
+        var resultDirectory = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "direct-results"));
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct replication", TransferMode.Replication, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [
+                new BatchAccountDraft(firstAccountId, 0, "/first", 2, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+                new BatchAccountDraft(secondAccountId, 1, "/second", 2, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+            ],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate",
+            resultDirectory: resultDirectory,
+            directBackground: true,
+            maxConcurrency: 2);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(4, preview.OperationCount);
+        Assert.Equal(4, preview.ShareCount);
+        Assert.Equal(2, preview.Accounts.Length);
+        Assert.Equal(2, created.Confirmation.Accounts.Length);
+
+        await using var unit = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await unit.Jobs.GetAsync(draft.BatchJobId));
+        Assert.True(job.DirectBackground);
+        Assert.Equal(2, job.MaxConcurrency);
+        Assert.Equal("Active", job.DirectActivationState);
+        Assert.Equal(4, job.OperationCount);
+        Assert.Equal(4, job.ShareOperationCount);
+
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        Assert.Equal(2L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(2L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM BatchOutputAccounts WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(4L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(4L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(0L, await ScalarAsync(connection, """
+            SELECT COUNT(*) FROM TransferOperations transfer
+            WHERE transfer.BatchJobId=$batch AND
+              (SELECT COUNT(*) FROM ShareOperations share
+               WHERE share.TransferOperationId=transfer.Id)<>1;
+            """, draft.BatchJobId));
+        Assert.Equal(0L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM StandaloneShareOperations WHERE BatchId=$batch;", draft.BatchJobId));
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT DirectExtractionCode FROM ShareOperations WHERE BatchJobId=$batch ORDER BY OutputOrdinal,Id;";
+            command.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+            await using var reader = await command.ExecuteReaderAsync();
+            var codes = new List<string>();
+            while (await reader.ReadAsync()) codes.Add(reader.GetString(0));
+            Assert.Equal(4, codes.Count);
+            Assert.All(codes, code =>
+            {
+                Assert.Equal(4, code.Length);
+                Assert.All(code, character => Assert.True(
+                    character is >= 'a' and <= 'z' or >= '0' and <= '9'));
+            });
+        }
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT DirectoryReference FROM BatchResultDestinations WHERE BatchJobId=$batch;";
+            command.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+            Assert.Equal(resultDirectory, Assert.IsType<string>(await command.ExecuteScalarAsync()));
+        }
+    }
+
+    [Fact]
+    public async Task DirectBackgroundTaskCountDistributionAcrossTwoAccountsPersistsExactActiveTransferShareGraph()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var firstAccountId = Guid.NewGuid();
+        var secondAccountId = Guid.NewGuid();
+        var rows = Enumerable.Range(1, 3).Select(row => BatchTestData.ReadyRow(sessionId, row)).ToArray();
+        await database.SeedAsync(
+            [BatchTestData.Account(firstAccountId, "direct-a"), BatchTestData.Account(secondAccountId, "direct-b")],
+            BatchTestData.ReadySession(sessionId, 3, 3),
+            rows,
+            payloads: rows.Select((row, index) => new StagedImportRowPayloadRecord(
+                row.Id, $"source-{index + 1}", $"resolved-{index + 1}", row.ShareUrl, "[]")));
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct distribution", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [
+                new BatchAccountDraft(firstAccountId, 0, "/first", 2, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+                new BatchAccountDraft(secondAccountId, 1, "/second", 1, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+            ],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate", resultDirectory: Path.GetTempPath(),
+            directBackground: true, maxConcurrency: 3);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(3, preview.OperationCount);
+        Assert.Equal(3, preview.ShareCount);
+        Assert.Equal([2L, 1L], preview.Accounts.OrderBy(account => account.PriorityOrder)
+            .Select(account => account.PlannedTransferCount));
+        Assert.Equal(2, created.Confirmation.Accounts.Length);
+        await using var unit = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await unit.Jobs.GetAsync(draft.BatchJobId));
+        Assert.Equal("Active", job.DirectActivationState);
+        Assert.Equal(3, job.OperationCount);
+        Assert.Equal(3, job.ShareOperationCount);
+        Assert.Equal(2, (await unit.Jobs.GetAllocationsPageAsync(
+            draft.BatchJobId, new PageQuery(1, 10))).TotalCount);
+        Assert.Equal(2, (await unit.Jobs.GetOutputAccountsAsync(draft.BatchJobId)).Count);
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        Assert.Equal(3L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(3L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch;", draft.BatchJobId));
+        Assert.Equal(0L, await ScalarAsync(connection, """
+            SELECT COUNT(*) FROM TransferOperations transfer
+            WHERE transfer.BatchJobId=$batch AND
+              (SELECT COUNT(*) FROM ShareOperations share
+               WHERE share.TransferOperationId=transfer.Id)<>1;
+            """, draft.BatchJobId));
+    }
+
+    [Fact]
+    public async Task DirectBackgroundDistributionAllowsSelectedZeroWorkAccountAndActivatesExactGraph()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var firstAccountId = Guid.NewGuid();
+        var secondAccountId = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(firstAccountId, "direct-a"), BatchTestData.Account(secondAccountId, "direct-b")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [row],
+            payloads: [new(row.Id, "source", "resolved", row.ShareUrl, "[]")]);
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct zero quota", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [
+                new BatchAccountDraft(firstAccountId, 0, "/first", 1, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+                new BatchAccountDraft(secondAccountId, 1, "/second", 0, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+            ],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate", resultDirectory: Path.GetTempPath(),
+            directBackground: true, maxConcurrency: 2);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal([1L, 0L], preview.Accounts.OrderBy(account => account.PriorityOrder)
+            .Select(account => account.PlannedTransferCount));
+        await using var unit = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await unit.Jobs.GetAsync(created.BatchJobId));
+        Assert.Equal("Active", job.DirectActivationState);
+        var outputs = await unit.Jobs.GetOutputAccountsAsync(created.BatchJobId);
+        Assert.True(outputs.Single(output => output.AccountId == firstAccountId).ShareEnabled);
+        var zeroOutput = outputs.Single(output => output.AccountId == secondAccountId);
+        Assert.Equal(0, zeroOutput.PlannedTransferCount);
+        Assert.Equal(0, zeroOutput.PlannedShareCount);
+        Assert.False(zeroOutput.ShareEnabled);
+    }
+
+    [Fact]
+    public async Task DirectBackgroundConfirmIgnoresSavedNotSelectedAccountAndActivatesSelectedGraph()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var selectedAccountId = Guid.NewGuid();
+        var notSelectedAccountId = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [
+                BatchTestData.Account(selectedAccountId, "selected"),
+                BatchTestData.Account(notSelectedAccountId, "saved"),
+            ],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [row],
+            payloads: [new(row.Id, "source-title", "resolved-title", row.ShareUrl, "[]")]);
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [
+                new BatchAccountDraft(
+                    selectedAccountId, 0, "/selected", 1, 0,
+                    BatchAccountSelectionDecision.Selected, shareEnabled: true),
+                new BatchAccountDraft(
+                    notSelectedAccountId, 1, "/saved", 0, 0,
+                    BatchAccountSelectionDecision.NotSelected, shareEnabled: false),
+            ],
+            "/selected", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate",
+            resultDirectory: Path.GetTempPath(),
+            directBackground: true,
+            maxConcurrency: 2);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var previewAccount = Assert.Single(preview.Accounts);
+        Assert.Equal(selectedAccountId, previewAccount.AccountId);
+
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        var confirmedAccount = Assert.Single(created.Confirmation.Accounts);
+        Assert.Equal(selectedAccountId, confirmedAccount.AccountId);
+        await using var unit = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await unit.Jobs.GetAsync(draft.BatchJobId));
+        Assert.Equal("Active", job.DirectActivationState);
+        var resource = Assert.Single(await AllResourcesAsync(unit.Jobs, draft.BatchJobId));
+        Assert.Equal("resolved-title", resource.ResolvedOutputTitle);
+        var allocation = Assert.Single(
+            (await unit.Jobs.GetAllocationsPageAsync(draft.BatchJobId, new PageQuery(1, 10))).Items);
+        Assert.Equal(selectedAccountId, allocation.AccountId);
+        var output = Assert.Single(await unit.Jobs.GetOutputAccountsAsync(draft.BatchJobId));
+        Assert.Equal(selectedAccountId, output.AccountId);
+        var transfer = Assert.Single(await AllOperationsAsync(unit.Jobs, draft.BatchJobId));
+        Assert.Equal(selectedAccountId, transfer.AssignedAccountId);
+
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        Assert.Equal(1L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND AccountId=$account;",
+            draft.BatchJobId, selectedAccountId));
+        Assert.Equal(0L, await ScalarAsync(connection, """
+            SELECT
+              (SELECT COUNT(*) FROM AccountAllocations WHERE BatchJobId=$batch AND AccountId=$account) +
+              (SELECT COUNT(*) FROM BatchOutputAccounts WHERE BatchJobId=$batch AND AccountId=$account) +
+              (SELECT COUNT(*) FROM TransferOperations WHERE BatchJobId=$batch AND AssignedAccountId=$account) +
+              (SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND AccountId=$account);
+            """, draft.BatchJobId, notSelectedAccountId));
+    }
+
+    [Theory]
+    [InlineData("output-plan")]
+    [InlineData("execution-profile")]
+    [InlineData("duplicate-policy")]
+    [InlineData("share-permanent")]
+    [InlineData("share-access")]
+    [InlineData("share-mode")]
+    [InlineData("share-policy")]
+    public async Task DirectBackgroundGraphGateRejectsTamperingBeforeActivation(string scenario)
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(accountId, "direct")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [row],
+            payloads: [new(row.Id, "source-title", "resolved-title", row.ShareUrl, "[]")]);
+        var tamperedProfile = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "tampered-profile", Guid.NewGuid(), Guid.NewGuid());
+        await SeedManagedProfileAsync(database, accountId, tamperedProfile);
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct tamper", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [new BatchAccountDraft(accountId, 0, "/target", 1, 0,
+                BatchAccountSelectionDecision.Selected, shareEnabled: true)],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate", resultDirectory: Path.GetTempPath(),
+            directBackground: true, maxConcurrency: 2);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+        await using (var connection = await database.ConnectionFactory.OpenConnectionAsync())
+        await using (var tamper = connection.CreateCommand())
+        {
+            tamper.CommandText = scenario switch
+            {
+                "output-plan" => """
+                    CREATE TRIGGER Test_TamperDirectOutputPlan
+                    AFTER INSERT ON BatchOutputAccounts
+                    BEGIN
+                      UPDATE BatchOutputAccounts
+                      SET PlannedTransferCount=PlannedTransferCount+1,
+                          PlannedShareCount=PlannedShareCount+1
+                      WHERE BatchJobId=NEW.BatchJobId AND AccountId=NEW.AccountId;
+                    END;
+                    """,
+                "execution-profile" => $"""
+                    DROP TRIGGER TR_ShareOperations_ExecutionSnapshotImmutable;
+                    CREATE TRIGGER Test_TamperDirectShareProfile
+                    AFTER INSERT ON ShareOperations
+                    BEGIN
+                      UPDATE ShareOperations
+                      SET ExecutionEngineVersion='ManagedChromium-v1',BrowserFamily='Chrome',
+                          ProfileId='{tamperedProfile.ProfileId}',
+                          InstallationId='{tamperedProfile.InstallationId!.Value:D}',
+                          SessionId='{tamperedProfile.SessionId!.Value:D}'
+                      WHERE Id=NEW.Id;
+                    END;
+                    """,
+                "duplicate-policy" => """
+                    CREATE TRIGGER Test_TamperDirectDuplicatePolicy
+                    AFTER INSERT ON BatchJobs
+                    BEGIN
+                      UPDATE BatchJobs SET DuplicatePolicy='Skip' WHERE Id=NEW.Id;
+                    END;
+                    """,
+                "share-permanent" => DirectShareSettingsTamperTrigger("IsPermanent=0"),
+                "share-access" => DirectShareSettingsTamperTrigger("IsAccessUnlimited=0"),
+                "share-mode" => DirectShareSettingsTamperTrigger(
+                    "ExtractionCodeMode='Fixed',FixedExtractionCode='a1b2'"),
+                "share-policy" => DirectShareSettingsTamperTrigger("ExistingSharePolicy='Reuse'"),
+                _ => throw new InvalidOperationException(scenario),
+            };
+            await tamper.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() =>
+            service.ConfirmAsync(draft, preview.ConfirmationToken));
+
+        await using var verify = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await verify.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    private static string DirectShareSettingsTamperTrigger(string assignment) => $"""
+        DROP TRIGGER TR_BatchShareSettings_Immutable;
+        CREATE TRIGGER Test_TamperDirectShareSettings
+        AFTER INSERT ON BatchShareSettings
+        BEGIN
+          UPDATE BatchShareSettings SET {assignment} WHERE BatchJobId=NEW.BatchJobId;
+        END;
+        """;
+
+    [Theory]
+    [InlineData("share-disabled")]
+    [InlineData("skip-duplicates")]
+    [InlineData("reuse-policy")]
+    [InlineData("relative-results")]
+    public async Task DirectBackgroundPreviewRejectsNonExactWorkflow(string scenario)
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+        await database.SeedAsync(
+            scenario == "share-disabled"
+                ? [BatchTestData.Account(first, "a"), BatchTestData.Account(second, "b")]
+                : [BatchTestData.Account(first, "a")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        var accounts = scenario == "share-disabled"
+            ? new[]
+            {
+                new BatchAccountDraft(first, 0, "/target", 1, 0,
+                    BatchAccountSelectionDecision.Selected, true),
+                new BatchAccountDraft(second, 1, "/unused", 0, 0,
+                    BatchAccountSelectionDecision.Selected, false),
+            }
+            : [new BatchAccountDraft(first, 0, "/target", 1, 0,
+                BatchAccountSelectionDecision.Selected, true)];
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction, accounts, "/target", "None",
+            scenario == "skip-duplicates" ? DuplicatePolicy.Skip : DuplicatePolicy.Rename,
+            "Immediate", 1, true,
+            existingSharePolicy: scenario == "reuse-policy" ? "Reuse" : "Regenerate",
+            resultDirectory: scenario == "relative-results" ? "relative" : Path.GetTempPath(),
+            directBackground: true,
+            maxConcurrency: 2);
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() =>
+            Service(database, long.MaxValue).PreviewAsync(draft));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
+    public void DirectBackgroundConcurrencyMustBeBetweenOneAndThree()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new BatchDraft(
+            Guid.NewGuid(), Guid.NewGuid(), "Direct", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [new BatchAccountDraft(Guid.NewGuid(), 0, "/target", 1, 0,
+                BatchAccountSelectionDecision.Selected, true)],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate", resultDirectory: Path.GetTempPath(),
+            directBackground: true, maxConcurrency: 4));
+    }
+
+    [Fact]
+    public async Task AcceptanceOnlyConfirmPersistsOneManagedTransferAndOneLinkedShare()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var profile = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "acceptance-profile", Guid.NewGuid(), Guid.NewGuid());
+        await database.SeedAsync(
+            [BatchTestData.Account(accountId, "managed") with { LoginMethod = "ManagedChromium" }],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await SeedManagedProfileAsync(database, accountId, profile);
+        var draft = AcceptanceDraft(sessionId, accountId, profile, resultDirectory: Path.GetTempPath());
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.True(preview.AcceptanceOnly);
+        await using var unit = await database.UnitOfWorkFactory.BeginAsync();
+        var job = Assert.IsType<BatchJobRecord>(await unit.Jobs.GetAsync(draft.BatchJobId));
+        var transfer = Assert.Single(await AllOperationsAsync(unit.Jobs, draft.BatchJobId));
+        Assert.True(job.AcceptanceOnly);
+        Assert.True(transfer.AcceptanceOnly);
+        Assert.Equal(profile, transfer.ExecutionProfile);
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT COUNT(*),share.Status,share.ExecutionEngineVersion,share.BrowserFamily,
+              share.ProfileId,share.InstallationId,share.SessionId
+            FROM ShareOperations share
+            WHERE share.BatchJobId=$batch AND share.TransferOperationId=$transfer;
+            """;
+        command.Parameters.AddWithValue("$batch", draft.BatchJobId.ToString("D"));
+        command.Parameters.AddWithValue("$transfer", transfer.Id.ToString("D"));
+        await using var row = await command.ExecuteReaderAsync();
+        Assert.True(await row.ReadAsync());
+        Assert.Equal(1, row.GetInt64(0));
+        Assert.Equal("WaitingTransfer", row.GetString(1));
+        Assert.Equal("ManagedChromium-v1", row.GetString(2));
+        Assert.Equal("Chrome", row.GetString(3));
+        Assert.Equal(profile.ProfileId, row.GetString(4));
+        Assert.Equal(profile.InstallationId!.Value.ToString("D"), row.GetString(5));
+        Assert.Equal(profile.SessionId!.Value.ToString("D"), row.GetString(6));
+    }
+
+    [Fact]
+    public async Task AcceptanceOnlyAcceptsLegacyAccountBoundToCurrentManagedSession()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var profile = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "acceptance-profile", Guid.NewGuid(), Guid.NewGuid());
+        await database.SeedAsync(
+            [BatchTestData.Account(accountId, "legacy-bound") with { LoginMethod = "WebView2" }],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await SeedManagedProfileAsync(database, accountId, profile);
+        var draft = AcceptanceDraft(sessionId, accountId, profile, resultDirectory: Path.GetTempPath());
+
+        var preview = await Service(database, long.MaxValue).PreviewAsync(draft);
+
+        Assert.True(preview.AcceptanceOnly);
+        Assert.Equal(1, preview.OperationCount);
+    }
+
+    [Fact]
+    public async Task AcceptanceOnlyConfirmRejectsManagedSessionRetiredAfterPreview()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var profile = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "acceptance-profile", Guid.NewGuid(), Guid.NewGuid());
+        await database.SeedAsync(
+            [BatchTestData.Account(accountId, "managed") with { LoginMethod = "ManagedChromium" }],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [BatchTestData.ReadyRow(sessionId, 1)]);
+        await SeedManagedProfileAsync(database, accountId, profile);
+        var draft = AcceptanceDraft(sessionId, accountId, profile);
+        var service = Service(database, long.MaxValue);
+        var preview = await service.PreviewAsync(draft);
+        await using (var connection = await database.ConnectionFactory.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "UPDATE ManagedBrowserSessions SET State='Retired' WHERE SessionId=$session;";
+            command.Parameters.AddWithValue("$session", profile.SessionId!.Value.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() =>
+            service.ConfirmAsync(draft, preview.ConfirmationToken));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Theory]
+    [InlineData("legacy")]
+    [InlineData("stale")]
+    [InlineData("multiple-resources")]
+    [InlineData("multiple-accounts")]
+    [InlineData("share-disabled")]
+    [InlineData("invalid-result-directory")]
+    public async Task AcceptanceOnlyPreviewRejectsAnyNonExactOrStaleScope(string scenario)
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var managed = ExecutionProfileSnapshot.Managed(
+            BrowserFamily.Chrome, "acceptance-profile", Guid.NewGuid(), Guid.NewGuid());
+        var rowCount = scenario == "multiple-resources" ? 2 : 1;
+        var account = BatchTestData.Account(accountId, "acceptance") with
+        {
+            LoginMethod = scenario == "legacy" ? "WebView2" : "ManagedChromium",
+        };
+        await database.SeedAsync(
+            [account],
+            BatchTestData.ReadySession(sessionId, rowCount, rowCount),
+            Enumerable.Range(1, rowCount).Select(row => BatchTestData.ReadyRow(sessionId, row)));
+        if (scenario is not ("legacy" or "stale"))
+            await SeedManagedProfileAsync(database, accountId, managed);
+        var profile = scenario == "legacy"
+            ? ExecutionProfileSnapshot.LegacyForAccount(accountId)
+            : managed;
+        var draft = AcceptanceDraft(
+            sessionId,
+            accountId,
+            profile,
+            targetItemCount: rowCount,
+            shareEnabled: scenario != "share-disabled",
+            resultDirectory: scenario == "invalid-result-directory" ? "relative" : Path.GetTempPath(),
+            includeSecondAccount: scenario == "multiple-accounts");
+
+        await Assert.ThrowsAsync<BatchDraftValidationException>(() =>
+            Service(database, long.MaxValue).PreviewAsync(draft));
+
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        Assert.Null(await read.Jobs.GetAsync(draft.BatchJobId));
+    }
+
+    [Fact]
     public async Task MissingSelectionRejectsBeforeOpeningUnitOfWork()
     {
         var factory = new RejectingUnitOfWorkFactory();
@@ -778,6 +1328,46 @@ public sealed class CreateBatchServiceTests
     }
 
     [Fact]
+    public async Task DirectBackgroundShareEnabledConfirmationAllowsBlankResolvedTitle()
+    {
+        await using var database = await BatchTestDatabase.CreateAsync();
+        var sessionId = Guid.NewGuid();
+        var account = Guid.NewGuid();
+        var row = BatchTestData.ReadyRow(sessionId, 1);
+        await database.SeedAsync(
+            [BatchTestData.Account(account, "direct")],
+            BatchTestData.ReadySession(sessionId, 1, 1),
+            [row],
+            payloads: [new(row.Id, null, "  ", row.ShareUrl, "[]")]);
+        var draft = new BatchDraft(
+            Guid.NewGuid(), sessionId, "Direct", TransferMode.Distribution, QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            [new BatchAccountDraft(account, 0, "/target", 1, 0,
+                BatchAccountSelectionDecision.Selected, shareEnabled: true)],
+            "/target", "None", DuplicatePolicy.Rename, "Immediate", 1, true,
+            existingSharePolicy: "Regenerate",
+            resultDirectory: Path.GetTempPath(),
+            directBackground: true,
+            maxConcurrency: 1);
+        var service = Service(database, long.MaxValue);
+
+        var preview = await service.PreviewAsync(draft);
+        var created = await service.ConfirmAsync(draft, preview.ConfirmationToken);
+
+        Assert.Equal(1, preview.OperationCount);
+        Assert.Equal(1, preview.ShareCount);
+        Assert.Equal(draft.BatchJobId, created.BatchJobId);
+        await using var read = await database.UnitOfWorkFactory.BeginAsync();
+        var resource = Assert.Single(await AllResourcesAsync(read.Jobs, draft.BatchJobId));
+        Assert.True(string.IsNullOrWhiteSpace(resource.ResolvedOutputTitle));
+        Assert.Single(await AllOperationsAsync(read.Jobs, draft.BatchJobId));
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        Assert.Equal(1L, await ScalarAsync(connection,
+            "SELECT COUNT(*) FROM ShareOperations WHERE BatchJobId=$batch AND Status='WaitingTransfer';",
+            draft.BatchJobId));
+    }
+
+    [Fact]
     public async Task ExactConfirmationReplayReturnsExistingJobWithoutDuplicatingGraph()
     {
         await using var database = await BatchTestDatabase.CreateAsync();
@@ -1537,6 +2127,30 @@ public sealed class CreateBatchServiceTests
                 new ReplicationPreflightEstimatorTests.StubDiskSpaceProbe(availableBytes),
                 database.DatabasePath));
 
+    private static async Task<long> ScalarAsync(
+        SqliteConnection connection,
+        string sql,
+        Guid batchJobId)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$batch", batchJobId.ToString("D"));
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
+    private static async Task<long> ScalarAsync(
+        SqliteConnection connection,
+        string sql,
+        Guid batchJobId,
+        Guid accountId)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$batch", batchJobId.ToString("D"));
+        command.Parameters.AddWithValue("$account", accountId.ToString("D"));
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
+    }
+
     private static BatchDraft Draft(
         Guid importSessionId,
         TransferMode mode,
@@ -1544,6 +2158,75 @@ public sealed class CreateBatchServiceTests
         IReadOnlyList<BatchAccountDraft> accounts) =>
         new(Guid.NewGuid(), importSessionId, "Batch", mode, quota, ShortagePolicy.ProportionalReduction,
             accounts, "/", "None", DuplicatePolicy.Skip, "Immediate", 1, true);
+
+    private static BatchDraft AcceptanceDraft(
+        Guid importSessionId,
+        Guid accountId,
+        ExecutionProfileSnapshot profile,
+        int targetItemCount = 1,
+        bool shareEnabled = true,
+        string? resultDirectory = null,
+        bool includeSecondAccount = false) =>
+        new(
+            Guid.NewGuid(),
+            importSessionId,
+            "Acceptance",
+            TransferMode.Distribution,
+            QuotaBasis.TaskCount,
+            ShortagePolicy.ProportionalReduction,
+            includeSecondAccount
+                ? [
+                    new BatchAccountDraft(
+                        accountId, 0, "/target", targetItemCount, 0,
+                        BatchAccountSelectionDecision.Selected, shareEnabled, profile),
+                    new BatchAccountDraft(
+                        Guid.NewGuid(), 1, "/unused", 0, 0,
+                        BatchAccountSelectionDecision.NotSelected, false),
+                ]
+                : [new BatchAccountDraft(
+                    accountId,
+                    0,
+                    "/target",
+                    targetItemCount,
+                    0,
+                    BatchAccountSelectionDecision.Selected,
+                    shareEnabled,
+                    profile)],
+            "/",
+            "None",
+            DuplicatePolicy.Skip,
+            "Immediate",
+            1,
+            true,
+            acceptanceOnly: true,
+            resultDirectory: resultDirectory ?? Path.GetTempPath());
+
+    private static async Task SeedManagedProfileAsync(
+        BatchTestDatabase database,
+        Guid accountId,
+        ExecutionProfileSnapshot profile)
+    {
+        await using var connection = await database.ConnectionFactory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO BrowserInstallations(
+              InstallationId,BrowserFamily,InstallationDirectory,ExecutablePath,Publisher,ProductName,
+              FileIdentity,State,Revision,CreatedAt,UpdatedAt)
+            VALUES($installation,'Chrome','C:\\Browser','C:\\Browser\\chrome.exe','Google LLC',
+              'Chrome','acceptance-file','Active',1,$now,$now);
+            INSERT INTO ManagedBrowserSessions(
+              SessionId,AccountId,BaiduUserId,InstallationId,BrowserFamily,ProfileId,ProfileOwnershipId,
+              State,Revision,CreatedAt,UpdatedAt)
+            SELECT $session,$account,BaiduUserId,$installation,'Chrome',$profile,'acceptance-owner',
+              'Active',1,$now,$now FROM Accounts WHERE Id=$account;
+            """;
+        command.Parameters.AddWithValue("$installation", profile.InstallationId!.Value.ToString("D"));
+        command.Parameters.AddWithValue("$session", profile.SessionId!.Value.ToString("D"));
+        command.Parameters.AddWithValue("$account", accountId.ToString("D"));
+        command.Parameters.AddWithValue("$profile", profile.ProfileId);
+        command.Parameters.AddWithValue("$now", BatchTestData.Now.ToString("O"));
+        await command.ExecuteNonQueryAsync();
+    }
 
     private static BatchWorkloadAccountInput WorkloadAccount(
         int priority,

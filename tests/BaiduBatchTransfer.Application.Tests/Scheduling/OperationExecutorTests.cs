@@ -5,7 +5,7 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Tests.Scheduling;
 
-public sealed class OperationExecutorTests
+public sealed partial class OperationExecutorTests
 {
     private static readonly DateTimeOffset Now = new(2026, 8, 19, 5, 0, 0, TimeSpan.Zero);
 
@@ -646,6 +646,7 @@ public sealed class OperationExecutorTests
         public int SucceededOrder { get; private set; }
         public bool Succeeded { get; private set; }
         public bool ResultPending { get; private set; }
+        public bool PreparationOutcomeUnknown { get; private set; }
         public bool ExactCompleted { get; private set; }
         public bool RejectSplitSuccessWrites { get; init; }
         public RemoteItemIdentitySet? ExactRemoteItems { get; private set; }
@@ -660,6 +661,8 @@ public sealed class OperationExecutorTests
         public int? PreparingExpectedAttemptCount { get; private set; }
         public int? BoundaryExpectedAttemptCount { get; private set; }
         public int? SucceededExpectedAttemptCount { get; private set; }
+        public bool AcceptBoundary { get; init; } = true;
+        public bool WaitingForDailyLimit { get; private set; }
 
         public Task<OperationExecutionSnapshot?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default)
         {
@@ -681,7 +684,14 @@ public sealed class OperationExecutorTests
             BoundaryExpectedAttemptCount = persistence.Command.ExpectedAttemptCount;
             Events.Add((++order, "Boundary"));
             timeline?.Add("Boundary");
-            return Task.FromResult(new SubmissionBoundaryResult(true, true, 1));
+            return Task.FromResult(new SubmissionBoundaryResult(AcceptBoundary, AcceptBoundary, AcceptBoundary ? 1 : 0));
+        }
+
+        public Task ReturnToWaitingForDailyLimitAsync(Guid operationId, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
+        {
+            WaitingForDailyLimit = true;
+            return Task.CompletedTask;
         }
 
         public Task RecordSubmissionIdentifiersAsync(Guid operationId, string? requestId,
@@ -753,6 +763,18 @@ public sealed class OperationExecutorTests
             AccountPauseCode = code;
             AccountPauseMessage = safeMessage;
             Events.Add((++order, "AccountPausedBeforeSubmission"));
+            return Task.CompletedTask;
+        }
+
+        public Task MarkPreparationOutcomeUnknownAsync(Guid operationId, string code,
+            string safeMessage, SubmissionAcceptance submissionAcceptance, DateTimeOffset now,
+            CancellationToken cancellationToken = default, int? expectedAttemptCount = null)
+        {
+            PreparationOutcomeUnknown = true;
+            PendingAcceptance = submissionAcceptance;
+            FailureCode = code;
+            FailureMessage = safeMessage;
+            Events.Add((++order, "PreparationOutcomeUnknown"));
             return Task.CompletedTask;
         }
 

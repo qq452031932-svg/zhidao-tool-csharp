@@ -60,3 +60,12 @@ public interface IBaiduNetdiskAdapter
             legacy.SubmissionAcceptance);
     }
 }
+
+public interface ISourceAwareBaiduTransferConfirmationAdapter
+{
+    Task<BaiduAdapterResult<TransferConfirmationResult>> ConfirmExactTransferAsync(
+        AccountSession session,
+        ShareReference sourceShare,
+        TransferConfirmationQuery query,
+        CancellationToken cancellationToken);
+}

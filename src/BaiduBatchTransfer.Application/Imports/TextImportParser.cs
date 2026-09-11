@@ -19,6 +19,7 @@ public sealed partial class TextImportParser
     {
         ArgumentNullException.ThrowIfNull(reader);
         var outputRowNumber = 0;
+        string? pendingTitle = null;
         string? line;
         while ((line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
         {
@@ -29,6 +30,21 @@ public sealed partial class TextImportParser
             }
 
             var matches = UrlPattern().Matches(line).Cast<Match>().ToArray();
+            if (matches.Length == 0)
+            {
+                metricsObserver?.Invoke(new TextImportParserLineMetrics(0, 0, 0));
+                if (pendingTitle is not null)
+                {
+                    yield return new ImportSourceRow(
+                        ++outputRowNumber,
+                        string.Empty,
+                        Note: pendingTitle,
+                        ValidationError: MissingLinkMessage);
+                }
+                pendingTitle = line.Trim();
+                continue;
+            }
+
             var note = CodePattern().Replace(UrlPattern().Replace(line, string.Empty), string.Empty).Trim();
             var baiduCandidateCount = 0;
             var candidateEvaluationCount = 0;
@@ -55,7 +71,8 @@ public sealed partial class TextImportParser
                     url,
                     code,
                     Note: note,
-                    ValidationError: IsSupportedBaiduHttpsUrl(url) ? null : MalformedBaiduLinkMessage);
+                    ValidationError: IsSupportedBaiduHttpsUrl(url) ? null : MalformedBaiduLinkMessage,
+                    SourceTitle: pendingTitle ?? (note.Length == 0 ? null : note));
             }
 
             metricsObserver?.Invoke(new TextImportParserLineMetrics(
@@ -65,12 +82,34 @@ public sealed partial class TextImportParser
 
             if (baiduCandidateCount == 0)
             {
+                if (pendingTitle is not null)
+                {
+                    yield return new ImportSourceRow(
+                        ++outputRowNumber,
+                        string.Empty,
+                        Note: pendingTitle,
+                        ValidationError: MissingLinkMessage);
+                    pendingTitle = null;
+                }
                 yield return new ImportSourceRow(
                     ++outputRowNumber,
                     string.Empty,
                     Note: line,
                     ValidationError: MissingLinkMessage);
             }
+            else
+            {
+                pendingTitle = null;
+            }
+        }
+
+        if (pendingTitle is not null)
+        {
+            yield return new ImportSourceRow(
+                ++outputRowNumber,
+                string.Empty,
+                Note: pendingTitle,
+                ValidationError: MissingLinkMessage);
         }
     }
 

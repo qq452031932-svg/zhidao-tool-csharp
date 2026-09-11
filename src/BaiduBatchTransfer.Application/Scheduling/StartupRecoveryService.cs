@@ -49,6 +49,8 @@ public sealed class StartupRecoveryService
     private readonly AllocationCounterRebuilder counterRebuilder;
     private readonly IInterruptedShareOperationRecoveryStore? shareRecovery;
     private readonly TimeProvider timeProvider;
+    private readonly SemaphoreSlim preparationLock = new(1, 1);
+    private bool localPrepared;
 
     public StartupRecoveryService(
         ISingleInstanceGuard instanceGuard,
@@ -68,13 +70,32 @@ public sealed class StartupRecoveryService
 
     public bool CoordinatorMayStart { get; private set; }
 
-    public async Task<StartupRecoveryResult> RecoverAsync(CancellationToken cancellationToken = default)
+    public async Task PrepareLocalAsync(CancellationToken cancellationToken = default)
     {
-        CoordinatorMayStart = false;
-        if (!await instanceGuard.TryAcquireAsync(cancellationToken).ConfigureAwait(false))
-            throw new SingleInstanceUnavailableException();
+        await preparationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (localPrepared) return;
 
-        await databaseMaintenance.PrepareAsync(cancellationToken).ConfigureAwait(false);
+            CoordinatorMayStart = false;
+            if (!await instanceGuard.TryAcquireAsync(cancellationToken).ConfigureAwait(false))
+                throw new SingleInstanceUnavailableException();
+
+            await databaseMaintenance.PrepareAsync(cancellationToken).ConfigureAwait(false);
+            localPrepared = true;
+        }
+        finally
+        {
+            preparationLock.Release();
+        }
+    }
+
+    public async Task<StartupRecoveryResult> RecoverPreparedAsync(CancellationToken cancellationToken = default)
+    {
+        if (!localPrepared)
+            throw new InvalidOperationException("Local startup preparation has not completed.");
+
+        CoordinatorMayStart = false;
         var recoveredAt = timeProvider.GetUtcNow();
         var operations = await operationRecovery.RecoverInterruptedOperationsAsync(
             recoveredAt, cancellationToken).ConfigureAwait(false);
@@ -84,5 +105,11 @@ public sealed class StartupRecoveryService
         var counters = await counterRebuilder.RebuildAsync(cancellationToken).ConfigureAwait(false);
         CoordinatorMayStart = true;
         return new StartupRecoveryResult(operations, counters, true, shares);
+    }
+
+    public async Task<StartupRecoveryResult> RecoverAsync(CancellationToken cancellationToken = default)
+    {
+        await PrepareLocalAsync(cancellationToken).ConfigureAwait(false);
+        return await RecoverPreparedAsync(cancellationToken).ConfigureAwait(false);
     }
 }

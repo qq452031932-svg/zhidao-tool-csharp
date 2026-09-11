@@ -7,20 +7,30 @@ public partial class AcceptanceConfirmationWindow : Window
 {
     private readonly AcceptanceWriteLeaseCoordinator coordinator;
     private readonly AdapterWriteAuthorizationRequest request;
+    private readonly RemoteWriteExecutionMode remoteWriteMode;
     private readonly TaskCompletionSource<bool> leaseDecision = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public AcceptanceConfirmationWindow(
         AcceptanceWriteLeaseCoordinator coordinator,
-        AdapterWriteAuthorizationRequest request)
+        AdapterWriteAuthorizationRequest request,
+        RemoteWriteExecutionMode remoteWriteMode = RemoteWriteExecutionMode.Full)
     {
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.request = request ?? throw new ArgumentNullException(nameof(request));
+        this.remoteWriteMode = remoteWriteMode;
+        if (!Enum.IsDefined(remoteWriteMode)) throw new ArgumentOutOfRangeException(nameof(remoteWriteMode));
         InitializeComponent();
+        if (remoteWriteMode == RemoteWriteExecutionMode.AcceptanceOnly)
+        {
+            AcceptVersionButton.IsEnabled = false;
+            AcceptVersionButton.Visibility = Visibility.Collapsed;
+        }
         Closed += (_, _) => leaseDecision.TrySetResult(false);
     }
 
     public bool EnableVersionAcceptance(string evidenceHash)
     {
+        if (remoteWriteMode != RemoteWriteExecutionMode.Full) return false;
         var enabled = evidenceHash is { Length: 64 } && evidenceHash.All(character =>
             character is >= '0' and <= '9' or >= 'A' and <= 'F');
         AcceptVersionButton.IsEnabled = enabled;

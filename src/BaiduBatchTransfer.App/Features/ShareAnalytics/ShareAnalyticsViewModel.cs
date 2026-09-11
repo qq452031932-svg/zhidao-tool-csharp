@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.Input;
 using System.Collections.Immutable;
 using System.Globalization;
 using System.IO;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Features.ShareAnalytics;
 
@@ -27,6 +28,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
     private readonly IShareAnalyticsWorkbookExportService exportService;
     private readonly IResultSaveDialog saveDialog;
     private readonly IShareAnalyticsBulkScheduler bulkScheduler;
+    private readonly ILicenseAuthorizationGate? licenseGate;
     private readonly CancellationTokenSource lifetime = new();
     private readonly object refreshSync = new();
     private HashSet<string> selectedShareIds = new(StringComparer.Ordinal);
@@ -71,7 +73,8 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         IShareAnalyticsDelay delay,
         IShareAnalyticsWorkbookExportService exportService,
         IResultSaveDialog saveDialog,
-        IShareAnalyticsBulkScheduler? bulkScheduler = null)
+        IShareAnalyticsBulkScheduler? bulkScheduler = null,
+        ILicenseAuthorizationGate? licenseGate = null)
     {
         this.service = service ?? throw new ArgumentNullException(nameof(service));
         this.projector = projector ?? throw new ArgumentNullException(nameof(projector));
@@ -81,6 +84,7 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         this.exportService = exportService ?? throw new ArgumentNullException(nameof(exportService));
         this.saveDialog = saveDialog ?? throw new ArgumentNullException(nameof(saveDialog));
         this.bulkScheduler = bulkScheduler ?? new ThreadPoolShareAnalyticsBulkScheduler();
+        this.licenseGate = licenseGate;
         RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => accountId is not null && isActive);
         SelectMetricCommand = new RelayCommand<AccountShareMetric>(SelectMetric);
         SortCommand = new RelayCommand<AccountShareSortColumn>(Sort);
@@ -353,6 +357,18 @@ public sealed class ShareAnalyticsViewModel : ObservableObject, IDisposable
         CancellationToken cancellationToken,
         RefreshFlight flight)
     {
+        if (licenseGate is not null)
+        {
+            var authorization = await licenseGate
+                .AuthorizeAsync(LicenseOperationKind.ShareAnalyticsRefresh, cancellationToken)
+                .ConfigureAwait(true);
+            if (!authorization.IsAuthorized)
+            {
+                if (CanApply(selected, selection, navigation))
+                    StatusMessage = "软件尚未激活，联网功能暂不可用。";
+                return;
+            }
+        }
         IsRefreshing = true;
         StatusMessage = snapshot?.LastSuccessfulSyncAtUtc is null
             ? "正在首次同步分享数据…"

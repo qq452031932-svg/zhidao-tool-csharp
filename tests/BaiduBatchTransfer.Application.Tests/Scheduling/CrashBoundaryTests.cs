@@ -118,6 +118,104 @@ public sealed class CrashBoundaryTests
     }
 
     [Fact]
+    public async Task PrepareLocalAcquiresSingleInstanceAndPreparesDatabaseOnlyOnce()
+    {
+        var calls = new List<string>();
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            new RecordingMaintenance(calls),
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now),
+            new RecordingShareRecoveryStore(calls));
+
+        await service.PrepareLocalAsync();
+        await service.PrepareLocalAsync();
+
+        Assert.Equal(["guard", "database"], calls);
+        Assert.False(service.CoordinatorMayStart);
+    }
+
+    [Fact]
+    public async Task ConcurrentPrepareLocalCallsShareOnePreparation()
+    {
+        var calls = new List<string>();
+        var maintenance = new BlockingMaintenance(calls);
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            maintenance,
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now));
+
+        var first = service.PrepareLocalAsync();
+        await maintenance.Entered.Task;
+        var second = service.PrepareLocalAsync();
+        maintenance.Release.TrySetResult();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(["guard", "database"], calls);
+    }
+
+    [Fact]
+    public async Task FailedPrepareLocalDoesNotMarkPreparedAndCanBeRetried()
+    {
+        var calls = new List<string>();
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            new FailsOnceMaintenance(calls),
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => service.PrepareLocalAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.RecoverPreparedAsync());
+        await service.PrepareLocalAsync();
+        await service.RecoverPreparedAsync();
+
+        Assert.Equal(["guard", "database", "guard", "database", "leases", "counters"], calls);
+        Assert.True(service.CoordinatorMayStart);
+    }
+
+    [Fact]
+    public async Task RecoverPreparedRequiresSuccessfulLocalPreparation()
+    {
+        var calls = new List<string>();
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            new RecordingMaintenance(calls),
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now),
+            new RecordingShareRecoveryStore(calls));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.RecoverPreparedAsync());
+
+        Assert.Empty(calls);
+        Assert.False(service.CoordinatorMayStart);
+    }
+
+    [Fact]
+    public async Task RecoverPreparedRecoversJobsAndCountersAfterLocalPreparation()
+    {
+        var calls = new List<string>();
+        var service = new StartupRecoveryService(
+            new RecordingGuard(calls, acquired: true),
+            new RecordingMaintenance(calls),
+            new RecordingRecoveryStore(calls),
+            new AllocationCounterRebuilder(new RecordingCounterStore(calls)),
+            new FixedTimeProvider(Now),
+            new RecordingShareRecoveryStore(calls));
+
+        await service.PrepareLocalAsync();
+        var result = await service.RecoverPreparedAsync();
+
+        Assert.Equal(["guard", "database", "leases", "share-leases", "counters"], calls);
+        Assert.True(result.CoordinatorMayStart);
+        Assert.True(service.CoordinatorMayStart);
+    }
+
+    [Fact]
     public async Task StartupRecoversShareLeasesBeforeCounterRebuildAndCoordinatorStart()
     {
         var calls = new List<string>();
@@ -252,6 +350,32 @@ public sealed class CrashBoundaryTests
         {
             calls.Add("expired-share-leases");
             return Task.FromResult(new ShareLeaseRecoveryResult(0, 0));
+        }
+    }
+
+    private sealed class BlockingMaintenance(List<string> calls) : IStartupDatabaseMaintenance
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task PrepareAsync(CancellationToken cancellationToken = default)
+        {
+            calls.Add("database");
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+        }
+    }
+
+    private sealed class FailsOnceMaintenance(List<string> calls) : IStartupDatabaseMaintenance
+    {
+        private int callCount;
+
+        public Task PrepareAsync(CancellationToken cancellationToken = default)
+        {
+            calls.Add("database");
+            return Interlocked.Increment(ref callCount) == 1
+                ? Task.FromException(new InvalidDataException("database failed"))
+                : Task.CompletedTask;
         }
     }
 

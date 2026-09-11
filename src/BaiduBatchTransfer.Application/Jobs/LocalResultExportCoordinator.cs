@@ -213,10 +213,18 @@ public sealed class LocalResultExportCoordinator(
                     .ConfigureAwait(false);
                 foreach (var owner in page.Items)
                 {
-                    var result = await EnsureAndExportAsync(owner.Key, cancellationToken).ConfigureAwait(false);
-                    if (result.Disposition is LocalResultExportDisposition.Exported or
-                        LocalResultExportDisposition.AlreadySucceeded)
-                        completed++;
+                    try
+                    {
+                        var result = await EnsureAndExportAsync(owner.Key, cancellationToken).ConfigureAwait(false);
+                        if (result.Disposition is LocalResultExportDisposition.Exported or
+                            LocalResultExportDisposition.AlreadySucceeded)
+                            completed++;
+                    }
+                    catch (InvalidDataException)
+                    {
+                        // Historical pre-snapshot batches cannot be exported with exact columns.
+                        // They must not prevent newer direct-background batches from starting.
+                    }
                 }
                 if ((long)pageNumber * page.PageSize >= page.TotalCount) break;
             }

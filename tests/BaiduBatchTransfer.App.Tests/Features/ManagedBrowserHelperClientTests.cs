@@ -6,7 +6,7 @@ using System.Threading.Channels;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
-public sealed class ManagedBrowserHelperClientTests
+public sealed partial class ManagedBrowserHelperClientTests
 {
     private static readonly ManagedBrowserHelperClientOptions Fast = new(
         TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(120), TimeSpan.FromMilliseconds(100));
@@ -24,6 +24,9 @@ public sealed class ManagedBrowserHelperClientTests
         Assert.NotEqual(one.Nonce, two.Nonce);
         Assert.Equal(Environment.ProcessId, one.ParentProcessId);
         Assert.Equal(ManagedBrowserProtocol.RequiredCapabilities, one.RequiredCapabilities);
+        Assert.Equal(3, ManagedBrowserProtocol.ProtocolVersion);
+        Assert.Equal("ManagedChromium-v3", ManagedBrowserProtocol.ExecutionEngineVersion);
+        Assert.Equal(24, one.RequiredCapabilities.Count);
         var health = await a.SendAsync(Request(), CancellationToken.None);
         Assert.IsType<ManagedBrowserHealthResult>(health.Result);
         Assert.Equal(ManagedBrowserAction.Handshake, first.Requests.First().Action);
@@ -62,8 +65,8 @@ public sealed class ManagedBrowserHelperClientTests
                 "nonce" => json.Replace(payload.Nonce, new string('0', 64)),
                 "parent" => json.Replace($"\"parentProcessId\":{Environment.ProcessId}", "\"parentProcessId\":1"),
                 "helper" => json.Replace($"\"helperProcessId\":{process.Id}", "\"helperProcessId\":1"),
-                "protocol" => json.Replace("\"protocolVersion\":1", "\"protocolVersion\":2"),
-                "engine" => json.Replace("ManagedChromium-v1", "ManagedChromium-v2"),
+                "protocol" => json.Replace("\"protocolVersion\":3", "\"protocolVersion\":2"),
+                "engine" => json.Replace("ManagedChromium-v3", "ManagedChromium-v2"),
                 _ => json.Replace("ObserveAccountIdentity\"", "OtherCapability\""),
             };
             process.Output.Emit(Frame(Encoding.UTF8.GetBytes(json)));
@@ -450,6 +453,139 @@ public sealed class ManagedBrowserHelperClientTests
         Assert.Empty(client.Diagnostics);
     }
 
+    [SelectedManagedHelperPackageFact("BAIDU_BATCH_TRANSFER_TEST_HELPER_DIRECTORY")]
+    public async Task PackagedHelperCanObserveTheSelectedLiveAcceptanceTarget()
+    {
+        var root = Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_HELPER_DIRECTORY")
+            ?? throw new InvalidOperationException("The selected packaged helper is required.");
+        var port = int.Parse(Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_DEVTOOLS_PORT")
+            ?? throw new InvalidOperationException("The selected DevTools port is required."));
+        var browserId = Guid.Parse(Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_BROWSER_ID")
+            ?? throw new InvalidOperationException("The selected browser ID is required."));
+        var targetId = Environment.GetEnvironmentVariable("BAIDU_BATCH_TRANSFER_TEST_TARGET_ID")
+            ?? throw new InvalidOperationException("The selected target ID is required.");
+        await using var client = await ManagedBrowserHelperClient.StartAsync(root, CancellationToken.None);
+        var operationId = Guid.NewGuid();
+        var accountId = Guid.NewGuid();
+        var health = new ManagedBrowserRequest(Guid.NewGuid(), operationId, accountId, 1,
+            ManagedBrowserAction.Health, ManagedBrowserRequestPayload.Empty);
+        Assert.IsType<ManagedBrowserHealthResult>((await client.SendAsync(health, CancellationToken.None)).Result);
+        var observe = new ManagedBrowserRequest(Guid.NewGuid(), operationId, accountId, 1,
+            ManagedBrowserAction.ObserveAccountIdentity,
+            new ManagedBrowserObserveAccountIdentityRequest(browserId, targetId,
+                new Uri($"http://127.0.0.1:{port}/"), 5000));
+        var response = await client.SendAsync(observe, CancellationToken.None);
+        Assert.Equal(ManagedBrowserIdentityResultKind.Observed,
+            Assert.IsType<ManagedBrowserIdentityResult>(response.Result).Kind);
+        Assert.Empty(client.Diagnostics);
+    }
+
+    [Fact]
+    public async Task TargetNavigationPrecancellationIsKnownNotDispatchedAndSendsNoFrame()
+    {
+        var process = new FakeProcess();
+        await using var client = await Start(process);
+        var before = process.Requests.Count;
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var binding = TargetBinding();
+        var requests = new[]
+        {
+            new ManagedBrowserRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+                ManagedBrowserAction.OpenTransferTargetRoot, new ManagedBrowserOpenTransferTargetRootRequest(binding)),
+            new ManagedBrowserRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+                ManagedBrowserAction.OpenTransferSourceAfterTargetRead,
+                new ManagedBrowserOpenTransferSourceAfterTargetReadRequest(binding, TargetInventory().ToHeader())),
+        };
+
+        var root = await client.SendAsync(requests[0], cancelled.Token);
+        var restore = await client.SendAsync(requests[1], cancelled.Token);
+
+        Assert.Equal(ManagedBrowserTargetNavigationState.KnownNotDispatched,
+            Assert.IsType<ManagedBrowserOpenTransferTargetRootResult>(root.Result).NavigationState);
+        Assert.Equal(ManagedBrowserTargetNavigationState.KnownNotDispatched,
+            Assert.IsType<ManagedBrowserOpenTransferSourceAfterTargetReadResult>(restore.Result).NavigationState);
+        Assert.Equal(before, process.Requests.Count);
+    }
+
+    [Fact]
+    public async Task TargetNavigationCancellationRaceBeforeWriteTaskIsKnownNotDispatched()
+    {
+        var process = new FakeProcess();
+        await using var client = await Start(process);
+        var before = process.Requests.Count;
+        var sync = typeof(ManagedBrowserHelperClient)
+            .GetField("sync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(client)!;
+        using var cancellation = new CancellationTokenSource();
+        Task<ManagedBrowserResponse> sending;
+        Monitor.Enter(sync);
+        try
+        {
+            sending = Task.Run(() => client.SendAsync(
+                new ManagedBrowserRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+                    ManagedBrowserAction.OpenTransferTargetRoot,
+                    new ManagedBrowserOpenTransferTargetRootRequest(TargetBinding())), cancellation.Token));
+            Thread.Sleep(30);
+            cancellation.Cancel();
+        }
+        finally { Monitor.Exit(sync); }
+
+        var result = Assert.IsType<ManagedBrowserOpenTransferTargetRootResult>((await sending).Result);
+        Assert.Equal(ManagedBrowserOpenTransferTargetRootResultKind.Cancelled, result.Kind);
+        Assert.Equal(ManagedBrowserTargetNavigationState.KnownNotDispatched, result.NavigationState);
+        Assert.Equal(before, process.Requests.Count);
+    }
+
+    [Fact]
+    public async Task TargetNavigationTimeoutWhileWaitingBeforeWriteTaskIsKnownNotDispatched()
+    {
+        var process = new FakeProcess();
+        await using var client = await Start(process);
+        var before = process.Requests.Count;
+        var sync = typeof(ManagedBrowserHelperClient)
+            .GetField("sync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(client)!;
+        Task<ManagedBrowserResponse> sending;
+        Monitor.Enter(sync);
+        try
+        {
+            sending = Task.Run(() => client.SendAsync(
+                new ManagedBrowserRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+                    ManagedBrowserAction.OpenTransferTargetRoot,
+                    new ManagedBrowserOpenTransferTargetRootRequest(TargetBinding(timeoutMilliseconds: 10))),
+                CancellationToken.None));
+            Thread.Sleep(40);
+        }
+        finally { Monitor.Exit(sync); }
+
+        var result = Assert.IsType<ManagedBrowserOpenTransferTargetRootResult>((await sending).Result);
+        Assert.Equal(ManagedBrowserOpenTransferTargetRootResultKind.TimedOut, result.Kind);
+        Assert.Equal(ManagedBrowserTargetNavigationState.KnownNotDispatched, result.NavigationState);
+        Assert.Equal(before, process.Requests.Count);
+    }
+
+    [Fact]
+    public async Task TargetNavigationChildExitAfterDispatchIsUnavailableAndRouteOutcomeUnknown()
+    {
+        var process = new FakeProcess();
+        await using var client = await Start(process);
+        process.OnRequest = _ =>
+        {
+            process.Exit();
+            return Task.CompletedTask;
+        };
+        var request = new ManagedBrowserRequest(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 1,
+            ManagedBrowserAction.OpenTransferTargetRoot,
+            new ManagedBrowserOpenTransferTargetRootRequest(TargetBinding()));
+
+        var response = await client.SendAsync(request, CancellationToken.None);
+
+        var result = Assert.IsType<ManagedBrowserOpenTransferTargetRootResult>(response.Result);
+        Assert.Equal(ManagedBrowserOpenTransferTargetRootResultKind.BrowserUnavailable, result.Kind);
+        Assert.Equal(ManagedBrowserTargetNavigationState.RouteOutcomeUnknown, result.NavigationState);
+    }
+
     private static Task<ManagedBrowserHelperClient> Start(FakeProcess process, FakeLease? lease = null) =>
         ManagedBrowserHelperClient.StartAsync(lease ?? new FakeLease(), () => process, Fast, CancellationToken.None);
 
@@ -459,6 +595,23 @@ public sealed class ManagedBrowserHelperClientTests
     private static ManagedBrowserRequest IdentityRequest(int timeout = 1000) => new(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 7,
         ManagedBrowserAction.ObserveAccountIdentity,
         new ManagedBrowserObserveAccountIdentityRequest(Guid.NewGuid(), "target", new Uri("http://127.0.0.1:9222/"), timeout));
+
+    private static ManagedBrowserTargetActionBinding TargetBinding(int timeoutMilliseconds = 1_000)
+    {
+        const string uri = "https://pan.baidu.com/s/source_1?pwd=A1b2";
+        var source = new ManagedBrowserSourceSnapshot("uid-1", "source-generation", 1, true, true,
+            [new ManagedBrowserSourceItem("source-1", ManagedBrowserSourceItemKind.File, "source.txt")],
+            "4cdb5ac7a450d6125ebaef9287cb8431f3976b5374ebc5de96c2570786995956");
+        return new ManagedBrowserTargetActionBinding(
+            Guid.Parse("44444444-4444-4444-4444-444444444444"), "target-1",
+            new Uri("http://127.0.0.1:43127/"), timeoutMilliseconds, uri, "uid-1", source);
+    }
+
+    private static ManagedBrowserTargetInventorySnapshot TargetInventory() => new(
+        Guid.Parse("44444444-4444-4444-4444-444444444444"), "target-1",
+        new Uri("http://127.0.0.1:43127/"), "uid-1", "generation-1", "parent-1", "/parent",
+        ["root-1", "parent-1"], 1, true, true, 1,
+        [new ManagedBrowserTargetInventoryItem("file-1", ManagedBrowserTargetInventoryItemKind.File, "one.txt")]);
 
     private static byte[] Frame(byte[] payload)
     {

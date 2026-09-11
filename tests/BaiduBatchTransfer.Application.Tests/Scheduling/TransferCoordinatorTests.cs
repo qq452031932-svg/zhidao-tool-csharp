@@ -174,6 +174,47 @@ public sealed class TransferCoordinatorTests
     }
 
     [Fact]
+    public async Task DirectPolicyPrioritizesReadyShareAndHonorsConfiguredConcurrency()
+    {
+        var batch = Guid.NewGuid();
+        var transfers = new RecordingAllocationStore(batch,
+            [Candidate(Guid.NewGuid(), 1, "Public"), Candidate(Guid.NewGuid(), 2, "Public")]);
+        var readyShare = new CoordinatedWork(
+            CoordinatedWorkKind.Share, Guid.NewGuid(), batch, Guid.NewGuid(), 1, 1);
+        var shares = new RecordingShareWorkSource([readyShare], expectedConcurrent: 1);
+        var policy = new FixedPolicySource(new BatchSchedulingPolicy(1, PreferReadyShares: true));
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(transfers), new ImmediateExecutor(),
+            new NetworkExecutionGate(true), shares, schedulingPolicies: policy).RunCycleAsync();
+
+        Assert.Equal(1, scheduled);
+        Assert.Equal([readyShare], shares.Executed);
+        Assert.Empty(transfers.Reserved);
+    }
+
+    [Fact]
+    public async Task DirectPolicyCanUseThreeWorkersButNeverAFourth()
+    {
+        var batch = Guid.NewGuid();
+        var store = new RecordingAllocationStore(batch,
+        [
+            Candidate(Guid.NewGuid(), 1, "Public"), Candidate(Guid.NewGuid(), 2, "Public"),
+            Candidate(Guid.NewGuid(), 3, "Public"), Candidate(Guid.NewGuid(), 4, "Public"),
+        ]);
+        var executor = new BlockingExecutor(expectedConcurrent: 3);
+
+        var scheduled = await new TransferCoordinator(
+            new AllocationTransactionService(store), executor, new NetworkExecutionGate(true),
+            schedulingPolicies: new FixedPolicySource(
+                new BatchSchedulingPolicy(3, PreferReadyShares: true))).RunCycleAsync();
+
+        Assert.Equal(3, scheduled);
+        Assert.Equal(3, executor.MaximumConcurrency);
+        Assert.Equal(3, store.Reserved.Count);
+    }
+
+    [Fact]
     public async Task DueResultPendingReconciliationUsesCapacityButIsNeverReservedAgain()
     {
         var batch = Guid.NewGuid();
@@ -291,6 +332,12 @@ public sealed class TransferCoordinatorTests
             await release.Task.WaitAsync(cancellationToken);
             Interlocked.Decrement(ref current);
         }
+    }
+
+    private sealed class FixedPolicySource(BatchSchedulingPolicy policy) : IBatchSchedulingPolicySource
+    {
+        public Task<BatchSchedulingPolicy> GetPolicyAsync(
+            Guid batchId, CancellationToken cancellationToken = default) => Task.FromResult(policy);
     }
 
     private sealed class RecordingShareWorkSource(IEnumerable<CoordinatedWork> work, int expectedConcurrent)

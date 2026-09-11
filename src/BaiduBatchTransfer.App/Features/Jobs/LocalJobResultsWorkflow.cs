@@ -24,7 +24,9 @@ public sealed class LocalJobResultsWorkflow(
             statistics.ResourceCount,
             statistics.OperationCount,
             statistics.Accounts.Sum(account => account.FailedCount),
-            statistics.Accounts.Sum(account => account.PausedCount));
+            statistics.Accounts.Sum(account => account.PausedCount),
+            statistics.Accounts.Sum(account => account.CompleteSuccessCount),
+            statistics.Accounts.Sum(account => account.TerminalProblemCount));
     }
 
     public async Task<JobResultsPage> LoadPageAsync(
@@ -58,7 +60,14 @@ public sealed class LocalJobResultsWorkflow(
                 item.TransferAttemptCount,
                 item.Status,
                 item.CanSafelyRetryTransfer,
-                item.LastErrorMessage)).ToArray(),
+                item.LastErrorMessage,
+                item.ShareUrl,
+                item.GeneratedShareUrl,
+                item.GeneratedExtractionCode,
+                item.TargetPath,
+                item.StagedImportRowId,
+                item.ShareStatus,
+                item.ShareEnabled)).ToArray(),
             page.TotalCount,
             page.NextCursor);
     }

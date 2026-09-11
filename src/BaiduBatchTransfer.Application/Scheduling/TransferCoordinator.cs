@@ -39,6 +39,23 @@ public interface IShareCoordinatorWorkSource
     Task ExecuteAsync(CoordinatedWork operation, CancellationToken cancellationToken = default);
 }
 
+public sealed record BatchSchedulingPolicy(int MaxConcurrency, bool PreferReadyShares)
+{
+    public static BatchSchedulingPolicy Standard { get; } = new(2, false);
+
+    public BatchSchedulingPolicy Validate() =>
+        MaxConcurrency is >= 1 and <= 3
+            ? this
+            : throw new InvalidOperationException("Batch concurrency must be between one and three.");
+}
+
+public interface IBatchSchedulingPolicySource
+{
+    Task<BatchSchedulingPolicy> GetPolicyAsync(
+        Guid batchId,
+        CancellationToken cancellationToken = default);
+}
+
 public sealed class TransferCoordinator
 {
     public const int MaximumGlobalConcurrency = 2;
@@ -48,6 +65,7 @@ public sealed class TransferCoordinator
     private readonly IShareCoordinatorWorkSource? shareWork;
     private readonly TimeProvider timeProvider;
     private readonly ILocalResultExportCoordinator? localResultExports;
+    private readonly IBatchSchedulingPolicySource? schedulingPolicies;
     private readonly SemaphoreSlim singleCycle = new(1, 1);
 
     public TransferCoordinator(
@@ -56,7 +74,8 @@ public sealed class TransferCoordinator
         NetworkExecutionGate networkGate,
         IShareCoordinatorWorkSource? shareWork = null,
         TimeProvider? timeProvider = null,
-        ILocalResultExportCoordinator? localResultExports = null)
+        ILocalResultExportCoordinator? localResultExports = null,
+        IBatchSchedulingPolicySource? schedulingPolicies = null)
     {
         this.allocation = allocation ?? throw new ArgumentNullException(nameof(allocation));
         this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
@@ -64,6 +83,7 @@ public sealed class TransferCoordinator
         this.shareWork = shareWork;
         this.timeProvider = timeProvider ?? TimeProvider.System;
         this.localResultExports = localResultExports;
+        this.schedulingPolicies = schedulingPolicies;
     }
 
     public async Task<int> RunCycleAsync(CancellationToken cancellationToken = default)
@@ -83,10 +103,15 @@ public sealed class TransferCoordinator
                 ? state.ActiveBatchIds[0]
                 : await allocation.TryActivateNextBatchAsync(cancellationToken).ConfigureAwait(false);
             if (batchId is null) return 0;
+            var policy = (schedulingPolicies is null
+                    ? BatchSchedulingPolicy.Standard
+                    : await schedulingPolicies.GetPolicyAsync(batchId.Value, cancellationToken)
+                        .ConfigureAwait(false))
+                .Validate();
 
-            var capacity = Math.Max(0, MaximumGlobalConcurrency - state.ActiveNetworkOperationCount);
+            var capacity = Math.Max(0, policy.MaxConcurrency - state.ActiveNetworkOperationCount);
             if (capacity == 0) return 0;
-            var channel = Channel.CreateBounded<CoordinatorDispatch>(new BoundedChannelOptions(MaximumGlobalConcurrency)
+            var channel = Channel.CreateBounded<CoordinatorDispatch>(new BoundedChannelOptions(policy.MaxConcurrency)
             {
                 SingleWriter = true,
                 SingleReader = false,
@@ -107,6 +132,17 @@ public sealed class TransferCoordinator
                     continue;
                 }
 
+                if (shareWork is not null && policy.PreferReadyShares)
+                    share = await shareWork.TryReserveShareAsync(
+                        batchId.Value, timeProvider.GetUtcNow(), TimeSpan.FromMinutes(5), scheduledAccounts,
+                        cancellationToken).ConfigureAwait(false);
+                if (share is not null)
+                {
+                    scheduledAccounts.Add(share.AccountId);
+                    await channel.Writer.WriteAsync(new(null, share), cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
                 var transfer = await allocation.TryAllocateNextAsync(batchId.Value, cancellationToken).ConfigureAwait(false);
                 if (transfer is not null)
                 {
@@ -115,7 +151,7 @@ public sealed class TransferCoordinator
                     continue;
                 }
 
-                if (shareWork is not null)
+                if (shareWork is not null && !policy.PreferReadyShares)
                     share = await shareWork.TryReserveShareAsync(
                         batchId.Value, timeProvider.GetUtcNow(), TimeSpan.FromMinutes(5), scheduledAccounts,
                         cancellationToken).ConfigureAwait(false);
@@ -136,7 +172,8 @@ public sealed class TransferCoordinator
                 }
             }
 
-            await Task.WhenAll(ConsumeAsync(), ConsumeAsync()).ConfigureAwait(false);
+            await Task.WhenAll(Enumerable.Range(0, policy.MaxConcurrency).Select(_ => ConsumeAsync()))
+                .ConfigureAwait(false);
             if (scheduled == 0 && state.ActiveNetworkOperationCount == 0 && state.BusyAccountIds.Count == 0 && networkGate.CanAcquireNewWork)
             {
                 await allocation.TryFinalizeExhaustedBatchAsync(batchId.Value, cancellationToken).ConfigureAwait(false);

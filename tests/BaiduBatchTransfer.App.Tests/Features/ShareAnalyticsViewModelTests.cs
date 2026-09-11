@@ -3,12 +3,87 @@ using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.ShareAnalytics;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class ShareAnalyticsViewModelTests
 {
     private static readonly DateTimeOffset Now = new(2026, 9, 2, 4, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public async Task InitialRefreshGatesBeforeCreatingRemoteWork()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, SnapshotWithoutSync(account, "cached"));
+        var gate = new RecordingLicenseGate(false);
+        var viewModel = Create(service, licenseGate: gate);
+        viewModel.SelectAccount(account, "账号");
+
+        await viewModel.EnterAsync();
+
+        Assert.Equal([LicenseOperationKind.ShareAnalyticsRefresh], gate.Operations);
+        Assert.Equal(0, service.SyncCalls);
+        Assert.Equal("软件尚未激活，联网功能暂不可用。", viewModel.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ManualRefreshGatesBeforeCreatingRemoteWork()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now));
+        var gate = new RecordingLicenseGate(false);
+        var viewModel = Create(service, licenseGate: gate);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Single(gate.Operations);
+        Assert.Equal(0, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task AutomaticDueRefreshGatesBeforeCreatingRemoteWork()
+    {
+        var account = Guid.NewGuid();
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)));
+        var delay = new FakeDelay();
+        var gate = new RecordingLicenseGate(false);
+        var viewModel = Create(service, delay, licenseGate: gate);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        delay.Complete(0);
+        await gate.WaitForCallsAsync(1);
+
+        Assert.Single(gate.Operations);
+        Assert.Equal(0, service.SyncCalls);
+    }
+
+    [Fact]
+    public async Task DelayedRetryCreatesANewGateFlight()
+    {
+        var account = Guid.NewGuid();
+        var time = new MutableTimeProvider(Now);
+        var service = new FakeSync(account, Snapshot(account, "cached", Now.AddHours(-22)))
+        {
+            SyncResults = [FailureResult]
+        };
+        var delay = new FakeDelay();
+        var gate = new RecordingLicenseGate(true, false);
+        var viewModel = Create(service, delay, time, licenseGate: gate);
+        viewModel.SelectAccount(account, "账号");
+        await viewModel.EnterAsync();
+
+        time.Advance(TimeSpan.FromHours(2));
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        delay.Complete(1);
+        await gate.WaitForCallsAsync(2);
+
+        Assert.Equal(2, gate.Operations.Count);
+        Assert.Equal(1, service.SyncCalls);
+    }
 
     [Fact]
     public void ShareAnalyticsViewUsesOnlyDeclaredNamedThemeStyles()
@@ -795,7 +870,8 @@ public sealed class ShareAnalyticsViewModelTests
     {
         var account = Guid.NewGuid();
         var service = new BlockingSync(account, Snapshot(account, "cached", Now.AddHours(-23)));
-        var viewModel = Create(service, new FakeDelay());
+        var gate = new RecordingLicenseGate(true);
+        var viewModel = Create(service, new FakeDelay(), licenseGate: gate);
         viewModel.SelectAccount(account, "账号");
         var entering = viewModel.EnterAsync();
         await service.SyncStarted.Task;
@@ -804,6 +880,7 @@ public sealed class ShareAnalyticsViewModelTests
 
         Assert.False(manual.IsCompleted);
         Assert.Equal(1, service.SyncCalls);
+        Assert.Single(gate.Operations);
         service.Release.TrySetResult();
         await Task.WhenAll(entering, manual);
         Assert.Equal(1, service.SyncCalls);
@@ -1535,10 +1612,12 @@ public sealed class ShareAnalyticsViewModelTests
         TimeProvider? timeProvider = null,
         IShareAnalyticsBulkScheduler? bulkScheduler = null,
         IShareAnalyticsWorkbookExportService? exportService = null,
-        IResultSaveDialog? saveDialog = null) =>
+        IResultSaveDialog? saveDialog = null,
+        ILicenseAuthorizationGate? licenseGate = null) =>
         new(service, new AccountShareAnalyticsProjector(), new FakeLauncher(),
             timeProvider ?? new FrozenTimeProvider(Now), delay ?? new FakeDelay(),
-            exportService ?? new RecordingExporter(), saveDialog ?? new ImmediateSaveDialog(null), bulkScheduler);
+            exportService ?? new RecordingExporter(), saveDialog ?? new ImmediateSaveDialog(null), bulkScheduler,
+            licenseGate);
 
     private static AccountShareCachedSnapshot Snapshot(Guid account, string title, DateTimeOffset? syncedAt = null) =>
         new(account, syncedAt ?? Now, [Record(title, AccountShareRemoteStatus.Valid, 10)]);
@@ -1623,6 +1702,29 @@ public sealed class ShareAnalyticsViewModelTests
 
         public async Task WaitForSyncCallsAsync(int expected) =>
             await WaitUntilAsync(() => SyncCalls >= expected);
+    }
+
+    private sealed class RecordingLicenseGate(params bool[] decisions) : ILicenseAuthorizationGate
+    {
+        private readonly Queue<bool> decisions = new(decisions.Length == 0 ? [true] : decisions);
+        public List<LicenseOperationKind> Operations { get; } = [];
+
+        public Task<LicenseGateResult> AuthorizeAsync(
+            LicenseOperationKind operation,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Operations.Add(operation);
+            var authorized = decisions.Count == 0 || decisions.Dequeue();
+            return Task.FromResult(new LicenseGateResult(
+                operation,
+                authorized,
+                UsedCachedLease: false,
+                authorized ? LicenseCodes.Ok : "activation_required"));
+        }
+
+        public async Task WaitForCallsAsync(int expected) =>
+            await WaitUntilAsync(() => Operations.Count >= expected);
     }
 
     private sealed class BlockingSync(Guid account, params AccountShareCachedSnapshot[] snapshots) : IShareAnalyticsWorkspaceService

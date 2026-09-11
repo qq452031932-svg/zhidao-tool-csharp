@@ -223,6 +223,16 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 return PreparationNotValidated();
             var baseline = WebAutomationBaseline.Create(
                 listing.TopLevelItems.Select(item => item.ExactId));
+            var durableFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+                request.Destination.RemoteId,
+                request.Destination.Path,
+                listing.TotalCount,
+                listing.ReachedEnd,
+                listing.IsStable,
+                targetGeneration,
+                targetUserId,
+                TransferTargetInventoryScope.AllItems,
+                baseline);
             var target = new TransferTargetPreparationEvidence(
                 request.Destination.RemoteId,
                 request.Destination.Path,
@@ -231,8 +241,9 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
                 listing.IsStable,
                 targetGeneration,
                 targetUserId,
+                TransferTargetInventoryScope.AllItems,
                 baseline,
-                listing.ObservationFingerprint);
+                durableFingerprint);
             await session.PersistTargetPreparationAsync(target, cancellationToken).ConfigureAwait(false);
             return BaiduAdapterResult<TransferAutomationPreparation>.Success(
                 new TransferAutomationPreparation(
@@ -548,7 +559,7 @@ public sealed class TransferAutomationFlow(TimeProvider? timeProvider = null)
     }
 
     private static bool IsStableComplete(TransferDirectoryListing listing) =>
-        listing is { IsComplete: true, IsStable: true };
+        listing is { Scope: TransferDirectoryListingScope.AllItems, IsComplete: true, IsStable: true };
 
     private static bool IsExactlyCorrelated(
         TransferSourceListing source,

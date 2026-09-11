@@ -1,10 +1,49 @@
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
+using System.Reflection;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Markup;
+using System.Windows.Media;
+using System.Windows.Threading;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class JobResultsViewModelTests
 {
+    [Fact]
+    public async Task LicenseFailureStopsManualShareRetryBeforeWorkflowMutation()
+    {
+        var workflow = new FakeWorkflow { Pages = [new([Row(1)], 1, null)] };
+        var gate = new RecordingLicenseGate(false);
+        var vm = Create(workflow, licenseGate: gate);
+        await vm.InitializeAsync(Guid.NewGuid());
+        vm.SelectedItem = Assert.Single(vm.Items);
+
+        await vm.RetryShareOnlyCommand.ExecuteAsync(null);
+
+        Assert.Equal([LicenseOperationKind.Share], gate.Operations);
+        Assert.Null(workflow.RetriedShareOperationId);
+        Assert.Equal("软件尚未激活，联网功能暂不可用。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task LicenseFailureStopsManualTransferResumeBeforeWorkflowMutation()
+    {
+        var paused = Row(1) with { CanResumeTransfer = true };
+        var workflow = new FakeWorkflow { Pages = [new([paused], 1, null)] };
+        var gate = new RecordingLicenseGate(false);
+        var vm = Create(workflow, licenseGate: gate);
+        await vm.InitializeAsync(Guid.NewGuid());
+        vm.SelectedItem = Assert.Single(vm.Items);
+
+        await vm.ResumeTransferCommand.ExecuteAsync(null);
+
+        Assert.Equal([LicenseOperationKind.Transfer], gate.Operations);
+        Assert.Equal(0, workflow.ResumedTransferCalls);
+    }
+
     [Fact]
     public async Task HandoffLoadPropagatesFailureWhileOrdinaryUiLoadKeepsFriendlyStatus()
     {
@@ -55,6 +94,23 @@ public sealed class JobResultsViewModelTests
     }
 
     [Fact]
+    public void ResultRowToStringRedactsShareUrlsAndExtractionCode()
+    {
+        var row = Row(1) with
+        {
+            OriginalShareUrl = "https://pan.baidu.com/s/original-secret",
+            GeneratedShareUrl = "https://pan.baidu.com/s/generated-secret",
+            GeneratedExtractionCode = "code-secret",
+        };
+
+        var text = row.ToString();
+
+        Assert.DoesNotContain("original-secret", text);
+        Assert.DoesNotContain("generated-secret", text);
+        Assert.DoesNotContain("code-secret", text);
+    }
+
+    [Fact]
     public async Task LatePageFromPreviousBatchDoesNotOverwriteNewBatch()
     {
         var firstBatch = Guid.NewGuid();
@@ -70,6 +126,187 @@ public sealed class JobResultsViewModelTests
 
         Assert.Equal(secondBatch, vm.BatchJobId);
         Assert.Equal(2, Assert.Single(vm.Items).CandidateSequence);
+    }
+
+    [Fact]
+    public async Task LifecycleRefreshPublishesOnlyFirstAndChangedProgressSnapshots()
+    {
+        var workflow = new ScriptedProgressWorkflow(
+            new(25, 25, 0, 0, 0, 0),
+            new(25, 25, 0, 0, 0, 0),
+            new(25, 25, 0, 0, 0, 0),
+            new(25, 25, 2, 0, 6, 2),
+            new(25, 25, 2, 0, 6, 2));
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var statuses = new List<string>();
+        var busyStates = new List<bool>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statuses.Add(vm.StatusMessage);
+            if (eventArgs.PropertyName == nameof(vm.IsBusy)) busyStates.Add(vm.IsBusy);
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        await vm.RefreshAsync();
+        await vm.RefreshAsync();
+
+        Assert.Equal([
+            "进度 0/25：成功 0，失败 0，剩余 25。",
+            "进度 8/25：成功 6，失败 2，剩余 17。",
+        ], statuses);
+        Assert.Contains(true, busyStates);
+        Assert.Contains(false, busyStates);
+    }
+
+    [Fact]
+    public async Task UnchangedDirectRefreshPreservesArbitraryNonLifecycleStatus()
+    {
+        var row = Row(1) with
+        {
+            GeneratedShareUrl = "https://pan.baidu.com/s/generated",
+            GeneratedExtractionCode = "a1b2",
+        };
+        var snapshot = new JobResultsSummary(1, 1, 0, 0, 1, 0);
+        var workflow = new ScriptedProgressWorkflow(snapshot, snapshot, snapshot)
+        {
+            Page = new([row], 1, null),
+        };
+        var vm = Create(workflow, clipboard: new FakeClipboard());
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        await vm.CopyGeneratedShareCommand.ExecuteAsync(Assert.Single(vm.Items));
+        Assert.Equal("分享链接和提取码已复制。", vm.StatusMessage);
+        var statusChanges = 0;
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statusChanges++;
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal("分享链接和提取码已复制。", vm.StatusMessage);
+        Assert.Equal(0, statusChanges);
+    }
+
+    [Fact]
+    public async Task ConsecutiveRefreshFailuresLogOnceAndRecoveryForcesOneProgressSnapshot()
+    {
+        var unchanged = new JobResultsSummary(10, 10, 1, 0, 2, 1);
+        var workflow = new ScriptedProgressWorkflow(new Func<Task<JobResultsSummary>>[]
+        {
+            () => Task.FromResult(unchanged),
+            () => Task.FromResult(unchanged),
+            () => Task.FromException<JobResultsSummary>(new IOException("secret first failure")),
+            () => Task.FromException<JobResultsSummary>(new IOException("secret second failure")),
+            () => Task.FromResult(unchanged),
+            () => Task.FromResult(unchanged),
+        });
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+        var statuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage)) statuses.Add(vm.StatusMessage);
+        };
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.False(await vm.RefreshForLifecycleAsync());
+        Assert.False(await vm.RefreshForLifecycleAsync());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal([
+            "进度 3/10：成功 2，失败 1，剩余 7。",
+            "任务结果刷新失败，请稍后重试。",
+            "进度 3/10：成功 2，失败 1，剩余 7。",
+        ], statuses);
+    }
+
+    [Fact]
+    public async Task SwitchingBatchesResetsFirstProgressSnapshotRule()
+    {
+        var snapshot = new JobResultsSummary(4, 4, 0, 0, 0, 0);
+        var workflow = new ScriptedProgressWorkflow(snapshot, snapshot, snapshot, snapshot);
+        var vm = Create(workflow);
+        var progressStatuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage) && vm.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                progressStatuses.Add(vm.StatusMessage);
+        };
+
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+        await vm.InitializeAsync(Guid.NewGuid());
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal([
+            "进度 0/4：成功 0，失败 0，剩余 4。",
+            "进度 0/4：成功 0，失败 0，剩余 4。",
+        ], progressStatuses);
+    }
+
+    [Fact]
+    public async Task StaleRefreshCannotOverwriteOrPublishAfterBatchSwitch()
+    {
+        var firstBatch = Guid.NewGuid();
+        var secondBatch = Guid.NewGuid();
+        var workflow = new DelayedRefreshWorkflow(firstBatch, secondBatch);
+        var vm = Create(workflow);
+        await vm.InitializeAsync(firstBatch);
+        var progressStatuses = new List<string>();
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(vm.StatusMessage) && vm.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                progressStatuses.Add(vm.StatusMessage);
+        };
+
+        var staleRefresh = vm.RefreshForLifecycleAsync();
+        await workflow.RefreshStarted.Task;
+        await vm.InitializeAsync(secondBatch);
+        workflow.ReleaseRefresh();
+
+        Assert.False(await staleRefresh);
+        Assert.Equal(secondBatch, vm.BatchJobId);
+        Assert.Equal(2, vm.OperationCount);
+        Assert.Equal(2, Assert.Single(vm.Items).CandidateSequence);
+        Assert.Empty(progressStatuses);
+    }
+
+    [Fact]
+    public async Task ProgressUsesSummaryCountsClampsRemainingAndContainsNoPrivateRowData()
+    {
+        var secrets = new[]
+        {
+            "private-account-id",
+            "private-title",
+            "https://pan.baidu.com/s/private-url",
+            "private-code",
+            "/private/path",
+        };
+        var privateRow = Row(1) with
+        {
+            AccountDisplayName = secrets[0],
+            ResolvedTitle = secrets[1],
+            OriginalShareUrl = secrets[2],
+            GeneratedExtractionCode = secrets[3],
+            TargetPath = secrets[4],
+        };
+        var workflow = new ScriptedProgressWorkflow(
+            new(25, 25, 5, 0, 22, 5),
+            new(25, 25, 5, 0, 22, 5))
+        {
+            Page = new([privateRow], 25, null),
+        };
+        var vm = Create(workflow);
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        Assert.True(await vm.RefreshForLifecycleAsync());
+
+        Assert.Equal("进度 27/25：成功 22，失败 5，剩余 0。", vm.StatusMessage);
+        Assert.All(secrets, secret => Assert.DoesNotContain(secret, vm.StatusMessage, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -197,26 +434,238 @@ public sealed class JobResultsViewModelTests
     }
 
     [Fact]
-    public void ViewUsesVirtualizedBoundedGridAndSeparateChineseStatusColumns()
+    public async Task ExportFailureNeverReportsSuccess()
+    {
+        var workflow = new FakeWorkflow
+        {
+            Pages = [new([Row(1)], 1, null)],
+            ThrowExport = true,
+        };
+        var vm = Create(workflow, saveDialog: new FakeSaveDialog("C:\\results"));
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        await vm.SaveAsAsync();
+
+        Assert.Equal("结果表格保存失败，请检查目录后重试。", vm.StatusMessage);
+        Assert.DoesNotContain("已保存", vm.StatusMessage, StringComparison.Ordinal);
+        Assert.False(vm.IsSaving);
+    }
+
+    [Fact]
+    public async Task CurrentBatchProjectsOriginalAndGeneratedShareValues()
+    {
+        var expected = Row(1) with
+        {
+            OriginalShareUrl = "https://pan.baidu.com/s/original",
+            TargetPath = "/保存目录",
+            GeneratedShareUrl = "https://pan.baidu.com/s/generated",
+            GeneratedExtractionCode = "a1b2",
+        };
+        var vm = Create(new FakeWorkflow { Pages = [new([expected], 1, null)] });
+
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        var actual = Assert.Single(vm.Items);
+        Assert.Equal(expected.OriginalShareUrl, actual.OriginalShareUrl);
+        Assert.Equal(expected.TargetPath, actual.TargetPath);
+        Assert.Equal(expected.GeneratedShareUrl, actual.GeneratedShareUrl);
+        Assert.Equal(expected.GeneratedExtractionCode, actual.GeneratedExtractionCode);
+    }
+
+    [Fact]
+    public async Task InitialLoadSelectsFirstResultForImmediateCopy()
+    {
+        var row = Row(1) with
+        {
+            GeneratedShareUrl = "https://pan.baidu.com/s/generated",
+            GeneratedExtractionCode = "a1b2",
+        };
+        var vm = Create(
+            new FakeWorkflow { Pages = [new([row], 1, null)] },
+            clipboard: new FakeClipboard());
+
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        Assert.Same(Assert.Single(vm.Items), vm.SelectedItem);
+        Assert.True(vm.CopyGeneratedShareCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task SelectedGeneratedShareCanBeCopiedAsLinkAndExtractionCode()
+    {
+        var clipboard = new FakeClipboard();
+        var expected = Row(1) with
+        {
+            GeneratedShareUrl = "https://pan.baidu.com/s/generated",
+            GeneratedExtractionCode = "a1b2",
+        };
+        var vm = Create(
+            new FakeWorkflow { Pages = [new([expected], 1, null)] },
+            clipboard: clipboard);
+        await vm.InitializeAsync(Guid.NewGuid());
+
+        var selected = Assert.Single(vm.Items);
+        Assert.Same(selected, vm.SelectedItem);
+        Assert.True(vm.CopyGeneratedShareCommand.CanExecute(null));
+        Assert.True(vm.CopyGeneratedShareCommand.CanExecute(selected));
+        await vm.CopyGeneratedShareCommand.ExecuteAsync(selected);
+
+        Assert.Equal("分享链接：https://pan.baidu.com/s/generated\r\n提取码：a1b2", clipboard.Text);
+        Assert.Equal("分享链接和提取码已复制。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task ClipboardFailureUsesSafeStatusWithoutEchoingShareData()
+    {
+        var secretUrl = "https://pan.baidu.com/s/private-secret";
+        var expected = Row(1) with
+        {
+            GeneratedShareUrl = secretUrl,
+            GeneratedExtractionCode = "z9x8",
+        };
+        var vm = Create(
+            new FakeWorkflow { Pages = [new([expected], 1, null)] },
+            clipboard: new FakeClipboard { Error = new InvalidOperationException("clipboard unavailable") });
+        await vm.InitializeAsync(Guid.NewGuid());
+        vm.SelectedItem = Assert.Single(vm.Items);
+
+        await vm.CopyGeneratedShareCommand.ExecuteAsync(null);
+
+        Assert.Equal("复制失败，请稍后重试。", vm.StatusMessage);
+        Assert.DoesNotContain(secretUrl, vm.StatusMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("z9x8", vm.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ViewUsesVirtualizedResultGridWithoutTechnicalRecoveryControls()
     {
         var xaml = File.ReadAllText(Path.Combine(
             FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Jobs", "JobResultsView.xaml"));
 
         Assert.Contains("EnableRowVirtualization=\"True\"", xaml);
+        Assert.Contains("SelectedItem=\"{Binding SelectedItem, Mode=TwoWay}\"", xaml);
         Assert.Contains("VirtualizationMode=\"Recycling\"", xaml);
+        Assert.Contains("Style=\"{StaticResource DenseDataGridStyle}\"", xaml);
+        Assert.Contains("RowHeight=\"34\"", xaml);
+        Assert.Contains("ColumnHeaderHeight=\"38\"", xaml);
+        Assert.Contains("Header=\"原链接\"", xaml);
+        Assert.Contains("Header=\"百度保存目录\"", xaml);
+        Assert.Contains("Binding=\"{Binding TargetPath}\"", xaml);
         Assert.Contains("Header=\"转存状态\"", xaml);
         Assert.Contains("Header=\"分享状态\"", xaml);
-        Assert.Contains("Content=\"仅重试分享\"", xaml);
+        Assert.Contains("Header=\"新分享链接\"", xaml);
+        Assert.Contains("Header=\"新提取码\"", xaml);
+        Assert.DoesNotContain("Header=\"转存错误码\"", xaml);
+        Assert.DoesNotContain("Header=\"分享错误码\"", xaml);
+        Assert.DoesNotContain("Content=\"仅重试分享\"", xaml);
+        Assert.DoesNotContain("Content=\"确认转存结果\"", xaml);
+        Assert.DoesNotContain("Content=\"确认分享结果\"", xaml);
+        Assert.DoesNotContain("Content=\"恢复转存\"", xaml);
+        Assert.DoesNotContain("Content=\"恢复分享\"", xaml);
+        Assert.DoesNotContain("Content=\"处理已有分享\"", xaml);
+        Assert.DoesNotContain("TransferCapabilityMessage", xaml);
+        Assert.DoesNotContain("ShareCapabilityMessage", xaml);
+        Assert.Contains("Content=\"下一页\"", xaml);
+        Assert.Contains("Content=\"刷新结果\"", xaml);
+        Assert.Contains("Content=\"另存结果表格\"", xaml);
+        Assert.Contains("Content=\"复制链接和提取码\"", xaml);
+        Assert.Contains("Command=\"{Binding CopyGeneratedShareCommand}\"", xaml);
+        Assert.Contains("x:Name=\"ResultsGrid\"", xaml);
+        Assert.Contains("CommandParameter=\"{Binding SelectedItem, ElementName=ResultsGrid}\"", xaml);
+        Assert.Contains("<MenuItem Header=\"更多\">", xaml);
+        Assert.Contains("Header=\"重试分享\" Command=\"{Binding RetryShareOnlyCommand}\"", xaml);
+        Assert.Contains("Header=\"继续转存\" Command=\"{Binding ResumeTransferCommand}\"", xaml);
+        Assert.Contains("Header=\"继续分享\" Command=\"{Binding ResumeShareCommand}\"", xaml);
+        Assert.Contains("Header=\"检查转存结果\" Command=\"{Binding ReconcileTransferCommand}\"", xaml);
+        Assert.Contains("Header=\"检查分享结果\" Command=\"{Binding ReconcileShareCommand}\"", xaml);
+        Assert.Contains("Header=\"处理已有分享\" Command=\"{Binding ResolveExistingSharesCommand}\"", xaml);
+        Assert.Contains("Header=\"取消另存\" Command=\"{Binding CancelSaveCommand}\"", xaml);
         Assert.Contains("AutomationProperties.LiveSetting=\"Polite\"", xaml);
+    }
+
+    [Fact]
+    public void ResultGridSelectionUpdatesViewModelAndEnablesCopyOnSta()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var row = Row(1) with
+                {
+                    GeneratedShareUrl = "https://pan.baidu.com/s/generated",
+                    GeneratedExtractionCode = "a1b2",
+                };
+                var vm = Create(
+                    new FakeWorkflow { Pages = [new([row], 1, null)] },
+                    clipboard: new FakeClipboard());
+                vm.InitializeAsync(Guid.NewGuid()).GetAwaiter().GetResult();
+                var xaml = File.ReadAllText(Path.Combine(
+                    FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Jobs", "JobResultsView.xaml"));
+                xaml = xaml.Replace(
+                    " x:Class=\"BaiduBatchTransfer.App.Features.Jobs.JobResultsView\"",
+                    string.Empty,
+                    StringComparison.Ordinal);
+                var openingTagEnd = xaml.IndexOf('>');
+                const string resources = """
+                    <UserControl.Resources>
+                        <ResourceDictionary>
+                            <ResourceDictionary.MergedDictionaries>
+                                <ResourceDictionary Source="/BaiduBatchTransfer.App;component/Styles/SuperPanTheme.xaml" />
+                            </ResourceDictionary.MergedDictionaries>
+                        </ResourceDictionary>
+                    </UserControl.Resources>
+                    """;
+                xaml = xaml.Insert(openingTagEnd + 1, resources);
+                var view = Assert.IsType<UserControl>(XamlReader.Parse(xaml));
+                view.DataContext = vm;
+                view.Measure(new Size(900, 500));
+                view.Arrange(new Rect(0, 0, 900, 500));
+                view.UpdateLayout();
+                var grid = FindVisualChild<DataGrid>(view);
+
+                grid.SelectedItem = Assert.Single(vm.Items);
+                Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.DataBind);
+
+                Assert.Same(grid.SelectedItem, vm.SelectedItem);
+                Assert.True(vm.CopyGeneratedShareCommand.CanExecute(null));
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                Dispatcher.CurrentDispatcher.InvokeShutdown();
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(10)), "STA result selection test timed out.");
+        if (failure is not null) throw new TargetInvocationException(failure);
+
+        static T FindVisualChild<T>(DependencyObject root) where T : DependencyObject
+        {
+            for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+            {
+                var child = VisualTreeHelper.GetChild(root, index);
+                if (child is T match) return match;
+                try { return FindVisualChild<T>(child); }
+                catch (InvalidOperationException) { }
+            }
+            throw new InvalidOperationException($"No {typeof(T).Name} was found.");
+        }
     }
 
     private static JobResultsViewModel Create(
         IJobResultsWorkflow workflow,
         IJobResultCapabilityAvailability? capabilities = null,
         IResultSaveDialog? saveDialog = null,
-        IExistingShareDecisionInteraction? existingShareInteraction = null) =>
+        IExistingShareDecisionInteraction? existingShareInteraction = null,
+        ITextClipboard? clipboard = null,
+        ILicenseAuthorizationGate? licenseGate = null) =>
         new(workflow, saveDialog ?? new FakeSaveDialog(null), capabilities ?? new FakeCapabilities { Share = true, Transfer = true },
-            existingShareInteraction);
+            existingShareInteraction, clipboard, licenseGate);
 
     private static JobResultRow Row(long sequence, string transferText = "转存成功", string shareText = "分享失败") =>
         new(Guid.NewGuid(), Guid.NewGuid(), sequence, "账号", "标题", transferText, shareText,
@@ -240,6 +689,19 @@ public sealed class JobResultsViewModelTests
             Task.FromResult(directory);
     }
 
+    private sealed class FakeClipboard : ITextClipboard
+    {
+        public string? Text { get; private set; }
+        public Exception? Error { get; init; }
+
+        public Task SetTextAsync(string text, CancellationToken cancellationToken = default)
+        {
+            if (Error is not null) throw Error;
+            Text = text;
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class FakeCapabilities : IJobResultCapabilityAvailability
     {
         public bool Transfer { get; init; }
@@ -248,6 +710,18 @@ public sealed class JobResultsViewModelTests
         public bool CanUseShareActions => Share;
         public string TransferStatusMessage => Transfer ? "转存操作可用。" : "转存操作不可用。";
         public string ShareStatusMessage => Share ? "分享操作可用。" : "分享操作不可用。";
+    }
+
+    private sealed class RecordingLicenseGate(bool isAuthorized) : ILicenseAuthorizationGate
+    {
+        public List<LicenseOperationKind> Operations { get; } = [];
+        public Task<LicenseGateResult> AuthorizeAsync(LicenseOperationKind operation, CancellationToken cancellationToken)
+        {
+            Operations.Add(operation);
+            return Task.FromResult(new LicenseGateResult(
+                operation, isAuthorized, UsedCachedLease: false,
+                isAuthorized ? LicenseCodes.Ok : "activation_required"));
+        }
     }
 
     private sealed class FakeExistingShareInteraction(Guid batchId) : IExistingShareDecisionInteraction
@@ -278,7 +752,9 @@ public sealed class JobResultsViewModelTests
         public IReadOnlyList<JobResultsPage> Pages { get; init; } = [new([Row(1)], 1, null)];
         public List<int> RequestedPageSizes { get; } = [];
         public Guid? RetriedShareOperationId { get; private set; }
+        public int ResumedTransferCalls { get; private set; }
         public bool BlockExport { get; init; }
+        public bool ThrowExport { get; init; }
         public TaskCompletionSource ExportStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) => Task.FromResult(Summary);
         public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default)
@@ -295,14 +771,18 @@ public sealed class JobResultsViewModelTests
             Task.FromResult(new JobResultActionOutcome(true, false, "转存结果已确认。"));
         public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new JobResultActionOutcome(true, false, "分享结果已确认。"));
-        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) =>
-            Task.FromResult(new JobResultActionOutcome(true, false, "转存任务已恢复。"));
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default)
+        {
+            ResumedTransferCalls++;
+            return Task.FromResult(new JobResultActionOutcome(true, false, "转存任务已恢复。"));
+        }
         public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) =>
             Task.FromResult(new JobResultActionOutcome(true, false, "分享任务已恢复。"));
         public async Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default)
         {
             ExportStarted.TrySetResult();
             if (BlockExport) await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            if (ThrowExport) throw new IOException("simulated export failure");
             progress.Report(1);
             return 1;
         }
@@ -314,6 +794,61 @@ public sealed class JobResultsViewModelTests
             Task.FromException<JobResultsSummary>(new InvalidOperationException("private database detail"));
         public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
             Task.FromResult(new JobResultsPage([], 0, null));
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class ScriptedProgressWorkflow : IJobResultsWorkflow
+    {
+        private readonly Queue<Func<Task<JobResultsSummary>>> summaries;
+
+        public ScriptedProgressWorkflow(params JobResultsSummary[] summaries)
+            : this(summaries.Select(summary => (Func<Task<JobResultsSummary>>)(() => Task.FromResult(summary))).ToArray())
+        {
+        }
+
+        public ScriptedProgressWorkflow(IEnumerable<Func<Task<JobResultsSummary>>> summaries) =>
+            this.summaries = new Queue<Func<Task<JobResultsSummary>>>(summaries);
+
+        public JobResultsPage Page { get; init; } = new([], 25, null);
+
+        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+            summaries.Dequeue()();
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
+            Task.FromResult(Page);
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class DelayedRefreshWorkflow(Guid firstBatch, Guid secondBatch) : IJobResultsWorkflow
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int firstBatchPageLoads;
+        public TaskCompletionSource RefreshStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void ReleaseRefresh() => release.TrySetResult();
+        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(batchJobId == firstBatch
+                ? new JobResultsSummary(99, 99, 10, 0, 80, 10)
+                : new JobResultsSummary(2, 2, 0, 0, 0, 0));
+        public async Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default)
+        {
+            if (batchJobId == firstBatch && Interlocked.Increment(ref firstBatchPageLoads) == 2)
+            {
+                RefreshStarted.TrySetResult();
+                await release.Task;
+                return new([Row(99)], 99, null);
+            }
+            Assert.Equal(batchJobId == firstBatch ? firstBatch : secondBatch, batchJobId);
+            return new([Row(batchJobId == firstBatch ? 1 : 2)], batchJobId == firstBatch ? 1 : 2, null);
+        }
         public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();

@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
 using System.IO;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.App.Features.ManagedBrowser;
 
@@ -40,6 +42,27 @@ public enum ManagedBrowserAction
     Health = 2,
     Shutdown = 3,
     ObserveAccountIdentity = 4,
+    OpenTransferSource = 5,
+    ReadTransferSource = 6,
+    ReadTransferDirectory = 7,
+    OpenTransferPicker = 8,
+    OpenTransferDirectoryRoot = 9,
+    EnterTransferDirectory = 10,
+    BeginCreateTransferDirectory = 11,
+    ConfirmCreateTransferDirectory = 12,
+    CancelTransferPicker = 13,
+    ObserveTransferPickerClosed = 14,
+    OpenTransferTargetRoot = 15,
+    EnterTransferTargetDirectory = 16,
+    ReadTransferTargetDirectory = 17,
+    OpenTransferSourceAfterTargetRead = 18,
+    ObserveTransferSubmissionReady = 19,
+    SubmitTransferOnce = 20,
+    ObserveTransferSubmissionOutcome = 21,
+    ReadShareOfficialListing = 22,
+    SubmitShareOnce = 23,
+    ObserveShareSubmissionOutcome = 24,
+    SubmitExtractionCode = 25,
 }
 
 public abstract class ManagedBrowserRequestPayload
@@ -259,6 +282,7 @@ public enum ManagedBrowserRoute
     Rejected = 0,
     PanRoot = 1,
     PassportRoot = 2,
+    PanMain = 3,
 }
 
 public static class ManagedBrowserRoutePolicy
@@ -269,18 +293,25 @@ public static class ManagedBrowserRoutePolicy
         if (!uri.IsAbsoluteUri ||
             !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal) ||
             !string.IsNullOrEmpty(uri.UserInfo) ||
-            !uri.IsDefaultPort ||
-            !string.Equals(uri.AbsolutePath, "/", StringComparison.Ordinal) ||
-            !string.IsNullOrEmpty(uri.Query) ||
-            !string.IsNullOrEmpty(uri.Fragment))
+            !uri.IsDefaultPort)
         {
             return ManagedBrowserRoute.Rejected;
         }
 
-        if (string.Equals(uri.IdnHost, "pan.baidu.com", StringComparison.Ordinal))
-            return ManagedBrowserRoute.PanRoot;
-        if (string.Equals(uri.IdnHost, "passport.baidu.com", StringComparison.Ordinal))
-            return ManagedBrowserRoute.PassportRoot;
+        if (string.Equals(uri.AbsolutePath, "/", StringComparison.Ordinal) &&
+            string.IsNullOrEmpty(uri.Query) && string.IsNullOrEmpty(uri.Fragment))
+        {
+            if (string.Equals(uri.IdnHost, "pan.baidu.com", StringComparison.Ordinal))
+                return ManagedBrowserRoute.PanRoot;
+            if (string.Equals(uri.IdnHost, "passport.baidu.com", StringComparison.Ordinal))
+                return ManagedBrowserRoute.PassportRoot;
+        }
+        // The screenshot-confirmed page location is not proof of a logged-in identity.
+        if (string.Equals(uri.IdnHost, "pan.baidu.com", StringComparison.Ordinal) &&
+            string.Equals(uri.AbsolutePath, "/disk/main", StringComparison.Ordinal) &&
+            (string.IsNullOrEmpty(uri.Query) || string.Equals(uri.Query, "?from=homeFlow", StringComparison.Ordinal)) &&
+            string.Equals(uri.Fragment, "#/index?category=all", StringComparison.Ordinal))
+            return ManagedBrowserRoute.PanMain;
         return ManagedBrowserRoute.Rejected;
     }
 
@@ -288,25 +319,32 @@ public static class ManagedBrowserRoutePolicy
         (from, to) is
             (ManagedBrowserRoute.PanRoot, ManagedBrowserRoute.PanRoot) or
             (ManagedBrowserRoute.PanRoot, ManagedBrowserRoute.PassportRoot) or
+            (ManagedBrowserRoute.PanRoot, ManagedBrowserRoute.PanMain) or
             (ManagedBrowserRoute.PassportRoot, ManagedBrowserRoute.PassportRoot) or
-            (ManagedBrowserRoute.PassportRoot, ManagedBrowserRoute.PanRoot);
+            (ManagedBrowserRoute.PassportRoot, ManagedBrowserRoute.PanRoot) or
+            (ManagedBrowserRoute.PassportRoot, ManagedBrowserRoute.PanMain) or
+            (ManagedBrowserRoute.PanMain, ManagedBrowserRoute.PanRoot) or
+            (ManagedBrowserRoute.PanMain, ManagedBrowserRoute.PassportRoot) or
+            (ManagedBrowserRoute.PanMain, ManagedBrowserRoute.PanMain);
 
     public static bool CanObserveIdentity(ManagedBrowserRoute route) =>
-        route == ManagedBrowserRoute.PanRoot;
+        route is ManagedBrowserRoute.PanRoot or ManagedBrowserRoute.PanMain;
 }
 
-public static class ManagedBrowserProtocol
+public static partial class ManagedBrowserProtocol
 {
-    public const int ProtocolVersion = 1;
-    public const string ExecutionEngineVersion = "ManagedChromium-v1";
-    public const int MaximumFrameBytes = 65_536;
+    public const int ProtocolVersion = 3;
+    public const string ExecutionEngineVersion = "ManagedChromium-v3";
+    public const int MaximumFrameBytes = 1_048_576;
+    public const int MaximumTargetEnterFrameBytes = 65_535;
     public const int MaximumOperationTimeoutMilliseconds = 120_000;
     public const int MaximumRequestsPerSession = 1_024;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly string[] Capabilities =
-        ["Health", "Shutdown", "ObserveAccountIdentity"];
+        ["Health", "Shutdown", "ObserveAccountIdentity", "OpenTransferSource", "ReadTransferSource", "ReadTransferDirectory", "OpenTransferPicker", "OpenTransferDirectoryRoot", "EnterTransferDirectory", "BeginCreateTransferDirectory", "ConfirmCreateTransferDirectory", "CancelTransferPicker", "ObserveTransferPickerClosed", "OpenTransferTargetRoot", "EnterTransferTargetDirectory", "ReadTransferTargetDirectory", "OpenTransferSourceAfterTargetRead", "ObserveTransferSubmissionReady", "SubmitTransferOnce", "ObserveTransferSubmissionOutcome", "ReadShareOfficialListing", "SubmitShareOnce", "ObserveShareSubmissionOutcome", "SubmitExtractionCode"];
     private static readonly HashSet<string> ForbiddenNames = new(
-        ["cookie", "authorization", "extractionCode", "pageUrl", "pageText", "html"],
+        ["cookie", "authorization", "extractionCode", "pageUrl", "pageText", "html",
+         "selector", "script", "url", "buttonText", "name", "toast"],
         StringComparer.OrdinalIgnoreCase);
 
     public static IReadOnlyList<string> RequiredCapabilities { get; } = Array.AsReadOnly(Capabilities);
@@ -318,19 +356,29 @@ public static class ManagedBrowserProtocol
     {
         ArgumentNullException.ThrowIfNull(request);
         using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        }))
         {
             WriteEnvelope(writer, request.CorrelationId, request.OperationId, request.AccountId,
                 request.Generation, request.Action, "payload", () => WritePayload(writer, request.Payload));
         }
-        return stream.ToArray();
+        var bytes = stream.ToArray();
+        if (request.Action == ManagedBrowserAction.EnterTransferTargetDirectory &&
+            bytes.Length + sizeof(int) > MaximumTargetEnterFrameBytes)
+            throw Failure(ManagedBrowserProtocolError.FrameSizeInvalid);
+        return bytes;
     }
 
     public static byte[] EncodeResponsePayload(ManagedBrowserResponse response)
     {
         ArgumentNullException.ThrowIfNull(response);
         using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream))
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        }))
         {
             WriteEnvelope(writer, response.CorrelationId, response.OperationId, response.AccountId,
                 response.Generation, response.Action, "result", () => WriteResult(writer, response.Result));
@@ -346,12 +394,36 @@ public static class ManagedBrowserProtocol
             "operationId", "accountId", "generation", "action", "payload"]);
         ValidateCommon(root, out var correlationId, out var operationId, out var accountId,
             out var generation, out var action);
+        if (action == ManagedBrowserAction.EnterTransferTargetDirectory &&
+            payload.Length + sizeof(int) > MaximumTargetEnterFrameBytes)
+            throw Failure(ManagedBrowserProtocolError.FrameSizeInvalid);
         var value = RequireObject(root, "payload", ManagedBrowserProtocolError.InvalidPayload);
         ManagedBrowserRequestPayload requestPayload = action switch
         {
             ManagedBrowserAction.Handshake => ParseHandshakeRequest(value),
             ManagedBrowserAction.Health or ManagedBrowserAction.Shutdown => ParseEmptyPayload(value),
             ManagedBrowserAction.ObserveAccountIdentity => ParseObserveRequest(value),
+            ManagedBrowserAction.OpenTransferSource => ParseOpenTransferSourceRequest(value),
+            ManagedBrowserAction.ReadTransferSource => ParseReadTransferSourceRequest(value),
+            ManagedBrowserAction.ReadTransferDirectory => ParseReadTransferDirectoryRequest(value),
+            ManagedBrowserAction.OpenTransferPicker => ParseOpenTransferPickerRequest(value),
+            ManagedBrowserAction.OpenTransferDirectoryRoot => ParseOpenTransferDirectoryRootRequest(value),
+            ManagedBrowserAction.EnterTransferDirectory => ParseEnterTransferDirectoryRequest(value),
+            ManagedBrowserAction.BeginCreateTransferDirectory => ParseBeginCreateTransferDirectoryRequest(value),
+            ManagedBrowserAction.ConfirmCreateTransferDirectory => ParseConfirmCreateTransferDirectoryRequest(value),
+            ManagedBrowserAction.CancelTransferPicker => ParseCancelTransferPickerRequest(value),
+            ManagedBrowserAction.ObserveTransferPickerClosed => ParseObserveTransferPickerClosedRequest(value),
+            ManagedBrowserAction.OpenTransferTargetRoot => ParseOpenTransferTargetRootRequest(value),
+            ManagedBrowserAction.EnterTransferTargetDirectory => ParseEnterTransferTargetDirectoryRequest(value),
+            ManagedBrowserAction.ReadTransferTargetDirectory => ParseReadTransferTargetDirectoryRequest(value),
+            ManagedBrowserAction.OpenTransferSourceAfterTargetRead => ParseOpenTransferSourceAfterTargetReadRequest(value),
+            ManagedBrowserAction.ObserveTransferSubmissionReady => ParseObserveTransferSubmissionReadyRequest(value),
+            ManagedBrowserAction.SubmitTransferOnce => ParseSubmitTransferOnceRequest(value),
+            ManagedBrowserAction.ObserveTransferSubmissionOutcome => ParseObserveTransferSubmissionOutcomeRequest(value),
+            ManagedBrowserAction.ReadShareOfficialListing => ParseReadShareOfficialListingRequest(value),
+            ManagedBrowserAction.SubmitShareOnce => ParseSubmitShareOnceRequest(value),
+            ManagedBrowserAction.ObserveShareSubmissionOutcome => ParseObserveShareSubmissionOutcomeRequest(value),
+            ManagedBrowserAction.SubmitExtractionCode => ParseSubmitExtractionCodeRequest(value),
             _ => throw Failure(ManagedBrowserProtocolError.UnknownAction),
         };
         return new ManagedBrowserRequest(
@@ -373,6 +445,27 @@ public static class ManagedBrowserProtocol
             ManagedBrowserAction.Health => ParseSingletonResult(value, "Healthy", ManagedBrowserHealthResult.Healthy),
             ManagedBrowserAction.Shutdown => ParseSingletonResult(value, "ShuttingDown", ManagedBrowserShutdownResult.ShuttingDown),
             ManagedBrowserAction.ObserveAccountIdentity => ParseIdentityResult(value),
+            ManagedBrowserAction.OpenTransferSource => ParseTransferSourceResult(value),
+            ManagedBrowserAction.ReadTransferSource => ParseSourceListingResult(value),
+            ManagedBrowserAction.ReadTransferDirectory => ParseDirectoryListingResult(value),
+            ManagedBrowserAction.OpenTransferPicker => ParseTransferPickerResult(value),
+            ManagedBrowserAction.OpenTransferDirectoryRoot => ParseDirectoryMutationResult(ManagedBrowserAction.OpenTransferDirectoryRoot, value),
+            ManagedBrowserAction.EnterTransferDirectory => ParseDirectoryMutationResult(ManagedBrowserAction.EnterTransferDirectory, value),
+            ManagedBrowserAction.BeginCreateTransferDirectory => ParseDirectoryMutationResult(ManagedBrowserAction.BeginCreateTransferDirectory, value),
+            ManagedBrowserAction.ConfirmCreateTransferDirectory => ParseDirectoryMutationResult(ManagedBrowserAction.ConfirmCreateTransferDirectory, value),
+            ManagedBrowserAction.CancelTransferPicker => ParseDirectoryMutationResult(ManagedBrowserAction.CancelTransferPicker, value),
+            ManagedBrowserAction.ObserveTransferPickerClosed => ParseTransferPickerClosedResult(value),
+            ManagedBrowserAction.OpenTransferTargetRoot => ParseOpenTransferTargetRootResult(value),
+            ManagedBrowserAction.EnterTransferTargetDirectory => ParseEnterTransferTargetDirectoryResult(value),
+            ManagedBrowserAction.ReadTransferTargetDirectory => ParseReadTransferTargetDirectoryResult(value),
+            ManagedBrowserAction.OpenTransferSourceAfterTargetRead => ParseOpenTransferSourceAfterTargetReadResult(value),
+            ManagedBrowserAction.ObserveTransferSubmissionReady => ParseTransferSubmissionReadinessResult(value),
+            ManagedBrowserAction.SubmitTransferOnce => ParseSubmitTransferOnceResult(value),
+            ManagedBrowserAction.ObserveTransferSubmissionOutcome => ParseTransferSubmissionOutcomeResult(value),
+            ManagedBrowserAction.ReadShareOfficialListing => ParseShareListingResult(value),
+            ManagedBrowserAction.SubmitShareOnce => ParseSubmitShareOnceResult(value),
+            ManagedBrowserAction.ObserveShareSubmissionOutcome => ParseShareSubmissionOutcomeResult(value),
+            ManagedBrowserAction.SubmitExtractionCode => ParseSubmitExtractionCodeResult(value),
             _ => throw Failure(ManagedBrowserProtocolError.UnknownAction),
         };
         return new ManagedBrowserResponse(
@@ -429,6 +522,61 @@ public static class ManagedBrowserProtocol
         {
             throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
         }
+        if (request.Payload is ManagedBrowserReadTransferTargetDirectoryRequest targetRequest &&
+            response.Result is ManagedBrowserReadTransferTargetDirectoryResult
+            {
+                Kind: ManagedBrowserReadTransferTargetDirectoryResultKind.Observed,
+                Snapshot: { } snapshot,
+            } &&
+            (snapshot.BrowserId != targetRequest.Binding.BrowserId ||
+             !string.Equals(snapshot.TargetId, targetRequest.Binding.TargetId, StringComparison.Ordinal) ||
+             !string.Equals(snapshot.DevToolsEndpoint.AbsoluteUri,
+                 targetRequest.Binding.DevToolsEndpoint.AbsoluteUri, StringComparison.Ordinal) ||
+             !string.Equals(snapshot.BaiduUserId, targetRequest.Binding.ExpectedBaiduUserId, StringComparison.Ordinal) ||
+             (targetRequest.ExpectedDirectoryExactId is null
+                 ? !string.Equals(snapshot.CanonicalPath, "/", StringComparison.Ordinal) ||
+                   snapshot.AncestorExactIds.Count != 1 ||
+                   !string.Equals(snapshot.AncestorExactIds[0], snapshot.DirectoryExactId, StringComparison.Ordinal)
+                 : !string.Equals(snapshot.DirectoryExactId, targetRequest.ExpectedDirectoryExactId, StringComparison.Ordinal) ||
+                   !string.Equals(snapshot.CanonicalPath, targetRequest.ExpectedCanonicalPath, StringComparison.Ordinal) ||
+                   !snapshot.AncestorExactIds.SequenceEqual(
+                       targetRequest.ExpectedAncestorExactIds!, StringComparer.Ordinal))))
+        {
+            throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
+        }
+        if (request.Payload is ManagedBrowserObserveTransferSubmissionReadyRequest readinessRequest &&
+            response.Result is ManagedBrowserTransferSubmissionReadinessResult
+            {
+                Kind: ManagedBrowserTransferSubmissionReadinessResultKind.Ready,
+                Readiness: { } readiness,
+            } && !readinessRequest.Context.EqualsEvidence(readiness.Context))
+            throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
+        if (request.Payload is ManagedBrowserObserveTransferSubmissionOutcomeRequest outcomeRequest &&
+            response.Result is ManagedBrowserTransferSubmissionOutcomeResult
+            {
+                Kind: ManagedBrowserTransferOutcomeKind.AcceptedBound,
+            } outcome &&
+            (!string.Equals(outcome.ExactTargetId, outcomeRequest.Context.SelectedTargetExactId, StringComparison.Ordinal) ||
+             !string.Equals(outcome.SourceExactId, outcomeRequest.Context.SourceExactId, StringComparison.Ordinal)))
+            throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
+        if (request.Payload is ManagedBrowserReadShareOfficialListingRequest shareListingRequest &&
+            response.Result is ManagedBrowserReadShareOfficialListingResult
+            {
+                Kind: ManagedBrowserShareListingResultKind.Observed,
+                Listing: { } shareListing,
+            } && !shareListingRequest.Context.EqualsEvidence(shareListing.Context))
+            throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
+        if (request.Payload is ManagedBrowserObserveShareSubmissionOutcomeRequest shareOutcomeRequest &&
+            response.Result is ManagedBrowserShareSubmissionOutcomeResult
+            {
+                Kind: ManagedBrowserShareOutcomeKind.AcceptedBound,
+            } shareOutcome &&
+            (shareOutcome.ExactItems != shareOutcomeRequest.Context.ExactItems ||
+             shareOutcome.CodeMode != shareOutcomeRequest.Context.CodeMode ||
+             shareOutcome.IsPermanent != true || shareOutcome.IsAccessUnlimited != true ||
+             shareOutcomeRequest.Context.CodeMode == ShareExtractionCodeBehavior.Fixed &&
+             !string.Equals(shareOutcome.EffectiveCode, shareOutcomeRequest.Context.FixedCode, StringComparison.Ordinal)))
+            throw Failure(ManagedBrowserProtocolError.ResponseIdentityMismatch);
     }
 
     internal static bool IsNonce(string? value) =>
@@ -507,6 +655,24 @@ public static class ManagedBrowserProtocol
                 ReferenceEquals(payload, ManagedBrowserRequestPayload.Empty),
             ManagedBrowserAction.ObserveAccountIdentity =>
                 payload is ManagedBrowserObserveAccountIdentityRequest,
+            ManagedBrowserAction.OpenTransferSource => payload is ManagedBrowserOpenTransferSourceRequest,
+            ManagedBrowserAction.ReadTransferSource => payload is ManagedBrowserReadTransferSourceRequest,
+            ManagedBrowserAction.ReadTransferDirectory => payload is ManagedBrowserReadTransferDirectoryRequest,
+            ManagedBrowserAction.OpenTransferPicker => payload is ManagedBrowserOpenTransferPickerRequest,
+            ManagedBrowserAction.OpenTransferDirectoryRoot or ManagedBrowserAction.EnterTransferDirectory or ManagedBrowserAction.BeginCreateTransferDirectory or ManagedBrowserAction.ConfirmCreateTransferDirectory or ManagedBrowserAction.CancelTransferPicker =>
+                payload is ManagedBrowserDirectoryMutationRequest mutation && mutation.Action == action,
+            ManagedBrowserAction.ObserveTransferPickerClosed => payload is ManagedBrowserObserveTransferPickerClosedRequest,
+            ManagedBrowserAction.OpenTransferTargetRoot => payload is ManagedBrowserOpenTransferTargetRootRequest,
+            ManagedBrowserAction.EnterTransferTargetDirectory => payload is ManagedBrowserEnterTransferTargetDirectoryRequest,
+            ManagedBrowserAction.ReadTransferTargetDirectory => payload is ManagedBrowserReadTransferTargetDirectoryRequest,
+            ManagedBrowserAction.OpenTransferSourceAfterTargetRead => payload is ManagedBrowserOpenTransferSourceAfterTargetReadRequest,
+            ManagedBrowserAction.ObserveTransferSubmissionReady => payload is ManagedBrowserObserveTransferSubmissionReadyRequest,
+            ManagedBrowserAction.SubmitTransferOnce => payload is ManagedBrowserSubmitTransferOnceRequest,
+            ManagedBrowserAction.ObserveTransferSubmissionOutcome => payload is ManagedBrowserObserveTransferSubmissionOutcomeRequest,
+            ManagedBrowserAction.ReadShareOfficialListing => payload is ManagedBrowserReadShareOfficialListingRequest,
+            ManagedBrowserAction.SubmitShareOnce => payload is ManagedBrowserSubmitShareOnceRequest,
+            ManagedBrowserAction.ObserveShareSubmissionOutcome => payload is ManagedBrowserObserveShareSubmissionOutcomeRequest,
+            ManagedBrowserAction.SubmitExtractionCode => payload is ManagedBrowserSubmitExtractionCodeRequest,
             _ => false,
         };
         if (!valid) throw new ArgumentException("The payload does not match the action.", nameof(payload));
@@ -520,10 +686,39 @@ public static class ManagedBrowserProtocol
             ManagedBrowserAction.Health => result is ManagedBrowserHealthResult,
             ManagedBrowserAction.Shutdown => result is ManagedBrowserShutdownResult,
             ManagedBrowserAction.ObserveAccountIdentity => result is ManagedBrowserIdentityResult,
+            ManagedBrowserAction.OpenTransferSource => result is ManagedBrowserTransferSourceResult,
+            ManagedBrowserAction.ReadTransferSource => result is ManagedBrowserSourceListingResult,
+            ManagedBrowserAction.ReadTransferDirectory => result is ManagedBrowserDirectoryListingResult,
+            ManagedBrowserAction.OpenTransferPicker => result is ManagedBrowserTransferPickerResult,
+            ManagedBrowserAction.OpenTransferDirectoryRoot or ManagedBrowserAction.EnterTransferDirectory or ManagedBrowserAction.BeginCreateTransferDirectory or ManagedBrowserAction.ConfirmCreateTransferDirectory or ManagedBrowserAction.CancelTransferPicker =>
+                result is ManagedBrowserDirectoryMutationResult mutation && IsAllowedDirectoryMutationResult(action, mutation.Kind),
+            ManagedBrowserAction.ObserveTransferPickerClosed => result is ManagedBrowserTransferPickerClosedResult,
+            ManagedBrowserAction.OpenTransferTargetRoot => result is ManagedBrowserOpenTransferTargetRootResult,
+            ManagedBrowserAction.EnterTransferTargetDirectory => result is ManagedBrowserEnterTransferTargetDirectoryResult,
+            ManagedBrowserAction.ReadTransferTargetDirectory => result is ManagedBrowserReadTransferTargetDirectoryResult,
+            ManagedBrowserAction.OpenTransferSourceAfterTargetRead => result is ManagedBrowserOpenTransferSourceAfterTargetReadResult,
+            ManagedBrowserAction.ObserveTransferSubmissionReady => result is ManagedBrowserTransferSubmissionReadinessResult,
+            ManagedBrowserAction.SubmitTransferOnce => result is ManagedBrowserSubmitTransferOnceResult,
+            ManagedBrowserAction.ObserveTransferSubmissionOutcome => result is ManagedBrowserTransferSubmissionOutcomeResult,
+            ManagedBrowserAction.ReadShareOfficialListing => result is ManagedBrowserReadShareOfficialListingResult,
+            ManagedBrowserAction.SubmitShareOnce => result is ManagedBrowserSubmitShareOnceResult,
+            ManagedBrowserAction.ObserveShareSubmissionOutcome => result is ManagedBrowserShareSubmissionOutcomeResult,
+            ManagedBrowserAction.SubmitExtractionCode => result is ManagedBrowserSubmitExtractionCodeResult,
             _ => false,
         };
         if (!valid) throw new ArgumentException("The result does not match the action.", nameof(result));
     }
+
+    private static bool IsAllowedDirectoryMutationResult(ManagedBrowserAction action,
+        ManagedBrowserDirectoryMutationResultKind kind) => kind switch
+    {
+        ManagedBrowserDirectoryMutationResultKind.RootOpened => action == ManagedBrowserAction.OpenTransferDirectoryRoot,
+        ManagedBrowserDirectoryMutationResultKind.DirectoryEntered => action == ManagedBrowserAction.EnterTransferDirectory,
+        ManagedBrowserDirectoryMutationResultKind.CreateDialogOpened => action == ManagedBrowserAction.BeginCreateTransferDirectory,
+        ManagedBrowserDirectoryMutationResultKind.DirectoryCreated => action == ManagedBrowserAction.ConfirmCreateTransferDirectory,
+        ManagedBrowserDirectoryMutationResultKind.PickerCancelled => action == ManagedBrowserAction.CancelTransferPicker,
+        _ => true,
+    };
 
     private static byte[] Frame(byte[] payload)
     {
@@ -643,7 +838,7 @@ public static class ManagedBrowserProtocol
     {
         if (!root.TryGetProperty("protocolVersion", out var protocolProperty) ||
             protocolProperty.ValueKind != JsonValueKind.Number ||
-            !string.Equals(protocolProperty.GetRawText(), "1", StringComparison.Ordinal))
+            !string.Equals(protocolProperty.GetRawText(), ProtocolVersion.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
             throw Failure(ManagedBrowserProtocolError.ProtocolVersionMismatch);
         if (!root.TryGetProperty("executionEngineVersion", out var engineProperty) ||
             engineProperty.ValueKind != JsonValueKind.String ||
@@ -702,6 +897,35 @@ public static class ManagedBrowserProtocol
                 RequireInt32(value, "timeoutMilliseconds", ManagedBrowserProtocolError.InvalidPayload));
         }
         catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
+    }
+
+    private static ManagedBrowserRequestPayload ParseOpenTransferSourceRequest(JsonElement value)
+    {
+        ValidateObject(value, ["browserId", "targetId", "devToolsEndpoint", "timeoutMilliseconds",
+            "sourceUri", "expectedBaiduUserId"], ManagedBrowserProtocolError.InvalidPayload);
+        try
+        {
+            if (!Uri.TryCreate(RequireString(value, "devToolsEndpoint", ManagedBrowserProtocolError.InvalidPayload),
+                    UriKind.Absolute, out var endpoint))
+                throw new ArgumentException("Invalid endpoint.");
+            return new ManagedBrowserOpenTransferSourceRequest(
+                RequireGuid(value, "browserId", ManagedBrowserProtocolError.InvalidPayload),
+                RequireString(value, "targetId", ManagedBrowserProtocolError.InvalidPayload), endpoint,
+                RequireInt32(value, "timeoutMilliseconds", ManagedBrowserProtocolError.InvalidPayload),
+                RequireString(value, "sourceUri", ManagedBrowserProtocolError.InvalidPayload),
+                RequireString(value, "expectedBaiduUserId", ManagedBrowserProtocolError.InvalidPayload));
+        }
+        catch (ArgumentException) { throw Failure(ManagedBrowserProtocolError.InvalidPayload); }
+    }
+
+    private static ManagedBrowserResult ParseTransferSourceResult(JsonElement value)
+    {
+        ValidateObject(value, ["kind"], ManagedBrowserProtocolError.InvalidPayload);
+        var text = RequireString(value, "kind", ManagedBrowserProtocolError.InvalidPayload);
+        if (!Enum.TryParse(text, ignoreCase: false, out ManagedBrowserTransferSourceResultKind kind) ||
+            !Enum.IsDefined(kind) || kind.ToString() != text)
+            throw Failure(ManagedBrowserProtocolError.InvalidPayload);
+        return new ManagedBrowserTransferSourceResult(kind);
     }
 
     private static ManagedBrowserResult ParseHandshakeResult(JsonElement value)
@@ -790,6 +1014,76 @@ public static class ManagedBrowserProtocol
                 writer.WriteString("devToolsEndpoint", observe.DevToolsEndpoint.AbsoluteUri);
                 writer.WriteNumber("timeoutMilliseconds", observe.TimeoutMilliseconds);
                 break;
+            case ManagedBrowserOpenTransferSourceRequest source:
+                writer.WriteString("browserId", source.BrowserId);
+                writer.WriteString("targetId", source.TargetId);
+                writer.WriteString("devToolsEndpoint", source.DevToolsEndpoint.AbsoluteUri);
+                writer.WriteNumber("timeoutMilliseconds", source.TimeoutMilliseconds);
+                writer.WriteString("sourceUri", source.SourceUri);
+                writer.WriteString("expectedBaiduUserId", source.ExpectedBaiduUserId);
+                break;
+            case ManagedBrowserReadTransferSourceRequest read:
+                WriteSourceBinding(writer, read.Binding);
+                break;
+            case ManagedBrowserReadTransferDirectoryRequest directory:
+                WriteSourceBinding(writer, directory.Binding);
+                writer.WriteString("expectedParentExactId", directory.ExpectedParentExactId);
+                writer.WriteString("expectedCanonicalPath", directory.ExpectedCanonicalPath);
+                break;
+            case ManagedBrowserOpenTransferPickerRequest picker:
+                WriteSourceBinding(writer, picker.Binding);
+                writer.WritePropertyName("expectedSource");
+                writer.WriteStartObject();
+                WriteSourceListing(writer, new ManagedBrowserSourceListingResult(
+                    ManagedBrowserSourceListingResultKind.Observed, picker.ExpectedSource));
+                writer.WriteEndObject();
+                break;
+            case ManagedBrowserDirectoryMutationRequest mutation:
+                WriteDirectoryMutationPayload(writer, mutation);
+                break;
+            case ManagedBrowserObserveTransferPickerClosedRequest closed:
+                WriteSourceBinding(writer, closed.Binding);
+                writer.WritePropertyName("expectedSource"); writer.WriteStartObject();
+                WriteSourceListing(writer, new ManagedBrowserSourceListingResult(ManagedBrowserSourceListingResultKind.Observed, closed.ExpectedSource));
+                writer.WriteEndObject();
+                break;
+            case ManagedBrowserOpenTransferTargetRootRequest targetRoot:
+                WriteTargetBinding(writer, targetRoot.Binding);
+                break;
+            case ManagedBrowserEnterTransferTargetDirectoryRequest targetEnter:
+                WriteTargetBinding(writer, targetEnter.Binding);
+                writer.WritePropertyName("expectedParent"); writer.WriteStartObject();
+                WriteTargetHeader(writer, targetEnter.ExpectedParent); writer.WriteEndObject();
+                writer.WriteString("childExactId", targetEnter.ChildExactId);
+                writer.WriteString("childServerName", targetEnter.ChildServerName);
+                writer.WriteString("childCanonicalPath", targetEnter.ChildCanonicalPath);
+                break;
+            case ManagedBrowserReadTransferTargetDirectoryRequest targetRead:
+                WriteTargetBinding(writer, targetRead.Binding);
+                writer.WriteString("expectedDirectoryExactId", targetRead.ExpectedDirectoryExactId);
+                writer.WriteString("expectedCanonicalPath", targetRead.ExpectedCanonicalPath);
+                writer.WritePropertyName("expectedAncestorExactIds");
+                if (targetRead.ExpectedAncestorExactIds is null) writer.WriteNullValue();
+                else WriteStrings(writer, targetRead.ExpectedAncestorExactIds);
+                break;
+            case ManagedBrowserOpenTransferSourceAfterTargetReadRequest restore:
+                WriteTargetBinding(writer, restore.Binding);
+                writer.WritePropertyName("expectedTarget"); writer.WriteStartObject();
+                WriteTargetHeader(writer, restore.ExpectedTarget); writer.WriteEndObject();
+                break;
+            case ManagedBrowserObserveTransferSubmissionReadyRequest or
+                 ManagedBrowserSubmitTransferOnceRequest or
+                 ManagedBrowserObserveTransferSubmissionOutcomeRequest:
+                WriteTransferSubmissionRequest(writer, payload);
+                break;
+            case ManagedBrowserReadShareOfficialListingRequest or
+                 ManagedBrowserSubmitShareOnceRequest or
+                 ManagedBrowserObserveShareSubmissionOutcomeRequest:
+                WriteShareSubmissionRequest(writer, payload);
+                break;
+            case ManagedBrowserSubmitExtractionCodeRequest extraction:
+                WriteExtractionRequest(writer, extraction);
+                break;
             default:
                 if (!ReferenceEquals(payload, ManagedBrowserRequestPayload.Empty))
                     throw new ArgumentOutOfRangeException(nameof(payload));
@@ -822,6 +1116,52 @@ public static class ManagedBrowserProtocol
                 if (identity.Kind == ManagedBrowserIdentityResultKind.Observed)
                     writer.WriteString("stableBaiduUserId", identity.StableBaiduUserId);
                 break;
+            case ManagedBrowserTransferSourceResult source:
+                writer.WriteString("kind", source.Kind.ToString());
+                break;
+            case ManagedBrowserSourceListingResult listing:
+                WriteSourceListing(writer, listing);
+                break;
+            case ManagedBrowserDirectoryListingResult directory:
+                WriteDirectoryListing(writer, directory);
+                break;
+            case ManagedBrowserTransferPickerResult picker:
+                writer.WriteString("kind", picker.Kind.ToString());
+                break;
+            case ManagedBrowserDirectoryMutationResult mutation:
+                writer.WriteString("kind", mutation.Kind.ToString());
+                break;
+            case ManagedBrowserTransferPickerClosedResult closed:
+                writer.WriteString("kind", closed.Kind.ToString());
+                break;
+            case ManagedBrowserOpenTransferTargetRootResult targetRoot:
+                writer.WriteString("kind", targetRoot.Kind.ToString());
+                writer.WriteString("navigationState", targetRoot.NavigationState.ToString());
+                break;
+            case ManagedBrowserEnterTransferTargetDirectoryResult targetEnter:
+                writer.WriteString("kind", targetEnter.Kind.ToString());
+                writer.WriteString("navigationState", targetEnter.NavigationState.ToString());
+                break;
+            case ManagedBrowserReadTransferTargetDirectoryResult targetRead:
+                WriteTargetInventory(writer, targetRead);
+                break;
+            case ManagedBrowserOpenTransferSourceAfterTargetReadResult restore:
+                writer.WriteString("kind", restore.Kind.ToString());
+                writer.WriteString("navigationState", restore.NavigationState.ToString());
+                break;
+            case ManagedBrowserTransferSubmissionReadinessResult or
+                 ManagedBrowserSubmitTransferOnceResult or
+                 ManagedBrowserTransferSubmissionOutcomeResult:
+                WriteTransferSubmissionResult(writer, result);
+                break;
+            case ManagedBrowserReadShareOfficialListingResult or
+                 ManagedBrowserSubmitShareOnceResult or
+                 ManagedBrowserShareSubmissionOutcomeResult:
+                WriteShareSubmissionResult(writer, result);
+                break;
+            case ManagedBrowserSubmitExtractionCodeResult extraction:
+                WriteExtractionResult(writer, extraction);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(result));
         }
@@ -842,7 +1182,10 @@ public static class ManagedBrowserProtocol
     {
         if (!value.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.String)
             throw Failure(bodyError);
-        return property.GetString()!;
+        // System.Text.Json parses lone escaped surrogates, but GetString refuses them.
+        // Preserve the redacted protocol boundary rather than leaking decoder exceptions.
+        try { return property.GetString()!; }
+        catch (InvalidOperationException) { throw Failure(bodyError); }
     }
 
     private static Guid RequireGuid(

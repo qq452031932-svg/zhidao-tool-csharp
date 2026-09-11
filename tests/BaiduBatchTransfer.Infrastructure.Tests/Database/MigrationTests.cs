@@ -1,3 +1,5 @@
+using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 using Microsoft.Data.Sqlite;
 
@@ -6,6 +8,289 @@ namespace BaiduBatchTransfer.Infrastructure.Tests.Database;
 public sealed class MigrationTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-migration-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task VersionTwentyThreeCreatesSingletonShareAnalyticsPreference()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "share-analytics-preference.db"));
+        var migrator = new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "share-analytics-preference-backups")),
+            "test");
+
+        Assert.Equal(23, await migrator.MigrateAsync());
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+
+        await using var connection = await factory.OpenConnectionAsync();
+        Assert.Equal(
+            ["SingletonId", "LastViewedAccountId", "UpdatedAtUtc"],
+            await ColumnsAsync(connection, "ShareAnalyticsPreferences"));
+        Assert.Equal(1L, await ScalarAsync<long>(connection,
+            "SELECT COUNT(*) FROM ShareAnalyticsPreferences WHERE SingletonId=1 AND LastViewedAccountId IS NULL AND UpdatedAtUtc<>'';"));
+        Assert.Equal(1L, await ScalarAsync<long>(connection,
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('ShareAnalyticsPreferences') WHERE \"table\"='Accounts' AND \"from\"='LastViewedAccountId' AND on_delete='SET NULL';"));
+    }
+
+    [Fact]
+    public async Task VersionTwentyTwoAddsAccountScopedShareAnalyticsCache()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "share-analytics.db"));
+        var migrator = new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "share-analytics-backups")),
+            "test");
+        for (var version = 1; version <= 21; version++)
+            await migrator.ApplyMigrationAsync(version, default);
+
+        await migrator.ApplyMigrationAsync(22, default);
+
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        await using var connection = await factory.OpenConnectionAsync();
+        Assert.Equal(new[]
+        {
+            "AccountId", "ShareId", "Title", "ShareUrl", "SharedAtUtc", "Status", "IsCurrent", "LastSeenAtUtc",
+        }, await ColumnsAsync(connection, "AccountShareRecords"));
+        Assert.Equal(new[]
+        {
+            "AccountId", "ShareId", "Metric", "DateKey", "CapturedAtUtc", "HistoricalTotal", "DailyValue", "DailySource",
+        }, await ColumnsAsync(connection, "AccountShareMetricSnapshots"));
+        Assert.Equal(new[]
+        {
+            "AccountId", "IssuedGeneration", "CommittedGeneration", "LastSuccessfulSyncAtUtc",
+        }, await ColumnsAsync(connection, "AccountShareSyncState"));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 22)).IsValid);
+    }
+
+    [Fact]
+    public async Task VersionTwentyOneFencesDirectBackgroundBatchesAndPersistsDurableSettings()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "direct-background.db"));
+        var migrator = new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "direct-background-backups")),
+            "test");
+        for (var version = 1; version <= 20; version++)
+            await migrator.ApplyMigrationAsync(version, default);
+
+        (string Resource, string Job, string Account) parents;
+        var operation = Guid.NewGuid().ToString("D");
+        await using (var old = await factory.OpenConnectionAsync())
+        {
+            parents = await SeedOperationParentsAsync(old);
+            await ExecuteAsync(old, """
+                INSERT INTO TransferOperations(
+                  Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                  CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,
+                  SubmitState,TargetSlotState,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId)
+                VALUES($id,$resource,$job,1,1,'/','/','',$account,'test','Waiting',0,'direct-fixture',
+                  'NotPrepared','Unoccupied','2026-01-01','2026-01-01','WebView2-v1','LegacyWebView2',$profile);
+                """, ("$id", operation), ("$resource", parents.Resource), ("$job", parents.Job),
+                ("$account", parents.Account), ("$profile", LegacyProfileId(Guid.Parse(parents.Account))));
+        }
+
+        await migrator.ApplyMigrationAsync(21, default);
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        await using var connection = await factory.OpenConnectionAsync();
+
+        var batchColumns = await ColumnsAsync(connection, "BatchJobs");
+        Assert.Contains("DirectBackground", batchColumns);
+        Assert.Contains("MaxConcurrency", batchColumns);
+        Assert.Contains("DirectActivationState", batchColumns);
+        Assert.Contains("DirectPauseReason", batchColumns);
+        Assert.Contains("UnknownResubmissionCount", await ColumnsAsync(connection, "TransferOperations"));
+        Assert.Contains("DirectExtractionCode", await ColumnsAsync(connection, "ShareOperations"));
+        Assert.Contains("ResponseOrdinal", await ColumnsAsync(connection, "ShareOperationRemoteItems"));
+        Assert.Equal(0L, await ScalarAsync<long>(connection,
+            "SELECT DirectBackground FROM BatchJobs WHERE Id=$id;", ("$id", parents.Job)));
+        Assert.Equal(1L, await ScalarAsync<long>(connection,
+            "SELECT MaxConcurrency FROM BatchJobs WHERE Id=$id;", ("$id", parents.Job)));
+        Assert.Equal("Inert", await ScalarAsync<string>(connection,
+            "SELECT DirectActivationState FROM BatchJobs WHERE Id=$id;", ("$id", parents.Job)));
+        Assert.Equal(0L, await ScalarAsync<long>(connection,
+            "SELECT UnknownResubmissionCount FROM TransferOperations WHERE Id=$id;", ("$id", operation)));
+
+        foreach (var table in new[]
+                 {
+                     "DirectBackgroundWorkspacePreferences",
+                     "DirectBackgroundAuthorizationState",
+                     "DirectBackgroundAcceptanceAuthorizations",
+                 })
+        {
+            Assert.Equal(1L, await ScalarAsync<long>(connection,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$name;", ("$name", table)));
+        }
+
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection,
+            "UPDATE BatchJobs SET MaxConcurrency=4 WHERE Id=$id;", ("$id", parents.Job)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection,
+            "UPDATE BatchJobs SET DirectBackground=1 WHERE Id=$id;", ("$id", parents.Job)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection,
+            "UPDATE TransferOperations SET UnknownResubmissionCount=2 WHERE Id=$id;", ("$id", operation)));
+    }
+
+    [Fact]
+    public async Task VersionTwentyAddsImmutableAcceptanceOnlyScopeWithLegacyDefaults()
+    {
+        Directory.CreateDirectory(root);
+        var factory = new SqliteConnectionFactory(Path.Combine(root, "acceptance-scope.db"));
+        var migrator = new DatabaseMigrator(
+            factory,
+            new DatabaseBackupService(factory, Path.Combine(root, "acceptance-backups")),
+            "test");
+        for (var version = 1; version <= 19; version++)
+            await migrator.ApplyMigrationAsync(version, default);
+        var operation = Guid.NewGuid().ToString("D");
+        (string Resource, string Job, string Account) parents;
+        await using (var old = await factory.OpenConnectionAsync())
+        {
+            parents = await SeedOperationParentsAsync(old);
+            await ExecuteAsync(old, """
+                INSERT INTO TransferOperations(
+                  Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                  CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,
+                  SubmitState,TargetSlotState,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId)
+                VALUES($id,$resource,$job,1,1,'/','/','',$account,'test','Waiting',0,'fingerprint',
+                  'NotPrepared','Unoccupied','2026-01-01','2026-01-01','WebView2-v1','LegacyWebView2',$profile);
+                """,
+                ("$id", operation), ("$resource", parents.Resource), ("$job", parents.Job),
+                ("$account", parents.Account),
+                ("$profile", $"legacy-webview2-account-{Guid.Parse(parents.Account):N}"));
+        }
+
+        await migrator.ApplyMigrationAsync(20, default);
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
+        await using var connection = await factory.OpenConnectionAsync();
+
+        Assert.Contains("AcceptanceOnly", await ColumnsAsync(connection, "BatchJobs"));
+        Assert.Contains("AcceptanceOnly", await ColumnsAsync(connection, "TransferOperations"));
+        Assert.Equal(0L, await ScalarAsync<long>(connection,
+            "SELECT AcceptanceOnly FROM BatchJobs WHERE Id=$id;", ("$id", parents.Job)));
+        Assert.Equal(0L, await ScalarAsync<long>(connection,
+            "SELECT AcceptanceOnly FROM TransferOperations WHERE Id=$id;", ("$id", operation)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection,
+            "UPDATE BatchJobs SET AcceptanceOnly=1 WHERE Id=$id;", ("$id", parents.Job)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteAsync(connection,
+            "UPDATE TransferOperations SET AcceptanceOnly=1 WHERE Id=$id;", ("$id", operation)));
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            connection, 20)).IsValid);
+    }
+
+    [Fact]
+    public async Task VersionEighteenUpgradeAddsManagedTransferSubmissionColumnsExactlyOnceAndBackfillsOfficialObservation()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v18-to-v19.db");
+        var operationId = Guid.NewGuid().ToString("D");
+        var accountId = string.Empty;
+        var baseline = WebAutomationBaseline.Create([]);
+        var source = new RemoteItemIdentitySet([new RemoteItemIdentity("source", null)]);
+        var accepted = new RemoteItemIdentitySet([new RemoteItemIdentity("destination", null)]);
+        var mapping = new TransferIdentityMapping([new("source", "destination")]);
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 18; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            var parents = await SeedOperationParentsAsync(connection);
+            accountId = parents.Account;
+            await ExecuteAsync(connection, """
+                INSERT INTO TransferOperations(
+                  Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
+                  CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,OperationFingerprint,
+                  ConfirmationDescriptorJson,SubmitState,TargetSlotState,CreatedAt,UpdatedAt,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId)
+                VALUES($operation,$resource,$job,1,1,'/target','/target','',$account,'Fixture','ResultPending',1,
+                  'operation-fingerprint','{}','PendingConfirmation','Reserved',
+                  '2026-08-30T00:00:00Z','2026-08-30T00:00:04Z',
+                  'WebView2-v1','LegacyWebView2',$profile);
+                """, ("$operation", operationId), ("$resource", parents.Resource), ("$job", parents.Job),
+                ("$account", accountId), ("$profile", LegacyProfileId(Guid.Parse(accountId))));
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,ObservationFingerprint,
+                  BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,
+                  CreatedAt,UpdatedAt,OfficialRequestId,AcceptanceFingerprint,
+                  AcceptancePersistedAt,AcceptedItemCount,
+                  SourceTotalCount,SourceReachedEnd,SourceIsStable,SourceGenerationToken,
+                  SourceFingerprint,SourceObservationFingerprint,BaiduUserId,
+                  CapabilityAdapterKind,CapabilityProtocolVersion,CapabilitySelectorVersion,CapabilityBuildVersion,
+                  TransferMappingFingerprint,TransferMappingCount,
+                  ExecutionEngineVersion,BrowserFamily,ProfileId)
+                VALUES($operation,$account,1,'Transfer','ResultPending',$observation,
+                  $baseline,0,'2026-08-30T00:00:00Z',0,4,'2026-08-30T00:00:00Z',
+                  '2026-08-30T00:00:04Z','official-request',$acceptance,
+                  '2026-08-30T00:00:03Z',1,
+                  1,1,1,'source-generation',$source,$sourceObservation,'baidu-user',
+                  'adapter','protocol','selector','build',$mapping,1,
+                  'WebView2-v1','LegacyWebView2',$profile);
+                """, ("$operation", operationId), ("$account", accountId),
+                ("$observation", new string('a', 64)), ("$baseline", baseline.Fingerprint),
+                ("$acceptance", accepted.Fingerprint), ("$source", source.Fingerprint),
+                ("$sourceObservation", new string('e', 64)), ("$mapping", mapping.Fingerprint),
+                ("$profile", LegacyProfileId(Guid.Parse(accountId))));
+            await ExecuteAsync(connection, """
+                INSERT INTO WebAutomationAttemptSourceItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'source',$sourceSort);
+                INSERT INTO WebAutomationAttemptAcceptedRemoteItems(
+                  OperationId,AccountId,Generation,ItemOrdinal,RemoteItemId,CanonicalSortKey)
+                VALUES($operation,$account,1,0,'destination',$destinationSort);
+                INSERT INTO WebAutomationTransferMappings(
+                  OperationId,AccountId,Generation,ItemOrdinal,SourceRemoteItemId,SourceCanonicalSortKey,
+                  DestinationRemoteItemId,DestinationCanonicalSortKey)
+                VALUES($operation,$account,1,0,'source',$sourceSort,'destination',$destinationSort);
+                """, ("$operation", operationId), ("$account", accountId),
+                ("$sourceSort", RemoteItemIdentitySet.GetCanonicalSortKey("source")),
+                ("$destinationSort", RemoteItemIdentitySet.GetCanonicalSortKey("destination")));
+            Assert.True((await new DatabaseSchemaValidator().ValidateAsync(connection, 18)).IsValid);
+        }
+        var factory = new SqliteConnectionFactory(path);
+        var migrator = new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "v19-backups")), "new");
+
+        Assert.Equal(DatabaseMigrator.LatestVersion, await migrator.MigrateAsync());
+        Assert.Equal(DatabaseMigrator.LatestVersion, await migrator.MigrateAsync());
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM SchemaVersions WHERE Version=19;"));
+        Assert.Subset(new HashSet<string>(await ColumnsAsync(upgraded, "WebAutomationAttempts")),
+            new HashSet<string>
+            {
+                "SubmissionId", "SubmissionReadinessFingerprint", "OfficialObservationFingerprint",
+                "TargetConfirmationFingerprint", "TargetConfirmedAt",
+            });
+        Assert.Equal(new string('a', 64), await ScalarAsync<string>(upgraded, """
+            SELECT OfficialObservationFingerprint FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND AccountId=$account AND Generation=1;
+            """, ("$operation", operationId), ("$account", accountId)));
+        Assert.Equal(1L, await ScalarAsync<long>(upgraded, """
+            SELECT COUNT(*) FROM WebAutomationAttempts
+            WHERE OperationId=$operation AND SubmissionId IS NULL
+              AND SubmissionReadinessFingerprint IS NULL
+              AND TargetConfirmationFingerprint IS NULL AND TargetConfirmedAt IS NULL;
+            """, ("$operation", operationId)));
+        await upgraded.CloseAsync();
+        var store = new SqliteWebAutomationAttemptStore(factory);
+        Assert.True(await store.TryAdvanceAsync(
+            Guid.Parse(operationId), Guid.Parse(accountId), 1,
+            WebAutomationAttemptState.ResultPending, 4,
+            WebAutomationAttemptState.Succeeded, new string('d', 64), false,
+            new DateTimeOffset(2026, 8, 30, 0, 0, 5, TimeSpan.Zero)));
+        var reopened = await new SqliteWebAutomationAttemptStore(factory)
+            .GetAsync(Guid.Parse(operationId), Guid.Parse(accountId), 1);
+        Assert.Equal(WebAutomationAttemptState.Succeeded, reopened!.State);
+    }
 
     [Fact]
     public async Task VersionSeventeenUpgradeAddsOnlyDirectorySelectionAndPreservesLegacyAccounts()
@@ -32,10 +317,11 @@ public sealed class MigrationTests : IDisposable
         }
         var factory = new SqliteConnectionFactory(path);
         var migrator = new DatabaseMigrator(factory, new DatabaseBackupService(factory, Path.Combine(root, "v18-backups")), "new");
-        Assert.Equal(18, await migrator.MigrateAsync());
-        Assert.Equal(18, await migrator.MigrateAsync());
+        Assert.Equal(DatabaseMigrator.LatestVersion, await migrator.MigrateAsync());
+        Assert.Equal(DatabaseMigrator.LatestVersion, await migrator.MigrateAsync());
         await using var upgraded = await factory.OpenConnectionAsync();
-        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, 18)).IsValid);
+        Assert.True((await new DatabaseSchemaValidator().ValidateAsync(
+            upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(1L, await ScalarAsync<long>(upgraded, "SELECT COUNT(*) FROM SchemaVersions WHERE Version=18;"));
         Assert.Equal(1L, await ScalarAsync<long>(upgraded,
             "SELECT COUNT(*) FROM BrowserDirectorySelection WHERE Singleton=1 AND Revision=0 AND Directory IS NULL AND IntentKind IS NULL;"));
@@ -316,6 +602,48 @@ public sealed class MigrationTests : IDisposable
             ("$operation", ids.TransferWaiting.ToString("D")));
         Assert.Equal(ids.AccountTwo.ToString("D"), await ScalarAsync<string>(upgraded,
             "SELECT AssignedAccountId FROM TransferOperations WHERE Id=$operation;",
+            ("$operation", ids.TransferWaiting.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task VersionFifteenUpgradeDiscardsSupersededPreparingTransferAttemptsWithoutEvidence()
+    {
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "v15-superseded-preparing-attempts.db");
+        var ids = new VersionFifteenSnapshotFixtureIds(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            Guid.NewGuid());
+        await using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
+        {
+            await connection.OpenAsync();
+            for (var version = 1; version <= 15; version++)
+            {
+                await ExecuteAsync(connection, DatabaseMigrator.ReadMigrationSql(version));
+                await ExecuteAsync(connection,
+                    "INSERT INTO SchemaVersions(Version,AppliedAt,AppVersion) VALUES($version,'2026-01-01','old');",
+                    ("$version", version));
+            }
+            await SeedVersionFifteenSnapshotFixtureAsync(connection, ids);
+            await ExecuteAsync(connection, """
+                UPDATE TransferOperations SET AttemptCount=5 WHERE Id=$operation;
+                INSERT INTO WebAutomationAttempts(
+                  OperationId,AccountId,Generation,OwnerKind,State,Revision,CreatedAt,UpdatedAt)
+                VALUES($operation,$account,4,'Transfer','Preparing',0,'2026-08-01','2026-08-01');
+                """, ("$operation", ids.TransferWaiting.ToString("D")),
+                ("$account", ids.AccountOne.ToString("D")));
+        }
+
+        var factory = new SqliteConnectionFactory(path);
+        await new DatabaseMigrator(
+            factory, new DatabaseBackupService(factory, Path.Combine(root, "superseded-backups")), "new")
+            .MigrateAsync();
+
+        await using var upgraded = await factory.OpenConnectionAsync();
+        Assert.Equal((long)DatabaseMigrator.LatestVersion, await ScalarAsync<long>(upgraded,
+            "SELECT MAX(Version) FROM SchemaVersions;"));
+        Assert.Equal(0L, await ScalarAsync<long>(upgraded,
+            "SELECT COUNT(*) FROM WebAutomationAttempts WHERE OperationId=$operation;",
             ("$operation", ids.TransferWaiting.ToString("D"))));
     }
 
@@ -1596,7 +1924,7 @@ public sealed class MigrationTests : IDisposable
 
         await new DatabaseMigrator(factory, backup, "new").MigrateAsync();
 
-        Assert.Equal(18, DatabaseMigrator.LatestVersion);
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
         await using var upgraded = await factory.OpenConnectionAsync();
         Assert.True((await new DatabaseSchemaValidator().ValidateAsync(upgraded, DatabaseMigrator.LatestVersion)).IsValid);
         Assert.Equal(before, await ReadOperationAsync(factory, operationId));
@@ -1645,7 +1973,7 @@ public sealed class MigrationTests : IDisposable
         var migrator = new DatabaseMigrator(factory, backup, "new");
         await Assert.ThrowsAsync<InvalidDataException>(() => migrator.ApplyMigrationAsync(8, default));
 
-        Assert.Equal(18, DatabaseMigrator.LatestVersion);
+        Assert.Equal(23, DatabaseMigrator.LatestVersion);
         await using var live = await factory.OpenConnectionAsync();
         Assert.Equal(7L, await ScalarAsync<long>(live, "SELECT MAX(Version) FROM SchemaVersions;"));
         Assert.Equal(new[] { "BadColumn" }, await ColumnsAsync(live, "BatchShareSettings"));

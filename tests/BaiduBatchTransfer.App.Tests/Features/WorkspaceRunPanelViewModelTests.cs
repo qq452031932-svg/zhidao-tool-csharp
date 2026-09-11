@@ -2,11 +2,380 @@ using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Scheduling;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
 public sealed class WorkspaceRunPanelViewModelTests
 {
+    [Fact]
+    public async Task LicenseFailureStopsManualResumeBeforeDurableStateChanges()
+    {
+        var store = new FakeRunControlStore();
+        var gate = new RecordingLicenseGate(false);
+        using var vm = Create(CreateResults(new FakeResultsWorkflow()), store, gate);
+        vm.PresentBatch(Guid.NewGuid(), batchStatus: "Paused");
+
+        await vm.ResumeAsync();
+
+        Assert.Equal([LicenseOperationKind.Transfer], gate.Operations);
+        Assert.Empty(store.ResumedBatches);
+        Assert.Equal("软件尚未激活，联网功能暂不可用。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task LicenseFailureStopsManualRetryBeforeDurableStateChanges()
+    {
+        var workflow = new FakeResultsWorkflow { Page = new([Row("Failed", "失败")], 1, null) };
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var gate = new RecordingLicenseGate(false);
+        using var vm = Create(results, store, gate);
+        await vm.ActivateBatchAsync(Guid.NewGuid());
+        results.SelectedItem = Assert.Single(results.Items);
+
+        await vm.RetryFailedTransferAsync();
+
+        Assert.Equal([LicenseOperationKind.Transfer], gate.Operations);
+        Assert.Empty(store.RetriedOperations);
+        Assert.Equal("软件尚未激活，联网功能暂不可用。", vm.StatusMessage);
+    }
+
+    [Theory]
+    [InlineData("Completed", false)]
+    [InlineData("CompletedWithShortfall", false)]
+    [InlineData("Cancelled", false)]
+    [InlineData("Completed", true)]
+    public async Task TerminalTransitionNotifiesOnceAfterSnapshotEvenWhenStatisticsFail(string status, bool failStatistics)
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(batch, "运行批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var notifications = new List<WorkspaceBatchTerminalEvent>();
+        var progressStatuses = new List<string>();
+        var notified = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage) &&
+                results.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                progressStatuses.Add(results.StatusMessage);
+        };
+        vm.BatchTerminal += (_, value) =>
+        {
+            Assert.Equal(status, vm.SelectedBatch?.BatchStatus);
+            Assert.False(results.IsBusy);
+            if (!failStatistics)
+                Assert.Equal("进度 5/5：成功 3，失败 2，剩余 0。", results.StatusMessage);
+            notifications.Add(value);
+            notified.TrySetResult();
+        };
+        await vm.InitializeAsync();
+        workflow.FailSummary = failStatistics;
+        workflow.BeforeSummary = () => Assert.Equal(status, vm.SelectedBatch?.BatchStatus);
+        history.Current = history.Current with { BatchStatus = status };
+        delay.Release();
+        await notified.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var terminal = Assert.Single(notifications);
+        Assert.Equal(batch, terminal.BatchJobId);
+        Assert.Equal(failStatistics ? null : (long?)3L, terminal.CompleteSuccessCount);
+        Assert.Equal(failStatistics ? null : (long?)2L, terminal.TerminalProblemCount);
+        Assert.Equal(failStatistics ? 1 : 2, workflow.PageLoadCount);
+        Assert.Equal(failStatistics ? 0 : 1, progressStatuses.Count);
+        workflow.FailSummary = false;
+        await results.RefreshAsync();
+        await vm.InitializeAsync();
+        vm.SelectedBatch = vm.SelectedBatch! with { BatchStatus = "Active" };
+        Assert.Single(notifications);
+    }
+
+    [Theory]
+    [InlineData("Completed")]
+    [InlineData("CompletedWithShortfall")]
+    [InlineData("Cancelled")]
+    [InlineData("Paused")]
+    [InlineData("AwaitingCandidates")]
+    [InlineData("PausedReady")]
+    public async Task HistoricalTerminalAndNonterminalIdleStatesDoNotNotify(string status)
+    {
+        var results = CreateResults(new FakeResultsWorkflow());
+        var store = new FakeRunControlStore();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: new FakeHistorySource([new(Guid.NewGuid(), "历史批次", status)]));
+        var notifications = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, value) => notifications.Add(value);
+        await vm.InitializeAsync();
+        await vm.LoadSelectedBatchAsync();
+        Assert.Empty(notifications);
+    }
+
+    [Fact]
+    public async Task LifecycleRefreshReportsStatisticsFailureWithoutThrowing()
+    {
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        await results.InitializeAsync(Guid.NewGuid());
+        Assert.True(await results.RefreshForLifecycleAsync());
+        Assert.Equal(3L, results.CompleteSuccessCount);
+        Assert.Equal(2L, results.TerminalProblemCount);
+        workflow.FailSummary = true;
+        Assert.False(await results.RefreshForLifecycleAsync());
+        Assert.False(results.IsBusy);
+    }
+
+    [Fact]
+    public async Task FinalizedBatchSuppressesLaterManualProgressAndRecoveryStatuses()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(batch, "运行批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        vm.BatchTerminal += (_, _) => terminal.TrySetResult();
+        await vm.InitializeAsync();
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var terminalStatus = results.StatusMessage;
+        var pageLoadsAtTerminal = workflow.PageLoadCount;
+        var statusChanges = 0;
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage)) statusChanges++;
+        };
+
+        workflow.FailSummary = true;
+        Assert.False(await results.RefreshForLifecycleAsync());
+        workflow.FailSummary = false;
+        Assert.False(await results.RefreshForLifecycleAsync());
+
+        Assert.Equal(terminalStatus, results.StatusMessage);
+        Assert.Equal(0, statusChanges);
+        Assert.Equal(pageLoadsAtTerminal, workflow.PageLoadCount);
+    }
+
+    [Fact]
+    public async Task TerminalTransitionWaitsForInFlightManualRefreshThenAppliesFinalSnapshot()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new SerializingResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(batch, "运行批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var ordering = new List<string>();
+        var terminal = new TaskCompletionSource<WorkspaceBatchTerminalEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage) &&
+                results.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                ordering.Add(results.StatusMessage);
+        };
+        vm.BatchTerminal += (_, value) =>
+        {
+            ordering.Add("terminal");
+            terminal.TrySetResult(value);
+        };
+        await vm.InitializeAsync();
+
+        var manualRefresh = results.RefreshForLifecycleAsync();
+        await workflow.ManualRefreshStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await history.SecondRead.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Yield();
+        var terminalOvertookManualRefresh = terminal.Task.IsCompleted;
+
+        workflow.ReleaseManualRefresh();
+        Assert.True(await manualRefresh.WaitAsync(TimeSpan.FromSeconds(2)));
+        var terminalEvent = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(terminalOvertookManualRefresh);
+        Assert.Equal(3, workflow.PageLoadCount);
+        Assert.Equal(4, results.CompleteSuccessCount);
+        Assert.Equal(1, results.TerminalProblemCount);
+        Assert.Equal(4, terminalEvent.CompleteSuccessCount);
+        Assert.Equal(1, terminalEvent.TerminalProblemCount);
+        Assert.Equal([
+            "进度 3/5：成功 2，失败 1，剩余 2。",
+            "进度 5/5：成功 4，失败 1，剩余 0。",
+            "terminal",
+        ], ordering);
+    }
+
+    [Fact]
+    public async Task PresentedBatchReachingTerminalBeforeResultLoadIsLoadedFinalizedAndNotified()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(batch, "新批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var ordering = new List<string>();
+        var terminal = new TaskCompletionSource<WorkspaceBatchTerminalEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage) &&
+                results.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                ordering.Add(results.StatusMessage);
+        };
+        vm.BatchTerminal += (_, value) =>
+        {
+            ordering.Add("terminal");
+            terminal.TrySetResult(value);
+        };
+
+        vm.PresentBatch(batch, "新批次", "Active");
+        Assert.Equal(Guid.Empty, results.BatchJobId);
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        var terminalEvent = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Yield();
+
+        Assert.Equal(batch, results.BatchJobId);
+        Assert.Equal(3, results.CompleteSuccessCount);
+        Assert.Equal(2, results.TerminalProblemCount);
+        Assert.Equal(3, terminalEvent.CompleteSuccessCount);
+        Assert.Equal(2, terminalEvent.TerminalProblemCount);
+        Assert.Equal([
+            "进度 5/5：成功 3，失败 2，剩余 0。",
+            "terminal",
+        ], ordering);
+        Assert.False(await results.RefreshForLifecycleAsync());
+        Assert.Equal("terminal", ordering[^1]);
+    }
+
+    [Fact]
+    public async Task PresentedBatchTerminalLoadCannotOverwriteNewSelectionAfterAwait()
+    {
+        var terminalBatch = Guid.NewGuid();
+        var retainedBatch = Guid.NewGuid();
+        var workflow = new NonCooperativeTerminalLoadWorkflow(terminalBatch, retainedBatch);
+        var results = CreateResults(workflow);
+        await results.InitializeAsync(retainedBatch);
+        var retainedStatus = results.StatusMessage;
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(terminalBatch, "结束中的批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var terminalNotifications = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, value) => terminalNotifications.Add(value);
+
+        vm.PresentBatch(terminalBatch, "结束中的批次", "Active");
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await workflow.TerminalLoadStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var refreshFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.IsBusy) && !results.IsBusy)
+                refreshFinished.TrySetResult();
+        };
+        vm.PresentBatch(retainedBatch, "仍在查看的批次", "Paused");
+        workflow.ReleaseTerminalLoad();
+        await refreshFinished.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(retainedBatch, vm.SelectedBatch?.BatchJobId);
+        Assert.Equal(retainedBatch, results.BatchJobId);
+        Assert.Equal(retainedStatus, results.StatusMessage);
+        Assert.Empty(terminalNotifications);
+    }
+
+    [Fact]
+    public async Task InFlightUnloadedTerminalFinalizationRejectsSelectedBatchReload()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new NonCooperativeTerminalLoadWorkflow(batch, Guid.NewGuid());
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(batch, "即将结束的批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var ordering = new List<string>();
+        var terminal = new TaskCompletionSource<WorkspaceBatchTerminalEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage) &&
+                results.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                ordering.Add(results.StatusMessage);
+        };
+        vm.BatchTerminal += (_, value) =>
+        {
+            ordering.Add("terminal");
+            terminal.TrySetResult(value);
+        };
+
+        vm.PresentBatch(batch, "即将结束的批次", "Active");
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await workflow.TerminalLoadStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var commandEnabledDuringFinalization = vm.LoadSelectedBatchCommand.CanExecute(null);
+        var selectedBatchLoad = vm.LoadSelectedBatchAsync();
+        await Task.Yield();
+        var terminalLoadsBeforeRelease = workflow.TerminalSummaryLoadCount;
+
+        workflow.ReleaseTerminalLoad();
+        await selectedBatchLoad.WaitAsync(TimeSpan.FromSeconds(2));
+        var terminalEvent = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(commandEnabledDuringFinalization);
+        Assert.Equal(1, terminalLoadsBeforeRelease);
+        Assert.Equal(4, terminalEvent.CompleteSuccessCount);
+        Assert.Equal(1, terminalEvent.TerminalProblemCount);
+        Assert.Equal([
+            "进度 5/5：成功 4，失败 1，剩余 0。",
+            "terminal",
+        ], ordering);
+        Assert.False(await results.RefreshForLifecycleAsync());
+        Assert.Equal("terminal", ordering[^1]);
+    }
+
+    [Fact]
+    public async Task DisposeDuringTerminalStatisticsReadPreventsLateNotification()
+    {
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(new(Guid.NewGuid(), "批次", "Active"));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(results, new(store), new(store), new(store),
+            historySource: history, automaticRefreshDelay: delay);
+        var notifications = new List<WorkspaceBatchTerminalEvent>();
+        vm.BatchTerminal += (_, value) => notifications.Add(value);
+        await vm.InitializeAsync();
+        var summaryRelease = new TaskCompletionSource<JobResultsSummary>(TaskCreationOptions.RunContinuationsAsynchronously);
+        workflow.SummaryOverride = summaryRelease.Task;
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await workflow.SecondPageLoad.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("Completed", vm.SelectedBatch?.BatchStatus);
+        var refreshFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(results.IsBusy) && !results.IsBusy) refreshFinished.TrySetResult();
+        };
+        vm.Dispose();
+        summaryRelease.SetResult(new(5, 5, 1, 0, 3, 2));
+        await refreshFinished.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Empty(notifications);
+    }
+
     [Fact]
     public async Task CreatedAndRestoredBatchesRemainSelectable()
     {
@@ -157,12 +526,55 @@ public sealed class WorkspaceRunPanelViewModelTests
         Assert.True(vm.CanUseBatchActions);
     }
 
-    private static WorkspaceRunPanelViewModel Create(JobResultsViewModel results, IBatchRunControlStore store) =>
+    [Fact]
+    public async Task ActiveBatchRefreshesUntilHistoryReportsTerminalStatus()
+    {
+        var batch = Guid.NewGuid();
+        var workflow = new FakeResultsWorkflow();
+        var results = CreateResults(workflow);
+        var store = new FakeRunControlStore();
+        var history = new MutableHistorySource(
+            new WorkspaceBatchItem(batch, "运行批次", "Active", DateTimeOffset.UtcNow));
+        var delay = new ControlledDelay();
+        using var vm = new WorkspaceRunPanelViewModel(
+            results,
+            new PauseBatchService(store),
+            new ResumeBatchService(store),
+            new RetryFailedTransferService(store),
+            historySource: history,
+            automaticRefreshDelay: delay,
+            automaticRefreshInterval: TimeSpan.FromSeconds(1));
+        var progressStatuses = new List<string>();
+        var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        results.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(results.StatusMessage) &&
+                results.StatusMessage.StartsWith("进度 ", StringComparison.Ordinal))
+                progressStatuses.Add(results.StatusMessage);
+        };
+        vm.BatchTerminal += (_, _) => terminal.TrySetResult();
+
+        await vm.InitializeAsync();
+        history.Current = history.Current with { BatchStatus = "Completed" };
+        delay.Release();
+        await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Yield();
+
+        Assert.Equal("Completed", vm.SelectedBatch?.BatchStatus);
+        Assert.Equal(2, workflow.PageLoadCount);
+        Assert.Equal(["进度 5/5：成功 3，失败 2，剩余 0。"], progressStatuses);
+    }
+
+    private static WorkspaceRunPanelViewModel Create(
+        JobResultsViewModel results,
+        IBatchRunControlStore store,
+        ILicenseAuthorizationGate? licenseGate = null) =>
         new(
             results,
             new PauseBatchService(store),
             new ResumeBatchService(store),
-            new RetryFailedTransferService(store));
+            new RetryFailedTransferService(store),
+            licenseGate: licenseGate);
 
     private static JobResultsViewModel CreateResults(IJobResultsWorkflow workflow) =>
         new(workflow, new FakeResultSaveDialog(), new AvailableCapabilities());
@@ -176,8 +588,85 @@ public sealed class WorkspaceRunPanelViewModelTests
     private sealed class FakeResultsWorkflow : IJobResultsWorkflow
     {
         public JobResultsPage Page { get; init; } = new([], 0, null);
-        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default) => Task.FromResult(new JobResultsSummary(Page.TotalCount, Page.TotalCount, 0, 0));
-        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) => Task.FromResult(Page);
+        public int PageLoadCount { get; private set; }
+        public TaskCompletionSource SecondPageLoad { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool FailSummary { get; set; }
+        public Task<JobResultsSummary>? SummaryOverride { get; set; }
+        public Action? BeforeSummary { get; set; }
+        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            BeforeSummary?.Invoke();
+            if (FailSummary) throw new IOException("private failure detail");
+            if (SummaryOverride is { } pending) return pending;
+            return Task.FromResult(new JobResultsSummary(5, 5, 1, 0, 3, 2));
+        }
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default)
+        {
+            PageLoadCount++;
+            if (PageLoadCount >= 2) SecondPageLoad.TrySetResult();
+            return Task.FromResult(Page);
+        }
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class SerializingResultsWorkflow : IJobResultsWorkflow
+    {
+        private readonly TaskCompletionSource<JobResultsSummary> manualSummary = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int summaryLoadCount;
+        public int PageLoadCount { get; private set; }
+        public TaskCompletionSource ManualRefreshStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public void ReleaseManualRefresh() => manualSummary.TrySetResult(new(5, 5, 1, 0, 2, 1));
+        public Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            var call = Interlocked.Increment(ref summaryLoadCount);
+            if (call == 2)
+            {
+                ManualRefreshStarted.TrySetResult();
+                return manualSummary.Task;
+            }
+            return Task.FromResult(call == 1
+                ? new JobResultsSummary(5, 5, 0, 0, 0, 0)
+                : new JobResultsSummary(5, 5, 1, 0, 4, 1));
+        }
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default)
+        {
+            PageLoadCount++;
+            return Task.FromResult(new JobResultsPage([], 5, null));
+        }
+        public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeTransferAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<JobResultActionOutcome> ResumeShareAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<long> ExportAsync(Guid batchJobId, string destinationDirectory, IProgress<long> progress, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class NonCooperativeTerminalLoadWorkflow(Guid terminalBatch, Guid retainedBatch) : IJobResultsWorkflow
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int terminalSummaryLoadCount;
+        public TaskCompletionSource TerminalLoadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int TerminalSummaryLoadCount => terminalSummaryLoadCount;
+        public void ReleaseTerminalLoad() => release.TrySetResult();
+        public async Task<JobResultsSummary> LoadSummaryAsync(Guid batchJobId, CancellationToken cancellationToken = default)
+        {
+            if (batchJobId == terminalBatch)
+            {
+                Interlocked.Increment(ref terminalSummaryLoadCount);
+                TerminalLoadStarted.TrySetResult();
+                await release.Task;
+                return new(5, 5, 1, 0, 4, 1);
+            }
+            Assert.Equal(retainedBatch, batchJobId);
+            return new(2, 2, 0, 0, 1, 0);
+        }
+        public Task<JobResultsPage> LoadPageAsync(Guid batchJobId, long? afterCursor, int pageSize, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new JobResultsPage([], batchJobId == terminalBatch ? 5 : 2, null));
         public Task<JobResultActionOutcome> RetryShareOnlyAsync(JobResultRow row, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileTransferAsync(Guid transferOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<JobResultActionOutcome> ReconcileShareAsync(Guid shareOperationId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -193,6 +682,29 @@ public sealed class WorkspaceRunPanelViewModelTests
             int limit,
             CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<WorkspaceBatchItem>>(items.Take(limit).ToArray());
+    }
+
+    private sealed class MutableHistorySource(WorkspaceBatchItem current) : IWorkspaceBatchHistorySource
+    {
+        public WorkspaceBatchItem Current { get; set; } = current;
+        public TaskCompletionSource SecondRead { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int readCount;
+
+        public Task<IReadOnlyList<WorkspaceBatchItem>> LoadRecentAsync(
+            int limit,
+            CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref readCount) >= 2) SecondRead.TrySetResult();
+            return Task.FromResult<IReadOnlyList<WorkspaceBatchItem>>([Current]);
+        }
+    }
+
+    private sealed class ControlledDelay : IAsyncDelay
+    {
+        private readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) =>
+            release.Task.WaitAsync(cancellationToken);
+        public void Release() => release.TrySetResult();
     }
 
     private class FakeRunControlStore : IBatchRunControlStore
@@ -214,6 +726,23 @@ public sealed class WorkspaceRunPanelViewModelTests
         {
             RetriedOperations.Add(operationId);
             return Task.FromResult(RetryFailedTransferDisposition.Requeued);
+        }
+    }
+
+    private sealed class RecordingLicenseGate(bool isAuthorized) : ILicenseAuthorizationGate
+    {
+        public List<LicenseOperationKind> Operations { get; } = [];
+
+        public Task<LicenseGateResult> AuthorizeAsync(
+            LicenseOperationKind operation,
+            CancellationToken cancellationToken)
+        {
+            Operations.Add(operation);
+            return Task.FromResult(new LicenseGateResult(
+                operation,
+                isAuthorized,
+                UsedCachedLease: false,
+                isAuthorized ? LicenseCodes.Ok : "activation_required"));
         }
     }
 

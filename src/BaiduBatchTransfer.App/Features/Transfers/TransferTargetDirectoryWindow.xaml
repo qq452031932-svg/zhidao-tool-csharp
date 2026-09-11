@@ -1,0 +1,59 @@
+<Window x:Class="BaiduBatchTransfer.App.Features.Transfers.TransferTargetDirectoryWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="选择百度网盘目录"
+        Width="560" Height="520" MinWidth="440" MinHeight="360"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" Margin="0,0,0,10">
+            <Button DockPanel.Dock="Left" Content="上一级"
+                    Command="{Binding GoToParentCommand}"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Padding="10,5" Margin="0,0,10,0" />
+            <Button DockPanel.Dock="Left" Content="新建文件夹"
+                    Click="CreateFolder_Click" IsEnabled="{Binding CanCreateFolder}"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Padding="10,5" Margin="0,0,10,0" />
+            <Border Padding="10,6" BorderBrush="{StaticResource PanelBorderBrush}"
+                    BorderThickness="1" CornerRadius="4">
+                <TextBlock Text="{Binding CurrentPath}" TextTrimming="CharacterEllipsis"
+                           ToolTip="{Binding CurrentPath}" VerticalAlignment="Center" />
+            </Border>
+        </DockPanel>
+
+        <ProgressBar Grid.Row="1" Height="3" Margin="0,0,0,8"
+                     IsIndeterminate="True" Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}" />
+        <ProgressBar Grid.Row="1" Height="3" Margin="0,0,0,8"
+                     IsIndeterminate="True" Visibility="{Binding IsCreating, Converter={StaticResource BooleanToVisibilityConverter}}" />
+
+        <ListBox Grid.Row="2" ItemsSource="{Binding Directories}"
+                 IsEnabled="{Binding CanBrowse}"
+                 SelectedItem="{Binding SelectedDirectory, Mode=TwoWay}"
+                 DisplayMemberPath="DisplayName"
+                 MouseDoubleClick="DirectoryList_MouseDoubleClick"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                 AutomationProperties.Name="百度网盘文件夹" />
+
+        <TextBlock Grid.Row="3" Margin="0,10,0,0" MinHeight="20"
+                   Text="{Binding ErrorMessage}" Foreground="#C53030"
+                   TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+
+        <StackPanel Grid.Row="4" Margin="0,14,0,0" Orientation="Horizontal"
+                    HorizontalAlignment="Right">
+            <Button Content="进入所选目录" Command="{Binding EnterSelectedDirectoryCommand}"
+                    Style="{StaticResource SecondaryButtonStyle}" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="取消" Command="{Binding CancelCommand}" IsCancel="True"
+                    Style="{StaticResource SecondaryButtonStyle}" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="选择此目录" Command="{Binding SelectCurrentDirectoryCommand}" IsDefault="True"
+                    Style="{StaticResource PrimaryButton}" Padding="12,6" />
+        </StackPanel>
+    </Grid>
+</Window>

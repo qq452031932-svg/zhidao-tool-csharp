@@ -1,5 +1,6 @@
 using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.Core.Abstractions;
+using BaiduBatchTransfer.Core.Domain;
 using BaiduBatchTransfer.Infrastructure.Database;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
@@ -127,11 +128,13 @@ public sealed class WebAutomationBatchCancellationTests : IDisposable
                 INSERT INTO TransferOperations(Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,
                   NormalizedTargetPath,CreateFolderName,AssignedAccountId,AllocationSource,Status,AttemptCount,
                   OperationFingerprint,ConfirmationDescriptorJson,AdapterRequestId,SubmitState,TargetSlotState,
-                  SubmitStartedAt,CreatedAt,UpdatedAt)
+                  SubmitStartedAt,CreatedAt,UpdatedAt,ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
                 VALUES($operation,$resource,$batch,1,1,'/','/','',$account,'Automatic','Submitting',2,
-                  'transfer-fp','{}','request-evidence','Submitting','Reserved',$now,$now,$now);
+                  'transfer-fp','{}','request-evidence','Submitting','Reserved',$now,$now,$now,
+                  'WebView2-v1','LegacyWebView2',$legacyProfile,NULL,NULL);
                 """;
             command.Parameters.AddWithValue("$account", identity.AccountId.ToString("D"));
+            command.Parameters.AddWithValue("$legacyProfile", ExecutionProfileSnapshot.LegacyForAccount(identity.AccountId).ProfileId);
             command.Parameters.AddWithValue("$batch", identity.BatchId.ToString("D"));
             command.Parameters.AddWithValue("$resource", resourceId.ToString("D"));
             command.Parameters.AddWithValue("$operation", identity.OperationId.ToString("D"));

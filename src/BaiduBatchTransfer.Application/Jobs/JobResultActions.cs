@@ -64,6 +64,12 @@ public sealed class UnavailableJobResultActionCapability : IJobResultActionCapab
     public bool CanUseShareActions => false;
 }
 
+public sealed class DirectBackgroundJobResultActionCapability : IJobResultActionCapability
+{
+    public bool CanUseTransferActions => true;
+    public bool CanUseShareActions => true;
+}
+
 public interface IJobResultActions
 {
     Task<JobResultActionResult> RetryShareOnlyAsync(Guid shareOperationId, int expectedGeneration, DateTimeOffset expectedUpdatedAt, CancellationToken cancellationToken = default);

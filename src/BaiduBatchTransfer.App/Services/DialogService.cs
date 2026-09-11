@@ -18,6 +18,26 @@ public interface IUiDispatcher
     Task<T> InvokeAsync<T>(Func<T> action, CancellationToken cancellationToken = default);
 }
 
+public interface ITextClipboard
+{
+    Task SetTextAsync(string text, CancellationToken cancellationToken = default);
+}
+
+public sealed class WpfTextClipboard(IUiDispatcher dispatcher) : ITextClipboard
+{
+    public async Task SetTextAsync(string text, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        await dispatcher.InvokeAsync(
+            () =>
+            {
+                Clipboard.SetText(text);
+                return true;
+            },
+            cancellationToken).ConfigureAwait(true);
+    }
+}
+
 public sealed class WpfUiDispatcher : IUiDispatcher
 {
     public Task<T> InvokeAsync<T>(Func<T> action, CancellationToken cancellationToken = default)
@@ -122,4 +142,11 @@ internal sealed class TemporaryAcceptanceAdapterAvailability(
     public string StatusMessage => CanStartTransfers
         ? "百度转存现场验收模式已启用，每项实际操作仍需单独确认。"
         : "百度转存功能尚不可用，当前版本不能开始任务。";
+}
+
+internal sealed class DirectBackgroundAdapterAvailability : IAdapterAvailability
+{
+    public bool CanStartTransfers => true;
+    public bool RequiresBulkPrecheckBeforeStart => false;
+    public string StatusMessage => "后台转存和自动分享已就绪。";
 }

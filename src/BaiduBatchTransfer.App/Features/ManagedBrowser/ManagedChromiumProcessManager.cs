@@ -130,6 +130,11 @@ internal sealed class ChromiumTargetTransport : IChromiumTargetTransport
 }
 
 public enum ManagedChromiumLaunchStatus { Ready, WaitingForPage }
+public enum ManagedChromiumLaunchStage
+{
+    Entered, ProfilePinned, ExecutablePinned, ProcessLaunched, RootVerified,
+    PortRead, TargetBound
+}
 public sealed record ManagedChromiumLaunchResult(ManagedChromiumLaunchStatus Status, ManagedChromiumSessionHandle? Session);
 
 public sealed class ManagedChromiumSessionHandle
@@ -146,7 +151,7 @@ public sealed class ManagedChromiumSessionHandle
     public override string ToString() => "ManagedChromiumSessionHandle { Identity = [REDACTED] }";
 }
 
-public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposable
+public sealed partial class ManagedChromiumProcessManager : IAsyncDisposable, IDisposable
 {
     private readonly Func<BrowserInstallationIdentity, CancellationToken, Task<IBrowserExecutableLaunchLease>> pinExecutable;
     private readonly Func<ManagedBrowserProfileDescriptor, CancellationToken, Task<IManagedBrowserProfileLease>> pinProfile;
@@ -182,12 +187,14 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
             new WindowsJobObject(), new WindowsTcpOwnerTable(), new ChromiumTargetProbe()) { }
 
     public async Task<ManagedChromiumLaunchResult> LaunchAsync(BrowserInstallationIdentity installation,
-        ManagedBrowserProfileDescriptor profile, CancellationToken cancellationToken = default)
+        ManagedBrowserProfileDescriptor profile, CancellationToken cancellationToken = default,
+        Action<ManagedChromiumLaunchStage>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(installation);
         ArgumentNullException.ThrowIfNull(profile);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stopping.Token);
         var token = linked.Token;
+        progress?.Invoke(ManagedChromiumLaunchStage.Entered);
         await serial.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -201,7 +208,10 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                 if (entry.Process.IsAlive)
                 {
                     await ReadPortAsync(entry, token).ConfigureAwait(false);
-                    return await BindAsync(entry, token).ConfigureAwait(false);
+                    progress?.Invoke(ManagedChromiumLaunchStage.PortRead);
+                    var rebound = await BindAsync(entry, token).ConfigureAwait(false);
+                    progress?.Invoke(ManagedChromiumLaunchStage.TargetBound);
+                    return rebound;
                 }
                 if (!Remove(entry)) throw new IOException("The previous owned browser job has not fully exited.");
                 entry = null; // New pins are not owned by the removed browser, even if acquisition is cancelled.
@@ -213,13 +223,16 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
             try
             {
                 profileLease = await pinProfile(profile, token).ConfigureAwait(false);
+                progress?.Invoke(ManagedChromiumLaunchStage.ProfilePinned);
                 executable = await pinExecutable(installation, token).ConfigureAwait(false);
+                progress?.Invoke(ManagedChromiumLaunchStage.ExecutablePinned);
                 if (!SameProfile(profile, profileLease.Profile) || !SameInstallation(installation, executable.Identity) ||
                     !profileLease.Validate() || !executable.Validate()) throw new IOException("The launch identity changed.");
                 token.ThrowIfCancellationRequested();
                 var launchFailed = false;
                 try { process = processes.Launch(executable, profileLease); }
                 catch (OwnedChromiumLaunchException failure) { process = failure.Process; launchFailed = true; }
+                progress?.Invoke(ManagedChromiumLaunchStage.ProcessLaunched);
                 entry = new OwnedBrowser(executable, profileLease, process);
                 executable = null; profileLease = null; process = null; // Exactly one owner, including a late shutdown race.
                 lock (gate)
@@ -229,8 +242,12 @@ public sealed class ManagedChromiumProcessManager : IAsyncDisposable, IDisposabl
                 }
                 if (launchFailed) throw new IOException("Browser launch failed; its owned job remains tracked until confirmed exit.");
                 RequireRoot(entry);
+                progress?.Invoke(ManagedChromiumLaunchStage.RootVerified);
                 await ReadPortAsync(entry, token).ConfigureAwait(false);
-                return await BindAsync(entry, token).ConfigureAwait(false);
+                progress?.Invoke(ManagedChromiumLaunchStage.PortRead);
+                var bound = await BindAsync(entry, token).ConfigureAwait(false);
+                progress?.Invoke(ManagedChromiumLaunchStage.TargetBound);
+                return bound;
             }
             catch (OperationCanceledException) when (entry is not null && !stopping.IsCancellationRequested)
             {

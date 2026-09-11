@@ -4,7 +4,7 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.Application.Tests.Scheduling;
 
-public sealed class ShareOperationExecutorTests
+public sealed partial class ShareOperationExecutorTests
 {
     private static readonly DateTimeOffset Now = new(2026, 8, 21, 4, 0, 0, TimeSpan.Zero);
     private static readonly Guid AccountId = Guid.Parse("10000000-0000-0000-0000-000000000001");
@@ -101,7 +101,7 @@ public sealed class ShareOperationExecutorTests
 
         Assert.Equal(ShareExecutionDisposition.ReusedExisting, outcome.Disposition);
         Assert.Empty(harness.Adapter.CreateRequests);
-        Assert.Equal(existing.ShareUrl, harness.Store.AcceptedResult?.ShareUrl);
+        Assert.Equal("https://pan.baidu.com/s/existing?pwd=r4Nd", harness.Store.AcceptedResult?.ShareUrl);
         Assert.Equal(existing.ExtractionCode, harness.Store.AcceptedResult?.ExtractionCode);
     }
 
@@ -116,6 +116,46 @@ public sealed class ShareOperationExecutorTests
         Assert.Equal(ShareExecutionDisposition.Succeeded, outcome.Disposition);
         Assert.Single(harness.Adapter.CreateRequests);
         Assert.Equal("new-share", harness.Store.AcceptedResult?.ShareId);
+        Assert.Equal("https://pan.baidu.com/s/new?pwd=r4Nd", harness.Store.AcceptedResult?.ShareUrl);
+        Assert.Equal("r4Nd", harness.Store.AcceptedResult?.ExtractionCode);
+    }
+
+    [Fact]
+    public async Task AcceptedReceiptWithConflictingUrlCodeBecomesPendingAfterSubmission()
+    {
+        var harness = Harness(RandomSettings());
+        harness.Adapter.SuccessShareUrl = "https://pan.baidu.com/s/new?pwd=x9Y8";
+
+        var outcome = await harness.Executor.ExecuteAsync(Lease(harness.Operation));
+
+        Assert.Equal(ShareExecutionDisposition.ResultPending, outcome.Disposition);
+        Assert.Equal("ResultPending", harness.Store.Status);
+        Assert.NotEqual("Submitting", harness.Store.Status);
+        Assert.True(harness.Store.ResultPending);
+        Assert.Null(harness.Store.AcceptedResult);
+        Assert.Single(harness.Adapter.CreateRequests);
+        Assert.DoesNotContain("x9Y8", outcome.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("r4Nd", outcome.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReusableShareWithConflictingUrlCodeFailsWithoutSubmissionOrSecretDiagnostic()
+    {
+        var harness = Harness(RandomSettings(), ExistingShareDecision.Reuse,
+            [Existing("existing", "https://pan.baidu.com/s/existing?pwd=x9Y8", "r4Nd", true, true)]);
+
+        var outcome = await harness.Executor.ExecuteAsync(Lease(harness.Operation));
+
+        Assert.Equal(ShareExecutionDisposition.Failed, outcome.Disposition);
+        Assert.Equal("Failed", harness.Store.Status);
+        Assert.NotEqual("Submitting", harness.Store.Status);
+        Assert.Equal("InvalidShareLink", harness.Store.ErrorCode);
+        Assert.Null(harness.Store.AcceptedResult);
+        Assert.Empty(harness.Adapter.CreateRequests);
+        var diagnostic = harness.Store.ErrorCode + harness.Store.SafeMessage + outcome;
+        Assert.DoesNotContain("x9Y8", diagnostic, StringComparison.Ordinal);
+        Assert.DoesNotContain("r4Nd", diagnostic, StringComparison.Ordinal);
+        Assert.DoesNotContain("https://", diagnostic, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -492,6 +532,9 @@ public sealed class ShareOperationExecutorTests
 
     private sealed class RecordingStore(ShareExecutionContext context) : IShareExecutionStore
     {
+        public string Status { get; private set; } = context.Operation.Status;
+        public string? ErrorCode { get; private set; }
+        public string? SafeMessage { get; private set; }
         public string? LastDescriptor { get; private set; }
         public BaiduShareResultRecord? AcceptedResult { get; private set; }
         public SharePauseReason? PauseReason { get; private set; }
@@ -503,8 +546,11 @@ public sealed class ShareOperationExecutorTests
         public Task<ShareExecutionContext?> LoadAsync(Guid operationId, CancellationToken cancellationToken = default) =>
             Task.FromResult<ShareExecutionContext?>(context);
 
-        public Task<bool> TryMarkPreparingAsync(Guid operationId, int generation, long leaseGeneration, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) =>
-            Task.FromResult(true);
+        public Task<bool> TryMarkPreparingAsync(Guid operationId, int generation, long leaseGeneration, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            Status = "Preparing";
+            return Task.FromResult(true);
+        }
 
         public Task AppendDiscoveryBaselinePageAsync(Guid operationId, long leaseGeneration, IEnumerable<ShareDiscoveryBaselineRecord> entries, CancellationToken cancellationToken = default) =>
             AddBaselineAsync(entries);
@@ -531,6 +577,7 @@ public sealed class ShareOperationExecutorTests
         public Task<bool> TryMarkSubmittingAsync(Guid operationId, int generation, long leaseGeneration, string descriptor, DateTimeOffset submittedAt, CancellationToken cancellationToken = default)
         {
             LastDescriptor = descriptor;
+            Status = "Submitting";
             return Task.FromResult(true);
         }
 
@@ -549,6 +596,7 @@ public sealed class ShareOperationExecutorTests
         public Task<bool> TryMarkResultPendingAsync(Guid operationId, int generation, long leaseGeneration, DateTimeOffset nextReconcileAt, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {
             ResultPending = true;
+            Status = "ResultPending";
             return Task.FromResult(true);
         }
 
@@ -558,17 +606,24 @@ public sealed class ShareOperationExecutorTests
             return Task.FromResult(true);
         }
 
-        public Task<bool> TryFailAsync(Guid operationId, int generation, long leaseGeneration, string errorCode, string safeMessage, DateTimeOffset updatedAt, CancellationToken cancellationToken = default) =>
-            Task.FromResult(true);
+        public Task<bool> TryFailAsync(Guid operationId, int generation, long leaseGeneration, string errorCode, string safeMessage, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
+        {
+            Status = "Failed";
+            ErrorCode = errorCode;
+            SafeMessage = safeMessage;
+            return Task.FromResult(true);
+        }
 
         public Task<bool> AcceptResultAsync(Guid operationId, ShareOperationStatus expectedStatus, long leaseGeneration, BaiduShareResultRecord result, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {
+            Status = "Succeeded";
             AcceptedResult = result;
             return Task.FromResult(true);
         }
 
         public Task<bool> ReuseExistingResultAsync(Guid operationId, long leaseGeneration, BaiduShareResultRecord result, DateTimeOffset updatedAt, CancellationToken cancellationToken = default)
         {
+            Status = "ReusedExisting";
             AcceptedResult = result;
             return Task.FromResult(true);
         }
@@ -580,12 +635,13 @@ public sealed class ShareOperationExecutorTests
         public List<PermanentShareRequest> CreateRequests { get; } = [];
         public List<string?> ListRequests { get; } = [];
         public Queue<BaiduAdapterResult<ShareCreationReceipt>> CreateResults { get; set; } = [];
+        public string SuccessShareUrl { get; set; } = "https://pan.baidu.com/s/new";
 
         public BaiduAdapterResult<ShareCreationReceipt> SuccessReceipt()
         {
             var request = CreateRequests.LastOrDefault() ?? new PermanentShareRequest(exact);
             return BaiduAdapterResult<ShareCreationReceipt>.Success(new(
-                Now, "adapter-request", request, "new-share", "https://pan.baidu.com/s/new", new(
+                Now, "adapter-request", request, "new-share", SuccessShareUrl, new(
                     true, true,
                     request.UsesRandomExtractionCode ? ShareExtractionCodeBehavior.Random : ShareExtractionCodeBehavior.Fixed,
                     request.FixedExtractionCode ?? "r4Nd")));

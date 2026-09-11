@@ -1,5 +1,5 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk"
-         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute">
+         TreatAsLocalProperty="_ExpectedProductVersion;_ExpectedInformationalVersion;_ExpectedFileVersion;_VersionPrefixIsValid;_ExpectedProductMajor;_ExpectedAssemblyVersion;_UpdateFeedUrlIsValid;_AcceptanceFeedIsAbsolute;LicenseProductId;LicenseRuntimeMode">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -7,6 +7,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <LicenseProductId>8270e8d7-1791-487d-ad76-0da7a0cbed12</LicenseProductId>
+    <LicenseSigningKeyId Condition="'$(LicenseSigningKeyId)' == ''">production-v1</LicenseSigningKeyId>
+    <LicenseAcceptanceBuild Condition="'$(LicenseAcceptanceBuild)' == ''">false</LicenseAcceptanceBuild>
+    <LicenseRuntimeMode Condition="'$(Configuration)' == 'Release'">Production</LicenseRuntimeMode>
+    <LicenseRuntimeMode Condition="'$(Configuration)' != 'Release' and '$(LicenseAcceptanceBuild)' == 'true'">Acceptance</LicenseRuntimeMode>
+    <LicenseRuntimeMode Condition="'$(Configuration)' != 'Release' and '$(LicenseAcceptanceBuild)' != 'true'">Disabled</LicenseRuntimeMode>
     <VersionPrefix Condition="'$(VersionPrefix)' == ''">1.0.0</VersionPrefix>
     <_ExpectedProductVersion>$(VersionPrefix)</_ExpectedProductVersion>
     <_ExpectedInformationalVersion>$(VersionPrefix)</_ExpectedInformationalVersion>
@@ -26,13 +32,119 @@
     <PackageId Condition="'$(PackageId)' == ''">SuperPan.BaiduBatchTransfer</PackageId>
     <UpdateChannel Condition="'$(UpdateChannel)' == ''">win-x64-stable</UpdateChannel>
     <AdapterBuildVersion Condition="'$(AdapterBuildVersion)' == ''">managed-browser-v3</AdapterBuildVersion>
-    <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\artifacts\managed-browser-helper</ManagedBrowserHelperPackageDirectory>
+    <ManagedBrowserHelperPackageDirectory Condition="'$(ManagedBrowserHelperPackageDirectory)' == ''">$(MSBuildProjectDirectory)\..\..\.artifacts\managed-session-pipeline-20260901\helper-bundle-r2</ManagedBrowserHelperPackageDirectory>
   </PropertyGroup>
 
   <PropertyGroup>
     <_UpdateFeedUrlIsValid Condition="'$(UpdateFeedUrl)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(UpdateFeedUrl)', '(?i)^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*(?::(?:[0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/[^?#\s]*)?$'))</_UpdateFeedUrlIsValid>
     <_AcceptanceFeedIsAbsolute Condition="'$(OtaAcceptanceFeedPath)' != ''">$([System.IO.Path]::IsPathFullyQualified('$(OtaAcceptanceFeedPath)'))</_AcceptanceFeedIsAbsolute>
+    <_LicenseServiceUrlIsAcceptanceLoopback Condition="'$(LicenseServiceUrl)' != ''">$([System.Text.RegularExpressions.Regex]::IsMatch('$(LicenseServiceUrl)', '^http://127\.0\.0\.1(?::[0-9]{1,5})?/?$'))</_LicenseServiceUrlIsAcceptanceLoopback>
+    <_LicenseAcceptanceConfigIsAbsolute Condition="'$(LicenseAcceptanceConfigPath)' != ''">$([System.IO.Path]::IsPathFullyQualified('$(LicenseAcceptanceConfigPath)'))</_LicenseAcceptanceConfigIsAbsolute>
   </PropertyGroup>
+
+  <UsingTask TaskName="ValidateLicenseProductionTrust"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <Task>
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.Linq;
+using System.Runtime.InteropServices;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public sealed class ValidateLicenseProductionTrust : Task
+{
+    [Required] public string ServiceUrl { get; set; } = string.Empty;
+    [Required] public string SigningPublicKey { get; set; } = string.Empty;
+    [Required] public string CurrentSpkiPin { get; set; } = string.Empty;
+    [Required] public string NextSpkiPin { get; set; } = string.Empty;
+
+    public override bool Execute()
+    {
+        try
+        {
+            var validUrl = Uri.TryCreate(ServiceUrl, UriKind.Absolute, out var endpoint)
+                && string.Equals(endpoint.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(endpoint.Host)
+                && string.IsNullOrEmpty(endpoint.UserInfo)
+                && string.IsNullOrEmpty(endpoint.Query)
+                && string.IsNullOrEmpty(endpoint.Fragment)
+                && endpoint.Port is >= 1 and <= 65535;
+            var validPinPair = IsPin(CurrentSpkiPin)
+                && IsPin(NextSpkiPin)
+                && !string.Equals(CurrentSpkiPin, NextSpkiPin, StringComparison.Ordinal);
+            var encodedKey = Convert.FromBase64String(SigningPublicKey);
+            var p256SpkiPrefix = new byte[]
+            {
+                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48,
+                0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+                0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+            };
+            var validKey = encodedKey.Length == 91
+                && encodedKey.Take(p256SpkiPrefix.Length).SequenceEqual(p256SpkiPrefix)
+                && TryImportP256Point(encodedKey, p256SpkiPrefix.Length);
+            if (validUrl && validPinPair && validKey)
+                return true;
+        }
+        catch
+        {
+        }
+        Log.LogError("License production trust configuration is invalid.");
+        return false;
+    }
+
+    private static bool IsPin(string value) => value is { Length: 64 }
+        && value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    private static bool TryImportP256Point(byte[] subjectPublicKeyInfo, int pointOffset)
+    {
+        var blob = new byte[72];
+        blob[0] = 0x45; blob[1] = 0x43; blob[2] = 0x53; blob[3] = 0x31;
+        blob[4] = 0x20;
+        Buffer.BlockCopy(subjectPublicKeyInfo, pointOffset, blob, 8, 64);
+        IntPtr algorithm = IntPtr.Zero;
+        IntPtr key = IntPtr.Zero;
+        try
+        {
+            if (BCryptOpenAlgorithmProvider(out algorithm, "ECDSA_P256", null, 0) != 0)
+                return false;
+            return BCryptImportKeyPair(
+                algorithm, IntPtr.Zero, "ECCPUBLICBLOB", out key, blob, blob.Length, 0) == 0;
+        }
+        finally
+        {
+            if (key != IntPtr.Zero) BCryptDestroyKey(key);
+            if (algorithm != IntPtr.Zero) BCryptCloseAlgorithmProvider(algorithm, 0);
+        }
+    }
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    private static extern int BCryptOpenAlgorithmProvider(
+        out IntPtr algorithm,
+        string algorithmId,
+        string implementation,
+        int flags);
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    private static extern int BCryptImportKeyPair(
+        IntPtr algorithm,
+        IntPtr importKey,
+        string blobType,
+        out IntPtr key,
+        byte[] input,
+        int inputLength,
+        int flags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern int BCryptDestroyKey(IntPtr key);
+
+    [DllImport("bcrypt.dll")]
+    private static extern int BCryptCloseAlgorithmProvider(IntPtr algorithm, int flags);
+}
+      ]]></Code>
+    </Task>
+  </UsingTask>
 
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" />
@@ -47,6 +159,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\SuperPan.Licensing.Client\SuperPan.Licensing.Client.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.Core\BaiduBatchTransfer.Core.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.Application\BaiduBatchTransfer.Application.csproj" />
     <ProjectReference Include="..\BaiduBatchTransfer.Infrastructure\BaiduBatchTransfer.Infrastructure.csproj" />
@@ -74,6 +187,38 @@
       <_Parameter1>OtaAcceptanceFeedPath</_Parameter1>
       <_Parameter2>$(OtaAcceptanceFeedPath)</_Parameter2>
     </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseProductId</_Parameter1>
+      <_Parameter2>$(LicenseProductId)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseRuntimeMode</_Parameter1>
+      <_Parameter2>$(LicenseRuntimeMode)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseServiceUrl</_Parameter1>
+      <_Parameter2>$(LicenseServiceUrl)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseSigningPublicKey</_Parameter1>
+      <_Parameter2>$(LicenseSigningPublicKey)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseSigningKeyId</_Parameter1>
+      <_Parameter2>$(LicenseSigningKeyId)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseCurrentSpkiPin</_Parameter1>
+      <_Parameter2>$(LicenseCurrentSpkiPin)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseNextSpkiPin</_Parameter1>
+      <_Parameter2>$(LicenseNextSpkiPin)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>LicenseAcceptanceBuild</_Parameter1>
+      <_Parameter2>$(LicenseAcceptanceBuild)</_Parameter2>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <ItemGroup>
@@ -92,7 +237,7 @@
     <Error Condition="!Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
            Text="A Release build requires a deterministic managed-browser-helper package. Run scripts/build_managed_browser_helper.ps1 and set ManagedBrowserHelperPackageDirectory if needed." />
     <Exec Condition="Exists('$(ManagedBrowserHelperPackageDirectory)\helper-manifest.json')"
-          Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\verify_managed_browser_helper_package.ps1&quot; -ManifestSource &quot;$(MSBuildProjectDirectory)\..\..\tools\managed_browser_helper\helper-manifest.json&quot; -PackageDirectory &quot;$(ManagedBrowserHelperPackageDirectory)&quot;" />
+          Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\verify_managed_browser_helper_package.ps1&quot; -ManifestSource &quot;$(MSBuildProjectDirectory)\..\..\tools\managed_browser_helper\helper-manifest.json&quot; -PackageDirectory &quot;$(ManagedBrowserHelperPackageDirectory)&quot; -HelperSourceDirectory &quot;$(MSBuildProjectDirectory)\..\..\tools\managed_browser_helper&quot;" />
   </Target>
 
   <Target Name="ValidateOtaBuildConfiguration" BeforeTargets="PrepareForBuild">
@@ -126,6 +271,22 @@
            Text="OTA production feed must be an absolute HTTPS URL without credentials, query, or fragment." />
     <Error Condition="'$(OtaAcceptanceBuild)' == 'false' and '$(UpdateChannel)' != 'win-x64-stable'"
            Text="OTA production builds require the win-x64-stable channel." />
+  </Target>
+
+  <Target Name="ValidateLicenseBuildConfiguration" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(LicenseAcceptanceBuild)' != 'true' and '$(LicenseAcceptanceBuild)' != 'false'"
+           Text="License acceptance build flag must be true or false." />
+    <Error Condition="'$(Configuration)' == 'Release' and '$(LicenseAcceptanceBuild)' == 'true'"
+           Text="License Release builds cannot carry the acceptance stamp." />
+    <ValidateLicenseProductionTrust Condition="'$(LicenseRuntimeMode)' == 'Production'"
+                                    ServiceUrl="$(LicenseServiceUrl)"
+                                    SigningPublicKey="$(LicenseSigningPublicKey)"
+                                    CurrentSpkiPin="$(LicenseCurrentSpkiPin)"
+                                    NextSpkiPin="$(LicenseNextSpkiPin)" />
+    <Error Condition="'$(LicenseRuntimeMode)' == 'Acceptance' and '$(_LicenseAcceptanceConfigIsAbsolute)' != 'True'"
+           Text="License acceptance builds require an absolute local configuration path." />
+    <Error Condition="'$(LicenseRuntimeMode)' == 'Acceptance' and '$(_LicenseServiceUrlIsAcceptanceLoopback)' != 'True'"
+           Text="License acceptance builds allow only the literal HTTP loopback service URL." />
   </Target>
 
 </Project>

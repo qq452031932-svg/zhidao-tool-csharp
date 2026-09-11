@@ -13,6 +13,37 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
     private readonly string root = Path.Combine(Path.GetTempPath(), $"bbt-repository-{Guid.NewGuid():N}");
 
     [Fact]
+    public async Task PendingRowProjectionPreservesImportIdentityAndRawShareStatus()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, true, 1);
+        var share = Assert.Single(graph.Operations);
+        var session = ImportSessionRecord.Create(Guid.NewGuid(), "Text", "projection");
+        var row = StagedImportRowRecord.Create(Guid.NewGuid(), session.Id, 1, "url", "Ready");
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Imports.AddSessionAsync(session);
+            await unit.Imports.AddRowsAsync([row]);
+            await unit.Jobs.AddAllocationsAsync([new(Guid.NewGuid(), share.BatchJobId, share.AccountId,
+                1, "/", "/", 1, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 1)]);
+            await unit.Jobs.AddShareOperationsAsync(graph.Operations, graph.RemoteItems);
+            await unit.CommitAsync();
+        }
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE ResourceItems SET StagedImportRowId=$row WHERE Id=$resource;";
+            command.Parameters.AddWithValue("$row", row.Id.ToString("D"));
+            command.Parameters.AddWithValue("$resource", share.ResourceItemId.ToString("D"));
+            await command.ExecuteNonQueryAsync();
+        }
+        await using var read = await SqliteUnitOfWork.BeginAsync(graph.Factory);
+        var result = Assert.Single((await read.Jobs.GetOperationResultsKeysetPageAsync(
+            new(share.BatchJobId, null, null, null, null, 10))).Items);
+        Assert.Equal("WaitingShare", result.ShareStatus);
+        Assert.Equal(row.Id, result.StagedImportRowId);
+    }
+
+    [Fact]
     public async Task UnitOfWorkCommitsAllRepositoriesAtomically()
     {
         var factory = await CreateFactoryAsync();
@@ -39,6 +70,82 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
 
         await using var verify = await SqliteUnitOfWork.BeginAsync(factory);
         Assert.Null(await verify.Accounts.GetByIdAsync(account.Id));
+    }
+
+    [Fact]
+    public async Task CapacityStoreUpdatesOnlyTheMatchingActiveAccountCapacity()
+    {
+        var factory = await CreateFactoryAsync();
+        var account = AccountRecord.Create(Guid.NewGuid(), "capacity-user", "Capacity") with
+        {
+            EncryptedSession = [1, 2, 3],
+            CapacityTotal = 10,
+            CapacityUsed = 4,
+            DailyLimit = 12,
+            SortOrder = 7,
+        };
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(account);
+            await unit.CommitAsync();
+        }
+        var validatedAt = new DateTimeOffset(2026, 9, 1, 8, 0, 0, TimeSpan.Zero);
+        var store = new SqliteAccountCapacityStore(factory);
+
+        var updated = await store.TryUpdateAsync(
+            account.Id,
+            account.BaiduUserId,
+            new AccountCapacity(100, 25),
+            validatedAt);
+
+        Assert.True(updated);
+        await using var verify = await SqliteUnitOfWork.BeginAsync(factory);
+        var saved = Assert.IsType<AccountRecord>(await verify.Accounts.GetByIdAsync(account.Id));
+        Assert.Equal(100, saved.CapacityTotal);
+        Assert.Equal(25, saved.CapacityUsed);
+        Assert.Equal(validatedAt, saved.LastValidatedAt);
+        Assert.Equal(account.DisplayName, saved.DisplayName);
+        Assert.Equal(account.DailyLimit, saved.DailyLimit);
+        Assert.Equal(account.SortOrder, saved.SortOrder);
+        Assert.Equal(account.EncryptedSession, saved.EncryptedSession);
+    }
+
+    [Theory]
+    [InlineData("wrong-user", false, true)]
+    [InlineData("capacity-user", true, true)]
+    [InlineData("capacity-user", false, false)]
+    public async Task CapacityStoreRejectsStaleDeletedOrDisabledAccounts(
+        string expectedBaiduUserId,
+        bool isDeleted,
+        bool isEnabled)
+    {
+        var factory = await CreateFactoryAsync();
+        var account = AccountRecord.Create(Guid.NewGuid(), "capacity-user", "Capacity") with
+        {
+            CapacityTotal = 10,
+            CapacityUsed = 4,
+            IsDeleted = isDeleted,
+            DeletedAt = isDeleted ? DateTimeOffset.UtcNow : null,
+            IsEnabled = isEnabled,
+        };
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(account);
+            await unit.CommitAsync();
+        }
+        var store = new SqliteAccountCapacityStore(factory);
+
+        var updated = await store.TryUpdateAsync(
+            account.Id,
+            expectedBaiduUserId,
+            new AccountCapacity(100, 25),
+            DateTimeOffset.UtcNow);
+
+        Assert.False(updated);
+        await using var verify = await SqliteUnitOfWork.BeginAsync(factory);
+        var saved = Assert.IsType<AccountRecord>(await verify.Accounts.GetByIdAsync(account.Id));
+        Assert.Equal(10, saved.CapacityTotal);
+        Assert.Equal(4, saved.CapacityUsed);
     }
 
     [Fact]
@@ -285,11 +392,17 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         var installationIdentity = new BrowserInstallationIdentity(
             Guid.NewGuid(), BrowserFamily.Chrome, directory, Path.Combine(directory, "chrome.exe"),
             "Google LLC", "Google Chrome", "managed-transfer-file");
-        await managedState.CreateInstallationAsync(installationIdentity, default);
+        var storedInstallation = await managedState.CreateInstallationAsync(installationIdentity, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await managedState.TryReplaceActiveInstallationAsync(
+                new ManagedBrowserInstallationActivationRequest(null, storedInstallation), default)).Status);
         var sessionIdentity = new ManagedBrowserSessionReference(
             Guid.NewGuid(), installationIdentity.InstallationId, account.Id, account.BaiduUserId,
             BrowserFamily.Chrome, "managed-transfer-profile", "managed-transfer-ownership");
-        await managedState.CreateSessionAsync(sessionIdentity, default);
+        var storedSession = await managedState.CreateSessionAsync(sessionIdentity, default);
+        Assert.Equal(ManagedBrowserTransitionStatus.Applied,
+            (await managedState.TryReplaceActiveSessionAsync(
+                new ManagedBrowserSessionActivationRequest(null, storedSession), default)).Status);
         var snapshot = ExecutionProfileSnapshot.Managed(
             BrowserFamily.Chrome, sessionIdentity.ProfileId,
             installationIdentity.InstallationId, sessionIdentity.SessionId);
@@ -1165,6 +1278,7 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         command.CommandText = """
             PRAGMA foreign_keys=OFF;
             DROP TRIGGER TR_ShareOperations_RequireEnabledPlannedOutput;
+            DROP TRIGGER TR_TransferOperations_AcceptanceOnly_InsertScope;
 
             INSERT INTO TransferOperations(
               Id,ResourceItemId,BatchJobId,SequenceNumber,AllocationOrdinal,TargetPath,NormalizedTargetPath,
@@ -1238,10 +1352,66 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         await command.ExecuteNonQueryAsync();
     }
 
+    [Theory]
+    [InlineData(true, "Failed", 0L, 1L)]
+    [InlineData(true, "Cancelled", 0L, 1L)]
+    [InlineData(true, "Succeeded", 1L, 0L)]
+    [InlineData(true, "ReusedExisting", 1L, 0L)]
+    [InlineData(true, "WaitingShare", 0L, 0L)]
+    [InlineData(false, "WaitingShare", 1L, 0L)]
+    public async Task TerminalStatisticsIncludesShareOutcomeWithoutChangingTransferFailures(
+        bool enabled, string shareStatus, long successes, long problems)
+    {
+        var graph = await CreateShareInsertGraphAsync(1, enabled, enabled ? 1 : 0);
+        var operation = graph.Operations[0];
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddAllocationsAsync([new AccountAllocationRecord(
+                Guid.NewGuid(), operation.BatchJobId, operation.AccountId, 1, "/", "/",
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)]);
+            if (enabled) await unit.Jobs.AddShareOperationsAsync(graph.Operations, graph.RemoteItems);
+            await unit.CommitAsync();
+        }
+        await using (var connection = await graph.Factory.OpenConnectionAsync())
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE ShareOperations SET Status=$status;";
+            command.Parameters.AddWithValue("$status", shareStatus);
+            await command.ExecuteNonQueryAsync();
+        }
+        await using var read = await SqliteUnitOfWork.BeginAsync(graph.Factory);
+        var account = Assert.Single((await read.Jobs.GetBatchStatisticsAsync(operation.BatchJobId)).Accounts);
+        Assert.Equal(0, account.FailedCount);
+        Assert.Equal(successes, account.CompleteSuccessCount);
+        Assert.Equal(problems, account.TerminalProblemCount);
+    }
+
+    [Fact]
+    public async Task TerminalStatisticsTreatsLegacyTransferWithoutOutputConfigurationAsComplete()
+    {
+        var graph = await CreateShareInsertGraphAsync(1, false, 0, includeOutputConfiguration: false);
+        var operation = graph.Operations[0];
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(graph.Factory))
+        {
+            await unit.Jobs.AddAllocationsAsync([new AccountAllocationRecord(
+                Guid.NewGuid(), operation.BatchJobId, operation.AccountId, 1, "/", "/",
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)]);
+            await unit.CommitAsync();
+        }
+        Assert.Equal(0, await CountTableAsync(graph.Factory, "ShareOperations"));
+        await using var read = await SqliteUnitOfWork.BeginAsync(graph.Factory);
+        Assert.Empty(await read.Jobs.GetOutputAccountsAsync(operation.BatchJobId));
+        var account = Assert.Single((await read.Jobs.GetBatchStatisticsAsync(operation.BatchJobId)).Accounts);
+        Assert.Equal(1, account.CompleteSuccessCount);
+        Assert.Equal(0, account.TerminalProblemCount);
+        Assert.Equal(0, account.FailedCount);
+    }
+
     private async Task<ShareInsertGraph> CreateShareInsertGraphAsync(
         int count,
         bool shareEnabled,
-        int plannedShareCount)
+        int plannedShareCount,
+        bool includeOutputConfiguration = true)
     {
         Directory.CreateDirectory(root);
         var factory = new SqliteConnectionFactory(Path.Combine(root, $"{Guid.NewGuid():N}.db"));
@@ -1279,9 +1449,12 @@ public sealed class RepositoryTests(ITestOutputHelper output) : IDisposable
         await unit.Jobs.AddAsync(batch);
         await unit.Jobs.AddResourcesAsync(resources);
         await unit.Jobs.AddOperationsAsync(transfers);
-        await unit.Jobs.SetShareSettingsAsync(new(batch.Id, true, true, "Random", null, "Ask", now, settingsFingerprint));
-        await unit.Jobs.AddOutputAccountsAsync([
-            new(batch.Id, account.Id, 1, "Bounded", count, plannedShareCount, shareEnabled)]);
+        if (includeOutputConfiguration)
+        {
+            await unit.Jobs.SetShareSettingsAsync(new(batch.Id, true, true, "Random", null, "Ask", now, settingsFingerprint));
+            await unit.Jobs.AddOutputAccountsAsync([
+                new(batch.Id, account.Id, 1, "Bounded", count, plannedShareCount, shareEnabled)]);
+        }
         await unit.CommitAsync();
         return new(factory, operations, remoteItems);
     }

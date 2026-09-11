@@ -20,7 +20,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
 
     internal const string ExpiredBatchSelectSql = """
         SELECT batch.Id FROM BatchJobs batch
-        WHERE batch.Status='Active' AND EXISTS(
+        WHERE batch.Status='Active' AND batch.AcceptanceOnly=0 AND EXISTS(
           SELECT 1 FROM ShareOperations candidate
           WHERE candidate.BatchJobId=batch.Id AND candidate.Status='Reserved'
             AND candidate.LeaseExpiresAt IS NOT NULL AND candidate.LeaseExpiresAt<=$now
@@ -189,8 +189,30 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                   AND member.SettingsFingerprint=operation.SettingsFingerprint
                   AND member.DiscoveryFingerprint=decision.DiscoveryFingerprint
                   AND member.ExactItemSetFingerprint=operation.ExactItemSetFingerprint
-                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1)
+                ORDER BY member.IsCompatible DESC,member.ShareId LIMIT 1),
+              CASE WHEN batch.AcceptanceOnly=1 AND transfer.AcceptanceOnly=1
+                AND transfer.Status='Succeeded' AND transfer.SubmitState='ResultReceived'
+                AND transfer.TargetSlotState='Fulfilled' AND transfer.RemoteItemIdsJson IS NOT NULL
+                AND json_valid(transfer.RemoteItemIdsJson)
+                AND json_array_length(transfer.RemoteItemIdsJson)=1
+                AND (SELECT COUNT(*) FROM ShareOperationRemoteItems exactItem
+                  WHERE exactItem.ShareOperationId=operation.Id)=1
+                AND json_extract(transfer.RemoteItemIdsJson,'$[0]')=(
+                  SELECT exactItem.RemoteItemId FROM ShareOperationRemoteItems exactItem
+                  WHERE exactItem.ShareOperationId=operation.Id LIMIT 1)
+                AND operation.BatchJobId=transfer.BatchJobId
+                AND operation.ResourceItemId=transfer.ResourceItemId
+                AND operation.AccountId=transfer.AssignedAccountId
+                AND operation.ExecutionEngineVersion='ManagedChromium-v1'
+                AND operation.ExecutionEngineVersion=transfer.ExecutionEngineVersion
+                AND operation.BrowserFamily=transfer.BrowserFamily
+                AND operation.ProfileId=transfer.ProfileId
+                AND operation.InstallationId=transfer.InstallationId
+                AND operation.SessionId=transfer.SessionId
+                THEN 1 ELSE 0 END
             FROM ShareOperations operation
+            JOIN BatchJobs batch ON batch.Id=operation.BatchJobId
+            JOIN TransferOperations transfer ON transfer.Id=operation.TransferOperationId
             JOIN BatchShareSettings settings ON settings.BatchJobId=operation.BatchJobId
               AND settings.SettingsFingerprint=operation.SettingsFingerprint
             JOIN BatchOutputAccounts output ON output.BatchJobId=operation.BatchJobId
@@ -234,6 +256,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         var existingCode = reader.IsDBNull(37) ? null : reader.GetString(37);
         var existingPermanent = !reader.IsDBNull(38) && reader.GetInt64(38) != 0;
         var existingUnlimited = !reader.IsDBNull(39) && reader.GetInt64(39) != 0;
+        var acceptanceOnly = reader.GetInt64(40) != 0;
         await reader.DisposeAsync().ConfigureAwait(false);
 
         await using var itemsCommand = Command(connection, transaction, """
@@ -251,7 +274,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
         var existing = existingShareId is null || existingShareUrl is null || existingCode is null
             ? null
             : new BaiduShareRecord(existingShareId, exact, existingShareUrl, existingCode, existingPermanent, existingUnlimited);
-        return new(operation, settings, Selected: true, shareEnabled, exact, decision, existing);
+        return new(operation, settings, Selected: true, shareEnabled, exact, decision, existing, acceptanceOnly);
     }
 
     public Task<bool> TryMarkPreparingAsync(
@@ -405,7 +428,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 string? batchId;
                 await using (var selectBatch = Command(connection, transaction, $"""
                     SELECT batch.Id FROM BatchJobs batch
-                    WHERE batch.Status='Active' AND EXISTS(
+                    WHERE batch.Status='Active' AND batch.AcceptanceOnly=0 AND EXISTS(
                       SELECT 1 FROM ShareOperations candidate
                       WHERE candidate.BatchJobId=batch.Id AND candidate.Status=$status
                         AND candidate.LeaseExpiresAt IS NULL
@@ -494,7 +517,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     WHERE settings.BatchJobId=ShareOperations.BatchJobId
                       AND settings.SettingsFingerprint=ShareOperations.SettingsFingerprint)
                   AND EXISTS(SELECT 1 FROM BatchJobs batch
-                    WHERE batch.Id=ShareOperations.BatchJobId AND batch.Status='Active')
+                    WHERE batch.Id=ShareOperations.BatchJobId AND batch.Status='Active'
+                      AND batch.AcceptanceOnly=0)
                   AND EXISTS(SELECT 1 FROM BatchOutputAccounts output
                     WHERE output.BatchJobId=ShareOperations.BatchJobId
                       AND output.AccountId=ShareOperations.AccountId
@@ -550,7 +574,8 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
               AND operation.SubmitStartedAt IS NOT NULL
               AND (operation.NextReconcileAt IS NULL OR operation.NextReconcileAt<=$now)
               {excludedPredicate}
-              AND EXISTS(SELECT 1 FROM BatchJobs batch WHERE batch.Id=operation.BatchJobId AND batch.Status='Active')
+              AND EXISTS(SELECT 1 FROM BatchJobs batch WHERE batch.Id=operation.BatchJobId
+                AND batch.Status='Active' AND batch.AcceptanceOnly=0)
               AND EXISTS(SELECT 1 FROM Accounts account WHERE account.Id=operation.AccountId
                 AND account.Status='Active' AND account.IsEnabled=1 AND account.IsDeleted=0)
             ORDER BY COALESCE(operation.NextReconcileAt,operation.SubmitStartedAt),operation.OutputOrdinal,operation.Id
@@ -854,7 +879,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                     WHERE remote.ShareOperationId=ShareOperations.Id))
               AND EXISTS(SELECT 1 FROM BatchJobs batch
                 WHERE batch.Id=ShareOperations.BatchJobId
-                  AND batch.Status IN ('Active','CompletedWithShortfall'))
+                  AND batch.Status IN ('Active','CompletedWithShortfall') AND batch.AcceptanceOnly=0)
               AND EXISTS(SELECT 1 FROM Accounts account
                 WHERE account.Id=ShareOperations.AccountId AND account.Status='Active'
                   AND account.IsEnabled=1 AND account.IsDeleted=0)
@@ -1728,10 +1753,11 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             var leaseScope = onlyExpired
                 ? "LeaseExpiresAt IS NOT NULL AND LeaseExpiresAt<=$now"
                 : "LeaseExpiresAt IS NOT NULL";
+            const string generalScope = "EXISTS(SELECT 1 FROM BatchJobs batch WHERE batch.Id=ShareOperations.BatchJobId AND batch.AcceptanceOnly=0)";
             await using (var clearBaseline = Command(connection, transaction, $"""
                 DELETE FROM ShareDiscoveryBaselines WHERE ShareOperationId IN (
                   SELECT Id FROM ShareOperations
-                  WHERE {leaseScope}
+                  WHERE {generalScope} AND {leaseScope}
                     AND ((Status IN ('Reserved','Preparing') AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL)
                       OR (Status='Submitting' AND SubmissionAcceptance='DefinitelyNotAccepted')));
                 """))
@@ -1744,7 +1770,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                   RequestDescriptorJson=NULL,AdapterRequestId=NULL,SubmissionAcceptance='Unknown',SubmitStartedAt=NULL,
                   NextReconcileAt=NULL,BaselineGeneration=NULL,BaselineFingerprint=NULL,BaselineShareCount=0,
                   BaselineCompletedAt=NULL,LastErrorCode=NULL,LastErrorMessage=NULL,UpdatedAt=$now
-                WHERE {leaseScope} AND (
+                WHERE {generalScope} AND {leaseScope} AND (
                   (Status IN ('Reserved','Preparing') AND RequestDescriptorJson IS NULL AND SubmitStartedAt IS NULL)
                   OR (Status='Submitting' AND SubmissionAcceptance='DefinitelyNotAccepted'));
                 """);
@@ -1755,7 +1781,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
                 UPDATE ShareOperations SET Status='ResultPending',SubmissionAcceptance='Unknown',LeaseExpiresAt=NULL,
                   NextReconcileAt=COALESCE(NextReconcileAt,$now),LastErrorCode='StartupUnknownAcceptance',
                   LastErrorMessage='分享提交结果待确认',UpdatedAt=$now
-                WHERE Status IN ('Reserved','Preparing','Submitting') AND {leaseScope}
+                WHERE {generalScope} AND Status IN ('Reserved','Preparing','Submitting') AND {leaseScope}
                   AND SubmissionAcceptance<>'DefinitelyNotAccepted'
                   AND (RequestDescriptorJson IS NOT NULL OR SubmitStartedAt IS NOT NULL OR Status='Submitting');
                 """);
@@ -2107,6 +2133,7 @@ public sealed class SqliteShareSchedulingStore : IShareSchedulingStore, IShareEx
             WHERE operation.Status='Paused'
               AND operation.LastErrorCode='AwaitingExistingShareDecision'
               AND batch.Status IN ('Active','CompletedWithShortfall')
+              AND batch.AcceptanceOnly=0
             GROUP BY operation.BatchJobId
             ORDER BY MIN(operation.UpdatedAt),operation.BatchJobId
             LIMIT $limit;

@@ -3,15 +3,19 @@ using BaiduBatchTransfer.Core.Domain;
 
 namespace BaiduBatchTransfer.BaiduAdapter.Http;
 
-public sealed class LiveBaiduShareAdapter : IBaiduShareAdapter
+public sealed class LiveBaiduShareAdapter(BaiduWebApiClient? webApiClient = null) : IBaiduShareAdapter
 {
+    private readonly BaiduWebApiClient? webApiClient = webApiClient;
+
     public Task<BaiduAdapterResult<ShareCreationReceipt>> CreatePermanentShareAsync(
         AccountSession session,
         PermanentShareRequest request,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return NotValidated<ShareCreationReceipt>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<ShareCreationReceipt>(session, cancellationToken)
+            : webApiClient.CreatePermanentShareAsync(session, request, cancellationToken);
     }
 
     public Task<BaiduAdapterResult<BaiduSharePage>> ListSharesAsync(
@@ -19,8 +23,9 @@ public sealed class LiveBaiduShareAdapter : IBaiduShareAdapter
         string? cursor,
         CancellationToken cancellationToken)
     {
-        _ = cursor;
-        return NotValidated<BaiduSharePage>(session, cancellationToken);
+        return webApiClient is null
+            ? NotValidated<BaiduSharePage>(session, cancellationToken)
+            : webApiClient.ListSharesAsync(session, cursor, cancellationToken);
     }
 
     private static Task<BaiduAdapterResult<T>> NotValidated<T>(

@@ -1,10 +1,17 @@
 using BaiduBatchTransfer.App.Features.Shares;
+using BaiduBatchTransfer.App.Features.Common;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.Application.Jobs;
 using BaiduBatchTransfer.Core.Abstractions;
 using BaiduBatchTransfer.Core.Domain;
 using System.Collections;
 using System.Reflection;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Markup;
+using System.Windows.Threading;
+using System.Xml.Linq;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Tests.Features;
 
@@ -14,6 +21,90 @@ public sealed class ShareWorkspaceViewModelTests
         Guid.Parse("11111111-1111-1111-1111-111111111111"), "账号甲");
     private static readonly ShareAccountOption AccountB = new(
         Guid.Parse("22222222-2222-2222-2222-222222222222"), "账号乙");
+
+    [Fact]
+    public async Task LicenseFailureStopsShareStartBeforeDraftOrDurableCreation()
+    {
+        var store = new FakeStore();
+        var gate = new RecordingLicenseGate(false);
+        var vm = Fixture(store: store, activeAccount: AccountA, licenseGate: gate);
+        vm.Add(Selection(AccountA, "a-1"));
+        vm.ResultDirectory = @"C:\结果";
+
+        await vm.StartAsync();
+
+        Assert.Equal([LicenseOperationKind.Share], gate.Operations);
+        Assert.Empty(store.Created);
+        Assert.False(vm.HasPendingBatchConfirmation);
+        Assert.Equal("软件尚未激活，联网功能暂不可用。", vm.StatusMessage);
+    }
+
+    [Fact]
+    public async Task LicenseFailureStopsShareResumeBeforeDurableMutation()
+    {
+        var store = new FakeStore();
+        store.SeedBatch(StandaloneShareBatchStatus.Paused);
+        var gate = new RecordingLicenseGate(false);
+        var vm = Fixture(store: store, licenseGate: gate);
+        await vm.InitializeAsync();
+
+        await vm.ResumeAsync();
+
+        Assert.Equal([LicenseOperationKind.Share], gate.Operations);
+        Assert.Empty(store.ResumeCalls);
+    }
+
+    [Fact]
+    public async Task LicenseFailureStopsShareRetryBeforeDurableMutation()
+    {
+        var store = new FakeStore();
+        var batch = store.SeedBatch(StandaloneShareBatchStatus.CompletedWithFailures);
+        var failed = store.ReplaceOnlyOperation(batch.Id, operation => RebuildOperation(
+            operation,
+            StandaloneShareOperationStatus.Failed,
+            StandaloneShareSubmissionState.DefinitelyNotAccepted));
+        var gate = new RecordingLicenseGate(false);
+        var vm = Fixture(store: store, licenseGate: gate);
+        await vm.InitializeAsync();
+        vm.SelectedOperation = failed;
+
+        await vm.RetryFailedAsync();
+
+        Assert.Equal([LicenseOperationKind.Share], gate.Operations);
+        Assert.Empty(store.RetryCalls);
+    }
+
+    [Fact]
+    public async Task StatusChangesProduceSafeLogsAndConsecutiveDuplicatesCoalesce()
+    {
+        var vm = Fixture(picker: new FakePicker((_, _) => []), activeAccount: AccountA);
+        var initialCount = vm.Logs.Count;
+
+        await vm.PickResourcesAsync();
+        await vm.PickResourcesAsync();
+
+        Assert.Equal(initialCount + 1, vm.Logs.Count);
+        Assert.Equal("没有添加资源。", vm.Logs[^1].Message);
+        Assert.Equal(WorkspaceLogLevel.Information, vm.Logs[^1].Level);
+    }
+
+    [Fact]
+    public async Task DisposePreventsLateStatusFromAppendingToLogs()
+    {
+        var store = new FakeStore
+        {
+            BeforeGetBatches = cancellationToken => Task.Delay(Timeout.Infinite, cancellationToken),
+        };
+        var vm = Fixture(store: store, activeAccount: AccountA);
+        var loading = vm.InitializeAsync();
+        await store.DelayedHistoryStarted.Task;
+        vm.Dispose();
+        var countAtDispose = vm.Logs.Count;
+
+        await loading;
+
+        Assert.Equal(countAtDispose, vm.Logs.Count);
+    }
 
     [Fact]
     public void Selection_CannotBeMovedToAnotherAccount()
@@ -738,6 +829,7 @@ public sealed class ShareWorkspaceViewModelTests
         var vm = Fixture(store: store, exports: exports);
         var batch = store.SeedBatch(StandaloneShareBatchStatus.CompletedWithFailures);
         vm.SelectedBatch = batch;
+        await vm.LoadSelectedBatchAsync();
 
         await vm.SaveResultsAsync();
 
@@ -785,13 +877,557 @@ public sealed class ShareWorkspaceViewModelTests
         Assert.Contains("AutomationProperties.LiveSetting=\"Polite\"", xaml);
     }
 
+    [Fact]
+    public void ShareWorkspace_UsesCompactToolbarDominantTabsAndFixedSafeLog()
+    {
+        var xaml = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml"));
+        var document = XDocument.Parse(xaml);
+        var xNamespace = XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml");
+        var content = document.Root!.Elements().Single(element => element.Name.LocalName == "Grid");
+        var names = content.DescendantsAndSelf()
+            .Select(element => (string?)element.Attribute(xNamespace + "Name"))
+            .Where(name => name is not null)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains("ShareToolbar", names);
+        Assert.Contains("ShareDataRegion", names);
+        Assert.Contains("ShareLogRegion", names);
+        Assert.Equal(new string?[] { "Auto", "*", "170" }, content.Elements()
+            .Single(element => element.Name.LocalName == "Grid.RowDefinitions")
+            .Elements().Select(element => (string?)element.Attribute("Height")).ToArray());
+        Assert.DoesNotContain(content.Elements(), element => element.Name.LocalName == "ScrollViewer");
+        Assert.DoesNotContain("<Popup", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"AdvancedSettingsExpander\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("IsEnabled=\"{Binding CanUseAdvancedSettings}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"AdvancedSettingsScrollViewer\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"ShareToolbarWrap\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("永久有效 · 不限次数", xaml, StringComparison.Ordinal);
+        Assert.Contains("不勾选时自动生成随机提取码", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"待分享资源\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"分享结果\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("ItemsSource=\"{Binding PendingRows}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("CommandParameter=\"{Binding Selection}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("ItemsSource=\"{Binding ResultRows}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"完成时间\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"结果保存\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"分享链接\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Header=\"提取码\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Header=\"新分享链接\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Header=\"新提取码\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style=\"{StaticResource DenseDataGridStyle}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("RowHeight=\"34\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("ColumnHeaderHeight=\"38\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"暂停\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"继续\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"重试失败项\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"保存结果\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"取消保存\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Command=\"{Binding CancelSaveResultsCommand}\"", xaml, StringComparison.Ordinal);
+
+        var logRegion = content.Descendants().Single(element =>
+            (string?)element.Attribute(xNamespace + "Name") == "ShareLogRegion");
+        Assert.Contains(logRegion.Descendants(), element =>
+            element.Name.LocalName == "ListBox" &&
+            (string?)element.Attribute("ItemsSource") == "{Binding Logs}" &&
+            (string?)element.Attribute("VirtualizingPanel.VirtualizationMode") == "Recycling");
+        Assert.Contains("x:Name=\"ShareStatusLiveRegion\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"{Binding UserFacingStatusMessage}\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Text=\"{Binding StatusMessage}\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Visibility=\"Collapsed\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("LastErrorCode", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("StableErrorCode", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void PendingRowsExposeSelectionAccountPolicyAndReadiness()
+    {
+        var vm = Fixture(activeAccount: AccountA);
+        var selection = Selection(AccountA, "pending-1");
+
+        vm.Add(selection);
+
+        var row = Assert.Single(vm.PendingRows);
+        Assert.Same(selection, row.Selection);
+        Assert.Equal(selection.DisplayName, row.Title);
+        Assert.Equal(selection.ParentPath.Value, row.ParentPath);
+        Assert.Equal(AccountA.DisplayName, row.AccountDisplayName);
+        Assert.Equal(vm.SelectedExistingShareDecision.DisplayName, row.ExistingSharePolicyDisplay);
+        Assert.Equal("准备就绪", row.ReadinessText);
+
+        vm.SelectedExistingShareDecision = vm.ExistingShareDecisionOptions.Single(option =>
+            option.Decision == ExistingShareDecision.Regenerate);
+
+        Assert.Equal("重新生成分享", Assert.Single(vm.PendingRows).ExistingSharePolicyDisplay);
+    }
+
+    [Fact]
+    public async Task ResultRowsFollowAllProjectionPagesAndReadTheExactStandaloneExportKey()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 2);
+        var first = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var second = store.ReplaceOperation(
+            seeded.Batch.Id, 1,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(first, null, null)], first.SequenceNumber);
+        projections.Pages[first.SequenceNumber] = new StandaloneShareResultProjectionPage(
+            [Projection(second, "https://pan.baidu.com/s/current", "A1b2")], null);
+        var exportStore = new FakeLocalResultExportStore
+        {
+            Result = ExportRecord(seeded.Batch.Id, LocalResultExportStatus.Succeeded),
+        };
+        var vm = Fixture(store: store, projectionRepository: projections, exportStore: exportStore);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.Equal([0, first.SequenceNumber], projections.AfterSequenceNumbers);
+        Assert.All(projections.PageSizes, pageSize => Assert.InRange(pageSize, 1, 1_000));
+        Assert.Equal(2, vm.ResultRows.Count);
+        Assert.Null(vm.ResultRows[0].NewShareUrl);
+        Assert.Null(vm.ResultRows[0].NewExtractionCode);
+        Assert.Equal("https://pan.baidu.com/s/current", vm.ResultRows[1].NewShareUrl);
+        Assert.Equal("A1b2", vm.ResultRows[1].NewExtractionCode);
+        Assert.Equal(second.UpdatedAt, vm.ResultRows[1].UpdatedAt);
+        Assert.Equal("已保存", vm.ResultRows[1].ResultSaveStatus);
+        Assert.Equal(new LocalResultExportKey(
+            LocalResultOwnerKind.StandaloneShareBatch,
+            seeded.Batch.Id,
+            LocalResultExportKind.StandaloneShareWorkbook,
+            1), Assert.Single(exportStore.Keys));
+    }
+
+    [Fact]
+    public async Task MissingOrUnmatchedProjectionNeverLeaksUrlAndExportReadFailureIsBlank()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.CompletedWithFailures, 1);
+        var projections = new FakeResultProjectionRepository();
+        var unrelated = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(), seeded.Batch.Id, Selection(AccountA, "unrelated"), 99, DateTimeOffset.UtcNow);
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(unrelated, "https://pan.baidu.com/s/must-not-leak", "zzzz")], null);
+        var exportStore = new FakeLocalResultExportStore { Error = new IOException("private path") };
+        var vm = Fixture(store: store, projectionRepository: projections, exportStore: exportStore);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        var row = Assert.Single(vm.ResultRows);
+        Assert.Null(row.NewShareUrl);
+        Assert.Null(row.NewExtractionCode);
+        Assert.Equal(string.Empty, row.ResultSaveStatus);
+        Assert.Same(seeded.Batch, vm.SelectedBatch);
+        Assert.Single(vm.Operations);
+        Assert.DoesNotContain("must-not-leak", vm.StatusMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RepeatedProjectionCursorFailsClosedWithoutKeepingPartialLinks()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 2);
+        var first = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var second = store.ReplaceOperation(
+            seeded.Batch.Id, 1,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(first, "https://pan.baidu.com/s/partial-one", "1111")], first.SequenceNumber);
+        projections.Pages[first.SequenceNumber] = new StandaloneShareResultProjectionPage(
+            [Projection(second, "https://pan.baidu.com/s/partial-two", "2222")], first.SequenceNumber);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.Equal([0, first.SequenceNumber], projections.AfterSequenceNumbers);
+        Assert.All(vm.ResultRows, row =>
+        {
+            Assert.Null(row.NewShareUrl);
+            Assert.Null(row.NewExtractionCode);
+        });
+        Assert.Contains(vm.Logs, entry =>
+            entry.Level == WorkspaceLogLevel.Warning &&
+            entry.Message == "分享结果暂时无法完整显示，请稍后刷新。");
+    }
+
+    [Fact]
+    public async Task SameOperationWithStaleSequenceNeverExposesProjectedLink()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var succeeded = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [new StandaloneShareResultProjection(
+                succeeded.Id,
+                succeeded.SequenceNumber + 1,
+                AccountA.DisplayName,
+                succeeded.DisplayName,
+                succeeded.Kind,
+                StandaloneShareOperationStatus.Succeeded,
+                "https://pan.baidu.com/s/stale-sequence",
+                "1234",
+                null)],
+            null);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        var row = Assert.Single(vm.ResultRows);
+        Assert.Null(row.NewShareUrl);
+        Assert.Null(row.NewExtractionCode);
+    }
+
+    [Theory]
+    [InlineData(StandaloneShareOperationStatus.Queued, StandaloneShareOperationStatus.Succeeded)]
+    [InlineData(StandaloneShareOperationStatus.Succeeded, StandaloneShareOperationStatus.ResultPending)]
+    public async Task NonSuccessfulOperationOrProjectionNeverExposesProjectedLink(
+        StandaloneShareOperationStatus operationStatus,
+        StandaloneShareOperationStatus projectionStatus)
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.CompletedWithFailures, 1);
+        var operation = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            current => RebuildOperation(
+                current,
+                operationStatus,
+                operationStatus == StandaloneShareOperationStatus.Succeeded
+                    ? StandaloneShareSubmissionState.Completed
+                    : StandaloneShareSubmissionState.NotStarted));
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [new StandaloneShareResultProjection(
+                operation.Id,
+                operation.SequenceNumber,
+                AccountA.DisplayName,
+                operation.DisplayName,
+                operation.Kind,
+                projectionStatus,
+                "https://pan.baidu.com/s/status-mismatch",
+                "1234",
+                null)],
+            null);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        var row = Assert.Single(vm.ResultRows);
+        Assert.Null(row.NewShareUrl);
+        Assert.Null(row.NewExtractionCode);
+    }
+
+    [Fact]
+    public async Task SaveResultsRefreshesExportStatusWithoutManualBatchReload()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var exportStore = new FakeLocalResultExportStore
+        {
+            Result = ExportRecord(seeded.Batch.Id, LocalResultExportStatus.Pending),
+        };
+        var exports = new FakeLocalResultExports
+        {
+            AfterExport = _ => exportStore.Result = ExportRecord(
+                seeded.Batch.Id, LocalResultExportStatus.Succeeded),
+        };
+        var vm = Fixture(store: store, exports: exports, exportStore: exportStore);
+        vm.SelectedBatch = seeded.Batch;
+        await vm.LoadSelectedBatchAsync();
+        Assert.Equal("等待保存", Assert.Single(vm.ResultRows).ResultSaveStatus);
+
+        await vm.SaveResultsAsync();
+
+        Assert.Equal("已保存", Assert.Single(vm.ResultRows).ResultSaveStatus);
+        Assert.Equal(2, exportStore.Keys.Count);
+    }
+
+    [Fact]
+    public void ResultDisplayRowToStringNeverContainsUserContentOrCredentials()
+    {
+        var operation = StandaloneShareOperationRecord.Create(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            Selection(AccountA, "private-item"),
+            1,
+            DateTimeOffset.UtcNow);
+        var row = new ShareResultDisplayRow(
+            operation,
+            "私人标题",
+            "私人账号",
+            "已完成",
+            "https://pan.baidu.com/s/private-link",
+            "A1b2",
+            operation.UpdatedAt,
+            "已保存");
+
+        var text = row.ToString();
+
+        Assert.Contains(operation.Id.ToString("D"), text, StringComparison.Ordinal);
+        Assert.DoesNotContain("私人标题", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("私人账号", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-link", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("A1b2", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SelectingAnotherBatchImmediatelyClearsPreviouslyLoadedDetails()
+    {
+        var store = new FakeStore();
+        var oldSeed = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var oldOperation = store.ReplaceOperation(
+            oldSeed.Batch.Id, 0,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var nextBatch = store.SeedBatch(StandaloneShareBatchStatus.Completed, createdMinutesAgo: 2);
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(oldOperation, "https://pan.baidu.com/s/old-batch", "old1")], null);
+        var vm = Fixture(store: store, projectionRepository: projections, exports: new FakeLocalResultExports());
+        vm.SelectedBatch = oldSeed.Batch;
+        await vm.LoadSelectedBatchAsync();
+        Assert.Equal("https://pan.baidu.com/s/old-batch", Assert.Single(vm.ResultRows).NewShareUrl);
+
+        vm.SelectedBatch = nextBatch;
+
+        Assert.Empty(vm.Operations);
+        Assert.Empty(vm.ResultRows);
+        Assert.Null(vm.SelectedOperation);
+        Assert.False(vm.CanSaveResults);
+    }
+
+    [Fact]
+    public async Task SwitchingBeforeSaveCannotExportOrRebuildFromPreviousBatchDetails()
+    {
+        var store = new FakeStore();
+        var oldSeed = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var oldOperation = store.ReplaceOperation(
+            oldSeed.Batch.Id, 0,
+            operation => RebuildOperation(
+                operation,
+                StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var nextBatch = store.SeedBatch(StandaloneShareBatchStatus.Completed, createdMinutesAgo: 2);
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(oldOperation, "https://pan.baidu.com/s/old-before-save", "old2")], null);
+        var exports = new FakeLocalResultExports();
+        var vm = Fixture(store: store, projectionRepository: projections, exports: exports);
+        vm.SelectedBatch = oldSeed.Batch;
+        await vm.LoadSelectedBatchAsync();
+
+        vm.SelectedBatch = nextBatch;
+        await vm.SaveResultsAsync();
+
+        Assert.Empty(exports.BatchIds);
+        Assert.Empty(vm.Operations);
+        Assert.Empty(vm.ResultRows);
+    }
+
+    [Fact]
+    public async Task SkippedProjectionSequenceFailsClosedForTheWholeBatch()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 2);
+        var first = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            operation => RebuildOperation(operation, StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var second = store.ReplaceOperation(
+            seeded.Batch.Id, 1,
+            operation => RebuildOperation(operation, StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(
+            [Projection(second, "https://pan.baidu.com/s/skipped", "2222")], null);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.All(vm.ResultRows, row => Assert.Null(row.NewShareUrl));
+        Assert.Contains(vm.Logs, entry => entry.Message == "分享结果暂时无法完整显示，请稍后刷新。");
+        Assert.NotEqual(first.Id, second.Id);
+    }
+
+    [Fact]
+    public async Task EmptyPageWithIncreasingCursorFailsClosed()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 1);
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage([], 1);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.Null(Assert.Single(vm.ResultRows).NewShareUrl);
+        Assert.Equal([0], projections.AfterSequenceNumbers);
+        Assert.Contains(vm.Logs, entry => entry.Message == "分享结果暂时无法完整显示，请稍后刷新。");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task MissingOrUnmatchedProjectionRowFailsClosedForTheWholeBatch(bool unmatched)
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 2);
+        var first = store.ReplaceOperation(
+            seeded.Batch.Id, 0,
+            operation => RebuildOperation(operation, StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var second = store.ReplaceOperation(
+            seeded.Batch.Id, 1,
+            operation => RebuildOperation(operation, StandaloneShareOperationStatus.Succeeded,
+                StandaloneShareSubmissionState.Completed));
+        var pageItems = new List<StandaloneShareResultProjection>
+        {
+            Projection(first, "https://pan.baidu.com/s/first", "1111"),
+        };
+        if (unmatched)
+        {
+            pageItems.Add(new StandaloneShareResultProjection(
+                Guid.NewGuid(), second.SequenceNumber, AccountA.DisplayName, second.DisplayName,
+                second.Kind, StandaloneShareOperationStatus.Succeeded,
+                "https://pan.baidu.com/s/unmatched", "2222", null));
+        }
+        var projections = new FakeResultProjectionRepository();
+        projections.Pages[0] = new StandaloneShareResultProjectionPage(pageItems, null);
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.All(vm.ResultRows, row => Assert.Null(row.NewShareUrl));
+        Assert.Contains(vm.Logs, entry => entry.Message == "分享结果暂时无法完整显示，请稍后刷新。");
+    }
+
+    [Fact]
+    public async Task MoreThanTenThousandLoadedOperationsNeverRequestsOrExposesProjection()
+    {
+        var store = new FakeStore();
+        var seeded = store.SeedBatchWithOperations(StandaloneShareBatchStatus.Completed, 10_001);
+        var projections = new FakeResultProjectionRepository();
+        var vm = Fixture(store: store, projectionRepository: projections);
+        vm.SelectedBatch = seeded.Batch;
+
+        await vm.LoadSelectedBatchAsync();
+
+        Assert.Empty(projections.AfterSequenceNumbers);
+        Assert.Equal(10_001, vm.ResultRows.Count);
+        Assert.All(vm.ResultRows, row => Assert.Null(row.NewShareUrl));
+        Assert.Contains(vm.Logs, entry => entry.Message == "分享结果暂时无法完整显示，请稍后刷新。");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ShareWorkbenchKeepsDataUsableAndLogFixedAtMinimumSizeOnSta(bool expanded)
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var xaml = File.ReadAllText(Path.Combine(
+                    FindRepositoryRoot(), "src", "BaiduBatchTransfer.App", "Features", "Shares", "ShareWorkspaceView.xaml"));
+                xaml = xaml.Replace(
+                    " x:Class=\"BaiduBatchTransfer.App.Features.Shares.ShareWorkspaceView\"",
+                    string.Empty,
+                    StringComparison.Ordinal);
+                var openingTagEnd = xaml.IndexOf('>');
+                const string resources = """
+                    <UserControl.Resources>
+                        <ResourceDictionary>
+                            <ResourceDictionary.MergedDictionaries>
+                                <ResourceDictionary Source="/BaiduBatchTransfer.App;component/Styles/SuperPanTheme.xaml" />
+                            </ResourceDictionary.MergedDictionaries>
+                            <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+                        </ResourceDictionary>
+                    </UserControl.Resources>
+                    """;
+                xaml = xaml.Insert(openingTagEnd + 1, resources);
+                var view = Assert.IsType<UserControl>(XamlReader.Parse(xaml));
+                var advanced = Assert.IsType<Expander>(view.FindName("AdvancedSettingsExpander"));
+                advanced.IsExpanded = expanded;
+                var available = new Size(716, 500);
+
+                view.Measure(available);
+                view.Arrange(new Rect(available));
+                view.UpdateLayout();
+
+                var toolbar = Assert.IsType<Border>(view.FindName("ShareToolbar"));
+                var wrap = Assert.IsType<WrapPanel>(view.FindName("ShareToolbarWrap"));
+                var data = Assert.IsType<Border>(view.FindName("ShareDataRegion"));
+                var log = Assert.IsType<Border>(view.FindName("ShareLogRegion"));
+                Assert.InRange(view.DesiredSize.Width, 1, available.Width);
+                Assert.InRange(toolbar.ActualWidth, 1, available.Width);
+                Assert.InRange(wrap.DesiredSize.Width, 1, toolbar.ActualWidth);
+                Assert.InRange(log.ActualHeight, 169.5, 170.5);
+                Assert.True(data.ActualHeight >= 80, $"Data region height was {data.ActualHeight:N1}px.");
+                if (expanded)
+                {
+                    var scroll = Assert.IsType<ScrollViewer>(view.FindName("AdvancedSettingsScrollViewer"));
+                    Assert.InRange(scroll.ActualHeight, 1, 110);
+                }
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                Dispatcher.CurrentDispatcher.InvokeShutdown();
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(10)), "STA share measure test timed out.");
+        if (failure is not null) throw new TargetInvocationException(failure);
+    }
+
     private static ShareWorkspaceViewModel Fixture(
         FakeStore? store = null,
         FakePicker? picker = null,
         IResultSaveDialog? resultDialog = null,
         ShareAccountOption? activeAccount = null,
         int historyPageSize = 20,
-        ILocalResultExportCoordinator? exports = null)
+        ILocalResultExportCoordinator? exports = null,
+        IStandaloneShareResultProjectionRepository? projectionRepository = null,
+        ILocalResultExportStore? exportStore = null,
+        ILicenseAuthorizationGate? licenseGate = null)
     {
         var vm = new ShareWorkspaceViewModel(
             [AccountA, AccountB],
@@ -800,9 +1436,24 @@ public sealed class ShareWorkspaceViewModelTests
             resultDialog ?? new FakeResultDialog(null),
             TimeProvider.System,
             historyPageSize,
-            localResultExports: exports);
+            localResultExports: exports,
+            resultProjectionRepository: projectionRepository,
+            localResultExportStore: exportStore,
+            licenseGate: licenseGate);
         vm.ActiveAccount = activeAccount;
         return vm;
+    }
+
+    private sealed class RecordingLicenseGate(bool isAuthorized) : ILicenseAuthorizationGate
+    {
+        public List<LicenseOperationKind> Operations { get; } = [];
+        public Task<LicenseGateResult> AuthorizeAsync(LicenseOperationKind operation, CancellationToken cancellationToken)
+        {
+            Operations.Add(operation);
+            return Task.FromResult(new LicenseGateResult(
+                operation, isAuthorized, UsedCachedLease: false,
+                isAuthorized ? LicenseCodes.Ok : "activation_required"));
+        }
     }
 
     private static OwnedRemoteSelection Selection(
@@ -827,6 +1478,41 @@ public sealed class ShareWorkspaceViewModelTests
             operation.DisplayName, operation.Kind, operation.ParentPath, operation.SequenceNumber,
             generation ?? operation.Generation, status, submissionState, revision ?? operation.Revision,
             operation.CreatedAt, DateTimeOffset.UtcNow);
+
+    private static StandaloneShareResultProjection Projection(
+        StandaloneShareOperationRecord operation,
+        string? url,
+        string? code) => new(
+            operation.Id,
+            operation.SequenceNumber,
+            AccountA.DisplayName,
+            operation.DisplayName,
+            operation.Kind,
+            operation.Status,
+            url,
+            code,
+            null);
+
+    private static LocalResultExportRecord ExportRecord(Guid batchId, LocalResultExportStatus status)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new LocalResultExportRecord(
+            Guid.NewGuid(),
+            new LocalResultExportKey(
+                LocalResultOwnerKind.StandaloneShareBatch,
+                batchId,
+                LocalResultExportKind.StandaloneShareWorkbook,
+                1),
+            status,
+            "results.xlsx",
+            status == LocalResultExportStatus.Succeeded ? "results.xlsx" : null,
+            null,
+            0,
+            null,
+            0,
+            now,
+            now);
+    }
 
     private static string FindRepositoryRoot([System.Runtime.CompilerServices.CallerFilePath] string sourceFilePath = "")
     {
@@ -878,11 +1564,13 @@ public sealed class ShareWorkspaceViewModelTests
     private sealed class FakeLocalResultExports : ILocalResultExportCoordinator
     {
         public List<Guid> BatchIds { get; } = [];
+        public Action<Guid>? AfterExport { get; init; }
 
         public Task<LocalResultExportOutcome> ExportStandaloneAsync(
             Guid batchId, CancellationToken cancellationToken = default)
         {
             BatchIds.Add(batchId);
+            AfterExport?.Invoke(batchId);
             return Task.FromResult(new LocalResultExportOutcome(LocalResultExportDisposition.Exported, "results.xlsx"));
         }
 
@@ -891,6 +1579,81 @@ public sealed class ShareWorkspaceViewModelTests
             throw new NotSupportedException();
 
         public Task<int> RecoverAsync(CancellationToken cancellationToken = default) => Task.FromResult(0);
+    }
+
+    private sealed class FakeResultProjectionRepository : IStandaloneShareResultProjectionRepository
+    {
+        public Dictionary<int, StandaloneShareResultProjectionPage> Pages { get; } = [];
+        public List<int> AfterSequenceNumbers { get; } = [];
+        public List<int> PageSizes { get; } = [];
+
+        public Task<StandaloneShareResultProjectionPage> GetPageAsync(
+            Guid batchId,
+            int afterSequenceNumber,
+            int pageSize,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            AfterSequenceNumbers.Add(afterSequenceNumber);
+            PageSizes.Add(pageSize);
+            return Task.FromResult(Pages.TryGetValue(afterSequenceNumber, out var page)
+                ? page
+                : new StandaloneShareResultProjectionPage([], null));
+        }
+    }
+
+    private sealed class FakeLocalResultExportStore : ILocalResultExportStore
+    {
+        public LocalResultExportRecord? Result { get; set; }
+        public Exception? Error { get; init; }
+        public List<LocalResultExportKey> Keys { get; } = [];
+
+        public Task<LocalResultExportRecord?> GetAsync(
+            LocalResultExportKey key,
+            CancellationToken cancellationToken = default)
+        {
+            Keys.Add(key);
+            if (Error is not null) throw Error;
+            return Task.FromResult(Result);
+        }
+
+        public Task<LocalResultExportRecord> CreateOrGetAsync(
+            LocalResultExportRequest request,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<Page<LocalResultExportRecord>> GetPageAsync(
+            PageQuery query,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<LocalResultExportLease?> TryAcquireAsync(
+            LocalResultExportKey key,
+            long expectedRevision,
+            Guid leaseOwnerId,
+            DateTimeOffset now,
+            DateTimeOffset leaseExpiresAt,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> TryCompleteAsync(
+            Guid exportId,
+            int expectedGeneration,
+            long expectedLeaseGeneration,
+            Guid expectedLeaseOwnerId,
+            long expectedRevision,
+            DateTimeOffset expectedLeaseExpiresAt,
+            string finalFileName,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> TryFailAsync(
+            Guid exportId,
+            int expectedGeneration,
+            long expectedLeaseGeneration,
+            Guid expectedLeaseOwnerId,
+            long expectedRevision,
+            DateTimeOffset expectedLeaseExpiresAt,
+            string sanitizedErrorCode,
+            DateTimeOffset updatedAt,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> RecoverExpiredAsync(
+            DateTimeOffset now,
+            int maximumCount,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeStore : IStandaloneShareStore
@@ -1112,12 +1875,38 @@ public sealed class ShareWorkspaceViewModelTests
             return batch;
         }
 
+        public (StandaloneShareBatchRecord Batch, IReadOnlyList<StandaloneShareOperationRecord> Operations)
+            SeedBatchWithOperations(StandaloneShareBatchStatus status, int operationCount)
+        {
+            var createdAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+            var batch = new StandaloneShareBatchRecord(
+                Guid.NewGuid(), @"C:\结果", status, operationCount, 0, createdAt, createdAt);
+            var seededOperations = Enumerable.Range(1, operationCount)
+                .Select(sequence => StandaloneShareOperationRecord.Create(
+                    Guid.NewGuid(), batch.Id, Selection(AccountA, $"item-{sequence}"), sequence,
+                    createdAt.AddSeconds(sequence)))
+                .ToArray();
+            batches.Add(batch);
+            operations.Add(batch.Id, seededOperations.ToList());
+            return (batch, seededOperations);
+        }
+
         public StandaloneShareOperationRecord ReplaceOnlyOperation(
             Guid batchId,
             Func<StandaloneShareOperationRecord, StandaloneShareOperationRecord> replace)
         {
             var updated = replace(Assert.Single(operations[batchId]));
             operations[batchId][0] = updated;
+            return updated;
+        }
+
+        public StandaloneShareOperationRecord ReplaceOperation(
+            Guid batchId,
+            int index,
+            Func<StandaloneShareOperationRecord, StandaloneShareOperationRecord> replace)
+        {
+            var updated = replace(operations[batchId][index]);
+            operations[batchId][index] = updated;
             return updated;
         }
 

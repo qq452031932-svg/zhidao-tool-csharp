@@ -17,6 +17,10 @@ public sealed class AccountCapacityRefreshServiceTests
         var adapter = new FakeAdapter
         {
             CapacityResult = BaiduAdapterResult<AccountCapacity>.Success(new(100, 25)),
+            IdentityResult = BaiduAdapterResult<BaiduAccountIdentity>.Success(new(
+                "baidu-user",
+                "测试账号",
+                new Uri("https://himg.bdimg.com/sys/portrait/item/test.jpg"))),
         };
         var capacities = new FakeCapacityStore();
         var service = Service(sessions, adapter, capacities);
@@ -26,10 +30,36 @@ public sealed class AccountCapacityRefreshServiceTests
         Assert.Equal(AccountCapacityRefreshDisposition.Updated, result.Disposition);
         Assert.Equal(100, result.Capacity!.TotalBytes);
         Assert.Equal(25, result.Capacity.UsedBytes);
+        Assert.Equal(new Uri("https://himg.bdimg.com/sys/portrait/item/test.jpg"), result.AvatarUri);
         Assert.Equal(AccountId, capacities.AccountId);
         Assert.Equal("baidu-user", capacities.BaiduUserId);
         Assert.Equal(Now, capacities.ValidatedAt);
         Assert.Equal(1, adapter.CapacityCalls);
+        Assert.Equal(1, adapter.IdentityCalls);
+    }
+
+    [Fact]
+    public async Task RefreshedIdentityMustStillMatchTheBoundAccount()
+    {
+        var adapter = new FakeAdapter
+        {
+            CapacityResult = BaiduAdapterResult<AccountCapacity>.Success(new(100, 25)),
+            IdentityResult = BaiduAdapterResult<BaiduAccountIdentity>.Success(new(
+                "different-user",
+                "其他账号",
+                new Uri("https://himg.bdimg.com/sys/portrait/item/other.jpg"))),
+        };
+        var capacities = new FakeCapacityStore();
+
+        var result = await Service(
+            new FakeSessionStore { Session = Session(AccountId, "baidu-user") },
+            adapter,
+            capacities).RefreshAsync(AccountId);
+
+        Assert.Equal(AccountCapacityRefreshDisposition.AccountChanged, result.Disposition);
+        Assert.Null(result.Capacity);
+        Assert.Null(result.AvatarUri);
+        Assert.Equal(0, capacities.UpdateCalls);
     }
 
     [Fact]
@@ -174,6 +204,9 @@ public sealed class AccountCapacityRefreshServiceTests
             BaiduAdapterResult<AccountCapacity>.Success(new(100, 25));
         public bool Throw { get; init; }
         public int CapacityCalls { get; private set; }
+        public int IdentityCalls { get; private set; }
+        public BaiduAdapterResult<BaiduAccountIdentity> IdentityResult { get; init; } =
+            BaiduAdapterResult<BaiduAccountIdentity>.Success(new("baidu-user", "测试账号"));
 
         public Task<BaiduAdapterResult<AccountCapacity>> GetCapacityAsync(
             AccountSession session,
@@ -185,7 +218,12 @@ public sealed class AccountCapacityRefreshServiceTests
             return Task.FromResult(CapacityResult);
         }
 
-        public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<BaiduAdapterResult<BaiduAccountIdentity>> ValidateSessionAsync(AccountSession session, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            IdentityCalls++;
+            return Task.FromResult(IdentityResult);
+        }
         public Task<BaiduAdapterResult<ImmutableArray<RemoteDirectory>>> ListDirectoriesAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<RemoteDirectory>> EnsureDirectoryAsync(AccountSession session, RemotePath path, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<BaiduAdapterResult<ShareMetadata>> InspectShareAsync(AccountSession session, ShareReference share, CancellationToken cancellationToken) => throw new NotSupportedException();

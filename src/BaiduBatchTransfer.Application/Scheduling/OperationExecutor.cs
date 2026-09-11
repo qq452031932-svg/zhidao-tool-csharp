@@ -84,6 +84,15 @@ public interface IOperationExecutionStore
         DateTimeOffset now,
         CancellationToken cancellationToken = default,
         int? expectedAttemptCount = null);
+    Task MarkPreparationOutcomeUnknownAsync(
+        Guid operationId,
+        string code,
+        string safeMessage,
+        SubmissionAcceptance submissionAcceptance,
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default,
+        int? expectedAttemptCount = null) =>
+        throw new NotSupportedException("The execution store does not support unknown preparation outcomes.");
     Task PauseAccountBeforeSubmissionAsync(
         Guid operationId,
         string code,
@@ -129,13 +138,16 @@ public sealed class TimeProviderDelay(TimeProvider timeProvider) : IAsyncDelay
 public sealed class OperationExecutor : ITransferOperationExecutor
 {
     private static readonly TimeSpan ConfirmationWindow = TimeSpan.FromMinutes(10);
-    private readonly IBaiduNetdiskAdapter adapter;
-    private readonly IBaiduSessionStore sessionStore;
+    private readonly IBaiduNetdiskAdapter? adapter;
+    private readonly IBaiduSessionStore? sessionStore;
+    private readonly ExecutionBoundTransferAdapter? boundAdapter;
+    private readonly IBaiduExecutionContextResolver? contextResolver;
     private readonly IOperationExecutionStore store;
     private readonly AccountDailyLimitService dailyLimit;
     private readonly RetryPolicy retryPolicy;
     private readonly IAsyncDelay delay;
     private readonly TimeProvider timeProvider;
+    private readonly bool allowLegacySessionForAnyProfile;
 
     public OperationExecutor(
         IBaiduNetdiskAdapter adapter,
@@ -144,10 +156,35 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         AccountDailyLimitService dailyLimit,
         RetryPolicy? retryPolicy = null,
         IAsyncDelay? delay = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        bool allowLegacySessionForAnyProfile = false)
     {
         this.adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         this.sessionStore = sessionStore ?? throw new ArgumentNullException(nameof(sessionStore));
+        this.store = store ?? throw new ArgumentNullException(nameof(store));
+        this.dailyLimit = dailyLimit ?? throw new ArgumentNullException(nameof(dailyLimit));
+        this.retryPolicy = retryPolicy ?? RetryPolicy.Default;
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.delay = delay ?? new TimeProviderDelay(this.timeProvider);
+        this.allowLegacySessionForAnyProfile = allowLegacySessionForAnyProfile;
+    }
+
+    /// <summary>
+    /// Uses the snapshotted engine and persisted account/session binding. Concrete adapters must
+    /// still enforce live identity, concurrency, ownership and write authorization; resolving a
+    /// stored binding does not authorize a page action. This constructor is explicitly opt-in.
+    /// </summary>
+    public OperationExecutor(
+        ExecutionBoundTransferAdapter adapter,
+        IBaiduExecutionContextResolver contextResolver,
+        IOperationExecutionStore store,
+        AccountDailyLimitService dailyLimit,
+        RetryPolicy? retryPolicy = null,
+        IAsyncDelay? delay = null,
+        TimeProvider? timeProvider = null)
+    {
+        boundAdapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+        this.contextResolver = contextResolver ?? throw new ArgumentNullException(nameof(contextResolver));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.dailyLimit = dailyLimit ?? throw new ArgumentNullException(nameof(dailyLimit));
         this.retryPolicy = retryPolicy ?? RetryPolicy.Default;
@@ -158,6 +195,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
     public async Task ExecuteAsync(Guid operationId, CancellationToken cancellationToken = default)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("An operation ID is required.", nameof(operationId));
+        cancellationToken.ThrowIfCancellationRequested();
         OperationExecutionSnapshot? snapshot;
         try
         {
@@ -171,16 +209,53 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             return;
         }
         if (snapshot is null) throw new InvalidOperationException("The scheduled operation no longer exists.");
-        var session = await sessionStore.LoadAsync(snapshot.AccountId.ToString("D"), cancellationToken)
-            .ConfigureAwait(false);
-        if (session is null)
+        cancellationToken.ThrowIfCancellationRequested();
+        BaiduExecutionContext execution;
+        if (contextResolver is not null)
         {
-            await PauseAccountBeforeSubmissionAsync(
-                    snapshot.OperationId, BaiduErrorKind.ExpiredLogin, observedSessionCapturedAtUtc: null,
-                    snapshot.AttemptCount, cancellationToken)
+            var resolution = await contextResolver.ResolveAsync(
+                    snapshot.AccountId, snapshot.ExecutionProfile, cancellationToken)
                 .ConfigureAwait(false);
-            return;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (resolution.Status != BaiduExecutionResolutionStatus.Ready)
+            {
+                await PauseUnresolvedExecutionAsync(snapshot,
+                    resolution.Status == BaiduExecutionResolutionStatus.LoginRequired
+                        ? TransferPauseReason.AccountSessionUnavailable
+                        : TransferPauseReason.UserInterventionRequired,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            execution = resolution.Context!;
         }
+        else
+        {
+            // Old registrations must not run managed snapshots with legacy cookies.
+            if (!allowLegacySessionForAnyProfile &&
+                snapshot.ExecutionProfile.Engine != BaiduExecutionEngine.WebView2V1)
+            {
+                await PauseUnresolvedExecutionAsync(snapshot, TransferPauseReason.UserInterventionRequired,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            var session = await sessionStore!.LoadAsync(snapshot.AccountId.ToString("D"), cancellationToken)
+                .ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (session is null)
+            {
+                await PauseUnresolvedExecutionAsync(snapshot, TransferPauseReason.AccountSessionUnavailable,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            if (allowLegacySessionForAnyProfile && session.LocalAccountId != snapshot.AccountId)
+            {
+                await PauseUnresolvedExecutionAsync(snapshot, TransferPauseReason.UserInterventionRequired,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            execution = BaiduExecutionContext.Legacy(session);
+        }
+        var observedSessionCapturedAtUtc = execution.LegacySession?.CapturedAtUtc;
 
         var now = timeProvider.GetUtcNow();
         await store.MarkPreparingAsync(
@@ -188,7 +263,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         var attemptCount = snapshot.AttemptGenerationPrepared
             ? snapshot.AttemptCount
             : checked(snapshot.AttemptCount + 1);
-        var automationContext = adapter is IOperationBoundBaiduNetdiskAdapter
+        var automationContext = boundAdapter is not null || adapter is IOperationBoundBaiduNetdiskAdapter
             ? new TransferOperationAutomationContext(
                 snapshot.OperationId,
                 snapshot.BatchId,
@@ -214,7 +289,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         try
         {
             directoryResult = await EnsureWithRetryAsync(
-                automationContext, session, completePath, cancellationToken).ConfigureAwait(false);
+                automationContext, execution, completePath, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
         {
@@ -228,7 +303,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             var error = directoryResult.ErrorKind!.Value;
             if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
                 await PauseAccountBeforeSubmissionAsync(
-                    snapshot.OperationId, error, session.CapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
+                    snapshot.OperationId, error, observedSessionCapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
             else if (IsAccountPausingFailure(error))
                 await FailAndPauseAccountAsync(snapshot.OperationId, error, attemptCount, cancellationToken).ConfigureAwait(false);
             else
@@ -243,7 +318,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             {
                 if (directoryError is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
                     await PauseAccountBeforeSubmissionAsync(
-                        snapshot.OperationId, directoryError, session.CapturedAtUtc, attemptCount,
+                        snapshot.OperationId, directoryError, observedSessionCapturedAtUtc, attemptCount,
                         cancellationToken).ConfigureAwait(false);
                 else if (IsAccountPausingFailure(directoryError))
                     await FailAndPauseAccountAsync(
@@ -256,32 +331,41 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                         .ConfigureAwait(false);
                 return;
             }
-            var partialPath = directoryOutcome.ConfirmedPartialPath?.Value ?? "/";
-            await store.MarkResultPendingAsync(
-                snapshot.OperationId,
-                "DirectoryCreationOutcomeUnknown",
-                $"目录创建结果不确定；已确认创建到：{partialPath}",
-                SubmissionAcceptance.DefinitelyNotAccepted,
-                timeProvider.GetUtcNow(),
-                cancellationToken,
-                attemptCount).ConfigureAwait(false);
+            if (execution.Engine == BaiduExecutionEngine.ManagedChromiumV1)
+                await store.MarkPreparationOutcomeUnknownAsync(
+                    snapshot.OperationId,
+                    "PreparationOutcomeUnknown",
+                    "The managed directory preparation outcome is unknown.",
+                    SubmissionAcceptance.Unknown,
+                    timeProvider.GetUtcNow(),
+                    cancellationToken,
+                    attemptCount).ConfigureAwait(false);
+            else
+                await store.MarkResultPendingAsync(
+                    snapshot.OperationId,
+                    "DirectoryCreationOutcomeUnknown",
+                    $"目录创建结果不确定；已确认创建到：{directoryOutcome.ConfirmedPartialPath?.Value ?? "/"}",
+                    SubmissionAcceptance.DefinitelyNotAccepted,
+                    timeProvider.GetUtcNow(),
+                    cancellationToken,
+                    attemptCount).ConfigureAwait(false);
             return;
         }
         var preparedDirectory = directoryOutcome.Directory ??
             throw new InvalidOperationException("Prepared directory evidence is missing.");
 
-        if (adapter is IOperationBoundBaiduNetdiskAdapter operationBoundAdapter)
+        if (boundAdapter is not null || adapter is IOperationBoundBaiduNetdiskAdapter)
         {
             BaiduAdapterResult<TransferPreparationReceipt> preparation;
             try
             {
-                preparation = await operationBoundAdapter.PrepareWholeShareForOperationAsync(
-                    automationContext!,
-                    session,
-                    snapshot.Share,
-                    preparedDirectory,
-                    snapshot.DuplicatePolicy,
-                    cancellationToken).ConfigureAwait(false);
+                preparation = boundAdapter is not null
+                    ? await boundAdapter.PrepareWholeShareForOperationAsync(
+                        automationContext!, execution, snapshot.Share, preparedDirectory,
+                        snapshot.DuplicatePolicy, cancellationToken).ConfigureAwait(false)
+                    : await ((IOperationBoundBaiduNetdiskAdapter)adapter!).PrepareWholeShareForOperationAsync(
+                        automationContext!, execution.LegacySession!, snapshot.Share, preparedDirectory,
+                        snapshot.DuplicatePolicy, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -293,10 +377,24 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             }
             if (!preparation.IsSuccess)
             {
+                if (execution.Engine == BaiduExecutionEngine.ManagedChromiumV1 &&
+                    preparation.SubmissionAcceptance == SubmissionAcceptance.Unknown)
+                {
+                    await store.MarkPreparationOutcomeUnknownAsync(
+                        snapshot.OperationId,
+                        "PreparationOutcomeUnknown",
+                        "The managed directory preparation outcome is unknown.",
+                        SubmissionAcceptance.Unknown,
+                        timeProvider.GetUtcNow(),
+                        cancellationToken,
+                        attemptCount).ConfigureAwait(false);
+                    return;
+                }
+
                 var error = preparation.ErrorKind!.Value;
                 if (error is BaiduErrorKind.ExpiredLogin or BaiduErrorKind.VerificationRequired)
                     await PauseAccountBeforeSubmissionAsync(
-                        snapshot.OperationId, error, session.CapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
+                        snapshot.OperationId, error, observedSessionCapturedAtUtc, attemptCount, cancellationToken).ConfigureAwait(false);
                 else if (IsAccountPausingFailure(error))
                     await FailAndPauseAccountAsync(snapshot.OperationId, error, attemptCount, cancellationToken).ConfigureAwait(false);
                 else
@@ -328,16 +426,20 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         BaiduAdapterResult<TransferReceipt> saveResult;
         try
         {
-            saveResult = adapter is IOperationBoundBaiduNetdiskAdapter operationBound
+            saveResult = boundAdapter is not null
+                ? await boundAdapter.SaveWholeShareForOperationAsync(
+                    automationContext!, execution, snapshot.Share, preparedDirectory,
+                    snapshot.DuplicatePolicy, cancellationToken).ConfigureAwait(false)
+                : adapter is IOperationBoundBaiduNetdiskAdapter operationBound
                 ? await operationBound.SaveWholeShareForOperationAsync(
                     automationContext!,
-                    session,
+                    execution.LegacySession!,
                     snapshot.Share,
                     preparedDirectory,
                     snapshot.DuplicatePolicy,
                     cancellationToken).ConfigureAwait(false)
-                : await adapter.SaveWholeShareAsync(
-                    session,
+                : await adapter!.SaveWholeShareAsync(
+                    execution.LegacySession!,
                     snapshot.Share,
                     preparedDirectory,
                     snapshot.DuplicatePolicy,
@@ -363,7 +465,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
                     snapshot.OperationId,
                     errorKind,
                     saveResult.SubmissionAcceptance,
-                    session.CapturedAtUtc,
+                    observedSessionCapturedAtUtc,
                     attemptCount,
                     cancellationToken).ConfigureAwait(false);
             }
@@ -433,7 +535,7 @@ public sealed class OperationExecutor : ITransferOperationExecutor
 
     private async Task<BaiduAdapterResult<TransferDirectoryPreparationOutcome>> EnsureWithRetryAsync(
         TransferOperationAutomationContext? context,
-        AccountSession session,
+        BaiduExecutionContext execution,
         RemotePath path,
         CancellationToken cancellationToken)
     {
@@ -441,14 +543,19 @@ public sealed class OperationExecutor : ITransferOperationExecutor
         while (true)
         {
             BaiduAdapterResult<TransferDirectoryPreparationOutcome> result;
-            if (context is not null && adapter is IOperationBoundBaiduNetdiskAdapter operationBound)
+            if (boundAdapter is not null)
+            {
+                result = await boundAdapter.EnsureDirectoryForOperationAsync(
+                    context!, execution, path, cancellationToken).ConfigureAwait(false);
+            }
+            else if (context is not null && adapter is IOperationBoundBaiduNetdiskAdapter operationBound)
             {
                 result = await operationBound.EnsureDirectoryForOperationAsync(
-                    context, session, path, cancellationToken).ConfigureAwait(false);
+                    context, execution.LegacySession!, path, cancellationToken).ConfigureAwait(false);
             }
             else
             {
-                var legacy = await adapter.EnsureDirectoryAsync(session, path, cancellationToken)
+                var legacy = await adapter!.EnsureDirectoryAsync(execution.LegacySession!, path, cancellationToken)
                     .ConfigureAwait(false);
                 result = legacy.IsSuccess
                     ? BaiduAdapterResult<TransferDirectoryPreparationOutcome>.Success(
@@ -464,6 +571,12 @@ public sealed class OperationExecutor : ITransferOperationExecutor
             await delay.DelayAsync(decision.Delay, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private Task PauseUnresolvedExecutionAsync(
+        OperationExecutionSnapshot snapshot, TransferPauseReason reason, CancellationToken cancellationToken) =>
+        store.PauseForAccountInterventionAsync(snapshot.OperationId, reason,
+            SubmissionAcceptance.DefinitelyNotAccepted, observedSessionCapturedAtUtc: null,
+            timeProvider.GetUtcNow(), cancellationToken, snapshot.AttemptCount);
 
     private Task FailAsync(
         Guid operationId,

@@ -60,15 +60,19 @@ public sealed class TransferRecoveryAuthorizationSourceTests
             new RemoteItemIdentitySet([new("source", "来源")]), 1, true, true,
             "source-generation", "uid-1", Capability, new string('a', 64));
         var baseline = WebAutomationBaseline.Create(["old"]);
+        var targetFingerprint = TransferTargetPreparationEvidence.ComputeObservationFingerprint(
+            "target-id", new RemotePath("/目标"), 1, true, true,
+            "target-generation", "uid-1", TransferTargetInventoryScope.AllItems, baseline);
         var target = new TransferTargetPreparationEvidence(
             "target-id", new RemotePath("/目标"), 1, true, true,
-            "target-generation", "uid-1", baseline, new string('b', 64));
+            "target-generation", "uid-1", TransferTargetInventoryScope.AllItems,
+            baseline, targetFingerprint);
         var submission = new TransferSubmissionEvidence(
             sourceEvidence.Items.Fingerprint, target.TargetExactId, baseline.Fingerprint,
             "uid-1", Capability, Now.AddMinutes(-1));
         var attempt = new WebAutomationAttemptRecord(
             operationId, accountId, 2, WebAutomationOwnerKind.Transfer,
-            WebAutomationAttemptState.ResultPending, null, baseline, new string('b', 64),
+            WebAutomationAttemptState.ResultPending, null, baseline, targetFingerprint,
             false, 5, Now.AddMinutes(-2), Now.AddMinutes(-1),
             sourceEvidence: sourceEvidence, targetPreparationEvidence: target,
             submissionEvidence: submission);

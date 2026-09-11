@@ -101,6 +101,8 @@ public sealed class BaiduLoginSettlingGate
         }
         return observedAt - authenticatedSince >= delay;
     }
+
+    public void Reset() => authenticatedSince = null;
 }
 
 public static class BaiduLoginDomClickPolicy
@@ -175,6 +177,16 @@ public sealed class BaiduLoginDomAutomationCoordinator
             if (!inProgress) throw new InvalidOperationException("An attempt must begin before completion.");
             inProgress = false;
             succeeded = clickPerformed;
+        }
+    }
+
+    public void Reset()
+    {
+        lock (gate)
+        {
+            inProgress = false;
+            succeeded = false;
+            AttemptCount = 0;
         }
     }
 }

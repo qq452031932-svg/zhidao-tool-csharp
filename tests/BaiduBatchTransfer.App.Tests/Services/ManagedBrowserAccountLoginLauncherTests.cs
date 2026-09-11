@@ -23,6 +23,37 @@ public sealed class ManagedBrowserAccountLoginLauncherTests
         Assert.Equal(id, presenter.Requests[2].AccountId);
     }
 
+    [Fact]
+    public async Task AcceptanceRestartCanResumeTheExactFirstUnboundProfileOnlyOnce()
+    {
+        var presenter = new Presenter();
+        var preserved = Guid.NewGuid();
+        var launcher = new ManagedBrowserAccountLoginLauncher(presenter, preserved);
+
+        await launcher.OpenAsync();
+        await launcher.OpenAsync();
+
+        Assert.Equal(preserved, presenter.Requests[0].AccountId);
+        Assert.NotEqual(preserved, presenter.Requests[1].AccountId);
+        Assert.NotEqual(Guid.Empty, presenter.Requests[1].AccountId);
+    }
+
+    [Theory]
+    [InlineData(false, "--managed-browser-account-id=11111111111111111111111111111111", null)]
+    [InlineData(true, "--managed-browser-account-id=not-a-guid", null)]
+    [InlineData(true, "--managed-browser-account-id=11111111111111111111111111111111",
+        "11111111-1111-1111-1111-111111111111")]
+    public void ResumeProfileArgumentIsAcceptedOnlyInAcceptanceMode(
+        bool acceptanceEnabled,
+        string argument,
+        string? expected)
+    {
+        var result = ManagedBrowserAccountLoginLauncher.ResumeProfileFromStartup(
+            [argument], acceptanceEnabled);
+
+        Assert.Equal(expected is null ? null : Guid.Parse(expected), result);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

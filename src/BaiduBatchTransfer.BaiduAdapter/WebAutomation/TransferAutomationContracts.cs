@@ -16,6 +16,13 @@ public enum TransferRemoteItemKind
     Folder,
 }
 
+/// <summary>Distinguishes complete destination inventory from picker-only child-folder candidates.</summary>
+public enum TransferDirectoryListingScope
+{
+    AllItems = 0,
+    FolderCandidates = 1,
+}
+
 public sealed record TransferRemoteItem
 {
     public TransferRemoteItem(
@@ -68,6 +75,7 @@ public sealed record TransferDirectoryListing
             throw new ArgumentException("Directory item identities must be unique.", nameof(topLevelItems));
         IsComplete = isComplete;
         IsStable = isStable;
+        Scope = TransferDirectoryListingScope.AllItems;
         TopLevelItems = Array.AsReadOnly(snapshot);
         ObservationFingerprint = observationFingerprint;
         DetailedItems = Array.AsReadOnly(snapshot.Select(item => new TransferRemoteItem(
@@ -86,11 +94,13 @@ public sealed record TransferDirectoryListing
         bool isStable,
         string generationToken,
         string baiduUserId,
-        string observationFingerprint)
+        string observationFingerprint,
+        TransferDirectoryListingScope scope)
     {
         ArgumentNullException.ThrowIfNull(directory);
         ArgumentNullException.ThrowIfNull(ancestorExactIds);
         ArgumentNullException.ThrowIfNull(items);
+        if (!Enum.IsDefined(scope)) throw new ArgumentOutOfRangeException(nameof(scope));
         WebAutomationAttemptRecord.ValidateFingerprint(observationFingerprint, nameof(observationFingerprint));
         if (totalCount < 0 || totalCount != items.Count)
             throw new ArgumentOutOfRangeException(nameof(totalCount));
@@ -98,6 +108,9 @@ public sealed record TransferDirectoryListing
             throw new ArgumentException("Directory items cannot contain null values.", nameof(items))).ToArray();
         if (itemSnapshot.Select(item => item.Identity.ExactId).Distinct(StringComparer.Ordinal).Count() != itemSnapshot.Length)
             throw new ArgumentException("Directory item identities must be unique.", nameof(items));
+        if (scope == TransferDirectoryListingScope.FolderCandidates && itemSnapshot.Any(item =>
+                item.Kind != TransferRemoteItemKind.Folder || string.IsNullOrWhiteSpace(item.ExactServerName)))
+            throw new ArgumentException("Folder candidates must be non-blank folders.", nameof(items));
         var ancestorSnapshot = ancestorExactIds.Select(item =>
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(item);
@@ -121,6 +134,7 @@ public sealed record TransferDirectoryListing
         ReachedEnd = reachedEnd;
         IsComplete = reachedEnd && totalCount == itemSnapshot.Length;
         IsStable = isStable;
+        Scope = scope;
         GenerationToken = generationToken.Trim();
         BaiduUserId = baiduUserId.Trim();
         ObservationFingerprint = observationFingerprint;
@@ -135,12 +149,14 @@ public sealed record TransferDirectoryListing
         bool isStable,
         string generationToken,
         string baiduUserId,
-        string observationFingerprint) =>
+        string observationFingerprint,
+        TransferDirectoryListingScope scope = TransferDirectoryListingScope.AllItems) =>
         new(directory, ancestorExactIds, items, totalCount, reachedEnd, isStable,
-            generationToken, baiduUserId, observationFingerprint);
+            generationToken, baiduUserId, observationFingerprint, scope);
 
     public bool IsComplete { get; }
     public bool IsStable { get; }
+    public TransferDirectoryListingScope Scope { get; }
     public IReadOnlyList<RemoteItemIdentity> TopLevelItems { get; }
     public RemoteDirectory? Directory { get; }
     public IReadOnlyList<string> AncestorExactIds { get; }

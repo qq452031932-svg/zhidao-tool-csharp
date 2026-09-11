@@ -2,8 +2,10 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using BaiduBatchTransfer.App.Features.Jobs;
 using BaiduBatchTransfer.Application.Jobs;
+using BaiduBatchTransfer.Application.Scheduling;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App.Features.Common;
 
@@ -16,6 +18,12 @@ public sealed record WorkspaceBatchItem(
     public override string ToString() => DisplayText;
 }
 
+public sealed record WorkspaceBatchTerminalEvent(
+    Guid BatchJobId,
+    string BatchStatus,
+    long? CompleteSuccessCount,
+    long? TerminalProblemCount);
+
 public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 {
     private readonly PauseBatchService pauseService;
@@ -23,11 +31,16 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private readonly RetryFailedTransferService retryService;
     private readonly IWorkspaceBatchHistorySource historySource;
     private readonly int maximumRecentBatches;
+    private readonly IAsyncDelay automaticRefreshDelay;
+    private readonly TimeSpan automaticRefreshInterval;
+    private readonly ILicenseAuthorizationGate? licenseGate;
     private readonly CancellationTokenSource lifetime = new();
+    private CancellationTokenSource? automaticRefresh;
     private WorkspaceBatchItem? selectedBatch;
     private string statusMessage = "尚未开始转存。";
     private bool isBusy;
     private bool isClosed;
+    private readonly HashSet<Guid> notifiedTerminalBatches = [];
 
     public WorkspaceRunPanelViewModel(
         JobResultsViewModel results,
@@ -35,7 +48,10 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         ResumeBatchService resumeService,
         RetryFailedTransferService retryService,
         int maximumRecentBatches = 20,
-        IWorkspaceBatchHistorySource? historySource = null)
+        IWorkspaceBatchHistorySource? historySource = null,
+        IAsyncDelay? automaticRefreshDelay = null,
+        TimeSpan? automaticRefreshInterval = null,
+        ILicenseAuthorizationGate? licenseGate = null)
     {
         if (maximumRecentBatches is < 1 or > 100)
             throw new ArgumentOutOfRangeException(nameof(maximumRecentBatches));
@@ -45,8 +61,13 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         this.retryService = retryService ?? throw new ArgumentNullException(nameof(retryService));
         this.historySource = historySource ?? EmptyWorkspaceBatchHistorySource.Instance;
         this.maximumRecentBatches = maximumRecentBatches;
+        this.automaticRefreshDelay = automaticRefreshDelay ?? new TimeProviderDelay(TimeProvider.System);
+        this.automaticRefreshInterval = automaticRefreshInterval ?? TimeSpan.FromSeconds(5);
+        this.licenseGate = licenseGate;
+        if (this.automaticRefreshInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(automaticRefreshInterval));
         Batches = [];
-        LoadSelectedBatchCommand = new AsyncRelayCommand(LoadSelectedBatchAsync, () => CanUseBatchActions);
+        LoadSelectedBatchCommand = new AsyncRelayCommand(LoadSelectedBatchAsync, () => CanLoadSelectedBatch);
         PauseCommand = new AsyncRelayCommand(PauseAsync, () => CanPause);
         ResumeCommand = new AsyncRelayCommand(ResumeAsync, () => CanResume);
         RetryFailedTransferCommand = new AsyncRelayCommand(
@@ -56,6 +77,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     }
 
     public JobResultsViewModel Results { get; }
+    public event EventHandler<WorkspaceBatchTerminalEvent>? BatchTerminal;
     public ObservableCollection<WorkspaceBatchItem> Batches { get; }
     public WorkspaceBatchItem? SelectedBatch
     {
@@ -64,6 +86,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         {
             if (!SetProperty(ref selectedBatch, value)) return;
             NotifyCommandState();
+            RestartAutomaticRefresh();
         }
     }
     public string StatusMessage { get => statusMessage; private set => SetProperty(ref statusMessage, value); }
@@ -78,6 +101,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     }
     public bool IsClosed => isClosed;
     public bool CanUseBatchActions => !isClosed && !IsBusy && SelectedBatch is not null;
+    public bool CanLoadSelectedBatch => CanUseBatchActions && !Results.IsBusy;
     public bool CanPause => CanUseBatchActions && SelectedBatch!.BatchStatus is "Queued" or "Active";
     public bool CanResume => CanUseBatchActions && SelectedBatch!.BatchStatus == "Paused";
     public bool CanRetryFailedTransfer => CanUseBatchActions &&
@@ -147,7 +171,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     }
 
     public Task LoadSelectedBatchAsync(CancellationToken cancellationToken = default) =>
-        SelectedBatch is { } selected
+        CanLoadSelectedBatch && SelectedBatch is { } selected
             ? LoadBatchAsync(selected.BatchJobId, cancellationToken)
             : Task.CompletedTask;
 
@@ -159,17 +183,20 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
             value => value is PauseBatchDisposition.Paused or PauseBatchDisposition.AlreadyPaused ? "Paused" : null,
             cancellationToken);
 
-    public Task ResumeAsync(CancellationToken cancellationToken = default) =>
-        !CanResume ? Task.CompletedTask :
-        RunBatchActionAsync(
+    public async Task ResumeAsync(CancellationToken cancellationToken = default)
+    {
+        if (!CanResume || !await IsRemoteOperationAuthorizedAsync(cancellationToken).ConfigureAwait(true)) return;
+        await RunBatchActionAsync(
             (batch, token) => resumeService.ResumeAsync(batch, token),
             MapResume,
             value => value is ResumeBatchDisposition.Queued or ResumeBatchDisposition.AlreadyResumed ? "Queued" : null,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(true);
+    }
 
     public async Task RetryFailedTransferAsync(CancellationToken cancellationToken = default)
     {
         if (!CanRetryFailedTransfer || Results.SelectedItem is not { } row) return;
+        if (!await IsRemoteOperationAuthorizedAsync(cancellationToken).ConfigureAwait(true)) return;
         var operation = BeginOperation(cancellationToken);
         if (operation is null) return;
         IsBusy = true;
@@ -200,10 +227,22 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         }
     }
 
+    private async Task<bool> IsRemoteOperationAuthorizedAsync(CancellationToken cancellationToken)
+    {
+        if (licenseGate is null) return true;
+        var result = await licenseGate
+            .AuthorizeAsync(LicenseOperationKind.Transfer, cancellationToken)
+            .ConfigureAwait(true);
+        if (result.IsAuthorized) return true;
+        StatusMessage = "软件尚未激活，联网功能暂不可用。";
+        return false;
+    }
+
     public void Close()
     {
         if (isClosed) return;
         isClosed = true;
+        automaticRefresh?.Cancel();
         lifetime.Cancel();
         OnPropertyChanged(nameof(IsClosed));
         NotifyCommandState();
@@ -218,7 +257,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
 
     private async Task LoadBatchAsync(Guid batchJobId, CancellationToken cancellationToken)
     {
-        if (isClosed || IsBusy) return;
+        if (isClosed || IsBusy || Results.IsBusy) return;
         var operation = BeginOperation(cancellationToken);
         if (operation is null) return;
         IsBusy = true;
@@ -287,6 +326,7 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
     private void NotifyCommandState()
     {
         OnPropertyChanged(nameof(CanUseBatchActions));
+        OnPropertyChanged(nameof(CanLoadSelectedBatch));
         OnPropertyChanged(nameof(CanPause));
         OnPropertyChanged(nameof(CanResume));
         OnPropertyChanged(nameof(CanRetryFailedTransfer));
@@ -305,6 +345,96 @@ public sealed class WorkspaceRunPanelViewModel : ObservableObject, IDisposable
         Batches[index] = updated;
         SelectedBatch = updated;
     }
+
+    private void RestartAutomaticRefresh()
+    {
+        automaticRefresh?.Cancel();
+        automaticRefresh = null;
+        if (isClosed || SelectedBatch is not { BatchStatus: "Queued" or "Active" } selected) return;
+
+        var refresh = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        automaticRefresh = refresh;
+        _ = RunAutomaticRefreshAsync(selected.BatchJobId, refresh);
+    }
+
+    private async Task RunAutomaticRefreshAsync(
+        Guid expectedBatchJobId,
+        CancellationTokenSource refresh)
+    {
+        try
+        {
+            while (!refresh.IsCancellationRequested)
+            {
+                await automaticRefreshDelay.DelayAsync(automaticRefreshInterval, refresh.Token)
+                    .ConfigureAwait(true);
+                if (isClosed || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
+
+                try
+                {
+                    var recent = await historySource.LoadRecentAsync(maximumRecentBatches, refresh.Token)
+                        .ConfigureAwait(true);
+                    if (isClosed || SelectedBatch?.BatchJobId != expectedBatchJobId) return;
+                    var latest = recent.FirstOrDefault(item => item.BatchJobId == expectedBatchJobId);
+                    var shouldFinalize = latest is not null && IsTerminal(latest.BatchStatus) &&
+                        SelectedBatch is { } previous && !IsTerminal(previous.BatchStatus) &&
+                        !notifiedTerminalBatches.Contains(expectedBatchJobId);
+                    if (latest is not null) ApplyAutomaticBatchSnapshot(latest);
+
+                    var statisticsRead = false;
+                    if (shouldFinalize)
+                    {
+                        statisticsRead = await Results.FinalizeForTerminalAsync(
+                                expectedBatchJobId,
+                                () => !isClosed && !refresh.IsCancellationRequested &&
+                                    SelectedBatch?.BatchJobId == expectedBatchJobId,
+                                refresh.Token)
+                            .ConfigureAwait(true);
+                    }
+                    else if (Results.BatchJobId == expectedBatchJobId)
+                        statisticsRead = await Results.RefreshForLifecycleAsync(refresh.Token).ConfigureAwait(true);
+                    if (shouldFinalize && !isClosed &&
+                        SelectedBatch?.BatchJobId == expectedBatchJobId &&
+                        Results.IsFinalizedForLifecycle(expectedBatchJobId) &&
+                        notifiedTerminalBatches.Add(expectedBatchJobId))
+                    {
+                        BatchTerminal?.Invoke(this, new(expectedBatchJobId, latest!.BatchStatus,
+                            statisticsRead ? Results.CompleteSuccessCount : null,
+                            statisticsRead ? Results.TerminalProblemCount : null));
+                    }
+
+                    if (latest is null || latest.BatchStatus is not ("Queued" or "Active")) return;
+                }
+                catch (OperationCanceledException) when (refresh.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception)
+                {
+                    if (!isClosed) StatusMessage = "自动刷新失败，稍后将再次尝试。";
+                }
+            }
+        }
+        catch (OperationCanceledException) when (refresh.IsCancellationRequested) { }
+        finally
+        {
+            if (ReferenceEquals(automaticRefresh, refresh)) automaticRefresh = null;
+            refresh.Dispose();
+        }
+    }
+
+    private void ApplyAutomaticBatchSnapshot(WorkspaceBatchItem latest)
+    {
+        if (SelectedBatch is not { } current) return;
+        var index = Batches.IndexOf(current);
+        if (index < 0) return;
+        Batches[index] = latest;
+        selectedBatch = latest;
+        OnPropertyChanged(nameof(SelectedBatch));
+        NotifyCommandState();
+    }
+
+    private static bool IsTerminal(string status) =>
+        status is "Completed" or "CompletedWithShortfall" or "Cancelled";
 
     private static string MapPause(PauseBatchDisposition value) => value switch
     {

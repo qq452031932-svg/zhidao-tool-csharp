@@ -1,0 +1,37 @@
+{
+  "request": {
+    "protocolVersion": 3,
+    "executionEngineVersion": "ManagedChromium-v3",
+    "correlationId": "11111111-1111-1111-1111-111111111111",
+    "operationId": "22222222-2222-2222-2222-222222222222",
+    "accountId": "33333333-3333-3333-3333-333333333333",
+    "generation": 7,
+    "action": "ReadTransferDirectory",
+    "payload": {
+      "browserId": "44444444-4444-4444-4444-444444444444",
+      "targetId": "synthetic-target",
+      "devToolsEndpoint": "http://127.0.0.1:9222/",
+      "timeoutMilliseconds": 1000,
+      "sourceUri": "https://pan.baidu.com/s/fixture_1?pwd=1234",
+      "expectedBaiduUserId": "synthetic-private-uid",
+      "expectedParentExactId": null,
+      "expectedCanonicalPath": null
+    }
+  },
+  "result": {
+    "kind": "Observed",
+    "baiduUserId": "synthetic-private-uid",
+    "generationToken": "directory-gen-1",
+    "parentExactId": "parent-1",
+    "canonicalPath": "/目标目录",
+    "ancestorExactIds": ["root-1", "parent-1"],
+    "totalCount": 2,
+    "reachedEnd": true,
+    "isStable": true,
+    "items": [
+      { "exactId": "101", "kind": "Folder", "serverName": "测试文件夹" },
+      { "exactId": "202", "kind": "Folder", "serverName": " spaced name " }
+    ],
+    "observationFingerprint": "53d8c07848a9a877545fc8c73521ee559d7041bf16e77ba397a9c5f0b1b06fa4"
+  }
+}

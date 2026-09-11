@@ -45,7 +45,8 @@ public sealed record WizardAccountOption(
     BatchAccountSelectionDecision SelectionDecision,
     bool ShareEnabled = true,
     long PlannedTransferCount = 0,
-    long PlannedShareCount = 0)
+    long PlannedShareCount = 0,
+    ExecutionProfileSnapshot? ExecutionProfile = null)
 {
     public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
 
@@ -78,7 +79,27 @@ public sealed record ImportPreviewRow(
     string? ExtractionCode,
     string? RequestedAccountName,
     string DispositionText,
-    string? PrecheckText);
+    string? PrecheckText,
+    string Disposition = "",
+    string? PrecheckStatus = null) : System.ComponentModel.INotifyPropertyChanged
+{
+    private string? runtimeStatusText;
+    public string Disposition { get; } = Disposition;
+    public string? PrecheckStatus { get; } = PrecheckStatus;
+    public string? RuntimeStatusText
+    {
+        get => runtimeStatusText;
+        set
+        {
+            if (runtimeStatusText == value) return;
+            runtimeStatusText = value;
+            PropertyChanged?.Invoke(this, new(nameof(RuntimeStatusText)));
+            PropertyChanged?.Invoke(this, new(nameof(DisplayDispositionText)));
+        }
+    }
+    public string DisplayDispositionText => RuntimeStatusText ?? DispositionText;
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+}
 
 public sealed record ImportPreviewPage(
     IReadOnlyList<ImportPreviewRow> Items,
@@ -111,7 +132,9 @@ public sealed class ImportPreviewPageSource(ImportPageQuery query) : IImportPrev
                 row.ExtractionCode,
                 row.RequestedAccountName,
                 ImportUiText.Disposition(row.Disposition),
-                ImportUiText.Precheck(row.PrecheckStatus))).ToArray(),
+                ImportUiText.Precheck(row.PrecheckStatus),
+                row.Disposition,
+                row.PrecheckStatus)).ToArray(),
             page.TotalCount,
             page.NextSourceRowNumber);
     }
@@ -124,7 +147,8 @@ public sealed record WizardAccountDraft(
     int TargetItemCount,
     int TargetSuccessCount,
     BatchAccountSelectionDecision SelectionDecision,
-    bool ShareEnabled = true)
+    bool ShareEnabled = true,
+    ExecutionProfileSnapshot? ExecutionProfile = null)
 {
     public bool IsSelected => SelectionDecision == BatchAccountSelectionDecision.Selected;
 
@@ -150,7 +174,11 @@ public sealed record WizardBatchDraft(
     bool IsShareAccessUnlimited = true,
     ShareExtractionCodeBehavior ExtractionCodeBehavior = ShareExtractionCodeBehavior.Random,
     string? FixedExtractionCode = null,
-    string ExistingSharePolicy = "Ask")
+    string ExistingSharePolicy = "Ask",
+    bool AcceptanceOnly = false,
+    string? ResultDirectory = null,
+    bool DirectBackground = false,
+    int MaxConcurrency = 1)
 {
     public override string ToString() =>
         $"WizardBatchDraft {{ Identity = [REDACTED], JobName = [REDACTED], TransferMode = {TransferMode}, QuotaBasis = {QuotaBasis}, Accounts = {Accounts?.Count ?? 0}, PathsAndCodes = [REDACTED], IsSharePermanent = {IsSharePermanent}, IsShareAccessUnlimited = {IsShareAccessUnlimited}, ExtractionCodeBehavior = {ExtractionCodeBehavior}, ExistingSharePolicy = {ExistingSharePolicy} }}";
@@ -379,7 +407,8 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
             account.TargetItemCount,
             account.TargetSuccessCount,
             account.SelectionDecision,
-            account.ShareEnabled)).ToArray(),
+            account.ShareEnabled,
+            account.ExecutionProfile)).ToArray(),
         draft.DefaultTargetPath,
         draft.FolderCreationMode,
         draft.DuplicatePolicy,
@@ -390,7 +419,11 @@ public sealed class WizardBatchService(CreateBatchService service) : IWizardBatc
         draft.IsShareAccessUnlimited,
         draft.ExtractionCodeBehavior,
         draft.FixedExtractionCode,
-        draft.ExistingSharePolicy);
+        draft.ExistingSharePolicy,
+        draft.AcceptanceOnly,
+        draft.ResultDirectory,
+        draft.DirectBackground,
+        draft.MaxConcurrency);
 }
 
 internal static class ImportUiText

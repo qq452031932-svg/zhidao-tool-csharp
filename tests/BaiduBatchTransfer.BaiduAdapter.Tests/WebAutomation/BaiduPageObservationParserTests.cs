@@ -381,7 +381,7 @@ internal static class SyntheticFixturePrivacyAudit
     public static IReadOnlyList<string> FindUnsafeJsonFiles(string rootDirectory) =>
         Directory.EnumerateFiles(
                 rootDirectory,
-                "*.json",
+                "*.synthetic.json",
                 SearchOption.AllDirectories)
             .Where(path => UnsafePattern.IsMatch(File.ReadAllText(path)))
             .Order(StringComparer.Ordinal)

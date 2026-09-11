@@ -27,7 +27,8 @@ public sealed record AddAccountRequest(
     Guid AccountId,
     AccountSession Session,
     DateTimeOffset CreatedAt,
-    AccountProfileOwnership ProfileOwnership);
+    AccountProfileOwnership ProfileOwnership,
+    bool PersistBrowserProfile = true);
 
 public enum AddAccountStatus
 {
@@ -109,18 +110,24 @@ public sealed class AddAccountService
             var result = await AddCoreAsync(request, cancellationToken).ConfigureAwait(false);
             if (result.Status == AddAccountStatus.Added) return result;
 
+            if (!request.PersistBrowserProfile) return result;
+
             var cleanup = await CleanupOwnedProfileAsync(
                 request.AccountId, request.ProfileOwnership, CancellationToken.None).ConfigureAwait(false);
             return result with { ProfileCleanupStatus = cleanup };
         }
         catch (OperationCanceledException exception)
         {
+            if (!request.PersistBrowserProfile)
+                throw new AddAccountCanceledException(request.AccountId, ProfileCleanupStatus.NotRequired, exception);
             var cleanup = await CleanupOwnedProfileAsync(
                 request.AccountId, request.ProfileOwnership, CancellationToken.None).ConfigureAwait(false);
             throw new AddAccountCanceledException(request.AccountId, cleanup, exception);
         }
         catch (Exception exception) when (exception is not AddAccountOperationException)
         {
+            if (!request.PersistBrowserProfile)
+                throw new AddAccountOperationException(request.AccountId, ProfileCleanupStatus.NotRequired, exception);
             var cleanup = await CleanupOwnedProfileAsync(
                 request.AccountId, request.ProfileOwnership, CancellationToken.None).ConfigureAwait(false);
             throw new AddAccountOperationException(request.AccountId, cleanup, exception);
@@ -146,11 +153,14 @@ public sealed class AddAccountService
         if (!IsStableIdentity(identity))
             return new(AddAccountStatus.InvalidIdentity, null, "The service did not report a stable account identity.");
 
-        string profilePath;
-        try { profilePath = profilePaths.GetAccountProfilePath(request.AccountId); }
-        catch (Exception exception) when (IsPathFailure(exception))
+        string? profilePath = null;
+        if (request.PersistBrowserProfile)
         {
-            return new(AddAccountStatus.InvalidProfilePath, null, "The account profile path is not safe.");
+            try { profilePath = profilePaths.GetAccountProfilePath(request.AccountId); }
+            catch (Exception exception) when (IsPathFailure(exception))
+            {
+                return new(AddAccountStatus.InvalidProfilePath, null, "The account profile path is not safe.");
+            }
         }
 
         await using var unit = await unitOfWorkFactory.BeginAsync(cancellationToken).ConfigureAwait(false);
@@ -186,16 +196,18 @@ public sealed class AddAccountService
                 LastValidatedAt = request.CreatedAt.ToUniversalTime(),
                 DailyCountDateKey = request.CreatedAt.ToString("yyyy-MM-dd")
             };
-            var committed = await profileStore.CommitOwnedAsync(
-                request.AccountId,
-                profilePath,
-                request.ProfileOwnership.Token,
-                async token =>
-                {
-                    await unit.Accounts.UpsertAsync(account, token).ConfigureAwait(false);
-                    await unit.CommitAsync(token).ConfigureAwait(false);
-                },
-                cancellationToken).ConfigureAwait(false);
+            var committed = request.PersistBrowserProfile
+                ? await profileStore.CommitOwnedAsync(
+                    request.AccountId,
+                    profilePath!,
+                    request.ProfileOwnership.Token,
+                    async token =>
+                    {
+                        await unit.Accounts.UpsertAsync(account, token).ConfigureAwait(false);
+                        await unit.CommitAsync(token).ConfigureAwait(false);
+                    },
+                    cancellationToken).ConfigureAwait(false)
+                : await CommitCookieOnlyAsync(unit, account, cancellationToken).ConfigureAwait(false);
             if (!committed)
             {
                 await unit.RollbackAsync(cancellationToken).ConfigureAwait(false);
@@ -209,6 +221,16 @@ public sealed class AddAccountService
             catch (Exception) { /* Preserve the original operation failure. */ }
             throw;
         }
+    }
+
+    private static async Task<bool> CommitCookieOnlyAsync(
+        IUnitOfWork unit,
+        AccountRecord account,
+        CancellationToken cancellationToken)
+    {
+        await unit.Accounts.UpsertAsync(account, cancellationToken).ConfigureAwait(false);
+        await unit.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     private async Task<ProfileCleanupStatus> CleanupOwnedProfileAsync(

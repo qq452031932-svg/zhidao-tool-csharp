@@ -1,10 +1,10 @@
 {
     "manifestVersion":  1,
-    "protocolVersion":  1,
-    "executionEngineVersion":  "ManagedChromium-v1",
+    "protocolVersion":  3,
+    "executionEngineVersion":  "ManagedChromium-v3",
     "pythonVersion":  "3.14.0",
     "distributionMode":  "PersonalNonCommercial",
-    "buildIdentity":  "d63d4c3911dbe25f42ee41b107c90f8a087116d1eba79cdb68ef55bbf1ddaa8a",
+    "buildIdentity":  "5e6edba4bda41506597cc9b9a038e15934fae3ea358497691a2276a115594336",
     "files":  [
                   {
                       "path":  "LICENSE.txt",
@@ -107,6 +107,11 @@
                       "sha256":  "74f64a5d724cad1c10ca9ba579b6af198178406b0a4f061685326e79cffa3eea"
                   },
                   {
+                      "path":  "identity_query.py",
+                      "length":  9432,
+                      "sha256":  "9477a703227c01b0dbd717a238d548b323345de5b92a83ed2f2416433c572685"
+                  },
+                  {
                       "path":  "libcrypto-3.dll",
                       "length":  5229424,
                       "sha256":  "e03dd02fdcfb791981c9962827cfcf495f2a47a514c1526efb57f847a9df514a"
@@ -123,13 +128,13 @@
                   },
                   {
                       "path":  "main.py",
-                      "length":  12222,
-                      "sha256":  "a561942fc0568a303308301ec2477d657daa4fe4b280b1bb95be5f2282bbd4f1"
+                      "length":  35276,
+                      "sha256":  "6a1bdb389387325c8ee90ef71a8da15771058bee1e49cbbbde92c0b92e76cd27"
                   },
                   {
                       "path":  "protocol.py",
-                      "length":  12198,
-                      "sha256":  "1243e274696df72dd8fc88de37a3ad6b0a391e26e4dfe6bc8b588750cce7f53c"
+                      "length":  64763,
+                      "sha256":  "3d75d46a44c32016f9f4d7024fa14233ee85c0d855311eae114ed92ad90e2d28"
                   },
                   {
                       "path":  "pyexpat.pyd",
@@ -180,6 +185,16 @@
                       "path":  "select.pyd",
                       "length":  33624,
                       "sha256":  "5c4103eef14aebd195425d42196895ffb87bf6a25ab4651242bebf0a6b25cf1d"
+                  },
+                  {
+                      "path":  "session_operations.py",
+                      "length":  1099,
+                      "sha256":  "f03c10978000a7630ea22d3b37141453ebf82452531eff7361f9379ed7d2ba24"
+                  },
+                  {
+                      "path":  "share_submission.py",
+                      "length":  24763,
+                      "sha256":  "3e3dfcf4c5ff5d31eb74e520d41462a27773aee0eb8602312d433dcbdf0d3e9d"
                   },
                   {
                       "path":  "site-packages/DrissionGet/__init__.py",
@@ -3955,6 +3970,41 @@
                       "path":  "sqlite3.dll",
                       "length":  1584984,
                       "sha256":  "c068490825d8258cfc16e9e2566d6ff5c2cdf91050db36f80ae62f4b2fd37456"
+                  },
+                  {
+                      "path":  "transfer_directory_listing.py",
+                      "length":  15392,
+                      "sha256":  "2903733c6f3fb24cdbc58a34a137fc392003fcee157a0c272b9d51a68ff93bec"
+                  },
+                  {
+                      "path":  "transfer_directory_mutation.py",
+                      "length":  18730,
+                      "sha256":  "4fbde51b4b32bcb0c502540dd391b157e0e880e24f5861136802981ca32017a1"
+                  },
+                  {
+                      "path":  "transfer_picker.py",
+                      "length":  12084,
+                      "sha256":  "976eb58aac53e535e96bd61e1a82681d935acbd75806bb470bf992f7a8b396ef"
+                  },
+                  {
+                      "path":  "transfer_source.py",
+                      "length":  15835,
+                      "sha256":  "9039b9aef2aa90f5717f1f21ef5aa9175a2df0dc1414af33f315c711d7f3fa05"
+                  },
+                  {
+                      "path":  "transfer_source_listing.py",
+                      "length":  14250,
+                      "sha256":  "d0564a604bd41319019bc2688e7cd540e5cfdde53e9514c8d93de1f19846ded4"
+                  },
+                  {
+                      "path":  "transfer_submission.py",
+                      "length":  23548,
+                      "sha256":  "8ece469c51c77842300c60e928fcb77b650e738ea43a461384c6d20ed7296a60"
+                  },
+                  {
+                      "path":  "transfer_target_baseline.py",
+                      "length":  30800,
+                      "sha256":  "250c3f0e03aa68688de053adecc75ea7823b2e0963dae92e3bc409d1cd93a053"
                   },
                   {
                       "path":  "unicodedata.pyd",

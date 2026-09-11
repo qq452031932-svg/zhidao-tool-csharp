@@ -11,6 +11,7 @@ using BaiduBatchTransfer.App.Features.BrowserAutomation;
 using BaiduBatchTransfer.App.Features.ManagedBrowser;
 using BaiduBatchTransfer.App.Features.Results;
 using BaiduBatchTransfer.App.Features.Settings;
+using BaiduBatchTransfer.App.Features.Licensing;
 using BaiduBatchTransfer.App.Services;
 using BaiduBatchTransfer.App.Updates;
 using BaiduBatchTransfer.Application.Accounts;
@@ -30,6 +31,7 @@ using BaiduBatchTransfer.Infrastructure.Security;
 using BaiduBatchTransfer.Infrastructure.SystemIntegration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using SuperPan.Licensing.Client;
 
 namespace BaiduBatchTransfer.App;
 
@@ -111,6 +113,19 @@ public static class AppBootstrap
         startupArguments ??= Array.Empty<string>();
         ArgumentNullException.ThrowIfNull(updateRuntime);
         var buildInfo = ApplicationBuildInfo.Current;
+        services.AddSingleton<LicenseRuntimeAuthorizationState>();
+        LicenseServiceRegistration.Add(
+            services,
+            LicenseRuntimeBuildInfo.Current,
+            startupArguments);
+        if (LicenseRuntimeBuildInfo.Current.Mode != LicenseRuntimeMode.Disabled)
+        {
+            services.AddSingleton<LicenseActivationService>();
+            services.AddSingleton<ILicenseActivationPresenter>(sp =>
+                new WpfLicenseActivationPresenter(
+                    "百度批量转存",
+                    sp.GetRequiredService<LicenseActivationService>().ActivateAsync));
+        }
         services.AddSingleton(buildInfo);
         services.AddSingleton<IApplicationUpdateRuntime>(updateRuntime);
         services.AddSingleton<ApplicationUpdateService>();
@@ -310,6 +325,9 @@ public static class AppBootstrap
         services.AddSingleton<ISessionProtector, DpapiSessionProtector>();
         services.AddSingleton<EncryptedBaiduSessionStore>();
         services.AddSingleton<IBaiduSessionStore>(sp => sp.GetRequiredService<EncryptedBaiduSessionStore>());
+        services.AddSingleton<ITransferTargetDirectorySource, BaiduTransferTargetDirectorySource>();
+        services.AddSingleton<ITransferTargetDirectoryCreator, BaiduTransferTargetDirectoryCreator>();
+        services.AddSingleton<ITransferTargetDirectoryPicker, WpfTransferTargetDirectoryPicker>();
         services.AddSingleton<AccountCapacityRefreshService>();
         services.AddSingleton(_ => new FileSystemManagedBrowserProfilePolicy(paths.RootDirectory));
         services.AddSingleton<IManagedBrowserProfilePolicy>(sp =>
@@ -863,6 +881,7 @@ public sealed class AppShellFactory(
     RetryFailedTransferService retryFailedTransferService,
     IWorkspaceBatchHistorySource batchHistorySource,
     ITransferResultDestinationSink resultDestinationSink,
+    ITransferTargetDirectoryPicker transferTargetDirectoryPicker,
     IRemoteResourcePicker remoteResourcePicker,
     IStandaloneShareStore standaloneShareStore,
     CreateStandaloneShareBatchService standaloneShareBatchService,
@@ -880,7 +899,8 @@ public sealed class AppShellFactory(
     RemoteWriteExecutionMode remoteWriteMode,
     IApplicationUpdateService updateService,
     ApplicationBuildInfo buildInfo,
-    AppRuntimeState runtimeState) : IAppShellFactory
+    AppRuntimeState runtimeState,
+    ILicenseAuthorizationGate licenseGate) : IAppShellFactory
 {
     public async Task<MainWindow> CreateAsync(CancellationToken cancellationToken = default)
     {
@@ -911,7 +931,7 @@ public sealed class AppShellFactory(
             accounts, pageSource, batchService, dialogService, adapterAvailability, draftWorkflow, precheckWorkflow,
             resultCapabilities);
         var resultsViewModel = new JobResultsViewModel(
-            jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction, textClipboard);
+            jobResultsWorkflow, resultSaveDialog, resultCapabilities, existingShareInteraction, textClipboard, licenseGate);
         var transferOptions = new TransferWorkspaceOptions(
             DefaultResultDirectory: Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
@@ -925,7 +945,8 @@ public sealed class AppShellFactory(
             resumeBatchService,
             retryFailedTransferService,
             transferOptions.MaximumRecentBatches,
-            batchHistorySource);
+            batchHistorySource,
+            licenseGate: licenseGate);
 
         async Task DispatchOnUiAsync(Action action)
         {
@@ -995,7 +1016,10 @@ public sealed class AppShellFactory(
             transferOptions,
             remoteWriteMode,
             acceptanceRunner.ExecuteAsync,
-            new LocalResultDirectoryPreparer());
+            new LocalResultDirectoryPreparer(),
+            transferTargetDirectoryPicker,
+            dialogService,
+            licenseGate);
         var transferWorkspace = new TransferWorkspaceView(transferViewModel);
         var homeWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("首页", "功能建设中"));
@@ -1006,7 +1030,8 @@ public sealed class AppShellFactory(
             timeProvider,
             shareAnalyticsDelay,
             shareAnalyticsExportService,
-            resultSaveDialog);
+            resultSaveDialog,
+            licenseGate: licenseGate);
         var shareDataWorkspace = new ShareAnalyticsView(shareAnalyticsViewModel);
         var adInsertionWorkspace = new DeferredWorkspaceView(
             new DeferredWorkspaceViewModel("广告插入", "功能建设中"));
@@ -1037,7 +1062,8 @@ public sealed class AppShellFactory(
             batchService: standaloneShareBatchService,
             localResultExports: localResultExports,
             resultProjectionRepository: standaloneShareResults,
-            localResultExportStore: localResultExportStore);
+            localResultExportStore: localResultExportStore,
+            licenseGate: licenseGate);
         var shareWorkspace = new ShareWorkspaceView(shareViewModel);
         var accountRefresh = new AccountRefreshCoordinator(
             accountProvider,

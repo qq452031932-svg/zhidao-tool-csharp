@@ -180,6 +180,30 @@ public sealed class ShareSubmissionEngine
             : new(ExistingShareAction.Incompatible);
     }
 
+    /// <summary>
+    /// Revalidates a complete discovery returned by an execution-specific adapter. The baseline,
+    /// full listing and exact-match projection must describe the same immutable snapshot.
+    /// </summary>
+    public BaiduAdapterResult<ShareDiscoverySnapshot> ValidateDiscoverySnapshot(
+        PermanentShareRequest request,
+        BaiduAdapterResult<ShareDiscoverySnapshot> discovery)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(discovery);
+        if (!discovery.IsSuccess) return discovery;
+        var snapshot = discovery.Value!;
+        var ids = snapshot.AllItems.Select(item => item.ShareId).ToArray();
+        if (ids.Distinct(StringComparer.Ordinal).Count() != ids.Length ||
+            !string.Equals(WebAutomationBaseline.Create(ids).Fingerprint,
+                snapshot.FullListing.Fingerprint, StringComparison.Ordinal))
+            return Failure("INVALID_SHARE_DISCOVERY_SNAPSHOT");
+        var exact = snapshot.AllItems.Where(item => item.RemoteItems == request.RemoteItems).ToArray();
+        if (exact.Length != snapshot.ExactMatches.Count ||
+            !exact.Zip(snapshot.ExactMatches, Same).All(value => value))
+            return Failure("INVALID_SHARE_DISCOVERY_PROJECTION");
+        return discovery;
+    }
+
     public async Task<BaiduAdapterResult<ShareDiscoverySnapshot>> DiscoverAsync(
         IBaiduShareAdapter adapter,
         AccountSession session,

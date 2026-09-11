@@ -81,6 +81,10 @@ public sealed class LocalResultExportArtifactService(
     {
         ArgumentNullException.ThrowIfNull(owner);
         LocalResultExportValidation.SafeFileName(targetFileName, nameof(targetFileName));
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Path.IsPathFullyQualified(owner.DestinationDirectory))
+            throw new InvalidDataException("The persisted result destination is invalid.");
+        Directory.CreateDirectory(Path.GetFullPath(owner.DestinationDirectory));
         var layout = owner.Key.ExportKind switch
         {
             LocalResultExportKind.ReplacementWorkbook =>

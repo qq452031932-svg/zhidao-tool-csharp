@@ -5,6 +5,18 @@ using BaiduBatchTransfer.Core.Services;
 
 namespace BaiduBatchTransfer.Application.Jobs;
 
+public interface IAcceptanceExecutionProfileStore
+{
+    Task<bool> IsCurrentManagedProfileAsync(
+        Guid accountId,
+        ExecutionProfileSnapshot profile,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> HasExactAcceptanceGraphAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default);
+}
+
 public sealed class BatchDraftValidator
 {
     private const int ReadPageSize = 1_000;
@@ -37,7 +49,9 @@ public sealed class BatchDraftValidator
         await ValidateSessionCountersAsync(session, unit.Imports, cancellationToken).ConfigureAwait(false);
 
         var accountDrafts = SelectAccounts(draft);
-        var accounts = await ValidateAccountsAsync(accountDrafts, unit.Accounts, cancellationToken).ConfigureAwait(false);
+        var acceptanceJobs = draft.AcceptanceOnly ? unit.Jobs : null;
+        var accounts = await ValidateAccountsAsync(
+            accountDrafts, unit.Accounts, acceptanceJobs, draft.AcceptanceOnly, cancellationToken).ConfigureAwait(false);
         var accountIds = accounts.Select(account => account.Draft.AccountId).ToHashSet();
         var rules = await ReadDirectoryRulesAsync(accounts, unit.Accounts, cancellationToken).ConfigureAwait(false);
         var rows = await ReadEligibleRowsAsync(session, draft, accounts, accountIds, rules, cancellationToken, unit.Imports).ConfigureAwait(false);
@@ -135,13 +149,18 @@ public sealed class BatchDraftValidator
                 plannedShareCount: planned.PlannedShareCount,
                 shareEnabled: planned.ShareEnabled,
                 outputOrdinal: planned.OutputOrdinal,
-                outputLabel: planned.OutputLabel);
+                outputLabel: planned.OutputLabel,
+                executionProfile: account.Draft.ExecutionProfile);
         }).ToImmutableArray();
 
         var operationCount = workload.TransferCount;
         var immediateOperationCount = draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.TaskCount
             ? operationCount
             : 0;
+        ValidateAcceptanceShape(
+            draft, rows.Length, confirmations, operationCount, immediateOperationCount, workload.ShareCount);
+        ValidateDirectBackgroundShape(
+            draft, rows.Length, confirmations, operationCount, immediateOperationCount, workload.ShareCount);
         return new ValidatedBatchDraft(
             session,
             rows,
@@ -152,7 +171,10 @@ public sealed class BatchDraftValidator
             outputLayout,
             columnDefinitions.OrderBy(column => column.ColumnOrdinal).ToImmutableArray(),
             BatchConfirmationTokens.ForCreate(
-                draft, session, rows, operationCount, confirmations, rules, columnDefinitions, outputLayout));
+                draft, session, rows, operationCount, confirmations, rules, columnDefinitions, outputLayout),
+            draft.AcceptanceOnly,
+            draft.DirectBackground,
+            draft.MaxConcurrency);
     }
 
     private int ConstraintCount(IReadOnlyDictionary<Guid, long> mappedCounts, Guid accountId)
@@ -212,6 +234,8 @@ public sealed class BatchDraftValidator
     private async Task<ImmutableArray<ValidatedBatchAccount>> ValidateAccountsAsync(
         ImmutableArray<BatchAccountDraft> drafts,
         IAccountRepository repository,
+        IJobRepository? jobs,
+        bool acceptanceOnly,
         CancellationToken cancellationToken)
     {
         var result = ImmutableArray.CreateBuilder<ValidatedBatchAccount>(drafts.Length);
@@ -220,10 +244,84 @@ public sealed class BatchDraftValidator
             var account = await repository.GetByIdAsync(draft.AccountId, cancellationToken).ConfigureAwait(false);
             if (account is null || account.IsDeleted || !account.IsEnabled || account.Status != "Active")
                 throw new BatchDraftValidationException("A participating account is unavailable.");
+            if (acceptanceOnly)
+            {
+                if (draft.ExecutionProfile.Engine != BaiduExecutionEngine.ManagedChromiumV1 ||
+                    jobs is not IAcceptanceExecutionProfileStore profiles ||
+                    !await profiles.IsCurrentManagedProfileAsync(
+                        draft.AccountId, draft.ExecutionProfile, cancellationToken).ConfigureAwait(false))
+                    throw new BatchDraftValidationException("AcceptanceOnly requires the current active Managed Chromium session.");
+            }
             var normalized = NormalizePath(draft.DefaultTargetPath);
             result.Add(new ValidatedBatchAccount(draft, normalized, account));
         }
         return result.MoveToImmutable();
+    }
+
+    private static void ValidateAcceptanceShape(
+        BatchDraft draft,
+        int resourceCount,
+        ImmutableArray<BatchAccountConfirmation> accounts,
+        long operationCount,
+        long immediateOperationCount,
+        long shareOperationCount)
+    {
+        if (!draft.AcceptanceOnly) return;
+        if (draft.Accounts.Length != 1 || accounts.Length != 1 ||
+            draft.TransferMode != TransferMode.Distribution || draft.QuotaBasis != QuotaBasis.TaskCount ||
+            resourceCount != 1 || operationCount != 1 || immediateOperationCount != 1 ||
+            shareOperationCount != 1 || !accounts[0].ShareEnabled)
+            throw new BatchDraftValidationException(
+                "AcceptanceOnly requires exactly one resource, one Managed account, one transfer, and one linked share.");
+        try
+        {
+            if (string.IsNullOrWhiteSpace(draft.ResultDirectory) ||
+                !Path.IsPathFullyQualified(draft.ResultDirectory))
+                throw new BatchDraftValidationException("AcceptanceOnly requires a valid local result directory.");
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            throw new BatchDraftValidationException("AcceptanceOnly requires a valid local result directory.");
+        }
+    }
+
+    private static void ValidateDirectBackgroundShape(
+        BatchDraft draft,
+        int resourceCount,
+        ImmutableArray<BatchAccountConfirmation> accounts,
+        long operationCount,
+        long immediateOperationCount,
+        long shareOperationCount)
+    {
+        if (!draft.DirectBackground) return;
+        var expectedOperationCount = draft.TransferMode switch
+        {
+            TransferMode.Distribution => resourceCount,
+            TransferMode.Replication => checked((long)resourceCount * accounts.Length),
+            _ => -1,
+        };
+        if (accounts.Length < 1 || draft.QuotaBasis != QuotaBasis.TaskCount ||
+            resourceCount < 1 || operationCount != expectedOperationCount ||
+            immediateOperationCount != expectedOperationCount ||
+            shareOperationCount != expectedOperationCount || accounts.Any(account => !account.ShareEnabled) ||
+            draft.DuplicatePolicy != DuplicatePolicy.Rename ||
+            draft.ExistingSharePolicy != "Regenerate" ||
+            draft.ExtractionCodeBehavior != ShareExtractionCodeBehavior.Random)
+            throw new BatchDraftValidationException(
+                "Direct-background batches require task-count replication or distribution, preserve-both transfer, and one automatic share per planned transfer.");
+        try
+        {
+            if (string.IsNullOrWhiteSpace(draft.ResultDirectory) ||
+                !Path.IsPathFullyQualified(draft.ResultDirectory))
+                throw new BatchDraftValidationException(
+                    "Direct-background batches require a valid local result directory.");
+            _ = LocalResultDirectoryReference.Normalize(draft.ResultDirectory, nameof(draft.ResultDirectory));
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException)
+        {
+            throw new BatchDraftValidationException(
+                "Direct-background batches require a valid local result directory.");
+        }
     }
 
     private static async Task<ImmutableArray<AccountRule>> ReadDirectoryRulesAsync(
@@ -339,7 +437,7 @@ public sealed class BatchDraftValidator
         ImmutableArray<ValidatedBatchAccount> accounts,
         BatchWorkloadPlan workload)
     {
-        if (workload.ShareCount == 0) return;
+        if (workload.ShareCount == 0 || draft.DirectBackground) return;
         var shareEnabled = workload.Accounts.Where(account => account.ShareEnabled)
             .Select(account => account.AccountId).ToHashSet();
         if (draft.TransferMode == TransferMode.Replication || draft.QuotaBasis == QuotaBasis.SuccessTarget)
@@ -407,7 +505,10 @@ internal sealed record ValidatedBatchDraft(
     long ShareOperationCount,
     ResultColumnLayout ResultColumnLayout,
     ImmutableArray<ImportColumnDefinitionRecord> ColumnDefinitions,
-    string ConfirmationToken);
+    string ConfirmationToken,
+    bool AcceptanceOnly = false,
+    bool DirectBackground = false,
+    int MaxConcurrency = 1);
 
 internal static class BatchConfirmationTokens
 {
@@ -431,6 +532,10 @@ internal static class BatchConfirmationTokens
         writer.WriteInt32("extraction-code-behavior", (int)draft.ExtractionCodeBehavior);
         writer.WriteString("fixed-extraction-code", draft.FixedExtractionCode);
         writer.WriteString("existing-share-policy", draft.ExistingSharePolicy);
+        writer.WriteBoolean("acceptance-only", draft.AcceptanceOnly);
+        writer.WriteString("result-directory", draft.ResultDirectory);
+        writer.WriteBoolean("direct-background", draft.DirectBackground);
+        writer.WriteInt32("max-concurrency", draft.MaxConcurrency);
         WriteAccountSelections(writer, draft.Accounts);
         return writer.GetHashHex();
     }
@@ -480,6 +585,10 @@ internal static class BatchConfirmationTokens
         writer.WriteString("fixed-extraction-code", draft.FixedExtractionCode);
         writer.WriteString("existing-share-policy", draft.ExistingSharePolicy);
         writer.WriteString("share-settings-fingerprint", draft.ShareSettingsFingerprint);
+        writer.WriteBoolean("acceptance-only", draft.AcceptanceOnly);
+        writer.WriteString("result-directory", draft.ResultDirectory);
+        writer.WriteBoolean("direct-background", draft.DirectBackground);
+        writer.WriteInt32("max-concurrency", draft.MaxConcurrency);
         writer.WriteString("column-mapping-fingerprint", session.ColumnMappingFingerprint);
         WriteAccountSelections(writer, draft.Accounts);
         writer.WriteInt32("row-count", rows.Count);
@@ -585,7 +694,7 @@ internal static class BatchConfirmationTokens
         writer.BeginCollection("account-selections", ordered.Length);
         foreach (var account in ordered)
         {
-            writer.BeginObject("account-selection", 7);
+            writer.BeginObject("account-selection", 12);
             writer.WriteGuid("account-id", account.AccountId);
             writer.WriteInt32("priority-order", account.PriorityOrder);
             writer.WriteInt32("selection-decision", (int)account.SelectionDecision);
@@ -593,6 +702,7 @@ internal static class BatchConfirmationTokens
             writer.WriteInt32("target-success-count", account.TargetSuccessCount);
             writer.WriteBoolean("share-enabled", account.ShareEnabled);
             writer.WriteString("default-target-path", account.DefaultTargetPath);
+            WriteExecutionProfile(writer, account.ExecutionProfile);
         }
     }
 
@@ -604,7 +714,7 @@ internal static class BatchConfirmationTokens
         writer.BeginCollection("account-confirmations", ordered.Length);
         foreach (var account in ordered)
         {
-            writer.BeginObject("account-confirmation", 10);
+            writer.BeginObject("account-confirmation", 15);
             writer.WriteGuid("account-id", account.AccountId);
             writer.WriteInt32("priority-order", account.PriorityOrder);
             writer.WriteInt32("target-item-count", account.TargetItemCount);
@@ -615,7 +725,17 @@ internal static class BatchConfirmationTokens
             writer.WriteInt32("output-ordinal", account.OutputOrdinal);
             writer.WriteString("output-label", account.OutputLabel);
             writer.WriteString("normalized-default-target-path", account.NormalizedDefaultTargetPath);
+            WriteExecutionProfile(writer, account.ExecutionProfile);
         }
+    }
+
+    private static void WriteExecutionProfile(CanonicalHashWriter writer, ExecutionProfileSnapshot profile)
+    {
+        writer.WriteInt32("execution-engine", (int)profile.Engine);
+        writer.WriteInt32("browser-family", (int)profile.BrowserFamily);
+        writer.WriteString("profile-id", profile.ProfileId);
+        writer.WriteNullableGuid("installation-id", profile.InstallationId);
+        writer.WriteNullableGuid("managed-session-id", profile.SessionId);
     }
 
     private static void WriteAppendConfirmations(

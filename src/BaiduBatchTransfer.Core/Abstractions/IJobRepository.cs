@@ -49,6 +49,18 @@ public interface IJobRepository
         IEnumerable<PendingShareOperationRecord> operations,
         CancellationToken cancellationToken = default) =>
         throw new NotSupportedException("Pending share operations are not supported by this repository.");
+    Task SetResultDestinationAsync(
+        LocalResultDestinationRecord destination,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Batch result destinations are not supported by this repository.");
+    Task<bool> HasExactDirectBackgroundGraphAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult(false);
+    Task ActivateDirectBackgroundAsync(
+        Guid batchJobId,
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("Direct-background activation is not supported by this repository.");
     Task AddShareOperationsAsync(
         IEnumerable<ShareOperationRecord> operations,
         IEnumerable<ShareOperationRemoteItemRecord> remoteItems,

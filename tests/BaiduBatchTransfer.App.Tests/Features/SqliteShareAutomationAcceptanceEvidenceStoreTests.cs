@@ -22,25 +22,7 @@ public sealed class SqliteShareAutomationAcceptanceEvidenceStoreTests : IDisposa
         var items = new RemoteItemIdentitySet([new RemoteItemIdentity("remote-id", "item")]);
         var context = new ShareOperationAutomationContext(
             operationId, Guid.NewGuid(), accountId, 1, WebAutomationOwnerKind.StandaloneShare, items).Validate();
-        await using (var connection = await factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
-                  SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
-                VALUES($account,'user','account','WebView2','Active',0,0,0,1,'2026-08-25',0);
-                INSERT INTO WebAutomationAttempts(
-                  OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
-                  BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
-                  AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
-                VALUES($operation,$account,1,'StandaloneShare','Submitting',NULL,NULL,$baseline,0,$now,0,1,$now,$now,NULL,0,NULL);
-                """;
-            command.Parameters.AddWithValue("$account", accountId.ToString("D"));
-            command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
-            command.Parameters.AddWithValue("$baseline", new string('a', 64));
-            command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            await command.ExecuteNonQueryAsync();
-        }
+        await SeedSubmittingAttemptAsync(factory, context, baselineItemCount: 0, revision: 1);
         var acceptance = ShareOfficialAcceptance.Accepted(
             "adapter", "share", "https://pan.baidu.com/s/share", items,
             new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Fixed, "A1b2"),
@@ -83,25 +65,7 @@ public sealed class SqliteShareAutomationAcceptanceEvidenceStoreTests : IDisposa
         var items = new RemoteItemIdentitySet([new RemoteItemIdentity("remote-id", "item")]);
         var context = new ShareOperationAutomationContext(
             operationId, Guid.NewGuid(), accountId, 1, WebAutomationOwnerKind.StandaloneShare, items).Validate();
-        await using (var connection = await factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
-                  SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
-                VALUES($account,'user','account','WebView2','Active',0,0,0,1,'2026-08-25',0);
-                INSERT INTO WebAutomationAttempts(
-                  OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
-                  BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
-                  AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
-                VALUES($operation,$account,1,'StandaloneShare','Submitting',NULL,NULL,$baseline,0,$now,0,1,$now,$now,NULL,0,NULL);
-                """;
-            command.Parameters.AddWithValue("$account", accountId.ToString("D"));
-            command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
-            command.Parameters.AddWithValue("$baseline", new string('a', 64));
-            command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            await command.ExecuteNonQueryAsync();
-        }
+        await SeedSubmittingAttemptAsync(factory, context, baselineItemCount: 0, revision: 1);
         var invalid = ShareOfficialAcceptance.Accepted(
             "adapter", "share", "https://pan.baidu.com/s/share", items,
             new EffectiveShareSettings(false, true, ShareExtractionCodeBehavior.Random, "A1b2"),
@@ -124,25 +88,7 @@ public sealed class SqliteShareAutomationAcceptanceEvidenceStoreTests : IDisposa
         var items = new RemoteItemIdentitySet([new RemoteItemIdentity("remote-id", "item")]);
         var context = new ShareOperationAutomationContext(
             operationId, Guid.NewGuid(), accountId, 1, WebAutomationOwnerKind.StandaloneShare, items).Validate();
-        await using (var connection = await factory.OpenConnectionAsync())
-        await using (var command = connection.CreateCommand())
-        {
-            command.CommandText = """
-                INSERT INTO Accounts(Id,BaiduUserId,DisplayName,LoginMethod,Status,DailyLimit,DailyExecutedCount,
-                  SortOrder,IsEnabled,DailyCountDateKey,IsDeleted)
-                VALUES($account,'user','account','WebView2','Active',0,0,0,1,'2026-08-25',0);
-                INSERT INTO WebAutomationAttempts(
-                  OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
-                  BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
-                  AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt)
-                VALUES($operation,$account,1,'StandaloneShare','Submitting',NULL,NULL,$baseline,1,$now,0,4,$now,$now,NULL,0,NULL);
-                """;
-            command.Parameters.AddWithValue("$account", accountId.ToString("D"));
-            command.Parameters.AddWithValue("$operation", operationId.ToString("D"));
-            command.Parameters.AddWithValue("$baseline", new string('a', 64));
-            command.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToString("O"));
-            await command.ExecuteNonQueryAsync();
-        }
+        await SeedSubmittingAttemptAsync(factory, context, baselineItemCount: 1, revision: 4);
         var acceptance = ShareOfficialAcceptance.Accepted(
             "share-recovered", "share-recovered", "https://pan.baidu.com/s/share-recovered", items,
             new EffectiveShareSettings(true, true, ShareExtractionCodeBehavior.Random, "A1b2"),
@@ -168,6 +114,52 @@ public sealed class SqliteShareAutomationAcceptanceEvidenceStoreTests : IDisposa
         Assert.Equal(5, reader.GetInt64(2));
         Assert.Equal(1, reader.GetInt32(3));
         Assert.Equal(1, reader.GetInt32(4));
+    }
+
+    private static async Task SeedSubmittingAttemptAsync(
+        SqliteConnectionFactory factory,
+        ShareOperationAutomationContext context,
+        int baselineItemCount,
+        long revision)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await using (var unit = await SqliteUnitOfWork.BeginAsync(factory))
+        {
+            await unit.Accounts.UpsertAsync(AccountRecord.Create(context.AccountId, "user", "account"));
+            await unit.CommitAsync();
+        }
+        var batch = StandaloneShareBatchRecord.Create(
+            context.BatchId, Path.Combine(Path.GetDirectoryName(factory.DatabasePath)!, "results"), 1, now);
+        var operation = StandaloneShareOperationRecord.Create(
+            context.OperationId, context.BatchId,
+            new OwnedRemoteSelection(context.AccountId, context.ExactRemoteItems,
+                "item", RemoteResourceKind.File, new RemotePath("/")),
+            1, now);
+        var receipt = await new SqliteStandaloneShareStore(factory).CreateOrGetBatchAsync(
+            StandaloneSharePendingBatchEnvelope.Create(batch, [operation]));
+        Assert.Equal(context.OperationId, Assert.Single(receipt.Operations).Id);
+
+        await using var connection = await factory.OpenConnectionAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO WebAutomationAttempts(
+              OperationId,AccountId,Generation,OwnerKind,State,ResumeStage,ObservationFingerprint,
+              BaselineFingerprint,BaselineItemCount,BaselinePersistedAt,IsWaitingForUser,Revision,CreatedAt,UpdatedAt,
+              AcceptanceFingerprint,AcceptedItemCount,AcceptancePersistedAt,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId)
+            SELECT Id,AccountId,$generation,'StandaloneShare','Submitting',NULL,NULL,
+              $baseline,$baselineCount,$now,0,$revision,$now,$now,NULL,0,NULL,
+              ExecutionEngineVersion,BrowserFamily,ProfileId,InstallationId,SessionId
+            FROM StandaloneShareOperations WHERE Id=$operation AND AccountId=$account;
+            """;
+        command.Parameters.AddWithValue("$account", context.AccountId.ToString("D"));
+        command.Parameters.AddWithValue("$operation", context.OperationId.ToString("D"));
+        command.Parameters.AddWithValue("$generation", context.Generation);
+        command.Parameters.AddWithValue("$baseline", new string('a', 64));
+        command.Parameters.AddWithValue("$baselineCount", baselineItemCount);
+        command.Parameters.AddWithValue("$revision", revision);
+        command.Parameters.AddWithValue("$now", now.ToString("O"));
+        Assert.Equal(1, await command.ExecuteNonQueryAsync());
     }
 
     public void Dispose()
