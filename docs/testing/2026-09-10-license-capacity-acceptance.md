@@ -1,0 +1,30 @@
+# License capacity acceptance
+
+This is a redacted evidence template. Execute only against a disposable instance on
+`127.0.0.1:18093`; production routing must remain absent.
+
+## Fixed workload
+
+- 50 requests/second for 10 minutes, followed by 100 requests/second for 10 minutes
+- 70% valid validation, 10% idempotent activation, 20% deliberate business rejection
+- Health checked continuously during both phases
+
+## Acceptance thresholds
+
+The run fails if any threshold is exceeded:
+
+- p95 latency > 250 ms
+- unexpected errors >= 0.1%
+- average CPU >= 70%
+- free memory <= 1 GiB
+- RSS growth >= 10%
+- any SQLite `BUSY` or `LOCKED` event
+- any health probe that is not HTTP 200
+
+## Evidence rules
+
+Record only aggregate counters, latency percentiles, CPU/RSS summaries, memory floor,
+health continuity, and exit statuses. Do not record cards, machine hashes, nonces,
+tokens, signatures, private keys, cookies, or response bodies. After the run, stop the
+exact test PID, run `license-dbcheck`, require `quick_check=ok`, and remove only the
+validated disposable data tree. If any gate fails, leave the public Nginx include absent.

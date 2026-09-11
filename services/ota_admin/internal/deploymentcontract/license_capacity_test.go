@@ -11,3 +11,10 @@ func TestCapacityArtifactsAreLoopbackAndRedacted(t *testing.T) {
  for _, want := range []string{"127.0.0.1:18093", "license-loadtest", "DBCHECK_BIN"} { if !strings.Contains(load+unit,want) { t.Errorf("missing %q",want) } }
  if strings.Contains(load, "card=") || strings.Contains(load, "secret") { t.Error("capacity script may leak sensitive values") }
 }
+
+func TestCapacityDocumentPinsAcceptanceThresholds(t *testing.T) {
+	doc := read(t, "docs", "testing", "2026-09-10-license-capacity-acceptance.md")
+	for _, want := range []string{"250 ms", "0.1%", "70%", "1 GiB", "10%", "BUSY", "LOCKED", "127.0.0.1:18093"} {
+		if !strings.Contains(doc, want) { t.Errorf("capacity document missing %q", want) }
+	}
+}
