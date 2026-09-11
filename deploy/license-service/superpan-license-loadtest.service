@@ -1,0 +1,14 @@
+[Unit]
+Description=SuperPan license disposable load test
+
+[Service]
+Type=simple
+User=superpan-license
+Group=superpan-license
+ExecStart=/opt/superpan-license/license-loadtest --origin http://127.0.0.1:18093
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/superpan-license-loadtest
+Restart=no
