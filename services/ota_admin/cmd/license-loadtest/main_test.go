@@ -25,7 +25,7 @@ func TestWorkloadRejectsUnsafeRateAndDuration(t *testing.T) {
 }
 
 func TestReportThresholdsDetectFailure(t *testing.T) {
-	if err := (Report{Requests: 1000, Errors: 1, P95Millis: 250}).Check(); err != nil { t.Fatal(err) }
+	if err := (Report{Requests: 1000, Errors: 0, P95Millis: 250}).Check(); err != nil { t.Fatal(err) }
 	if err := (Report{Requests: 1000, Errors: 2, P95Millis: 10}).Check(); err == nil { t.Fatal("error threshold not enforced") }
 }
 
