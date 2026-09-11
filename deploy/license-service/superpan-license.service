@@ -1,0 +1,29 @@
+[Unit]
+Description=SuperPan license service
+After=network.target
+
+[Service]
+Type=simple
+User=superpan-license
+Group=superpan-license
+UMask=0077
+WorkingDirectory=/var/lib/superpan-license
+# The service configuration binds the listener to this loopback endpoint.
+# 127.0.0.1:18092
+ExecStart=/opt/superpan-license/superpan-license serve --config /etc/superpan-license/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+InaccessibleDirectories=/var/www
+ReadWriteDirectories=/var/lib/superpan-license
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
