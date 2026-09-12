@@ -822,7 +822,7 @@ func TestLicenseInstallCompleteTransactionContract(t *testing.T) {
 		`inventory.tsv`, `unit-state.tsv`, `manifest.sha256`, `source-commit.txt`,
 		`license-db-snapshot`, `schema-before.db`, `schema-migrated.db`, `schema-after.db`,
 		`serve --config "$SCHEMA_NEW_CONFIG"`, `serve --config "$SCHEMA_OLD_CONFIG"`,
-		`http://127.0.0.1:28092/internal/health`, `semantic aggregate mismatch`,
+		`http://127.0.0.1:28092/internal/health`, `validate_schema_semantics`,
 		`systemctl restart superpan-license.service`, `http://127.0.0.1:18092/internal/health`,
 		`bash "$OTA_INSTALLER" --loopback-license-transaction`,
 		`http://127.0.0.1:18091/admin/`, `installed-hashes.txt`,
@@ -920,7 +920,7 @@ func TestPersistentKeysWithoutDatabaseIsRetryableFirstInstall(t *testing.T) {
 		`database-sha256`,
 		`database exists without a complete valid key set`,
 	)
-	requireFragments(t, harness, `RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit)`)
+	requireFragments(t, harness, `RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)`)
 	if strings.Contains(install, `sha256sum -- "$DATA/state.db"`) {
 		// The database hash may only appear behind an explicit regular-file branch.
 		requireBefore(t, install, `if [ -f "$DATA/state.db" ]; then`, `sha256sum -- "$DATA/state.db"`)
@@ -999,5 +999,98 @@ func TestInstallerRejectsUnrecoverableEnablementBeforeMutation(t *testing.T) {
 		`restore_wants_link`, `case "$wants" in`, `present)`, `absent)`,
 		`ln -s -- "$expected" "$link"`, `rm -f -- "$link"`,
 		`prior unit enablement state was not restored`,
+	)
+}
+
+func TestOldLicenseArtifactsAreTrustedBeforeBackupOrExecution(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`validate_old_license_artifacts_before_mutation`,
+		`validate_trusted_path "$DEST/superpan-license"`,
+		`stat -c '%h:%U:%G:%a' "$DEST/superpan-license"`, `1:root:root:755`,
+		`validate_trusted_path "$SOURCE_COMMIT_TARGET"`,
+		`stat -c '%h:%U:%G:%a' "$SOURCE_COMMIT_TARGET"`, `1:root:root:644`,
+		`OLD_LICENSE_BINARY_SHA256=`, `OLD_LICENSE_SOURCE_COMMIT_SHA256=`,
+		`backup payload changed while copying`,
+		`validate_schema_backup_executable`, `validate_trusted_path "$BACKUP_DIR/license-binary"`,
+		`schema backup executable hash mismatch`,
+	)
+	requireBefore(t, install, `validate_old_license_artifacts_before_mutation`, `TRANSACTION_MUTATED=true`)
+	requireBefore(t, install, `validate_old_license_artifacts_before_mutation`, `cp -a -- "$target" "$BACKUP_DIR/$name"`)
+	requireBefore(t, install, `validate_schema_backup_executable`, `"$BACKUP_DIR/license-binary" serve`)
+}
+
+func TestTrustedPathRejectsUnsafeOwnerModeAndParentBeforeExecution(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	start := strings.Index(install, "validate_trusted_path()")
+	end := strings.Index(install, "while [ \"$#\" -gt 0 ]")
+	if start < 0 || end <= start { t.Fatal("trusted-path shell contract is not extractable") }
+	functions := install[start:end]
+	bash := installerBash(t)
+	dir := t.TempDir()
+	volume := filepath.VolumeName(dir)
+	if len(volume) != 2 || volume[1] != ':' { t.Fatalf("unexpected fixture volume %q", volume) }
+	posixDir := "/" + strings.ToLower(volume[:1]) + strings.TrimPrefix(filepath.ToSlash(dir), volume)
+	leaf := posixDir + "/old-license"
+	if err := os.WriteFile(filepath.Join(dir, "old-license"), []byte("fixture"), 0600); err != nil { t.Fatal(err) }
+	parent := strings.TrimSuffix(leaf, "/old-license")
+	for _, tc := range []struct{name, badPath, badKind string}{
+		{"leaf-owner", leaf, "owner"},
+		{"leaf-mode", leaf, "mode"},
+		{"parent-owner", parent, "owner"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := filepath.Join(dir, tc.name+".executed")
+			script := filepath.Join(dir, tc.name+".sh")
+			body := "#!/usr/bin/env bash\nset -euo pipefail\ndie(){ echo \"ERROR: $*\" >&2; exit 1; }\n"+functions+`\nstat() {\n  local format="$2" path="$3"\n  if [ "$path" = "$BAD_PATH" ] && [ "$BAD_KIND" = owner ] && [ "$format" = '%u' ]; then printf '1000\\n'; return; fi\n  if [ "$path" = "$BAD_PATH" ] && [ "$BAD_KIND" = mode ] && [ "$format" = '%a' ]; then printf '777\\n'; return; fi\n  case "$format" in '%u') printf '0\\n' ;; '%a') printf '755\\n' ;; *) return 1 ;; esac\n}\nreadlink() { [ "$1" = -f ] && [ "$2" = -- ] && printf '%s\\n' "$3"; }\nvalidate_trusted_path "$1"\nprintf 'executed\\n' >"$2"\n`
+			if err := os.WriteFile(script, []byte(body), 0700); err != nil { t.Fatal(err) }
+			cmd := exec.Command(bash, filepath.ToSlash(script), leaf, filepath.ToSlash(marker))
+			cmd.Env = append(os.Environ(), "BAD_PATH="+tc.badPath, "BAD_KIND="+tc.badKind)
+			if output, err := cmd.CombinedOutput(); err == nil { t.Fatalf("unsafe path accepted: %s", output) }
+			if _, err := os.Stat(marker); !os.IsNotExist(err) { t.Fatalf("execution marker exists after rejected path: %v", err) }
+		})
+	}
+}
+
+func TestSchemaSemanticContractRejectsDestructiveMigration(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	requireFragments(t, install,
+		`parse_semantic_summary`, `validate_schema_semantics`, `# SCHEMA_SEMANTIC_CONTRACT_END`,
+		`duplicate semantic aggregate`, `missing semantic aggregate`, `non-numeric semantic aggregate`,
+		`migration removed a pre-existing aggregate`, `migration decreased a pre-existing aggregate`,
+		`# New aggregate keys are allowed`, `cmp -s "$after_normalized" "$old_normalized"`,
+	)
+	start := strings.Index(install, "parse_semantic_summary()")
+	end := strings.Index(install, "# SCHEMA_SEMANTIC_CONTRACT_END")
+	if start < 0 || end <= start { t.Fatal("semantic shell contract is not extractable") }
+	functions := install[start:end]
+	bash := installerBash(t)
+	for _, tc := range []struct{name, before, after, old string; wantOK bool}{
+		{"preserve-and-add", "schema_version=1 quick_check=ok count_cards=2 sha256="+strings.Repeat("a",64), "schema_version=2 quick_check=ok count_cards=2 count_new=1 sha256="+strings.Repeat("b",64), "schema_version=2 quick_check=ok count_cards=2 count_new=1 sha256="+strings.Repeat("c",64), true},
+		{"destructive", "schema_version=1 quick_check=ok count_cards=2 sha256="+strings.Repeat("a",64), "schema_version=2 quick_check=ok count_cards=1 sha256="+strings.Repeat("b",64), "schema_version=2 quick_check=ok count_cards=1 sha256="+strings.Repeat("c",64), false},
+		{"duplicate", "schema_version=1 quick_check=ok count_cards=2 count_cards=2 sha256="+strings.Repeat("a",64), "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("b",64), "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("c",64), false},
+		{"missing", "schema_version=1 quick_check=ok count_cards=2", "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("b",64), "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("c",64), false},
+		{"non-numeric", "schema_version=1 quick_check=ok count_cards=two sha256="+strings.Repeat("a",64), "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("b",64), "schema_version=2 quick_check=ok count_cards=2 sha256="+strings.Repeat("c",64), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir(); script := filepath.Join(dir, "semantic.sh")
+			body := "#!/usr/bin/env bash\nset -euo pipefail\ndie(){ echo \"ERROR: $*\" >&2; exit 1; }\n"+functions+"\nvalidate_schema_semantics \"$1\" \"$2\" \"$3\" \"$4\"\n"
+			if err := os.WriteFile(script, []byte(body), 0700); err != nil { t.Fatal(err) }
+			output, err := exec.Command(bash, script, tc.before, tc.after, tc.old, dir).CombinedOutput()
+			if tc.wantOK && err != nil { t.Fatalf("valid semantics rejected: %v: %s", err, output) }
+			if !tc.wantOK && err == nil { t.Fatalf("invalid semantics accepted: %s", output) }
+		})
+	}
+}
+
+func TestInterruptedInitialStateAndLateFailpointsAreRetryable(t *testing.T) {
+	install := read(t, "deploy", "license-service", "install.sh")
+	harness := read(t, "deploy", "license-service", "test-install-v219.sh")
+	requireFragments(t, install,
+		`INSTALL_STATE="interrupted-initial"`, `database present with valid keys and no old binary`,
+		`schema_interrupted_initial_preflight`, `validate_schema_semantics "$BEFORE_SUMMARY" "$AFTER_SUMMARY" "$AFTER_SUMMARY"`,
+	)
+	requireFragments(t, harness,
+		`RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)`,
 	)
 }

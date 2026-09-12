@@ -38,6 +38,10 @@ TRANSACTION_BACKUP=""
 declare -A SCHEMA_TEST_IDENTITIES=()
 declare -A SCHEMA_TEST_BINARIES=()
 FAILPOINT_REQUIRES_STOPPED_RECOVERY=false
+OLD_LICENSE_BINARY_SHA256=""
+OLD_LICENSE_SOURCE_COMMIT_SHA256=""
+SCHEMA_OLD_CONFIG_SHA256=""
+INSTALL_STATE="initial"
 
 usage() {
     cat >&2 <<'USAGE'
@@ -379,6 +383,7 @@ validate_persistent_state_before_mutation() {
 validate_existing_config_before_mutation() {
     local config="$ETC/config.json"
     if [ -e "$config" ] || [ -L "$config" ]; then
+        validate_trusted_path "$config"
         validate_file "$config" root "$LICENSE_GROUP" 640 variable config
         "$BUNDLE/superpan-license" check-config --config "$config" >/dev/null || die "existing production license config is invalid"
     fi
@@ -388,6 +393,25 @@ assert_exact_identity_before_mutation
 validate_existing_acl_before_mutation
 validate_existing_config_before_mutation
 validate_persistent_state_before_mutation
+
+validate_old_license_artifacts_before_mutation() {
+    local binary="$DEST/superpan-license"
+    if [ -e "$binary" ] || [ -L "$binary" ]; then
+        validate_trusted_path "$DEST/superpan-license"
+        [ -f "$binary" ] && [ ! -L "$binary" ] && [ "$(stat -c '%h:%U:%G:%a' "$DEST/superpan-license")" = 1:root:root:755 ] ||
+            die "old license binary metadata is unsafe"
+        OLD_LICENSE_BINARY_SHA256="$(sha256sum -- "$binary" | awk '{print $1}')"
+        [ -e "$SOURCE_COMMIT_TARGET" ] || die "old license binary requires its source-commit record"
+        validate_trusted_path "$SOURCE_COMMIT_TARGET"
+        [ -f "$SOURCE_COMMIT_TARGET" ] && [ ! -L "$SOURCE_COMMIT_TARGET" ] &&
+            [ "$(stat -c '%h:%U:%G:%a' "$SOURCE_COMMIT_TARGET")" = 1:root:root:644 ] || die "old source-commit metadata is unsafe"
+        [[ "$(cat "$SOURCE_COMMIT_TARGET")" =~ ^[0-9a-f]{40}$ ]] && [ "$(wc -l <"$SOURCE_COMMIT_TARGET")" -eq 1 ] || die "old source-commit record is malformed"
+        OLD_LICENSE_SOURCE_COMMIT_SHA256="$(sha256sum -- "$SOURCE_COMMIT_TARGET" | awk '{print $1}')"
+    elif [ -e "$SOURCE_COMMIT_TARGET" ] || [ -L "$SOURCE_COMMIT_TARGET" ]; then
+        die "old source-commit record exists without its license binary"
+    fi
+}
+validate_old_license_artifacts_before_mutation
 
 unit_wants_link() {
     case "$1" in
@@ -416,9 +440,15 @@ assert_recoverable_unit_state_before_mutation() {
 assert_recoverable_unit_state_before_mutation
 
 UPGRADE_MODE=false
-if [ -e "$DEST/superpan-license" ] || [ -e "$DATA/state.db" ]; then
-    [ -f "$DEST/superpan-license" ] && [ ! -L "$DEST/superpan-license" ] && [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] ||
-        die "upgrade requires paired old license binary and schema; initial install requires both absent"
+if [ -n "$OLD_LICENSE_BINARY_SHA256" ]; then
+    [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ] || die "old license binary requires its valid database and key set"
+    INSTALL_STATE="upgrade"
+    UPGRADE_MODE=true
+elif [ -f "$DATA/state.db" ] && [ ! -L "$DATA/state.db" ]; then
+    [ "$PERSISTENT_STATE_MODE" = existing ] || die "database present with valid keys and no old binary was not proven"
+    INSTALL_STATE="interrupted-initial"
+fi
+if [ "$INSTALL_STATE" != initial ]; then
     for source in "$LICENSE_DB_SNAPSHOT" "$LICENSE_DB_SNAPSHOT_SHA256" "$LICENSE_DB_SNAPSHOT_COMMIT"; do
         validate_trusted_path "$source"
         [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c '%h:%U:%G' "$source")" = 1:root:root ] || die "unsafe license-db-snapshot input"
@@ -427,7 +457,6 @@ if [ -e "$DEST/superpan-license" ] || [ -e "$DATA/state.db" ]; then
     [ -n "$SNAPSHOT_EXPECTED" ] || die "license-db-snapshot sidecar is malformed"
     verify_sha256 "$LICENSE_DB_SNAPSHOT" "$SNAPSHOT_EXPECTED"
     printf '%s\n' "$SOURCE_COMMIT" | cmp -s - "$LICENSE_DB_SNAPSHOT_COMMIT" || die "license-db-snapshot is not from the authenticated source commit"
-    UPGRADE_MODE=true
 fi
 
 case "${LICENSE_INSTALL_FAILPOINT:-}" in
@@ -507,11 +536,19 @@ record_unit_state() {
     printf '%s\t%s\t%s\t%s\n' "$unit" "$enabled" "$active" "$wants" >>"$BACKUP_DIR/unit-state.tsv"
 }
 backup_target() {
-    local target="$1" name="$2"
+    local target="$1" name="$2" source_identity source_hash backup_hash
     if [ -e "$target" ] || [ -L "$target" ]; then
         [ -f "$target" ] && [ ! -L "$target" ] && [ "$(stat -c '%h' "$target")" = 1 ] || die "unsafe rollback target: $target"
+        source_identity="$(stat -c '%d:%i:%h:%u:%g:%a' "$target")"
+        source_hash="$(sha256sum -- "$target" | awk '{print $1}')"
         cp -a -- "$target" "$BACKUP_DIR/$name"
-        printf '%s\t%s\tpresent\t%s\t%s\t%s\t%s\n' "$target" "$name" "$(stat -c '%u' "$target")" "$(stat -c '%g' "$target")" "$(stat -c '%a' "$target")" "$(sha256sum -- "$target" | awk '{print $1}')" >>"$BACKUP_DIR/inventory.tsv"
+        [ "$(stat -c '%d:%i:%h:%u:%g:%a' "$target")" = "$source_identity" ] || die "backup source identity changed while copying"
+        [ -f "$BACKUP_DIR/$name" ] && [ ! -L "$BACKUP_DIR/$name" ] && [ "$(stat -c '%h' "$BACKUP_DIR/$name")" = 1 ] ||
+            die "backup payload identity is unsafe"
+        backup_hash="$(sha256sum -- "$BACKUP_DIR/$name" | awk '{print $1}')"
+        [ "$backup_hash" = "$source_hash" ] || die "backup payload changed while copying"
+        [ "$(stat -c '%u:%g:%a' "$BACKUP_DIR/$name")" = "$(stat -c '%u:%g:%a' "$target")" ] || die "backup payload metadata changed while copying"
+        printf '%s\t%s\tpresent\t%s\t%s\t%s\t%s\n' "$target" "$name" "$(stat -c '%u' "$target")" "$(stat -c '%g' "$target")" "$(stat -c '%a' "$target")" "$source_hash" >>"$BACKUP_DIR/inventory.tsv"
     else
         printf '%s\t%s\tabsent\t-\t-\t-\t-\n' "$target" "$name" >>"$BACKUP_DIR/inventory.tsv"
     fi
@@ -523,6 +560,12 @@ backup_target /opt/superpan-ota-admin/ota-admin ota-binary
 backup_target /etc/superpan-ota-admin/config.json ota-config
 backup_target /etc/systemd/system/superpan-ota-admin.service ota-unit
 backup_target "$SOURCE_COMMIT_TARGET" license-source-commit
+if [ -n "$OLD_LICENSE_BINARY_SHA256" ]; then
+    [ "$(sha256sum -- "$BACKUP_DIR/license-binary" | awk '{print $1}')" = "$OLD_LICENSE_BINARY_SHA256" ] ||
+        die "old license binary changed between preflight and backup"
+    [ "$(sha256sum -- "$BACKUP_DIR/license-source-commit" | awk '{print $1}')" = "$OLD_LICENSE_SOURCE_COMMIT_SHA256" ] ||
+        die "old source-commit changed between preflight and backup"
+fi
 record_unit_state superpan-license.service
 record_unit_state superpan-ota-admin.service
 printf '%s\n' "$SOURCE_COMMIT" >"$BACKUP_DIR/source-commit.txt"
@@ -767,6 +810,45 @@ wait_schema_health() {
     return 1
 }
 
+parse_semantic_summary() {
+    local summary="$1" output="$2" label="$3" token key value count_keys=0
+    local -A seen=()
+    : >"$output"
+    for token in $summary; do
+        case "$token" in *=*) key="${token%%=*}"; value="${token#*=}" ;; *) echo "$label missing semantic aggregate assignment" >&2; return 1 ;; esac
+        [ "${seen[$key]+present}" != present ] || { echo "$label duplicate semantic aggregate: $key" >&2; return 1; }
+        seen["$key"]=1
+        case "$key" in
+            schema_version) [[ "$value" =~ ^[0-9]+$ ]] || { echo "$label non-numeric semantic aggregate: $key" >&2; return 1; }; printf '%s %s\n' "$key" "$value" >>"$output" ;;
+            quick_check) [ "$value" = ok ] || { echo "$label quick_check is not ok" >&2; return 1; } ;;
+            sha256) [[ "$value" =~ ^[0-9a-f]{64}$ ]] || { echo "$label malformed semantic snapshot hash" >&2; return 1; } ;;
+            count_*) [[ "$value" =~ ^[0-9]+$ ]] || { echo "$label non-numeric semantic aggregate: $key" >&2; return 1; }; printf '%s %s\n' "$key" "$value" >>"$output"; count_keys=$((count_keys + 1)) ;;
+            *) echo "$label unknown semantic aggregate: $key" >&2; return 1 ;;
+        esac
+    done
+    [ "${seen[schema_version]+present}" = present ] && [ "${seen[quick_check]+present}" = present ] && [ "${seen[sha256]+present}" = present ] && [ "$count_keys" -gt 0 ] ||
+        { echo "$label missing semantic aggregate" >&2; return 1; }
+    LC_ALL=C sort -o "$output" "$output"
+}
+
+validate_schema_semantics() {
+    local before="$1" after="$2" old="$3" work="$4" key before_value after_value
+    local before_normalized="$work/semantic-before.$$.txt" after_normalized="$work/semantic-after.$$.txt" old_normalized="$work/semantic-old.$$.txt"
+    parse_semantic_summary "$before" "$before_normalized" before || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "invalid migration-before semantics"; }
+    parse_semantic_summary "$after" "$after_normalized" after || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "invalid migration-after semantics"; }
+    parse_semantic_summary "$old" "$old_normalized" old || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "invalid old-binary semantics"; }
+    while read -r key before_value; do
+        case "$key" in count_*) ;; *) continue ;; esac
+        after_value="$(awk -v wanted="$key" '$1==wanted {print $2}' "$after_normalized")"
+        [ -n "$after_value" ] || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "migration removed a pre-existing aggregate: $key"; }
+        [ "$after_value" -ge "$before_value" ] || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "migration decreased a pre-existing aggregate: $key"; }
+    done <"$before_normalized"
+    # New aggregate keys are allowed after a schema migration; every old key is monotonic.
+    cmp -s "$after_normalized" "$old_normalized" || { rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"; die "old binary changed migrated semantic aggregates"; }
+    rm -f -- "$before_normalized" "$after_normalized" "$old_normalized"
+}
+# SCHEMA_SEMANTIC_CONTRACT_END
+
 schema_process_identity() {
     local pid="$1" expected_binary="$2" process_hash expected_hash stat_line stat_tail start_time
     kill -0 "$pid" 2>/dev/null || return 1
@@ -821,8 +903,23 @@ restore_old_license_activity() {
     if [ "$LICENSE_WAS_ACTIVE" = true ]; then systemctl start superpan-license.service; else systemctl stop superpan-license.service; fi
 }
 
+validate_schema_backup_executable() {
+    validate_trusted_path "$BACKUP_DIR/license-binary"
+    [ -f "$BACKUP_DIR/license-binary" ] && [ ! -L "$BACKUP_DIR/license-binary" ] &&
+        [ "$(stat -c '%h:%U:%G:%a' "$BACKUP_DIR/license-binary")" = 1:root:root:755 ] ||
+        die "schema backup executable metadata is unsafe"
+    [ "$(sha256sum -- "$BACKUP_DIR/license-binary" | awk '{print $1}')" = "$OLD_LICENSE_BINARY_SHA256" ] ||
+        die "schema backup executable hash mismatch"
+    validate_trusted_path "$SCHEMA_OLD_CONFIG"
+    [ -f "$SCHEMA_OLD_CONFIG" ] && [ ! -L "$SCHEMA_OLD_CONFIG" ] &&
+        [ "$(stat -c '%h:%U:%G:%a' "$SCHEMA_OLD_CONFIG")" = "1:root:$LICENSE_GROUP:640" ] ||
+        die "schema old config metadata is unsafe"
+    [ "$(sha256sum -- "$SCHEMA_OLD_CONFIG" | awk '{print $1}')" = "$SCHEMA_OLD_CONFIG_SHA256" ] ||
+        die "schema old config hash mismatch"
+}
+
 schema_upgrade_preflight() {
-    if [ "$UPGRADE_MODE" != true ]; then
+    if [ "$INSTALL_STATE" = initial ]; then
         printf 'initial-install: old binary and schema absent\n' >"$BACKUP_DIR/schema-preflight.txt"
         chmod 0600 "$BACKUP_DIR/schema-preflight.txt"
         refresh_manifest
@@ -848,8 +945,21 @@ schema_upgrade_preflight() {
     systemctl stop superpan-license.service
     AFTER_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$migrated" --destination "$after")"
     restore_old_license_activity
+    if [ "$INSTALL_STATE" = interrupted-initial ]; then
+        schema_interrupted_initial_preflight
+        {
+            printf 'before %s\n' "$BEFORE_SUMMARY"
+            printf 'after %s\n' "$AFTER_SUMMARY"
+            printf 'interrupted-initial new-binary-only verification\n'
+        } >"$BACKUP_DIR/schema-preflight.txt"
+        chmod 0600 "$BACKUP_DIR/schema-preflight.txt" "$BACKUP_DIR"/schema-*.json "$BACKUP_DIR"/schema-*.log
+        refresh_manifest
+        return
+    fi
     cp -- "$after" "$oldcopy"; chown root:root "$oldcopy"; chmod 0600 "$oldcopy"
     write_schema_config "$oldcopy" 127.0.0.1:28092 "$SCHEMA_OLD_CONFIG"
+    SCHEMA_OLD_CONFIG_SHA256="$(sha256sum -- "$SCHEMA_OLD_CONFIG" | awk '{print $1}')"
+    validate_schema_backup_executable
     "$BACKUP_DIR/license-binary" serve --config "$SCHEMA_OLD_CONFIG" >"$BACKUP_DIR/schema-old.log" 2>&1 &
     schema_pid="$!"
     register_schema_pid "$schema_pid" "$BACKUP_DIR/license-binary"
@@ -860,9 +970,7 @@ schema_upgrade_preflight() {
     systemctl stop superpan-license.service
     OLD_SUMMARY="$("$LICENSE_DB_SNAPSHOT" --service superpan-license.service --source "$oldcopy" --destination "$verified")"
     restore_old_license_activity
-    AFTER_AGGREGATE="$(printf '%s\n' "$AFTER_SUMMARY" | tr ' ' '\n' | grep '^count_' | LC_ALL=C sort)"
-    OLD_AGGREGATE="$(printf '%s\n' "$OLD_SUMMARY" | tr ' ' '\n' | grep '^count_' | LC_ALL=C sort)"
-    [ "$AFTER_AGGREGATE" = "$OLD_AGGREGATE" ] || die "semantic aggregate mismatch after old-binary compatibility probe"
+    validate_schema_semantics "$BEFORE_SUMMARY" "$AFTER_SUMMARY" "$OLD_SUMMARY" "$BACKUP_DIR"
     {
         printf 'before %s\n' "$BEFORE_SUMMARY"
         printf 'after %s\n' "$AFTER_SUMMARY"
@@ -870,6 +978,10 @@ schema_upgrade_preflight() {
     } >"$BACKUP_DIR/schema-preflight.txt"
     chmod 0600 "$BACKUP_DIR/schema-preflight.txt" "$BACKUP_DIR"/schema-*.json "$BACKUP_DIR"/schema-*.log
     refresh_manifest
+}
+
+schema_interrupted_initial_preflight() {
+    validate_schema_semantics "$BEFORE_SUMMARY" "$AFTER_SUMMARY" "$AFTER_SUMMARY" "$BACKUP_DIR"
 }
 
 schema_upgrade_preflight

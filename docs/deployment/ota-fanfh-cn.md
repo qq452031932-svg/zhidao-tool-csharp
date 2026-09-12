@@ -43,14 +43,21 @@ source commit、现有身份、ACL、密钥配对状态以及升级时的维护�
 unit 以及授权服务 source-commit 文件原先的 present/absent、数字 owner/group、mode 和
 SHA-256；`unit-state.tsv` 记录两个服务原先的 enabled/active 状态。`manifest.sha256`
 覆盖备份中的每个允许文件。数据库和密钥只以配对身份及指纹写入审计记录，不作为普通
-恢复载荷。
+恢复载荷。旧授权 binary、source-commit 和既有 config 在备份前还必须通过从 `/` 到 leaf
+的 root-owned、非 group/world-writable、无 symlink 信任链检查；binary leaf 必须是单链接
+`root:root` `0755`。备份副本的 inode metadata 与 SHA-256 会再次核对，旧 binary 做 schema
+probe 前还会重新验证固定备份根、leaf metadata、config metadata 与预先记录的 hash。
 
 升级已有 schema 时，安装器在恢复 trap 已武装后短暂停止旧授权服务，使用与 bundle
 相同 source commit 的 `/opt/superpan-license-maintenance/license-db-snapshot` 生成一致快照，
 并立即恢复原 active 状态。新 binary 只在 `127.0.0.1:28092` 针对快照副本完成迁移和
-健康检查；再次 checkpoint 后再由旧 binary 对迁移副本完成健康和只读表计数验证。首次
-安装必须同时不存在旧 binary 和数据库；只存在其中之一会 fail closed。Windows 本地只
-验证脚本合同，以上 ELF/systemd 流程仍须在获批的 Linux staging 快照上执行。
+健康检查；再次 checkpoint 后再由旧 binary 对迁移副本完成健康和只读表计数验证。迁移
+前已有的每个业务表计数必须在迁移后仍存在且不得减少，迁移新增表可以新增计数；摘要中
+缺失、重复或非数字的 aggregate 均会拒绝，旧 binary 读到的迁移后 aggregate 必须与新
+binary 一致。完整有效密钥与数据库已存在而旧 binary 缺失时按 `interrupted-initial`
+恢复：只用同 commit 的新 binary 对一致快照执行 quick-check 与相同语义验证，不执行不
+存在的旧 binary。Windows 本地只验证脚本合同，以上 ELF/systemd 流程仍须在获批的 Linux
+staging 快照上执行。
 
 正式提交顺序固定为：授权 binary、渲染后的 config、unit、启动与
 `127.0.0.1:18092/internal/health`；随后调用 OTA installer 的受控事务模式，仅替换同一

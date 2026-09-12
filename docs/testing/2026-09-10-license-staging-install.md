@@ -49,8 +49,9 @@ deploy tree and does not discover ambient lifecycle commands from `PATH`.
 
 The entry point automatically runs first install, WAL upgrade, explicit rollback,
 restart, all 17 failpoints, and normal retries after `secret-publish`,
-`license-binary`, `license-config`, and `license-unit`. Each installer invocation
-must create exactly one backup below the fixed backup root.
+`license-binary`, `license-config`, `license-unit`, `license-start`,
+`license-health`, and every `ota-*` failpoint. Each installer invocation must
+create exactly one backup below the fixed backup root.
 
 The failpoint allowlist is: `identity`, `secret-encryption`, `secret-lookup`,
 `secret-admin`, `secret-signing`, `secret-publish`, `backup`, `license-binary`,
@@ -63,9 +64,11 @@ returned nonzero.
 
 Every successful scenario also verifies binary/config/unit owner, group and mode;
 enabled/active state; listener address, MainPID and `/proc/<pid>/exe` hash; and
-database/key pairing. A complete key set with an absent database is accepted and
-reported as an interrupted first-install state; partial keys or a database without
-all valid keys fail the matrix.
+database/key pairing. A complete key set with an absent database is accepted as a
+retryable secret-publication state. A complete valid key set and database with no
+old binary is accepted as `interrupted-initial` and verified with the authenticated
+new binary against a coherent snapshot; partial keys or a database without all
+valid keys fail the matrix.
 
 The staging run must also prove the upgrade snapshot/checkpoint sequence, new
 binary migration on temporary loopback port `28092`, old-binary read compatibility,

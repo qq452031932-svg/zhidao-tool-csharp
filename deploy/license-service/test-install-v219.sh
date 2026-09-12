@@ -16,7 +16,7 @@ BUNDLE=""
 FIXTURE_VHOST=""
 declare -A SEEN_ARGS=()
 FAILPOINTS=(identity secret-encryption secret-lookup secret-admin secret-signing secret-publish backup license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)
-RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit)
+RETRY_FAILPOINTS=(secret-publish license-binary license-config license-unit license-start license-health ota-binary ota-config ota-unit ota-restart ota-health)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 usage() { echo "usage: test-install-v219.sh --bundle ABSOLUTE_PATH --fixture-vhost FIXTURE_ID" >&2; exit 2; }
