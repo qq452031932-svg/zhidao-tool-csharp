@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
@@ -32,8 +34,8 @@ func (s Summary) String() string {
 	return strings.Join(parts, " ")
 }
 
-func validateInputs(path, root, marker string) error {
-	for _, value := range []string{path, root, marker} {
+func validateInputs(path, root, marker, expected string) error {
+	for _, value := range []string{path, root, marker, expected} {
 		if !filepath.IsAbs(value) {
 			return errors.New("absolute paths required")
 		}
@@ -45,14 +47,14 @@ func validateInputs(path, root, marker string) error {
 	if runtime.GOOS == "linux" && cleanRoot != "/var/lib/"+disposableBaseName {
 		return errors.New("disposable root is not the fixed Linux path")
 	}
-	if filepath.Clean(path) != filepath.Join(cleanRoot, "state.db") || filepath.Clean(marker) != filepath.Join(cleanRoot, stoppedMarkerName) {
+	if filepath.Clean(path) != filepath.Join(cleanRoot, "state.db") || filepath.Clean(marker) != filepath.Join(cleanRoot, stoppedMarkerName) || filepath.Clean(expected) != filepath.Join(cleanRoot, "expected-counts.json") {
 		return errors.New("paths do not match disposable contract")
 	}
 	rootInfo, err := os.Lstat(cleanRoot)
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && rootInfo.Mode().Perm()&0077 != 0) {
 		return errors.New("untrusted disposable root")
 	}
-	for _, value := range []string{path, marker} {
+	for _, value := range []string{path, marker, expected} {
 		info, e := os.Lstat(value)
 		if e != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
 			return errors.New("untrusted disposable file")
@@ -65,8 +67,12 @@ func validateInputs(path, root, marker string) error {
 	return nil
 }
 
-func CheckDatabase(path, root, marker string) (Summary, error) {
-	if err := validateInputs(path, root, marker); err != nil {
+func CheckDatabase(path, root, marker, expectedPath string) (Summary, error) {
+	if err := validateInputs(path, root, marker, expectedPath); err != nil {
+		return Summary{}, err
+	}
+	expected, err := readExpectedCounts(expectedPath)
+	if err != nil {
 		return Summary{}, err
 	}
 	db, anchor, err := openAnchoredReadOnly(path)
@@ -88,7 +94,7 @@ func CheckDatabase(path, root, marker string) (Summary, error) {
 	if err = db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('license_schema_version','license_software','license_packages','license_package_members','license_cards','license_activation_bindings','license_activation_requests','license_replay_nonces','license_leases','license_admin_idempotency','license_admin_idempotency_cards')").Scan(&unknown); err != nil || unknown != 0 {
 		return Summary{}, errors.New("schema allowlist invariant failed")
 	}
-	invariants := []string{"SELECT count(*) FROM license_cards WHERE (activated_at IS NULL)!=(expires_at IS NULL) OR (activated_at IS NULL)!=(machine_hash IS NULL) OR unactivated_total_days<0", "SELECT count(*) FROM license_activation_bindings WHERE expires_at<activated_at", "SELECT count(*) FROM license_activation_requests WHERE expires_at<activated_at OR lease_until<activated_at", "SELECT count(*) FROM license_package_members m LEFT JOIN license_packages p ON p.id=m.package_id LEFT JOIN license_software s ON s.id=m.software_id WHERE p.id IS NULL OR s.id IS NULL"}
+	invariants := []string{"SELECT count(*) FROM license_cards c LEFT JOIN license_packages p ON p.id=c.package_id WHERE p.id IS NULL OR (c.activated_at IS NULL)!=(c.expires_at IS NULL) OR (c.activated_at IS NULL)!=(c.machine_hash IS NULL) OR c.unactivated_total_days<0", "SELECT count(*) FROM license_package_members m LEFT JOIN license_packages p ON p.id=m.package_id LEFT JOIN license_software s ON s.id=m.software_id WHERE p.id IS NULL OR s.id IS NULL", "SELECT count(*) FROM license_activation_bindings b LEFT JOIN license_cards c ON c.id=b.card_id LEFT JOIN license_software s ON s.id=b.software_id WHERE c.id IS NULL OR s.id IS NULL OR b.expires_at<b.activated_at", "SELECT count(*) FROM license_activation_requests r LEFT JOIN license_cards c ON c.id=r.card_id LEFT JOIN license_software s ON s.id=r.software_id WHERE c.id IS NULL OR s.id IS NULL OR r.expires_at<r.activated_at OR r.lease_until<r.activated_at", "SELECT count(*) FROM license_leases l LEFT JOIN license_cards c ON c.id=l.card_id LEFT JOIN license_software s ON s.id=l.software_id WHERE c.id IS NULL OR s.id IS NULL", "SELECT count(*) FROM license_admin_idempotency_cards x LEFT JOIN license_admin_idempotency i ON i.key=x.idempotency_key LEFT JOIN license_cards c ON c.id=x.card_id WHERE i.key IS NULL OR c.id IS NULL"}
 	for _, query := range invariants {
 		var invalid int64
 		if err = db.QueryRowContext(ctx, query).Scan(&invalid); err != nil || invalid != 0 {
@@ -103,7 +109,63 @@ func CheckDatabase(path, root, marker string) (Summary, error) {
 		}
 		counts[name] = count
 	}
+	for name, want := range expected.Minimum {
+		if counts[name] < want {
+			return Summary{}, errors.New("minimum aggregate invariant failed")
+		}
+	}
+	for name, want := range expected.Exact {
+		if counts[name] != want {
+			return Summary{}, errors.New("exact aggregate invariant failed")
+		}
+	}
 	return Summary{"ok", version, counts}, nil
+}
+
+type expectedCounts struct {
+	Minimum map[string]int64 `json:"minimum"`
+	Exact   map[string]int64 `json:"exact"`
+}
+
+func readExpectedCounts(path string) (expectedCounts, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return expectedCounts{}, errors.New("expected aggregates unavailable")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	var value expectedCounts
+	if decoder.Decode(&value) != nil {
+		return expectedCounts{}, errors.New("invalid expected aggregates")
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return expectedCounts{}, errors.New("invalid expected aggregates")
+	}
+	allowed := map[string]bool{}
+	for _, name := range approvedTables {
+		allowed[name] = true
+	}
+	core := approvedTables[:8]
+	for _, name := range core {
+		if value.Minimum[name] < 1 {
+			return expectedCounts{}, errors.New("core load aggregate minimum missing")
+		}
+	}
+	for name, count := range value.Minimum {
+		if !allowed[name] || count < 0 {
+			return expectedCounts{}, errors.New("invalid minimum aggregate")
+		}
+		if _, duplicate := value.Exact[name]; duplicate {
+			return expectedCounts{}, errors.New("duplicate expected aggregate")
+		}
+	}
+	for name, count := range value.Exact {
+		if !allowed[name] || count < 0 {
+			return expectedCounts{}, errors.New("invalid exact aggregate")
+		}
+	}
+	return value, nil
 }
 
 func openAnchoredReadOnly(path string) (*sql.DB, *os.File, error) {
@@ -142,13 +204,14 @@ func runCLI(args []string) error {
 	path := fs.String("database", "", "stopped database")
 	root := fs.String("root", "", "disposable root")
 	marker := fs.String("stopped-marker", "", "stopped proof")
+	expected := fs.String("expected-counts", "", "protected expected aggregates")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return errors.New("positional arguments forbidden")
 	}
-	summary, err := CheckDatabase(*path, *root, *marker)
+	summary, err := CheckDatabase(*path, *root, *marker, *expected)
 	if err != nil {
 		return err
 	}

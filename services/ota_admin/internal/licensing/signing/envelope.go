@@ -1,6 +1,7 @@
 package signing
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
@@ -58,6 +59,34 @@ func (s *Signer) Sign(claims model.Claims) (model.SignedEnvelope, error) {
 		Payload:   base64.StdEncoding.EncodeToString(payload),
 		Signature: base64.StdEncoding.EncodeToString(signature),
 	}, nil
+}
+
+// Verify authenticates the exact canonical claims representation produced by Sign.
+func Verify(envelope model.SignedEnvelope, expectedKeyID string, publicKey *ecdsa.PublicKey) (model.Claims, error) {
+	if envelope.Validate() != nil || envelope.KeyID != expectedKeyID || publicKey == nil || publicKey.Curve != elliptic.P256() || !publicKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
+		return model.Claims{}, errors.New("invalid signed envelope identity")
+	}
+	payload, err := base64.StdEncoding.Strict().DecodeString(envelope.Payload)
+	if err != nil || base64.StdEncoding.EncodeToString(payload) != envelope.Payload {
+		return model.Claims{}, errors.New("invalid signed payload encoding")
+	}
+	var claims model.Claims
+	if json.Unmarshal(payload, &claims) != nil || claims.Validate() != nil {
+		return model.Claims{}, errors.New("invalid signed claims")
+	}
+	canonical, err := json.Marshal(claims)
+	if err != nil || !bytes.Equal(canonical, payload) {
+		return model.Claims{}, errors.New("noncanonical signed claims")
+	}
+	signature, err := base64.StdEncoding.Strict().DecodeString(envelope.Signature)
+	if err != nil || base64.StdEncoding.EncodeToString(signature) != envelope.Signature {
+		return model.Claims{}, errors.New("invalid signature encoding")
+	}
+	digest := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(publicKey, digest[:], signature) {
+		return model.Claims{}, errors.New("signature verification failed")
+	}
+	return claims, nil
 }
 
 func LoadPrivateKey(path string) (*ecdsa.PrivateKey, error) {

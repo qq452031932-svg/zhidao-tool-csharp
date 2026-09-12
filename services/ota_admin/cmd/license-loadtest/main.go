@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,11 +16,15 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"fanfh.cn/superpan/ota-admin/internal/licensing/authwire"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/signing"
 )
 
 const approvedSeed int64 = 20260910
@@ -38,15 +44,18 @@ func (w Workload) ValidateProduction() error {
 }
 
 type Manifest struct {
-	Seed          int64  `json:"seed"`
-	Card          string `json:"card"`
-	SoftwareID    string `json:"software_id"`
-	MachineHash   string `json:"machine_hash"`
-	RejectionCard string `json:"rejection_card"`
+	Seed             int64  `json:"seed"`
+	Card             string `json:"card"`
+	SoftwareID       string `json:"software_id"`
+	MachineHash      string `json:"machine_hash"`
+	RejectionCard    string `json:"rejection_card"`
+	RejectionCode    string `json:"rejection_code"`
+	SigningSPKIPath  string `json:"signing_spki_path"`
+	SigningKeyIDPath string `json:"signing_key_id_path"`
 }
 
 func (m Manifest) Validate() error {
-	if m.Seed != approvedSeed || !cardFixturePattern.MatchString(m.Card) || !cardFixturePattern.MatchString(m.RejectionCard) || !softwareFixturePattern.MatchString(m.SoftwareID) || !machineFixturePattern.MatchString(m.MachineHash) || m.Card == m.RejectionCard {
+	if m.Seed != approvedSeed || !cardFixturePattern.MatchString(m.Card) || !cardFixturePattern.MatchString(m.RejectionCard) || !softwareFixturePattern.MatchString(m.SoftwareID) || !machineFixturePattern.MatchString(m.MachineHash) || m.Card == m.RejectionCard || m.RejectionCode != "license_not_found" {
 		return errors.New("manifest does not match fixed fixtures")
 	}
 	return nil
@@ -112,6 +121,14 @@ type phaseOptions struct {
 	Requests                 int64
 	Interval, HealthInterval time.Duration
 }
+type responseTrust struct {
+	keyID     string
+	publicKey *ecdsa.PublicKey
+}
+type bindingResult struct {
+	cardID, softwareID, machineHash, packageName string
+	expiresAt, leaseUntil                        time.Time
+}
 
 func validateOrigin(origin string) error {
 	u, err := url.Parse(origin)
@@ -141,6 +158,10 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 		options.HealthInterval = time.Second
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
+	trust, err := loadResponseTrust(manifest)
+	if err != nil {
+		return Report{}, err
+	}
 	before, err := readMetrics(ctx, client, origin, token)
 	if err != nil {
 		return Report{}, err
@@ -151,6 +172,7 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 	report.ExpectedRequests = options.Requests
 	var mu sync.Mutex
 	var healthWG sync.WaitGroup
+	var activationBaseline *bindingResult
 	healthWG.Add(1)
 	go func() {
 		defer healthWG.Done()
@@ -195,6 +217,7 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 		go func(index int64) {
 			defer wg.Done()
 			kind := classify(index)
+			id := requestIdentity(index, kind)
 			body, path := requestBody(manifest, workload.Rate, index, kind, time.Now().UTC())
 			req, e := http.NewRequestWithContext(ctx, http.MethodPost, origin+path, bytes.NewReader(body))
 			if e == nil {
@@ -202,13 +225,12 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 				req.Header.Set(loadSecretHeader, token)
 			}
 			start := time.Now()
-			status := 0
+			var claims model.Claims
 			if e == nil {
 				var resp *http.Response
 				resp, e = client.Do(req)
 				if resp != nil {
-					status = resp.StatusCode
-					_, _ = io.Copy(io.Discard, resp.Body)
+					claims, e = verifyBusinessResponse(resp, id, kind, manifest, trust)
 					_ = resp.Body.Close()
 				}
 			}
@@ -217,14 +239,20 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 			defer mu.Unlock()
 			report.Requests++
 			latencies = append(latencies, elapsed)
+			if e == nil && kind == kindActivate {
+				current := bindingFromClaims(claims)
+				if activationBaseline == nil {
+					activationBaseline = &current
+				} else if *activationBaseline != current {
+					e = errors.New("idempotent activation result changed")
+				}
+			}
 			if e != nil {
 				report.Unexpected++
-			} else if kind == kindReject && status >= 400 && status < 500 {
+			} else if kind == kindReject {
 				report.Rejections++
-			} else if kind != kindReject && status == 200 {
-				report.Successes++
 			} else {
-				report.Unexpected++
+				report.Successes++
 			}
 		}(index)
 	}
@@ -243,14 +271,83 @@ func runPhase(ctx context.Context, origin string, workload Workload, manifest Ma
 	return report, nil
 }
 
+func loadResponseTrust(m Manifest) (responseTrust, error) {
+	spki, err := readTrustedPublicFile(m.SigningSPKIPath, 4096)
+	if err != nil {
+		return responseTrust{}, errors.New("signing trust unavailable")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(spki)
+	key, ok := parsed.(*ecdsa.PublicKey)
+	if err != nil || !ok {
+		return responseTrust{}, errors.New("invalid signing trust")
+	}
+	keyIDBytes, err := readTrustedPublicFile(m.SigningKeyIDPath, 129)
+	keyID := strings.TrimSuffix(string(keyIDBytes), "\n")
+	if err != nil || keyID == "" || strings.Contains(keyID, "\n") {
+		return responseTrust{}, errors.New("invalid signing identity")
+	}
+	return responseTrust{keyID, key}, nil
+}
+func readTrustedPublicFile(path string, limit int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && info.Mode().Perm()&0022 != 0) {
+		return nil, errors.New("untrusted public file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, errors.New("public file too large")
+	}
+	return data, nil
+}
+func verifyBusinessResponse(resp *http.Response, requestID string, kind requestKind, m Manifest, trust responseTrust) (model.Claims, error) {
+	if len(resp.Header.Values("Content-Type")) != 1 || resp.Header.Get("Content-Type") != "application/json" || len(resp.Header.Values("Cache-Control")) != 1 || resp.Header.Get("Cache-Control") != "no-store" {
+		return model.Claims{}, errors.New("response headers invalid")
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	if readErr != nil || len(body) > 65536 {
+		return model.Claims{}, errors.New("response body invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var envelope model.SignedEnvelope
+	if decoder.Decode(&envelope) != nil {
+		return model.Claims{}, errors.New("invalid response envelope")
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return model.Claims{}, errors.New("response has trailing data")
+	}
+	claims, err := signing.Verify(envelope, trust.keyID, trust.publicKey)
+	if err != nil || claims.RequestID != requestID {
+		return model.Claims{}, errors.New("response authentication failed")
+	}
+	if kind == kindReject {
+		if resp.StatusCode != http.StatusForbidden || claims.Decision != model.DecisionDeny || string(claims.Code) != m.RejectionCode || claims.CardID != nil || claims.SoftwareID != nil || claims.MachineHash != nil || claims.ExpiresAt != nil || claims.LeaseUntil != nil {
+			return model.Claims{}, errors.New("unexpected rejection semantics")
+		}
+		return claims, nil
+	}
+	if resp.StatusCode != http.StatusOK || claims.Decision != model.DecisionAllow || claims.Code != model.CodeOK || claims.SoftwareID == nil || *claims.SoftwareID != m.SoftwareID || claims.MachineHash == nil || *claims.MachineHash != m.MachineHash || claims.CardID == nil || claims.PackageName == nil || claims.ExpiresAt == nil || claims.LeaseUntil == nil {
+		return model.Claims{}, errors.New("unexpected authorization semantics")
+	}
+	return claims, nil
+}
+func bindingFromClaims(c model.Claims) bindingResult {
+	return bindingResult{*c.CardID, *c.SoftwareID, *c.MachineHash, *c.PackageName, *c.ExpiresAt, *c.LeaseUntil}
+}
+
 func requestBody(m Manifest, rate int, index int64, kind requestKind, now time.Time) ([]byte, string) {
 	card := m.Card
 	path := "/license-api/v1/validate"
-	id := fmt.Sprintf("capacity-%d", index)
+	id := requestIdentity(index, kind)
 	field := "request_id"
 	if kind == kindActivate {
 		path = "/license-api/v1/activate"
-		id = "capacity-idempotent"
 		field = "activation_request_id"
 	}
 	if kind == kindReject {
@@ -259,6 +356,12 @@ func requestBody(m Manifest, rate int, index int64, kind requestKind, now time.T
 	payload := map[string]any{"protocol_version": 1, field: id, "card": card, "software_id": m.SoftwareID, "machine_hash": m.MachineHash, "timestamp": now.Format(time.RFC3339Nano), "nonce": phaseNonce(m.Seed, rate, index)}
 	body, _ := json.Marshal(payload)
 	return body, path
+}
+func requestIdentity(index int64, kind requestKind) string {
+	if kind == kindActivate {
+		return "capacity-idempotent"
+	}
+	return fmt.Sprintf("capacity-%d", index)
 }
 func deterministicNonce(seed, index int64) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", seed, index)))

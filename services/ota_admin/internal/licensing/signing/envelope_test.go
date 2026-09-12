@@ -197,6 +197,35 @@ func TestLoadPrivateKeyRejectsSymlinkOnLinux(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsTamperingAndWrongKeyID(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := New("capacity-key", key, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 10, 1, 2, 3, 0, time.UTC)
+	card, software, machine, pkg := "card", "software", "machine", "package"
+	expires, lease := now.Add(time.Hour), now.Add(time.Minute)
+	envelope, err := signer.Sign(model.Claims{ProtocolVersion: 1, RequestID: "request", ServerTime: now, Decision: model.DecisionAllow, Code: model.CodeOK, CardID: &card, SoftwareID: &software, MachineHash: &machine, PackageName: &pkg, ExpiresAt: &expires, LeaseUntil: &lease})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(envelope, "capacity-key", &key.PublicKey); err != nil {
+		t.Fatal(err)
+	}
+	tampered := envelope
+	tampered.Payload = base64.StdEncoding.EncodeToString([]byte(`{"protocol_version":1}`))
+	if _, err := Verify(tampered, "capacity-key", &key.PublicKey); err == nil {
+		t.Fatal("tampered payload accepted")
+	}
+	if _, err := Verify(envelope, "other-key", &key.PublicKey); err == nil {
+		t.Fatal("wrong key id accepted")
+	}
+}
+
 func writePEM(t *testing.T, name string, block *pem.Block, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)

@@ -1,14 +1,27 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"fanfh.cn/superpan/ota-admin/internal/licensing/authwire"
+	licensehttp "fanfh.cn/superpan/ota-admin/internal/licensing/httpapi"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/model"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/service"
+	"fanfh.cn/superpan/ota-admin/internal/licensing/signing"
+	licensestore "fanfh.cn/superpan/ota-admin/internal/licensing/store"
 )
 
 func TestProductionWorkloadAllowsOnlyApprovedPhases(t *testing.T) {
@@ -36,7 +49,7 @@ func TestOriginIsExplicitLiteralIPv4Loopback(t *testing.T) {
 }
 
 func TestManifestRequiresFixedSeedAndFixtures(t *testing.T) {
-	good := Manifest{Seed: approvedSeed, Card: "AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA", SoftwareID: "8270e8d7-1791-487d-ad76-0da7a0cbed12", MachineHash: strings.Repeat("a", 64), RejectionCard: "BBBBBBBB-BBBBBBBB-BBBBBBBB-BBBBBBBB"}
+	good := Manifest{Seed: approvedSeed, Card: "AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA", SoftwareID: "8270e8d7-1791-487d-ad76-0da7a0cbed12", MachineHash: strings.Repeat("a", 64), RejectionCard: "BBBBBBBB-BBBBBBBB-BBBBBBBB-BBBBBBBB", RejectionCode: "license_not_found"}
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -71,40 +84,25 @@ func TestApprovedPhasesUseDisjointNonceSequences(t *testing.T) {
 	}
 }
 
-func TestRunPhaseUsesPublicRoutesMetricsAndConcurrentHealth(t *testing.T) {
-	manifest := Manifest{Seed: approvedSeed, Card: "AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA", SoftwareID: "8270e8d7-1791-487d-ad76-0da7a0cbed12", MachineHash: strings.Repeat("a", 64), RejectionCard: "BBBBBBBB-BBBBBBBB-BBBBBBBB-BBBBBBBB"}
-	var mu sync.Mutex
-	paths := map[string]int{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		paths[r.URL.Path]++
-		mu.Unlock()
-		switch r.URL.Path {
-		case "/internal/load-metrics":
-			if r.Header.Get(loadSecretHeader) != "test-token" {
-				w.WriteHeader(401)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"busy":0,"locked":0}`))
-		case "/internal/health":
-			w.WriteHeader(200)
-		case "/license-api/v1/activate":
-			w.WriteHeader(200)
-		case "/license-api/v1/validate":
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["card"] == manifest.RejectionCard {
-				w.WriteHeader(403)
-			} else {
-				w.WriteHeader(200)
-			}
-		default:
-			w.WriteHeader(404)
-		}
-	}))
+func TestRunPhaseUsesRealSignedRouterSemantics(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signer, _ := signing.New("capacity-key", key, rand.Reader)
+	spki, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	dir := t.TempDir()
+	spkiPath := dir + "/signing.der"
+	keyIDPath := dir + "/key-id"
+	_ = os.WriteFile(spkiPath, spki, 0600)
+	_ = os.WriteFile(keyIDPath, []byte("capacity-key\n"), 0600)
+	manifest := Manifest{Seed: approvedSeed, Card: "AAAAAAAA-AAAAAAAA-AAAAAAAA-AAAAAAAA", SoftwareID: "8270e8d7-1791-487d-ad76-0da7a0cbed12", MachineHash: strings.Repeat("a", 64), RejectionCard: "BBBBBBBB-BBBBBBBB-BBBBBBBB-BBBBBBBB", SigningSPKIPath: spkiPath, SigningKeyIDPath: keyIDPath, RejectionCode: "license_not_found"}
+	secret := bytes.Repeat([]byte{0x5a}, 32)
+	svc := &semanticService{manifest: manifest}
+	handler, err := licensehttp.NewRouter(licensehttp.Options{Service: svc, ReplayStore: acceptReplay{}, Signer: signer, Clock: liveClock{}, MaxBodyBytes: 4096, MaxHeaderBytes: 4096, TimestampWindow: time.Minute, NonceLifetime: time.Minute, MaxReplayNonces: 1000, ActivationRate: licensehttp.RateLimit{Requests: 1, Window: time.Minute}, ValidationRate: licensehttp.RateLimit{Requests: 1, Window: time.Minute}, MaxLimiterEntries: 10, LoadTestSecret: secret, StoreMetrics: zeroMetrics{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
 	defer server.Close()
-	report, err := runPhase(context.Background(), server.URL, Workload{Rate: 100, DurationSeconds: 600}, manifest, "test-token", phaseOptions{Requests: 100, Interval: time.Millisecond, HealthInterval: time.Millisecond})
+	report, err := runPhase(context.Background(), server.URL, Workload{Rate: 100, DurationSeconds: 600}, manifest, authwire.EncodeInternalToken(secret), phaseOptions{Requests: 100, Interval: time.Millisecond, HealthInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,10 +112,62 @@ func TestRunPhaseUsesPublicRoutesMetricsAndConcurrentHealth(t *testing.T) {
 	if report.HealthChecks == 0 || report.HealthFailures != 0 || report.BusyDelta != 0 || report.LockedDelta != 0 {
 		t.Fatalf("health/metrics=%+v", report)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if paths["/license-api/v1/activate"] != 10 || paths["/license-api/v1/validate"] != 90 || paths["/internal/load-metrics"] != 2 || paths["/internal/health"] == 0 {
-		t.Fatalf("paths=%v", paths)
+}
+
+type liveClock struct{}
+
+func (liveClock) Now() time.Time { return time.Now().UTC() }
+
+type acceptReplay struct{}
+
+func (acceptReplay) ClaimReplayNonce(context.Context, string, time.Time, time.Time, int) (bool, error) {
+	return true, nil
+}
+
+type zeroMetrics struct{}
+
+func (zeroMetrics) Metrics() licensestore.Metrics { return licensestore.Metrics{} }
+
+type semanticService struct{ manifest Manifest }
+
+func (s *semanticService) Activate(_ context.Context, id, card, software, machine string) (model.ActivationState, error) {
+	return stableState(id, s.manifest), nil
+}
+func (s *semanticService) Validate(_ context.Context, card, software, machine string) (model.ActivationState, error) {
+	if card == s.manifest.RejectionCard {
+		return model.ActivationState{}, service.ErrNotFound
+	}
+	return stableState("validation", s.manifest), nil
+}
+func stableState(id string, m Manifest) model.ActivationState {
+	now := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	return model.ActivationState{RequestID: id, CardID: "card-id", SoftwareID: m.SoftwareID, MachineHash: m.MachineHash, PackageName: "package", ActivatedAt: now, ExpiresAt: now.Add(time.Hour), LeaseUntil: now.Add(time.Minute)}
+}
+
+func TestBusinessResponseVerifierRejectsFalsePositiveMutations(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signer, _ := signing.New("capacity-key", key, rand.Reader)
+	now := time.Now().UTC()
+	card, software, machine, pkg := "card-id", "8270e8d7-1791-487d-ad76-0da7a0cbed12", strings.Repeat("a", 64), "package"
+	expires, lease := now.Add(time.Hour), now.Add(time.Minute)
+	envelope, _ := signer.Sign(model.Claims{ProtocolVersion: 1, RequestID: "capacity-3", ServerTime: now, Decision: model.DecisionAllow, Code: model.CodeOK, CardID: &card, SoftwareID: &software, MachineHash: &machine, PackageName: &pkg, ExpiresAt: &expires, LeaseUntil: &lease})
+	body, _ := json.Marshal(envelope)
+	manifest := Manifest{SoftwareID: software, MachineHash: machine, RejectionCode: "license_not_found"}
+	trust := responseTrust{"capacity-key", &key.PublicKey}
+	for _, tc := range []struct {
+		name                          string
+		status                        int
+		contentType, cache, requestID string
+		body                          []byte
+	}{{"valid", 200, "application/json", "no-store", "capacity-3", body}, {"conflict", 409, "application/json", "no-store", "capacity-3", body}, {"wrong request", 200, "application/json", "no-store", "other", body}, {"cacheable", 200, "application/json", "public", "capacity-3", body}, {"unsigned", 200, "application/json", "no-store", "capacity-3", []byte(`{"code":"ok"}`)}} {
+		resp := &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": []string{tc.contentType}, "Cache-Control": []string{tc.cache}}, Body: io.NopCloser(bytes.NewReader(tc.body))}
+		_, err := verifyBusinessResponse(resp, tc.requestID, kindValidate, manifest, trust)
+		if tc.name == "valid" && err != nil {
+			t.Fatal(err)
+		}
+		if tc.name != "valid" && err == nil {
+			t.Fatalf("mutation %s accepted", tc.name)
+		}
 	}
 }
 

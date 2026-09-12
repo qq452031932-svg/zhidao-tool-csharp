@@ -1,6 +1,7 @@
 package deploymentcontract
 
 import (
+	"fmt"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -40,6 +41,35 @@ func TestCapacityOrchestratorHasExactIdentitySamplingAndCleanupContract(t *testi
 	}
 	if strings.Contains(body, "eval ") || strings.Contains(body, "rm -rf") || strings.Contains(body, "LOAD_SECRET=") {
 		t.Fatal("unsafe orchestration construct")
+	}
+	if err := validateCapacityRuntimeContract(body); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validateCapacityRuntimeContract(body string) error {
+	for _, required := range []string{"jq -S '{public_api_base_path,limits}'", "runtime Uid mismatch", "runtime Gid mismatch", "runtime Umask mismatch", "runtime NOFILE mismatch", "ACTUAL_GROUPS", "run_phase 50 600", "run_phase 100 600", "phase sample count too low", "phase sample coverage too short", "wait \"$SAMPLER_PID\""} {
+		if !strings.Contains(body, required) {
+			return fmt.Errorf("missing runtime contract %q", required)
+		}
+	}
+	if strings.Contains(body, "wait \"$SAMPLER_PID\" || true") {
+		return fmt.Errorf("sampler failure is suppressed")
+	}
+	return nil
+}
+
+func TestCapacityRuntimeContractRejectsCriticalMutations(t *testing.T) {
+	body := read(t, "deploy", "license-service", "run-capacity-test.sh")
+	for _, fragment := range []string{"jq -S '{public_api_base_path,limits}'", "runtime Uid mismatch", "runtime Umask mismatch", "phase sample count too low", "phase sample coverage too short"} {
+		mutated := strings.ReplaceAll(body, fragment, "removed")
+		if err := validateCapacityRuntimeContract(mutated); err == nil {
+			t.Fatalf("mutation removing %q escaped contract", fragment)
+		}
+	}
+	mutated := strings.Replace(body, "wait \"$SAMPLER_PID\";", "wait \"$SAMPLER_PID\" || true;", 1)
+	if err := validateCapacityRuntimeContract(mutated); err == nil {
+		t.Fatal("sampler suppression mutation escaped contract")
 	}
 }
 

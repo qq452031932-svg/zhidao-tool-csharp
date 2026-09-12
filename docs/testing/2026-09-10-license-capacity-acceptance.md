@@ -8,6 +8,9 @@ This is a redacted evidence template. Execute only against a disposable instance
 - 50 requests/second for 600 seconds, followed by 100 requests/second for 600 seconds
 - 70% valid validation, 10% idempotent activation, 20% deliberate business rejection
 - Health checked continuously during both phases
+- Every public result is accepted only after strict envelope decoding, response-signature
+  verification against the protected SPKI/key-ID files, request correlation, and exact
+  decision/code/binding semantics. HTTP status alone is never evidence of success.
 
 ## Acceptance thresholds
 
@@ -28,6 +31,8 @@ health continuity, and exit statuses. Do not record cards, machine hashes, nonce
 tokens, signatures, private keys, cookies, or response bodies. After the run, stop the
 exact test PID, run `license-dbcheck`, require `quick_check=ok`, and remove only the
 validated disposable data tree. If any gate fails, leave the public Nginx include absent.
+The protected expected-count manifest must require non-empty workload tables and exact or
+minimum aggregate counts; empty, missing, or referentially orphaned rows fail acceptance.
 
 ## Staging evidence
 
