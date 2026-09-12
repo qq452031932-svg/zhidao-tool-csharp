@@ -113,7 +113,11 @@ public sealed record OperationResultRecord(
       bool CanSafelyRetryTransfer = false,
       string? GeneratedShareUrl = null,
       string? GeneratedExtractionCode = null,
-      Guid? StagedImportRowId = null)
+      Guid? StagedImportRowId = null,
+      string? InputShareUrl = null,
+      string? InputExtractionCode = null,
+      string? LatestShareUrl = null,
+      string? LatestExtractionCode = null)
 {
     public override string ToString() =>
         $"OperationResultRecord {{ OperationId = {OperationId}, CandidateSequence = {CandidateSequence}, Status = {Status}, UserContent = [REDACTED] }}";
