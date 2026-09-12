@@ -14,13 +14,13 @@
 
 **Files:**
 - Modify: `src/BaiduBatchTransfer.Core/Abstractions/PersistenceModels.cs`
-- Modify: `src/BaiduBatchTransfer.Core/Domain/OperationResult.cs` (or the current operation-result model)
-- Modify: SQLite migrations/repositories for operation results
+- Modify: `src/BaiduBatchTransfer.Core/Abstractions/PersistenceModels.cs` (`OperationResultRecord`)
+- Modify: the existing SQLite job repository/migrations that read and write `OperationResults`
 - Test: `tests/BaiduBatchTransfer.Application.Tests/Jobs/OperationResultPersistenceTests.cs`
 
 - [ ] Write failing tests proving immutable input URL/code and latest output URL/code are persisted; successful results export latest values, failed/skipped/pending results export input values, and a success without code clears the code.
 - [ ] Run focused tests and confirm failure because fields/migration are absent.
-- [ ] Add nullable latest URL/code fields, migration, repository writes, and reads.
+- [ ] Add immutable-per-attempt input URL/code plus nullable latest URL/code fields, migration, and writes in the transfer-success transaction; on retry, the newly imported failed-row values become that attempt's input while prior attempts remain audit history.
 - [ ] Run focused tests and full operation-result tests.
 - [ ] Commit `feat: persist latest share outputs per operation result`.
 
@@ -33,7 +33,7 @@
 
 - [ ] Write failing tests for a `SelectFailed` command: it selects every failed/skipped/pending row, leaves successful rows unselected, and does not start transfer.
 - [ ] Run focused UI tests and verify the expected failure.
-- [ ] Implement the command, button text `选中失败`, selected-count update, and empty-result message.
+- [ ] Implement a global selected-ID set (not only visible rows), button text `选中失败`, selected-count update, and empty-result message; selection survives paging/refresh until explicitly cleared.
 - [ ] Run UI tests and verify selection is stable across refresh/paging.
 - [ ] Commit `feat: add select-failed transfer action`.
 
@@ -45,9 +45,9 @@
 - Test: `tests/BaiduBatchTransfer.Application.Tests/Jobs/AccountResultExportTests.cs`
 
 - [ ] Write failing tests for one-account success/failed files, multi-account splitting by AccountId, and omission of empty result files.
-- [ ] Add a single export timestamp per invocation and deterministic grouping/order.
+- [ ] Add a single export timestamp per invocation and deterministic grouping/order; stream account/outcome groups in database order instead of loading the whole batch into memory.
 - [ ] Implement filename sanitization, reserved-name handling, path containment, atomic non-overwriting file creation, and collision suffixes.
-- [ ] Ensure success rows use latest URL/code; failed rows use original URL/code and include status/reason.
+- [ ] Ensure status mapping is fixed: `Success`→成功 file; `Failed`, `Skipped`, `Pending`, `Cancelled`, conflicts, and unknown statuses→失败 file. Success rows use latest URL/code; all other rows use immutable input URL/code and include fixed 状态/失败原因 columns.
 - [ ] Run tests including same-name accounts, invalid Unicode/Windows names, cancellation, and write failure.
 - [ ] Commit `feat: split result exports by account and outcome`.
 
@@ -60,7 +60,7 @@
 
 - [ ] Write failing Open XML tests that read generated workbooks and assert the supported standard columns remain, exactly one link/code column exists, and no horizontal result columns are added.
 - [ ] Implement row mapping that replaces only link and extraction-code cells for success rows.
-- [ ] Keep failed rows unchanged for retry and add fixed status/reason columns only where defined by the approved schema.
+- [ ] Keep failed rows unchanged for retry; define the standard columns exactly as 序号、标题、账号、分享链接、提取码、目标目录、转存状态、失败原因, and make the importer ignore the two result-only columns while preserving account/path mapping.
 - [ ] Verify formula sanitization, row rollover, empty workbooks, and >Excel row-limit behavior.
 - [ ] Commit `feat: preserve source columns in account result workbooks`.
 
@@ -72,7 +72,7 @@
 - Test: app integration tests for export command and generated file list
 
 - [ ] Write failing integration tests for one/two-account export filenames and success/failed file contents.
-- [ ] Implement output-directory selection, progress, cancellation, partial-failure reporting, and user-facing file list.
+- [ ] Implement output-directory selection, progress, cancellation, partial-failure reporting, and user-facing file list; write `.partial` files only during generation, atomically rename on success, and remove partials on cancellation/failure.
 - [ ] Ensure each run uses one timestamp and never overwrites existing files.
 - [ ] Update docs with retry flow: click `选中失败` → review → start transfer → export success/failed files.
 - [ ] Run focused app/infrastructure tests and full regression suite.
