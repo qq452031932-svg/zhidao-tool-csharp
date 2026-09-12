@@ -5,7 +5,7 @@ This is a redacted evidence template. Execute only against a disposable instance
 
 ## Fixed workload
 
-- 50 requests/second for 10 minutes, followed by 100 requests/second for 10 minutes
+- 50 requests/second for 600 seconds, followed by 100 requests/second for 600 seconds
 - 70% valid validation, 10% idempotent activation, 20% deliberate business rejection
 - Health checked continuously during both phases
 
@@ -28,3 +28,14 @@ health continuity, and exit statuses. Do not record cards, machine hashes, nonce
 tokens, signatures, private keys, cookies, or response bodies. After the run, stop the
 exact test PID, run `license-dbcheck`, require `quick_check=ok`, and remove only the
 validated disposable data tree. If any gate fails, leave the public Nginx include absent.
+
+## Staging evidence
+
+Status: **PENDING AUTHORIZED LINUX STAGING**.
+
+Do not convert this status to pass from local or simulated runs. The authorized operator
+must record the deployment-bundle source commit and binary hashes, both aggregate phase
+reports, CPU average, RSS start/end/growth, memory floor, health totals, busy/locked
+deltas, database-check aggregate output, and cleanup/public-route assertions. All values
+must come from the installed binary's exact `MainPID`; no request fixture or secret value
+may be copied into this document.

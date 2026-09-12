@@ -1,14 +1,30 @@
 [Unit]
-Description=SuperPan license disposable load test
+Description=SuperPan license disposable capacity instance
+After=network.target
 
 [Service]
 Type=simple
 User=superpan-license
 Group=superpan-license
-ExecStart=/opt/superpan-license/license-loadtest --origin http://127.0.0.1:18093
+SupplementaryGroups=superpan-license-admin
+UMask=0077
+ExecStartPre=/bin/sh -ec 'actual=$$(id -Gn | tr " " "\n" | LC_ALL=C sort | tr "\n" " "); test "$$actual" = "superpan-license superpan-license-admin "'
+WorkingDirectory=/var/lib/license-capacity-18093
+ExecStart=/opt/superpan-license/superpan-license serve --config /var/lib/license-capacity-18093/config.json
+Restart=no
+RestartSec=5s
+TimeoutStopSec=30s
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
+PrivateDevices=true
+ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/superpan-license-loadtest
-Restart=no
+InaccessibleDirectories=/var/www
+ReadOnlyDirectories=/
+ReadWriteDirectories=/var/lib/license-capacity-18093
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
