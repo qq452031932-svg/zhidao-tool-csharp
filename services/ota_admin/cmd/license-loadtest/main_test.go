@@ -84,6 +84,18 @@ func TestApprovedPhasesUseDisjointNonceSequences(t *testing.T) {
 	}
 }
 
+func TestApprovedTenMinutePhasesFitReplayCapacity(t *testing.T) {
+	seen := map[string]struct{}{}
+	for _, rate := range []int{50, 100} {
+		for index := int64(0); index < int64(rate*600); index++ {
+			seen[phaseNonce(approvedSeed, rate, index)] = struct{}{}
+		}
+	}
+	if len(seen) != 4096 {
+		t.Fatalf("approved phases use %d distinct nonces, want bounded disjoint pool of 4096", len(seen))
+	}
+}
+
 func TestRunPhaseUsesRealSignedRouterSemantics(t *testing.T) {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	signer, _ := signing.New("capacity-key", key, rand.Reader)
@@ -168,6 +180,20 @@ func TestBusinessResponseVerifierRejectsFalsePositiveMutations(t *testing.T) {
 		if tc.name != "valid" && err == nil {
 			t.Fatalf("mutation %s accepted", tc.name)
 		}
+	}
+}
+
+func TestRejectionVerifierRejectsPackageMetadata(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signer, _ := signing.New("capacity-key", key, rand.Reader)
+	now := time.Now().UTC()
+	packageName := "must-not-be-present"
+	envelope, _ := signer.Sign(model.Claims{ProtocolVersion: 1, RequestID: "capacity-reject", ServerTime: now, Decision: model.DecisionDeny, Code: model.Code("license_not_found"), PackageName: &packageName})
+	body, _ := json.Marshal(envelope)
+	manifest := Manifest{RejectionCode: "license_not_found"}
+	resp := &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{"Content-Type": []string{"application/json"}, "Cache-Control": []string{"no-store"}}, Body: io.NopCloser(bytes.NewReader(body))}
+	if _, err := verifyBusinessResponse(resp, "capacity-reject", kindReject, manifest, responseTrust{"capacity-key", &key.PublicKey}); err == nil {
+		t.Fatal("rejection response carrying package metadata was accepted")
 	}
 }
 

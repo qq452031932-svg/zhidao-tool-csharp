@@ -101,7 +101,7 @@ func TestLoadCredentialBypassesOnlyPublicRateLimitFromLoopback(t *testing.T) {
 	}
 }
 
-func TestLoadBypassStillEnforcesBodyReplayAndSignatureControls(t *testing.T) {
+func TestLoadBypassStillEnforcesBodyAndSignatureControlsWithoutFillingReplayStore(t *testing.T) {
 	replay := &trackingReplayStore{}
 	handler, service, clock, secret := loadTestRouter(t, replay)
 	token := authwire.EncodeInternalToken(secret)
@@ -133,7 +133,7 @@ func TestLoadBypassStillEnforcesBodyReplayAndSignatureControls(t *testing.T) {
 		t.Fatalf("load response is not signed: %s", rec.Body.String())
 	}
 	nonces, _ := replay.snapshot()
-	if len(nonces) != 1 || nonces[0] != nonce(210) {
-		t.Fatalf("load request did not pass replay control: %v", nonces)
+	if len(nonces) != 0 {
+		t.Fatalf("authenticated load request consumed replay capacity: %v", nonces)
 	}
 }

@@ -41,15 +41,16 @@ EXPECTED_SERVICE_HASH=$(cut -d' ' -f1 "$BUNDLE/superpan-license.sha256"); [ "$(s
 jq -e '.listen_address=="127.0.0.1:18093" and .license_database_path=="/var/lib/license-capacity-18093/state.db" and .load_test_enabled==true and .load_test_secret_path=="/var/lib/license-capacity-18093/load-test.secret" and .public_api_base_path=="/license-api/v1"' "$ROOT/config.json" >/dev/null || die 'test-only load configuration missing'
 [ "$(jq -S '{public_api_base_path,limits}' "$ROOT/config.json")" = "$(jq -S '{public_api_base_path,limits}' "$PRODUCTION_CONFIG")" ] || die 'capacity configuration differs from production behavior'
 
-SAMPLER_PID= MAIN_PID=
+SAMPLER_PID= MAIN_PID= START_ATTEMPTED=false
 cleanup_failure(){
   status=$?
   if [ -n "$SAMPLER_PID" ] && kill -0 "$SAMPLER_PID" 2>/dev/null; then kill -TERM "$SAMPLER_PID"; if ! wait "$SAMPLER_PID"; then status=1; fi; fi
-  if [ -n "$MAIN_PID" ] && kill -0 "$MAIN_PID" 2>/dev/null; then systemctl stop "$UNIT" || true; fi
+  if [ "$START_ATTEMPTED" = true ] && ! systemctl stop "$UNIT"; then status=1; fi
   assert_public_absent
   exit "$status"
 }
 trap cleanup_failure EXIT INT TERM HUP
+START_ATTEMPTED=true
 systemctl start "$UNIT"
 MAIN_PID=$(systemctl show --property=MainPID --value "$UNIT"); [[ "$MAIN_PID" =~ ^[1-9][0-9]*$ ]] || die 'invalid MainPID'
 [ "$(readlink -f -- "/proc/$MAIN_PID/exe")" = /opt/superpan-license/superpan-license ] || die 'MainPID executable mismatch'
@@ -97,6 +98,7 @@ run_phase 100 600
 
 systemctl stop superpan-license-loadtest.service
 kill -0 "$MAIN_PID" 2>/dev/null && die 'exact capacity PID survived stop'
+START_ATTEMPTED=false
 printf 'stopped\n' >"$STOPPED_MARKER"; chown superpan-license:superpan-license "$STOPPED_MARKER"; chmod 600 "$STOPPED_MARKER"
 runuser -u superpan-license -- "$TOOLS/license-dbcheck" --database "$DATABASE" --root "$ROOT" --stopped-marker "$STOPPED_MARKER" --expected-counts "$EXPECTED_COUNTS"
 assert_public_absent

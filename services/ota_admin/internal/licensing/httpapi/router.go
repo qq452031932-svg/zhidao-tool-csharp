@@ -237,6 +237,11 @@ func loopbackPeer(r *http.Request) bool {
 
 type loadBypassContextKey struct{}
 
+func isAuthenticatedLoadRequest(r *http.Request) bool {
+	bypass, _ := r.Context().Value(loadBypassContextKey{}).(bool)
+	return bypass
+}
+
 func (a *api) protect(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

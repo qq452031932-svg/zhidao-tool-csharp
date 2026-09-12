@@ -47,6 +47,16 @@ func TestCapacityOrchestratorHasExactIdentitySamplingAndCleanupContract(t *testi
 	}
 }
 
+func TestCapacityCleanupStopsUnitAfterEveryStartAttempt(t *testing.T) {
+	body := read(t, "deploy", "license-service", "run-capacity-test.sh")
+	requireBefore(t, body, "START_ATTEMPTED=false", "cleanup_failure(){")
+	requireBefore(t, body, "START_ATTEMPTED=true", "systemctl start \"$UNIT\"")
+	requireFragments(t, body, "if [ \"$START_ATTEMPTED\" = true ]", "systemctl stop \"$UNIT\"")
+	if strings.Contains(body, "[ -n \"$MAIN_PID\" ] && kill -0 \"$MAIN_PID\"") {
+		t.Fatal("cleanup still depends on obtaining MainPID")
+	}
+}
+
 func validateCapacityRuntimeContract(body string) error {
 	for _, required := range []string{"jq -S '{public_api_base_path,limits}'", "runtime Uid mismatch", "runtime Gid mismatch", "runtime Umask mismatch", "runtime NOFILE mismatch", "ACTUAL_GROUPS", "run_phase 50 600", "run_phase 100 600", "phase sample count too low", "phase sample coverage too short", "wait \"$SAMPLER_PID\""} {
 		if !strings.Contains(body, required) {
