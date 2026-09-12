@@ -35,10 +35,77 @@ func (permissiveTrust) ValidateSidecar(path string, _ SourceKind) (FileIdentity,
 }
 func (permissiveTrust) SecureOutput(string) error { return nil }
 
+type fakeBinding struct{ identity FileIdentity }
+
+func (b fakeBinding) Identity() FileIdentity { return b.identity }
+func (fakeBinding) Close() error             { return nil }
+
+type fakeBinder struct{ identity FileIdentity }
+
+func (b fakeBinder) Bind(string, FileIdentity) (SourceBinding, error) {
+	return fakeBinding{identity: b.identity}, nil
+}
+
+type quietProbe struct{}
+
+func (quietProbe) Prove(context.Context) error { return nil }
+
 func testOptions(t *testing.T, source, destination string) SnapshotOptions {
 	t.Helper()
 	return SnapshotOptions{ServiceName: requiredService, Source: source, Destination: destination,
-		ServiceProbe: fakeServiceProbe{state: ServiceStopped}, TrustProbe: permissiveTrust{}}
+		ServiceProbe: fakeServiceProbe{state: ServiceStopped}, TrustProbe: permissiveTrust{},
+		SourceBinder: fakeBinder{identity: FileIdentity{Device: 1, Inode: 1}}, QuiescenceProbe: quietProbe{},
+		DatabaseOpener: func(path string) (*sql.DB, FileIdentity, error) {
+			db, err := sql.Open("sqlite", buildSQLiteDSN(path, false))
+			return db, FileIdentity{Device: 1, Inode: 1}, err
+		}}
+}
+
+func TestSnapshotRejectsSQLiteTargetIdentityMismatch(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "state.db")
+	dst := filepath.Join(root, "snapshot.db")
+	createTestDB(t, src)
+	o := testOptions(t, src, dst)
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DatabaseOpener = func(string) (*sql.DB, FileIdentity, error) {
+		db, err := sql.Open("sqlite", buildSQLiteDSN(src, false))
+		return db, FileIdentity{Device: 9, Inode: 9}, err
+	}
+	if _, err := Snapshot(context.Background(), o); err == nil || !strings.Contains(err.Error(), "SQLite target identity") {
+		t.Fatalf("expected identity mismatch, got %v", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination leaked: %v", err)
+	}
+}
+
+func TestSQLitePathRejectsURIControlCharacters(t *testing.T) {
+	for _, name := range []string{"state?mode=memory.db", "state#fragment.db", "state%2fother.db"} {
+		if err := validateSQLitePath(filepath.Join(t.TempDir(), name)); err == nil {
+			t.Fatalf("URI-mutating basename accepted: %q", name)
+		}
+	}
+}
+
+type failingRows struct {
+	next   int
+	closed bool
+}
+
+func (r *failingRows) Next() bool      { r.next++; return r.next == 1 }
+func (*failingRows) Scan(...any) error { return nil }
+func (*failingRows) Err() error        { return errors.New("iteration failed") }
+func (r *failingRows) Close() error    { r.closed = true; return nil }
+
+func TestCollectTableNamesRejectsIterationErrorBeforeClose(t *testing.T) {
+	rows := &failingRows{}
+	if _, err := collectTableNames(rows); err == nil || !strings.Contains(err.Error(), "iteration failed") {
+		t.Fatalf("expected iteration failure, got %v", err)
+	}
+	if !rows.closed {
+		t.Fatal("rows were not closed")
+	}
 }
 
 func TestSnapshotRejectsInvalidOrUnprovenServiceState(t *testing.T) {
@@ -211,7 +278,7 @@ func TestSnapshotRejectsSidecarIdentityReplacementAndCleans(t *testing.T) {
 
 func createTestDB(t *testing.T, path string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", strings.Replace(buildSQLiteDSN(path, false), "mode=rw", "mode=rwc", 1))
 	if err != nil {
 		t.Fatal(err)
 	}

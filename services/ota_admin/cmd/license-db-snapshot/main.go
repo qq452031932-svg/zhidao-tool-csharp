@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -41,6 +42,16 @@ const (
 
 type FileIdentity struct{ Device, Inode uint64 }
 
+type SourceBinding interface {
+	Identity() FileIdentity
+	Close() error
+}
+type SourceBinder interface {
+	Bind(string, FileIdentity) (SourceBinding, error)
+}
+type QuiescenceProbe interface{ Prove(context.Context) error }
+type DatabaseOpener func(string) (*sql.DB, FileIdentity, error)
+
 type ServiceStateProbe interface {
 	State(context.Context, string) (ServiceState, error)
 }
@@ -52,13 +63,16 @@ type TrustProbe interface {
 }
 
 type SnapshotOptions struct {
-	ServiceName    string
-	Source         string
-	Destination    string
-	ServiceProbe   ServiceStateProbe
-	TrustProbe     TrustProbe
-	PathClassifier func(string, string) (SourceKind, error)
-	Checkpoint     func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
+	ServiceName     string
+	Source          string
+	Destination     string
+	ServiceProbe    ServiceStateProbe
+	TrustProbe      TrustProbe
+	PathClassifier  func(string, string) (SourceKind, error)
+	Checkpoint      func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
+	SourceBinder    SourceBinder
+	QuiescenceProbe QuiescenceProbe
+	DatabaseOpener  DatabaseOpener
 }
 
 type Summary struct {
@@ -106,9 +120,30 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if options.ServiceProbe == nil || options.TrustProbe == nil {
 		return summary, errors.New("service and trust probes are required")
 	}
+	if err = validateSQLitePath(options.Source); err != nil {
+		return summary, fmt.Errorf("source path: %w", err)
+	}
+	if err = validateSQLitePath(options.Destination); err != nil {
+		return summary, fmt.Errorf("destination path: %w", err)
+	}
 	state, probeErr := options.ServiceProbe.State(ctx, options.ServiceName)
 	if probeErr != nil || state != ServiceStopped {
 		return summary, errors.New("service stopped state was not proven")
+	}
+	binder := options.SourceBinder
+	if binder == nil {
+		binder = platformSourceBinder{}
+	}
+	quiescence := options.QuiescenceProbe
+	if quiescence == nil {
+		quiescence = platformQuiescenceProbe{}
+	}
+	databaseOpener := options.DatabaseOpener
+	if databaseOpener == nil {
+		databaseOpener = openVerifiedDatabase
+	}
+	if err = quiescence.Prove(ctx); err != nil {
+		return summary, fmt.Errorf("service UID quiescence: %w", err)
 	}
 	classifier := options.PathClassifier
 	if classifier == nil {
@@ -121,6 +156,14 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	sourceIdentity, err := options.TrustProbe.ValidateSource(options.Source, kind)
 	if err != nil {
 		return summary, fmt.Errorf("source trust: %w", err)
+	}
+	binding, err := binder.Bind(options.Source, sourceIdentity)
+	if err != nil {
+		return summary, fmt.Errorf("bind verified source: %w", err)
+	}
+	defer binding.Close()
+	if binding.Identity() != sourceIdentity {
+		return summary, errors.New("bound source identity mismatch")
 	}
 	parent := filepath.Dir(options.Destination)
 	parentIdentity, err := options.TrustProbe.ValidateBackupDirectory(parent)
@@ -137,11 +180,17 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err != nil {
 		return summary, err
 	}
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(options.Source)+"?mode=rw&_pragma=busy_timeout(0)")
+	db, sqliteIdentity, err := databaseOpener(options.Source)
 	if err != nil {
 		return summary, err
 	}
 	defer db.Close()
+	if sqliteIdentity != binding.Identity() {
+		return summary, errors.New("SQLite target identity does not match verified source")
+	}
+	if err = quiescence.Prove(ctx); err != nil {
+		return summary, fmt.Errorf("service UID quiescence: %w", err)
+	}
 	db.SetMaxOpenConns(1)
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -162,6 +211,9 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	}
 	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
 		return summary, err
+	}
+	if err = quiescence.Prove(ctx); err != nil {
+		return summary, fmt.Errorf("service UID quiescence: %w", err)
 	}
 	var busy, logFrames, checkpointed int
 	checkpoint := options.Checkpoint
@@ -205,6 +257,9 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err = compareSource(options.TrustProbe, options.Source, kind, sourceIdentity); err != nil {
 		return summary, err
 	}
+	if err = quiescence.Prove(ctx); err != nil {
+		return summary, fmt.Errorf("service UID quiescence: %w", err)
+	}
 	if summary, err = verify(ctx, temporary); err != nil {
 		return Summary{}, err
 	}
@@ -213,6 +268,9 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	}
 	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
 		return Summary{}, err
+	}
+	if err = quiescence.Prove(ctx); err != nil {
+		return Summary{}, fmt.Errorf("service UID quiescence: %w", err)
 	}
 	if err = os.Link(temporary, options.Destination); err != nil {
 		return Summary{}, fmt.Errorf("publish without replacement: %w", err)
@@ -231,6 +289,43 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 		return Summary{}, err
 	}
 	return summary, nil
+}
+
+func buildSQLiteDSN(filePath string, readOnly bool) string {
+	slashed := filepath.ToSlash(filePath)
+	query := url.Values{}
+	if readOnly {
+		query.Set("mode", "ro")
+	} else {
+		query.Set("mode", "rw")
+		query.Add("_pragma", "busy_timeout(0)")
+	}
+	escapedPath := (&url.URL{Path: slashed}).EscapedPath()
+	return "file:" + escapedPath + "?" + query.Encode()
+}
+
+func validateSQLitePath(filePath string) error {
+	if strings.ContainsAny(filepath.Base(filePath), "?#%") {
+		return errors.New("SQLite basename contains forbidden URI control characters")
+	}
+	return nil
+}
+
+func openVerifiedDatabase(filePath string) (*sql.DB, FileIdentity, error) {
+	db, err := sql.Open("sqlite", buildSQLiteDSN(filePath, false))
+	if err != nil {
+		return nil, FileIdentity{}, err
+	}
+	if err = db.Ping(); err != nil {
+		db.Close()
+		return nil, FileIdentity{}, err
+	}
+	identity, err := platformPathIdentity(filePath)
+	if err != nil {
+		db.Close()
+		return nil, FileIdentity{}, err
+	}
+	return db, identity, nil
 }
 
 func sqliteCheckpoint(ctx context.Context, conn *sql.Conn) (busy, logFrames, checkpointed int, err error) {
@@ -328,7 +423,7 @@ func syncFile(path string) error {
 }
 
 func verify(ctx context.Context, path string) (Summary, error) {
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+	db, err := sql.Open("sqlite", buildSQLiteDSN(path, true))
 	if err != nil {
 		return Summary{}, err
 	}
@@ -349,16 +444,8 @@ func verify(ctx context.Context, path string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
-	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return Summary{}, err
-		}
-		names = append(names, name)
-	}
-	if err := rows.Close(); err != nil {
+	names, err := collectTableNames(rows)
+	if err != nil {
 		return Summary{}, err
 	}
 	for _, name := range names {
@@ -374,6 +461,33 @@ func verify(ctx context.Context, path string) (Summary, error) {
 	}
 	h := sha256.Sum256(b)
 	return Summary{SchemaVersion: version, QuickCheck: "ok", TableCounts: counts, SHA256: hex.EncodeToString(h[:])}, nil
+}
+
+type tableRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+	Close() error
+}
+
+func collectTableNames(rows tableRows) ([]string, error) {
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 type systemdProbe struct{}
@@ -405,7 +519,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "service, source and destination are required")
 		os.Exit(2)
 	}
-	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}})
+	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}, SourceBinder: platformSourceBinder{}, QuiescenceProbe: platformQuiescenceProbe{}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

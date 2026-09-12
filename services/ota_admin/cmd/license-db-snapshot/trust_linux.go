@@ -3,16 +3,112 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
 type platformTrustProbe struct{}
+
+type platformSourceBinding struct {
+	file     *os.File
+	identity FileIdentity
+}
+
+func (b *platformSourceBinding) Identity() FileIdentity { return b.identity }
+func (b *platformSourceBinding) Close() error           { return b.file.Close() }
+
+type platformSourceBinder struct{}
+
+func (platformSourceBinder) Bind(path string, expected FileIdentity) (SourceBinding, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		file.Close()
+		return nil, err
+	}
+	actual := FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+	if actual != expected {
+		file.Close()
+		return nil, errors.New("source identity changed before descriptor binding")
+	}
+	return &platformSourceBinding{file: file, identity: actual}, nil
+}
+
+type platformQuiescenceProbe struct{}
+
+func (platformQuiescenceProbe) Prove(context.Context) error {
+	// The service account is dedicated and cannot be assumed by an unprivileged
+	// process. Once every Linux UID slot is absent from /proc, only the trusted
+	// root boundary can create a new process able to rename its 0700-owned DB.
+	uid, _, err := serviceIDs()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read process %s status: %w", entry.Name(), err)
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			if !strings.HasPrefix(line, "Uid:") {
+				continue
+			}
+			fields := strings.Fields(strings.TrimPrefix(line, "Uid:"))
+			if len(fields) != 4 {
+				return fmt.Errorf("process %s has malformed Uid status", entry.Name())
+			}
+			for _, field := range fields {
+				value, parseErr := strconv.ParseUint(field, 10, 32)
+				if parseErr != nil {
+					return parseErr
+				}
+				if uint32(value) == uid {
+					return fmt.Errorf("process %s still uses dedicated service UID", entry.Name())
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func platformPathIdentity(path string) (FileIdentity, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return FileIdentity{}, errors.New("SQLite target is not a regular no-follow path")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return FileIdentity{}, errors.New("SQLite target stat unavailable")
+	}
+	return FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
+}
 
 func (platformTrustProbe) ValidateSource(path string, kind SourceKind) (FileIdentity, error) {
 	uid, gid := uint32(0), uint32(0)

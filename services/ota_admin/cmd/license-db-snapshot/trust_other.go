@@ -2,9 +2,26 @@
 
 package main
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 type platformTrustProbe struct{}
+type platformSourceBinder struct{}
+
+func (platformSourceBinder) Bind(string, FileIdentity) (SourceBinding, error) {
+	return nil, errors.New("verified source binding is supported only on Linux")
+}
+
+type platformQuiescenceProbe struct{}
+
+func (platformQuiescenceProbe) Prove(context.Context) error {
+	return errors.New("service UID quiescence is supported only on Linux")
+}
+func platformPathIdentity(string) (FileIdentity, error) {
+	return FileIdentity{}, errors.New("path identity is supported only on Linux")
+}
 
 func (platformTrustProbe) ValidateSource(string, SourceKind) (FileIdentity, error) {
 	return FileIdentity{}, errors.New("strict filesystem trust validation is supported only on Linux")
