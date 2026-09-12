@@ -84,6 +84,33 @@ require_seen() {
     fi
 }
 
+# This makes pathname reopen safe against non-root rename: every component from
+# the leaf to the root trust boundary is root-owned and not group/world writable.
+validate_trusted_path() {
+    local trusted_path="$1" component component_path component_mode canonical
+    local -a TRUSTED_PATH_COMPONENTS=()
+    case "$trusted_path" in /*) ;; *) die "trusted path must be absolute: $trusted_path" ;; esac
+    [ "$(stat -c '%u' /)" = "0" ] || die "trusted root must be owned by root"
+    component_mode="$(stat -c '%a' /)"
+    (( (8#$component_mode & 8#022) == 0 )) || die "trusted root must not be group/world writable"
+    IFS='/' read -r -a TRUSTED_PATH_COMPONENTS <<<"${trusted_path#/}"
+    component_path="/"
+    for component in "${TRUSTED_PATH_COMPONENTS[@]}"; do
+        [ -n "$component" ] && [ "$component" != "." ] && [ "$component" != ".." ] ||
+            die "trusted path contains a non-canonical component: $trusted_path"
+        component_path="${component_path%/}/$component"
+        [ -e "$component_path" ] && [ ! -L "$component_path" ] ||
+            die "trusted path component must not be a symlink: $component_path"
+        [ "$(stat -c '%u' "$component_path")" = "0" ] ||
+            die "trusted path component must be owned by root: $component_path"
+        component_mode="$(stat -c '%a' "$component_path")"
+        (( (8#$component_mode & 8#022) == 0 )) ||
+            die "trusted path component must not be group/world writable: $component_path"
+    done
+    canonical="$(readlink -f -- "$trusted_path")" || die "trusted path cannot be canonicalized: $trusted_path"
+    [ "$canonical" = "$trusted_path" ] || die "trusted path must be canonical: $trusted_path"
+}
+
 verify_sha256() {
     local source="$1"
     local expected="$2"
@@ -103,6 +130,9 @@ preflight_loopback_license_transaction() {
     [[ "$LOOPBACK_UNIT_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "unit SHA-256 must be 64 lowercase hexadecimal characters"
     [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "source commit must be exactly 40 lowercase hexadecimal characters"
     command -v sha256sum >/dev/null || die "sha256sum is required"
+    validate_trusted_path "$BINARY_SOURCE"
+    validate_trusted_path "$LOOPBACK_CONFIG_SOURCE"
+    validate_trusted_path "$LOOPBACK_UNIT_SOURCE"
     for source in "$BINARY_SOURCE" "$LOOPBACK_CONFIG_SOURCE" "$LOOPBACK_UNIT_SOURCE"; do
         case "$source" in /*) ;; *) die "loopback transaction inputs must use absolute paths" ;; esac
         [ "$(readlink -f -- "$source")" = "$source" ] || die "loopback transaction inputs must use canonical paths"

@@ -73,6 +73,15 @@ func TestLicenseInstallPreflight(t *testing.T) {
 		`[ "$(stat -c '%U:%G' "$OTA_INSTALLER")" = "root:root" ]`,
 		`[ "$(stat -c '%h' "$OTA_INSTALLER")" = "1" ]`,
 		"OTA_INSTALLER_MODE=", "OTA installer must not be group/world writable",
+		"validate_trusted_path", "TRUSTED_PATH_COMPONENTS", "component_path",
+		`[ ! -L "$component_path" ]`, `stat -c '%u' "$component_path"`,
+		"trusted path component must be owned by root",
+		"trusted path component must not be group/world writable",
+		`[ "$(stat -c '%u' /)" = "0" ]`, "trusted root must not be group/world writable",
+		"Root ownership plus a non-writable ancestor chain prevents unprivileged rename",
+		`validate_trusted_path "$BUNDLE"`, `validate_trusted_path "$LICENSE_CONFIG_SOURCE"`,
+		`validate_trusted_path "$LICENSE_UNIT_SOURCE"`, `validate_trusted_path "$OTA_CONFIG_SOURCE"`,
+		`validate_trusted_path "$OTA_UNIT_SOURCE"`, `validate_trusted_path "$OTA_INSTALLER"`,
 	)
 	if strings.Count(install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE") != 1 {
 		t.Fatal("license installer must have exactly one preflight-complete mutation boundary")
@@ -93,14 +102,14 @@ func TestLicenseInstallPreflight(t *testing.T) {
 			}
 		}
 	}
+	requireBefore(t, install, `validate_trusted_path "$OTA_INSTALLER"`, `bash "$OTA_INSTALLER"`)
+	requireBefore(t, install, `bash "$OTA_INSTALLER"`, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE")
 	requireBefore(t, install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE", `if [ "$PREFLIGHT_ONLY" = true ]; then`)
-	requireBefore(t, install, "# LICENSE_INSTALL_PREFLIGHT_COMPLETE", `bash "$OTA_INSTALLER"`)
-	requireBefore(t, install, `if [ "$PREFLIGHT_ONLY" = true ]; then`, `bash "$OTA_INSTALLER"`)
 	requireBefore(t, install, `bash "$OTA_INSTALLER"`, "groupadd --system superpan-license")
 	childScripts := regexp.MustCompile(`(?m)^[[:space:]]*(bash|sh)[[:space:]]+`)
 	for _, location := range childScripts.FindAllStringIndex(install, -1) {
-		if location[0] < boundaryAt {
-			t.Error("external child script invocation appears before preflight completion")
+		if location[0] < boundaryAt && location[0] != otaPreflightAt {
+			t.Error("an untrusted external child script invocation appears before preflight completion")
 		}
 	}
 	for _, forbidden := range []string{"ota.fanfh.cn.license-api.nginx.conf", "nginx -t", "nginx -s reload", "ACTIVE_VHOST", "active-vhost"} {
@@ -120,6 +129,11 @@ func TestLicenseInstallLoopbackOnly(t *testing.T) {
 		"public-install arguments are forbidden in loopback license transaction mode",
 		"loopback transaction arguments require --loopback-license-transaction",
 		"loopback transaction inputs must be owned by root:root",
+		"validate_trusted_path", `validate_trusted_path "$BINARY_SOURCE"`,
+		`validate_trusted_path "$LOOPBACK_CONFIG_SOURCE"`, `validate_trusted_path "$LOOPBACK_UNIT_SOURCE"`,
+		"trusted path component must not be a symlink", "trusted path component must be owned by root",
+		"trusted path component must not be group/world writable",
+		`[ "$(stat -c '%u' /)" = "0" ]`, "trusted root must not be group/world writable",
 	)
 	requireBefore(t, ota, `if [ "$LOOPBACK_LICENSE_TRANSACTION" = true ]; then`, `[ -f "$ACTIVE_VHOST" ]`)
 	requireBefore(t, ota, "preflight_loopback_license_transaction", "loopback license transaction preflight complete")
@@ -247,7 +261,39 @@ func TestLicenseInstallPreflightExecutableFixture(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Git Bash reports NTFS directories as 0755; exact 0700 and link metadata require Linux")
 	}
-	root := t.TempDir()
+	uid, err := exec.Command("id", "-u").Output()
+	if err != nil || strings.TrimSpace(string(uid)) != "0" {
+		t.Skip("trusted-ancestor executable fixture requires Linux root and a /root-owned tree")
+	}
+	root, err := os.MkdirTemp("/root", "license-install-preflight-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fixtureDeploy := filepath.Join(root, "deploy")
+	fixtureLicense := filepath.Join(fixtureDeploy, "license-service")
+	fixtureOTA := filepath.Join(fixtureDeploy, "ota-admin")
+	for _, directory := range []string{fixtureDeploy, fixtureLicense, fixtureOTA} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for source, destination := range map[string]string{
+		filepath.Join(repositoryRoot(t), "deploy", "license-service", "install.sh"): filepath.Join(fixtureLicense, "install.sh"),
+		filepath.Join(repositoryRoot(t), "deploy", "ota-admin", "install.sh"):       filepath.Join(fixtureOTA, "install.sh"),
+	} {
+		body, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination, body, 0500); err != nil {
+			t.Fatal(err)
+		}
+	}
+	licenseInstaller := filepath.Join(fixtureLicense, "install.sh")
 	bundle := filepath.Join(root, "bundle")
 	if err := os.Mkdir(bundle, 0700); err != nil {
 		t.Fatal(err)
@@ -290,25 +336,6 @@ func TestLicenseInstallPreflightExecutableFixture(t *testing.T) {
 	if err := os.Mkdir(wrappers, 0700); err != nil {
 		t.Fatal(err)
 	}
-	realID, err := exec.LookPath("id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	realStat, err := exec.LookPath("stat")
-	if err != nil {
-		t.Fatal(err)
-	}
-	idWrapper := "#!/bin/sh\nif [ \"${1:-}\" = -u ]; then echo 0; exit 0; fi\nexec \"" + realID + "\" \"$@\"\n"
-	statWrapper := "#!/bin/sh\nif [ \"${1:-}\" = -c ] && [ \"${2:-}\" = '%U:%G' ]; then echo root:root; exit 0; fi\nexec \"" + realStat + "\" \"$@\"\n"
-	for name, body := range map[string]string{"id": idWrapper, "stat": statWrapper} {
-		path := filepath.Join(wrappers, name)
-		if err := os.WriteFile(path, []byte(body), 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(path, 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
 	probe := filepath.Join(root, "mutation-probe")
 	for _, name := range []string{"mkdir", "groupadd", "useradd", "usermod", "install", "cp", "mv", "rm", "chown", "chmod", "touch", "tee", "systemctl"} {
 		body := "#!/bin/sh\necho " + name + " >>\"$MUTATION_PROBE\"\nexit 97\n"
@@ -332,7 +359,7 @@ func TestLicenseInstallPreflightExecutableFixture(t *testing.T) {
 		"--preflight-only",
 	}
 	run := func(arguments []string) ([]byte, error) {
-		command := exec.Command(installerBash(t), append([]string{filepath.Join(repositoryRoot(t), "deploy", "license-service", "install.sh")}, arguments...)...)
+		command := exec.Command(installerBash(t), append([]string{licenseInstaller}, arguments...)...)
 		command.Env = append(os.Environ(), "PATH="+wrappers+string(os.PathListSeparator)+os.Getenv("PATH"), "MUTATION_PROBE="+probe)
 		return command.CombinedOutput()
 	}
@@ -350,6 +377,53 @@ func TestLicenseInstallPreflightExecutableFixture(t *testing.T) {
 		t.Fatalf("preflight success marker missing: %s", output)
 	}
 	assertNoMutation()
+	t.Run("reject writable ancestor", func(t *testing.T) {
+		if err := os.Chmod(root, 0770); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(root, 0700)
+		output, err := run(args)
+		if err == nil || !strings.Contains(string(output), "trusted path component must not be group/world writable") {
+			t.Fatalf("writable ancestor was not rejected: err=%v output=%s", err, output)
+		}
+		assertNoMutation()
+	})
+	t.Run("reject non-root ancestor", func(t *testing.T) {
+		if err := os.Chown(root, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chown(root, 0, 0)
+		output, err := run(args)
+		if err == nil || !strings.Contains(string(output), "trusted path component must be owned by root") {
+			t.Fatalf("non-root ancestor was not rejected: err=%v output=%s", err, output)
+		}
+		assertNoMutation()
+	})
+	t.Run("reject symlink ancestor", func(t *testing.T) {
+		realParent := filepath.Join(root, "real-template-parent")
+		linkParent := filepath.Join(root, "linked-template-parent")
+		if err := os.Mkdir(realParent, 0700); err != nil {
+			t.Fatal(err)
+		}
+		linkedConfig := filepath.Join(realParent, "license-config")
+		if err := os.WriteFile(linkedConfig, []byte("license-config\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realParent, linkParent); err != nil {
+			t.Skipf("directory symlink unavailable: %v", err)
+		}
+		mutated := append([]string{}, args...)
+		for index := range mutated {
+			if mutated[index] == "--license-config" {
+				mutated[index+1] = filepath.Join(linkParent, "license-config")
+			}
+		}
+		output, err := run(mutated)
+		if err == nil || !strings.Contains(string(output), "not be a symlink") {
+			t.Fatalf("symlink ancestor was not rejected: err=%v output=%s", err, output)
+		}
+		assertNoMutation()
+	})
 	for _, mode := range []os.FileMode{0755, 0750, 0711, 0500} {
 		t.Run(fmt.Sprintf("reject bundle mode %04o", mode), func(t *testing.T) {
 			if err := os.Chmod(bundle, mode); err != nil {

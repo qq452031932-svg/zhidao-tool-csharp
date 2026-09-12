@@ -58,6 +58,34 @@ require_seen() {
     fi
 }
 
+# Root ownership plus a non-writable ancestor chain prevents unprivileged rename
+# between pathname validation and the later read-only reopen. Root is the trust
+# boundary; shell cannot pin an inode across separate tool invocations.
+validate_trusted_path() {
+    local trusted_path="$1" component component_path component_mode canonical
+    local -a TRUSTED_PATH_COMPONENTS=()
+    case "$trusted_path" in /*) ;; *) die "trusted path must be absolute: $trusted_path" ;; esac
+    [ "$(stat -c '%u' /)" = "0" ] || die "trusted root must be owned by root"
+    component_mode="$(stat -c '%a' /)"
+    (( (8#$component_mode & 8#022) == 0 )) || die "trusted root must not be group/world writable"
+    IFS='/' read -r -a TRUSTED_PATH_COMPONENTS <<<"${trusted_path#/}"
+    component_path="/"
+    for component in "${TRUSTED_PATH_COMPONENTS[@]}"; do
+        [ -n "$component" ] && [ "$component" != "." ] && [ "$component" != ".." ] ||
+            die "trusted path contains a non-canonical component: $trusted_path"
+        component_path="${component_path%/}/$component"
+        [ -e "$component_path" ] && [ ! -L "$component_path" ] ||
+            die "trusted path component must exist and not be a symlink: $component_path"
+        [ "$(stat -c '%u' "$component_path")" = "0" ] ||
+            die "trusted path component must be owned by root: $component_path"
+        component_mode="$(stat -c '%a' "$component_path")"
+        (( (8#$component_mode & 8#022) == 0 )) ||
+            die "trusted path component must not be group/world writable: $component_path"
+    done
+    canonical="$(readlink -f -- "$trusted_path")" || die "trusted path cannot be canonicalized: $trusted_path"
+    [ "$canonical" = "$trusted_path" ] || die "trusted path must be canonical: $trusted_path"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --bundle) mark_seen "$1"; require_value "$1" "${2:-}"; BUNDLE="$2"; shift 2 ;;
@@ -87,6 +115,7 @@ for required in --bundle --source-commit --ota-binary-sha256 --license-binary-sh
 done
 [ "$(id -u)" -eq 0 ] || die "install.sh must run as root"
 case "$BUNDLE" in /*) ;; *) die "bundle path must be absolute and canonical" ;; esac
+validate_trusted_path "$BUNDLE"
 BUNDLE_CANONICAL="$(readlink -f -- "$BUNDLE")" || die "bundle path cannot be canonicalized"
 [ "$BUNDLE_CANONICAL" = "$BUNDLE" ] || die "bundle path must be absolute and canonical"
 [ -d "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || die "bundle must be a real directory"
@@ -123,6 +152,10 @@ verify_sidecar() {
         die "sidecar does not match the explicit expected SHA-256 as one canonical line: $sidecar"
 }
 
+validate_trusted_path "$LICENSE_CONFIG_SOURCE"
+validate_trusted_path "$LICENSE_UNIT_SOURCE"
+validate_trusted_path "$OTA_CONFIG_SOURCE"
+validate_trusted_path "$OTA_UNIT_SOURCE"
 for source in "$LICENSE_CONFIG_SOURCE" "$LICENSE_UNIT_SOURCE" "$OTA_CONFIG_SOURCE" "$OTA_UNIT_SOURCE"; do
     case "$source" in /*) ;; *) die "trusted template paths must be absolute" ;; esac
     [ "$(readlink -f -- "$source")" = "$source" ] || die "trusted template paths must be canonical"
@@ -148,12 +181,7 @@ BUNDLE_SOURCE_COMMIT="$(cat "$BUNDLE/source-commit.txt")"
 [ "$BUNDLE_SOURCE_COMMIT" = "$SOURCE_COMMIT" ] || die "source-commit.txt does not match --source-commit"
 printf '%s\n' "$SOURCE_COMMIT" | cmp -s - "$BUNDLE/source-commit.txt" || die "source-commit.txt is not canonical"
 
-# LICENSE_INSTALL_PREFLIGHT_COMPLETE: every input byte and source record is authenticated.
-if [ "$PREFLIGHT_ONLY" = true ]; then
-    echo "license installation preflight complete for source commit $SOURCE_COMMIT"
-    exit 0
-fi
-
+validate_trusted_path "$OTA_INSTALLER"
 [ -f "$OTA_INSTALLER" ] && [ ! -L "$OTA_INSTALLER" ] || die "OTA installer is missing or unsafe"
 [ "$(readlink -f -- "$OTA_INSTALLER")" = "$OTA_INSTALLER" ] || die "OTA installer path is not canonical"
 [ "$(stat -c '%U:%G' "$OTA_INSTALLER")" = "root:root" ] || die "OTA installer must be owned by root:root"
@@ -166,6 +194,12 @@ bash "$OTA_INSTALLER" --loopback-license-transaction \
     --config "$OTA_CONFIG_SOURCE" --config-sha256 "$OTA_CONFIG_SHA256" \
     --unit "$OTA_UNIT_SOURCE" --unit-sha256 "$OTA_UNIT_SHA256" \
     --source-commit "$SOURCE_COMMIT"
+
+# LICENSE_INSTALL_PREFLIGHT_COMPLETE: every input byte and source record is authenticated.
+if [ "$PREFLIGHT_ONLY" = true ]; then
+    echo "license installation preflight complete for source commit $SOURCE_COMMIT"
+    exit 0
+fi
 
 DEST=/opt/superpan-license
 ETC=/etc/superpan-license
