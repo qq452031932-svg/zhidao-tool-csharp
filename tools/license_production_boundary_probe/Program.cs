@@ -14,11 +14,12 @@ internal static class Program
             var root = Path.GetFullPath(args[3]);
             var approvedBase = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SuperPan", "Licensing", "BoundaryProbe"));
             var rootInfo = new DirectoryInfo(root);
-            if (!rootInfo.Exists || rootInfo.Attributes.HasFlag(FileAttributes.ReparsePoint) ||
+            if (!rootInfo.Exists || HasReparseAncestor(rootInfo, approvedBase) ||
                 !string.Equals(rootInfo.Parent?.FullName, approvedBase, StringComparison.OrdinalIgnoreCase) ||
                 !rootInfo.Name.StartsWith("probe-", StringComparison.Ordinal) ||
                 !File.Exists(Path.Combine(root, ".superpan-boundary-probe-root")) ||
-                !File.Exists(Path.Combine(root, "licenses.dat"))) return Emit("invalid_store_root", 2);
+                !IsRegularNonReparseFile(Path.Combine(root, ".superpan-boundary-probe-root")) ||
+                !IsRegularNonReparseFile(Path.Combine(root, "licenses.dat"))) return Emit("invalid_store_root", 2);
             var trust = ReadTrust();
             var clock = new FixedTimeProvider(now);
             using var verifier = new SignedLicenseEnvelopeVerifier(trust.Options, clock);
@@ -40,6 +41,18 @@ internal static class Program
         return (product, new LicenseClientOptions(product, new Uri(Get("LicenseOrigin")), Get("LicenseSigningKeyId"), new string(PemEncoding.Write("PUBLIC KEY", der)), [Get("LicenseCurrentSpkiPin"), Get("LicenseNextSpkiPin")]));
     }
     private static int Emit(string code, int exitCode) { Console.WriteLine(code); return exitCode; }
+    private static bool IsRegularNonReparseFile(string path) =>
+        File.Exists(path) && !File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint) && !File.GetAttributes(path).HasFlag(FileAttributes.Directory);
+    private static bool HasReparseAncestor(DirectoryInfo root, string approvedBase)
+    {
+        var sawApprovedBase = false;
+        for (DirectoryInfo? cursor = root; cursor is not null; cursor = cursor.Parent)
+        {
+            if (!cursor.Exists || cursor.Attributes.HasFlag(FileAttributes.ReparsePoint)) return true;
+            if (string.Equals(cursor.FullName, approvedBase, StringComparison.OrdinalIgnoreCase)) sawApprovedBase = true;
+        }
+        return !sawApprovedBase;
+    }
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider { public override DateTimeOffset GetUtcNow() => now; }
     private sealed class UnavailableHandler : HttpMessageHandler { protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token) => throw new HttpRequestException(); }
 }

@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$ClientRootA,
     [Parameter(Mandatory)][string]$ClientRootBC,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSourceCommit,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9A-Fa-f]{40}$')][string]$ApprovedSigningCertificateThumbprint,
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9.-]+$')][string]$ServerHost,
     [Parameter(Mandatory)][string]$ProbeStoreRoot,
     [Parameter(Mandatory)][DateTimeOffset]$ProbeUtcNow,
@@ -17,13 +18,19 @@ function Read-VerifiedClientRoot([string]$Root) {
     $root = [IO.Path]::GetFullPath($Root); $manifestPath = Join-Path $root 'production-license-clients.json'; $signaturePath = $manifestPath + '.p7s'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or -not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) { throw 'Signed client manifest is missing.' }
     $bytes = [IO.File]::ReadAllBytes($manifestPath)
-    $cms = [Security.Cryptography.Pkcs.SignedCms]::new([Security.Cryptography.Pkcs.ContentInfo]::new($bytes), $true); $cms.Decode([IO.File]::ReadAllBytes($signaturePath)); $cms.CheckSignature($true)
-    if ($cms.SignerInfos.Count -ne 1) { throw 'Client manifest must have exactly one signer.' }
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new([Security.Cryptography.Pkcs.ContentInfo]::new($bytes), $true); $cms.Decode([IO.File]::ReadAllBytes($signaturePath)); $cms.CheckSignature($false)
+    $approvedThumbprint = $ApprovedSigningCertificateThumbprint.ToUpperInvariant()
+    if ($cms.SignerInfos.Count -ne 1 -or $cms.SignerInfos[0].Certificate.Thumbprint -cne $approvedThumbprint) { throw 'Client manifest must have the externally approved signer.' }
     $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
     if ($value.sourceCommit -cne $ExpectedSourceCommit -or $value.origin -cne 'https://ota.fanfh.cn' -or
         $value.superPanProduct -cne '8270e8d7-1791-487d-ad76-0da7a0cbed12' -or $value.currentTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or
         $value.nextTlsSpki -cnotmatch '^[0-9a-f]{64}$' -or $value.currentTlsSpki -ceq $value.nextTlsSpki -or
-        $cms.SignerInfos[0].Certificate.Thumbprint -cne $value.artifacts[0].signerThumbprint) { throw 'Signed client manifest identity is invalid.' }
+        $value.artifacts.Count -ne 3) { throw 'Signed client manifest identity is invalid.' }
+    $requiredArtifacts = @{
+        'superpan/BaiduBatchTransfer.App.exe' = $false
+        'smoke-nonshipping/SuperPan.Licensing.ProductionSmoke.NonShipping.exe' = $false
+        'boundary-probe-nonshipping/SuperPan.Licensing.BOUNDARY-PROBE-NONSHIPPING.exe' = $false
+    }
     $expected = @{}
     foreach ($file in @($value.files)) {
         if ($file.path -notmatch '^(superpan|smoke-nonshipping|boundary-probe-nonshipping)/[^/].*$' -or $file.path -match '\.\.') { throw 'Manifest file path is invalid.' }
@@ -32,13 +39,25 @@ function Read-VerifiedClientRoot([string]$Root) {
     }
     $actual = @(foreach ($role in @('superpan','smoke-nonshipping','boundary-probe-nonshipping')) { Get-ChildItem -LiteralPath (Join-Path $root $role) -File -Recurse | Select-Object -ExpandProperty FullName })
     if ($actual.Count -ne $expected.Count) { throw 'Client tree contains missing or extra files.' }
-    foreach ($path in $actual) { if (-not $expected.ContainsKey($path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected[$path]) { throw 'Client artifact hash mismatch.' } }
+    foreach ($path in $actual) { Assert-NoReparseContainedPath $root $path; if (-not $expected.ContainsKey($path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected[$path]) { throw 'Client artifact hash mismatch.' } }
     foreach ($artifact in @($value.artifacts)) {
-        $path = Join-Path (Join-Path $root $artifact.role) $artifact.file; $auth = Get-AuthenticodeSignature -LiteralPath $path
-        if ($auth.Status -ne 'Valid' -or $auth.SignerCertificate.Thumbprint -cne $artifact.signerThumbprint -or $null -eq $auth.TimeStamperCertificate -or
+        $artifactKey = "$($artifact.role)/$($artifact.file)"
+        if (-not $requiredArtifacts.ContainsKey($artifactKey) -or $requiredArtifacts[$artifactKey] -or $artifact.signerThumbprint -cne $approvedThumbprint) { throw 'Manifest must contain exactly the three expected signed clients.' }
+        $requiredArtifacts[$artifactKey] = $true
+        $path = [IO.Path]::GetFullPath((Join-Path (Join-Path $root $artifact.role) $artifact.file)); Assert-NoReparseContainedPath $root $path
+        $auth = Get-AuthenticodeSignature -LiteralPath $path
+        $signtoolOutput = @(& (Get-Command signtool.exe -ErrorAction Stop).Source verify /pa /all /v $path 2>&1)
+        if ($LASTEXITCODE -ne 0 -or ($signtoolOutput -join "`n") -notmatch '(?i)sha256' -or $auth.Status -ne 'Valid' -or $auth.SignerCertificate.Thumbprint -cne $approvedThumbprint -or $null -eq $auth.TimeStamperCertificate -or
             (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $artifact.sha256) { throw 'Exact client Authenticode identity is invalid.' }
     }
     return $value
+}
+
+function Assert-NoReparseContainedPath([string]$Root,[string]$Path) {
+    $root=[IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar);$path=[IO.Path]::GetFullPath($Path)
+    if(-not $path.StartsWith($root+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw'Client artifact escapes its signed root.'}
+    $cursor=[IO.FileInfo]::new($path)
+    while($null-ne $cursor-and $cursor.FullName.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)){if($cursor.Exists-and($cursor.Attributes-band[IO.FileAttributes]::ReparsePoint)){throw'Client artifact path contains a reparse point.'};$cursor=$cursor.Directory}
 }
 
 function Get-ObservedTlsSpki([Uri]$Uri) {

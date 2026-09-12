@@ -25,6 +25,8 @@ public sealed class ProductionBoundaryProbeTests
         Assert.Contains(".superpan-boundary-probe-root", program, StringComparison.Ordinal);
         Assert.Contains("FileAttributes.ReparsePoint", program, StringComparison.Ordinal);
         Assert.Contains("rootInfo.Parent?.FullName", program, StringComparison.Ordinal);
+        Assert.Contains("HasReparseAncestor", program, StringComparison.Ordinal);
+        Assert.Contains("IsRegularNonReparseFile", program, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>

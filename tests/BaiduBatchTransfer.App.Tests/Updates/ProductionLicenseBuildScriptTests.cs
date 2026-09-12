@@ -53,6 +53,11 @@ public sealed class ProductionLicenseBuildScriptTests
         Assert.Contains("RandomNumberGenerator", script, StringComparison.Ordinal);
         Assert.Contains("root@", script, StringComparison.Ordinal);
         Assert.Contains("Invoke-ExactSmoke", script, StringComparison.Ordinal);
+        Assert.Contains("ApprovedSigningCertificateThumbprint", script, StringComparison.Ordinal);
+        Assert.Contains("CheckSignature($false)", script, StringComparison.Ordinal);
+        Assert.Contains("BaiduBatchTransfer.App.exe", script, StringComparison.Ordinal);
+        Assert.Contains("signtool.exe", script, StringComparison.Ordinal);
+        Assert.Contains("Assert-NoReparseContainedPath", script, StringComparison.Ordinal);
     }
 
     private static string Root([CallerFilePath] string path = "") =>
