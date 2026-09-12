@@ -29,6 +29,27 @@ func requireBefore(t *testing.T, body, earlier, later string) {
 	}
 }
 
+func TestLicenseMaintenanceBuilder(t *testing.T) {
+	builder := read(t, "services", "ota_admin", "scripts", "build_linux_license_maintenance_tools.ps1")
+	requireFragments(t, builder,
+		"[Parameter(Mandatory)][string] $SourceCommit",
+		"Assert-LicenseMaintenanceSourceState",
+		"status --porcelain=v1 --untracked-files=all",
+		"SourceCommit must exactly equal HEAD",
+		"git -C $RepositoryRoot", "archive", "${SourceCommit}:services/ota_admin",
+		"Get-SnapshotFingerprint", "immutable maintenance source snapshot changed",
+		"Set-SealedLicenseBuildEnvironment", "Assert-PinnedLicenseGoToolchain",
+		"GOOS", "linux", "GOARCH", "amd64", "CGO_ENABLED", "0",
+		"license-db-snapshot", "license-db-snapshot.sha256", "source-commit.txt",
+		"ToLowerInvariant", "[System.IO.Directory]::Move", "StagedPublishDirectory",
+	)
+	if strings.Contains(builder, "-C (Join-Path $repo 'services\\ota_admin') build") {
+		t.Fatal("maintenance binary must not be built from the mutable worktree")
+	}
+	requireBefore(t, builder, "Assert-LicenseMaintenanceSourceState", "New-LicenseMaintenanceSourceSnapshot")
+	requireBefore(t, builder, "New-LicenseMaintenanceSourceSnapshot", "./cmd/license-db-snapshot")
+}
+
 func TestLicenseInstallBundleAuthentication(t *testing.T) {
 	install := read(t, "deploy", "license-service", "install.sh")
 	requireFragments(t, install,

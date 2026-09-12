@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -16,49 +18,397 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const (
+	requiredService  = "superpan-license.service"
+	liveDatabasePath = "/var/lib/superpan-license/state.db"
+	backupRoot       = "/var/backups/superpan-license"
+)
+
+type ServiceState uint8
+
+const (
+	ServiceUnknown ServiceState = iota
+	ServiceStopped
+	ServiceActive
+)
+
+type SourceKind uint8
+
+const (
+	SourceLive SourceKind = iota
+	SourceBackup
+)
+
+type FileIdentity struct{ Device, Inode uint64 }
+
+type ServiceStateProbe interface {
+	State(context.Context, string) (ServiceState, error)
+}
+type TrustProbe interface {
+	ValidateSource(string, SourceKind) (FileIdentity, error)
+	ValidateBackupDirectory(string) (FileIdentity, error)
+	ValidateSidecar(string, SourceKind) (FileIdentity, bool, error)
+	SecureOutput(string) error
+}
+
+type SnapshotOptions struct {
+	ServiceName    string
+	Source         string
+	Destination    string
+	ServiceProbe   ServiceStateProbe
+	TrustProbe     TrustProbe
+	PathClassifier func(string, string) (SourceKind, error)
+	Checkpoint     func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
+}
+
 type Summary struct {
 	SchemaVersion int
-	QuickCheck string
-	TableCounts map[string]int64
-	SHA256 string
+	QuickCheck    string
+	TableCounts   map[string]int64
+	SHA256        string
 }
 
 func (s Summary) String() string {
-	keys := make([]string, 0, len(s.TableCounts)); for k := range s.TableCounts { keys = append(keys, k) }; sort.Strings(keys)
-	parts := []string{fmt.Sprintf("schema_version=%d", s.SchemaVersion), "quick_check=" + s.QuickCheck, "sha256=" + s.SHA256}
-	for _, k := range keys { parts = append(parts, fmt.Sprintf("count_%s=%d", k, s.TableCounts[k])) }
+	keys := make([]string, 0, len(s.TableCounts))
+	for k := range s.TableCounts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := []string{fmt.Sprintf("schema_version=%d", s.SchemaVersion), "quick_check=" + s.QuickCheck}
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("count_%s=%d", k, s.TableCounts[k]))
+	}
+	parts = append(parts, "sha256="+s.SHA256)
 	return strings.Join(parts, " ")
 }
 
-func Snapshot(ctx context.Context, source, destination, maintenanceRoot string) (Summary, error) {
-	var zero Summary
-	src, err := filepath.Abs(source); if err != nil || !filepath.IsAbs(source) { return zero, errors.New("source must be absolute") }
-	dst, err := filepath.Abs(destination); if err != nil || !filepath.IsAbs(destination) { return zero, errors.New("destination must be absolute") }
-	root, err := filepath.Abs(maintenanceRoot); if err != nil { return zero, err }
-	inside := func(p string) bool { rel, e := filepath.Rel(root, p); return e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel) }
-	if !inside(src) || !inside(dst) { return zero, errors.New("paths must stay under maintenance root") }
-	st, err := os.Lstat(src); if err != nil { return zero, err }; if !st.Mode().IsRegular() { return zero, errors.New("source must be a regular file") }
-	if _, err := os.Lstat(dst); err == nil { return zero, errors.New("destination already exists") } else if !os.IsNotExist(err) { return zero, err }
-	db, err := sql.Open("sqlite", src); if err != nil { return zero, err }; defer db.Close()
-	if _, err = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil { return zero, fmt.Errorf("checkpoint: %w", err) }
-	if _, err = db.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil { return zero, fmt.Errorf("vacuum: %w", err) }
-	check, err := verify(ctx, dst); if err != nil { return zero, err }; return check, nil
+func classifyPaths(source, destination string) (SourceKind, error) {
+	if source == "" || destination == "" || !path.IsAbs(source) || !path.IsAbs(destination) || path.Clean(source) != source || path.Clean(destination) != destination {
+		return 0, errors.New("source and destination must be canonical absolute paths")
+	}
+	insideBackup := func(p string) bool { return strings.HasPrefix(p, backupRoot+"/") }
+	if !insideBackup(destination) {
+		return 0, errors.New("destination must be below the fixed backup root")
+	}
+	if source == liveDatabasePath {
+		return SourceLive, nil
+	}
+	if insideBackup(source) {
+		return SourceBackup, nil
+	}
+	return 0, errors.New("source is not the live database or a trusted backup path")
+}
+
+func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, err error) {
+	if options.ServiceName != requiredService {
+		return summary, errors.New("invalid service name")
+	}
+	if options.ServiceProbe == nil || options.TrustProbe == nil {
+		return summary, errors.New("service and trust probes are required")
+	}
+	state, probeErr := options.ServiceProbe.State(ctx, options.ServiceName)
+	if probeErr != nil || state != ServiceStopped {
+		return summary, errors.New("service stopped state was not proven")
+	}
+	classifier := options.PathClassifier
+	if classifier == nil {
+		classifier = classifyPaths
+	}
+	kind, err := classifier(options.Source, options.Destination)
+	if err != nil {
+		return summary, err
+	}
+	sourceIdentity, err := options.TrustProbe.ValidateSource(options.Source, kind)
+	if err != nil {
+		return summary, fmt.Errorf("source trust: %w", err)
+	}
+	parent := filepath.Dir(options.Destination)
+	parentIdentity, err := options.TrustProbe.ValidateBackupDirectory(parent)
+	if err != nil {
+		return summary, fmt.Errorf("destination parent trust: %w", err)
+	}
+	if _, statErr := os.Lstat(options.Destination); statErr == nil {
+		return summary, errors.New("destination already exists")
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return summary, statErr
+	}
+
+	initialSidecars, err := captureSidecars(options.TrustProbe, options.Source, kind)
+	if err != nil {
+		return summary, err
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(options.Source)+"?mode=rw&_pragma=busy_timeout(0)")
+	if err != nil {
+		return summary, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return summary, err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "PRAGMA locking_mode=EXCLUSIVE"); err != nil {
+		return summary, fmt.Errorf("exclusive locking mode: %w", err)
+	}
+	if _, err = conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		return summary, fmt.Errorf("exclusive lock: %w", err)
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return summary, fmt.Errorf("exclusive lock commit: %w", err)
+	}
+	if err = compareSource(options.TrustProbe, options.Source, kind, sourceIdentity); err != nil {
+		return summary, err
+	}
+	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
+		return summary, err
+	}
+	var busy, logFrames, checkpointed int
+	checkpoint := options.Checkpoint
+	if checkpoint == nil {
+		checkpoint = sqliteCheckpoint
+	}
+	if busy, logFrames, checkpointed, err = checkpoint(ctx, conn); err != nil {
+		return summary, fmt.Errorf("checkpoint: %w", err)
+	}
+	if busy != 0 || logFrames != checkpointed {
+		return summary, fmt.Errorf("checkpoint incomplete: busy=%d log=%d checkpointed=%d", busy, logFrames, checkpointed)
+	}
+	if err = compareExistingSidecars(options.TrustProbe, options.Source, kind, initialSidecars); err != nil {
+		return summary, err
+	}
+	lockedSidecars, err := captureSidecars(options.TrustProbe, options.Source, kind)
+	if err != nil {
+		return summary, err
+	}
+
+	temporary, err := unusedTemporaryName(parent)
+	if err != nil {
+		return summary, err
+	}
+	published := false
+	defer func() {
+		_ = os.Remove(temporary)
+		if err != nil && published {
+			_ = os.Remove(options.Destination)
+		}
+	}()
+	if _, err = conn.ExecContext(ctx, "VACUUM INTO ?", temporary); err != nil {
+		return summary, fmt.Errorf("vacuum into temporary: %w", err)
+	}
+	if err = options.TrustProbe.SecureOutput(temporary); err != nil {
+		return summary, fmt.Errorf("secure temporary: %w", err)
+	}
+	if err = compareSidecars(options.TrustProbe, options.Source, kind, lockedSidecars); err != nil {
+		return summary, err
+	}
+	if err = compareSource(options.TrustProbe, options.Source, kind, sourceIdentity); err != nil {
+		return summary, err
+	}
+	if summary, err = verify(ctx, temporary); err != nil {
+		return Summary{}, err
+	}
+	if err = syncFile(temporary); err != nil {
+		return Summary{}, err
+	}
+	if err = compareBackupDirectory(options.TrustProbe, parent, parentIdentity); err != nil {
+		return Summary{}, err
+	}
+	if err = os.Link(temporary, options.Destination); err != nil {
+		return Summary{}, fmt.Errorf("publish without replacement: %w", err)
+	}
+	published = true
+	if err = os.Remove(temporary); err != nil {
+		return Summary{}, fmt.Errorf("remove temporary link: %w", err)
+	}
+	if err = options.TrustProbe.SecureOutput(options.Destination); err != nil {
+		return Summary{}, fmt.Errorf("secure published output: %w", err)
+	}
+	if err = syncFile(options.Destination); err != nil {
+		return Summary{}, err
+	}
+	if err = syncDirectory(parent); err != nil {
+		return Summary{}, err
+	}
+	return summary, nil
+}
+
+func sqliteCheckpoint(ctx context.Context, conn *sql.Conn) (busy, logFrames, checkpointed int, err error) {
+	err = conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed)
+	return
+}
+
+func compareSource(probe TrustProbe, source string, kind SourceKind, expected FileIdentity) error {
+	actual, err := probe.ValidateSource(source, kind)
+	if err != nil {
+		return fmt.Errorf("source trust: %w", err)
+	}
+	if actual != expected {
+		return errors.New("source identity changed")
+	}
+	return nil
+}
+
+func compareBackupDirectory(probe TrustProbe, directory string, expected FileIdentity) error {
+	actual, err := probe.ValidateBackupDirectory(directory)
+	if err != nil {
+		return fmt.Errorf("destination parent trust: %w", err)
+	}
+	if actual != expected {
+		return errors.New("destination parent identity changed")
+	}
+	return nil
+}
+
+func unusedTemporaryName(parent string) (string, error) {
+	f, err := os.CreateTemp(parent, ".license-db-snapshot-*.db")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	closeErr := f.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if removeErr != nil {
+		return "", removeErr
+	}
+	return name, nil
+}
+
+func captureSidecars(probe TrustProbe, source string, kind SourceKind) (map[string]FileIdentity, error) {
+	result := make(map[string]FileIdentity)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		identity, exists, err := probe.ValidateSidecar(source+suffix, kind)
+		if err != nil {
+			return nil, fmt.Errorf("sidecar trust: %w", err)
+		}
+		if exists {
+			result[suffix] = identity
+		}
+	}
+	return result, nil
+}
+
+func compareSidecars(probe TrustProbe, source string, kind SourceKind, expected map[string]FileIdentity) error {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		identity, exists, err := probe.ValidateSidecar(source+suffix, kind)
+		if err != nil {
+			return fmt.Errorf("sidecar trust: %w", err)
+		}
+		previous, wasPresent := expected[suffix]
+		if exists != wasPresent || (exists && identity != previous) {
+			return fmt.Errorf("sidecar identity changed: %s", suffix)
+		}
+	}
+	return nil
+}
+
+func compareExistingSidecars(probe TrustProbe, source string, kind SourceKind, expected map[string]FileIdentity) error {
+	for suffix, previous := range expected {
+		identity, exists, err := probe.ValidateSidecar(source+suffix, kind)
+		if err != nil {
+			return fmt.Errorf("sidecar trust: %w", err)
+		}
+		if !exists || identity != previous {
+			return fmt.Errorf("sidecar identity changed: %s", suffix)
+		}
+	}
+	return nil
+}
+
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func verify(ctx context.Context, path string) (Summary, error) {
-	db, err := sql.Open("sqlite", path); if err != nil { return Summary{}, err }; defer db.Close()
-	var qc string; if err = db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&qc); err != nil { return Summary{}, err }; if !strings.EqualFold(qc, "ok") { return Summary{}, fmt.Errorf("quick_check=%s", qc) }
-	var version int; if err = db.QueryRowContext(ctx, "SELECT version FROM license_schema_version WHERE singleton_id=1").Scan(&version); err != nil { return Summary{}, err }
-	counts := map[string]int64{}; rows, err := db.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"); if err != nil { return Summary{}, err }; defer rows.Close()
-	for rows.Next() { var name string; if err := rows.Scan(&name); err != nil { return Summary{}, err }; var n int64; if err := db.QueryRowContext(ctx, "SELECT count(*) FROM \""+strings.ReplaceAll(name, "\"", "\"\"")+"\"").Scan(&n); err != nil { return Summary{}, err }; counts[name] = n }
-	b, err := os.ReadFile(path); if err != nil { return Summary{}, err }; h := sha256.Sum256(b)
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+	if err != nil {
+		return Summary{}, err
+	}
+	defer db.Close()
+	var qc string
+	if err = db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&qc); err != nil {
+		return Summary{}, err
+	}
+	if qc != "ok" {
+		return Summary{}, fmt.Errorf("quick_check=%s", qc)
+	}
+	var version int
+	if err = db.QueryRowContext(ctx, "SELECT version FROM license_schema_version WHERE singleton_id=1").Scan(&version); err != nil {
+		return Summary{}, err
+	}
+	counts := map[string]int64{}
+	rows, err := db.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		return Summary{}, err
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return Summary{}, err
+		}
+		names = append(names, name)
+	}
+	if err := rows.Close(); err != nil {
+		return Summary{}, err
+	}
+	for _, name := range names {
+		var n int64
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM \""+strings.ReplaceAll(name, "\"", "\"\"")+"\"").Scan(&n); err != nil {
+			return Summary{}, err
+		}
+		counts[name] = n
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Summary{}, err
+	}
+	h := sha256.Sum256(b)
 	return Summary{SchemaVersion: version, QuickCheck: "ok", TableCounts: counts, SHA256: hex.EncodeToString(h[:])}, nil
 }
 
+type systemdProbe struct{}
+
+func (systemdProbe) State(ctx context.Context, service string) (ServiceState, error) {
+	if service != requiredService {
+		return ServiceUnknown, errors.New("invalid service")
+	}
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveState", "--value", service).Output()
+	if err != nil {
+		return ServiceUnknown, err
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "inactive":
+		return ServiceStopped, nil
+	case "active":
+		return ServiceActive, nil
+	default:
+		return ServiceUnknown, nil
+	}
+}
+
 func main() {
+	service := flag.String("service", "", "service that must be stopped")
 	source := flag.String("source", "", "absolute source database")
-	destination := flag.String("destination", "", "new snapshot path")
-	root := flag.String("maintenance-root", "", "validated maintenance root")
-	flag.Parse(); if *source == "" || *destination == "" || *root == "" { fmt.Fprintln(os.Stderr, "source, destination and maintenance-root are required"); os.Exit(2) }
-	s, err := Snapshot(context.Background(), *source, *destination, *root); if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }; fmt.Println(s.String())
+	destination := flag.String("destination", "", "new snapshot path below the fixed backup root")
+	flag.Parse()
+	if *service == "" || *source == "" || *destination == "" {
+		fmt.Fprintln(os.Stderr, "service, source and destination are required")
+		os.Exit(2)
+	}
+	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Println(s.String())
 }
