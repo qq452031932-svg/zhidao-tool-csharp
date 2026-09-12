@@ -132,6 +132,63 @@ func TestDirectoryGuardRestoreFailureOverridesSuccessfulSnapshot(t *testing.T) {
 	if _, err := Snapshot(context.Background(), o); err == nil || !strings.Contains(err.Error(), "manual repair") {
 		t.Fatalf("restore failure did not override success: %v", err)
 	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination survived restore failure: %v", err)
+	}
+}
+
+func TestRestoreFailureSurfacesDestinationCleanupFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*SnapshotOptions)
+		want      string
+	}{
+		{"remove", func(o *SnapshotOptions) {
+			o.RemovePublished = func(string) error { return errors.New("remove failed") }
+		}, "remove failed"},
+		{"sync", func(o *SnapshotOptions) {
+			o.SyncPublishedDirectory = func(string) error { return errors.New("sync failed") }
+		}, "sync failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			src := filepath.Join(root, "state.db")
+			dst := filepath.Join(root, "snapshot.db")
+			createTestDB(t, src)
+			events := []string{}
+			o := testOptions(t, src, dst)
+			o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+			o.DirectoryGuard = fakeDirectoryGuard{events: &events, restoreErr: errors.New("restore failed")}
+			tc.configure(&o)
+			if _, err := Snapshot(context.Background(), o); err == nil || !strings.Contains(err.Error(), "restore failed") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("joined error missing: %v", err)
+			}
+		})
+	}
+}
+
+func TestPanicAfterPublishRestoresAndCleansBeforeRepanic(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "state.db")
+	dst := filepath.Join(root, "snapshot.db")
+	createTestDB(t, src)
+	events := []string{}
+	o := testOptions(t, src, dst)
+	o.PathClassifier = func(string, string) (SourceKind, error) { return SourceLive, nil }
+	o.DirectoryGuard = fakeDirectoryGuard{events: &events}
+	o.AfterPublish = func() { panic("fixture panic") }
+	defer func() {
+		if recover() == nil {
+			t.Fatal("panic was not propagated")
+		}
+		if events[len(events)-1] != "restore" {
+			t.Fatalf("guard was not restored: %v", events)
+		}
+		if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("destination survived panic: %v", err)
+		}
+	}()
+	_, _ = Snapshot(context.Background(), o)
 }
 
 func TestDirectoryGuardIdentityChangeFailsAndRestores(t *testing.T) {

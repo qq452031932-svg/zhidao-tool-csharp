@@ -11,10 +11,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	_ "modernc.org/sqlite"
 )
@@ -69,16 +71,19 @@ type TrustProbe interface {
 }
 
 type SnapshotOptions struct {
-	ServiceName    string
-	Source         string
-	Destination    string
-	ServiceProbe   ServiceStateProbe
-	TrustProbe     TrustProbe
-	PathClassifier func(string, string) (SourceKind, error)
-	Checkpoint     func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
-	SourceBinder   SourceBinder
-	DirectoryGuard DirectoryGuard
-	DatabaseOpener DatabaseOpener
+	ServiceName            string
+	Source                 string
+	Destination            string
+	ServiceProbe           ServiceStateProbe
+	TrustProbe             TrustProbe
+	PathClassifier         func(string, string) (SourceKind, error)
+	Checkpoint             func(context.Context, *sql.Conn) (busy, logFrames, checkpointed int, err error)
+	SourceBinder           SourceBinder
+	DirectoryGuard         DirectoryGuard
+	DatabaseOpener         DatabaseOpener
+	RemovePublished        func(string) error
+	SyncPublishedDirectory func(string) error
+	AfterPublish           func()
 }
 
 type Summary struct {
@@ -160,14 +165,45 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 	if err != nil {
 		return summary, fmt.Errorf("acquire source directory guard: %w", err)
 	}
+	removePublished := options.RemovePublished
+	if removePublished == nil {
+		removePublished = os.Remove
+	}
+	syncPublishedDirectory := options.SyncPublishedDirectory
+	if syncPublishedDirectory == nil {
+		syncPublishedDirectory = syncDirectory
+	}
 	published := false
+	temporary := ""
+	temporaryPresent := false
 	defer func() {
-		if restoreErr := guardLease.Restore(); restoreErr != nil {
-			summary = Summary{}
-			err = fmt.Errorf("source directory restore failed; keep service stopped and repair ownership manually: %w", restoreErr)
-			if published {
-				_ = os.Remove(options.Destination)
+		panicValue := recover()
+		restoreErr := guardLease.Restore()
+		var cleanupErr error
+		if temporaryPresent {
+			if removeErr := os.Remove(temporary); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove temporary: %w", removeErr))
 			}
+		}
+		if (err != nil || restoreErr != nil || panicValue != nil) && published {
+			if removeErr := removePublished(options.Destination); removeErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove published destination: %w", removeErr))
+			} else if syncErr := syncPublishedDirectory(filepath.Dir(options.Destination)); syncErr != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sync destination cleanup: %w", syncErr))
+			}
+		}
+		if restoreErr != nil {
+			summary = Summary{}
+			err = errors.Join(err, fmt.Errorf("source directory restore failed; keep service stopped and repair ownership manually: %w", restoreErr), cleanupErr)
+		} else if cleanupErr != nil {
+			summary = Summary{}
+			err = errors.Join(err, cleanupErr)
+		}
+		if panicValue != nil {
+			if err != nil {
+				panic(errors.Join(fmt.Errorf("snapshot panic: %v", panicValue), err))
+			}
+			panic(panicValue)
 		}
 	}()
 	if err = guardLease.Validate(); err != nil {
@@ -257,16 +293,11 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 		return summary, err
 	}
 
-	temporary, err := unusedTemporaryName(parent)
+	temporary, err = unusedTemporaryName(parent)
 	if err != nil {
 		return summary, err
 	}
-	defer func() {
-		_ = os.Remove(temporary)
-		if err != nil && published {
-			_ = os.Remove(options.Destination)
-		}
-	}()
+	temporaryPresent = true
 	if _, err = conn.ExecContext(ctx, "VACUUM INTO ?", temporary); err != nil {
 		return summary, fmt.Errorf("vacuum into temporary: %w", err)
 	}
@@ -298,9 +329,13 @@ func Snapshot(ctx context.Context, options SnapshotOptions) (summary Summary, er
 		return Summary{}, fmt.Errorf("publish without replacement: %w", err)
 	}
 	published = true
+	if options.AfterPublish != nil {
+		options.AfterPublish()
+	}
 	if err = os.Remove(temporary); err != nil {
 		return Summary{}, fmt.Errorf("remove temporary link: %w", err)
 	}
+	temporaryPresent = false
 	if err = options.TrustProbe.SecureOutput(options.Destination); err != nil {
 		return Summary{}, fmt.Errorf("secure published output: %w", err)
 	}
@@ -541,7 +576,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "service, source and destination are required")
 		os.Exit(2)
 	}
-	s, err := Snapshot(context.Background(), SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}, SourceBinder: platformSourceBinder{}, DirectoryGuard: platformDirectoryGuard{}})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	s, err := Snapshot(ctx, SnapshotOptions{ServiceName: *service, Source: *source, Destination: *destination, ServiceProbe: systemdProbe{}, TrustProbe: platformTrustProbe{}, SourceBinder: platformSourceBinder{}, DirectoryGuard: platformDirectoryGuard{}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

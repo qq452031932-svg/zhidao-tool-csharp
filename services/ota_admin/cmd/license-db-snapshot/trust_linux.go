@@ -109,19 +109,19 @@ func acquirePlatformDirectoryGuard(parent string, live bool, expectedUID, expect
 		return nil, err
 	}
 	if err := syscall.Fchmod(fd, 0700); err != nil {
-		_ = lease.seizeRoot()
+		seizeErr := lease.seizeRoot()
 		file.Close()
-		return nil, err
+		return nil, errors.Join(err, seizeErr)
 	}
 	if err := file.Sync(); err != nil {
-		_ = lease.seizeRoot()
+		seizeErr := lease.seizeRoot()
 		file.Close()
-		return nil, err
+		return nil, errors.Join(err, seizeErr)
 	}
 	if err := lease.Validate(); err != nil {
-		_ = lease.seizeRoot()
+		seizeErr := lease.seizeRoot()
 		file.Close()
-		return nil, err
+		return nil, errors.Join(err, seizeErr)
 	}
 	return lease, nil
 }
@@ -159,35 +159,56 @@ func (g *platformDirectoryGuardLease) Restore() error {
 	}
 	fd := int(g.file.Fd())
 	if err := syscall.Fchmod(fd, 0700); err != nil {
-		return fmt.Errorf("prepare restore: %w", err)
+		return g.restoreFailure("prepare restore", err)
 	}
 	if err := g.file.Sync(); err != nil {
-		return fmt.Errorf("sync guarded metadata: %w", err)
+		return g.restoreFailure("sync guarded metadata", err)
 	}
 	if err := syscall.Fchown(fd, int(g.uid), int(g.gid)); err != nil {
-		_ = g.seizeRoot()
-		return fmt.Errorf("restore owner: %w", err)
+		return g.restoreFailure("restore owner", err)
 	}
 	if err := syscall.Fchmod(fd, g.mode); err != nil {
-		_ = g.seizeRoot()
-		return fmt.Errorf("restore mode: %w", err)
+		return g.restoreFailure("restore mode", err)
 	}
 	if err := g.file.Sync(); err != nil {
-		_ = g.seizeRoot()
-		return fmt.Errorf("sync restored metadata: %w", err)
+		return g.restoreFailure("sync restored metadata", err)
+	}
+	if err := g.validateMetadata(g.uid, g.gid, g.mode); err != nil {
+		return g.restoreFailure("verify restored metadata", err)
 	}
 	return nil
 }
 
 func (g *platformDirectoryGuardLease) seizeRoot() error {
 	fd := int(g.file.Fd())
-	if err := syscall.Fchown(fd, 0, 0); err != nil {
+	chownErr := syscall.Fchown(fd, 0, 0)
+	chmodErr := syscall.Fchmod(fd, 0700)
+	syncErr := g.file.Sync()
+	return errors.Join(chownErr, chmodErr, syncErr)
+}
+
+func (g *platformDirectoryGuardLease) restoreFailure(step string, stepErr error) error {
+	seizeErr := g.seizeRoot()
+	verifyErr := g.validateMetadata(0, 0, 0700)
+	return errors.Join(fmt.Errorf("%s: %w", step, stepErr), wrapOptional("re-seize root control", seizeErr), wrapOptional("verify root control", verifyErr))
+}
+
+func wrapOptional(message string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", message, err)
+}
+
+func (g *platformDirectoryGuardLease) validateMetadata(uid, gid, mode uint32) error {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(g.file.Fd()), &stat); err != nil {
 		return err
 	}
-	if err := syscall.Fchmod(fd, 0700); err != nil {
-		return err
+	if stat.Uid != uid || stat.Gid != gid || uint32(stat.Mode)&07777 != mode {
+		return fmt.Errorf("unexpected metadata uid=%d gid=%d mode=%04o", stat.Uid, stat.Gid, uint32(stat.Mode)&07777)
 	}
-	return g.file.Sync()
+	return nil
 }
 
 func validateRootAncestors(parent string) error {
