@@ -33,12 +33,23 @@ EXPECTED_SPKI_SHA256=""
 COMPILED_PUBLISHER_SPKI_SHA256="f905188d79bb427c1a6eacc4bc9741d68a407228f643f6a50bfd791211da6cff"
 ACTIVE_VHOST_SHA256=""
 BACKUP_ROOT="/var/backups/superpan-ota-admin"
+LOOPBACK_LICENSE_TRANSACTION=false
+LOOPBACK_CONFIG_SOURCE=""
+LOOPBACK_CONFIG_SHA256=""
+LOOPBACK_UNIT_SOURCE=""
+LOOPBACK_UNIT_SHA256=""
+SOURCE_COMMIT=""
 
 usage() {
     cat >&2 <<'USAGE'
 Usage: install.sh --binary PATH --binary-sha256 HEX \
   --certificate PATH --certificate-sha256 HEX --publisher-spki-sha256 HEX \
   --active-vhost-sha256 HEX
+
+Loopback license transaction preflight (does not mutate in this release):
+  install.sh --loopback-license-transaction --binary PATH --binary-sha256 HEX \
+    --config PATH --config-sha256 HEX --unit PATH --unit-sha256 HEX \
+    --source-commit 40_LOWERCASE_HEX
 
 The existing OTA HTTPS server block must already contain exactly this line:
   include /etc/superpan-ota-admin/ota.fanfh.cn.admin.nginx.conf;
@@ -54,6 +65,39 @@ require_value() {
     [ "$#" -eq 2 ] && [ -n "$2" ] || die "missing value for $1"
 }
 
+verify_sha256() {
+    local source="$1"
+    local expected="$2"
+    local actual
+    actual="$(sha256sum -- "$source" | awk '{print $1}')"
+    [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $source"
+}
+
+preflight_loopback_license_transaction() {
+    [ -z "$CERTIFICATE_SOURCE$CERTIFICATE_SHA256$EXPECTED_SPKI_SHA256$ACTIVE_VHOST_SHA256" ] ||
+        die "public-install arguments are forbidden in loopback license transaction mode"
+    [ -n "$BINARY_SOURCE" ] || die "--binary is required for loopback license transaction"
+    [ -n "$LOOPBACK_CONFIG_SOURCE" ] || die "--config is required for loopback license transaction"
+    [ -n "$LOOPBACK_UNIT_SOURCE" ] || die "--unit is required for loopback license transaction"
+    [[ "$BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "binary SHA-256 must be 64 lowercase hexadecimal characters"
+    [[ "$LOOPBACK_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "config SHA-256 must be 64 lowercase hexadecimal characters"
+    [[ "$LOOPBACK_UNIT_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "unit SHA-256 must be 64 lowercase hexadecimal characters"
+    [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "source commit must be exactly 40 lowercase hexadecimal characters"
+    command -v sha256sum >/dev/null || die "sha256sum is required"
+    for source in "$BINARY_SOURCE" "$LOOPBACK_CONFIG_SOURCE" "$LOOPBACK_UNIT_SOURCE"; do
+        case "$source" in /*) ;; *) die "loopback transaction inputs must use absolute paths" ;; esac
+        [ "$(readlink -f -- "$source")" = "$source" ] || die "loopback transaction inputs must use canonical paths"
+        [ -f "$source" ] && [ ! -L "$source" ] || die "loopback transaction input must be a regular non-symlink file"
+        [ "$(stat -c '%h' "$source")" = "1" ] || die "loopback transaction input must have exactly one link"
+        [ "$(stat -c '%U:%G' "$source")" = "root:root" ] || die "loopback transaction inputs must be owned by root:root"
+        mode="$(stat -c '%a' "$source")"
+        (( (8#$mode & 8#022) == 0 )) || die "loopback transaction input must not be group/world writable"
+    done
+    verify_sha256 "$BINARY_SOURCE" "$BINARY_SHA256"
+    verify_sha256 "$LOOPBACK_CONFIG_SOURCE" "$LOOPBACK_CONFIG_SHA256"
+    verify_sha256 "$LOOPBACK_UNIT_SOURCE" "$LOOPBACK_UNIT_SHA256"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --binary) require_value "$1" "${2:-}"; BINARY_SOURCE="$2"; shift 2 ;;
@@ -62,12 +106,25 @@ while [ "$#" -gt 0 ]; do
         --certificate-sha256) require_value "$1" "${2:-}"; CERTIFICATE_SHA256="$2"; shift 2 ;;
         --publisher-spki-sha256) require_value "$1" "${2:-}"; EXPECTED_SPKI_SHA256="$2"; shift 2 ;;
         --active-vhost-sha256) require_value "$1" "${2:-}"; ACTIVE_VHOST_SHA256="$2"; shift 2 ;;
+        --loopback-license-transaction) LOOPBACK_LICENSE_TRANSACTION=true; shift ;;
+        --config) require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SOURCE="$2"; shift 2 ;;
+        --config-sha256) require_value "$1" "${2:-}"; LOOPBACK_CONFIG_SHA256="$2"; shift 2 ;;
+        --unit) require_value "$1" "${2:-}"; LOOPBACK_UNIT_SOURCE="$2"; shift 2 ;;
+        --unit-sha256) require_value "$1" "${2:-}"; LOOPBACK_UNIT_SHA256="$2"; shift 2 ;;
+        --source-commit) require_value "$1" "${2:-}"; SOURCE_COMMIT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; die "unknown argument: $1" ;;
     esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "run this installer as root"
+if [ "$LOOPBACK_LICENSE_TRANSACTION" = true ]; then
+    preflight_loopback_license_transaction
+    echo "loopback license transaction preflight complete for source commit $SOURCE_COMMIT"
+    exit 0
+fi
+[ -z "$LOOPBACK_CONFIG_SOURCE$LOOPBACK_CONFIG_SHA256$LOOPBACK_UNIT_SOURCE$LOOPBACK_UNIT_SHA256$SOURCE_COMMIT" ] ||
+    die "loopback transaction arguments require --loopback-license-transaction"
 [ -n "$BINARY_SOURCE" ] || { usage; die "--binary is required"; }
 [ -n "$CERTIFICATE_SOURCE" ] || { usage; die "--certificate is required"; }
 [[ "$BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "binary SHA-256 must be 64 lowercase hexadecimal characters"
@@ -90,14 +147,6 @@ command -v curl >/dev/null || die "curl is required"
 command -v mountpoint >/dev/null || die "mountpoint is required"
 command -v find >/dev/null || die "find is required"
 command -v ps >/dev/null || die "ps is required"
-
-verify_sha256() {
-    local source="$1"
-    local expected="$2"
-    local actual
-    actual="$(sha256sum -- "$source" | awk '{print $1}')"
-    [ "$actual" = "$expected" ] || die "SHA-256 mismatch for $source"
-}
 
 read_nginx_master_pid() {
     [ -f "$NGINX_PID_FILE" ] && [ ! -L "$NGINX_PID_FILE" ] || return 1
