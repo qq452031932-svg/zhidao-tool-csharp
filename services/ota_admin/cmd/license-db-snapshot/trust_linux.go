@@ -241,11 +241,53 @@ func (g *platformDirectoryGuardLease) recoverPartialAcquire(acquireErr error) er
 		restoreErr = g.validateMetadata(g.uid, g.gid, g.mode)
 	}
 	if restoreErr == nil {
+		restoreErr = g.validateRestoredPath()
+	}
+	if restoreErr == nil {
 		return acquireErr
 	}
 	seizeErr := g.seizeRoot()
 	verifyErr := g.validateMetadata(0, 0, 0700)
 	return errors.Join(ErrManualRepairRequired, acquireErr, fmt.Errorf("partial guard rollback: %w", restoreErr), wrapOptional("re-seize root control", seizeErr), wrapOptional("verify root control", verifyErr))
+}
+
+func (g *platformDirectoryGuardLease) validateRestoredPath() error {
+	if g.live {
+		if err := validateRootAncestors(g.path); err != nil {
+			return err
+		}
+	}
+	info, err := os.Lstat(g.path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("restored guard path is not a no-follow directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("restored guard path stat unavailable")
+	}
+	if (FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}) != g.identity {
+		return errors.New("restored guard path identity changed")
+	}
+	if stat.Uid != g.uid || stat.Gid != g.gid || uint32(stat.Mode)&07777 != g.mode {
+		return errors.New("restored guard path metadata changed")
+	}
+	fd, err := syscall.Open(g.path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("reopen restored guard path: %w", err)
+	}
+	var reopened syscall.Stat_t
+	statErr := syscall.Fstat(fd, &reopened)
+	closeErr := syscall.Close(fd)
+	if statErr != nil || closeErr != nil {
+		return errors.Join(statErr, closeErr)
+	}
+	if (FileIdentity{Device: uint64(reopened.Dev), Inode: reopened.Ino}) != g.identity {
+		return errors.New("reopened guard path identity changed")
+	}
+	return nil
 }
 
 func validateRootAncestors(parent string) error {

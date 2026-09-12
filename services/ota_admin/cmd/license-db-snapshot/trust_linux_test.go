@@ -40,13 +40,23 @@ func (o *fakeDirectoryOps) Metadata(int) (uint32, uint32, uint32, error) {
 
 func TestPartialGuardAcquireRollbackSuccessRestoresMetadata(t *testing.T) {
 	original := errors.New("fixture acquire validation failure")
+	guardedPath := t.TempDir()
+	if err := os.Chmod(guardedPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(guardedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	identity := FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
 	ops := &fakeDirectoryOps{uid: 0, gid: 0, mode: 0700, failNextSync: original}
-	lease := &platformDirectoryGuardLease{file: os.NewFile(0, "fixture"), uid: 123, gid: 456, mode: 0700, live: true, ops: ops}
-	err := lease.finishPartialAcquire()
+	lease := &platformDirectoryGuardLease{file: os.NewFile(0, "fixture"), path: guardedPath, identity: identity, uid: stat.Uid, gid: stat.Gid, mode: 0700, live: true, ops: ops}
+	err = lease.finishPartialAcquire()
 	if !errors.Is(err, original) || errors.Is(err, ErrManualRepairRequired) {
 		t.Fatalf("unexpected rollback result: %v", err)
 	}
-	if ops.uid != 123 || ops.gid != 456 || ops.mode != 0700 {
+	if ops.uid != stat.Uid || ops.gid != stat.Gid || ops.mode != 0700 {
 		t.Fatalf("metadata not restored: %#v", ops)
 	}
 }
@@ -61,6 +71,43 @@ func TestPartialGuardAcquireRollbackFailureRequiresManualRepair(t *testing.T) {
 	}
 	if ops.uid != 0 || ops.gid != 0 || ops.mode != 0700 {
 		t.Fatalf("root control was not re-seized: %#v", ops)
+	}
+}
+
+func TestPartialGuardRollbackRejectsMissingOrReplacedPath(t *testing.T) {
+	for _, variant := range []string{"missing", "symlink"} {
+		t.Run(variant, func(t *testing.T) {
+			root := t.TempDir()
+			guardedPath := filepath.Join(root, "live")
+			if err := os.Mkdir(guardedPath, 0700); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(guardedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stat := info.Sys().(*syscall.Stat_t)
+			identity := FileIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}
+			moved := filepath.Join(root, "moved")
+			if err := os.Rename(guardedPath, moved); err != nil {
+				t.Fatal(err)
+			}
+			if variant == "symlink" {
+				if err := os.Symlink(moved, guardedPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			original := errors.New("fixture partial acquire failure")
+			ops := &fakeDirectoryOps{uid: 0, gid: 0, mode: 0700}
+			lease := &platformDirectoryGuardLease{file: os.NewFile(0, "fixture"), path: guardedPath, identity: identity, uid: 123, gid: 456, mode: 0700, live: true, ops: ops}
+			err = lease.recoverPartialAcquire(original)
+			if !errors.Is(err, ErrManualRepairRequired) || !strings.Contains(err.Error(), "keep superpan-license.service stopped; manually restore directory ownership") {
+				t.Fatalf("unsafe path restoration accepted: %v", err)
+			}
+			if ops.uid != 0 || ops.gid != 0 || ops.mode != 0700 {
+				t.Fatalf("root control was not re-seized: %#v", ops)
+			}
+		})
 	}
 }
 
