@@ -4,7 +4,7 @@
 
 **Goal:** Export each account's successful and unsuccessful transfer rows into timestamped workbooks, replacing links and extraction codes only for successful rows while preserving retryable failed rows.
 
-**Architecture:** Persist the latest generated share URL and extraction code on operation results. A batch export service groups by stable account ID and result class, copies the original workbook-shaped columns, and replaces link/code cells only for successes. The UI adds a “选中失败” command that selects failed rows without starting a retry.
+**Architecture:** Persist immutable input URL/code plus latest generated URL/code on operation results. A batch export service groups by stable account ID and result class, writes the software's supported standard columns, and replaces link/code cells only for successes. The UI adds a “选中失败” command that selects failed rows without starting a retry.
 
 **Tech Stack:** .NET 8/C#, existing application services and SQLite repositories, Open XML streaming writer, CommunityToolkit MVVM, xUnit.
 
@@ -18,7 +18,7 @@
 - Modify: SQLite migrations/repositories for operation results
 - Test: `tests/BaiduBatchTransfer.Application.Tests/Jobs/OperationResultPersistenceTests.cs`
 
-- [ ] Write failing tests proving successful results persist new URL/code, failed results retain original URL/code, and a success without code clears the code.
+- [ ] Write failing tests proving immutable input URL/code and latest output URL/code are persisted; successful results export latest values, failed/skipped/pending results export input values, and a success without code clears the code.
 - [ ] Run focused tests and confirm failure because fields/migration are absent.
 - [ ] Add nullable latest URL/code fields, migration, repository writes, and reads.
 - [ ] Run focused tests and full operation-result tests.
@@ -51,14 +51,14 @@
 - [ ] Run tests including same-name accounts, invalid Unicode/Windows names, cancellation, and write failure.
 - [ ] Commit `feat: split result exports by account and outcome`.
 
-### Task 4: Preserve workbook columns while replacing link/code cells
+### Task 4: Write supported standard workbook columns while replacing link/code cells
 
 **Files:**
 - Modify: `src/BaiduBatchTransfer.Infrastructure/Excel/OpenXmlResultWriter.cs`
 - Modify: Excel row mapping/import-export contracts
 - Test: `tests/BaiduBatchTransfer.Infrastructure.Tests/Excel/AccountResultWorkbookTests.cs`
 
-- [ ] Write failing Open XML tests that read generated workbooks and assert original title/name/path columns remain, exactly one link/code column exists, and no horizontal result columns are added.
+- [ ] Write failing Open XML tests that read generated workbooks and assert the supported standard columns remain, exactly one link/code column exists, and no horizontal result columns are added.
 - [ ] Implement row mapping that replaces only link and extraction-code cells for success rows.
 - [ ] Keep failed rows unchanged for retry and add fixed status/reason columns only where defined by the approved schema.
 - [ ] Verify formula sanitization, row rollover, empty workbooks, and >Excel row-limit behavior.
